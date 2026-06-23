@@ -335,6 +335,7 @@ class LiveRuntime:
         self._last_private_position_probe_ms: int = 0
         self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, ...], int] = {}
         self._unsupported_symbol_diagnostic_seen_keys: set[tuple[str, ...]] = set()
+        self._pending_recovery_unsupported_symbol_diagnostics: list[dict[str, Any]] = []
         self._last_position_drift_check_ms: int = 0
         self._symbol_admission_blocked_until_ms: dict[tuple[str, str], int] = {}
 
@@ -2282,51 +2283,138 @@ class LiveRuntime:
             and getattr(self.journal, "_file", None) is not None
         ):
             now_ms = wall_clock_now_ms()
-            unsupported_symbols = tuple(
-                sorted({str(item["symbol"]) for item in unsupported})
-            )
-            diagnostic_key = (
-                "recovery.live_position_probe_unsupported_symbols",
-                *unsupported_symbols,
-            )
-            if diagnostic_key in self._unsupported_symbol_diagnostic_seen_keys:
-                return filtered
-            self._unsupported_symbol_diagnostic_seen_keys.add(diagnostic_key)
-            self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
-            sample = unsupported[:10]
-            self.journal.append(
-                "recovery.live_position_probe_unsupported_symbols",
-                {
-                    "venue": venue.value,
-                    "endpoint": endpoint,
-                    "catalog_source": "adapter.supported_symbols",
-                    "catalog_supported_count": catalog_supported_count,
-                    "sample_supported_symbols": sample_supported_symbols,
-                    "symbol_count": len(symbols),
-                    "requested_symbols": [str(symbol) for symbol in symbols],
-                    "skipped_by_catalog": [item["symbol"] for item in unsupported],
-                    "unsupported_count": len(unsupported),
-                    "sample_symbols": [item["symbol"] for item in sample],
-                    "sample_venue_symbols": [
-                        item["venue_symbol"] for item in sample
-                    ],
-                    "classification": "catalog_diagnostic",
-                    "close_reconciliation_state": "catalog_diagnostic",
-                    "blocking": False,
-                    "decision": "catalog_diagnostic",
-                    "symbol_mapping_samples": [
-                        {
-                            "symbol": item["symbol"],
-                            "venue_symbol": item["venue_symbol"],
-                        }
-                        for item in sample
-                    ],
-                    "diagnostic_key": list(diagnostic_key),
-                    "diagnostic_rate_limit_ms": self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
-                    "reason": "unsupported_symbol",
-                },
+            self._record_recovery_unsupported_symbol_diagnostic(
+                venue=venue,
+                endpoint=endpoint,
+                requested_symbols=[str(symbol) for symbol in symbols],
+                unsupported=unsupported,
+                catalog_supported_count=catalog_supported_count,
+                sample_supported_symbols=sample_supported_symbols,
+                now_ms=now_ms,
             )
         return filtered
+
+    def _record_recovery_unsupported_symbol_diagnostic(
+        self,
+        *,
+        venue: Venue,
+        endpoint: str,
+        requested_symbols: list[str],
+        unsupported: list[dict[str, str]],
+        catalog_supported_count: int,
+        sample_supported_symbols: list[str],
+        now_ms: int,
+    ) -> None:
+        self._pending_recovery_unsupported_symbol_diagnostics.append(
+            {
+                "venue": venue.value,
+                "endpoint": endpoint,
+                "requested_symbols": list(requested_symbols),
+                "unsupported": [dict(item) for item in unsupported],
+                "catalog_supported_count": catalog_supported_count,
+                "sample_supported_symbols": list(sample_supported_symbols),
+                "ts_ms": now_ms,
+            }
+        )
+
+    def _flush_recovery_unsupported_symbol_diagnostics(self, *, now_ms: int) -> None:
+        diagnostics = list(self._pending_recovery_unsupported_symbol_diagnostics)
+        self._pending_recovery_unsupported_symbol_diagnostics = []
+        if not diagnostics or getattr(self.journal, "_file", None) is None:
+            return
+
+        venues: list[str] = []
+        seen_venues: set[str] = set()
+        requested_symbols: list[str] = []
+        seen_requested: set[str] = set()
+        unsupported_symbols: list[str] = []
+        seen_unsupported: set[str] = set()
+        unsupported_by_venue: dict[str, list[str]] = {}
+        mapping_samples: list[dict[str, str]] = []
+
+        first = diagnostics[0]
+        for diagnostic in diagnostics:
+            venue = str(diagnostic.get("venue") or "")
+            if venue and venue not in seen_venues:
+                venues.append(venue)
+                seen_venues.add(venue)
+            for symbol in diagnostic.get("requested_symbols") or []:
+                symbol_s = str(symbol)
+                if symbol_s and symbol_s not in seen_requested:
+                    requested_symbols.append(symbol_s)
+                    seen_requested.add(symbol_s)
+            venue_unsupported: list[str] = []
+            for item in diagnostic.get("unsupported") or []:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol") or "")
+                venue_symbol = str(item.get("venue_symbol") or symbol)
+                if symbol and symbol not in venue_unsupported:
+                    venue_unsupported.append(symbol)
+                if symbol and symbol not in seen_unsupported:
+                    unsupported_symbols.append(symbol)
+                    seen_unsupported.add(symbol)
+                if len(mapping_samples) < 10:
+                    mapping_samples.append(
+                        {
+                            "venue": venue,
+                            "symbol": symbol,
+                            "venue_symbol": venue_symbol,
+                        }
+                    )
+            if venue:
+                unsupported_by_venue[venue] = venue_unsupported
+
+        diagnostic_key = (
+            "recovery.live_position_probe_unsupported_symbols",
+            *sorted(unsupported_symbols),
+        )
+        if diagnostic_key in self._unsupported_symbol_diagnostic_seen_keys:
+            return
+        self._unsupported_symbol_diagnostic_seen_keys.add(diagnostic_key)
+        self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
+        sample_mappings = mapping_samples[:10]
+        self.journal.append(
+            "recovery.live_position_probe_unsupported_symbols",
+            {
+                "venue": venues[0] if venues else "",
+                "venues": venues,
+                "endpoint": str(first.get("endpoint") or "fetch_position"),
+                "catalog_source": "adapter.supported_symbols",
+                "catalog_supported_count": int(
+                    first.get("catalog_supported_count") or 0
+                ),
+                "sample_supported_symbols": list(
+                    first.get("sample_supported_symbols") or []
+                ),
+                "symbol_count": len(requested_symbols),
+                "requested_symbols": requested_symbols,
+                "skipped_by_catalog": unsupported_symbols,
+                "unsupported_count": len(unsupported_symbols),
+                "unsupported_by_venue": unsupported_by_venue,
+                "sample_symbols": [
+                    item["symbol"] for item in sample_mappings
+                ],
+                "sample_venue_symbols": [
+                    item["venue_symbol"] for item in sample_mappings
+                ],
+                "classification": "catalog_diagnostic",
+                "close_reconciliation_state": "catalog_diagnostic",
+                "blocking": False,
+                "decision": "catalog_diagnostic",
+                "symbol_mapping_samples": [
+                    {
+                        "symbol": item["symbol"],
+                        "venue_symbol": item["venue_symbol"],
+                    }
+                    for item in sample_mappings
+                ],
+                "symbol_mapping_samples_by_venue": sample_mappings,
+                "diagnostic_key": list(diagnostic_key),
+                "diagnostic_rate_limit_ms": self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
+                "reason": "unsupported_symbol",
+            },
+        )
 
     def _position_probe_exception_payload(
         self,
@@ -2617,6 +2705,9 @@ class LiveRuntime:
                 adapter,
                 requested_symbols,
             )
+        self._flush_recovery_unsupported_symbol_diagnostics(
+            now_ms=global_probe_started_at_ms
+        )
         truth_required_symbol_sources = (
             self._truth_required_recovery_probe_symbol_sources(requested_symbols)
         )
@@ -3034,6 +3125,9 @@ class LiveRuntime:
                 venue,
                 self._venue_adapters[venue],
             )
+        self._flush_recovery_unsupported_symbol_diagnostics(
+            now_ms=wall_clock_now_ms()
+        )
 
         tasks = [
             fetch_one(venue, adapter, symbol)

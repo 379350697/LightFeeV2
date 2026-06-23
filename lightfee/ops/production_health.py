@@ -525,11 +525,21 @@ def analyze_current_state(
     pending_entries = int(state.get("pending_entry_count") or 0)
     pending_closes = int(state.get("pending_close_count") or 0)
     pending_residual_repairs = int(state.get("pending_residual_repair_count") or 0)
+    pending_close_reconciliations = int(
+        state.get("pending_close_reconciliation_count") or 0
+    )
+    pending_close_reconciliation_blocking = int(
+        state.get("pending_close_reconciliation_blocking_count") or 0
+    )
+    pending_close_reconciliation_terminal_flat = int(
+        state.get("pending_close_reconciliation_terminal_flat_count") or 0
+    )
     clean = (
         open_count == 0
         and pending_entries == 0
         and pending_closes == 0
         and pending_residual_repairs == 0
+        and pending_close_reconciliation_blocking == 0
     )
     last_scan = state.get("last_scan")
     last_scan_ts_ms = 0
@@ -546,6 +556,8 @@ def analyze_current_state(
         fingerprints.append("stale_fail_closed_clean_state")
     if state.get("last_scan") is None:
         fingerprints.append("last_scan_missing")
+    if pending_close_reconciliation_blocking:
+        fingerprints.append("pending_close_reconciliations_active")
     exchange_truth = state.get("exchange_truth")
     exchange_truth_mismatches: list[dict[str, Any]] = []
     recovery_decision = _recovery_decision_payload(state, exchange_truth)
@@ -677,6 +689,16 @@ def analyze_current_state(
             "open_position_count": open_count,
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
+            "pending_close_reconciliation_count": pending_close_reconciliations,
+            "pending_close_reconciliation_blocking_count": (
+                pending_close_reconciliation_blocking
+            ),
+            "pending_close_reconciliation_terminal_flat_count": (
+                pending_close_reconciliation_terminal_flat
+            ),
+            "pending_close_reconciliation_symbols": list(
+                state.get("pending_close_reconciliation_symbols") or []
+            ),
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
             "current_state_age_ms": current_state_age_ms,

@@ -96,6 +96,60 @@ def test_current_state_flags_stale_fail_closed_clean_state():
     assert "stale_fail_closed_clean_state" in report.fingerprints
 
 
+def test_current_state_blocks_only_active_pending_close_reconciliations():
+    base_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "generated_at_ms": 1778786999000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "last_scan": {"ts_ms": 1778786998000},
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        },
+    }
+
+    blocking = analyze_current_state(
+        {
+            **base_state,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_blocking_count": 1,
+            "pending_close_reconciliation_terminal_flat_count": 0,
+            "pending_close_reconciliation_symbols": ["HUSDT"],
+        },
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+    )
+    assert not blocking.ok
+    assert "pending_close_reconciliations_active" in blocking.fingerprints
+    assert blocking.details["pending_close_reconciliation_blocking_count"] == 1
+
+    terminal_flat_audit = analyze_current_state(
+        {
+            **base_state,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_blocking_count": 0,
+            "pending_close_reconciliation_terminal_flat_count": 1,
+            "pending_close_reconciliation_symbols": ["HUSDT"],
+        },
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+    )
+    assert terminal_flat_audit.ok
+    assert (
+        terminal_flat_audit.details[
+            "pending_close_reconciliation_terminal_flat_count"
+        ]
+        == 1
+    )
+
+
 def test_current_state_preserves_recent_auto_fail_closed_recovery_as_detail_only():
     state = {
         "lifecycle": "running",

@@ -461,6 +461,123 @@ def _truth_records_cover_scope(
     return True
 
 
+def _truth_venue_probe_succeeded(
+    truth: dict[str, Any],
+    *,
+    venue: str,
+    symbol: str,
+    status_key: str,
+    evidence_key: str,
+    success_classification: str,
+) -> bool:
+    fetch_status = truth.get("fetch_status")
+    if isinstance(fetch_status, dict):
+        venue_status = fetch_status.get(venue)
+        if isinstance(venue_status, dict):
+            failed_key = (
+                "positions_failed"
+                if status_key == "positions_succeeded"
+                else "orders_failed"
+            )
+            failed = {
+                str(item).upper()
+                for item in venue_status.get(failed_key, []) or []
+                if str(item)
+            }
+            if "*" in failed or (symbol and symbol in failed):
+                return False
+            succeeded = {
+                str(item).upper()
+                for item in venue_status.get(status_key, []) or []
+                if str(item)
+            }
+            if "*" in succeeded or (symbol and symbol in succeeded):
+                return True
+
+    evidence = truth.get(evidence_key)
+    if isinstance(evidence, dict):
+        venue_evidence = evidence.get(venue)
+        if isinstance(venue_evidence, dict):
+            for key in ("*", symbol):
+                if not key:
+                    continue
+                item = venue_evidence.get(key)
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("classification") or "") == success_classification:
+                    return True
+    return False
+
+
+def _account_level_flat_truth_covers_scope(
+    truth: dict[str, Any],
+    *,
+    symbol: str,
+    venues: set[str],
+) -> bool:
+    if truth.get("truth_available") is False or truth.get("available") is False:
+        return False
+    confidence = truth.get("confidence")
+    if confidence is not None and str(confidence or "").lower() != "high":
+        return False
+    if truth.get("has_nonzero_position") is not False:
+        return False
+    if truth.get("has_open_order") is not False:
+        return False
+    if not venues:
+        return False
+    for venue in venues:
+        if not _truth_venue_probe_succeeded(
+            truth,
+            venue=venue,
+            symbol=symbol,
+            status_key="positions_succeeded",
+            evidence_key="position_probe_evidence",
+            success_classification="position_probe_unfiltered_succeeded",
+        ):
+            return False
+        if not _truth_venue_probe_succeeded(
+            truth,
+            venue=venue,
+            symbol=symbol,
+            status_key="orders_succeeded",
+            evidence_key="open_order_probe_evidence",
+            success_classification="open_order_probe_unfiltered_succeeded",
+        ):
+            return False
+    return True
+
+
+def _close_reconciliation_truth_covers_scope(
+    truth: dict[str, Any],
+    reconciliation: dict[str, Any],
+) -> bool:
+    symbol, venues = _close_reconciliation_scope(reconciliation)
+    if passive_close_has_terminal_truth({"exchange_truth": truth}):
+        positions = truth.get("positions")
+        if not _truth_records_cover_scope(
+            positions,
+            symbol=symbol,
+            venues=venues,
+            quantity_key="quantity",
+        ):
+            return False
+        open_order_truth = truth.get("open_order_truth")
+        if not _truth_records_cover_scope(
+            open_order_truth,
+            symbol=symbol,
+            venues=venues,
+            open_orders_key="open_orders_empty",
+        ):
+            return False
+        return True
+    return _account_level_flat_truth_covers_scope(
+        truth,
+        symbol=symbol,
+        venues=venues,
+    )
+
+
 def close_reconciliation_exchange_truth(
     reconciliation: dict[str, Any] | None,
     *,
@@ -473,31 +590,15 @@ def close_reconciliation_exchange_truth(
     embedded_truth = item.get("exchange_truth") or original_payload.get(
         "exchange_truth"
     )
-    if isinstance(embedded_truth, dict) and passive_close_has_terminal_truth(
-        {"exchange_truth": embedded_truth}
+    if isinstance(embedded_truth, dict) and _close_reconciliation_truth_covers_scope(
+        embedded_truth,
+        item,
     ):
         return embedded_truth
 
     if not isinstance(current_exchange_truth, dict):
         return None
-    if not passive_close_has_terminal_truth({"exchange_truth": current_exchange_truth}):
-        return None
-    symbol, venues = _close_reconciliation_scope(item)
-    positions = current_exchange_truth.get("positions")
-    if not _truth_records_cover_scope(
-        positions,
-        symbol=symbol,
-        venues=venues,
-        quantity_key="quantity",
-    ):
-        return None
-    open_order_truth = current_exchange_truth.get("open_order_truth")
-    if not _truth_records_cover_scope(
-        open_order_truth,
-        symbol=symbol,
-        venues=venues,
-        open_orders_key="open_orders_empty",
-    ):
+    if not _close_reconciliation_truth_covers_scope(current_exchange_truth, item):
         return None
     return current_exchange_truth
 

@@ -825,6 +825,72 @@ def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
     assert gate["runtime_market_data_config"]["local_l2_effective_enabled"] is False
 
 
+def test_acceptance_gate_blocks_active_pending_close_reconciliation():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_blocking_count": 1,
+            "pending_close_reconciliation_terminal_flat_count": 0,
+            "pending_close_reconciliation_symbols": ["HUSDT"],
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["pending_close_reconciliation_blocking_count"] == 1
+    assert "pending_close_reconciliations_active" in gate["blocking_reasons"]
+
+
+def test_acceptance_gate_allows_terminal_flat_pending_close_reconciliation_audit():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_blocking_count": 0,
+            "pending_close_reconciliation_terminal_flat_count": 1,
+            "pending_close_reconciliation_symbols": ["HUSDT"],
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["gate_passed"] is True
+    assert gate["pending_close_reconciliation_terminal_flat_count"] == 1
+    assert gate["blocking_reasons"] == []
+
+
 def test_state_consistency_exposes_runtime_progress_diagnostics():
     from scripts.diagnose_live import _build_state_consistency
 

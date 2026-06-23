@@ -6283,6 +6283,50 @@ def _build_production_acceptance_gate(
         )
         or 0
     )
+    pending_close_reconciliation_items = _state_collection_or_count(
+        local_state,
+        "pending_close_reconciliations",
+        "pending_close_reconciliation_count",
+    )
+    pending_close_reconciliation_count = int(
+        local_state.get("pending_close_reconciliation_count")
+        or len(pending_close_reconciliation_items)
+        or 0
+    )
+    if "pending_close_reconciliation_blocking_count" in local_state:
+        pending_close_reconciliation_blocking_count = int(
+            local_state.get("pending_close_reconciliation_blocking_count") or 0
+        )
+    else:
+        pending_close_reconciliation_blocking_count = sum(
+            1
+            for item in pending_close_reconciliation_items
+            if not (
+                isinstance(item, dict)
+                and item.get("archived") is True
+                and str(item.get("archive_reason") or "")
+                == "terminal_flat_accounting_gap"
+            )
+        )
+    if "pending_close_reconciliation_terminal_flat_count" in local_state:
+        pending_close_reconciliation_terminal_flat_count = int(
+            local_state.get("pending_close_reconciliation_terminal_flat_count")
+            or 0
+        )
+    else:
+        pending_close_reconciliation_terminal_flat_count = sum(
+            1
+            for item in pending_close_reconciliation_items
+            if (
+                isinstance(item, dict)
+                and item.get("archived") is True
+                and str(item.get("archive_reason") or "")
+                == "terminal_flat_accounting_gap"
+            )
+        )
+    pending_close_reconciliation_symbols = list(
+        local_state.get("pending_close_reconciliation_symbols") or []
+    )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
     pending_live_conflicts = _build_pending_entry_live_conflict_summary(
@@ -6316,6 +6360,7 @@ def _build_production_acceptance_gate(
         and pending_entry_count == 0
         and pending_close_count == 0
         and pending_residual_repair_count == 0
+        and pending_close_reconciliation_blocking_count == 0
     )
     exchange_recovery_clean = exchange_truth_flat and exchange_truth_no_open_orders
     current_core_clean = (
@@ -6336,6 +6381,8 @@ def _build_production_acceptance_gate(
         in {"RUNNING_CLEAN", "RUNNING_WITH_EVIDENCE_GAP"}
     )
     fingerprints: list[str] = []
+    if pending_close_reconciliation_blocking_count:
+        fingerprints.append("pending_close_reconciliations_active")
     if (
         current_core_clean
         and str(local_state.get("lifecycle", "") or "").lower() == "risk_only"
@@ -6429,6 +6476,7 @@ def _build_production_acceptance_gate(
         and pending_entry_count == 0
         and pending_close_count == 0
         and pending_residual_repair_count == 0
+        and pending_close_reconciliation_blocking_count == 0
         and exchange_truth.get("available")
         and not exchange_truth_flat
         and exchange_truth_no_open_orders
@@ -6451,6 +6499,8 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("local_open_positions_present")
     if pending_entry_count or pending_close_count:
         blocking_reasons.append("local_pending_entries_or_closes_present")
+    if pending_close_reconciliation_blocking_count:
+        blocking_reasons.append("pending_close_reconciliations_active")
     if pending_residual_repair_count:
         blocking_reasons.append("local_pending_residual_repairs_present")
     if residual_count and not residual_lifecycle_closed:
@@ -6587,6 +6637,16 @@ def _build_production_acceptance_gate(
         "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,
+        "pending_close_reconciliation_count": pending_close_reconciliation_count,
+        "pending_close_reconciliation_blocking_count": (
+            pending_close_reconciliation_blocking_count
+        ),
+        "pending_close_reconciliation_terminal_flat_count": (
+            pending_close_reconciliation_terminal_flat_count
+        ),
+        "pending_close_reconciliation_symbols": (
+            pending_close_reconciliation_symbols
+        ),
         "pending_residual_repair_count": pending_residual_repair_count,
         "residual_count": residual_count,
         "quick_flat_count": quick_flat_count,

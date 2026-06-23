@@ -7,6 +7,8 @@ from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
     classify_entry_quantity_contract,
     classify_noise_visibility,
+    close_reconciliation_exchange_truth,
+    close_reconciliation_exchange_truth_clean,
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     entry_market_evidence_contract,
@@ -312,6 +314,92 @@ def test_close_reconciliation_state_catalog_diagnostic_never_becomes_truth_block
     assert result["blocks_entry"] is False
     assert result["archive_reconciliation"] is True
     assert result["reason"] == "unsupported_symbol_probe_filtered"
+
+
+def _account_level_flat_truth(*venues: str) -> dict:
+    return {
+        "truth_available": True,
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {venue: {} for venue in venues},
+        "open_orders": {venue: {"*": []} for venue in venues},
+        "position_probe_evidence": {
+            venue: {
+                "*": {
+                    "classification": "position_probe_unfiltered_succeeded",
+                    "position_count": 0,
+                },
+            }
+            for venue in venues
+        },
+        "open_order_probe_evidence": {
+            venue: {
+                "*": {
+                    "classification": "open_order_probe_unfiltered_succeeded",
+                    "order_count": 0,
+                },
+            }
+            for venue in venues
+        },
+        "fetch_status": {
+            venue: {
+                "status": "ok",
+                "positions_succeeded": ["*"],
+                "positions_failed": [],
+                "orders_succeeded": ["*"],
+                "orders_failed": [],
+                "positions_unsupported_symbols": [],
+                "orders_unsupported_symbols": [],
+            }
+            for venue in venues
+        },
+    }
+
+
+def test_close_reconciliation_exchange_truth_accepts_account_level_flat_probe():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+    }
+    truth = _account_level_flat_truth("bybit", "okx")
+
+    assert (
+        close_reconciliation_exchange_truth(
+            reconciliation,
+            current_exchange_truth=truth,
+        )
+        is truth
+    )
+    assert close_reconciliation_exchange_truth_clean(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is True
+
+
+def test_close_reconciliation_exchange_truth_rejects_incomplete_account_level_probe():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+    }
+    truth = _account_level_flat_truth("bybit")
+
+    assert close_reconciliation_exchange_truth(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is None
+    assert close_reconciliation_exchange_truth_clean(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is False
 
 
 def test_noise_visibility_classifies_resolved_close_artifact_as_historical():

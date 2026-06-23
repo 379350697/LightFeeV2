@@ -98,6 +98,49 @@ class TestCurrentStateExportV1Semantics:
         finally:
             os.unlink(path)
 
+    def test_export_classifies_pending_close_reconciliation_queue(self):
+        state = EngineState(
+            lifecycle=EngineLifecycle.RUNNING,
+            risk_mode=GlobalRiskMode.RUNNING,
+        )
+        state.pending_close_reconciliations = [
+            {
+                "position_id": "entry-husdt",
+                "symbol": "HUSDT",
+                "long_venue": "bybit",
+                "short_venue": "okx",
+                "pending_backfill": True,
+                "evidence_gap_reason": "missing_close_statement",
+            },
+            {
+                "position_id": "entry-idusdt",
+                "symbol": "IDUSDT",
+                "long_venue": "bybit",
+                "short_venue": "okx",
+                "pending_backfill": True,
+                "archived": True,
+                "archive_reason": "terminal_flat_accounting_gap",
+            },
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            _export_current_state_snapshot(state, path)
+            with open(path) as f:
+                data = json.load(f)
+
+            assert data["pending_close_reconciliation_count"] == 2
+            assert data["pending_close_reconciliation_blocking_count"] == 1
+            assert data["pending_close_reconciliation_terminal_flat_count"] == 1
+            assert data["pending_close_reconciliation_symbols"] == [
+                "HUSDT",
+                "IDUSDT",
+            ]
+        finally:
+            os.unlink(path)
+
     def test_export_includes_global_risk_reason_when_present(self):
         """V1: global_risk_reason is included when set (nullable)."""
         state = EngineState(

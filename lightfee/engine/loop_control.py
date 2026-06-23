@@ -7,10 +7,14 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from lightfee.config.schema import AppConfig
-from lightfee.engine.state import EngineState
+from lightfee.engine.business_contract import (
+    classify_close_reconciliation_state,
+    close_reconciliation_exchange_truth_clean,
+)
+from lightfee.engine.state import EngineState, normalize_pending_close_reconciliations
 
 
 def metrics_export_path(config: AppConfig) -> Optional[str]:
@@ -74,6 +78,50 @@ class ExportState:
 
     next_metrics_export_ms: int = 0
     next_state_export_ms: int = 0
+
+
+def _pending_close_reconciliation_summary(raw: Any) -> dict[str, Any]:
+    items = normalize_pending_close_reconciliations(raw)
+    blocking_count = 0
+    terminal_flat_count = 0
+    symbols: list[str] = []
+    seen_symbols: set[str] = set()
+
+    for item in items:
+        snapshot = item.get("position_snapshot") if isinstance(item, dict) else {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        symbol = str(item.get("symbol") or snapshot.get("symbol") or "").upper()
+        if symbol and symbol not in seen_symbols:
+            symbols.append(symbol)
+            seen_symbols.add(symbol)
+
+        if (
+            item.get("archived") is True
+            and str(item.get("archive_reason") or "")
+            == "terminal_flat_accounting_gap"
+        ):
+            terminal_flat_count += 1
+            continue
+
+        contract = classify_close_reconciliation_state(
+            item,
+            current_exchange_truth_clean=close_reconciliation_exchange_truth_clean(
+                item
+            ),
+        )
+        state = str(contract.get("state") or "")
+        if state == "terminal_flat_accounting_gap":
+            terminal_flat_count += 1
+        if contract.get("blocks_entry") is True:
+            blocking_count += 1
+
+    return {
+        "pending_close_reconciliation_count": len(items),
+        "pending_close_reconciliation_blocking_count": blocking_count,
+        "pending_close_reconciliation_terminal_flat_count": terminal_flat_count,
+        "pending_close_reconciliation_symbols": symbols,
+    }
 
 
 def maybe_export_runtime_metrics(
@@ -167,6 +215,9 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
             exchange_truth=None,
             generated_at_ms=now_ms,
         ).to_dict()
+    pending_close_reconciliation = _pending_close_reconciliation_summary(
+        getattr(state, "pending_close_reconciliations", [])
+    )
 
     data = {
         "schema": "lightfee.current_state.v1",
@@ -195,6 +246,7 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "pending_entry_count": len(state.pending_entries),
         "pending_close_count": len(state.pending_closes),
         "pending_passive_close_count": len(state.pending_passive_closes),
+        **pending_close_reconciliation,
         "pending_residual_repair_count": len(getattr(state, "pending_residual_repairs", []) or []),
         "pending_residual_repairs": list(getattr(state, "pending_residual_repairs", []) or []),
         "live_recovery_reduce_only_pairs": list(getattr(state, "live_recovery_reduce_only_pairs", []) or []),

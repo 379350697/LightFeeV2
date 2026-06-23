@@ -562,6 +562,50 @@ def _terminal_flat_exchange_truth(
     }
 
 
+def _account_level_flat_exchange_truth(*, venues: list[Venue] | tuple[Venue, ...]) -> dict:
+    venue_values = [venue.value for venue in venues]
+    return {
+        "truth_available": True,
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": {venue: {} for venue in venue_values},
+        "open_orders": {venue: {"*": []} for venue in venue_values},
+        "position_probe_evidence": {
+            venue: {
+                "*": {
+                    "classification": "position_probe_unfiltered_succeeded",
+                    "position_count": 0,
+                },
+            }
+            for venue in venue_values
+        },
+        "open_order_probe_evidence": {
+            venue: {
+                "*": {
+                    "classification": "open_order_probe_unfiltered_succeeded",
+                    "order_count": 0,
+                },
+            }
+            for venue in venue_values
+        },
+        "fetch_status": {
+            venue: {
+                "status": "ok",
+                "positions_succeeded": ["*"],
+                "positions_failed": [],
+                "orders_succeeded": ["*"],
+                "orders_failed": [],
+                "positions_unsupported_symbols": [],
+                "orders_unsupported_symbols": [],
+            }
+            for venue in venue_values
+        },
+        "source": "current_recovery_exchange_truth",
+    }
+
+
 def _pending_entry(**overrides):
     values = dict(
         pending_id="entry-v1-drift",
@@ -1434,6 +1478,95 @@ async def test_pending_close_reconciliation_uses_current_flat_truth_when_payload
 
 
 @pytest.mark.asyncio
+async def test_pending_close_reconciliation_uses_account_level_flat_truth(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    symbol = "HUSDT"
+    long_adapter = _CloseLegMissingStatementAdapter(Venue.BYBIT, {})
+    short_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=360.0,
+            average_price=0.03731,
+            order_id="okx-close-order",
+            client_order_id="okx-close-cid",
+            fee_quote=0.01,
+            filled_at_ms=2000,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.BYBIT: long_adapter,
+        Venue.OKX: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-husdt", symbol=symbol)
+    )
+    runtime._last_recovery_exchange_truth = _account_level_flat_exchange_truth(
+        venues=[Venue.BYBIT, Venue.OKX],
+    )
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(
+            position_id="entry-husdt",
+            symbol=symbol,
+            created_cycle=1,
+            long_venue=Venue.BYBIT.value,
+            short_venue=Venue.OKX.value,
+            position_snapshot={
+                "position_id": "entry-husdt",
+                "symbol": symbol,
+                "long_venue": Venue.BYBIT.value,
+                "short_venue": Venue.OKX.value,
+                "long_entry_price": 0.03700,
+                "short_entry_price": 0.03740,
+            },
+            long_legs=[{
+                "venue": Venue.BYBIT.value,
+                "order_id": "bybit-close-order",
+                "client_order_id": "bybit-close-cid",
+            }],
+            short_legs=[{
+                "venue": Venue.OKX.value,
+                "order_id": "okx-close-order",
+                "client_order_id": "okx-close-cid",
+            }],
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert [
+        record
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ] == []
+    archived = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["symbol"] == symbol
+    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    reconciled = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "exit.reconciled"
+    ]
+    assert len(reconciled) == 1
+    assert reconciled[0]["missing_leg_terminality"] == (
+        "flat_by_position_truth_no_trade_statement"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pending_close_reconciliation_without_clean_current_truth_stays_fail_closed(
     config,
     tmp_journal,
@@ -1566,6 +1699,75 @@ async def test_pending_close_reconciliation_archives_terminal_flat_no_fill_when_
         if record["kind"] == "reconciliation.pending_close_reconciliation_invalid"
         and record["payload"].get("reason") == "confirmed_no_close_fill"
     ] == []
+    assert [
+        record
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ] == []
+    archived = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["missing_leg"] == "both"
+    assert archived[0]["evidence_gap_reason"] == "missing_both_close_trade_statements"
+    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert archived[0]["archive_reconciliation"] is True
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_archives_terminal_flat_no_fill_with_account_level_truth(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    symbol = "HUSDT"
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _CloseLegMissingStatementAdapter(Venue.BYBIT, {}),
+            Venue.OKX: _CloseLegMissingStatementAdapter(Venue.OKX, {}),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-husdt", symbol=symbol)
+    )
+    runtime._last_recovery_exchange_truth = _account_level_flat_exchange_truth(
+        venues=[Venue.BYBIT, Venue.OKX],
+    )
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(
+            position_id="entry-husdt",
+            symbol=symbol,
+            created_cycle=1,
+            long_venue=Venue.BYBIT.value,
+            short_venue=Venue.OKX.value,
+            position_snapshot={
+                "position_id": "entry-husdt",
+                "symbol": symbol,
+                "long_venue": Venue.BYBIT.value,
+                "short_venue": Venue.OKX.value,
+            },
+            long_legs=[{
+                "venue": Venue.BYBIT.value,
+                "order_id": "bybit-close-order",
+                "client_order_id": "bybit-close-cid",
+            }],
+            short_legs=[{
+                "venue": Venue.OKX.value,
+                "order_id": "okx-close-order",
+                "client_order_id": "okx-close-cid",
+            }],
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
     assert [
         record
         for record in records
@@ -2178,6 +2380,55 @@ def test_pending_close_reconciliation_gate_uses_current_flat_truth_when_payload_
 
     allowed, reason = runtime._gate_pending_close_reconciliation(
         SimpleNamespace(symbol="HUSDT", long_venue="binance", short_venue="bybit")
+    )
+
+    assert allowed is True
+    assert reason == ""
+    assert runtime.state.pending_close_reconciliations[0]["archived"] is True
+    assert (
+        runtime.state.pending_close_reconciliations[0]["archive_reason"]
+        == "terminal_flat_accounting_gap"
+    )
+
+
+def test_pending_close_reconciliation_gate_uses_account_level_flat_truth(
+    config,
+    tmp_journal,
+):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-h", symbol="HUSDT")
+    ))
+    runtime._last_recovery_exchange_truth = _account_level_flat_exchange_truth(
+        venues=[Venue.BYBIT, Venue.OKX],
+    )
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "kind": "final",
+        "long_venue": Venue.BYBIT.value,
+        "short_venue": Venue.OKX.value,
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+        "position_snapshot": {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": Venue.BYBIT.value,
+            "short_venue": Venue.OKX.value,
+        },
+        "long_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+    })
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="HUSDT", long_venue="bybit", short_venue="okx")
     )
 
     assert allowed is True
