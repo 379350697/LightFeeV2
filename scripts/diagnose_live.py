@@ -3246,6 +3246,8 @@ def _payload_dict(record: dict[str, Any]) -> dict[str, Any]:
 
 def _is_snapshot_fallback_blocking(payload: dict[str, Any]) -> bool:
     if _snapshot_fallback_blocking_scope(payload):
+        if not _snapshot_fallback_payload_identity_keys(payload):
+            return bool(payload.get("blocked") is True or payload.get("block_reason"))
         return True
     if payload.get("blocked") is True or payload.get("block_reason"):
         return True
@@ -6582,7 +6584,6 @@ def _build_production_acceptance_gate(
 
         if (
             kind == "runtime.snapshot_fallback_last_good"
-            and _is_snapshot_fallback_blocking(payload)
             and _snapshot_fallback_is_current(rec, diagnostic_now_ms)
         ):
             if _snapshot_fallback_resolved_by_entry_quote_truth(
@@ -6590,7 +6591,7 @@ def _build_production_acceptance_gate(
                 snapshot_fallback_quote_resolution_keys,
             ):
                 snapshot_fallback_resolved_by_entry_quote_truth_count += 1
-            else:
+            elif _is_snapshot_fallback_blocking(payload):
                 snapshot_fallback_blocking_count += 1
                 snapshot_fallback_unresolved_current_blocker_count += 1
                 exception_conclusions["snapshot_fallback_blocking"] = (

@@ -2412,6 +2412,71 @@ def test_run_diagnose_acceptance_gate_downgrades_broad_snapshot_after_entry_quot
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_does_not_count_broad_snapshot_scope_as_current_blocker(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "HUSDT",
+                            "candidate_pair_id": "husdt:bitget->aster",
+                            "domain": "quote",
+                            "venue": "bitget",
+                            "source_age_ms": 15000,
+                            "fallback_duration_ms": 11000,
+                            "blocked": True,
+                            "block_reason": "quote_stale",
+                        },
+                        {
+                            "candidate_symbol": "GUAUSDT",
+                            "candidate_pair_id": "guausdt:gate->aster",
+                            "domain": "liquidity",
+                            "venue": "gate",
+                            "source_age_ms": 14000,
+                            "fallback_duration_ms": 11000,
+                            "blocked": True,
+                            "block_reason": "perp_open_interest_below_floor",
+                        },
+                    ],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 0
+        assert gate["snapshot_fallback_unresolved_current_blocker_count"] == 0
+        assert gate["snapshot_fallback_resolved_by_entry_quote_truth_count"] == 0
+        assert "snapshot_fallback_blocking" not in gate["exception_conclusions"]
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_blocks_global_snapshot_fallback_without_scope_evidence(monkeypatch):
     from scripts import diagnose_live as dl
 
