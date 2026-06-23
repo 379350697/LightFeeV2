@@ -2287,9 +2287,6 @@ class LiveRuntime:
             )
             diagnostic_key = (
                 "recovery.live_position_probe_unsupported_symbols",
-                venue.value,
-                endpoint,
-                str(catalog_supported_count),
                 *unsupported_symbols,
             )
             if diagnostic_key in self._unsupported_symbol_diagnostic_seen_keys:
@@ -2313,6 +2310,10 @@ class LiveRuntime:
                     "sample_venue_symbols": [
                         item["venue_symbol"] for item in sample
                     ],
+                    "classification": "catalog_diagnostic",
+                    "close_reconciliation_state": "catalog_diagnostic",
+                    "blocking": False,
+                    "decision": "catalog_diagnostic",
                     "symbol_mapping_samples": [
                         {
                             "symbol": item["symbol"],

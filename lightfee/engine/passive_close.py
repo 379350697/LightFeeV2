@@ -4946,6 +4946,9 @@ class PassiveCloseExecutor:
             "attempt_count": 0,
             "next_attempt_ms": closed_at_ms,
         }
+        exchange_truth = payload.get("exchange_truth")
+        if isinstance(exchange_truth, dict):
+            reconciliation["exchange_truth"] = dict(exchange_truth)
         state.enqueue_pending_close_reconciliation(reconciliation)
         self._journal.append(
             "exit.pending_close_reconciliation_registered",
@@ -5308,6 +5311,8 @@ class PassiveCloseExecutor:
         if extra:
             payload.update(extra)
         payload.update(closure_fields)
+        if isinstance(exchange_truth, dict):
+            payload["exchange_truth"] = dict(exchange_truth)
         missing = object()
         original_pending = state.pending_passive_closes.get(pending.position_id, missing)
         original_open = state.open_positions.get(pending.position_id, missing)

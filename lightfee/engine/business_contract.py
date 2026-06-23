@@ -303,9 +303,13 @@ def close_reconciliation_evidence_contract(
     payload = payload if isinstance(payload, dict) else {}
     if payload.get("evidence_gap") is not True:
         return {}
+    effective_exchange_truth_clean = bool(
+        current_exchange_truth_clean
+        or close_reconciliation_exchange_truth_clean(payload)
+    )
     state_contract = classify_close_reconciliation_state(
         payload,
-        current_exchange_truth_clean=current_exchange_truth_clean,
+        current_exchange_truth_clean=effective_exchange_truth_clean,
     )
     clean = str(state_contract.get("state") or "") == "terminal_flat_accounting_gap"
     action = (
@@ -399,18 +403,114 @@ def classify_close_reconciliation_state(
     return base
 
 
-def close_reconciliation_exchange_truth_clean(
-    reconciliation: dict[str, Any] | None,
+def _close_reconciliation_scope(
+    reconciliation: dict[str, Any],
+) -> tuple[str, set[str]]:
+    snapshot = reconciliation.get("position_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "").upper()
+    venues = {
+        str(value or "").lower()
+        for value in (
+            reconciliation.get("long_venue") or snapshot.get("long_venue"),
+            reconciliation.get("short_venue") or snapshot.get("short_venue"),
+        )
+        if str(value or "")
+    }
+    return symbol, venues
+
+
+def _truth_records_cover_scope(
+    records: Any,
+    *,
+    symbol: str,
+    venues: set[str],
+    quantity_key: str | None = None,
+    open_orders_key: str | None = None,
 ) -> bool:
+    if not isinstance(records, list) or not records:
+        return True
+    scoped: list[dict[str, Any]] = []
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        record_symbol = str(raw.get("symbol") or "").upper()
+        record_venue = str(raw.get("venue") or "").lower()
+        if symbol and record_symbol and record_symbol != symbol:
+            continue
+        if venues and record_venue and record_venue not in venues:
+            continue
+        scoped.append(raw)
+    if not scoped:
+        return False
+    scoped_venues = {
+        str(item.get("venue") or "").lower()
+        for item in scoped
+        if str(item.get("venue") or "")
+    }
+    if venues and scoped_venues and not venues.issubset(scoped_venues):
+        return False
+    if quantity_key is not None:
+        return all(
+            abs(_safe_float(item.get(quantity_key))) <= 1e-9
+            for item in scoped
+        )
+    if open_orders_key is not None:
+        return all(item.get(open_orders_key) is True for item in scoped)
+    return True
+
+
+def close_reconciliation_exchange_truth(
+    reconciliation: dict[str, Any] | None,
+    *,
+    current_exchange_truth: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     item = reconciliation if isinstance(reconciliation, dict) else {}
     original_payload = item.get("original_payload")
     if not isinstance(original_payload, dict):
         original_payload = {}
-    exchange_truth = (
-        item.get("exchange_truth")
-        or original_payload.get("exchange_truth")
+    embedded_truth = item.get("exchange_truth") or original_payload.get(
+        "exchange_truth"
     )
-    return passive_close_has_terminal_truth({"exchange_truth": exchange_truth})
+    if isinstance(embedded_truth, dict) and passive_close_has_terminal_truth(
+        {"exchange_truth": embedded_truth}
+    ):
+        return embedded_truth
+
+    if not isinstance(current_exchange_truth, dict):
+        return None
+    if not passive_close_has_terminal_truth({"exchange_truth": current_exchange_truth}):
+        return None
+    symbol, venues = _close_reconciliation_scope(item)
+    positions = current_exchange_truth.get("positions")
+    if not _truth_records_cover_scope(
+        positions,
+        symbol=symbol,
+        venues=venues,
+        quantity_key="quantity",
+    ):
+        return None
+    open_order_truth = current_exchange_truth.get("open_order_truth")
+    if not _truth_records_cover_scope(
+        open_order_truth,
+        symbol=symbol,
+        venues=venues,
+        open_orders_key="open_orders_empty",
+    ):
+        return None
+    return current_exchange_truth
+
+
+def close_reconciliation_exchange_truth_clean(
+    reconciliation: dict[str, Any] | None,
+    *,
+    current_exchange_truth: dict[str, Any] | None = None,
+) -> bool:
+    return close_reconciliation_exchange_truth(
+        reconciliation,
+        current_exchange_truth=current_exchange_truth,
+    ) is not None
 
 
 def quote_rewarm_handoff_contract(

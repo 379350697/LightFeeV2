@@ -1030,7 +1030,14 @@ class EntryGateRuntime:
                 contract = classify_close_reconciliation_state(
                     rec,
                     current_exchange_truth_clean=(
-                        close_reconciliation_exchange_truth_clean(rec)
+                        close_reconciliation_exchange_truth_clean(
+                            rec,
+                            current_exchange_truth=getattr(
+                                self.ctx,
+                                "_last_recovery_exchange_truth",
+                                None,
+                            ),
+                        )
                     ),
                 )
                 if contract.get("blocks_entry") is False:

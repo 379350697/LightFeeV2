@@ -219,6 +219,30 @@ def test_close_reconciliation_evidence_contract_does_not_trust_terminal_marker_w
     assert result["diagnostic_severity"] == "critical"
 
 
+def test_close_reconciliation_evidence_contract_uses_frozen_exchange_truth_when_current_probe_dirty():
+    result = close_reconciliation_evidence_contract(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "evidence_gap": True,
+            "evidence_gap_reason": "missing_short_close_trade_statement",
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+                "source": "passive_close_final_exchange_truth_gate",
+            },
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["action"] == "terminal_flat_accounting_gap"
+    assert result["terminality"] == "terminal_flat_accounting_gap"
+    assert result["blocks_business_terminal"] is False
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_close_reconciliation_state_releases_terminal_flat_accounting_gap():
     result = classify_close_reconciliation_state(
         {

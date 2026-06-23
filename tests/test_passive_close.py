@@ -3148,6 +3148,81 @@ class TestFallbackResidualReal:
             record["kind"] for record in records
         ]
 
+    def test_live_flat_reconciliation_record_persists_exchange_truth(self):
+        """Pending close backfill must not lose the flat truth that created it."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {},
+            journal,
+            config_overrides={"runtime_mode": "live"},
+        )
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-live-flat-truth-backfill",
+            symbol="HUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.OKX,
+            long_quantity=360.0,
+            short_quantity=360.0,
+            matched_quantity=360.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=360.0,
+            chunk_quantities=[360.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=0.0,
+                average_price=0.0,
+                order_id="bybit-close-order",
+                client_order_id="bybit-close-cid",
+                last_fill_time_ms=3_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=360.0,
+                average_price=0.03731,
+                order_id="okx-close-order",
+                client_order_id="okx-close-cid",
+                last_fill_time_ms=3_010,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        exchange_truth = {
+            "truth_available": True,
+            "positions": [
+                {"venue": "bybit", "symbol": "HUSDT", "quantity": 0.0},
+                {"venue": "okx", "symbol": "HUSDT", "quantity": 0.0},
+            ],
+            "open_orders": [],
+            "open_order_truth": [
+                {"venue": "bybit", "symbol": "HUSDT", "open_orders_empty": True},
+                {"venue": "okx", "symbol": "HUSDT", "open_orders_empty": True},
+            ],
+            "source": "passive_close_live_flat_truth",
+        }
+
+        executor._clear_live_flat_state(
+            state,
+            pending,
+            position,
+            source="pending_passive_close_flat_probe",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+            exchange_truth=exchange_truth,
+        )
+
+        assert len(state.pending_close_reconciliations) == 1
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["exchange_truth"] == exchange_truth
+        assert reconciliation["original_payload"]["exchange_truth"] == exchange_truth
+
     def test_live_final_chunk_flattens_trusted_single_leg_exchange_truth(self):
         """Trusted one-sided final truth is actionable close work, not a wait loop."""
         journal = _open_journal()

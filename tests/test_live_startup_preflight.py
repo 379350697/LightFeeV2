@@ -1304,6 +1304,72 @@ class TestRuntimePreflight:
             assert unsupported[0]["payload"]["unsupported_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_dedupes_unsupported_symbols_across_venues(self):
+        """Catalog diagnostics are symbol-scope, not one blocker per venue fanout."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self, venue: Venue):
+                    super().__init__(venue)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=self.venue,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            bitget = SupportedOnlyAdapter(Venue.BITGET)
+            bybit = SupportedOnlyAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BITGET: bitget, Venue.BYBIT: bybit},
+            )
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "DELISTEDUSDT", "OLDUSDT"]
+                )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            unsupported = [
+                r for r in records
+                if r["kind"] == "recovery.live_position_probe_unsupported_symbols"
+            ]
+            assert bitget.fetch_position_symbols == ["BTCUSDT"]
+            assert bybit.fetch_position_symbols == ["BTCUSDT"]
+            assert len(unsupported) == 1
+            assert unsupported[0]["payload"]["classification"] == "catalog_diagnostic"
+            assert unsupported[0]["payload"]["skipped_by_catalog"] == [
+                "DELISTEDUSDT",
+                "OLDUSDT",
+            ]
+            assert not any(
+                r["kind"] == "recovery.live_position_probe_error"
+                and r["payload"].get("decision")
+                == "truth_unavailable_for_required_recovery"
+                for r in records
+            )
+
+    @pytest.mark.asyncio
     async def test_live_position_fallback_probe_dedupes_same_unsupported_set_after_rate_window(
         self,
         monkeypatch,
