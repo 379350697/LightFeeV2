@@ -3237,6 +3237,8 @@ def _build_order_reconcile_identifier_summary(
 # production acceptance gate
 # ---------------------------------------------------------------------------
 
+_SNAPSHOT_FALLBACK_CURRENT_TTL_MS = 60_000
+
 def _payload_dict(record: dict[str, Any]) -> dict[str, Any]:
     payload = record.get("payload", {})
     return payload if isinstance(payload, dict) else {}
@@ -3324,6 +3326,19 @@ def _snapshot_fallback_resolved_by_entry_quote_truth(
     if not resolution_keys:
         return False
     return bool(_snapshot_fallback_identity_keys(payload) & resolution_keys)
+
+
+def _snapshot_fallback_is_current(
+    record: dict[str, Any],
+    now_ms: int,
+) -> bool:
+    try:
+        ts_ms = int(record.get("ts_ms", 0) or 0)
+    except (TypeError, ValueError):
+        ts_ms = 0
+    if ts_ms <= 0 or now_ms <= 0:
+        return True
+    return max(now_ms - ts_ms, 0) <= _SNAPSHOT_FALLBACK_CURRENT_TTL_MS
 
 
 def _snapshot_fallback_exception_conclusion(payload: dict[str, Any]) -> str:
@@ -6347,6 +6362,7 @@ def _build_production_acceptance_gate(
     local_state: dict[str, Any],
     exchange_truth: dict[str, Any],
     state_consistency: dict[str, Any] | None = None,
+    now_ms: int = 0,
 ) -> dict[str, Any]:
     fill_ratios: list[float] = []
     passive_maker_zero_fill_count = 0
@@ -6380,6 +6396,7 @@ def _build_production_acceptance_gate(
     )
     local_l2_residual_runtime_enabled_count = 0
     snapshot_fallback_quote_resolution_keys = _snapshot_fallback_resolution_keys(events)
+    diagnostic_now_ms = now_ms or _now_ms()
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -6556,7 +6573,11 @@ def _build_production_acceptance_gate(
         ):
             local_l2_residual_runtime_enabled_count += 1
 
-        if kind == "runtime.snapshot_fallback_last_good" and _is_snapshot_fallback_blocking(payload):
+        if (
+            kind == "runtime.snapshot_fallback_last_good"
+            and _is_snapshot_fallback_blocking(payload)
+            and _snapshot_fallback_is_current(rec, diagnostic_now_ms)
+        ):
             if _snapshot_fallback_resolved_by_entry_quote_truth(
                 payload,
                 snapshot_fallback_quote_resolution_keys,
@@ -7675,7 +7696,11 @@ def run_diagnose(
     snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
     production_acceptance_gate = _build_production_acceptance_gate(
-        all_events, local_state, exchange_truth, state_consistency,
+        all_events,
+        local_state,
+        exchange_truth,
+        state_consistency,
+        generated_at_ms,
     )
     business_progression_quality_summary = (
         _build_business_progression_quality_summary(

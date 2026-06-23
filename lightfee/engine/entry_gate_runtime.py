@@ -33,6 +33,11 @@ _ENTRY_ADMISSION_EVIDENCE_FIELDS = (
     "order_role",
 )
 
+_ASTER_REMAINING_OPENABLE_DOC_URL = (
+    "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
+    "#remaining-openable-notional-value-user_data"
+)
+
 
 def _copy_entry_admission_evidence_fields(
     target: dict[str, Any],
@@ -49,6 +54,36 @@ def _first_sample_value(samples: list[dict[str, Any]], key: str) -> Any:
         if value is not None and value != "":
             return value
     return None
+
+
+def _normalize_aster_max_notional_evidence(payload: dict[str, Any]) -> None:
+    venue = str(payload.get("venue") or "").lower()
+    reason = str(payload.get("reason") or "")
+    if venue != Venue.ASTER.value or reason != "max_notional_admission_blocked":
+        return
+
+    missing_fields = [
+        field
+        for field in (
+            "requested_notional",
+            "remaining_openable_notional",
+            "notional_gap",
+            "leverage",
+        )
+        if payload.get(field) is None or payload.get(field) == ""
+    ]
+    if not missing_fields:
+        return
+
+    payload["evidence_gap"] = True
+    payload.setdefault("headroom_source", "legacy_cooldown_missing_headroom")
+    payload.setdefault(
+        "headroom_error",
+        "missing "
+        + "/".join(missing_fields)
+        + " on persisted Aster max_notional admission cooldown",
+    )
+    payload.setdefault("official_doc_url", _ASTER_REMAINING_OPENABLE_DOC_URL)
 
 
 class EntryGateRuntime:
@@ -708,6 +743,7 @@ class EntryGateRuntime:
             route_payload.setdefault("evidence_gap", False)
             route_payload.setdefault("candidate_pair_id", candidate_pair_id)
             route_payload.setdefault("pair_id", candidate_pair_id)
+            _normalize_aster_max_notional_evidence(route_payload)
             return route_payload
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
@@ -769,6 +805,7 @@ class EntryGateRuntime:
                     payload.setdefault("evidence_gap", True)
                     payload.setdefault("candidate_pair_id", candidate_pair_id)
                     payload.setdefault("pair_id", candidate_pair_id)
+                    _normalize_aster_max_notional_evidence(payload)
                     return payload
                 return {
                     "venue": venue.value,
@@ -807,6 +844,8 @@ class EntryGateRuntime:
         evidence_gap_values: set[bool] = set()
         for candidate in candidates:
             block = self._candidate_admission_block(candidate, now_ms)
+            if block:
+                _normalize_aster_max_notional_evidence(block)
             reason = str(block.get("reason") or "venue_admission_blocked") if block else ""
             block_scope = str(block.get("block_scope") or "symbol") if block else ""
             if not block or not entry_admission_blocks_candidate(reason, block_scope):

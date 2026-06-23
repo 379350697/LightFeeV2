@@ -1694,3 +1694,50 @@ def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
             assert degraded_payload["samples"][0]["symbol"] == "LABUSDT"
         finally:
             runtime.journal.close()
+
+
+def test_legacy_aster_venue_cooldown_without_headroom_becomes_evidence_gap():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        try:
+            runtime.state.venue_entry_cooldowns["aster:*"] = {
+                "venue": "aster",
+                "symbol": "*",
+                "blocked_symbol": "ESPORTSUSDT",
+                "reason": "max_notional_admission_blocked",
+                "raw_error": "max_notional_admission_blocked",
+                "blocked_until_ms": 1778787600000,
+                "ttl_ms": 21_600_000,
+                "official_doc_url": "https://www.asterdex.com/",
+                "evidence_gap": False,
+                "block_scope": "venue",
+                "source": "pre_entry_aster_precheck",
+            }
+            blocked = _candidate("LABUSDT", "binance", "aster")
+
+            filtered = runtime._filter_candidates_by_entry_admission(
+                [blocked],
+                now_ms=1778787000000,
+                stage="candidate_prefilter",
+            )
+
+            assert filtered == []
+            sample = runtime._last_entry_admission_filter_samples[0]
+            assert sample["evidence_gap"] is True
+            assert sample["headroom_source"] == "legacy_cooldown_missing_headroom"
+            assert "requested_notional" in sample["headroom_error"]
+            degraded_payload = [
+                record["payload"]
+                for record in runtime.journal.read_all()
+                if record["kind"] == "runtime.entry_admission_venue_degraded"
+            ][-1]
+            assert degraded_payload["evidence_gap"] is True
+            assert (
+                degraded_payload["headroom_source"]
+                == "legacy_cooldown_missing_headroom"
+            )
+            assert "remaining_openable_notional" in degraded_payload["headroom_error"]
+            assert degraded_payload["samples"][0]["evidence_gap"] is True
+        finally:
+            runtime.journal.close()

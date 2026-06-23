@@ -2384,6 +2384,63 @@ def test_run_diagnose_acceptance_gate_blocks_global_snapshot_fallback_without_sc
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_does_not_count_aged_snapshot_fallback_as_current(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816200000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "symbol": "BULLAUSDT",
+                    "candidate_pair_id": "bulla:bybit->aster",
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "BULLAUSDT",
+                            "candidate_pair_id": "bulla:bybit->aster",
+                            "domain": "quote",
+                            "venue": "bybit",
+                            "source_age_ms": 60000,
+                            "fallback_duration_ms": 55000,
+                            "blocked": True,
+                            "block_reason": "quote_stale",
+                        }
+                    ],
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="BULLAUSDT",
+            venues=["bybit", "aster"],
+            now_ms=1779816200000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 0
+        assert gate["snapshot_fallback_unresolved_current_blocker_count"] == 0
+        assert "snapshot_fallback_blocking" not in gate["exception_conclusions"]
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_blocks_unhedged_open_events(monkeypatch):
     from scripts import diagnose_live as dl
 
