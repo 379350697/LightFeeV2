@@ -1304,6 +1304,81 @@ class TestRuntimePreflight:
             assert unsupported[0]["payload"]["unsupported_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_dedupes_same_unsupported_set_after_rate_window(
+        self,
+        monkeypatch,
+    ):
+        """Same unsupported symbol set should not re-emit after time-only changes."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+                    self.fetch_position_symbols: list[str] = []
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    self.fetch_position_symbols.append(symbol)
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            now_ms = 1_780_000_000_000
+            monkeypatch.setattr(
+                "lightfee.engine.runtime.wall_clock_now_ms",
+                lambda: now_ms,
+            )
+            bitget = SupportedOnlyAdapter()
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "DELISTEDUSDT", "OLDUSDT"]
+                )
+                now_ms += runtime._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS + 1
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "DELISTEDUSDT", "OLDUSDT"]
+                )
+                now_ms += runtime._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS + 1
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", "DELISTEDUSDT", "NEWUSDT", "OLDUSDT"]
+                )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            unsupported = [
+                r for r in records
+                if r["kind"] == "recovery.live_position_probe_unsupported_symbols"
+            ]
+            assert bitget.fetch_position_symbols == ["BTCUSDT", "BTCUSDT", "BTCUSDT"]
+            assert len(unsupported) == 2
+            assert unsupported[0]["payload"]["skipped_by_catalog"] == [
+                "DELISTEDUSDT",
+                "OLDUSDT",
+            ]
+            assert unsupported[1]["payload"]["skipped_by_catalog"] == [
+                "DELISTEDUSDT",
+                "NEWUSDT",
+                "OLDUSDT",
+            ]
+
+    @pytest.mark.asyncio
     async def test_live_position_probe_catalog_unavailable_is_journaled(self):
         """If the catalog cannot load, keep fallback behavior but record why."""
         with tempfile.TemporaryDirectory() as td:
@@ -3133,6 +3208,77 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            runtime.journal.close()
+
+    def test_required_truth_timeout_blocker_clears_after_clean_truth(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.state.pending_entries["entry-timeout"] = {
+                "pending_id": "entry-timeout",
+                "symbol": "TRXUSDT",
+                "long_venue": "bybit",
+                "short_venue": "okx",
+            }
+
+            blocked_ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": False,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [
+                        {
+                            "venue": "okx",
+                            "symbol": "TRXUSDT",
+                            "endpoint": "fetch_position",
+                            "classification": "timeout",
+                            "error": "position truth timed out",
+                        }
+                    ],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert any(item.blocking for item in blocked_ledger.work_items)
+            assert runtime.recovery_decision is not None
+            assert (
+                runtime.recovery_decision.kind
+                == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
+            )
+            assert runtime.state.recovery_blocked_reason == (
+                "truth_unavailable_for_required_recovery"
+            )
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+
+            runtime.state.pending_entries.clear()
+            clean_ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                now_ms=1778787001000,
+            )
+
+            assert not any(item.blocking for item in clean_ledger.work_items)
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "recovery.ledger_blocked"
+                and event["payload"]["reason"]
+                == "truth_unavailable_for_required_recovery"
+                for event in events
+            )
+            clears = [
+                event for event in events
+                if event["kind"] == "recovery.ledger_clear"
+            ]
+            assert clears[-1]["payload"]["reason"] == "core_running_clean"
             runtime.journal.close()
 
     def test_complete_flat_truth_clears_previous_live_artifact_blocker(self):

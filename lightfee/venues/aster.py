@@ -92,6 +92,15 @@ class AsterAdapter(VenueAdapter):
             f"aster private API disabled: {reason}",
         )
 
+    def _remaining_openable_provider(self):
+        private = self._private
+        if private is None:
+            return None
+        provider = getattr(private, "fetch_remaining_openable_notional", None)
+        if callable(provider):
+            return provider
+        return None
+
     async def ensure_supported_symbols_loaded(self) -> None:
         """Populate the Aster contract catalog with actively trading symbols."""
         if self._transport._symbol_metadata:
@@ -183,9 +192,7 @@ class AsterAdapter(VenueAdapter):
                 headroom_price,
                 order_role="maker" if request.post_only else "hedge",
                 source="aster_headroom_pre_entry_precheck",
-                remaining_openable_provider=(
-                    self._private.fetch_remaining_openable_notional
-                ),
+                remaining_openable_provider=self._remaining_openable_provider(),
             )
         )
         result = dict(preflight)
@@ -277,11 +284,7 @@ class AsterAdapter(VenueAdapter):
                 headroom_price,
                 order_role="maker" if request.post_only else "hedge",
                 source="aster_headroom_precheck",
-                remaining_openable_provider=(
-                    self._private.fetch_remaining_openable_notional
-                    if self._private is not None
-                    else None
-                ),
+                remaining_openable_provider=self._remaining_openable_provider(),
             )
         )
         attempt_payload = dict(preflight)

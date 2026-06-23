@@ -13,7 +13,11 @@ from typing import Any
 
 from lightfee.core.domain import OrderFillProbeStatus, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
-from lightfee.engine.business_contract import close_reconciliation_evidence_fields
+from lightfee.engine.business_contract import (
+    classify_close_reconciliation_state,
+    close_reconciliation_exchange_truth_clean,
+    close_reconciliation_evidence_fields,
+)
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
@@ -573,6 +577,7 @@ class CloseRuntime:
             self._RECONCILE_RETRY_MAX_MS,
         )
         reconciliation["next_attempt_ms"] = now_ms + delay
+
     def _exit_reconciled_payload_from_leg_fills(
         self,
         reconciliation: dict[str, Any],
@@ -849,9 +854,17 @@ class CloseRuntime:
         retained: list[Any] = []
         eligible: list[dict[str, Any]] = []
         current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
+        changed = False
         for reconciliation in list(pending_reconciliations):
             if not isinstance(reconciliation, dict):
                 retained.append(reconciliation)
+                continue
+            if (
+                reconciliation.get("archived") is True
+                and str(reconciliation.get("archive_reason") or "")
+                == "terminal_flat_accounting_gap"
+            ):
+                changed = True
                 continue
             created_cycle = int(reconciliation.get("created_cycle") or 0)
             if current_cycle != 0 and created_cycle >= current_cycle:
@@ -862,7 +875,6 @@ class CloseRuntime:
                 continue
             eligible.append(reconciliation)
 
-        changed = False
         for reconciliation in sorted(
             eligible,
             key=lambda item: (
@@ -960,11 +972,32 @@ class CloseRuntime:
                         "",
                     )
                     reconciliation["last_partial_reconciled_at_ms"] = now_ms
-                    self._call_apply_pending_close_reconciliation_backoff(
+                    contract = classify_close_reconciliation_state(
                         reconciliation,
-                        now_ms,
+                        current_exchange_truth_clean=(
+                            close_reconciliation_exchange_truth_clean(reconciliation)
+                        ),
                     )
-                    retained.append(reconciliation)
+                    reconciliation["close_reconciliation_state"] = str(
+                        contract.get("state") or ""
+                    )
+                    archive_reconciliation = bool(
+                        contract.get("archive_reconciliation") is True
+                    )
+                    if archive_reconciliation:
+                        reconciliation["archived"] = True
+                        reconciliation["archive_reason"] = str(
+                            contract.get("state") or ""
+                        )
+                        reconciliation["business_contract_action"] = str(
+                            contract.get("state") or ""
+                        )
+                    else:
+                        self._call_apply_pending_close_reconciliation_backoff(
+                            reconciliation,
+                            now_ms,
+                        )
+                        retained.append(reconciliation)
                     self.ctx.journal.append(
                         "reconciliation.pending_close_backfill_retained",
                         {
@@ -981,6 +1014,10 @@ class CloseRuntime:
                                 "source",
                                 "pending_close_reconciliation",
                             ),
+                            "close_reconciliation_state": str(
+                                contract.get("state") or ""
+                            ),
+                            "archive_reconciliation": archive_reconciliation,
                         },
                     )
                 changed = True

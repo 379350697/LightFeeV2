@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from lightfee.core.domain import OrderFill, Side, Venue
+from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
 from lightfee.persistence.journal import Journal
 from tests.fake_adapters import FakeVenueAdapter
 from lightfee.engine.entry import (
@@ -186,6 +186,35 @@ class TestEntrySyncExecutorConstruction:
 
 
 class TestEntrySyncMakerReject:
+    @pytest.mark.asyncio
+    async def test_missing_adapter_rejects_without_secondary_error(self, journal):
+        executor = EntrySyncExecutor(adapters={}, journal=journal)
+        request = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            price=50000.0,
+            client_order_id="missing-adapter-cid",
+        )
+
+        result = await executor._submit_order(
+            request,
+            "entry-missing-adapter",
+            "maker",
+            1_700_000_000_000,
+        )
+
+        assert result == {
+            "outcome": "rejected",
+            "fill": None,
+            "order_id": "",
+            "reason": "no adapter for binance",
+        }
+        records = journal.read_all()
+        assert records[-1]["kind"] == "order.rejected"
+        assert records[-1]["payload"]["reason"] == "no adapter for binance"
+
     @pytest.mark.asyncio
     async def test_maker_reject_fails_entry_without_hedge_submit(self, adapters, journal, btc_context):
         binance_ada = adapters[Venue.BINANCE]

@@ -9,7 +9,7 @@ import math
 import sys
 from collections import Counter
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
@@ -90,6 +90,10 @@ from lightfee.engine.v1_lifecycle_closure import (
     closure_event_fields,
     entry_gate_from_closure,
 )
+
+if TYPE_CHECKING:
+    from lightfee.engine.entry_sync import HedgeDriveResult
+
 from lightfee.engine.pending_entry_lifecycle import (
     advance_pending_entry_zero_fill_phase,
     apply_pending_entry_passive_progress,
@@ -186,6 +190,9 @@ class LiveRuntime:
             filter_symbols_supported_by_venue=self._filter_symbols_supported_by_venue,
             unsupported_symbol_diagnostic_last_ms=(
                 self._unsupported_symbol_diagnostic_last_ms
+            ),
+            unsupported_symbol_diagnostic_seen_keys=(
+                self._unsupported_symbol_diagnostic_seen_keys
             ),
         )
 
@@ -326,7 +333,8 @@ class LiveRuntime:
         self._runtime_diagnostic_event_last_emit_ms: dict[tuple[str, ...], int] = {}
         self._runtime_diagnostic_event_suppressed: Counter[tuple[str, ...]] = Counter()
         self._last_private_position_probe_ms: int = 0
-        self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, str], int] = {}
+        self._unsupported_symbol_diagnostic_last_ms: dict[tuple[str, ...], int] = {}
+        self._unsupported_symbol_diagnostic_seen_keys: set[tuple[str, ...]] = set()
         self._last_position_drift_check_ms: int = 0
         self._symbol_admission_blocked_until_ms: dict[tuple[str, str], int] = {}
 
@@ -2274,16 +2282,19 @@ class LiveRuntime:
             and getattr(self.journal, "_file", None) is not None
         ):
             now_ms = wall_clock_now_ms()
+            unsupported_symbols = tuple(
+                sorted({str(item["symbol"]) for item in unsupported})
+            )
             diagnostic_key = (
                 "recovery.live_position_probe_unsupported_symbols",
                 venue.value,
+                endpoint,
+                str(catalog_supported_count),
+                *unsupported_symbols,
             )
-            last_ms = self._unsupported_symbol_diagnostic_last_ms.get(diagnostic_key, 0)
-            if (
-                last_ms > 0
-                and now_ms < last_ms + self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS
-            ):
+            if diagnostic_key in self._unsupported_symbol_diagnostic_seen_keys:
                 return filtered
+            self._unsupported_symbol_diagnostic_seen_keys.add(diagnostic_key)
             self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
             sample = unsupported[:10]
             self.journal.append(
@@ -7417,6 +7428,15 @@ class LiveRuntime:
             reason,
         )
         if abort_gate.get("decision") == "retain_pending":
+            truth_gate_decision = str(abort_gate.get("truth_gate_decision") or "")
+            if truth_gate_decision == "retain_pending_live_open_order_truth":
+                await self._ensure_pending_entry_maker_not_open_before_abort(
+                    pending,
+                    entry_id,
+                    reason,
+                )
+            enter_fail_closed(self.state)
+            self.state.last_error = reason
             pending.uncertain_outcome = True
             pending.reconcile_next_attempt_ms = max(
                 int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
@@ -8438,7 +8458,7 @@ class LiveRuntime:
 
             # --- Step 1: Query venue for order status (resolve uncertain outcomes) ---
             if pending.uncertain_outcome:
-                await self._recover_poll_order_status(entry_id, pending)
+                await self._recover_poll_order_status(entry_id, pending, now_ms)
 
             # Re-check after order status poll: if no longer startup_recovery_ready, skip
             if not pending.startup_recovery_ready():
@@ -8448,7 +8468,10 @@ class LiveRuntime:
             # V1: hydrate_pending_entry_from_live_balanced_exposure —
             # fetches live positions from both venues; if there's already balanced
             # exposure, applies fills and may finalize.
-            hydrated = await self._recover_hydrate_from_live_positions(pending)
+            hydrated = await self._recover_hydrate_from_live_positions(
+                pending,
+                now_ms,
+            )
             if hydrated:
                 self.journal.append(
                     "recovery.pending_entry_live_balance_hydrated",
@@ -8662,13 +8685,19 @@ class LiveRuntime:
         # --- Post-recovery lifecycle transition ---
         self._finalize_startup_recovery()
 
-    async def _recover_poll_order_status(self, entry_id: str, pending) -> None:
+    async def _recover_poll_order_status(
+        self,
+        entry_id: str,
+        pending,
+        now_ms: int | None = None,
+    ) -> None:
         """Query each venue for its respective order status.
 
         V1: queries maker venue with maker_order_id and hedge venue with
         hedge_order_id independently, rather than using a fallback chain
         that shadows the hedge order when a maker order exists.
         """
+        now_ms = wall_clock_now_ms() if now_ms is None else now_ms
         # Query maker venue with maker passive order identity.
         order_id, client_order_id = self._pending_entry_maker_order_identifiers(pending)
         if order_id or client_order_id:
@@ -8822,7 +8851,11 @@ class LiveRuntime:
                 except Exception:
                     pass
 
-    async def _recover_hydrate_from_live_positions(self, pending) -> bool:
+    async def _recover_hydrate_from_live_positions(
+        self,
+        pending,
+        now_ms: int | None = None,
+    ) -> bool:
         """Try to hydrate pending entry from live exchange positions.
 
         V1: hydrate_pending_entry_from_live_balanced_exposure() —
@@ -8833,6 +8866,7 @@ class LiveRuntime:
         still fill). We approximate this by checking for an active hedge
         order id with uncertain outcome.
         """
+        now_ms = wall_clock_now_ms() if now_ms is None else now_ms
         # V1: skip hydration while a hedge is actively inflight. A restored
         # hedge order id alone is not active-order evidence; live/open-order
         # truth below decides whether it is safe to hydrate.

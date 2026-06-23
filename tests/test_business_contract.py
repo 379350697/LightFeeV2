@@ -4,6 +4,7 @@ import pytest
 
 from lightfee.engine.business_contract import (
     classify_business_event_kind,
+    classify_close_reconciliation_state,
     classify_entry_quantity_contract,
     classify_noise_visibility,
     close_reconciliation_evidence_contract,
@@ -198,6 +199,95 @@ def test_close_reconciliation_evidence_contract_blocks_unclean_gap():
     assert result["terminality"] == "unresolved_close_accounting_gap"
     assert result["blocks_business_terminal"] is True
     assert result["diagnostic_severity"] == "critical"
+
+
+def test_close_reconciliation_evidence_contract_does_not_trust_terminal_marker_without_truth():
+    result = close_reconciliation_evidence_contract(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "evidence_gap": True,
+            "evidence_gap_reason": "missing_short_close_trade_statement",
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["action"] == "unresolved_close_accounting_gap"
+    assert result["terminality"] == "unresolved_close_accounting_gap"
+    assert result["blocks_business_terminal"] is True
+    assert result["diagnostic_severity"] == "critical"
+
+
+def test_close_reconciliation_state_releases_terminal_flat_accounting_gap():
+    result = classify_close_reconciliation_state(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": "binance",
+            "short_venue": "bybit",
+            "pending_backfill": True,
+            "last_evidence_gap_reason": "missing_short_close_trade_statement",
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["state"] == "terminal_flat_accounting_gap"
+    assert result["blocks_entry"] is False
+    assert result["archive_reconciliation"] is True
+    assert result["reason"] == "missing_short_close_trade_statement"
+
+
+def test_close_reconciliation_state_blocks_when_truth_unavailable():
+    result = classify_close_reconciliation_state(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": "binance",
+            "short_venue": "bybit",
+            "pending_backfill": True,
+            "last_evidence_gap_reason": "missing_short_close_trade_statement",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["state"] == "truth_unavailable"
+    assert result["blocks_entry"] is True
+    assert result["archive_reconciliation"] is False
+
+
+def test_close_reconciliation_state_does_not_trust_terminal_marker_without_truth():
+    result = classify_close_reconciliation_state(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "pending_backfill": True,
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "last_evidence_gap_reason": "missing_short_close_trade_statement",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["state"] == "truth_unavailable"
+    assert result["blocks_entry"] is True
+    assert result["archive_reconciliation"] is False
+
+
+def test_close_reconciliation_state_catalog_diagnostic_never_becomes_truth_blocker():
+    result = classify_close_reconciliation_state(
+        {
+            "symbol": "HOMEUSDT",
+            "evidence_gap": True,
+            "close_reconciliation_state": "catalog_diagnostic",
+            "reason": "unsupported_symbol_probe_filtered",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["state"] == "catalog_diagnostic"
+    assert result["blocks_entry"] is False
+    assert result["archive_reconciliation"] is True
+    assert result["reason"] == "unsupported_symbol_probe_filtered"
 
 
 def test_noise_visibility_classifies_resolved_close_artifact_as_historical():

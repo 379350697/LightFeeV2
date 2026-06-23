@@ -1144,6 +1144,100 @@ async def test_pending_close_reconciliation_backfill_emits_only_delta_across_ret
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "HUSDT",
+        "CLOUSDT",
+        "TNSRUSDT",
+        "IDUSDT",
+        "CATIUSDT",
+        "HOMEUSDT",
+        "FOLKSUSDT",
+    ],
+)
+async def test_pending_close_reconciliation_archives_terminal_flat_backfill(
+    config,
+    tmp_journal,
+    symbol,
+):
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.BINANCE, {
+        ("binance-close-order", "binance-close-cid"): OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol=symbol,
+            side=Side.SELL,
+            quantity=10.0,
+            average_price=1.0100,
+            order_id="binance-close-order",
+            client_order_id="binance-close-cid",
+            fee_quote=0.01,
+            filled_at_ms=2000,
+        ),
+    })
+    short_adapter = _CloseLegMissingStatementAdapter(Venue.BYBIT, {})
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.BINANCE: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-h", symbol=symbol)
+    )
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(
+            position_id="entry-h",
+            symbol=symbol,
+            created_cycle=1,
+            long_venue=Venue.BINANCE.value,
+            short_venue=Venue.BYBIT.value,
+            position_snapshot={
+                "position_id": "entry-h",
+                "symbol": symbol,
+                "long_venue": Venue.BINANCE.value,
+                "short_venue": Venue.BYBIT.value,
+                "long_entry_price": 1.0,
+                "short_entry_price": 1.03,
+            },
+            long_legs=[{
+                "venue": Venue.BINANCE.value,
+                "order_id": "binance-close-order",
+                "client_order_id": "binance-close-cid",
+            }],
+            short_legs=[{
+                "venue": Venue.BYBIT.value,
+                "order_id": "bybit-close-order",
+                "client_order_id": "bybit-close-cid",
+            }],
+            original_payload={
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                    "source": "passive_close_final_exchange_truth_gate",
+                },
+            },
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+    await runtime._reconcile_pending_state(now_ms=4000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    retained = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ]
+    assert len(retained) == 1
+    assert retained[0]["symbol"] == symbol
+    assert retained[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert retained[0]["archive_reconciliation"] is True
+
+
+@pytest.mark.asyncio
 async def test_pending_close_reconciliation_is_live_only(config, tmp_journal):
     long_adapter = _CloseLegFillAdapter(Venue.OKX, {
         ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
@@ -1641,6 +1735,104 @@ def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_jou
     assert reason == "pending_close_reconciliation_conflict"
     assert reversed_allowed is False
     assert reversed_reason == "pending_close_reconciliation_conflict"
+
+
+def test_pending_close_reconciliation_gate_releases_terminal_flat_accounting_gap(
+    config,
+    tmp_journal,
+):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-h", symbol="HUSDT")
+    ))
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "kind": "final",
+        "long_venue": Venue.BINANCE.value,
+        "short_venue": Venue.BYBIT.value,
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_short_close_trade_statement",
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "original_payload": {
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+                "source": "passive_close_final_exchange_truth_gate",
+            },
+        },
+        "position_snapshot": {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": Venue.BINANCE.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "binance-close-order",
+            "client_order_id": "binance-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    })
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="HUSDT", long_venue="binance", short_venue="bybit")
+    )
+
+    assert allowed is True
+    assert reason == ""
+    assert runtime.state.pending_close_reconciliations[0]["archived"] is True
+    assert (
+        runtime.state.pending_close_reconciliations[0]["archive_reason"]
+        == "terminal_flat_accounting_gap"
+    )
+
+
+def test_pending_close_reconciliation_gate_blocks_terminal_marker_without_truth(
+    config,
+    tmp_journal,
+):
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="entry-h", symbol="HUSDT")
+    ))
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "kind": "final",
+        "long_venue": Venue.BINANCE.value,
+        "short_venue": Venue.BYBIT.value,
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_short_close_trade_statement",
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "position_snapshot": {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": Venue.BINANCE.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "binance-close-order",
+            "client_order_id": "binance-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    })
+
+    allowed, reason = runtime._gate_pending_close_reconciliation(
+        SimpleNamespace(symbol="HUSDT", long_venue="binance", short_venue="bybit")
+    )
+
+    assert allowed is False
+    assert reason == "pending_close_reconciliation_conflict"
+    assert "archived" not in runtime.state.pending_close_reconciliations[0]
 
 
 def test_pending_close_reconciliation_gate_normalizes_dict_shaped_queue(config, tmp_journal):

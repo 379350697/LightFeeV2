@@ -649,6 +649,7 @@ class EntrySyncExecutor:
         adapter = self.adapters.get(request.venue)
         is_maker = (leg == "maker")
         if adapter is None:
+            reason = f"no adapter for {request.venue.value}"
             self.journal.append(
                 "order.rejected",
                 {
@@ -657,7 +658,7 @@ class EntrySyncExecutor:
                     "leg": leg,
                     "venue": request.venue.value,
                     "symbol": request.symbol,
-                    "reason": f"no adapter for {request.venue.value}",
+                    "reason": reason,
                     "client_order_id": request.client_order_id,
                     "is_maker": is_maker,
                 },
@@ -666,7 +667,7 @@ class EntrySyncExecutor:
                 "outcome": "rejected",
                 "fill": None,
                 "order_id": "",
-                "reason": str(e),
+                "reason": reason,
             }
 
         # V2: post_only maker orders go through passive submit (ACK, not fill)

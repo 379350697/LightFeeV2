@@ -6,10 +6,13 @@ Do not change passive maker business conditions while extracting it.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lightfee.core.domain import Side
 from lightfee.engine.runtime_context import PassiveMakerRuntimeContext
+
+if TYPE_CHECKING:
+    from lightfee.engine.entry_sync import HedgeDriveResult
 
 
 class PassiveMakerRuntime:

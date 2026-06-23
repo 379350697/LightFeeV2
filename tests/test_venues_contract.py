@@ -372,6 +372,24 @@ class TestFixtureDrivenOrderSuccess:
                 "lightfee.venues.transport.get_symbol_rules_cache",
                 lambda: FakeRulesCache(),
             )
+        if venue_id == Venue.ASTER:
+            from lightfee.venues.symbol_rules import SymbolRule
+
+            class FakeRulesCache:
+                async def get(self, transport, venue, venue_symbol):
+                    assert venue == Venue.ASTER
+                    return SymbolRule(
+                        tick_size=0.01,
+                        qty_step=0.001,
+                        min_qty=0.001,
+                        min_notional=5.0,
+                        rule_source="exchangeInfo",
+                    )
+
+            monkeypatch.setattr(
+                "lightfee.venues.transport.get_symbol_rules_cache",
+                lambda: FakeRulesCache(),
+            )
 
         try:
             req = OrderRequest(
@@ -559,6 +577,11 @@ class TestAsterOrderRequestShape:
 
             async def close(self):
                 return None
+
+            async def fetch_remaining_openable_notional(self, symbol: str, leverage: int):
+                assert symbol == "HUSDT"
+                assert leverage > 0
+                return 1_000_000.0
 
         monkeypatch.setattr(
             "lightfee.venues.transport.get_symbol_rules_cache",

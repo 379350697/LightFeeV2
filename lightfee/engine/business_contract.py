@@ -303,7 +303,11 @@ def close_reconciliation_evidence_contract(
     payload = payload if isinstance(payload, dict) else {}
     if payload.get("evidence_gap") is not True:
         return {}
-    clean = bool(current_exchange_truth_clean)
+    state_contract = classify_close_reconciliation_state(
+        payload,
+        current_exchange_truth_clean=current_exchange_truth_clean,
+    )
+    clean = str(state_contract.get("state") or "") == "terminal_flat_accounting_gap"
     action = (
         "terminal_flat_accounting_gap"
         if clean
@@ -314,13 +318,99 @@ def close_reconciliation_evidence_contract(
         "terminality": action,
         "action": action,
         "action_taken": action,
-        "blocks_business_terminal": not clean,
+        "blocks_business_terminal": bool(state_contract.get("blocks_entry") is True),
         "diagnostic_severity": "info" if clean else "critical",
         "owner_id": str(payload.get("position_id") or payload.get("entry_id") or ""),
         "symbol": str(payload.get("symbol") or ""),
         "reason": str(payload.get("evidence_gap_reason") or "unknown"),
         "statement_probe_status": str(payload.get("statement_probe_status") or ""),
     }
+
+
+def classify_close_reconciliation_state(
+    reconciliation: dict[str, Any] | None,
+    *,
+    current_exchange_truth_clean: bool,
+) -> dict[str, Any]:
+    """Classify pending-close reconciliation work with the shared risk contract."""
+    item = reconciliation if isinstance(reconciliation, dict) else {}
+    marker = str(
+        item.get("close_reconciliation_state")
+        or item.get("business_contract_action")
+        or item.get("terminality")
+        or item.get("action")
+        or ""
+    )
+    reason = str(
+        item.get("last_evidence_gap_reason")
+        or item.get("evidence_gap_reason")
+        or item.get("reason")
+        or ""
+    )
+    base = {
+        "state": "active_close_work",
+        "blocks_entry": True,
+        "archive_reconciliation": False,
+        "reason": reason,
+        "owner_id": str(item.get("position_id") or item.get("entry_id") or ""),
+        "symbol": str(item.get("symbol") or "").upper(),
+    }
+    has_accounting_gap = (
+        bool(item.get("pending_backfill"))
+        or item.get("evidence_gap") is True
+    )
+
+    if marker == "catalog_diagnostic":
+        return {
+            **base,
+            "state": "catalog_diagnostic",
+            "blocks_entry": False,
+            "archive_reconciliation": True,
+            "reason": reason or "catalog_diagnostic",
+        }
+
+    if has_accounting_gap and bool(current_exchange_truth_clean):
+        return {
+            **base,
+            "state": "terminal_flat_accounting_gap",
+            "blocks_entry": False,
+            "archive_reconciliation": True,
+            "reason": reason or "terminal_flat_accounting_gap",
+        }
+
+    if has_accounting_gap and not current_exchange_truth_clean:
+        return {
+            **base,
+            "state": "truth_unavailable",
+            "blocks_entry": True,
+            "archive_reconciliation": False,
+            "reason": reason or "exchange_truth_not_clean",
+        }
+
+    if marker == "terminal_flat_accounting_gap":
+        return {
+            **base,
+            "state": "truth_unavailable",
+            "blocks_entry": True,
+            "archive_reconciliation": False,
+            "reason": reason or "exchange_truth_not_clean",
+        }
+
+    return base
+
+
+def close_reconciliation_exchange_truth_clean(
+    reconciliation: dict[str, Any] | None,
+) -> bool:
+    item = reconciliation if isinstance(reconciliation, dict) else {}
+    original_payload = item.get("original_payload")
+    if not isinstance(original_payload, dict):
+        original_payload = {}
+    exchange_truth = (
+        item.get("exchange_truth")
+        or original_payload.get("exchange_truth")
+    )
+    return passive_close_has_terminal_truth({"exchange_truth": exchange_truth})
 
 
 def quote_rewarm_handoff_contract(

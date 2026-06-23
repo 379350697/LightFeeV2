@@ -13,6 +13,8 @@ from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import AccountBalanceSnapshot, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import (
+    classify_close_reconciliation_state,
+    close_reconciliation_exchange_truth_clean,
     entry_admission_aggregation_key,
     entry_admission_blocks_candidate,
     entry_route_key,
@@ -1025,6 +1027,19 @@ class EntryGateRuntime:
                 return False, "pending_close_reconciliation_invalid"
             if (pc_long_s == long_v and pc_short_s == short_v) or \
                (pc_long_s == short_v and pc_short_s == long_v):
+                contract = classify_close_reconciliation_state(
+                    rec,
+                    current_exchange_truth_clean=(
+                        close_reconciliation_exchange_truth_clean(rec)
+                    ),
+                )
+                if contract.get("blocks_entry") is False:
+                    rec["archived"] = True
+                    rec["archive_reason"] = str(contract.get("state") or "")
+                    rec["business_contract_action"] = str(
+                        contract.get("state") or ""
+                    )
+                    continue
                 return False, "pending_close_reconciliation_conflict"
         return True, ""
 

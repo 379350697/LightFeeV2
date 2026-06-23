@@ -59,7 +59,10 @@ from lightfee.engine.passive_close import (
     PassiveCloseManagerProfile,
     PassiveManagerDecisionKind,
 )
-from lightfee.engine.business_contract import entry_route_key
+from lightfee.engine.business_contract import (
+    entry_route_key,
+    passive_close_has_terminal_truth,
+)
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.state import (
     ActiveMakerLeg,
@@ -3275,11 +3278,14 @@ class TestFallbackResidualReal:
         ]
         assert resolved
         assert resolved[-1]["resolution_source"] == "passive_close_live_one_sided_flattened"
-        assert resolved[-1]["exchange_truth"]["truth_available"] is True
+        truth = resolved[-1]["exchange_truth"]
+        assert truth["truth_available"] is True
+        assert all(abs(item["quantity"]) <= 1e-9 for item in truth["positions"])
         assert all(
             item["open_orders_empty"] is True
-            for item in resolved[-1]["exchange_truth"]["open_order_truth"]
+            for item in truth["open_order_truth"]
         )
+        assert passive_close_has_terminal_truth({"exchange_truth": truth}) is True
 
     def test_live_recovered_final_chunk_without_snapshot_clears_on_trusted_flat_truth(self):
         """Recovered pending close records clear only after live flat truth proof."""
