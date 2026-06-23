@@ -631,6 +631,12 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                 evidence["observed_at_ms"] = int(
                     getattr(refreshed, "observed_at_ms", 0) or 0
                 )
+                evidence["received_at_ms"] = int(
+                    getattr(refreshed, "received_at_ms", 0) or 0
+                )
+                evidence["exchange_event_at_ms"] = int(
+                    getattr(refreshed, "exchange_event_at_ms", 0) or 0
+                )
                 return cache.get_quote(venue, symbol) or refreshed, evidence
             evidence["outcome"] = "cache_rejected"
             evidence["quote_evidence"] = self._quote_base_evidence(
@@ -640,6 +646,10 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             return quote, evidence
         evidence["outcome"] = "refreshed"
         evidence["observed_at_ms"] = int(getattr(refreshed, "observed_at_ms", 0) or 0)
+        evidence["received_at_ms"] = int(getattr(refreshed, "received_at_ms", 0) or 0)
+        evidence["exchange_event_at_ms"] = int(
+            getattr(refreshed, "exchange_event_at_ms", 0) or 0
+        )
         return refreshed, evidence
 
     def _quote_needs_rest_refresh(

@@ -4129,6 +4129,7 @@ def _build_quote_rewarm_after_rest_stale_summary(
         status = "timeout"
         matched_at_ms = 0
         matched_field = "timeout_at_ms"
+        matched_payload: dict[str, Any] = {}
         for ts_ms, kind, event_key, payload in followups:
             if event_key != key or ts_ms < scheduled_at_ms:
                 continue
@@ -4136,12 +4137,14 @@ def _build_quote_rewarm_after_rest_stale_summary(
                 status = "resolved"
                 matched_at_ms = ts_ms
                 matched_field = "resolved_at_ms"
+                matched_payload = payload
                 break
             reason_bucket = str(payload.get("reason_bucket") or "")
             if kind in failure_kinds and reason_bucket == "rest_resolved_but_stale":
                 status = "still_stale"
                 matched_at_ms = ts_ms
                 matched_field = "still_stale_at_ms"
+                matched_payload = payload
                 break
         if status == "resolved":
             resolved_count += 1
@@ -4166,6 +4169,13 @@ def _build_quote_rewarm_after_rest_stale_summary(
             }
             if matched_at_ms:
                 sample[matched_field] = matched_at_ms
+            for field in (
+                "rest_quote_observed_at_ms",
+                "rest_quote_received_at_ms",
+                "rest_quote_exchange_event_at_ms",
+            ):
+                if field in matched_payload:
+                    sample[field] = matched_payload.get(field)
             samples.append(sample)
 
     return {

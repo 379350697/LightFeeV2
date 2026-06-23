@@ -1188,6 +1188,9 @@ _EVENT_KIND_PHASES = {
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_reconcile_error": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "reconciliation.pending_close_backfill_retained": (
+        V1LifecycleClosurePhase.PASSIVE_CLOSE.value
+    ),
     "exit.accepted_order_truth_gap_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.pending_close_reconciliation_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.retry_wait": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

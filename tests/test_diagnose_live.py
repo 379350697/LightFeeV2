@@ -5925,6 +5925,9 @@ def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
                 "venue": "aster",
                 "symbol": "BSBUSDT",
                 "reason_bucket": "rest_resolved_but_stale",
+                "rest_quote_observed_at_ms": 2190,
+                "rest_quote_received_at_ms": 2190,
+                "rest_quote_exchange_event_at_ms": 1000,
             },
         },
     ]
@@ -5952,6 +5955,9 @@ def test_entry_outcome_summary_tracks_rewarm_after_rest_stale_resolution():
                 "status": "still_stale",
                 "scheduled_at_ms": 2000,
                 "still_stale_at_ms": 2200,
+                "rest_quote_observed_at_ms": 2190,
+                "rest_quote_received_at_ms": 2190,
+                "rest_quote_exchange_event_at_ms": 1000,
             },
         ],
     }

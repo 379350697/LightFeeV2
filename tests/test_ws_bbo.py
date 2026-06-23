@@ -249,12 +249,52 @@ def test_rest_top_book_refresher_fetches_aster_bookticker_official_path():
     assert quote.symbol == "GUNUSDT"
     assert quote.bid == 0.00735
     assert quote.ask == 0.00742
-    assert quote.observed_at_ms == 1778985599950
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599950
     assert quote.source == "aster_rest_top_book"
     assert requests
     assert str(requests[0].url) == (
         "https://fapi.asterdex.com/fapi/v1/ticker/bookTicker?symbol=GUNUSDT"
     )
+
+
+def test_rest_top_book_refresher_uses_receipt_time_for_binance_style_lease_freshness():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    exchange_transaction_time_ms = 1778985590000
+    rest_received_at_ms = 1778985600000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "XCNUSDT",
+                "bidPrice": "0.01420",
+                "bidQty": "100000",
+                "askPrice": "0.01421",
+                "askQty": "120000",
+                "time": exchange_transaction_time_ms,
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(client=client, timeout_ms=250)
+
+    result = refresher.refresh_quote_result(
+        "aster",
+        "XCNUSDT",
+        now_ms=rest_received_at_ms,
+    )
+
+    assert result.outcome == "resolved"
+    assert result.quote is not None
+    assert result.quote.observed_at_ms == rest_received_at_ms
+    assert result.quote.received_at_ms == rest_received_at_ms
+    assert result.quote.exchange_event_at_ms == exchange_transaction_time_ms
+    assert result.observed_at_ms == rest_received_at_ms
+    assert result.received_at_ms == rest_received_at_ms
+    assert result.exchange_event_at_ms == exchange_transaction_time_ms
 
 
 def test_bbo_stream_state_reports_quote_lease_readiness_buckets():
@@ -547,6 +587,9 @@ def test_rest_top_book_refresher_reports_structured_resolved_and_throttled_resul
     assert resolved.bid == 0.065
     assert resolved.ask == 0.066
     assert resolved.venue_symbol == "HEMIUSDT"
+    assert resolved.observed_at_ms == 1778985600000
+    assert resolved.received_at_ms == 1778985600000
+    assert resolved.exchange_event_at_ms == 1778985599950
     assert resolved.url.endswith("/fapi/v1/ticker/bookTicker")
     assert throttled.outcome == "throttled"
     assert throttled.attempt_interval_outcome == "min_interval_not_elapsed"

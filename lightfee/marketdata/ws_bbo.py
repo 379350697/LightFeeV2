@@ -27,6 +27,7 @@ class TopBookQuote:
     ask_size: float = 0.0
     observed_at_ms: int = 0
     received_at_ms: int = 0
+    exchange_event_at_ms: int = 0
     source: str = ""
 
 
@@ -44,6 +45,8 @@ class RestTopBookQuoteResult:
     bid: float = 0.0
     ask: float = 0.0
     observed_at_ms: int = 0
+    received_at_ms: int = 0
+    exchange_event_at_ms: int = 0
     attempt_interval_outcome: str = ""
     error: str = ""
 
@@ -270,6 +273,8 @@ class RestTopBookQuoteRefresher:
             bid=float(quote.bid),
             ask=float(quote.ask),
             observed_at_ms=int(quote.observed_at_ms or 0),
+            received_at_ms=int(quote.received_at_ms or 0),
+            exchange_event_at_ms=int(quote.exchange_event_at_ms or 0),
         )
 
     def _quote_request_metadata(self, venue: str, symbol: str) -> dict[str, str]:
@@ -311,6 +316,11 @@ class RestTopBookQuoteRefresher:
                 params={"symbol": venue_symbol},
             )
             row = self._select_row(raw, venue_symbol)
+            exchange_event_at_ms = _int_ms(
+                row.get("time"),
+                row.get("E"),
+                row.get("T"),
+            )
             return self._make_rest_quote(
                 venue=venue,
                 symbol=symbol,
@@ -318,13 +328,9 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("askPrice"), row.get("a")),
                 bid_size=_float_value(row.get("bidQty"), row.get("B")),
                 ask_size=_float_value(row.get("askQty"), row.get("A")),
-                observed_at_ms=_int_ms(
-                    row.get("time"),
-                    row.get("E"),
-                    row.get("T"),
-                    now_ms,
-                ),
+                observed_at_ms=now_ms,
                 received_at_ms=now_ms,
+                exchange_event_at_ms=exchange_event_at_ms,
             )
 
         if venue == "bybit":
@@ -344,6 +350,7 @@ class RestTopBookQuoteRefresher:
                 ask_size=_float_value(row.get("ask1Size"), row.get("askSize")),
                 observed_at_ms=_int_ms(row.get("ts"), raw.get("time"), now_ms),
                 received_at_ms=now_ms,
+                exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("time")),
             )
 
         if venue == "okx":
@@ -364,6 +371,7 @@ class RestTopBookQuoteRefresher:
                 ask_size=_float_value(row.get("askSz")),
                 observed_at_ms=_int_ms(row.get("ts"), raw.get("ts"), now_ms),
                 received_at_ms=now_ms,
+                exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("ts")),
             )
 
         if venue == "bitget":
@@ -382,6 +390,7 @@ class RestTopBookQuoteRefresher:
                 ask_size=_float_value(row.get("askSz"), row.get("ask1Size")),
                 observed_at_ms=_int_ms(row.get("ts"), raw.get("requestTime"), now_ms),
                 received_at_ms=now_ms,
+                exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("requestTime")),
             )
 
         if venue == "gate":
@@ -399,6 +408,7 @@ class RestTopBookQuoteRefresher:
                 ask_size=_float_value(row.get("lowest_size"), row.get("ask_size")),
                 observed_at_ms=_int_ms(row.get("time_ms"), row.get("time"), now_ms),
                 received_at_ms=now_ms,
+                exchange_event_at_ms=_int_ms(row.get("time_ms"), row.get("time")),
             )
 
         if venue == "hyperliquid":
@@ -420,6 +430,7 @@ class RestTopBookQuoteRefresher:
                 ask_size=_float_value(ask_row.get("sz"), ask_row.get("size")),
                 observed_at_ms=_int_ms(raw.get("time"), now_ms),
                 received_at_ms=now_ms,
+                exchange_event_at_ms=_int_ms(raw.get("time")),
             )
 
         return None
@@ -470,6 +481,7 @@ class RestTopBookQuoteRefresher:
         ask_size: float,
         observed_at_ms: int,
         received_at_ms: int,
+        exchange_event_at_ms: int = 0,
     ) -> TopBookQuote | None:
         quote = TopBookQuote(
             venue=venue,
@@ -480,6 +492,7 @@ class RestTopBookQuoteRefresher:
             ask_size=ask_size,
             observed_at_ms=observed_at_ms or received_at_ms,
             received_at_ms=received_at_ms,
+            exchange_event_at_ms=exchange_event_at_ms,
             source=f"{venue}_rest_top_book",
         )
         if quote.bid <= 0.0 or quote.ask <= 0.0 or quote.bid >= quote.ask:

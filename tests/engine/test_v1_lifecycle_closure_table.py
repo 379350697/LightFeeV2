@@ -196,6 +196,39 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
     assert close_rows[0]["recovery_policy"] == "manage_owned_pending_passive_close"
 
 
+def test_pending_close_backfill_retained_is_mapped_passive_close_accounting_evidence():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth=_clean_exchange_truth(),
+        events=[
+            {
+                "kind": "reconciliation.pending_close_backfill_retained",
+                "payload": {
+                    "position_id": "entry-1782143533434-CLOUSDT",
+                    "symbol": "CLOUSDT",
+                    "reason": "missing_short_close_trade_statement",
+                    "truth_source": "exchange_flat_no_open_orders",
+                },
+            }
+        ],
+        generated_at_ms=1782144304000,
+    )
+
+    payload = table.to_dict()
+    assert "reconciliation.pending_close_backfill_retained" not in payload[
+        "unmapped_event_kinds"
+    ]
+
+
 def test_owned_pending_entry_live_conflict_projects_as_live_artifact_row():
     from lightfee.engine.recovery_ledger import (
         ExchangeArtifact,

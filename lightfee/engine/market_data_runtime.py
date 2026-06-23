@@ -1451,6 +1451,10 @@ class MarketDataRuntime:
             "sticky_warm_until_ms": expires_at_ms,
             "sticky_ttl_ms": sticky_ttl_ms,
             "rest_quote_observed_at_ms": target.get("rest_quote_observed_at_ms"),
+            "rest_quote_received_at_ms": target.get("rest_quote_received_at_ms"),
+            "rest_quote_exchange_event_at_ms": target.get(
+                "rest_quote_exchange_event_at_ms"
+            ),
             "rest_quote_age_ms": target.get("rest_quote_age_ms"),
             "quote_validation_reject_reason": str(
                 target.get("quote_validation_reject_reason") or ""
@@ -1663,7 +1667,13 @@ class MarketDataRuntime:
                 )
                 if refreshed is not None:
                     observed_at_ms = int(getattr(refreshed, "observed_at_ms", 0) or 0)
+                    received_at_ms = int(getattr(refreshed, "received_at_ms", 0) or 0)
+                    exchange_event_at_ms = int(
+                        getattr(refreshed, "exchange_event_at_ms", 0) or 0
+                    )
                     target["rest_quote_observed_at_ms"] = observed_at_ms
+                    target["rest_quote_received_at_ms"] = received_at_ms
+                    target["rest_quote_exchange_event_at_ms"] = exchange_event_at_ms
                     target["rest_quote_age_ms"] = (
                         max(now_ms - observed_at_ms, 0)
                         if observed_at_ms > 0
@@ -1705,6 +1715,10 @@ class MarketDataRuntime:
                 if str(target.get("rest_outcome") or "")
                 else "fresh_ws_quote",
                 "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
+                "received_at_ms": int(getattr(quote, "received_at_ms", 0) or 0),
+                "exchange_event_at_ms": int(
+                    getattr(quote, "exchange_event_at_ms", 0) or 0
+                ),
                 "age_ms": max(
                     now_ms - int(getattr(quote, "observed_at_ms", 0) or 0),
                     0,
@@ -1816,6 +1830,10 @@ class MarketDataRuntime:
                     target.get("quote_validation_reject_reason") or ""
                 ),
                 "rest_quote_observed_at_ms": target.get("rest_quote_observed_at_ms"),
+                "rest_quote_received_at_ms": target.get("rest_quote_received_at_ms"),
+                "rest_quote_exchange_event_at_ms": target.get(
+                    "rest_quote_exchange_event_at_ms"
+                ),
                 "rest_quote_age_ms": target.get("rest_quote_age_ms"),
                 "rest_quote_bid": float(target.get("rest_quote_bid") or 0.0),
                 "rest_quote_ask": float(target.get("rest_quote_ask") or 0.0),
