@@ -35,6 +35,8 @@ class CloseRuntime:
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
         self._close_reconciliation_archive_emitted_keys: set[str] = set()
+        self._close_reconciliation_exchange_truth: dict[str, Any] | None = None
+        self._close_reconciliation_truth_refresh_next_ms = 0
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
         flush = getattr(self.ctx, "_flush_adapter_order_diagnostics", None)
@@ -699,11 +701,74 @@ class CloseRuntime:
         self,
         reconciliation: dict[str, Any],
     ) -> dict[str, Any] | None:
-        current_truth = getattr(self.ctx, "_last_recovery_exchange_truth", None)
-        current_truth = current_truth if isinstance(current_truth, dict) else None
-        return close_reconciliation_exchange_truth(
-            reconciliation,
-            current_exchange_truth=current_truth,
+        for raw_truth in (
+            getattr(self.ctx, "_last_recovery_exchange_truth", None),
+            self._close_reconciliation_exchange_truth,
+        ):
+            current_truth = raw_truth if isinstance(raw_truth, dict) else None
+            exchange_truth = close_reconciliation_exchange_truth(
+                reconciliation,
+                current_exchange_truth=current_truth,
+            )
+            if exchange_truth is not None:
+                return exchange_truth
+        return close_reconciliation_exchange_truth(reconciliation)
+
+    async def _refresh_close_reconciliation_account_truth(
+        self,
+        reconciliations: list[dict[str, Any]],
+        *,
+        now_ms: int,
+    ) -> None:
+        if not reconciliations:
+            return
+        if all(
+            self._current_exchange_truth_for_close_reconciliation(reconciliation)
+            is not None
+            for reconciliation in reconciliations
+        ):
+            return
+        if self._close_reconciliation_truth_refresh_next_ms > now_ms:
+            return
+        collector = getattr(self.ctx, "_collect_recovery_ledger_account_truth", None)
+        if not callable(collector):
+            return
+
+        self._close_reconciliation_truth_refresh_next_ms = (
+            now_ms + self._RECONCILE_RETRY_BASE_MS
+        )
+        try:
+            exchange_truth = await collector(now_ms)
+        except Exception as exc:
+            self.ctx.journal.append(
+                "reconciliation.pending_close_exchange_truth_refresh_failed",
+                {
+                    "reason": str(exc),
+                    "next_attempt_ms": self._close_reconciliation_truth_refresh_next_ms,
+                },
+            )
+            return
+        if not isinstance(exchange_truth, dict):
+            return
+        if exchange_truth.get("truth_supported") is False:
+            return
+        exchange_truth = dict(exchange_truth)
+        exchange_truth.setdefault(
+            "source",
+            "pending_close_reconciliation_account_truth_refresh",
+        )
+        self._close_reconciliation_exchange_truth = exchange_truth
+        self.ctx.journal.append(
+            "reconciliation.pending_close_exchange_truth_refreshed",
+            {
+                "truth_supported": exchange_truth.get("truth_supported"),
+                "truth_available": exchange_truth.get("truth_available"),
+                "position_row_count": len(exchange_truth.get("positions") or []),
+                "open_order_count": len(exchange_truth.get("open_orders") or []),
+                "probe_evidence_count": len(exchange_truth.get("probe_evidence") or []),
+                "error_count": len(exchange_truth.get("errors") or []),
+                "next_attempt_ms": self._close_reconciliation_truth_refresh_next_ms,
+            },
         )
 
     @staticmethod
@@ -1038,9 +1103,28 @@ class CloseRuntime:
         if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
             return
 
+        current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
+        refresh_candidates = [
+            reconciliation
+            for reconciliation in pending_reconciliations
+            if isinstance(reconciliation, dict)
+            and not (
+                reconciliation.get("archived") is True
+                and str(reconciliation.get("archive_reason") or "")
+                == "terminal_flat_accounting_gap"
+            )
+            and not (
+                current_cycle != 0
+                and int(reconciliation.get("created_cycle") or 0) >= current_cycle
+            )
+        ]
+        await self._refresh_close_reconciliation_account_truth(
+            refresh_candidates,
+            now_ms=now_ms,
+        )
+
         retained: list[Any] = []
         eligible: list[dict[str, Any]] = []
-        current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
         changed = False
         for reconciliation in list(pending_reconciliations):
             if not isinstance(reconciliation, dict):

@@ -396,6 +396,46 @@ def _recovery_ledger_flat_truth(symbol: str, *venues: str) -> dict:
     }
 
 
+def _recovery_ledger_account_flat_truth(*venues: str) -> dict:
+    return {
+        "truth_supported": True,
+        "truth_available": False,
+        "positions": [],
+        "open_orders": [],
+        "probe_evidence": [
+            {
+                "venue": venue,
+                "symbol": "*",
+                "endpoint": "fetch_all_positions",
+                "method": "fetch_all_positions",
+                "classification": "position_probe_unfiltered_succeeded",
+            }
+            for venue in venues
+        ]
+        + [
+            {
+                "venue": venue,
+                "symbol": "*",
+                "endpoint": "fetch_open_orders(None)",
+                "method": "fetch_open_orders",
+                "classification": "open_order_probe_unfiltered_succeeded",
+            }
+            for venue in venues
+        ]
+        + [
+            {
+                "venue": "hyperliquid",
+                "symbol": "*",
+                "endpoint": "fetch_all_positions",
+                "method": "fetch_all_positions",
+                "classification": "position_probe_unfiltered_failed",
+                "error": "account_wallet_signer_mismatch",
+            }
+        ],
+        "errors": ["hyperliquid:*:positions:account_wallet_signer_mismatch"],
+    }
+
+
 def test_close_reconciliation_exchange_truth_accepts_account_level_flat_probe():
     reconciliation = {
         "position_id": "entry-h",
@@ -442,6 +482,76 @@ def test_close_reconciliation_exchange_truth_accepts_recovery_ledger_flat_probe(
         reconciliation,
         current_exchange_truth=truth,
     ) is True
+
+
+def test_close_reconciliation_exchange_truth_accepts_recovery_account_flat_probe():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+    }
+    truth = _recovery_ledger_account_flat_truth("bybit", "okx")
+
+    assert (
+        close_reconciliation_exchange_truth(
+            reconciliation,
+            current_exchange_truth=truth,
+        )
+        is truth
+    )
+    assert close_reconciliation_exchange_truth_clean(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is True
+
+
+def test_close_reconciliation_exchange_truth_rejects_target_account_truth_error():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+    }
+    truth = _recovery_ledger_account_flat_truth("bybit", "okx")
+    truth["errors"] = ["okx:*:open_orders:timeout"]
+    truth["probe_evidence"].append({
+        "venue": "okx",
+        "symbol": "*",
+        "endpoint": "fetch_open_orders(None)",
+        "method": "fetch_open_orders",
+        "classification": "open_order_probe_unfiltered_failed",
+        "error": "timeout",
+    })
+
+    assert close_reconciliation_exchange_truth(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is None
+
+
+def test_close_reconciliation_exchange_truth_rejects_unfiltered_target_open_order():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+    }
+    truth = _recovery_ledger_account_flat_truth("bybit", "okx")
+    truth["open_orders"] = [{
+        "venue": "bybit",
+        "symbol": "OTHERUSDT",
+        "quantity": 1.0,
+    }]
+
+    assert close_reconciliation_exchange_truth(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is None
 
 
 def test_close_reconciliation_exchange_truth_rejects_incomplete_account_level_probe():

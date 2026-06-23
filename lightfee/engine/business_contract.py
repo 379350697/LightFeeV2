@@ -514,12 +514,13 @@ def _truth_probe_evidence_succeeded(
     *,
     venue: str,
     symbol: str,
-    endpoint: str,
+    endpoint: str | set[str],
     success_classifications: set[str],
 ) -> bool:
     evidence = truth.get("probe_evidence")
     if not isinstance(evidence, list):
         return False
+    endpoints = {endpoint} if isinstance(endpoint, str) else set(endpoint)
     venue_l = str(venue or "").lower()
     symbol_u = str(symbol or "").upper()
     for raw in evidence:
@@ -529,13 +530,44 @@ def _truth_probe_evidence_succeeded(
         if raw_venue and raw_venue != venue_l:
             continue
         raw_symbol = str(raw.get("symbol") or "").upper()
-        if symbol_u and raw_symbol and raw_symbol != symbol_u:
+        if symbol_u and raw_symbol and raw_symbol not in {symbol_u, "*"}:
             continue
-        raw_endpoint = str(raw.get("endpoint") or raw.get("method") or "")
-        if raw_endpoint != endpoint:
+        raw_endpoints = {
+            str(raw.get("endpoint") or ""),
+            str(raw.get("method") or ""),
+        }
+        raw_endpoints.discard("")
+        if endpoints and raw_endpoints.isdisjoint(endpoints):
             continue
         if str(raw.get("classification") or "") in success_classifications:
             return True
+    return False
+
+
+def _truth_probe_evidence_has_error_for_scope(
+    truth: dict[str, Any],
+    *,
+    venues: set[str],
+) -> bool:
+    if not venues:
+        return False
+    evidence = truth.get("probe_evidence")
+    if isinstance(evidence, list):
+        for raw in evidence:
+            if not isinstance(raw, dict):
+                continue
+            raw_venue = str(raw.get("venue") or "").lower()
+            if raw_venue not in venues:
+                continue
+            classification = str(raw.get("classification") or "")
+            if raw.get("error") or classification.endswith(("_failed", "_error")):
+                return True
+    errors = truth.get("errors")
+    if isinstance(errors, list):
+        for raw_error in errors:
+            venue = str(raw_error or "").split(":", 1)[0].lower()
+            if venue in venues:
+                return True
     return False
 
 
@@ -547,9 +579,7 @@ def _recovery_ledger_flat_truth_covers_scope(
 ) -> bool:
     if truth.get("truth_supported") is False:
         return False
-    if truth.get("truth_available") is False or truth.get("available") is False:
-        return False
-    if truth.get("errors"):
+    if truth.get("available") is False:
         return False
     if not venues:
         return False
@@ -557,14 +587,18 @@ def _recovery_ledger_flat_truth_covers_scope(
     open_orders = truth.get("open_orders")
     if not isinstance(positions, list) or not isinstance(open_orders, list):
         return False
+    if _truth_probe_evidence_has_error_for_scope(truth, venues=venues):
+        return False
 
     symbol_u = str(symbol or "").upper()
+    unfiltered_position_venues: set[str] = set()
+    unfiltered_order_venues: set[str] = set()
     for venue in venues:
         if not _truth_probe_evidence_succeeded(
             truth,
             venue=venue,
             symbol=symbol_u,
-            endpoint="fetch_position",
+            endpoint={"fetch_position", "fetch_all_positions"},
             success_classifications={
                 "position_truth",
                 "position_probe_unfiltered_succeeded",
@@ -582,6 +616,22 @@ def _recovery_ledger_flat_truth_covers_scope(
             },
         ):
             return False
+        if _truth_probe_evidence_succeeded(
+            truth,
+            venue=venue,
+            symbol=symbol_u,
+            endpoint="fetch_all_positions",
+            success_classifications={"position_probe_unfiltered_succeeded"},
+        ):
+            unfiltered_position_venues.add(venue)
+        if _truth_probe_evidence_succeeded(
+            truth,
+            venue=venue,
+            symbol=symbol_u,
+            endpoint="fetch_open_orders",
+            success_classifications={"open_order_probe_unfiltered_succeeded"},
+        ):
+            unfiltered_order_venues.add(venue)
 
     for raw in positions:
         if not isinstance(raw, dict):
@@ -589,7 +639,8 @@ def _recovery_ledger_flat_truth_covers_scope(
         record_symbol = str(raw.get("symbol") or "").upper()
         record_venue = str(raw.get("venue") or "").lower()
         if symbol_u and record_symbol and record_symbol != symbol_u:
-            continue
+            if record_venue not in unfiltered_position_venues:
+                continue
         if venues and record_venue and record_venue not in venues:
             continue
         if abs(_safe_float(raw.get("quantity"))) > 1e-9:
@@ -601,7 +652,8 @@ def _recovery_ledger_flat_truth_covers_scope(
         record_symbol = str(raw.get("symbol") or "").upper()
         record_venue = str(raw.get("venue") or "").lower()
         if symbol_u and record_symbol and record_symbol != symbol_u:
-            continue
+            if record_venue not in unfiltered_order_venues:
+                continue
         if venues and record_venue and record_venue not in venues:
             continue
         return False
