@@ -3335,7 +3335,15 @@ def _snapshot_fallback_resolved_by_entry_quote_truth(
     scoped_keys = _snapshot_fallback_identity_keys(payload)
     if scoped_keys & resolution_keys:
         return True
-    return bool(scoped_keys and _snapshot_fallback_blocking_scope(payload))
+    return False
+
+
+def _snapshot_fallback_broad_scope_demoted(payload: dict[str, Any]) -> bool:
+    if _snapshot_fallback_payload_identity_keys(payload):
+        return False
+    if payload.get("blocked") is True or payload.get("block_reason"):
+        return False
+    return bool(_snapshot_fallback_has_scoped_blocking_evidence(payload))
 
 
 def _snapshot_fallback_is_current(
@@ -3836,6 +3844,9 @@ def _build_entry_market_evidence_summary(
         payload = rec.get("payload", {})
         if not isinstance(payload, dict):
             payload = {}
+        else:
+            payload = dict(payload)
+            payload.setdefault("event_ts_ms", rec.get("ts_ms", 0))
         contract = entry_market_evidence_contract(kind, payload)
         if not contract:
             continue
@@ -6116,6 +6127,9 @@ def _build_diagnostic_noise_summary(
         payload = rec.get("payload", {})
         if not isinstance(payload, dict):
             payload = {}
+        else:
+            payload = dict(payload)
+            payload.setdefault("event_ts_ms", rec.get("ts_ms", 0))
         contract = classify_noise_visibility(
             kind,
             payload,
@@ -6382,6 +6396,7 @@ def _build_production_acceptance_gate(
     snapshot_fallback_blocking_count = 0
     snapshot_fallback_unresolved_current_blocker_count = 0
     snapshot_fallback_resolved_by_entry_quote_truth_count = 0
+    snapshot_fallback_broad_scope_demoted_count = 0
     bulk_health_diagnostic_count = 0
     contained_admission_count = 0
     hyperliquid_margin_view_zero_count = 0
@@ -6597,6 +6612,8 @@ def _build_production_acceptance_gate(
                 exception_conclusions["snapshot_fallback_blocking"] = (
                     _snapshot_fallback_exception_conclusion(payload)
                 )
+            elif _snapshot_fallback_broad_scope_demoted(payload):
+                snapshot_fallback_broad_scope_demoted_count += 1
 
         if kind == "entry.opened":
             entry_opened_count += 1
@@ -6967,6 +6984,9 @@ def _build_production_acceptance_gate(
         ),
         "snapshot_fallback_resolved_by_entry_quote_truth_count": (
             snapshot_fallback_resolved_by_entry_quote_truth_count
+        ),
+        "snapshot_fallback_broad_scope_demoted_count": (
+            snapshot_fallback_broad_scope_demoted_count
         ),
         "bulk_health_diagnostic_count": bulk_health_diagnostic_count,
         "contained_admission_count": contained_admission_count,

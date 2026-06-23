@@ -313,10 +313,33 @@ def _entry_oi_structural_backoff_active(payload: dict[str, Any]) -> bool:
     if recheck_ms in (None, "", 0):
         return False
     try:
+        recheck_until_ms = int(float(recheck_ms))
+    except (TypeError, ValueError):
+        return False
+    if recheck_until_ms <= 0:
+        return False
+    try:
         consecutive_failures = int(payload.get("consecutive_failures") or 0)
     except (TypeError, ValueError):
         consecutive_failures = 0
-    return consecutive_failures > 1
+    if consecutive_failures <= 1:
+        return False
+
+    for field in (
+        "diagnostic_now_ms",
+        "current_time_ms",
+        "now_ms",
+        "last_structural_probe_at_ms",
+        "event_ts_ms",
+        "ts_ms",
+    ):
+        try:
+            anchor_ms = int(float(payload.get(field) or 0))
+        except (TypeError, ValueError):
+            anchor_ms = 0
+        if anchor_ms > 0:
+            return recheck_until_ms > anchor_ms
+    return True
 
 
 def close_reconciliation_evidence_contract(

@@ -2403,7 +2403,8 @@ def test_run_diagnose_acceptance_gate_downgrades_broad_snapshot_after_entry_quot
         gate = result["production_acceptance_gate"]
         assert gate["snapshot_fallback_blocking_count"] == 0
         assert gate["snapshot_fallback_unresolved_current_blocker_count"] == 0
-        assert gate["snapshot_fallback_resolved_by_entry_quote_truth_count"] == 1
+        assert gate["snapshot_fallback_resolved_by_entry_quote_truth_count"] == 0
+        assert gate["snapshot_fallback_broad_scope_demoted_count"] == 1
         assert "snapshot_fallback_blocking" not in gate["exception_conclusions"]
         assert gate["blocking_reasons"] == []
         assert gate["gate_passed"] is True
@@ -6442,6 +6443,43 @@ def test_entry_market_evidence_summary_infers_structural_suppression_from_backof
     assert summary["candidate_admission_noise_summary"]["raw_candidate_block_count"] == 0
     assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 1
     assert noise["current_admission_blocker_count"] == 0
+
+
+def test_entry_market_evidence_summary_treats_expired_structural_backoff_as_current_blocker():
+    from scripts.diagnose_live import _build_diagnostic_noise_summary
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "ts_ms": 1779816055000,
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "hyperliquid",
+                "symbol": "0GUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "consecutive_failures": 310,
+                "suppress_until_ms": 1779816049000,
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+    noise = _build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate={},
+        business_progression_quality_summary={},
+    )
+
+    assert summary["blocked_candidate_count"] == 1
+    assert summary["action_counts"] == {"block_oi_structural": 1}
+    assert summary["oi"]["structural_count"] == 1
+    assert summary["oi"]["structural_suppressed_count"] == 0
+    assert summary["candidate_admission_noise_summary"]["raw_candidate_block_count"] == 1
+    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 0
+    assert noise["current_admission_blocker_count"] == 1
 
 
 def test_entry_market_evidence_summary_low_oi_only_needs_no_data_backfill():

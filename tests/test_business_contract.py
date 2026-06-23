@@ -196,6 +196,26 @@ def test_entry_market_evidence_contract_infers_structural_backoff_from_ttl():
     assert visibility["visibility"] == "aggregated_diagnostic"
 
 
+def test_entry_market_evidence_contract_treats_expired_structural_backoff_as_blocker():
+    result = entry_market_evidence_contract(
+        "execution.entry_liquidity_blocked",
+        {
+            "venue": "hyperliquid",
+            "symbol": "0GUSDT",
+            "reason": "perp_open_interest_structural",
+            "open_interest_evidence_status": "available",
+            "consecutive_failures": 310,
+            "suppress_until_ms": 1779816049000,
+            "last_structural_probe_at_ms": 1779816050000,
+        },
+    )
+
+    assert result["action"] == "block_oi_structural"
+    assert result["blocks_entry"] is True
+    assert result["terminality"] == "terminal_candidate_block"
+    assert result["diagnostic_severity"] == "production_issue"
+
+
 def test_entry_market_evidence_contract_terminalizes_quote_rewarm():
     result = entry_market_evidence_contract(
         "runtime.entry_quote_rewarm_terminal_stale",
