@@ -3277,22 +3277,24 @@ def _snapshot_fallback_has_scoped_blocking_evidence(payload: dict[str, Any]) -> 
 
 
 def _snapshot_fallback_identity_keys(payload: dict[str, Any]) -> set[str]:
-    keys: set[str] = set()
-
-    def add_from(raw: dict[str, Any]) -> None:
-        for field in ("candidate_pair_id", "pair_id"):
-            value = str(raw.get(field) or "").strip()
-            if value:
-                keys.add(f"pair:{value}")
-        for field in ("candidate_symbol", "symbol"):
-            value = str(raw.get(field) or "").strip().upper()
-            if value:
-                keys.add(f"symbol:{value}")
-
-    add_from(payload)
+    keys = _snapshot_fallback_payload_identity_keys(payload)
     for item in payload.get("candidate_freshness_scope", []) or []:
         if isinstance(item, dict):
-            add_from(item)
+            keys.update(_snapshot_fallback_payload_identity_keys(item))
+    return keys
+
+
+def _snapshot_fallback_payload_identity_keys(payload: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+
+    for field in ("candidate_pair_id", "pair_id"):
+        value = str(payload.get(field) or "").strip()
+        if value:
+            keys.add(f"pair:{value}")
+    for field in ("candidate_symbol", "symbol"):
+        value = str(payload.get(field) or "").strip().upper()
+        if value:
+            keys.add(f"symbol:{value}")
     return keys
 
 
@@ -3325,7 +3327,13 @@ def _snapshot_fallback_resolved_by_entry_quote_truth(
 ) -> bool:
     if not resolution_keys:
         return False
-    return bool(_snapshot_fallback_identity_keys(payload) & resolution_keys)
+    direct_keys = _snapshot_fallback_payload_identity_keys(payload)
+    if direct_keys:
+        return bool(direct_keys & resolution_keys)
+    scoped_keys = _snapshot_fallback_identity_keys(payload)
+    if scoped_keys & resolution_keys:
+        return True
+    return bool(scoped_keys and _snapshot_fallback_blocking_scope(payload))
 
 
 def _snapshot_fallback_is_current(
@@ -3960,9 +3968,8 @@ def _build_entry_market_evidence_summary(
 
     for stat in blocked_owner_stats.values():
         reasons = stat.get("reasons") if isinstance(stat.get("reasons"), dict) else {}
-        structural_count = int(
-            (reasons or {}).get("perp_open_interest_structural") or 0
-        )
+        actions = stat.get("actions") if isinstance(stat.get("actions"), dict) else {}
+        structural_count = int((actions or {}).get("block_oi_structural") or 0)
         next_recheck = int(stat.get("next_structural_recheck_ms") or 0)
         existing_suppressed = int(stat.get("structural_suppressed_count") or 0)
         if structural_count > 1 and next_recheck:

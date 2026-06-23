@@ -279,7 +279,10 @@ def _entry_oi_block_action(payload: dict[str, Any], reason: str) -> str:
     ).strip().lower()
     normalized_reason = str(reason or "").strip()
     if normalized_reason == "perp_open_interest_structural":
-        if payload.get("structural_suppressed") is True:
+        if (
+            payload.get("structural_suppressed") is True
+            or _entry_oi_structural_backoff_active(payload)
+        ):
             return "suppress_oi_structural"
         return "block_oi_structural"
     if normalized_reason == "perp_open_interest_below_floor":
@@ -301,6 +304,19 @@ def _entry_oi_block_action(payload: dict[str, Any], reason: str) -> str:
     if evidence_status == "available" and floor > 0.0 and current_value < floor:
         return "block_oi_below_floor"
     return "block_oi_unavailable"
+
+
+def _entry_oi_structural_backoff_active(payload: dict[str, Any]) -> bool:
+    recheck_ms = payload.get("next_structural_recheck_ms") or payload.get(
+        "suppress_until_ms"
+    )
+    if recheck_ms in (None, "", 0):
+        return False
+    try:
+        consecutive_failures = int(payload.get("consecutive_failures") or 0)
+    except (TypeError, ValueError):
+        consecutive_failures = 0
+    return consecutive_failures > 1
 
 
 def close_reconciliation_evidence_contract(

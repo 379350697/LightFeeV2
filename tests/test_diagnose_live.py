@@ -2337,6 +2337,81 @@ def test_run_diagnose_acceptance_gate_downgrades_snapshot_fallback_resolved_by_q
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_acceptance_gate_downgrades_broad_snapshot_after_entry_quote_truth(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1779816049000,
+                "kind": "runtime.snapshot_fallback_last_good",
+                "payload": {
+                    "candidate_freshness_scope": [
+                        {
+                            "candidate_symbol": "HUSDT",
+                            "candidate_pair_id": "husdt:bitget->aster",
+                            "domain": "quote",
+                            "venue": "bitget",
+                            "source_age_ms": 15000,
+                            "fallback_duration_ms": 11000,
+                            "blocked": True,
+                            "block_reason": "quote_stale",
+                        },
+                        {
+                            "candidate_symbol": "GUAUSDT",
+                            "candidate_pair_id": "guausdt:gate->aster",
+                            "domain": "liquidity",
+                            "venue": "gate",
+                            "source_age_ms": 14000,
+                            "fallback_duration_ms": 11000,
+                            "blocked": True,
+                            "block_reason": "perp_open_interest_below_floor",
+                        },
+                    ],
+                },
+            },
+            {
+                "ts_ms": 1779816049500,
+                "kind": "runtime.entry_quote_revalidate_resolved",
+                "payload": {
+                    "symbol": "CHIPUSDT",
+                    "pair_id": "chipusdt:binance->hyperliquid",
+                    "reason": "quote_stale",
+                    "venue": "binance",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["snapshot_fallback_blocking_count"] == 0
+        assert gate["snapshot_fallback_unresolved_current_blocker_count"] == 0
+        assert gate["snapshot_fallback_resolved_by_entry_quote_truth_count"] == 1
+        assert "snapshot_fallback_blocking" not in gate["exception_conclusions"]
+        assert gate["blocking_reasons"] == []
+        assert gate["gate_passed"] is True
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_acceptance_gate_blocks_global_snapshot_fallback_without_scope_evidence(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -6206,17 +6281,17 @@ def test_entry_market_evidence_summary_reports_structural_suppression_backoff():
     summary = _build_entry_market_evidence_summary(events)
 
     assert summary["oi"]["structural_count"] == 3
-    assert summary["oi"]["structural_suppressed_count"] == 2
+    assert summary["oi"]["structural_suppressed_count"] == 3
     assert summary["oi"]["next_structural_recheck_ms"] == 1779817850000
-    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 2
+    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 3
     assert summary["candidate_admission_noise_summary"]["top_blocked_owner_ids"] == [
         {
             "owner_id": "aster:ESPORTSUSDT",
             "count": 3,
-            "actions": {"block_oi_structural": 3},
+            "actions": {"suppress_oi_structural": 3},
             "evidence_classes": {"oi": 3},
             "reasons": {"perp_open_interest_structural": 3},
-            "structural_suppressed_count": 2,
+            "structural_suppressed_count": 3,
             "next_structural_recheck_ms": 1779817850000,
         }
     ]
@@ -6265,6 +6340,43 @@ def test_entry_market_evidence_summary_does_not_count_suppressed_structural_as_c
             "next_structural_recheck_ms": 1779817850000,
         }
     ]
+
+
+def test_entry_market_evidence_summary_infers_structural_suppression_from_backoff_ttl():
+    from scripts.diagnose_live import _build_diagnostic_noise_summary
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "hyperliquid",
+                "symbol": "0GUSDT",
+                "reason": "perp_open_interest_structural",
+                "open_interest_evidence_status": "available",
+                "observed_open_interest_quote": 10_000.0,
+                "min_open_interest_quote": 1_000_000.0,
+                "consecutive_failures": 310,
+                "suppress_until_ms": 1779817850000,
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+    noise = _build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate={},
+        business_progression_quality_summary={},
+    )
+
+    assert summary["blocked_candidate_count"] == 0
+    assert summary["action_counts"] == {"suppress_oi_structural": 1}
+    assert summary["oi"]["structural_count"] == 1
+    assert summary["oi"]["structural_suppressed_count"] == 1
+    assert summary["oi"]["next_structural_recheck_ms"] == 1779817850000
+    assert summary["candidate_admission_noise_summary"]["raw_candidate_block_count"] == 0
+    assert summary["candidate_admission_noise_summary"]["structural_suppressed_count"] == 1
+    assert noise["current_admission_blocker_count"] == 0
 
 
 def test_entry_market_evidence_summary_low_oi_only_needs_no_data_backfill():
