@@ -581,6 +581,120 @@ class CloseRuntime:
         )
         reconciliation["next_attempt_ms"] = now_ms + delay
 
+    @staticmethod
+    def _missing_leg_from_reconciliation(reconciliation: dict[str, Any]) -> str:
+        missing_leg = str(reconciliation.get("missing_leg") or "")
+        if missing_leg in {"long", "short", "both"}:
+            return missing_leg
+        reason = str(
+            reconciliation.get("last_evidence_gap_reason")
+            or reconciliation.get("evidence_gap_reason")
+            or reconciliation.get("reason")
+            or ""
+        )
+        if "missing_both_close_trade_statement" in reason:
+            return "both"
+        if "missing_long_close_trade_statement" in reason:
+            return "long"
+        if "missing_short_close_trade_statement" in reason:
+            return "short"
+        return ""
+
+    def _archive_terminal_flat_pending_close_reconciliation(
+        self,
+        reconciliation: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> bool:
+        exchange_truth = self._current_exchange_truth_for_close_reconciliation(
+            reconciliation
+        )
+        if not isinstance(exchange_truth, dict):
+            return False
+        contract = classify_close_reconciliation_state(
+            reconciliation,
+            current_exchange_truth_clean=True,
+        )
+        if contract.get("archive_reconciliation") is not True:
+            return False
+        state = str(contract.get("state") or "")
+        if state != "terminal_flat_accounting_gap":
+            return False
+
+        snapshot = reconciliation.get("position_snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        symbol = str(
+            reconciliation.get("symbol") or snapshot.get("symbol") or ""
+        ).upper()
+        evidence_gap_reason = str(
+            reconciliation.get("last_evidence_gap_reason")
+            or reconciliation.get("evidence_gap_reason")
+            or contract.get("reason")
+            or "terminal_flat_accounting_gap"
+        )
+        missing_leg = self._missing_leg_from_reconciliation(reconciliation)
+        truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
+        payload = {
+            "position_id": reconciliation.get("position_id", ""),
+            "symbol": symbol,
+            "candidate_owner_id": reconciliation.get(
+                "candidate_owner_id",
+                reconciliation.get("position_id", ""),
+            ),
+            "missing_leg": missing_leg,
+            "evidence_gap_reason": evidence_gap_reason,
+            "next_attempt_ms": reconciliation.get("next_attempt_ms", 0),
+            "source": reconciliation.get(
+                "source",
+                "pending_close_reconciliation",
+            ),
+            "close_reconciliation_state": state,
+            "archive_reconciliation": True,
+            "exchange_truth_hash": truth_hash,
+        }
+        archive_key = (
+            self._close_reconciliation_archive_key(
+                payload,
+                truth_hash=truth_hash,
+            )
+            if truth_hash
+            else ""
+        )
+        archive_already_emitted = bool(
+            archive_key
+            and archive_key in self._close_reconciliation_archive_emitted_keys
+        )
+
+        reconciliation["close_reconciliation_state"] = state
+        reconciliation["archived"] = True
+        reconciliation["archive_reason"] = state
+        reconciliation["business_contract_action"] = state
+        reconciliation["exchange_truth"] = dict(exchange_truth)
+        reconciliation["last_partial_reconciled_at_ms"] = now_ms
+        if missing_leg:
+            reconciliation["missing_leg"] = missing_leg
+        if evidence_gap_reason:
+            reconciliation["last_evidence_gap_reason"] = evidence_gap_reason
+        if truth_hash:
+            reconciliation["exchange_truth_hash"] = truth_hash
+        if archive_key:
+            reconciliation["archive_key"] = archive_key
+        original_payload = reconciliation.get("original_payload")
+        if not isinstance(original_payload, dict):
+            original_payload = {}
+        original_payload["exchange_truth"] = dict(exchange_truth)
+        reconciliation["original_payload"] = original_payload
+
+        if not archive_already_emitted:
+            self.ctx.journal.append(
+                "reconciliation.pending_close_backfill_archived",
+                payload,
+            )
+            if archive_key:
+                self._close_reconciliation_archive_emitted_keys.add(archive_key)
+        return True
+
     def _current_exchange_truth_for_close_reconciliation(
         self,
         reconciliation: dict[str, Any],
@@ -942,6 +1056,12 @@ class CloseRuntime:
             created_cycle = int(reconciliation.get("created_cycle") or 0)
             if current_cycle != 0 and created_cycle >= current_cycle:
                 retained.append(reconciliation)
+                continue
+            if self._archive_terminal_flat_pending_close_reconciliation(
+                reconciliation,
+                now_ms=now_ms,
+            ):
+                changed = True
                 continue
             if int(reconciliation.get("next_attempt_ms") or 0) > now_ms:
                 retained.append(reconciliation)

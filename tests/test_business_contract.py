@@ -358,6 +358,44 @@ def _account_level_flat_truth(*venues: str) -> dict:
     }
 
 
+def _recovery_ledger_flat_truth(symbol: str, *venues: str) -> dict:
+    return {
+        "truth_supported": True,
+        "truth_available": True,
+        "positions": [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "side": "buy",
+                "quantity": 0.0,
+                "entry_price": 0.0,
+            }
+            for venue in venues
+        ],
+        "open_orders": [],
+        "probe_evidence": [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_position",
+                "method": "fetch_position",
+                "classification": "position_truth",
+            }
+            for venue in venues
+        ]
+        + [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_open_orders",
+                "method": "fetch_open_orders",
+                "classification": "open_order_truth",
+            }
+            for venue in venues
+        ],
+    }
+
+
 def test_close_reconciliation_exchange_truth_accepts_account_level_flat_probe():
     reconciliation = {
         "position_id": "entry-h",
@@ -368,6 +406,30 @@ def test_close_reconciliation_exchange_truth_accepts_account_level_flat_probe():
         "last_evidence_gap_reason": "missing_long_close_trade_statement",
     }
     truth = _account_level_flat_truth("bybit", "okx")
+
+    assert (
+        close_reconciliation_exchange_truth(
+            reconciliation,
+            current_exchange_truth=truth,
+        )
+        is truth
+    )
+    assert close_reconciliation_exchange_truth_clean(
+        reconciliation,
+        current_exchange_truth=truth,
+    ) is True
+
+
+def test_close_reconciliation_exchange_truth_accepts_recovery_ledger_flat_probe():
+    reconciliation = {
+        "position_id": "entry-h",
+        "symbol": "HUSDT",
+        "long_venue": "bybit",
+        "short_venue": "okx",
+        "pending_backfill": True,
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+    }
+    truth = _recovery_ledger_flat_truth("HUSDT", "bybit", "okx")
 
     assert (
         close_reconciliation_exchange_truth(

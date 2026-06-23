@@ -606,6 +606,50 @@ def _account_level_flat_exchange_truth(*, venues: list[Venue] | tuple[Venue, ...
     }
 
 
+def _recovery_ledger_flat_exchange_truth(
+    *,
+    symbol: str,
+    venues: list[Venue] | tuple[Venue, ...],
+) -> dict:
+    venue_values = [venue.value for venue in venues]
+    return {
+        "truth_supported": True,
+        "truth_available": True,
+        "positions": [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "side": "buy",
+                "quantity": 0.0,
+                "entry_price": 0.0,
+            }
+            for venue in venue_values
+        ],
+        "open_orders": [],
+        "probe_evidence": [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_position",
+                "method": "fetch_position",
+                "classification": "position_truth",
+            }
+            for venue in venue_values
+        ]
+        + [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_open_orders",
+                "method": "fetch_open_orders",
+                "classification": "open_order_truth",
+            }
+            for venue in venue_values
+        ],
+        "source": "recovery_ledger_exchange_truth",
+    }
+
+
 def _pending_entry(**overrides):
     values = dict(
         pending_id="entry-v1-drift",
@@ -1564,6 +1608,78 @@ async def test_pending_close_reconciliation_uses_account_level_flat_truth(
     assert reconciled[0]["missing_leg_terminality"] == (
         "flat_by_position_truth_no_trade_statement"
     )
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_archives_recovery_ledger_truth_before_backoff(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    symbol = "HUSDT"
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _CloseLegMissingStatementAdapter(Venue.BYBIT, {}),
+            Venue.OKX: _CloseLegMissingStatementAdapter(Venue.OKX, {}),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime._last_recovery_exchange_truth = _recovery_ledger_flat_exchange_truth(
+        symbol=symbol,
+        venues=[Venue.BYBIT, Venue.OKX],
+    )
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(
+            position_id="entry-husdt",
+            symbol=symbol,
+            created_cycle=1,
+            next_attempt_ms=600_000,
+            pending_backfill=True,
+            missing_leg="long",
+            last_evidence_gap_reason="missing_long_close_trade_statement",
+            close_reconciliation_state="truth_unavailable",
+            long_venue=Venue.BYBIT.value,
+            short_venue=Venue.OKX.value,
+            position_snapshot={
+                "position_id": "entry-husdt",
+                "symbol": symbol,
+                "long_venue": Venue.BYBIT.value,
+                "short_venue": Venue.OKX.value,
+            },
+            long_legs=[{
+                "venue": Venue.BYBIT.value,
+                "order_id": "bybit-close-order",
+                "client_order_id": "bybit-close-cid",
+            }],
+            short_legs=[{
+                "venue": Venue.OKX.value,
+                "order_id": "okx-close-order",
+                "client_order_id": "okx-close-cid",
+            }],
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert [
+        record
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ] == []
+    archived = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["symbol"] == symbol
+    assert archived[0]["missing_leg"] == "long"
+    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert archived[0]["archive_reconciliation"] is True
 
 
 @pytest.mark.asyncio
