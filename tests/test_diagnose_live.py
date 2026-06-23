@@ -1337,6 +1337,8 @@ def test_run_diagnose_resolves_aster_5018_when_headroom_admission_blocked(monkey
                     "evidence_gap": False,
                     "requested_notional": 30.0,
                     "remaining_openable_notional": 10.0,
+                    "notional_gap": 20.0,
+                    "leverage": 4,
                 },
             },
         ])
@@ -1361,6 +1363,20 @@ def test_run_diagnose_resolves_aster_5018_when_headroom_admission_blocked(monkey
             "max_notional_admission_blocked": 1
         }
         assert cooldown_summary["scope_counts"] == {"symbol_and_venue": 1}
+        assert cooldown_summary["top_blocked_symbols"] == [
+            {
+                "venue": "aster",
+                "symbol": "LABUSDT",
+                "count": 1,
+                "requested_notional": 30.0,
+                "remaining_openable_notional": 10.0,
+                "notional_gap": 20.0,
+                "reasons": {"max_notional_admission_blocked": 1},
+            }
+        ]
+        assert cooldown_summary["advice_counts"] == {
+            "check_aster_account_leverage_position_limit_or_capital": 1
+        }
         assert result["production_acceptance_gate"]["gate_passed"] is True
     finally:
         import shutil
@@ -7048,6 +7064,7 @@ def test_diagnostic_noise_summary_does_not_double_count_resolved_close_artifact(
             "payload": {
                 "position_id": "entry-close",
                 "symbol": "CLOSEUSDT",
+                "client_order_id": "close-order-1",
                 "exchange_code": "-2022",
                 "request_context": {"reduce_only": True},
             },
@@ -7067,7 +7084,13 @@ def test_diagnostic_noise_summary_does_not_double_count_resolved_close_artifact(
         production_acceptance_gate=gate,
         business_progression_quality_summary={},
         resolved_close_order_error_summary={
+            "count": 1,
             "reduce_only_terminal_flat_count": 1,
+            "current_exchange_truth_clean": True,
+            "resolved_identities": [
+                "client_order_id:close-order-1",
+                "position_id:entry-close",
+            ],
         },
     )
 
@@ -7100,6 +7123,86 @@ def test_diagnostic_noise_summary_does_not_historicalize_close_artifacts_when_tr
     assert summary["resolved_close_artifact_count"] == 0
     assert summary["visibility_counts"] == {"current_blocker": 2}
     assert summary["current_blocker_count"] == 2
+    assert summary["historical_terminal_reason_counts"] == {}
+    assert summary["samples"][0]["reason"] == "unresolved_close_artifact"
+
+
+def test_resolved_close_order_error_summary_requires_order_identity_match_for_reduce_only():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-close",
+                "symbol": "CLOSEUSDT",
+                "terminal_state": "flat",
+                "problem": False,
+            },
+        },
+        {
+            "ts_ms": 1_100,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-close",
+                "symbol": "CLOSEUSDT",
+                "venue": "binance",
+                "exchange_code": "-2022",
+                "reason": "HTTP 400: ReduceOnly Order is rejected.",
+                "request_context": {"reduce_only": True},
+            },
+        },
+    ]
+
+    summary = dl._build_resolved_close_order_error_summary(
+        events,
+        _flat_exchange_truth("/unused", ["CLOSEUSDT"], ["binance"]),
+    )
+
+    assert summary["count"] == 0
+    assert summary["reduce_only_terminal_flat_count"] == 0
+
+
+def test_diagnostic_noise_summary_keeps_unmatched_reduce_only_as_current_blocker():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_100,
+            "kind": "order.rejected",
+            "payload": {
+                "position_id": "entry-close",
+                "symbol": "CLOSEUSDT",
+                "venue": "binance",
+                "exchange_code": "-2022",
+                "reason": "HTTP 400: ReduceOnly Order is rejected.",
+                "request_context": {"reduce_only": True},
+            },
+        },
+    ]
+    gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "entry_outcome_summary": {"phase_duration_summary": {}},
+        "resolved_order_truth_gap_count": 0,
+    }
+
+    summary = dl._build_diagnostic_noise_summary(
+        events,
+        production_acceptance_gate=gate,
+        business_progression_quality_summary={},
+        resolved_close_order_error_summary={
+            "count": 0,
+            "reduce_only_terminal_flat_count": 0,
+            "current_exchange_truth_clean": True,
+        },
+    )
+
+    assert summary["visibility_counts"] == {"current_blocker": 1}
+    assert summary["current_blocker_count"] == 1
     assert summary["historical_terminal_reason_counts"] == {}
     assert summary["samples"][0]["reason"] == "unresolved_close_artifact"
 
@@ -7220,6 +7323,7 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
                 "position_id": "entry-h",
                 "symbol": "HUSDT",
                 "venue": "binance",
+                "client_order_id": "close-reduce-1",
                 "exchange_code": "-2022",
                 "reason": "ReduceOnly Order is rejected.",
                 "request_context": {"reduce_only": True},
@@ -7232,6 +7336,7 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
                 "position_id": "entry-h",
                 "symbol": "HUSDT",
                 "venue": "binance",
+                "client_order_id": "close-post-1",
                 "exchange_code": "-5022",
                 "reason": "Post Only order will be rejected.",
                 "request_context": {"post_only": True, "reduce_only": True},
@@ -7244,6 +7349,7 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
                 "position_id": "entry-h",
                 "symbol": "HUSDT",
                 "venue": "bybit",
+                "client_order_id": "close-zero-1",
                 "reason": "zero fill order uncertain",
             },
         },
@@ -7254,6 +7360,7 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
                 "position_id": "entry-h",
                 "symbol": "HUSDT",
                 "venue": "bybit",
+                "client_order_id": "close-duplicate-1",
                 "exchange_code": "110072",
                 "exchange_msg": "OrderLinkedID is duplicate",
             },
@@ -7320,10 +7427,29 @@ def test_diagnostic_noise_summary_splits_flat_window_close_admission_and_catalog
         events,
         production_acceptance_gate=gate,
         business_progression_quality_summary={},
+        resolved_truth_gap_summary={
+            "count": 1,
+            "current_exchange_truth_clean": True,
+            "resolved_identities": [
+                "client_order_id:close-duplicate-1",
+                "client_ref:close-duplicate-1",
+            ],
+        },
         resolved_close_order_error_summary={
+            "count": 3,
+            "current_exchange_truth_clean": True,
             "post_only_boundary_reject_count": 1,
             "reduce_only_terminal_flat_count": 1,
             "zero_fill_terminal_flat_count": 1,
+            "resolved_identities": [
+                "position_id:entry-h",
+                "client_order_id:close-post-1",
+                "client_ref:close-post-1",
+                "client_order_id:close-reduce-1",
+                "client_ref:close-reduce-1",
+                "client_order_id:close-zero-1",
+                "client_ref:close-zero-1",
+            ],
         },
     )
 

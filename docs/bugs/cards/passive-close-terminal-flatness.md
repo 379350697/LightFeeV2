@@ -127,8 +127,11 @@ Diagnostic visibility is part of the same terminal-truth contract. Resolved
 close/order artifacts such as Binance close `-2022`, Binance close post-only
 `-5022`, Bybit duplicate `110072`, ACK-only, and zero-fill may be
 `historical_terminal_evidence` only after current exchange truth proves
-flat/no-open-orders. If that truth is unavailable or dirty, the artifact stays
-a current blocker. Quote stale and quote rewarm terminal stale are
+flat/no-open-orders. Reduce-only and zero-fill artifacts also need a strong
+order/client identity match to terminal close evidence before diagnostics may
+downgrade them; a same-position terminal event without order identity is not
+enough. If that truth is unavailable, dirty, or identity cannot be matched, the
+artifact stays a current blocker. Quote stale and quote rewarm terminal stale are
 `current_admission_blocker` records, not current exposure. Unsupported-symbol
 position/open-order probe records from venue catalog scope are
 `catalog_diagnostic`; they stay visible for audit but do not block the gate.
@@ -187,6 +190,7 @@ alone is not success evidence.
 | 2026-06-20 | Compensation already-flat lifecycle mapping | local green, deploy pending | Post-deploy strict review found `exit.compensation_already_flat` could remain a V1 lifecycle unmapped tail even though it means the passive-close compensation branch already has flat truth. The follow-up maps it through `classify_business_event_kind(...)` to V1 `PASSIVE_CLOSE`, `terminal_flat_already_proven`, action `record_compensation_terminal_flat`, so terminal-flat evidence is preserved without creating current risk or suppressing true non-flat blockers. |
 | 2026-06-21 | Binance close 5022/2022 and exit dual-taker semantic split | `9dee9f3` deployed/cloud verified; terminal quantity-warning residual fixed locally, deploy pending | CL-105 adds BBO guard + post-submit 5022 classification for passive close. Zero-progress high-slippage chunks may rotate to the opposite maker leg; partial-progress chunks preserve fill accounting and arm `DUAL_TAKER`. Binance `-2022` close rejects now adopt an existing matching reduce-only close order before retry/fail-closed. Passive-close `execution.dual_taker_armed` carries `execution_kind=exit` and maps to V1 `PASSIVE_CLOSE`, while entry fallback remains `PENDING_ENTRY`. Cloud baseline `9dee9f3` verified flat/no-open-orders, services green, `gate_passed=true`, and no exact `-5022`/`-2022` recurrence. |
 | 2026-06-21 | Terminal-zero truth-probe retain-pending split from maker submit errors | local green, deploy pending | Latest cloud showed one `exit.passive_close_maker_submit_error` whose payload was not an exchange submit failure: `reason=terminal_zero_qty_live_truth_not_flat`, `decision=retain_pending`, followed by terminal close resolution and clean exchange truth. Diagnose now splits this shape into `truth_probe_retain_pending_*` terminal-zero summary fields and filters it from `order_error_evidence` only after same-position terminal evidence; unproven maker submit errors remain active. |
+| 2026-06-23 | Close artifact diagnostic downgrade requires trusted identity | local green, deploy pending | CL-110 tightens Binance/Aster `-2022` and zero-fill diagnostic downgrade: clean exchange truth plus same-position terminal flat is not enough without same-order/client identity. `diagnostic_noise_summary` now trusts only resolved truth-gap, terminal-zero-qty, or close-terminal summaries; unmatched artifacts remain `current_blocker/unresolved_close_artifact`. `reconciliation.pending_close_exchange_truth_refreshed` maps to V1 `PASSIVE_CLOSE`. |
 
 ## Recurrences
 
@@ -204,6 +208,7 @@ alone is not success evidence.
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 | 2026-06-19 | `GENIUSUSDT` Bybit reduce-only close owner | `106f47e` | deployed terminal-truth gates pass; waiting-event evidence payload now local to the event | [daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](../daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption) |
 | 2026-06-21 | `HOMEUSDT`, `ESPORTSUSDT`, Binance close `-5022`/`-2022` families | `cfd0644`, deployed baseline `9dee9f3`, terminal quantity-warning residual fixed locally | cloud baseline flat/no-open-orders, no exact `-5022`/`-2022`, and passive close artifacts resolved; residual root fix closes min-notional lifecycle and terminal/unopened quantity warning diagnostics | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
+| 2026-06-23 | Binance/Aster reduce-only diagnostic noise and pending-close exchange-truth refresh mapping | working tree | local green; deploy pending | [daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics](../daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics) |
 
 ## Regression Harness
 

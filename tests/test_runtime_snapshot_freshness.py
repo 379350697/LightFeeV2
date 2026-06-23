@@ -273,6 +273,8 @@ def test_ws_bbo_provider_resolves_stale_sidecar_quote_for_entry_freshness(tmp_pa
     assert {payload["venue"] for payload in resolved} == {"okx", "bybit"}
     assert all(payload["source"] == "ws_bbo_quote_lease" for payload in resolved)
     assert all(payload["sidecar_reason"] == "quote_stale" for payload in resolved)
+    assert all(payload["ws_bbo_lease_hit"] is True for payload in resolved)
+    assert all(payload["rest_revalidate_hit"] is False for payload in resolved)
     assert runtime._last_snapshot_freshness_filter_blockers["quote_stale"] == 0
     assert metrics["okx|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
     assert metrics["bybit|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
@@ -825,6 +827,10 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
         "bybit_rest_topbook": 1,
         "okx_rest_topbook": 1,
     }
+    assert {payload["rest_revalidate_hit"] for payload in resolved_payloads} == {True}
+    assert {payload["rest_revalidate_terminal_stale"] for payload in resolved_payloads} == {False}
+    assert {payload["ws_bbo_lease_hit"] for payload in resolved_payloads} == {False}
+    assert {payload["sidecar_reason"] for payload in resolved_payloads} == {"quote_stale"}
     assert {payload["source"] for payload in resolved_payloads} == {
         "bybit_rest_topbook",
         "okx_rest_topbook",
@@ -1456,6 +1462,10 @@ async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucke
     }
     assert all(payload["rest_quote_observed_at_ms"] == now_ms - 250 for payload in failures)
     assert all(payload["rest_quote_age_ms"] == 250 for payload in failures)
+    assert all(payload["rest_revalidate_hit"] is True for payload in failures)
+    assert all(payload["rest_revalidate_terminal_stale"] is True for payload in failures)
+    assert all(payload["ws_bbo_lease_hit"] is False for payload in failures)
+    assert all(payload["sidecar_reason"] == "quote_stale" for payload in failures)
     assert all(payload["rest_quote_bid"] == pytest.approx(100.0) for payload in failures)
     assert all(payload["rest_quote_ask"] == pytest.approx(101.0) for payload in failures)
     scheduled = [

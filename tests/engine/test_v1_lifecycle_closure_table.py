@@ -605,6 +605,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "execution.min_notional_accumulating",
         "execution.min_notional_abort_and_flatten",
         "execution.pending_entry_hedge_chunk_buffering",
+        "reconciliation.pending_close_exchange_truth_refreshed",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -656,6 +657,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("execution.min_notional_accumulating") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.min_notional_abort_and_flatten") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.pending_entry_hedge_chunk_buffering") == "PENDING_ENTRY"
+    assert (
+        map_lifecycle_event_kind("reconciliation.pending_close_exchange_truth_refreshed")
+        == "PASSIVE_CLOSE"
+    )
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

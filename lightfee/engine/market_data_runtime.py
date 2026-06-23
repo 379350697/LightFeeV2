@@ -1621,6 +1621,7 @@ class MarketDataRuntime:
         if callable(refresh_quote_result) or callable(refresh_quote):
             for key, target in list(unresolved.items()):
                 stats["rest_attempt_count"] += 1
+                target["rest_revalidate_attempted"] = True
                 refreshed = None
                 try:
                     if callable(refresh_quote_result):
@@ -1656,6 +1657,9 @@ class MarketDataRuntime:
                             target["venue"],
                             target["symbol"],
                             now_ms=now_ms,
+                        )
+                        target["rest_outcome"] = (
+                            "resolved" if refreshed is not None else "missing_quote"
                         )
                 except Exception as exc:  # pragma: no cover - defensive telemetry
                     target["rest_error"] = f"{type(exc).__name__}: {exc}"[:240]
@@ -1708,11 +1712,14 @@ class MarketDataRuntime:
                 (item for item in targets if (item["venue"], item["symbol"]) == key),
                 {"venue": key[0], "symbol": key[1]},
             )
+            rest_revalidate_attempted = bool(
+                target.get("rest_revalidate_attempted")
+            ) or bool(str(target.get("rest_outcome") or ""))
             payload = {
                 **target,
                 "source": source,
                 "reason_bucket": "rest_resolved"
-                if str(target.get("rest_outcome") or "")
+                if rest_revalidate_attempted
                 else "fresh_ws_quote",
                 "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
                 "received_at_ms": int(getattr(quote, "received_at_ms", 0) or 0),
@@ -1725,6 +1732,10 @@ class MarketDataRuntime:
                 ),
                 "quote_bid": float(getattr(quote, "bid", 0.0) or 0.0),
                 "quote_ask": float(getattr(quote, "ask", 0.0) or 0.0),
+                "sidecar_reason": str(target.get("reason") or ""),
+                "ws_bbo_lease_hit": not rest_revalidate_attempted,
+                "rest_revalidate_hit": rest_revalidate_attempted,
+                "rest_revalidate_terminal_stale": False,
                 "outcome": "resolved",
                 "ts_ms": now_ms,
             }
@@ -1828,6 +1839,16 @@ class MarketDataRuntime:
                 "reason_family": reason_family,
                 "quote_validation_reject_reason": str(
                     target.get("quote_validation_reject_reason") or ""
+                ),
+                "sidecar_reason": str(target.get("reason") or ""),
+                "ws_bbo_lease_hit": False,
+                "rest_revalidate_attempted": bool(
+                    target.get("rest_revalidate_attempted")
+                ),
+                "rest_revalidate_hit": rest_outcome == "resolved",
+                "rest_revalidate_terminal_stale": (
+                    rest_outcome == "resolved"
+                    and str(target.get("quote_validation_reject_reason") or "") == "stale"
                 ),
                 "rest_quote_observed_at_ms": target.get("rest_quote_observed_at_ms"),
                 "rest_quote_received_at_ms": target.get("rest_quote_received_at_ms"),
@@ -2757,6 +2778,9 @@ class MarketDataRuntime:
             "sidecar_observed_at_ms": int(sidecar_observed_at_ms or 0),
             "sidecar_age_ms": int(sidecar_age_ms or 0),
             "sidecar_budget_ms": int(sidecar_budget_ms or 0),
+            "ws_bbo_lease_hit": True,
+            "rest_revalidate_hit": False,
+            "rest_revalidate_terminal_stale": False,
             "ws_bbo_source": str(getattr(quote, "source", "") or ""),
             "quote_bid": bid,
             "quote_ask": ask,
@@ -2787,6 +2811,8 @@ class MarketDataRuntime:
         age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
         bid = float(getattr(quote, "bid", 0.0) or 0.0)
         ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        quote_source = str(getattr(quote, "source", "") or "")
+        rest_revalidate_hit = "rest" in quote_source.lower()
         reason = (
             "last_good_revalidated_by_entry_quote_truth"
             if sidecar_reason == "last_good_sidecar"
@@ -2816,7 +2842,10 @@ class MarketDataRuntime:
             "sidecar_observed_at_ms": int(sidecar_observed_at_ms or 0),
             "sidecar_age_ms": int(sidecar_age_ms or 0),
             "sidecar_budget_ms": int(sidecar_budget_ms or 0),
-            "entry_quote_truth_source": str(getattr(quote, "source", "") or ""),
+            "ws_bbo_lease_hit": not rest_revalidate_hit,
+            "rest_revalidate_hit": rest_revalidate_hit,
+            "rest_revalidate_terminal_stale": False,
+            "entry_quote_truth_source": quote_source,
             "quote_bid": bid,
             "quote_ask": ask,
             "quote_bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),

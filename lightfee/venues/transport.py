@@ -5640,6 +5640,12 @@ class VenueTransport(MarketDataClient):
         evidence_gap: bool,
         error: str = "",
     ) -> None:
+        notional_gap: float | None = None
+        if remaining_openable_notional is not None:
+            notional_gap = max(
+                float(requested_notional) - float(remaining_openable_notional),
+                0.0,
+            )
         payload: dict[str, Any] = {
             "venue": Venue.ASTER.value,
             "symbol": venue_sym,
@@ -5647,6 +5653,7 @@ class VenueTransport(MarketDataClient):
             "source": source,
             "requested_notional": requested_notional,
             "remaining_openable_notional": remaining_openable_notional,
+            "notional_gap": notional_gap,
             "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
             "order_role": order_role,
             "cooldown_scope": "symbol_and_venue",

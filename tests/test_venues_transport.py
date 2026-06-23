@@ -5174,6 +5174,8 @@ class TestV1PassiveBusinessFlowParity:
         assert payload["source"] == "aster_headroom_precheck"
         assert payload["requested_notional"] == 30.0
         assert payload["remaining_openable_notional"] == 10.0
+        assert payload["notional_gap"] == 20.0
+        assert payload["leverage"] == 4
         assert payload["cooldown_scope"] == "symbol_and_venue"
 
     @pytest.mark.asyncio
@@ -9621,6 +9623,8 @@ class TestPassivePreflight:
         assert block["kind"] == "runtime.entry_admission_blocked"
         assert block["payload"]["source"] == "aster_headroom_pre_entry_precheck"
         assert block["payload"]["remaining_openable_notional"] == 0.0
+        assert block["payload"]["notional_gap"] == pytest.approx(23.0)
+        assert block["payload"]["leverage"] == 4
 
 
 # ====================================================================# Root Fix: Journal Evidence Tests

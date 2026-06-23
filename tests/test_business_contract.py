@@ -898,9 +898,43 @@ def test_close_order_error_resolution_requires_clean_exchange_truth():
         has_order_identity=False,
     )
 
-    assert clean["resolved"] is True
-    assert clean["resolution_bucket"] == "reduce_only_terminal_flat"
+    assert clean["resolved"] is False
     assert dirty["resolved"] is False
+
+
+def test_close_order_error_resolution_requires_order_identity_match_for_reduce_only():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "SAHARAUSDT",
+        "venue": "binance",
+        "client_order_id": "close-leg-1",
+        "exchange_code": "-2022",
+        "reason": "HTTP 400: ReduceOnly Order is rejected.",
+        "request_context": {"reduce_only": True},
+    }
+
+    unmatched = close_order_error_resolution_contract(
+        kind="order.rejected",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=False,
+        has_order_identity=True,
+    )
+    matched = close_order_error_resolution_contract(
+        kind="order.rejected",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert unmatched["resolved"] is False
+    assert matched == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
 
 
 def test_close_order_error_resolution_reads_nested_exchange_error_payload():
@@ -925,8 +959,7 @@ def test_close_order_error_resolution_reads_nested_exchange_error_payload():
         has_order_identity=False,
     )
 
-    assert result["resolved"] is True
-    assert result["resolution_bucket"] == "reduce_only_terminal_flat"
+    assert result["resolved"] is False
 
 
 def test_close_order_error_resolution_requires_reduce_only_context():

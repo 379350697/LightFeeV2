@@ -815,10 +815,7 @@ def close_order_error_resolution_contract(
             "resolution_bucket": "post_only_boundary_reject",
         }
     if reduce_only or zero_fill:
-        resolved = bool(
-            order_terminal_match
-            or (not has_order_identity and position_terminal_match)
-        )
+        resolved = bool(order_terminal_match)
         return {
             "resolved": resolved,
             "resolution_bucket": (

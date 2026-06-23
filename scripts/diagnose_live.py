@@ -2449,10 +2449,7 @@ def _order_error_resolved_by_close_terminal_truth(
         _payload_is_reduce_only_terminal_flat_reject(payload)
         or _payload_is_zero_fill_terminal_flat(payload)
     ):
-        return bool(
-            order_terminal_match
-            or (not order_identities and position_terminal_match)
-        )
+        return bool(order_terminal_match)
     return False
 
 
@@ -4998,10 +4995,21 @@ def _build_duplicate_close_leg_suppressed_summary(
 def _build_entry_admission_cooldown_summary(
     events: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    def optional_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
     reason_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
     scope_counts: dict[str, int] = {}
     venue_symbol_counts: dict[str, int] = {}
+    advice_counts: dict[str, int] = {}
+    symbol_rollups: dict[str, dict[str, Any]] = {}
     samples: list[dict[str, Any]] = []
     total = 0
     for rec in events:
@@ -5031,6 +5039,39 @@ def _build_entry_admission_cooldown_summary(
         if venue or symbol:
             key = f"{venue}:{symbol}" if symbol else f"{venue}:*"
             venue_symbol_counts[key] = venue_symbol_counts.get(key, 0) + 1
+            rollup = symbol_rollups.setdefault(
+                key,
+                {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "count": 0,
+                    "requested_notional": 0.0,
+                    "remaining_openable_notional": None,
+                    "notional_gap": 0.0,
+                    "reasons": {},
+                },
+            )
+            rollup["count"] += 1
+            rollup["reasons"][reason] = rollup["reasons"].get(reason, 0) + 1
+            requested_notional = optional_float(payload.get("requested_notional"))
+            remaining_notional = optional_float(payload.get("remaining_openable_notional"))
+            notional_gap = optional_float(payload.get("notional_gap"))
+            if requested_notional is not None:
+                rollup["requested_notional"] += requested_notional
+            if remaining_notional is not None:
+                current_remaining = rollup.get("remaining_openable_notional")
+                rollup["remaining_openable_notional"] = (
+                    remaining_notional
+                    if current_remaining is None
+                    else min(float(current_remaining), remaining_notional)
+                )
+            if notional_gap is None and requested_notional is not None and remaining_notional is not None:
+                notional_gap = max(requested_notional - remaining_notional, 0.0)
+            if notional_gap is not None:
+                rollup["notional_gap"] += notional_gap
+        if venue == "aster" and reason == "max_notional_admission_blocked":
+            advice = "check_aster_account_leverage_position_limit_or_capital"
+            advice_counts[advice] = advice_counts.get(advice, 0) + 1
         if len(samples) < 12:
             samples.append({
                 "ts_ms": rec.get("ts_ms", 0),
@@ -5042,13 +5083,23 @@ def _build_entry_admission_cooldown_summary(
                 "cooldown_scope": scope,
                 "blocked_until_ms": int(payload.get("blocked_until_ms") or 0),
                 "evidence_gap": payload.get("evidence_gap"),
+                "requested_notional": payload.get("requested_notional"),
+                "remaining_openable_notional": payload.get("remaining_openable_notional"),
+                "notional_gap": payload.get("notional_gap"),
+                "leverage": payload.get("leverage"),
             })
+    top_blocked_symbols = sorted(
+        symbol_rollups.values(),
+        key=lambda item: (-int(item.get("count", 0) or 0), str(item.get("venue") or ""), str(item.get("symbol") or "")),
+    )[:12]
     return {
         "count": total,
         "reason_counts": dict(sorted(reason_counts.items())),
         "source_counts": dict(sorted(source_counts.items())),
         "scope_counts": dict(sorted(scope_counts.items())),
         "venue_symbol_counts": dict(sorted(venue_symbol_counts.items())),
+        "top_blocked_symbols": top_blocked_symbols,
+        "advice_counts": dict(sorted(advice_counts.items())),
         "samples": samples,
     }
 
@@ -5713,6 +5764,7 @@ def _build_diagnostic_noise_summary(
     *,
     production_acceptance_gate: dict[str, Any] | None,
     business_progression_quality_summary: dict[str, Any],
+    resolved_truth_gap_summary: dict[str, Any] | None = None,
     resolved_close_order_error_summary: dict[str, Any] | None = None,
     resolved_terminal_zero_qty_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -5730,6 +5782,11 @@ def _build_diagnostic_noise_summary(
     resolved_terminal_zero_qty = (
         resolved_terminal_zero_qty_summary
         if isinstance(resolved_terminal_zero_qty_summary, dict)
+        else {}
+    )
+    resolved_truth_gaps = (
+        resolved_truth_gap_summary
+        if isinstance(resolved_truth_gap_summary, dict)
         else {}
     )
     raw_resolved_close_artifact_count = int(
@@ -5827,6 +5884,33 @@ def _build_diagnostic_noise_summary(
             "symbol": str(payload.get("symbol") or "").upper(),
             "scope": str(contract.get("scope") or ""),
         }
+        if (
+            kind in ORDER_ERROR_KINDS
+            and visibility == "historical_terminal_evidence"
+            and sample["reason"] == "resolved_close_artifact_after_terminal_truth"
+        ):
+            trusted_resolution = (
+                _order_error_resolved_by_truth_gap(payload, resolved_truth_gaps)
+                or _order_error_resolved_by_terminal_zero_qty(
+                    payload,
+                    resolved_terminal_zero_qty,
+                )
+                or _order_error_resolved_by_close_terminal_truth(
+                    payload,
+                    resolved_close_errors,
+                )
+            )
+            if not trusted_resolution:
+                contract = {
+                    **contract,
+                    "visibility": "current_blocker",
+                    "reason": "unresolved_close_artifact",
+                    "blocks_gate": True,
+                    "requires_operator_action": True,
+                }
+                visibility = "current_blocker"
+                sample["visibility"] = visibility
+                sample["reason"] = "unresolved_close_artifact"
         if sample["reason"] == "current_single_leg_or_risk_only_exposure":
             raw_current_risk_only_count += 1
         if (
@@ -7442,6 +7526,7 @@ def run_diagnose(
         all_events,
         production_acceptance_gate=production_acceptance_gate,
         business_progression_quality_summary=business_progression_quality_summary,
+        resolved_truth_gap_summary=resolved_order_truth_gap_summary,
         resolved_close_order_error_summary=resolved_close_order_error_summary,
         resolved_terminal_zero_qty_summary=resolved_terminal_zero_qty_summary,
     )
