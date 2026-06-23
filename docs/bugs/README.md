@@ -18,6 +18,49 @@ If no existing card matches, write the daily entry first. Add a new card only
 when the failure family has recurred, is likely to recur, or contains a partial
 or ineffective fix that future debugging must not repeat.
 
+## Ledger Layers
+
+The bug ledger has three responsibilities:
+
+- `daily/YYYY-MM-DD.md`: full evidence, root cause, fix details, verification,
+  and acceptance state for each cluster.
+- `cards/*.md` and `contracts/*.md`: recurring family rules, invariants, and the
+  first place to look when the same failure shape returns.
+- `BUG_INDEX.md`: recent routing table only. It points to daily ledgers and
+  cards; it must not copy investigation narratives.
+
+`BUG_INDEX.md` keeps the recent window only. The default window begins at
+`2026-06-19`; long-form narratives outside the window belong under
+`docs/bugs/archive/`, currently
+`archive/BUG_INDEX_HISTORY_2026-05-15_to_2026-06-18.md`.
+
+## Status Vocabulary
+
+Use these status phrases consistently in the index and daily acceptance notes:
+
+- `deployed/cloud verified`: deployed code plus cloud or production probes prove
+  the closure condition.
+- `local green; deploy pending`: local tests and harnesses passed, but deployment
+  or cloud proof is still missing.
+- `current cloud watch`: not closed; keep watching live evidence or probes.
+- `blocked`: closure is blocked by missing evidence, missing operator action, or
+  an external prerequisite.
+
+Local green is not closure for production/parity bugs unless the bug is
+explicitly non-production. If a Recent Closures row says `local green`, it must
+also say `deploy pending`.
+
+## Index Discipline
+
+Keep the main index short enough to scan during an incident:
+
+- Add or update one compact Recent Closures row per cluster.
+- Link to daily ledgers for evidence and to cards/contracts for reusable rules.
+- Move long `Latest ...` narratives outside the recent window into
+  `docs/bugs/archive/`.
+- Do not append full root-cause writeups, command output, or investigation
+  timelines to `BUG_INDEX.md`.
+
 ## Minimal Templates
 
 Use these short templates when speed matters. Keep details compact and link to

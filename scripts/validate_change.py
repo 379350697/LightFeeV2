@@ -46,6 +46,15 @@ BASE_STEPS = (
 
 PROFILES: dict[str, tuple[Step, ...]] = {
     "smoke": BASE_STEPS,
+    "bug-docs": (
+        *BASE_STEPS,
+        Step("bug ledger governance", py("scripts/check_bug_ledger.py"), 60),
+        Step(
+            "pytest tests/test_bug_docs_status.py",
+            py("-m", "pytest", "-q", "tests/test_bug_docs_status.py"),
+            120,
+        ),
+    ),
     "close": (
         *BASE_STEPS,
         pytest(

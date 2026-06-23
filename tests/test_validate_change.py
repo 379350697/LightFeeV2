@@ -56,3 +56,15 @@ def test_validate_change_full_profile_excludes_live_probes():
     )
 
     assert "tests/probes" not in result.stdout
+
+
+def test_validate_change_bug_docs_profile_checks_bug_ledger_governance():
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "--profile", "bug-docs", "--dry-run"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "scripts/check_bug_ledger.py" in result.stdout
+    assert "tests/test_bug_docs_status.py" in result.stdout
