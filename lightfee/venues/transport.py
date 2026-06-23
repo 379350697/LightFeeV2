@@ -3955,12 +3955,16 @@ class VenueTransport(MarketDataClient):
                     body["type"] = "LIMIT"
                     body["price"] = _format_decimal(request.price)
                     body["timeInForce"] = "GTC"
+                if spec.venue_id == Venue.BINANCE and body.get("type") == "MARKET":
+                    body["newOrderRespType"] = "RESULT"
                 # V1: Binance/Aster newClientOrderId max 36 chars (FAPI constraint)
                 if request.client_order_id:
                     body["newClientOrderId"] = request.client_order_id[:36]
                 preflight["position_mode"] = (
                     "hedge" if fapi_hedge_mode else "one_way"
                 )
+                if body.get("newOrderRespType"):
+                    preflight["new_order_resp_type"] = body["newOrderRespType"]
                 if "positionSide" in body:
                     preflight["position_side"] = body["positionSide"]
             elif spec.venue_id == Venue.OKX:
@@ -4430,10 +4434,41 @@ class VenueTransport(MarketDataClient):
 
         status_str = str(data.get("status", "")).upper()
         has_fill_status = status_str in ("FILLED", "FINISHED", "CLOSED")
+        terminal_no_fill_status = status_str in {
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+        }
 
         if exec_qty_raw is not None:
             exec_qty = abs(float(exec_qty_raw))
             exec_price = float(exec_price_raw) if exec_price_raw is not None else float(data.get("price", 0))
+            if exec_qty <= 1e-12 and order_id and not (
+                has_fill_status or terminal_no_fill_status
+            ):
+                err = OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    f"order accepted (id={order_id}) with status={status_str or 'unknown'} "
+                    "but terminal fill not confirmed",
+                )
+                accepted_client_order_id = str(
+                    data.get(
+                        "orderLinkId",
+                        data.get(
+                            "clientOrderId",
+                            data.get("clOrdId", request.client_order_id),
+                        ),
+                    )
+                    or request.client_order_id
+                    or ""
+                )
+                err.order_ack_only = True
+                err.accepted_order_id = order_id
+                err.accepted_client_order_id = accepted_client_order_id
+                err.fill_confirmation_missing_fields = ["terminal_fill_status"]
+                err.exchange_response_body = json.dumps(raw, separators=(",", ":"))
+                raise err
         elif has_fill_status:
             exec_qty = abs(float(data.get("size", data.get("quantity", 0))))
             exec_price = float(data.get("price", data.get("avgPrice", 0)))

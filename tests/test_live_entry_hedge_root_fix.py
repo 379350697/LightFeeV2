@@ -1988,6 +1988,24 @@ class _FakeVenueAdapter:
         }
 
 
+class _FilledOrderStatus:
+    def __init__(self, *, quantity: float, status: str = "filled"):
+        self.status = status
+        self.filled_quantity = quantity
+        self.executed_qty = quantity
+
+
+class _OrderStatusVenueAdapter(_FakeVenueAdapter):
+    def __init__(self, venue: Venue, order_status: _FilledOrderStatus | None = None):
+        super().__init__(venue)
+        self.order_status = order_status
+        self._get_order_status_calls: list[tuple[str, str]] = []
+
+    async def get_order_status(self, symbol: str, order_id: str):
+        self._get_order_status_calls.append((symbol, order_id))
+        return self.order_status
+
+
 class _CountingVenueAdapter(_FakeVenueAdapter):
     def __init__(self, venue: Venue):
         super().__init__(venue)
@@ -2657,6 +2675,236 @@ class TestRealPathAbortCleanupDeadline:
         assert [
             call.time_in_force for call in hedge_adapter._place_order_calls
         ] == [TimeInForce.IOC, TimeInForce.IOC]
+
+    @pytest.mark.asyncio
+    async def test_live_truth_hedge_progress_consumes_fifo_before_retry(self, tmp_path):
+        """Live/order truth hedge progress must retire maker slices before retry."""
+
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters = {
+            Venue.BINANCE: _FakeVenueAdapter(Venue.BINANCE),
+            Venue.BYBIT: hedge_adapter,
+        }
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-dexe-live-hedge",
+            symbol="DEXEUSDT",
+            long_status="filled",
+            short_status="filled",
+            short_position=PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="DEXEUSDT",
+                side=Side.SELL,
+                quantity=1.0,
+                entry_price=10.0,
+                observed_at_ms=2100,
+            ),
+        )
+        pending = PendingEntry(
+            pending_id="entry-dexe-live-hedge",
+            symbol="DEXEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            maker_fill_price=10.0,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-dexe",
+            maker_client_order_id="maker-cid-dexe",
+            hedge_client_order_id="hedge-cid-dexe",
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.0,
+                    notional_quote=10.0,
+                    fill_at_ms=1100,
+                )
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(now_ms=2200)
+
+        assert hedge_adapter._place_order_calls == []
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+
+    @pytest.mark.asyncio
+    async def test_recover_poll_order_status_hedge_fill_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _OrderStatusVenueAdapter(
+            Venue.BYBIT,
+            _FilledOrderStatus(quantity=1.0),
+        )
+        runtime._venue_adapters = {Venue.BYBIT: hedge_adapter}
+        pending = PendingEntry(
+            pending_id="entry-order-status-hedge",
+            symbol="DEXEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            maker_fill_price=10.0,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            hedge_order_id="hedge-oid-dexe",
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.0,
+                    notional_quote=10.0,
+                    fill_at_ms=1100,
+                )
+            ],
+        )
+
+        await runtime._recover_poll_order_status(
+            pending.pending_id,
+            pending,
+            now_ms=2200,
+        )
+
+        assert hedge_adapter._get_order_status_calls == [
+            ("DEXEUSDT", "hedge-oid-dexe")
+        ]
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+
+    @pytest.mark.asyncio
+    async def test_recover_live_position_hydration_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        long_adapter = _FakeVenueAdapter(Venue.BINANCE)
+        long_adapter.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="DEXEUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            entry_price=10.0,
+            observed_at_ms=2100,
+        )
+        short_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        short_adapter.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="DEXEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            entry_price=10.0,
+            observed_at_ms=2100,
+        )
+        runtime._venue_adapters = {
+            Venue.BINANCE: long_adapter,
+            Venue.BYBIT: short_adapter,
+        }
+        pending = PendingEntry(
+            pending_id="entry-live-hydration-hedge",
+            symbol="DEXEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            maker_fill_price=10.0,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.0,
+                    notional_quote=10.0,
+                    fill_at_ms=1100,
+                )
+            ],
+        )
+
+        hydrated = await runtime._recover_hydrate_from_live_positions(
+            pending,
+            now_ms=2200,
+        )
+
+        assert hydrated is True
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+        assert pending.outcome == "filled"
+
+    @pytest.mark.asyncio
+    async def test_force_reconcile_hedge_fill_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        runtime._venue_adapters = {
+            Venue.BINANCE: _FakeVenueAdapter(Venue.BINANCE),
+            Venue.BYBIT: _FakeVenueAdapter(Venue.BYBIT),
+        }
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-force-hedge-progress",
+            symbol="DEXEUSDT",
+            long_status="filled",
+            short_status="filled",
+            long_fill=OrderFill(
+                venue=Venue.BINANCE,
+                symbol="DEXEUSDT",
+                side=Side.BUY,
+                quantity=1.0,
+                price=10.0,
+                order_id="maker-oid-dexe",
+                filled_at_ms=2100,
+            ),
+            short_fill=OrderFill(
+                venue=Venue.BYBIT,
+                symbol="DEXEUSDT",
+                side=Side.SELL,
+                quantity=1.0,
+                price=10.0,
+                order_id="hedge-oid-dexe",
+                filled_at_ms=2100,
+            ),
+        )
+        pending = PendingEntry(
+            pending_id="entry-force-hedge-progress",
+            symbol="DEXEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            maker_fill_price=10.0,
+            hedge_leg_filled=0.0,
+            hedge_fill_price=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-dexe",
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=1.0,
+                    notional_quote=10.0,
+                    fill_at_ms=1100,
+                )
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_entries_force(now_ms=2200)
+
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
 
     @pytest.mark.asyncio
     async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):
@@ -7063,6 +7311,65 @@ class TestResidualRepairExecutionV1Parity:
         assert req.reduce_only is True
         assert req.post_only is False
         assert runtime.state.pending_residual_repairs == []
+
+    @pytest.mark.asyncio
+    async def test_residual_repair_zero_fill_with_order_id_keeps_truth_gap(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        now_ms = 1779422875621
+        runtime.state.pending_residual_repairs.append({
+            "position_id": "entry-layer-repair",
+            "pair_id": "layerusdt:binance->bybit",
+            "symbol": "LAYERUSDT",
+            "origin": "entry_open",
+            "repair_venue": "binance",
+            "repair_side": "buy",
+            "repair_quantity": 419.3,
+            "created_at_ms": now_ms,
+            "deadline_ms": now_ms + 30_000,
+            "retry_count": 0,
+            "last_attempt_at_ms": 0,
+        })
+
+        binance = _FakeVenueAdapter(Venue.BINANCE)
+        binance.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="LAYERUSDT",
+            side=Side.SELL,
+            quantity=419.3,
+            entry_price=1.0,
+            observed_at_ms=now_ms,
+        )
+        binance.place_order_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="LAYERUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            price=0.0,
+            order_id="2898926259",
+            client_order_id="repair-layer-cid",
+            filled_at_ms=now_ms,
+        )
+        runtime._venue_adapters = {Venue.BINANCE: binance}
+
+        await runtime._recover_residual_repairs(now_ms + 1)
+
+        assert len(binance._place_order_calls) == 1
+        assert len(runtime.state.pending_residual_repairs) == 1
+        task = runtime.state.pending_residual_repairs[0]
+        assert task["accepted_order_id"] == "2898926259"
+        assert task["accepted_client_order_id"] == "repair-layer-cid"
+        events = runtime.journal.read_all()
+        assert not [
+            event for event in events
+            if event["kind"] == "execution.residual_repair_completed"
+            and event["payload"].get("filled_quantity") == 0.0
+        ]
+        inflight = [
+            event for event in events
+            if event["kind"] == "execution.residual_repair_inflight"
+        ]
+        assert inflight
+        assert inflight[-1]["payload"]["remaining_quantity"] == pytest.approx(419.3)
 
     @pytest.mark.asyncio
     async def test_bybit_duplicate_residual_repair_reconciles_full_live_flat(self, tmp_path):

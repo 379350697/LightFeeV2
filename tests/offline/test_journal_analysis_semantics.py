@@ -164,7 +164,7 @@ class TestQuickFlatObservability:
         assert summary["quick_flat_count"] == 1
         assert summary["duplicate_event_count"] == 1
 
-    def test_quick_flat_summary_exposes_terminal_samples(self):
+    def test_position_drift_corrected_is_exposure_drift_not_terminal_quick_flat(self):
         records = [
             {
                 "ts_ms": 1000,
@@ -190,8 +190,9 @@ class TestQuickFlatObservability:
             quick_flat_window_ms=60_000,
         )
 
-        assert summary["quick_flat_count"] == 1
-        assert summary["samples"] == [
+        assert summary["quick_flat_count"] == 0
+        assert summary["entry_overhedge_drift_corrected_count"] == 1
+        assert summary["entry_overhedge_drift_corrected_samples"] == [
             {
                 "position_id": "entry-esports",
                 "symbol": "ESPORTSUSDT",

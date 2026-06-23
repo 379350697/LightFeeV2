@@ -48,6 +48,11 @@ evidence must map to the matrix before runtime code changes.
   filled.
 - Bybit market/IOC order ACK has order id/client id but `/v5/execution/list`
   has no executions.
+- Binance MARKET order response has order id/client id with `status=NEW`,
+  `PENDING`, or `executedQty=0` and no terminal fill status.
+- `hedge_leg_filled` increases from live/order truth while
+  `maker_remainder_slices` remains non-empty, causing
+  `missing_hedge_quantity()` to stay positive after restart or force reconcile.
 - Production health or diagnose reports
   `okx fill evidence conflicts with okx live flat` or
   `live position owned by pending conflict`.
@@ -88,6 +93,13 @@ Zero-fill reconciliation is terminal evidence only when the maker/order status
 is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
 entry unresolved, and a later stale zero reconciliation must not erase a
 previously confirmed positive fill.
+
+Hedge progress is a shared state transition, not a raw field assignment. Any
+confirmed hedge fill from submit result, order query, execution history,
+live-position hydration, startup recovery, or forced reconciliation must update
+the hedge total and consume maker remainder FIFO slices through the same helper.
+If those two effects diverge, `missing_hedge_quantity()` can become false
+positive and drive duplicate hedge submission after restart.
 
 A rejected/retained pending entry with positive fill evidence must not remain
 as a local false-flat loop. Startup/runtime recovery must either hydrate and
@@ -242,6 +254,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-06-10 | PE-14 supervision stale-backlog terminality closure | fixed, deployed, cloud verified | Follow-up root closure for the same CL-064 risk window. The pending-entry terminalizer now owns the V1 supervision stale-clear decision: only zero-fill, no inflight hedge, no cancel requested, resting passive order, progress fetch absent, and live truth proving no open order/position may remove pending. Matching live open order, live position, unavailable truth, any fill, inflight hedge, cancel request, non-resting progress, or existing progress retains pending. RED/GREEN coverage is in `tests/engine/test_pending_entry_terminalizer.py -k supervision_stale_clear` (`4 passed`), the full terminalizer suite reports `11 passed`, final full pytest reports `3782 passed`, `9 skipped`, `1 warning`, and production acceptance for deployed runtime `66a3688` passed with all-account flat/no-open-orders truth. |
 | 2026-06-10 | Hyperliquid exchange-truth account identity false-green | fixed locally, deploy pending | CL-065 closes the root cause where diagnose queried the signer/API-wallet address instead of the configured Hyperliquid account and therefore reported empty `assetPositions` while the configured account had 18 nonzero positions. V2 now preserves explicit account addresses, loads wallet mode in diagnose, treats API/agent wallets as signers for the configured account, fails closed on account-wallet signer/account mismatch, and emits sanitized credential identity so future account/signer drift is visible. Local related diagnose/health gates report `104 passed`, full venue transport reports `401 passed`, and GitNexus detect-changes is low risk with no affected processes. |
 | 2026-06-14 | HOME positive-fill/live-truth conflict and owned single-leg cleanup | fixed, deployed; current cloud watch | CL-078/CL-080 close the recurrence where OKX order detail/local fill evidence and Bybit IOC/hedge ACK could disagree with live account truth, and where an owned pending live-conflict still needed an execution path before pending release. OKX now requires `/api/v5/trade/fills` aggregation and `ctVal` conversion before fill truth; empty fills remain `execution_not_found`. Bybit ACK/order ids are reconciled through execution list before counting hedge filled. Bitget positive fill without valid side fails closed. Pending positive-fill live single legs are owned as `owned_pending_entry_live_conflict`, block as live artifacts, project through lifecycle closure, run owner-scoped reduce-only cleanup when open-order truth is empty and exactly one direction-correct live leg remains, and clear only after fresh account flat plus open-order truth. Cloud `793d28d` verified the old positive-fill cleanup chain through `owned_live_conflict_cleanup_succeeded` and `removed_by_v1_lifecycle_closure`. Zero-fill direct cleanup is code/test closed on the same deployed line, but the post-deploy window has no fresh zero-fill sample that exercised the specialized direct-cleanup event path. A later docs-backfill recheck saw a new HOME matched open position, not a pending live-conflict recurrence, so current cloud acceptance is watch until that active exposure closes; the same recheck exposed and locally fixed an unmapped `reconciliation.entry_flat_not_found_terminal_cleared` lifecycle event. |
+| 2026-06-24 | Unified order-truth submit contract and hedge-progress FIFO application | local green; deploy pending | CL-111 maps DEXEUSDT and LAYERUSDT into one shared semantic family: ACK/NEW/PENDING plus order id is accepted-uncertain order truth, not `OrderFill(0)`, and every confirmed hedge progress path must consume maker FIFO with the hedge total update. Startup order-status recovery, live-position hydration, force reconciliation, direct hedge submit, and order-truth reconciliation now route through one helper; Binance MARKET submit requests `newOrderRespType=RESULT`; residual repair accepted-order zero-fill stays inflight/truth-gap instead of false completed. See [daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix](../daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix). |
 
 ## Recurrences
 

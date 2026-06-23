@@ -6631,6 +6631,10 @@ def _build_production_acceptance_gate(
     )
     quick_flat_summary = summarize_quick_flat_events(events)
     quick_flat_count = int(quick_flat_summary.get("quick_flat_count", 0) or 0)
+    entry_overhedge_drift_corrected_count = int(
+        quick_flat_summary.get("entry_overhedge_drift_corrected_count", 0)
+        or 0
+    )
     recovery_lifecycle = _build_recovery_lifecycle_summary(events)
     open_position_count = int(local_state.get("open_position_count", 0) or 0)
     max_concurrent_positions = int(
@@ -6872,6 +6876,8 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("residual_events_present")
     if quick_flat_count:
         blocking_reasons.append("quick_flat_events_present")
+    if entry_overhedge_drift_corrected_count and not current_terminal_truth_clean:
+        blocking_reasons.append("entry_overhedge_drift_corrected_present")
     if not exchange_truth.get("available"):
         blocking_reasons.append("exchange_truth_unavailable")
     else:
@@ -7024,6 +7030,9 @@ def _build_production_acceptance_gate(
         "pending_residual_repair_count": pending_residual_repair_count,
         "residual_count": residual_count,
         "quick_flat_count": quick_flat_count,
+        "entry_overhedge_drift_corrected_count": (
+            entry_overhedge_drift_corrected_count
+        ),
         "quick_flat_duplicate_event_count": int(
             quick_flat_summary.get("duplicate_event_count", 0) or 0
         ),

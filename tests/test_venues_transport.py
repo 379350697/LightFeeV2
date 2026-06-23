@@ -3075,6 +3075,66 @@ class TestOrderAckNotFill:
         assert fill.quantity == 0.01
         assert fill.price == 50001.0
 
+    def test_binance_market_ack_new_zero_executed_qty_is_uncertain(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {
+            "orderId": 1615506390,
+            "clientOrderId": "hedge-cid-dexe",
+            "symbol": "DEXEUSDT",
+            "status": "NEW",
+            "executedQty": "0",
+            "avgPrice": "0.00000",
+            "type": "MARKET",
+            "side": "SELL",
+            "positionSide": "SHORT",
+        }
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="DEXEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="hedge-cid-dexe",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            transport._parse_order_fill(raw, req, "DEXEUSDT", 1000)
+
+        assert exc_info.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert getattr(exc_info.value, "order_ack_only", False) is True
+        assert getattr(exc_info.value, "accepted_order_id", "") == "1615506390"
+        assert getattr(exc_info.value, "accepted_client_order_id", "") == "hedge-cid-dexe"
+        assert "terminal_fill_status" in getattr(
+            exc_info.value,
+            "fill_confirmation_missing_fields",
+            [],
+        )
+
+    def test_terminal_zero_fill_response_still_returns_no_fill(self):
+        spec = binance_spec()
+        transport = VenueTransport(spec=spec, mode="paper")
+        raw = {
+            "orderId": 1615506391,
+            "clientOrderId": "expired-cid",
+            "symbol": "DEXEUSDT",
+            "status": "EXPIRED",
+            "executedQty": "0",
+            "avgPrice": "0.00000",
+        }
+        req = OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="DEXEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+        )
+
+        fill = transport._parse_order_fill(raw, req, "DEXEUSDT", 1000)
+
+        assert fill.order_id == "1615506391"
+        assert fill.quantity == 0.0
+        assert fill.price == 0.0
+
     def test_filled_status_without_explicit_qty_falls_back_to_size(self):
         spec = gate_spec()
         transport = VenueTransport(spec=spec, mode="paper")
@@ -4999,6 +5059,7 @@ class TestAckOnlyResponses:
         order_call = [call for call in calls if call[1] == "/fapi/v1/order"][0]
         params = order_call[2]["params"]
         assert fill.order_id == "123456"
+        assert params["newOrderRespType"] == "RESULT"
         assert params["positionSide"] == "LONG"
         assert "reduceOnly" not in params
 

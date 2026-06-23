@@ -122,11 +122,14 @@ _PAPER_OUTCOME_KINDS = frozenset({
 })
 
 _QUICK_FLAT_TERMINAL_KIND_PRIORITY = {
-    "runtime.position_drift_corrected": 10,
     "exit.closed": 20,
     "runtime.position_lifecycle_terminal": 30,
     "recovery.flat": 40,
 }
+
+_ENTRY_OVERHEDGE_DRIFT_CORRECTION_KINDS = frozenset({
+    "runtime.position_drift_corrected",
+})
 
 
 def _event_payload(event: dict) -> dict:
@@ -322,7 +325,9 @@ def summarize_quick_flat_events(
     entry_times = _entry_time_info(records)
 
     seen_exit_keys: set[tuple] = set()
+    seen_entry_overhedge_drift_keys: set[tuple] = set()
     quick_flat_positions: dict[str, dict] = {}
+    entry_overhedge_drift_positions: dict[str, dict] = {}
     resolved_positions: dict[str, dict] = {}
     duplicate_event_count = 0
     low_confidence_event_count = 0
@@ -330,6 +335,48 @@ def summarize_quick_flat_events(
 
     for record in records:
         kind = str(record.get("kind", "") or "")
+        if kind in _ENTRY_OVERHEDGE_DRIFT_CORRECTION_KINDS:
+            payload = _event_payload(record)
+            position_id = str(payload.get("position_id", "") or "")
+            if not position_id:
+                continue
+            key = quick_flat_event_key(record)
+            if key in seen_entry_overhedge_drift_keys:
+                continue
+            seen_entry_overhedge_drift_keys.add(key)
+            entry_info = entry_times.get(position_id)
+            if not entry_info:
+                continue
+            corrected_at_ms = _event_ts_ms(record)
+            opened_at_ms, time_source, timestamp_quality = _select_quick_flat_entry_time(
+                entry_info,
+                corrected_at_ms,
+            )
+            if opened_at_ms <= 0:
+                continue
+            elapsed_ms = corrected_at_ms - opened_at_ms
+            terminal = {
+                "entry_started_ts_ms": int(entry_info.get("started_at_ms") or opened_at_ms),
+                "entry_entered_ts_ms": int(entry_info.get("entered_at_ms") or 0),
+                "entry_opened_ts_ms": int(entry_info.get("opened_at_ms") or opened_at_ms),
+                "entry_opened_event_ts_ms": int(
+                    entry_info.get("opened_event_ts_ms")
+                    or entry_info.get("opened_at_ms")
+                    or opened_at_ms
+                ),
+                "kind": kind,
+                "position_id": position_id,
+                "symbol": str(payload.get("symbol") or entry_info.get("symbol") or ""),
+                "ts_ms": corrected_at_ms,
+                "elapsed_ms": elapsed_ms,
+                "time_source": time_source,
+                "timestamp_quality": timestamp_quality,
+            }
+            previous = entry_overhedge_drift_positions.get(position_id)
+            if previous is None or corrected_at_ms >= int(previous["ts_ms"]):
+                entry_overhedge_drift_positions[position_id] = terminal
+            continue
+
         if kind not in _QUICK_FLAT_TERMINAL_KIND_PRIORITY:
             continue
         payload = _event_payload(record)
@@ -414,6 +461,10 @@ def summarize_quick_flat_events(
     close_identity_confidence = "lower" if low_confidence_event_count else "high"
     return {
         "quick_flat_count": len(quick_flat_positions),
+        "terminal_quick_flat_count": len(quick_flat_positions),
+        "entry_overhedge_drift_corrected_count": len(
+            entry_overhedge_drift_positions
+        ),
         "duplicate_event_count": duplicate_event_count,
         "quick_flat_duplicate_event_count": duplicate_event_count,
         "resolved_long_pending_fast_close_count": len(resolved_positions),
@@ -438,6 +489,30 @@ def summarize_quick_flat_events(
             }
             for terminal in sorted(
                 quick_flat_positions.values(),
+                key=lambda item: (
+                    int(item.get("ts_ms") or 0),
+                    str(item.get("position_id") or ""),
+                ),
+            )[:12]
+        ],
+        "entry_overhedge_drift_corrected_samples": [
+            {
+                "position_id": str(terminal.get("position_id") or ""),
+                "symbol": str(terminal.get("symbol") or ""),
+                "entry_opened_ts_ms": int(terminal.get("entry_opened_ts_ms") or 0),
+                "entry_started_ts_ms": int(terminal.get("entry_started_ts_ms") or 0),
+                "entry_entered_ts_ms": int(terminal.get("entry_entered_ts_ms") or 0),
+                "entry_opened_event_ts_ms": int(
+                    terminal.get("entry_opened_event_ts_ms") or 0
+                ),
+                "terminal_ts_ms": int(terminal.get("ts_ms") or 0),
+                "terminal_kind": str(terminal.get("kind") or ""),
+                "elapsed_ms": int(terminal.get("elapsed_ms") or 0),
+                "time_source": str(terminal.get("time_source") or ""),
+                "timestamp_quality": str(terminal.get("timestamp_quality") or ""),
+            }
+            for terminal in sorted(
+                entry_overhedge_drift_positions.values(),
                 key=lambda item: (
                     int(item.get("ts_ms") or 0),
                     str(item.get("position_id") or ""),

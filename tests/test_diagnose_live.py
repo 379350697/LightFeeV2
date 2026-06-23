@@ -1739,6 +1739,56 @@ def test_acceptance_gate_still_blocks_true_legacy_quick_flat_when_flat():
     assert "quick_flat_events_present" in gate["blocking_reasons"]
 
 
+def test_acceptance_gate_blocks_entry_overhedge_drift_separately_from_quick_flat():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-dexe-overhedge"
+    events = [
+        {
+            "ts_ms": 1781294076000,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "DEXEUSDT",
+            },
+        },
+        {
+            "ts_ms": 1781294095000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "DEXEUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"DEXEUSDT": {"quantity": 1.0}},
+            "bybit": {"DEXEUSDT": {"quantity": -1.0}},
+        },
+        "open_orders": {"binance": {"DEXEUSDT": []}, "bybit": {"DEXEUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["quick_flat_count"] == 0
+    assert gate["entry_overhedge_drift_corrected_count"] == 1
+    assert "entry_overhedge_drift_corrected_present" in gate["blocking_reasons"]
+    assert "quick_flat_events_present" not in gate["blocking_reasons"]
+
+
 def test_acceptance_gate_does_not_accept_passive_close_resolved_when_live_state_not_flat():
     from scripts import diagnose_live as dl
 
@@ -3431,6 +3481,15 @@ def test_run_diagnose_keeps_flat_close_accounting_gap_non_blocking_with_quick_fl
                     "statement_probe_status": "partial",
                     "long_closed_qty": 0.0,
                     "short_closed_qty": 1000.0,
+                },
+            },
+            {
+                "ts_ms": 1781293940200,
+                "kind": "recovery.flat",
+                "payload": {
+                    "position_id": "entry-home",
+                    "symbol": "HOMEUSDT",
+                    "reason": "exchange_truth_flat",
                 },
             },
         ])

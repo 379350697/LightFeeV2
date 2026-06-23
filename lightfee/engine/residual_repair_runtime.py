@@ -944,7 +944,57 @@ class ResidualRepairRuntime:
                     )
                     continue
 
-            remaining_quantity = max(live_excess_quantity - float(fill.quantity or 0.0), 0.0)
+            fill_quantity = float(fill.quantity or 0.0)
+            remaining_quantity = max(live_excess_quantity - fill_quantity, 0.0)
+            accepted_order_id = str(getattr(fill, "order_id", "") or "")
+            accepted_client_order_id = str(
+                getattr(fill, "client_order_id", "")
+                or req.client_order_id
+                or ""
+            )
+            if (
+                fill_quantity <= 1e-9
+                and remaining_quantity > 1e-9
+                and accepted_order_id
+            ):
+                self._retain_residual_repair_accepted_order_gap(
+                    task,
+                    now_ms,
+                    status="submit_zero_fill_truth_gap",
+                    accepted_order_id=accepted_order_id,
+                    accepted_client_order_id=accepted_client_order_id,
+                )
+                self.ctx.journal.append(
+                    "execution.residual_repair_inflight",
+                    {
+                        "position_id": position_id,
+                        "pair_id": pair_id,
+                        "symbol": symbol,
+                        "origin": task.get("origin", ""),
+                        "repair_venue": repair_venue.value,
+                        "repair_side": repair_side.value,
+                        "result": "accepted_order_truth_gap",
+                        "requested_quantity": repair_quantity,
+                        "filled_quantity": fill_quantity,
+                        "remaining_quantity": remaining_quantity,
+                        "open_order_count": open_order_count,
+                        "open_order_counts_by_venue": open_order_counts_by_venue,
+                        "live_truth_venues": [
+                            venue.value for venue in probe_venues
+                        ],
+                        "live_positions": self._live_positions_evidence(
+                            live_positions
+                        ),
+                        "live_excess_quantity": live_excess_quantity,
+                        "baseline_quantity": baseline,
+                        "live_size": live_size,
+                        "accepted_order_id": accepted_order_id,
+                        "accepted_client_order_id": accepted_client_order_id,
+                        "order_truth_state": task.get("order_truth_state", ""),
+                        "ledger_decision": task.get("ledger_decision", ""),
+                    },
+                )
+                continue
             self.ctx.state.pending_residual_repairs.remove(task)
             if remaining_quantity > 1e-9:
                 updated = dict(task)
@@ -971,7 +1021,7 @@ class ResidualRepairRuntime:
                     "repair_venue": repair_venue.value,
                     "repair_side": repair_side.value,
                     "requested_quantity": repair_quantity,
-                    "filled_quantity": float(fill.quantity or 0.0),
+                    "filled_quantity": fill_quantity,
                     "remaining_quantity": remaining_quantity,
                     "open_order_count": open_order_count,
                     "open_order_counts_by_venue": open_order_counts_by_venue,

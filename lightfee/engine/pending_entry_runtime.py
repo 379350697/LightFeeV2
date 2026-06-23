@@ -21,6 +21,38 @@ from lightfee.engine.runtime_context import RuntimeContext
 from lightfee.risk.modes import EngineLifecycle
 
 
+def apply_pending_entry_hedge_progress(
+    pending: Any,
+    *,
+    new_total_quantity: float,
+    price: float = 0.0,
+    order_id: str = "",
+    observed_at_ms: int = 0,
+    now_ms: int = 0,
+    quality: str = "observed",
+) -> float:
+    """Apply confirmed hedge progress and retire maker remainder FIFO slices."""
+
+    previous_quantity = float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0)
+    target_quantity = max(float(new_total_quantity or 0.0), previous_quantity)
+    delta = max(target_quantity - previous_quantity, 0.0)
+    if delta > 1e-12:
+        pending.hedge_leg_filled = target_quantity
+        pending.consume_hedge_quantity_fifo(delta)
+        pending.note_hedge_fill_observed(
+            int(observed_at_ms or now_ms or 0),
+            quality=quality,
+        )
+
+    price_value = float(price or 0.0)
+    if price_value > 0:
+        pending.hedge_fill_price = price_value
+    if order_id:
+        pending.hedge_order_id = str(order_id)
+
+    return delta
+
+
 class PendingEntryRuntime:
     def __init__(self, ctx: RuntimeContext) -> None:
         self.ctx = ctx
@@ -158,18 +190,20 @@ class PendingEntryRuntime:
                         maker_filled_updated = True
                 else:
                     if result.long_fill.quantity > pending.hedge_leg_filled:
-                        pending.hedge_leg_filled = result.long_fill.quantity
-                        pending.hedge_fill_price = _recon_fill_price(result.long_fill)
-                        pending.hedge_order_id = result.long_fill.order_id
-                        pending.note_hedge_fill_observed(
-                            getattr(result.long_fill, "filled_at_ms", 0) or now_ms,
+                        delta = apply_pending_entry_hedge_progress(
+                            pending,
+                            new_total_quantity=result.long_fill.quantity,
+                            price=_recon_fill_price(result.long_fill),
+                            order_id=result.long_fill.order_id,
+                            observed_at_ms=getattr(result.long_fill, "filled_at_ms", 0),
+                            now_ms=now_ms,
                             quality=(
                                 "exchange_fill_exact"
                                 if getattr(result.long_fill, "filled_at_ms", 0)
                                 else "observed"
                             ),
                         )
-                        hedge_filled_updated = True
+                        hedge_filled_updated = delta > 0
 
             if result.short_fill is not None and result.short_fill.quantity > 0:
                 if pending.maker_leg == "short":
@@ -187,18 +221,20 @@ class PendingEntryRuntime:
                         maker_filled_updated = True
                 else:
                     if result.short_fill.quantity > pending.hedge_leg_filled:
-                        pending.hedge_leg_filled = result.short_fill.quantity
-                        pending.hedge_fill_price = _recon_fill_price(result.short_fill)
-                        pending.hedge_order_id = result.short_fill.order_id
-                        pending.note_hedge_fill_observed(
-                            getattr(result.short_fill, "filled_at_ms", 0) or now_ms,
+                        delta = apply_pending_entry_hedge_progress(
+                            pending,
+                            new_total_quantity=result.short_fill.quantity,
+                            price=_recon_fill_price(result.short_fill),
+                            order_id=result.short_fill.order_id,
+                            observed_at_ms=getattr(result.short_fill, "filled_at_ms", 0),
+                            now_ms=now_ms,
                             quality=(
                                 "exchange_fill_exact"
                                 if getattr(result.short_fill, "filled_at_ms", 0)
                                 else "observed"
                             ),
                         )
-                        hedge_filled_updated = True
+                        hedge_filled_updated = delta > 0
 
             def _defer_live_position_progress(
                 *,
@@ -259,12 +295,19 @@ class PendingEntryRuntime:
                             position=result.long_position,
                         )
                 elif pos_qty > pending.hedge_leg_filled:
-                    pending.hedge_leg_filled = pos_qty
-                    pending.note_hedge_fill_observed(
-                        getattr(result.long_position, "observed_at_ms", 0) or now_ms,
+                    delta = apply_pending_entry_hedge_progress(
+                        pending,
+                        new_total_quantity=pos_qty,
+                        price=pos_price,
+                        order_id=(
+                            "" if pending.hedge_order_id
+                            else f"{entry_id}-recovery-long"
+                        ),
+                        observed_at_ms=getattr(result.long_position, "observed_at_ms", 0),
+                        now_ms=now_ms,
                         quality="live_truth_observed",
                     )
-                    hedge_filled_updated = True
+                    hedge_filled_updated = delta > 0
                 if pending.maker_leg != "long":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
                         pending.hedge_fill_price = pos_price
@@ -298,12 +341,19 @@ class PendingEntryRuntime:
                             position=result.short_position,
                         )
                 elif pos_qty > pending.hedge_leg_filled:
-                    pending.hedge_leg_filled = pos_qty
-                    pending.note_hedge_fill_observed(
-                        getattr(result.short_position, "observed_at_ms", 0) or now_ms,
+                    delta = apply_pending_entry_hedge_progress(
+                        pending,
+                        new_total_quantity=pos_qty,
+                        price=pos_price,
+                        order_id=(
+                            "" if pending.hedge_order_id
+                            else f"{entry_id}-recovery-short"
+                        ),
+                        observed_at_ms=getattr(result.short_position, "observed_at_ms", 0),
+                        now_ms=now_ms,
                         quality="live_truth_observed",
                     )
-                    hedge_filled_updated = True
+                    hedge_filled_updated = delta > 0
                 if pending.maker_leg != "short":
                     if pos_price > 0 and pending.hedge_fill_price <= 0:
                         pending.hedge_fill_price = pos_price

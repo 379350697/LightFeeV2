@@ -75,7 +75,10 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_startup_runtime import RecoveryStartupRuntime
 from lightfee.engine.market_data_runtime import MarketDataRuntime
 from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
-from lightfee.engine.pending_entry_runtime import PendingEntryRuntime
+from lightfee.engine.pending_entry_runtime import (
+    PendingEntryRuntime,
+    apply_pending_entry_hedge_progress,
+)
 from lightfee.engine.residual_repair_runtime import ResidualRepairRuntime
 from lightfee.engine.unpaired_live_position_recovery import (
     UnpairedLivePositionRecoveryRuntime,
@@ -8352,30 +8355,58 @@ class LiveRuntime:
                 continue
 
             if result.long_status == "filled" and result.short_status == "filled":
-                if result.long_fill and result.long_fill.quantity > pending.maker_leg_filled:
-                    pending.maker_leg_filled = result.long_fill.quantity
-                    pending.note_maker_fill_observed(
-                        getattr(result.long_fill, "filled_at_ms", 0) or now_ms,
-                        quality=(
-                            "exchange_fill_exact"
-                            if getattr(result.long_fill, "filled_at_ms", 0)
-                            else "observed"
-                        ),
+                if result.long_fill and result.long_fill.quantity > 0:
+                    long_quality = (
+                        "exchange_fill_exact"
+                        if getattr(result.long_fill, "filled_at_ms", 0)
+                        else "observed"
                     )
-                if result.short_fill and result.short_fill.quantity > pending.hedge_leg_filled:
-                    pending.hedge_leg_filled = result.short_fill.quantity
-                    pending.note_hedge_fill_observed(
-                        getattr(result.short_fill, "filled_at_ms", 0) or now_ms,
-                        quality=(
-                            "exchange_fill_exact"
-                            if getattr(result.short_fill, "filled_at_ms", 0)
-                            else "observed"
-                        ),
+                    long_price = _recon_fill_price(result.long_fill)
+                    if pending.maker_leg == "long":
+                        if result.long_fill.quantity > pending.maker_leg_filled:
+                            pending.maker_leg_filled = result.long_fill.quantity
+                            pending.note_maker_fill_observed(
+                                getattr(result.long_fill, "filled_at_ms", 0) or now_ms,
+                                quality=long_quality,
+                            )
+                        if long_price > 0:
+                            pending.maker_fill_price = long_price
+                    elif result.long_fill.quantity > pending.hedge_leg_filled:
+                        apply_pending_entry_hedge_progress(
+                            pending,
+                            new_total_quantity=result.long_fill.quantity,
+                            price=long_price,
+                            order_id=result.long_fill.order_id,
+                            observed_at_ms=getattr(result.long_fill, "filled_at_ms", 0),
+                            now_ms=now_ms,
+                            quality=long_quality,
+                        )
+                if result.short_fill and result.short_fill.quantity > 0:
+                    short_quality = (
+                        "exchange_fill_exact"
+                        if getattr(result.short_fill, "filled_at_ms", 0)
+                        else "observed"
                     )
-                if result.long_fill and _recon_fill_price(result.long_fill) > 0:
-                    pending.maker_fill_price = _recon_fill_price(result.long_fill)
-                if result.short_fill and _recon_fill_price(result.short_fill) > 0:
-                    pending.hedge_fill_price = _recon_fill_price(result.short_fill)
+                    short_price = _recon_fill_price(result.short_fill)
+                    if pending.maker_leg == "short":
+                        if result.short_fill.quantity > pending.maker_leg_filled:
+                            pending.maker_leg_filled = result.short_fill.quantity
+                            pending.note_maker_fill_observed(
+                                getattr(result.short_fill, "filled_at_ms", 0) or now_ms,
+                                quality=short_quality,
+                            )
+                        if short_price > 0:
+                            pending.maker_fill_price = short_price
+                    elif result.short_fill.quantity > pending.hedge_leg_filled:
+                        apply_pending_entry_hedge_progress(
+                            pending,
+                            new_total_quantity=result.short_fill.quantity,
+                            price=short_price,
+                            order_id=result.short_fill.order_id,
+                            observed_at_ms=getattr(result.short_fill, "filled_at_ms", 0),
+                            now_ms=now_ms,
+                            quality=short_quality,
+                        )
                 if await self._finalize_pending_entry(pending, entry_id, now_ms):
                     resolved_ids.append(entry_id)
                 else:
@@ -8929,10 +8960,15 @@ class LiveRuntime:
                         pending.outcome = "filled"
                         filled_qty = getattr(status, "filled_quantity", 0.0) or getattr(status, "executed_qty", 0.0)
                         if filled_qty and filled_qty > 0:
-                            prev_filled = pending.hedge_leg_filled
-                            pending.hedge_leg_filled = max(pending.hedge_leg_filled, float(filled_qty))
-                            if pending.hedge_leg_filled > prev_filled + 1e-9:
-                                pending.note_hedge_fill_observed(now_ms, quality="observed")
+                            apply_pending_entry_hedge_progress(
+                                pending,
+                                new_total_quantity=float(filled_qty),
+                                price=pending.hedge_fill_price,
+                                order_id=pending.hedge_order_id,
+                                observed_at_ms=now_ms,
+                                now_ms=now_ms,
+                                quality="observed",
+                            )
                         self.journal.append(
                             "recovery.hedge_order_status_resolved",
                             {"entry_id": entry_id, "venue": str(hedge_ven), "status": status.status},
@@ -9051,15 +9087,28 @@ class LiveRuntime:
                     hedge_price_source = short_pos.entry_price
 
                 pending.maker_leg_filled = live_balanced
-                pending.hedge_leg_filled = live_balanced
+                if live_balanced > pending.hedge_leg_filled + 1e-9:
+                    apply_pending_entry_hedge_progress(
+                        pending,
+                        new_total_quantity=live_balanced,
+                        price=hedge_price_source,
+                        order_id=pending.hedge_order_id,
+                        observed_at_ms=getattr(hedge_live_position, "observed_at_ms", 0),
+                        now_ms=now_ms,
+                        quality="live_truth_observed",
+                    )
+                else:
+                    # Downward live-truth correction, not hedge fill progress.
+                    pending.hedge_leg_filled = live_balanced
                 pending.note_maker_fill_observed(
                     getattr(maker_live_position, "observed_at_ms", 0) or now_ms,
                     quality="live_truth_observed",
                 )
-                pending.note_hedge_fill_observed(
-                    getattr(hedge_live_position, "observed_at_ms", 0) or now_ms,
-                    quality="live_truth_observed",
-                )
+                if live_balanced <= before_hedge + 1e-9:
+                    pending.note_hedge_fill_observed(
+                        getattr(hedge_live_position, "observed_at_ms", 0) or now_ms,
+                        quality="live_truth_observed",
+                    )
                 pending.target_quantity = live_balanced
                 if pending.maker_fill_price <= 0:
                     if maker_price_source > 0:
@@ -9138,9 +9187,13 @@ class LiveRuntime:
                     quality="live_truth_observed",
                 )
             if recovered_hedge_qty > pending.hedge_leg_filled + 1e-9:
-                pending.hedge_leg_filled = recovered_hedge_qty
-                pending.note_hedge_fill_observed(
-                    getattr(hedge_live_position, "observed_at_ms", 0) or now_ms,
+                apply_pending_entry_hedge_progress(
+                    pending,
+                    new_total_quantity=recovered_hedge_qty,
+                    price=hedge_price_source,
+                    order_id=pending.hedge_order_id,
+                    observed_at_ms=getattr(hedge_live_position, "observed_at_ms", 0),
+                    now_ms=now_ms,
                     quality="live_truth_observed",
                 )
             if pending.maker_fill_price <= 0 and maker_price_source > 0:
@@ -9456,18 +9509,19 @@ class LiveRuntime:
             )
             fill = await adapter.place_order(req)
             if fill.quantity > 0:
-                pending.hedge_leg_filled += fill.quantity
-                pending.note_hedge_fill_observed(
-                    getattr(fill, "filled_at_ms", 0) or now_ms,
+                apply_pending_entry_hedge_progress(
+                    pending,
+                    new_total_quantity=pending.hedge_leg_filled + fill.quantity,
+                    price=fill.price,
+                    order_id=fill.order_id,
+                    observed_at_ms=getattr(fill, "filled_at_ms", 0),
+                    now_ms=now_ms,
                     quality=(
                         "exchange_fill_exact"
                         if getattr(fill, "filled_at_ms", 0)
                         else "observed"
                     ),
                 )
-                pending.consume_hedge_quantity_fifo(fill.quantity)
-                pending.hedge_order_id = fill.order_id
-                pending.hedge_fill_price = fill.price
                 pending.hedge_inflight = None
                 note_pending_entry_hedge_filled(pending)
                 if pending.missing_hedge_quantity() <= 1e-9:
@@ -9514,22 +9568,23 @@ class LiveRuntime:
             reconciliation_quantity = truth_decision.reconciled_qty
             if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 fill_qty = reconciliation_quantity
-                pending.hedge_leg_filled += fill_qty
-                pending.note_hedge_fill_observed(
-                    getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+                apply_pending_entry_hedge_progress(
+                    pending,
+                    new_total_quantity=pending.hedge_leg_filled + fill_qty,
+                    price=(
+                        getattr(reconciliation, "average_price", 0.0)
+                        or getattr(reconciliation, "price", 0.0)
+                        or pending.hedge_fill_price
+                        or 0.0
+                    ),
+                    order_id=getattr(reconciliation, "order_id", "") or "",
+                    observed_at_ms=getattr(reconciliation, "filled_at_ms", 0),
+                    now_ms=now_ms,
                     quality=(
                         "exchange_fill_exact"
                         if getattr(reconciliation, "filled_at_ms", 0)
                         else "observed"
                     ),
-                )
-                pending.consume_hedge_quantity_fifo(fill_qty)
-                pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
-                pending.hedge_fill_price = float(
-                    getattr(reconciliation, "average_price", 0.0)
-                    or getattr(reconciliation, "price", 0.0)
-                    or pending.hedge_fill_price
-                    or 0.0
                 )
                 pending.hedge_inflight = None
                 note_pending_entry_hedge_filled(pending)
@@ -9734,18 +9789,19 @@ class LiveRuntime:
             self._flush_adapter_order_diagnostics(adapter)
 
             if fill.quantity > 0:
-                pending.hedge_leg_filled += fill.quantity
-                pending.note_hedge_fill_observed(
-                    getattr(fill, "filled_at_ms", 0) or now_ms,
+                apply_pending_entry_hedge_progress(
+                    pending,
+                    new_total_quantity=pending.hedge_leg_filled + fill.quantity,
+                    price=fill.price,
+                    order_id=fill.order_id,
+                    observed_at_ms=getattr(fill, "filled_at_ms", 0),
+                    now_ms=now_ms,
                     quality=(
                         "exchange_fill_exact"
                         if getattr(fill, "filled_at_ms", 0)
                         else "observed"
                     ),
                 )
-                pending.consume_hedge_quantity_fifo(fill.quantity)
-                pending.hedge_order_id = fill.order_id
-                pending.hedge_fill_price = fill.price
                 pending.hedge_inflight = None
                 note_pending_entry_hedge_filled(pending)
 
@@ -9830,22 +9886,23 @@ class LiveRuntime:
             reconciliation_quantity = truth_decision.reconciled_qty
             if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
                 fill_qty = reconciliation_quantity
-                pending.hedge_leg_filled += fill_qty
-                pending.note_hedge_fill_observed(
-                    getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+                apply_pending_entry_hedge_progress(
+                    pending,
+                    new_total_quantity=pending.hedge_leg_filled + fill_qty,
+                    price=(
+                        getattr(reconciliation, "average_price", 0.0)
+                        or getattr(reconciliation, "price", 0.0)
+                        or pending.hedge_fill_price
+                        or 0.0
+                    ),
+                    order_id=getattr(reconciliation, "order_id", "") or "",
+                    observed_at_ms=getattr(reconciliation, "filled_at_ms", 0),
+                    now_ms=now_ms,
                     quality=(
                         "exchange_fill_exact"
                         if getattr(reconciliation, "filled_at_ms", 0)
                         else "observed"
                     ),
-                )
-                pending.consume_hedge_quantity_fifo(fill_qty)
-                pending.hedge_order_id = getattr(reconciliation, "order_id", "") or ""
-                pending.hedge_fill_price = float(
-                    getattr(reconciliation, "average_price", 0.0)
-                    or getattr(reconciliation, "price", 0.0)
-                    or pending.hedge_fill_price
-                    or 0.0
                 )
                 pending.hedge_inflight = None
                 note_pending_entry_hedge_filled(pending)
