@@ -264,6 +264,47 @@ def test_close_reconciliation_state_releases_terminal_flat_accounting_gap():
     assert result["reason"] == "missing_short_close_trade_statement"
 
 
+def test_close_reconciliation_state_releases_accepted_order_truth_gap_when_flat():
+    result = classify_close_reconciliation_state(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": "aster",
+            "short_venue": "bybit",
+            "kind": "accepted_order_truth_gap",
+            "accepted_order_truth_gap": True,
+            "truth_required_by": "accepted_order_truth_gap",
+            "reason": "first_stage_capture",
+        },
+        current_exchange_truth_clean=True,
+    )
+
+    assert result["state"] == "terminal_flat_accounting_gap"
+    assert result["blocks_entry"] is False
+    assert result["archive_reconciliation"] is True
+    assert result["reason"] == "accepted_order_truth_gap"
+
+
+def test_close_reconciliation_state_blocks_accepted_order_truth_gap_without_truth():
+    result = classify_close_reconciliation_state(
+        {
+            "position_id": "entry-h",
+            "symbol": "HUSDT",
+            "long_venue": "aster",
+            "short_venue": "bybit",
+            "kind": "accepted_order_truth_gap",
+            "accepted_order_truth_gap": True,
+            "truth_required_by": "accepted_order_truth_gap",
+        },
+        current_exchange_truth_clean=False,
+    )
+
+    assert result["state"] == "truth_unavailable"
+    assert result["blocks_entry"] is True
+    assert result["archive_reconciliation"] is False
+    assert result["reason"] == "accepted_order_truth_gap"
+
+
 def test_close_reconciliation_state_blocks_when_truth_unavailable():
     result = classify_close_reconciliation_state(
         {

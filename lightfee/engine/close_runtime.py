@@ -588,6 +588,13 @@ class CloseRuntime:
         missing_leg = str(reconciliation.get("missing_leg") or "")
         if missing_leg in {"long", "short", "both"}:
             return missing_leg
+        if (
+            reconciliation.get("accepted_order_truth_gap") is True
+            or str(reconciliation.get("kind") or "") == "accepted_order_truth_gap"
+        ):
+            leg = str(reconciliation.get("leg") or "")
+            if leg in {"long", "short"}:
+                return leg
         reason = str(
             reconciliation.get("last_evidence_gap_reason")
             or reconciliation.get("evidence_gap_reason")

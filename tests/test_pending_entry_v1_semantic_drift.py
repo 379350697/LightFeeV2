@@ -1773,6 +1773,90 @@ async def test_pending_close_reconciliation_refreshes_account_truth_before_backo
 
 
 @pytest.mark.asyncio
+async def test_pending_close_reconciliation_archives_accepted_order_gap_with_account_truth(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    symbol = "LABUSDT"
+    long_adapter = _AccountTruthCloseLegMissingStatementAdapter(Venue.ASTER)
+    short_adapter = _AccountTruthCloseLegMissingStatementAdapter(Venue.BYBIT)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.ASTER: long_adapter,
+            Venue.BYBIT: short_adapter,
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime._last_recovery_exchange_truth = None
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations.append(
+        _pending_close_reconciliation(
+            position_id="entry-lab",
+            symbol=symbol,
+            kind="accepted_order_truth_gap",
+            created_cycle=1,
+            next_attempt_ms=600_000,
+            accepted_order_truth_gap=True,
+            truth_required_by="accepted_order_truth_gap",
+            order_truth_state="ack_only_accepted",
+            leg="long",
+            source="passive_close_live_one_sided_order_truth_gap",
+            reason="first_stage_capture",
+            long_venue=Venue.ASTER.value,
+            short_venue=Venue.BYBIT.value,
+            position_snapshot={
+                "position_id": "entry-lab",
+                "symbol": symbol,
+                "long_venue": Venue.ASTER.value,
+                "short_venue": Venue.BYBIT.value,
+                "long_quantity": 1.0,
+                "short_quantity": 1.0,
+            },
+            long_legs=[{
+                "venue": Venue.ASTER.value,
+                "order_id": "720012783",
+                "client_order_id": "lfexfda08ec7467c95e0",
+                "quantity": 0.0,
+            }],
+            short_legs=[],
+            original_payload={
+                "accepted_order_id": "720012783",
+                "accepted_client_order_id": "lfexfda08ec7467c95e0",
+                "accepted_order_truth_gap": True,
+                "truth_required_by": "accepted_order_truth_gap",
+            },
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert long_adapter.account_position_calls == 1
+    assert short_adapter.account_position_calls == 1
+    assert long_adapter.account_open_order_calls == [None]
+    assert short_adapter.account_open_order_calls == [None]
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert [
+        record
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ] == []
+    archived = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["symbol"] == symbol
+    assert archived[0]["missing_leg"] == "long"
+    assert archived[0]["evidence_gap_reason"] == "accepted_order_truth_gap"
+    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert archived[0]["archive_reconciliation"] is True
+
+
+@pytest.mark.asyncio
 async def test_pending_close_reconciliation_without_clean_current_truth_stays_fail_closed(
     config,
     tmp_journal,

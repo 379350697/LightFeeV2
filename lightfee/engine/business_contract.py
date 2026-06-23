@@ -345,9 +345,19 @@ def classify_close_reconciliation_state(
         or item.get("action")
         or ""
     )
-    reason = str(
+    explicit_gap_reason = str(
         item.get("last_evidence_gap_reason")
         or item.get("evidence_gap_reason")
+        or ""
+    )
+    is_accepted_order_truth_gap = (
+        item.get("accepted_order_truth_gap") is True
+        or str(item.get("kind") or "") == "accepted_order_truth_gap"
+        or str(item.get("truth_required_by") or "") == "accepted_order_truth_gap"
+    )
+    reason = str(
+        explicit_gap_reason
+        or ("accepted_order_truth_gap" if is_accepted_order_truth_gap else "")
         or item.get("reason")
         or ""
     )
@@ -362,6 +372,7 @@ def classify_close_reconciliation_state(
     has_accounting_gap = (
         bool(item.get("pending_backfill"))
         or item.get("evidence_gap") is True
+        or is_accepted_order_truth_gap
     )
 
     if marker == "catalog_diagnostic":
