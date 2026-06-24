@@ -150,6 +150,15 @@ def _funding_timestamp_ms(item: dict[str, Any], *, fallback_ms: int = 0) -> int:
     return fallback_ms
 
 
+def _funding_timestamp_ms_or_seconds(value: Any) -> int:
+    ts = int(_safe_float(value, default=0.0))
+    if ts <= 0:
+        return 0
+    if ts < 10_000_000_000:
+        return ts * 1000
+    return ts
+
+
 # ---------------------------------------------------------------------------
 # MarketDataClient
 # ---------------------------------------------------------------------------
@@ -293,7 +302,6 @@ class MarketDataClient:
             if method.upper() == "GET":
                 resp = await client.get(url, params=params)
             elif method.upper() == "POST":
-                import json
                 resp = await client.post(url, json=body)
             else:
                 raise ValueError(f"unsupported method: {method}")
@@ -857,7 +865,6 @@ class MarketDataClient:
         spec = self._spec
         venue_str = spec.venue_id.value
         now_ms = _now_ms()
-        canonical_symbols = {s.upper() for s in symbols}
         venue_sym_to_canon: dict[str, str] = {}
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
@@ -1092,7 +1099,6 @@ class MarketDataClient:
     async def _fetch_okx_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
-        canonical_symbols = {s.upper() for s in symbols}
         venue_sym_to_canon: dict[str, str] = {}
         for s in symbols:
             venue_sym = self._to_venue_symbol(s)
@@ -1323,6 +1329,27 @@ class MarketDataClient:
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
 
+        now_ms = _now_ms()
+        funding_map: dict[str, dict[str, Any]] = {}
+        if spec.funding_rate_path:
+            try:
+                funding_raw = await self._public_get(
+                    spec.funding_rate_path,
+                    params={"productType": "USDT-FUTURES"},
+                )
+            except PublicTransportError:
+                funding_raw = {}
+            funding_data = (
+                funding_raw.get("data", []) if isinstance(funding_raw, dict) else []
+            )
+            funding_items = funding_data if isinstance(funding_data, list) else [funding_data]
+            for funding_item in funding_items:
+                if not isinstance(funding_item, dict):
+                    continue
+                sym = str(funding_item.get("symbol", ""))
+                if sym in venue_sym_to_canon:
+                    funding_map[sym] = funding_item
+
         result: dict[str, FundingTicker] = {}
         for item in items:
             sym = str(item.get("symbol", ""))
@@ -1349,6 +1376,12 @@ class MarketDataClient:
                 open_interest_quote = 0.0
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
+            funding_item = funding_map.get(sym, {})
+            funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                funding_item.get("nextUpdate", 0)
+            )
+            if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+                funding_timestamp_ms = 0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
@@ -1358,8 +1391,10 @@ class MarketDataClient:
                 ask_size=_safe_float(item.get("askSz", 0)),
                 mark_price=mark,
                 index_price=_safe_float(item.get("indexPrice", 0)),
-                funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=_now_ms(),  # Bitget REST ticker does not include funding time
+                funding_rate_bps=_safe_float(
+                    funding_item.get("fundingRate", item.get("fundingRate", 0))
+                ) * 10000.0,
+                funding_timestamp_ms=funding_timestamp_ms,
                 volume_24h_quote=_safe_float(
                     item.get("usdtVolume", item.get("quoteVolume", 0))
                 ),
@@ -1380,6 +1415,56 @@ class MarketDataClient:
 
         raw = await self._public_get(spec.funding_ticker_path)
         items = raw if isinstance(raw, list) else [raw]
+
+        now_ms = _now_ms()
+        contract_map: dict[str, dict[str, Any]] = {}
+        missing_contract_symbols: set[str] = set()
+        for venue_sym, canon in venue_sym_to_canon.items():
+            cache_key = f"{venue_str}:{canon}"
+            if self._funding_rate_is_fresh(cache_key, now_ms):
+                rate_bps, ts_ms, _ = self._funding_cache[cache_key]
+                contract_map[venue_sym] = {
+                    "funding_rate": str(rate_bps / 10000.0),
+                    "funding_next_apply": ts_ms,
+                }
+            else:
+                missing_contract_symbols.add(venue_sym)
+
+        if spec.funding_contracts_path and missing_contract_symbols:
+            try:
+                contracts_raw = await self._public_get(spec.funding_contracts_path)
+            except PublicTransportError:
+                contracts_raw = []
+            contract_items = (
+                contracts_raw if isinstance(contracts_raw, list) else [contracts_raw]
+            )
+            for contract_item in contract_items:
+                if not isinstance(contract_item, dict):
+                    continue
+                sym = str(
+                    contract_item.get(
+                        "name",
+                        contract_item.get("contract", ""),
+                    )
+                )
+                if not sym:
+                    continue
+                funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                    contract_item.get("funding_next_apply", 0)
+                )
+                funding_is_fresh = funding_timestamp_ms > now_ms + _FUNDING_CACHE_MIN_FUTURE_MS
+                if funding_is_fresh and _has_nonempty_field(contract_item, "funding_rate"):
+                    canon = venue_sym_to_canon.get(
+                        sym,
+                        self._from_venue_symbol(sym).upper(),
+                    )
+                    self._funding_cache[f"{venue_str}:{canon}"] = (
+                        _safe_float(contract_item.get("funding_rate", 0)) * 10000.0,
+                        funding_timestamp_ms,
+                        now_ms,
+                    )
+                if sym in venue_sym_to_canon and (funding_is_fresh or sym not in contract_map):
+                    contract_map[sym] = contract_item
 
         result: dict[str, FundingTicker] = {}
         for item in items:
@@ -1405,6 +1490,12 @@ class MarketDataClient:
                 open_interest_quote = 0.0
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
+            contract_item = contract_map.get(sym, {})
+            funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                contract_item.get("funding_next_apply", 0)
+            )
+            if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+                funding_timestamp_ms = 0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
@@ -1414,9 +1505,13 @@ class MarketDataClient:
                 ask_size=_safe_float(item.get("ask_size", 0)),
                 mark_price=mark,
                 index_price=_safe_float(item.get("index_price", 0)),
-                funding_rate_bps=_safe_float(item.get("funding_rate", 0)) * 10000.0,
-                funding_timestamp_ms=_now_ms(),  # Gate REST ticker does not include funding next apply time
-                volume_24h_quote=_safe_float(item.get("volume_24h_quote", item.get("volume_24h", 0))),
+                funding_rate_bps=_safe_float(
+                    contract_item.get("funding_rate", item.get("funding_rate", 0))
+                ) * 10000.0,
+                funding_timestamp_ms=funding_timestamp_ms,
+                volume_24h_quote=_safe_float(
+                    item.get("volume_24h_quote", item.get("volume_24h", 0))
+                ),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,

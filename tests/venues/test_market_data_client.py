@@ -17,7 +17,6 @@ from lightfee.venues.market_data import (
     _safe_float,
 )
 from lightfee.venues.specs import (
-    VenueSpec,
     binance_spec,
     okx_spec,
     bybit_spec,
@@ -25,8 +24,6 @@ from lightfee.venues.specs import (
     gate_spec,
     aster_spec,
     hyperliquid_spec,
-    AuthScheme,
-    VenueAccountContract,
 )
 
 
@@ -121,6 +118,16 @@ class TestVenueSpecSidecarEndpoints:
         assert spec.funding_ticker_path == "/api/v5/market/tickers"
         assert spec.funding_rate_path == "/api/v5/public/funding-rate"
         assert spec.open_interest_path == "/api/v5/public/open-interest"
+
+    def test_bitget_has_current_fund_rate_sidecar_path(self):
+        spec = bitget_spec()
+        assert spec.funding_ticker_path == "/api/v2/mix/market/tickers"
+        assert spec.funding_rate_path == "/api/v2/mix/market/current-fund-rate"
+
+    def test_gate_has_contracts_funding_sidecar_path(self):
+        spec = gate_spec()
+        assert spec.funding_ticker_path == "/api/v4/futures/usdt/tickers"
+        assert spec.funding_contracts_path == "/api/v4/futures/usdt/contracts"
 
     def test_bybit_bitget_gate_hl_ticker_includes_volume_oi(self):
         for spec_fn in (bybit_spec, bitget_spec, gate_spec, hyperliquid_spec):
@@ -940,6 +947,186 @@ class TestProductionSidecarParserRegressions:
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.open_interest_evidence_status == "available"
+
+    @pytest.mark.asyncio
+    async def test_bitget_current_fund_rate_supplies_future_funding_timestamp(self):
+        class FakeBitgetClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v2/mix/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "bidPr": "100",
+                                "askPr": "101",
+                                "bidSz": "1",
+                                "askSz": "2",
+                                "markPrice": "100.5",
+                                "indexPrice": "100.4",
+                                "fundingRate": "0.0001",
+                                "usdtVolume": "1000000",
+                                "holdingAmount": "2500",
+                            }
+                        ]
+                    }
+                if path == "/api/v2/mix/market/current-fund-rate":
+                    assert params == {"productType": "USDT-FUTURES"}
+                    return {
+                        "data": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "fundingRate": "0.0003",
+                                "nextUpdate": "4100007200000",
+                            }
+                        ]
+                    }
+                raise AssertionError(f"unexpected path: {path}")
+
+        result = await FakeBitgetClient(bitget_spec())._fetch_bitget_style(["BTCUSDT"])
+
+        ticker = result["bitget:BTCUSDT"]
+        assert ticker.funding_timestamp_ms == 4_100_007_200_000
+        assert ticker.funding_rate_bps == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_bitget_missing_current_fund_rate_fails_closed(self):
+        class FakeBitgetClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v2/mix/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "bidPr": "100",
+                                "askPr": "101",
+                                "markPrice": "100.5",
+                                "fundingRate": "0.0001",
+                            }
+                        ]
+                    }
+                if path == "/api/v2/mix/market/current-fund-rate":
+                    return {"data": []}
+                raise AssertionError(f"unexpected path: {path}")
+
+        result = await FakeBitgetClient(bitget_spec())._fetch_bitget_style(["BTCUSDT"])
+
+        ticker = result["bitget:BTCUSDT"]
+        assert ticker.funding_timestamp_ms == 0
+        assert ticker.funding_rate_bps == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_gate_contracts_supplies_future_funding_timestamp(self):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [
+                        {
+                            "contract": "BTC_USDT",
+                            "highest_bid": "100",
+                            "lowest_ask": "101",
+                            "bid_size": "1",
+                            "ask_size": "2",
+                            "mark_price": "100.5",
+                            "index_price": "100.4",
+                            "funding_rate": "0.0001",
+                            "volume_24h_quote": "1000000",
+                            "total_size": "2500",
+                            "quanto_multiplier": "0.01",
+                        }
+                    ]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return [
+                        {
+                            "name": "BTC_USDT",
+                            "funding_rate": "0.0004",
+                            "funding_next_apply": 4100007200,
+                        }
+                    ]
+                raise AssertionError(f"unexpected path: {path}")
+
+        result = await FakeGateClient(gate_spec())._fetch_gate_style(["BTCUSDT"])
+
+        ticker = result["gate:BTCUSDT"]
+        assert ticker.funding_timestamp_ms == 4_100_007_200_000
+        assert ticker.funding_rate_bps == pytest.approx(4.0)
+
+    @pytest.mark.asyncio
+    async def test_gate_contracts_funding_bulk_cache_reuses_fresh_metadata(self):
+        class FakeGateClient(MarketDataClient):
+            def __init__(self, spec):
+                super().__init__(spec)
+                self.contract_calls = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [
+                        {
+                            "contract": "BTC_USDT",
+                            "highest_bid": "100",
+                            "lowest_ask": "101",
+                            "mark_price": "100.5",
+                            "funding_rate": "0.0001",
+                        },
+                        {
+                            "contract": "ETH_USDT",
+                            "highest_bid": "200",
+                            "lowest_ask": "201",
+                            "mark_price": "200.5",
+                            "funding_rate": "0.0002",
+                        },
+                    ]
+                if path == "/api/v4/futures/usdt/contracts":
+                    self.contract_calls += 1
+                    if self.contract_calls > 1:
+                        raise AssertionError("fresh Gate contracts funding cache was not reused")
+                    return [
+                        {
+                            "name": "BTC_USDT",
+                            "funding_rate": "0.0004",
+                            "funding_next_apply": 4100007200,
+                        },
+                        {
+                            "name": "ETH_USDT",
+                            "funding_rate": "0.0005",
+                            "funding_next_apply": 4100007200,
+                        },
+                    ]
+                raise AssertionError(f"unexpected path: {path}")
+
+        client = FakeGateClient(gate_spec())
+
+        first = await client._fetch_gate_style(["BTCUSDT"])
+        second = await client._fetch_gate_style(["ETHUSDT"])
+
+        assert first["gate:BTCUSDT"].funding_timestamp_ms == 4_100_007_200_000
+        assert first["gate:BTCUSDT"].funding_rate_bps == pytest.approx(4.0)
+        assert second["gate:ETHUSDT"].funding_timestamp_ms == 4_100_007_200_000
+        assert second["gate:ETHUSDT"].funding_rate_bps == pytest.approx(5.0)
+        assert client.contract_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_gate_missing_contracts_funding_fails_closed(self):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [
+                        {
+                            "contract": "BTC_USDT",
+                            "highest_bid": "100",
+                            "lowest_ask": "101",
+                            "mark_price": "100.5",
+                            "funding_rate": "0.0001",
+                        }
+                    ]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return []
+                raise AssertionError(f"unexpected path: {path}")
+
+        result = await FakeGateClient(gate_spec())._fetch_gate_style(["BTCUSDT"])
+
+        ticker = result["gate:BTCUSDT"]
+        assert ticker.funding_timestamp_ms == 0
+        assert ticker.funding_rate_bps == pytest.approx(1.0)
 
     @pytest.mark.asyncio
     async def test_hyperliquid_meta_dict_universe_is_parsed(self):
