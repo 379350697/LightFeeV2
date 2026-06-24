@@ -7411,7 +7411,15 @@ class VenueTransport(MarketDataClient):
 
         try:
             params: dict[str, Any] = {}
-            contract = get_operation_contract(spec, VenueOperation.CANCEL_ORDER)
+            if spec.venue_id == Venue.BITGET:
+                family = await _resolve_bitget_contract_family_for_truth(self)
+                contract = get_operation_contract(
+                    spec,
+                    VenueOperation.CANCEL_ORDER,
+                    resolved_account_family=family,
+                )
+            else:
+                contract = get_operation_contract(spec, VenueOperation.CANCEL_ORDER)
             if not contract.supported:
                 raise TransportError(
                     TransportErrorCategory.UNSUPPORTED_CAPABILITY,
@@ -7443,11 +7451,16 @@ class VenueTransport(MarketDataClient):
                 elif client_order_id:
                     params["orderLinkId"] = client_order_id
             elif spec.venue_id == Venue.BITGET:
-                params["symbol"] = venue_sym
+                extra: dict[str, Any] = {}
                 if order_id:
-                    params["orderId"] = order_id
+                    extra["orderId"] = order_id
                 elif client_order_id:
-                    params["clientOid"] = client_order_id
+                    extra["clientOid"] = client_order_id
+                params = _bitget_contract_params(
+                    contract,
+                    venue_sym=venue_sym if contract.symbol_shape else "",
+                    extra=extra,
+                )
             elif spec.venue_id == Venue.GATE:
                 if order_id:
                     params["order_id"] = order_id

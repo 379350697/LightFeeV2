@@ -170,6 +170,11 @@ class TestVenueOperationContracts:
 
         spec = bitget_spec()
 
+        classic_cancel = get_operation_contract(
+            spec,
+            VenueOperation.CANCEL_ORDER,
+            resolved_account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+        )
         classic_open = get_operation_contract(
             spec,
             VenueOperation.OPEN_ORDERS,
@@ -200,7 +205,18 @@ class TestVenueOperationContracts:
             VenueOperation.ALL_POSITIONS,
             resolved_account_family=BitgetContractFamily.UTA_V3,
         )
+        uta_cancel = get_operation_contract(
+            spec,
+            VenueOperation.CANCEL_ORDER,
+            resolved_account_family=BitgetContractFamily.UTA_V3,
+        )
 
+        assert classic_cancel.path == "/api/v2/mix/order/cancel-order"
+        assert classic_cancel.required_params == (
+            "productType=USDT-FUTURES",
+            "marginCoin=USDT",
+        )
+        assert classic_cancel.symbol_shape == "BTCUSDT"
         assert classic_open.path == "/api/v2/mix/order/orders-pending"
         assert classic_position.path == "/api/v2/mix/position/single-position"
         assert classic_all_positions.path == "/api/v2/mix/position/all-position"
@@ -209,6 +225,9 @@ class TestVenueOperationContracts:
             "marginCoin=USDT",
         )
 
+        assert uta_cancel.path == "/api/v3/trade/cancel-order"
+        assert uta_cancel.required_params == ("category=USDT-FUTURES",)
+        assert uta_cancel.symbol_shape == ""
         assert uta_open.path == "/api/v3/trade/unfilled-orders"
         assert uta_position.path == "/api/v3/position/current-position"
         assert uta_all_positions.path == "/api/v3/position/current-position"
@@ -9887,11 +9906,14 @@ class TestCancelAbsentOrderDetection:
     async def test_cancel_passive_order_returns_canceled_on_absent_response(self):
         """V1 parity: successful HTTP response with absent-order code → CANCELED ack."""
         from lightfee.venues.transport import VenueTransport
-        from lightfee.venues.specs import bitget_spec
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
         from lightfee.core.domain import PassiveOrderState
 
         transport = VenueTransport(bitget_spec(), mode="paper")
         transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
 
         async def fake_request(*args, **kwargs):
             return {"code": "40109", "msg": "order does not exist"}
@@ -9910,11 +9932,14 @@ class TestCancelAbsentOrderDetection:
     async def test_cancel_passive_order_returns_canceled_on_transport_error_absent(self):
         """V1 parity: TransportError with absent-order body → CANCELED ack."""
         from lightfee.venues.transport import VenueTransport, TransportError, TransportErrorCategory
-        from lightfee.venues.specs import bitget_spec
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
         from lightfee.core.domain import PassiveOrderState
 
         transport = VenueTransport(bitget_spec(), mode="paper")
         transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
 
         async def fake_request(*args, **kwargs):
             raise TransportError(
@@ -9933,6 +9958,79 @@ class TestCancelAbsentOrderDetection:
             symbol="BTCUSDT", order_id="123456",
         )
         assert ack.state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_cancel_passive_order_uses_family_contract_params(self):
+        """Bitget Classic cancel must send official productType/marginCoin params."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(bitget_spec(), mode="paper")
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = kwargs.get("body")
+            return {"code": "00000", "data": {"orderId": "oid-1"}}
+
+        transport._request = fake_request
+
+        await transport.cancel_passive_order(
+            symbol="BTCUSDT",
+            order_id="oid-1",
+            client_order_id="cid-1",
+        )
+
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/api/v2/mix/order/cancel-order"
+        assert seen["body"] == {
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "symbol": "BTCUSDT",
+            "orderId": "oid-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_cancel_passive_order_uses_family_contract_params(self):
+        """Bitget UTA cancel must send official category and not Classic params."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(bitget_spec(), mode="paper")
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.UTA_V3
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = kwargs.get("body")
+            return {"code": "00000", "data": {"clientOid": "cid-1"}}
+
+        transport._request = fake_request
+
+        await transport.cancel_passive_order(
+            symbol="BTCUSDT",
+            order_id="",
+            client_order_id="cid-1",
+        )
+
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/api/v3/trade/cancel-order"
+        assert seen["body"] == {
+            "category": "USDT-FUTURES",
+            "clientOid": "cid-1",
+        }
+        assert "symbol" not in seen["body"]
+        assert "productType" not in seen["body"]
+        assert "marginCoin" not in seen["body"]
 
     @pytest.mark.asyncio
     async def test_bybit_cancel_passive_order_uses_cancel_endpoint(self):

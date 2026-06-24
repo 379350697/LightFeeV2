@@ -290,7 +290,12 @@ def bitget_spec() -> VenueSpec:
     classic_mix_v2_contracts = {
         VenueOperation.CREATE_ORDER: _contract("POST", "/api/v2/mix/order/place-order"),
         VenueOperation.AMEND_ORDER: _unsupported_contract("bitget_amend_cancel_replace_required"),
-        VenueOperation.CANCEL_ORDER: _contract("POST", "/api/v2/mix/order/cancel-order"),
+        VenueOperation.CANCEL_ORDER: _contract(
+            "POST",
+            "/api/v2/mix/order/cancel-order",
+            required_params=("productType=USDT-FUTURES", "marginCoin=USDT"),
+            symbol_shape="BTCUSDT",
+        ),
         VenueOperation.ORDER_STATUS: _contract(
             "GET",
             "/api/v2/mix/order/detail",
@@ -329,7 +334,12 @@ def bitget_spec() -> VenueSpec:
     uta_v3_contracts = {
         VenueOperation.CREATE_ORDER: _contract("POST", "/api/v3/trade/place-order"),
         VenueOperation.AMEND_ORDER: _unsupported_contract("bitget_uta_amend_cancel_replace_required"),
-        VenueOperation.CANCEL_ORDER: _contract("POST", "/api/v3/trade/cancel-order"),
+        VenueOperation.CANCEL_ORDER: _contract(
+            "POST",
+            "/api/v3/trade/cancel-order",
+            required_params=("category=USDT-FUTURES",),
+            symbol_shape="",
+        ),
         VenueOperation.ORDER_STATUS: _contract(
             "GET",
             "/api/v3/trade/order-info",
