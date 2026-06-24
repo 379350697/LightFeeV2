@@ -13,6 +13,9 @@ decision path short.
 - Bybit opening balance family: `110007`, `ab not enough for new order`, `Available balance is insufficient`.
 - Aster max-notional family: `-5018`, `maximum notional value limit`, `max_notional_admission_blocked`.
 - Hyperliquid insufficient-margin family: `Insufficient margin to place order.`
+- Gate futures contract sizing family: `INSUFFICIENT_AVAILABLE` with
+  `quantity_units=base_to_gate_contracts`, `contract_qty`, and
+  `contract_multiplier`.
 - `execution.entry_quantity_plan` with `quantity_contract_status` and
   `unhedgeable_residual_quantity`.
 - `execution.entry_quantity_plan` with `quantity_plan_reason=planner_quantity_adjustment`
@@ -78,6 +81,10 @@ Deterministic hedge admission reject must:
     `runtime.entry_admission_blocked`, or
     `pending_entry.hedge_admission_blocked` without balanced opened evidence,
     classify it as unopened terminal candidate evidence.
+18. Gate futures order `size` is contract count, while engine
+    `OrderRequest.quantity` is base quantity. Live Gate order sizing must use
+    official contract metadata (`quanto_multiplier`, `order_size_round`,
+    `order_size_min`) and fail closed when that metadata is missing.
 
 ## V1 / Exchange Semantics
 
@@ -143,6 +150,7 @@ Deterministic hedge admission reject must:
 | 2026-06-19 | `HUSDT` Binance maker / Aster hedge, Aster headroom exhausted | `039d52c` | deployed RED/GREEN covers pre-submit block and post-fill fee-drag guard; current cloud recovered | [daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality](../daily/2026-06-19.md#cluster-cl-099---aster-headroom-pre-submit-single-leg-fee-drag-guard-and-active-handoff-quality) |
 | 2026-06-21 | `ESPORTSUSDT` unopened Aster admission-blocked quantity plan plus terminal-flat quantity warning residues | `cfd0644`, deployed baseline `9dee9f3`, terminal quantity-warning residual fixed locally | cloud baseline flat/no-open-orders and no exact `-5022`/`-2022`; residual RED/GREEN keeps unproven active mismatches warning while terminal/unopened/repair/clean-truth quantity adjustments resolve | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 | 2026-06-23 | Aster max-notional admission diagnostics | working tree | local green; deploy pending | [daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics](../daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics) |
+| 2026-06-24 | Gate contract-size quantity drift after Gate/Bitget candidate recovery | working tree | local green; deploy pending | [daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure](../daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure) |
 
 ## Regression Harness
 

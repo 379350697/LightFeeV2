@@ -679,6 +679,12 @@ def _passive_submit_reject_classification(venue: "Venue", error: Exception) -> s
         or "margin is insufficient" in message
     ):
         return "insufficient_margin_admission_blocked"
+    if venue == Venue.GATE and (
+        "INSUFFICIENT_AVAILABLE" in message
+        or "insufficient_available" in message.lower()
+        or ("margin" in message.lower() and "available" in message.lower())
+    ):
+        return "insufficient_available_admission_blocked"
     if venue == Venue.BINANCE and _is_post_only_would_take_reject(venue, error):
         return "post_only_would_take"
     if venue in (Venue.BINANCE, Venue.ASTER) and (
@@ -1890,12 +1896,29 @@ class VenueTransport(MarketDataClient):
             if symbol_rule is not None and symbol_rule.tick_size > 0
             else float(spec.price_tick or 0.0)
         )
+        gate_contract_multiplier = 0.0
+        if symbol_rule is not None and spec.venue_id == Venue.GATE:
+            gate_contract_multiplier = float(
+                getattr(symbol_rule, "contract_multiplier", 0.0)
+                or getattr(symbol_rule, "ct_val", 0.0)
+                or 0.0
+            )
+
         if symbol_rule is not None and spec.venue_id == Venue.OKX:
             # OKX SWAP/FUTURES/OPTION SymbolRule qty_step/min_qty are lotSz/minSz
             # in contracts. The engine request quantity is base units; contract
             # validation happens later via _okx_contract_order_diagnostics.
             quantity_step = 0.0
             min_qty = 0.0
+        elif (
+            symbol_rule is not None
+            and spec.venue_id == Venue.GATE
+            and gate_contract_multiplier > 0.0
+        ):
+            contract_step = float(symbol_rule.qty_step or 0.0)
+            min_contracts = float(symbol_rule.min_qty or 0.0)
+            quantity_step = contract_step * gate_contract_multiplier
+            min_qty = min_contracts * gate_contract_multiplier
         else:
             quantity_step = (
                 float(symbol_rule.qty_step)
@@ -1925,7 +1948,7 @@ class VenueTransport(MarketDataClient):
         raw_price = float(request.price) if request.price is not None else None
         quantized_qty = _floor_to_step(raw_qty, quantity_step) if quantity_step > 0 else raw_qty
         quantized_qty = round(quantized_qty, _step_decimals(quantity_step))
-        if spec.venue_id == Venue.GATE:
+        if spec.venue_id == Venue.GATE and gate_contract_multiplier <= 0.0:
             quantized_qty = float(int(quantized_qty))
         quantized_price = raw_price
         if raw_price is not None and tick_size > 0:
@@ -3160,6 +3183,8 @@ class VenueTransport(MarketDataClient):
                 raw = await self._request("GET", spec.position_path, params=params, private=True)
             if spec.venue_id == Venue.OKX:
                 positions = await self._parse_all_positions_okx(raw, now_ms)
+            elif spec.venue_id == Venue.GATE:
+                positions = await self._parse_all_positions_gate(raw, now_ms)
             else:
                 positions = self._parse_all_positions(raw, now_ms)
             # Populate position cache for supervisor private position confirmation
@@ -3251,6 +3276,14 @@ class VenueTransport(MarketDataClient):
                     now_ms,
                     contract_size_override=contract_size,
                 )
+            elif spec.venue_id == Venue.GATE:
+                contract_size = await self._gate_contract_size_for_venue_symbol(venue_sym)
+                snapshot = self._parse_position(
+                    raw,
+                    symbol,
+                    now_ms,
+                    contract_size_override=contract_size,
+                )
             else:
                 snapshot = self._parse_position(raw, venue_sym, now_ms)
             self._position_cache[symbol] = (snapshot, now_ms)
@@ -3292,6 +3325,32 @@ class VenueTransport(MarketDataClient):
                 continue
             payload = _position_row_parse_payload(row, Venue.OKX)
             contract_size = await self._okx_contract_size_for_venue_symbol(venue_symbol)
+            pos = self._parse_position(
+                payload,
+                _canonical_position_symbol(spec, venue_symbol),
+                now_ms,
+                contract_size_override=contract_size,
+            )
+            if abs(pos.quantity) <= 1e-9:
+                continue
+            positions.append(
+                replace(pos, symbol=_canonical_position_symbol(spec, venue_symbol))
+            )
+        return positions
+
+    async def _parse_all_positions_gate(
+        self,
+        raw: Any,
+        now_ms: int,
+    ) -> list[PositionSnapshot]:
+        spec = self._spec
+        positions: list[PositionSnapshot] = []
+        for row in _venue_position_rows(raw, Venue.GATE):
+            venue_symbol = _position_row_symbol(row, Venue.GATE)
+            if not venue_symbol:
+                continue
+            payload = _position_row_parse_payload(row, Venue.GATE)
+            contract_size = await self._gate_contract_size_for_venue_symbol(venue_symbol)
             pos = self._parse_position(
                 payload,
                 _canonical_position_symbol(spec, venue_symbol),
@@ -3410,6 +3469,54 @@ class VenueTransport(MarketDataClient):
             ),
         )
 
+    async def _gate_contract_size_for_venue_symbol(self, venue_symbol: str) -> float:
+        """Resolve Gate quanto_multiplier used to convert contracts into base size."""
+        candidates = [venue_symbol]
+        spec = self._spec
+        if spec.symbol_from_venue is not None:
+            try:
+                candidates.append(spec.symbol_from_venue(venue_symbol))
+            except Exception:
+                pass
+
+        for key in candidates:
+            metadata = self._symbol_metadata.get(key)
+            multiplier = self._gate_multiplier_from_metadata(metadata)
+            if multiplier > 0.0:
+                return multiplier
+
+        if self.mode == "live":
+            try:
+                raw = await self._public_get(
+                    f"/api/v4/futures/usdt/contracts/{venue_symbol}",
+                )
+                metadata = raw.get("data", raw) if isinstance(raw, dict) else raw
+                if isinstance(metadata, dict):
+                    self._symbol_metadata[venue_symbol] = dict(metadata)
+                    multiplier = self._gate_multiplier_from_metadata(metadata)
+                    if multiplier > 0.0:
+                        return multiplier
+            except Exception:
+                pass
+            raise TransportError(
+                TransportErrorCategory.NORMALIZATION_FAILURE,
+                f"gate_contract_metadata_missing venue_symbol={venue_symbol}",
+            )
+
+        return float(spec.contract_size or 1.0)
+
+    @staticmethod
+    def _gate_multiplier_from_metadata(metadata: Any) -> float:
+        if not isinstance(metadata, dict):
+            return 0.0
+        return _safe_float(
+            metadata.get(
+                "quanto_multiplier",
+                metadata.get("quantoMultiplier", metadata.get("contract_multiplier")),
+            ),
+            default=0.0,
+        )
+
     def _parse_position(
         self,
         raw: dict[str, Any],
@@ -3454,7 +3561,12 @@ class VenueTransport(MarketDataClient):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
         if spec.venue_id == Venue.GATE:
-            result = _parse_gate_position(raw, venue_sym, now_ms, contract_size=spec.contract_size)
+            contract_size = (
+                contract_size_override
+                if contract_size_override is not None
+                else spec.contract_size
+            )
+            result = _parse_gate_position(raw, venue_sym, now_ms, contract_size=contract_size)
             if result.quantity > 0 or not isinstance(raw, dict):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
@@ -3919,7 +4031,7 @@ class VenueTransport(MarketDataClient):
                 request = replace(request, quantity=wire_qty, price=limit_px)
             else:
                 symbol_rule = None
-                if spec.venue_id == Venue.BYBIT:
+                if spec.venue_id in (Venue.BYBIT, Venue.GATE):
                     try:
                         symbol_rule = await get_symbol_rules_cache().get(
                             self, spec.venue_id, venue_sym,
@@ -4043,13 +4155,37 @@ class VenueTransport(MarketDataClient):
                 if request.reduce_only:
                     body["reduceOnly"] = "true"
             elif spec.venue_id == Venue.GATE:
-                signed_size = int(request.quantity)
+                contract_multiplier = float(
+                    getattr(symbol_rule, "contract_multiplier", 0.0)
+                    or getattr(symbol_rule, "ct_val", 0.0)
+                    or 0.0
+                )
+                gate_sizing = self._gate_contract_order_diagnostics(
+                    base_qty=float(request.quantity),
+                    contract_multiplier=contract_multiplier,
+                    contract_step=float(getattr(symbol_rule, "qty_step", 0.0) or 0.0),
+                    min_contracts=float(getattr(symbol_rule, "min_qty", 0.0) or 0.0),
+                    max_contracts=float(
+                        getattr(symbol_rule, "max_market_qty", 0.0) or 0.0
+                    ),
+                )
+                preflight.update(gate_sizing)
+                reject_reason = gate_sizing.get("reject_reason")
+                if reject_reason:
+                    preflight["response_classification"] = "rejected"
+                    self._record_order_diagnostic("order.submit_result", preflight)
+                    result_recorded = True
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        str(reject_reason),
+                    )
+                signed_size = float(gate_sizing["contract_qty"])
                 if request.side == Side.SELL:
                     signed_size = -signed_size
                 gate_ioc = request.time_in_force == TimeInForce.IOC
                 body = {
                     "contract": venue_sym,
-                    "size": signed_size,
+                    "size": self._format_gate_contract_size(signed_size),
                     "price": (
                         _format_decimal(request.price)
                         if request.price is not None and not gate_ioc
@@ -4180,6 +4316,17 @@ class VenueTransport(MarketDataClient):
                         venue_sym,
                         now_ms,
                         contract_size_override=okx_contract_size,
+                    )
+                elif spec.venue_id == Venue.GATE:
+                    gate_contract_size = float(
+                        preflight.get("contract_multiplier") or 0.0
+                    )
+                    fill = self._parse_order_fill(
+                        raw,
+                        request,
+                        venue_sym,
+                        now_ms,
+                        contract_size_override=gate_contract_size,
                     )
                 else:
                     fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
@@ -4513,6 +4660,11 @@ class VenueTransport(MarketDataClient):
                 exec_qty,
                 contract_size_override,
             )
+        if spec.venue_id == Venue.GATE:
+            exec_qty = self._gate_contracts_to_base_quantity(
+                exec_qty,
+                contract_size_override,
+            )
 
         return OrderFill(
             venue=spec.venue_id,
@@ -4533,6 +4685,75 @@ class VenueTransport(MarketDataClient):
         ct_val = float(contract_size or 0.0)
         quantity = abs(float(contract_quantity or 0.0))
         return quantity * ct_val if ct_val > 0.0 else quantity
+
+    @staticmethod
+    def _gate_contracts_to_base_quantity(
+        contract_quantity: float,
+        contract_size: float | None,
+    ) -> float:
+        multiplier = float(contract_size or 0.0)
+        quantity = abs(float(contract_quantity or 0.0))
+        return quantity * multiplier if multiplier > 0.0 else quantity
+
+    @staticmethod
+    def _gate_contract_order_diagnostics(
+        *,
+        base_qty: float,
+        contract_multiplier: float,
+        contract_step: float,
+        min_contracts: float,
+        max_contracts: float = 0.0,
+    ) -> dict[str, Any]:
+        multiplier = float(contract_multiplier or 0.0)
+        step = float(contract_step or 0.0)
+        min_qty = float(min_contracts or 0.0)
+        max_qty = float(max_contracts or 0.0)
+        raw_base_qty = float(base_qty or 0.0)
+        payload: dict[str, Any] = {
+            "quantity_units": "base_to_gate_contracts",
+            "base_qty": raw_base_qty,
+            "contract_multiplier": multiplier,
+            "contract_step": step,
+            "min_contracts": min_qty,
+            "max_contracts": max_qty,
+            "raw_contract_qty": 0.0,
+            "contract_qty": 0.0,
+            "normalized_base_qty": 0.0,
+        }
+        if multiplier <= 0.0:
+            payload["reject_reason"] = "gate_contract_metadata_missing"
+            return payload
+        if step <= 0.0:
+            payload["reject_reason"] = "gate_contract_step_missing"
+            return payload
+        raw_contract_qty = raw_base_qty / multiplier
+        contract_qty = _floor_to_step(raw_contract_qty, step)
+        contract_qty = round(contract_qty, _step_decimals(step))
+        normalized_base_qty = contract_qty * multiplier
+        payload.update(
+            {
+                "raw_contract_qty": raw_contract_qty,
+                "contract_qty": contract_qty,
+                "normalized_base_qty": normalized_base_qty,
+            }
+        )
+        if contract_qty <= 0.0:
+            payload["reject_reason"] = "gate_contract_qty_zero"
+            return payload
+        if min_qty > 0.0 and contract_qty + 1e-12 < min_qty:
+            payload["reject_reason"] = "gate_contract_qty_below_min"
+            return payload
+        if max_qty > 0.0 and contract_qty > max_qty + 1e-12:
+            payload["reject_reason"] = "gate_contract_qty_above_max"
+            return payload
+        return payload
+
+    @staticmethod
+    def _format_gate_contract_size(contract_qty: float) -> int | str:
+        value = float(contract_qty or 0.0)
+        if abs(value - int(value)) <= 1e-12:
+            return int(value)
+        return _format_decimal(value)
 
     @staticmethod
     def _extract_order_identifiers(raw: dict[str, Any]) -> tuple[str, str]:
@@ -5845,6 +6066,34 @@ class VenueTransport(MarketDataClient):
             else:
                 contract_qty = quantized_qty
 
+            if spec.venue_id == Venue.GATE:
+                contract_multiplier = float(
+                    getattr(symbol_rule, "contract_multiplier", 0.0)
+                    or getattr(symbol_rule, "ct_val", 0.0)
+                    or 0.0
+                )
+                gate_sizing = self._gate_contract_order_diagnostics(
+                    base_qty=quantized_qty,
+                    contract_multiplier=contract_multiplier,
+                    contract_step=float(getattr(symbol_rule, "qty_step", 0.0) or 0.0),
+                    min_contracts=float(getattr(symbol_rule, "min_qty", 0.0) or 0.0),
+                    max_contracts=float(
+                        getattr(symbol_rule, "max_market_qty", 0.0) or 0.0
+                    ),
+                )
+                preflight.update(gate_sizing)
+                contract_qty = float(gate_sizing["contract_qty"])
+                reject_reason = gate_sizing.get("reject_reason")
+                if reject_reason:
+                    result_payload = dict(preflight)
+                    result_payload["response_classification"] = "rejected"
+                    self._record_order_diagnostic("order.submit_result", result_payload)
+                    result_recorded = True
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        str(reject_reason),
+                    )
+
             # --- Build venue-specific body ---
             body = self._build_passive_order_body(
                 request, venue_sym, contract_qty, quantized_price, cid,
@@ -5882,6 +6131,15 @@ class VenueTransport(MarketDataClient):
                 attempt_payload["lot_sz"] = lot_sz
                 if ct_val_sz > 0:
                     attempt_payload["venue_contract_qty"] = _format_decimal(contract_qty)
+            if spec.venue_id == Venue.GATE:
+                attempt_payload["base_qty"] = quantized_qty
+                attempt_payload["contract_qty"] = contract_qty
+                attempt_payload["contract_multiplier"] = preflight.get(
+                    "contract_multiplier",
+                    0.0,
+                )
+                attempt_payload["quantity_units"] = "base_to_gate_contracts"
+                attempt_payload["venue_contract_qty"] = _format_decimal(contract_qty)
             if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
                 attempt_payload["position_mode"] = (
                     "hedge" if self._fapi_position_hedge_mode else "one_way"
@@ -6466,7 +6724,7 @@ class VenueTransport(MarketDataClient):
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "contract": venue_sym,
-            "size": int(quantized_qty),
+            "size": self._format_gate_contract_size(quantized_qty),
             "tif": "gtc",
             "post_only": True,
         }
@@ -7638,6 +7896,53 @@ class VenueTransport(MarketDataClient):
                     step_size=float(getattr(symbol_rule, "qty_step", 0.0) or 0.0),
                     contract_size=spec.contract_size,
                     min_quantity=float(getattr(symbol_rule, "min_qty", 0.0) or 0.0),
+                )
+        if spec.venue_id == Venue.GATE:
+            has_gate_metadata = bool(
+                self._symbol_metadata.get(venue_sym) or self._symbol_metadata.get(symbol)
+            )
+            if self.mode != "live" and not has_gate_metadata:
+                return normalize_venue_quantity(
+                    quantity=quantity,
+                    step_size=spec.quantity_step,
+                    contract_size=spec.contract_size,
+                    min_quantity=spec.min_quantity,
+                )
+            symbol_rule = None
+            try:
+                symbol_rule = await get_symbol_rules_cache().get(
+                    self, Venue.GATE, venue_sym,
+                )
+            except Exception:
+                symbol_rule = None
+            contract_multiplier = float(
+                getattr(symbol_rule, "contract_multiplier", 0.0)
+                or getattr(symbol_rule, "ct_val", 0.0)
+                or 0.0
+            )
+            if symbol_rule is not None and contract_multiplier > 0.0:
+                diagnostics = self._gate_contract_order_diagnostics(
+                    base_qty=float(quantity),
+                    contract_multiplier=contract_multiplier,
+                    contract_step=float(getattr(symbol_rule, "qty_step", 0.0) or 0.0),
+                    min_contracts=float(getattr(symbol_rule, "min_qty", 0.0) or 0.0),
+                    max_contracts=float(
+                        getattr(symbol_rule, "max_market_qty", 0.0) or 0.0
+                    ),
+                )
+                reject_reason = diagnostics.get("reject_reason")
+                if reject_reason in ("gate_contract_qty_zero", "gate_contract_qty_below_min"):
+                    return 0.0
+                if reject_reason:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        str(reject_reason),
+                    )
+                return float(diagnostics["normalized_base_qty"])
+            if self.mode == "live":
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "gate_contract_metadata_missing",
                 )
         if spec.venue_id == Venue.OKX:
             venue_sym = self._venue_symbol(symbol)

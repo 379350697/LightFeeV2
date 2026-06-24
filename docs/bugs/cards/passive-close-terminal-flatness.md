@@ -25,6 +25,7 @@ residuals, and live-flat cleanup.
 - `exit.passive_close_post_only_maker_rotated`
 - Binance close `-5022 GTX_ORDER_REJECT` post-only maker reject
 - Binance close `-2022 ReduceOnly Order is rejected`
+- Bitget close `40786 Duplicate clientOid`
 - `exit.reconciled` with `evidence_gap_reason`,
   `statement_probe_status`, and `trade_probe_status`
 - `price_unavailable_for_min_notional`
@@ -83,6 +84,12 @@ venue+symbol+side+reduce-only+quantity coverage when that evidence is
 consistent, then continue passive maintenance. Do not submit a duplicate
 reduce-only maker or taker-flatten while the owned close order is live. If the
 open order cannot be proven as a close owner, fail closed and block new risk.
+
+Duplicate client-order ids are idempotency conflicts, not terminal success by
+themselves. Bybit `110072` and Bitget `40786 Duplicate clientOid` must query
+order/fill truth by client id and current live position truth. They may clear
+only when reconciliation proves filled/flat or current exchange truth is flat;
+truth gaps remain fail-closed.
 
 Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry
@@ -209,6 +216,7 @@ alone is not success evidence.
 | 2026-06-19 | `GENIUSUSDT` Bybit reduce-only close owner | `106f47e` | deployed terminal-truth gates pass; waiting-event evidence payload now local to the event | [daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption](../daily/2026-06-19.md#cluster-cl-100---openclose-lifecycle-owner-truth-and-reduce-only-adoption) |
 | 2026-06-21 | `HOMEUSDT`, `ESPORTSUSDT`, Binance close `-5022`/`-2022` families | `cfd0644`, deployed baseline `9dee9f3`, terminal quantity-warning residual fixed locally | cloud baseline flat/no-open-orders, no exact `-5022`/`-2022`, and passive close artifacts resolved; residual root fix closes min-notional lifecycle and terminal/unopened quantity warning diagnostics | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 | 2026-06-23 | Binance/Aster reduce-only diagnostic noise and pending-close exchange-truth refresh mapping | working tree | local green; deploy pending | [daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics](../daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics) |
+| 2026-06-24 | Bitget `40786 Duplicate clientOid` close/recovery truth closure | working tree | local green; deploy pending | [daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure](../daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure) |
 
 ## Regression Harness
 

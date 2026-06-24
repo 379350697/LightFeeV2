@@ -2571,6 +2571,42 @@ class TestPositionSideParsing:
         assert pos.side == Side.SELL
         assert pos.quantity == 1.0
 
+    def test_gate_position_size_is_converted_from_contracts_to_base_quantity(self):
+        from lightfee.venues.transport import _parse_gate_position
+        raw = {"contract": "SIREN_USDT", "size": "-5", "entry_price": "0.041"}
+        pos = _parse_gate_position(raw, "SIREN_USDT", 1000, contract_size=10.0)
+        assert pos.side == Side.SELL
+        assert pos.quantity == 50.0
+
+    def test_gate_order_fill_size_is_converted_from_contracts_to_base_quantity(self):
+        transport = VenueTransport(spec=gate_spec(), mode="paper")
+        req = OrderRequest(
+            venue=Venue.GATE,
+            symbol="SIRENUSDT",
+            side=Side.BUY,
+            quantity=50.0,
+            price=0.041,
+        )
+        raw = {
+            "data": {
+                "id": "gate-fill-1",
+                "fillSz": "5",
+                "avgPrice": "0.041",
+                "status": "finished",
+            }
+        }
+
+        fill = transport._parse_order_fill(
+            raw,
+            req,
+            "SIREN_USDT",
+            1000,
+            contract_size_override=10.0,
+        )
+
+        assert fill.quantity == 50.0
+        assert fill.order_id == "gate-fill-1"
+
     def test_hyperliquid_negative_szi_is_short(self):
         from lightfee.venues.transport import _parse_hyperliquid_position
         raw = {"assetPositions": [
@@ -9148,6 +9184,86 @@ class TestPassiveBodyBuilders:
         assert "reduce_only" not in body  # not hardcoded when false
 
     @pytest.mark.asyncio
+    async def test_gate_live_passive_order_converts_base_quantity_to_contract_size(self):
+        import json as _json
+        seen_body = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(
+                200,
+                json={"id": "gate-maker-001", "status": "open", "size": 5, "price": "0.041"},
+            )
+
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport.set_symbol_metadata({
+            "SIREN_USDT": {
+                "name": "SIREN_USDT",
+                "quanto_multiplier": "10",
+                "order_size_min": "1",
+                "order_size_round": "1",
+                "order_price_round": "0.000001",
+            }
+        })
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        req = OrderRequest(
+            venue=Venue.GATE,
+            symbol="SIRENUSDT",
+            side=Side.BUY,
+            quantity=50.0,
+            price=0.041,
+            post_only=True,
+            client_order_id="lfv2-gate-maker-001",
+        )
+
+        await transport.submit_passive_order(req)
+
+        assert seen_body["contract"] == "SIREN_USDT"
+        assert seen_body["size"] == 5
+        assert seen_body["price"] == "0.041"
+        assert "quantity" not in seen_body
+
+    @pytest.mark.asyncio
+    async def test_gate_normalize_quantity_returns_contract_quantized_base_quantity(self):
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport.set_symbol_metadata({
+            "NORMGATE_USDT": {
+                "name": "NORMGATE_USDT",
+                "quanto_multiplier": "10",
+                "order_size_min": "1",
+                "order_size_round": "1",
+            }
+        })
+
+        assert await transport.normalize_quantity("NORMGATEUSDT", 55.0) == 50.0
+        assert await transport.normalize_quantity("NORMGATEUSDT", 9.0) == 0.0
+
+    @pytest.mark.asyncio
+    async def test_gate_live_normalize_quantity_fails_closed_without_contract_metadata(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"label": "CONTRACT_NOT_FOUND"})
+
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with pytest.raises(OrderSubmitError) as exc:
+            await transport.normalize_quantity("MISSNORMGATEUSDT", 55.0)
+
+        assert "gate_contract_metadata_missing" in str(exc.value)
+
+    @pytest.mark.asyncio
     async def test_gate_reduce_only_sell_uses_signed_negative_market_size(self):
         import json as _json
         seen_body = {}
@@ -9164,12 +9280,20 @@ class TestPassiveBodyBuilders:
             mode="live",
             credential=LiveCredential(api_key="k", api_secret="s"),
         )
+        transport.set_symbol_metadata({
+            "SKYAI_USDT": {
+                "name": "SKYAI_USDT",
+                "quanto_multiplier": "10",
+                "order_size_min": "1",
+                "order_size_round": "1",
+            }
+        })
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         req = OrderRequest(
             venue=Venue.GATE,
             symbol="SKYAIUSDT",
             side=Side.SELL,
-            quantity=69,
+            quantity=690,
             reduce_only=True,
             client_order_id="lfv2-gate-close-long-001",
         )
@@ -9202,12 +9326,20 @@ class TestPassiveBodyBuilders:
             mode="live",
             credential=LiveCredential(api_key="k", api_secret="s"),
         )
+        transport.set_symbol_metadata({
+            "INJ_USDT": {
+                "name": "INJ_USDT",
+                "quanto_multiplier": "10",
+                "order_size_min": "1",
+                "order_size_round": "1",
+            }
+        })
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         req = OrderRequest(
             venue=Venue.GATE,
             symbol="INJUSDT",
             side=Side.BUY,
-            quantity=11,
+            quantity=110,
             reduce_only=True,
             client_order_id="lfv2-gate-close-short-001",
         )

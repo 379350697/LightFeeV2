@@ -50,6 +50,38 @@ def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
 
 
+def test_bitget_duplicate_client_oid_order_error_resolves_by_truth_gap():
+    import scripts.diagnose_live as diagnose_live
+
+    payload = {
+        "reason": "bitget order failed: code=40786 msg=Duplicate clientOid",
+        "client_order_id": "lfx-bitget-dup",
+        "exchange_error": {
+            "venue": "bitget",
+            "exchange_code": "40786",
+            "exchange_msg": "Duplicate clientOid",
+            "request_context": {
+                "symbol": "ESPORTSUSDT",
+                "client_order_id": "lfx-bitget-dup",
+            },
+        },
+        "request_context": {
+            "symbol": "ESPORTSUSDT",
+            "client_order_id": "lfx-bitget-dup",
+        },
+    }
+    resolved_summary = {
+        "count": 1,
+        "resolved_identities": ["lfx-bitget-dup"],
+        "unresolved_count": 0,
+        "current_exchange_truth_clean": True,
+    }
+
+    assert diagnose_live._order_error_resolved_by_truth_gap(
+        payload, resolved_summary
+    ) is True
+
+
 def test_l2_evidence_excludes_legacy_ws_bbo_selection_events():
     from scripts.diagnose_live import _build_l2_evidence
 

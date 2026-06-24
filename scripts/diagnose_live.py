@@ -2035,6 +2035,17 @@ def _strong_order_identity_values(payload: dict[str, Any]) -> set[str]:
     }
 
 
+def _identity_values_with_bare_refs(values: set[str]) -> set[str]:
+    normalized = {str(value).lower() for value in values if value}
+    for value in list(normalized):
+        if ":" not in value:
+            continue
+        _prefix, raw = value.split(":", 1)
+        if raw:
+            normalized.add(raw)
+    return normalized
+
+
 def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:
     exchange_error = payload.get("exchange_error")
     return exchange_error if isinstance(exchange_error, dict) else {}
@@ -2064,7 +2075,7 @@ def _payload_is_ack_only_order_truth_gap(payload: dict[str, Any]) -> bool:
     )
 
 
-def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
+def _payload_is_duplicate_client_id(payload: dict[str, Any]) -> bool:
     exchange_error = _exchange_error_dict(payload)
     exchange_code = str(
         payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
@@ -2075,10 +2086,18 @@ def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
     reason = str(payload.get("reason") or payload.get("error") or "").lower()
     return (
         exchange_code == "110072"
+        or exchange_code == "40786"
         or ("110072" in reason)
+        or ("40786" in reason)
         or ("orderlinkedid" in exchange_msg and "duplicate" in exchange_msg)
         or ("orderlinkedid" in reason and "duplicate" in reason)
+        or ("clientoid" in exchange_msg and "duplicate" in exchange_msg)
+        or ("clientoid" in reason and "duplicate" in reason)
     )
+
+
+def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
+    return _payload_is_duplicate_client_id(payload)
 
 
 def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> bool:
@@ -2235,11 +2254,20 @@ def _order_error_resolved_by_truth_gap(
         return False
     if not (
         _payload_is_ack_only_order_truth_gap(payload)
-        or _payload_is_bybit_duplicate_client_id(payload)
+        or _payload_is_duplicate_client_id(payload)
     ):
         return False
-    resolved = set(resolved_truth_gap_summary.get("resolved_identities", []) or [])
-    return bool(_truth_gap_identity_values(payload) & resolved)
+    resolved = _identity_values_with_bare_refs(
+        {
+            str(value)
+            for value in (resolved_truth_gap_summary.get("resolved_identities", []) or [])
+            if value
+        }
+    )
+    payload_identities = _identity_values_with_bare_refs(
+        _truth_gap_identity_values(payload)
+    )
+    return bool(payload_identities & resolved)
 
 
 def _build_resolved_terminal_zero_qty_reduce_only_summary(
