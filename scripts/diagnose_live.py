@@ -1536,6 +1536,163 @@ def _live_position_details(exchange_truth: dict[str, Any]) -> list[dict[str, Any
     return live
 
 
+def _local_open_position_rows(local_state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = local_state.get("open_positions")
+    if not rows:
+        rows = local_state.get("positions")
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _active_owner_managed_scope(local_state: dict[str, Any]) -> dict[str, set[str]]:
+    position_ids: set[str] = set()
+    symbols: set[str] = set()
+    for row in _local_open_position_rows(local_state):
+        symbol = str(row.get("symbol") or "").upper()
+        position_id = str(
+            row.get("position_id")
+            or row.get("internal_entry_id")
+            or row.get("entry_id")
+            or ""
+        )
+        if position_id.startswith("live-recovered:"):
+            continue
+        if "matched_quantity" in row:
+            qty = _safe_abs_quantity(row.get("matched_quantity"))
+        else:
+            qty = _safe_abs_quantity(row.get("quantity"))
+        if qty <= 1e-9:
+            continue
+        if position_id:
+            position_ids.add(position_id)
+        if symbol:
+            symbols.add(symbol)
+    return {"position_ids": position_ids, "symbols": symbols}
+
+
+def _position_side_from_truth(row: dict[str, Any], quantity: float) -> str:
+    side = str(row.get("side") or row.get("position_side") or "").lower()
+    if side in {"long", "buy"}:
+        return "long"
+    if side in {"short", "sell"}:
+        return "short"
+    if quantity > 1e-9:
+        return "long"
+    if quantity < -1e-9:
+        return "short"
+    return ""
+
+
+def _exchange_truth_has_balanced_symbol(
+    exchange_truth: dict[str, Any],
+    symbol: str,
+) -> bool:
+    target = str(symbol or "").upper()
+    if not target or not exchange_truth.get("available"):
+        return False
+    sides: set[str] = set()
+    quantities: list[float] = []
+    for positions in (exchange_truth.get("positions") or {}).values():
+        if not isinstance(positions, dict):
+            continue
+        for raw_symbol, row in positions.items():
+            if not isinstance(row, dict):
+                continue
+            row_symbol = str(row.get("symbol") or raw_symbol or "").upper()
+            if row_symbol != target:
+                continue
+            qty = _safe_float(row.get("quantity"))
+            abs_qty = abs(qty)
+            if abs_qty <= 1e-9:
+                continue
+            side = _position_side_from_truth(row, qty)
+            if side:
+                sides.add(side)
+            quantities.append(abs_qty)
+    if not {"long", "short"}.issubset(sides) or len(quantities) < 2:
+        return False
+    return max(quantities) - min(quantities) <= max(max(quantities) * 1e-9, 1e-9)
+
+
+def _event_scoped_to_active_owner(
+    payload: dict[str, Any],
+    *,
+    scope: dict[str, set[str]],
+    exchange_truth: dict[str, Any],
+) -> bool:
+    position_id = str(
+        payload.get("position_id")
+        or payload.get("entry_id")
+        or payload.get("internal_entry_id")
+        or ""
+    )
+    symbol = str(payload.get("symbol") or "").upper()
+    if position_id:
+        scoped = position_id in scope["position_ids"]
+    else:
+        scoped = bool(symbol and symbol in scope["symbols"])
+    return scoped and _exchange_truth_has_balanced_symbol(exchange_truth, symbol)
+
+
+def _completed_residuals_scoped_to_active_owner(
+    events: list[dict[str, Any]],
+    *,
+    scope: dict[str, set[str]],
+    exchange_truth: dict[str, Any],
+) -> bool:
+    saw_residual = False
+    completed_scopes: set[tuple[str, str]] = set()
+    residual_scopes: set[tuple[str, str]] = set()
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = _payload_dict(rec)
+        reason = str(payload.get("reason") or "")
+        if "residual" not in kind and "residual" not in reason:
+            continue
+        saw_residual = True
+        if not _event_scoped_to_active_owner(
+            payload,
+            scope=scope,
+            exchange_truth=exchange_truth,
+        ):
+            return False
+        key = (
+            str(
+                payload.get("position_id")
+                or payload.get("entry_id")
+                or payload.get("internal_entry_id")
+                or ""
+            ),
+            str(payload.get("symbol") or "").upper(),
+        )
+        residual_scopes.add(key)
+        if _is_residual_completion(kind, payload):
+            completed_scopes.add(key)
+    return saw_residual and residual_scopes.issubset(completed_scopes)
+
+
+def _overhedge_corrections_scoped_to_active_owner(
+    events: list[dict[str, Any]],
+    *,
+    scope: dict[str, set[str]],
+    exchange_truth: dict[str, Any],
+) -> bool:
+    saw_correction = False
+    for rec in events:
+        if str(rec.get("kind") or "") != "runtime.position_drift_corrected":
+            continue
+        payload = _payload_dict(rec)
+        saw_correction = True
+        if not _event_scoped_to_active_owner(
+            payload,
+            scope=scope,
+            exchange_truth=exchange_truth,
+        ):
+            return False
+    return saw_correction
+
+
 def _local_expected_legs(local_state: dict[str, Any]) -> list[dict[str, Any]]:
     legs: list[dict[str, Any]] = []
     for pos in local_state.get("positions", []) or []:
@@ -3583,10 +3740,16 @@ def _exchange_truth_no_open_orders(exchange_truth: dict[str, Any]) -> bool:
     for venue_orders in (exchange_truth.get("open_orders") or {}).values():
         if not isinstance(venue_orders, dict):
             continue
+        if venue_orders.get("error"):
+            return False
         for orders in venue_orders.values():
-            if isinstance(orders, list) and orders:
+            if isinstance(orders, list):
+                if orders:
+                    return False
+                continue
+            if isinstance(orders, dict):
                 return False
-            if isinstance(orders, dict) and not orders.get("error"):
+            if orders not in (None, "", False):
                 return False
     return True
 
@@ -6860,6 +7023,29 @@ def _build_production_acceptance_gate(
             exception_conclusions["position_opened"] = "active_lifecycle_in_progress"
             if entry_opened_count:
                 exception_conclusions["entry_opened"] = "active_lifecycle_in_progress"
+    active_owner_scope = _active_owner_managed_scope(local_state)
+    active_residual_lifecycle_closed = (
+        active_positions_with_capacity
+        and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
+        and _completed_residuals_scoped_to_active_owner(
+            events,
+            scope=active_owner_scope,
+            exchange_truth=exchange_truth,
+        )
+    )
+    if active_residual_lifecycle_closed:
+        residual_lifecycle_closed = True
+        fingerprints.append("active_owner_residual_resolved")
+    active_overhedge_correction_resolved = (
+        active_positions_with_capacity
+        and _overhedge_corrections_scoped_to_active_owner(
+            events,
+            scope=active_owner_scope,
+            exchange_truth=exchange_truth,
+        )
+    )
+    if active_overhedge_correction_resolved:
+        fingerprints.append("active_owner_overhedge_corrected")
 
     blocking_reasons: list[str] = []
     if open_position_count > max_concurrent_positions:
@@ -6876,7 +7062,11 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("residual_events_present")
     if quick_flat_count:
         blocking_reasons.append("quick_flat_events_present")
-    if entry_overhedge_drift_corrected_count and not current_terminal_truth_clean:
+    if (
+        entry_overhedge_drift_corrected_count
+        and not current_terminal_truth_clean
+        and not active_overhedge_correction_resolved
+    ):
         blocking_reasons.append("entry_overhedge_drift_corrected_present")
     if not exchange_truth.get("available"):
         blocking_reasons.append("exchange_truth_unavailable")

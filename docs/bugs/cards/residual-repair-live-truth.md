@@ -24,6 +24,9 @@ tracked as separate active root-fix branches.
 - `residual_repair_live_truth_untrusted`
 - residual repair submit returns an accepted order id/client id with
   `filled_quantity=0` or no terminal fill evidence.
+- Diagnose reports `residual_events_present` after the residual lifecycle is
+  completed and the affected owner-managed active position has balanced
+  exchange truth plus empty open-order truth.
 - Recurrence shape: pending residual repair or pair gate remains after local entry state is gone, or repeated pauses appear even though later exchange truth proves flat.
 
 ## Current Effective Rule
@@ -44,6 +47,13 @@ open order present or unavailable truth keeps the existing pending repair task,
 preserves accepted ids, and makes the next tick reconcile those ids before any
 resubmit.
 
+Completed residual repair scoped to a current owner-managed active position is
+not a current production blocker when local owner evidence, balanced exchange
+truth, and trusted empty open-order truth agree. `live-recovered:*` rows, zero
+matched quantity, unresolved residual work, missing truth, open-order fetch
+errors, stale owner ids, nonempty open orders, or unbalanced live legs remain
+blocking.
+
 ## V1 / Exchange Semantics
 
 - V1 computes residual repair from live exchange truth, not stale local deltas.
@@ -63,6 +73,7 @@ resubmit.
 | 2026-06-04 | BIOUSDT Bybit duplicate cleanup convergence | deployed/cloud verified | Repeated Bybit `110072` residual cleanup with stale-full/live-nonzero evidence now persists bounded CID attempt evidence, stops at `residual_repair_duplicate_live_nonzero_blocked`, enters fail-closed/risk-only, and retains the residual pair gate. Cloud `68a979b` final verifier/diagnose proved all seven venues flat/no-open-orders. |
 | 2026-06-08 | ACK-only reduce-only repair evidence | local RED/GREEN, deploy pending | `recovery.residual_repair_failed` now carries the same accepted-order truth-gap evidence as pending-entry/passive-close submit errors while preserving the existing reschedule/pending residual repair state machine. |
 | 2026-06-08 | ACK-only reduce-only repair closure | fixed, deployed, cloud verified | ACK-only residual repair now resolves accepted order ids through fill/order/open-order/live-position truth in the same recovery loop; confirmed fill or trusted live-flat/open-order-empty completes without duplicate submit, while open order/truth gaps retain the task and reconcile first next tick. `4b02ec2` deployed with singleton PASS, production verifier `ok=true`, and high-confidence flat/no-open-orders diagnose evidence. |
+| 2026-06-24 | Active owner-managed residual gate scope | local green; deploy pending | CL-112 keeps residual repair lifecycle blocking until completion, but stops completed owner-scoped residual repair from requiring whole-account flatness only when the position remains normally owner-managed, owner ids match when present, and trusted open-order truth is empty. `live-recovered:*`, zero matched quantity, stale owner ids, or open-order fetch errors remain blockers. See [daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state](../daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state). |
 | 2026-06-24 | Zero-fill accepted repair shares order-truth contract | `b9f35e3` deployed/cloud verified | CL-111 prevents accepted repair order ids with zero fill from emitting `execution.residual_repair_completed(filled_quantity=0)`. They remain `execution.residual_repair_inflight` / accepted-order truth gaps until order/fill/live-position truth confirms fill, terminal no-fill plus live flat, or a fail-closed blocker. Cloud acceptance proved zero pending residual repair, flat/no-open-orders exchange truth, and no unresolved order-truth gap. See [daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix](../daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix). |
 
 ## Recurrences

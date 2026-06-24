@@ -1789,6 +1789,343 @@ def test_acceptance_gate_blocks_entry_overhedge_drift_separately_from_quick_flat
     assert "quick_flat_events_present" not in gate["blocking_reasons"]
 
 
+def test_acceptance_gate_accepts_completed_residual_for_owner_managed_active_position():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-husdt-active-residual"
+    events = [
+        {
+            "ts_ms": 1782269654388,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "quantity": 210.0,
+                "long_quantity": 210.0,
+                "short_quantity": 210.0,
+            },
+        },
+        {
+            "ts_ms": 1782269654500,
+            "kind": "execution.residual_repair_queued",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "reason": "incremental_entry_open_partially_matched",
+                "residual_quantity": 8.0,
+            },
+        },
+        {
+            "ts_ms": 1782269655000,
+            "kind": "execution.residual_repair_completed",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "result": "filled",
+                "filled_quantity": 8.0,
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 210.0,
+                "matched_quantity": 210.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"HUSDT": {"quantity": 210.0}},
+            "bybit": {"HUSDT": {"quantity": -210.0}},
+        },
+        "open_orders": {"binance": {"HUSDT": []}, "bybit": {"HUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["residual_count"] >= 1
+    assert gate["closed_residual_lifecycle_count"] == 1
+    assert gate["unclosed_residual_lifecycle_count"] == 0
+    assert "active_positions_with_capacity" in gate["fingerprints"]
+    assert "residual_events_present" not in gate["blocking_reasons"]
+    assert gate["gate_passed"] is True
+
+
+def test_acceptance_gate_accepts_owner_managed_overhedge_correction_scope():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-layer-owner-managed"
+    events = [
+        {
+            "ts_ms": 1782269654388,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "LAYERUSDT",
+                "quantity": 12.0,
+                "long_quantity": 12.0,
+                "short_quantity": 12.0,
+            },
+        },
+        {
+            "ts_ms": 1782269655000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "LAYERUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+                "correction_scope": "pending_entry_owner_managed",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": position_id,
+                "symbol": "LAYERUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 12.0,
+                "matched_quantity": 12.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"LAYERUSDT": {"quantity": 12.0}},
+            "bybit": {"LAYERUSDT": {"quantity": -12.0}},
+        },
+        "open_orders": {"binance": {"LAYERUSDT": []}, "bybit": {"LAYERUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["quick_flat_count"] == 0
+    assert gate["entry_overhedge_drift_corrected_count"] == 1
+    assert "active_positions_with_capacity" in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" not in gate["blocking_reasons"]
+    assert gate["gate_passed"] is True
+
+
+def test_acceptance_gate_keeps_live_recovered_overhedge_as_blocker():
+    from scripts import diagnose_live as dl
+
+    position_id = "live-recovered:4USDT:binance->bybit"
+    events = [
+        {
+            "ts_ms": 1782269654388,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "4USDT",
+            },
+        },
+        {
+            "ts_ms": 1782269655000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "4USDT",
+                "reason": "duplicated_hedge_progress_repaired",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": position_id,
+                "symbol": "4USDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 2211.0,
+                "matched_quantity": 0.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"4USDT": {"quantity": 2211.0}},
+            "bybit": {"4USDT": {"quantity": -2211.0}},
+        },
+        "open_orders": {"binance": {"4USDT": []}, "bybit": {"4USDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert "active_owner_overhedge_corrected" not in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" in gate["blocking_reasons"]
+    assert gate["gate_passed"] is False
+
+
+def test_acceptance_gate_requires_trusted_open_order_truth_for_active_owner_scope():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-husdt-open-order-truth-gap"
+    events = [
+        {
+            "ts_ms": 1782269654388,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782269655000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": position_id,
+                "symbol": "HUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 210.0,
+                "matched_quantity": 210.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"HUSDT": {"quantity": 210.0}},
+            "bybit": {"HUSDT": {"quantity": -210.0}},
+        },
+        "open_orders": {
+            "binance": {"HUSDT": []},
+            "bybit": {"error": "fetch failed"},
+        },
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["exchange_truth_no_open_orders"] is False
+    assert "active_owner_overhedge_corrected" not in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" in gate["blocking_reasons"]
+    assert "exchange_truth_open_orders_present" in gate["blocking_reasons"]
+    assert gate["gate_passed"] is False
+
+
+def test_acceptance_gate_requires_owner_id_match_before_symbol_fallback():
+    from scripts import diagnose_live as dl
+
+    current_position_id = "entry-layer-current-owner"
+    stale_position_id = "entry-layer-stale-owner"
+    events = [
+        {
+            "ts_ms": 1782269651000,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LAYERUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782269654388,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": current_position_id,
+                "symbol": "LAYERUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782269655000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LAYERUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": current_position_id,
+                "symbol": "LAYERUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 12.0,
+                "matched_quantity": 12.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"LAYERUSDT": {"quantity": 12.0}},
+            "bybit": {"LAYERUSDT": {"quantity": -12.0}},
+        },
+        "open_orders": {"binance": {"LAYERUSDT": []}, "bybit": {"LAYERUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert "active_owner_overhedge_corrected" not in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" in gate["blocking_reasons"]
+    assert gate["gate_passed"] is False
+
+
 def test_acceptance_gate_does_not_accept_passive_close_resolved_when_live_state_not_flat():
     from scripts import diagnose_live as dl
 

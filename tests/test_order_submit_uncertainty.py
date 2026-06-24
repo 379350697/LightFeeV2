@@ -185,6 +185,68 @@ def test_order_truth_resolution_keeps_weak_exchange_evidence_out_of_confirmed_fi
     assert decision.terminal_without_truth is False
 
 
+def test_order_truth_business_state_maps_binance_new_zero_fill_to_accepted_uncertain():
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.BINANCE,
+        symbol="DEXEUSDT",
+        order_id="1268875145",
+        client_order_id="maker-dexe",
+        target_qty=2211.0,
+        reconciliation=None,
+        metadata={
+            "raw_exchange_status": "NEW",
+            "response_classification": "ack_accepted",
+            "queried_endpoints": ["/fapi/v1/order"],
+        },
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.TRUTH_GAP
+    assert decision.decision == "retain_backoff"
+    assert decision.business_state == "accepted_uncertain"
+    assert decision.reconciled_qty == 0.0
+
+
+def test_order_truth_business_state_maps_fail_closed_gap():
+    decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+        venue=Venue.BITGET,
+        symbol="BTCUSDT",
+        order_id="oid-1",
+        client_order_id="cid-1",
+        target_qty=1.0,
+        reconciliation=None,
+        metadata={
+            "response_classification": "positive_quantity_missing_side",
+            "queried_endpoints": ["/api/v3/trade/order-info"],
+        },
+    )
+
+    assert decision.fill_status is OrderTruthFillStatus.UNSUPPORTED_FAIL_CLOSED
+    assert decision.decision == "retain_fail_closed"
+    assert decision.business_state == "truth_gap_fail_closed"
+
+
+def test_order_truth_decision_business_state_maps_duplicate_partial_to_residual():
+    decision = OrderTruthDecision(
+        state="resolved_position",
+        classification="partial",
+        decision="retry_new_client_order_id",
+        target_qty=10.0,
+        reconciled_qty=4.0,
+        live_qty=6.0,
+        remaining_qty=6.0,
+        retry_qty=6.0,
+    )
+
+    assert decision.business_state == "terminal_partial_with_residual"
+
+
+def test_order_truth_decision_business_state_maps_backoff_to_accepted_uncertain():
+    decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
+
+    assert decision.decision == "backoff_recheck"
+    assert decision.business_state == "accepted_uncertain"
+
+
 def test_order_truth_resolution_rejects_positive_quantity_from_order_detail_only():
     from lightfee.core.domain import OrderFillReconciliation, Side
 

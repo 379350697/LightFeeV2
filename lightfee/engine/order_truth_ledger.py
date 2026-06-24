@@ -56,6 +56,17 @@ class OrderTruthEvidenceStatus(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class OrderTruthBusinessState(StrEnum):
+    """Venue-neutral business semantics for order terminality decisions."""
+
+    CONFIRMED_FILL = "confirmed_fill"
+    ACCEPTED_UNCERTAIN = "accepted_uncertain"
+    TERMINAL_NO_FILL = "terminal_no_fill"
+    REJECTED = "rejected"
+    TERMINAL_PARTIAL_WITH_RESIDUAL = "terminal_partial_with_residual"
+    TRUTH_GAP_FAIL_CLOSED = "truth_gap_fail_closed"
+
+
 @dataclass(frozen=True)
 class OrderTruthDecision:
     """Owner-neutral next action for uncertain order truth."""
@@ -82,6 +93,27 @@ class OrderTruthDecision:
     @property
     def should_retry_with_new_client_id(self) -> bool:
         return self.decision == "retry_new_client_order_id" and self.retry_qty > 1e-9
+
+    @property
+    def business_state(self) -> OrderTruthBusinessState:
+        classification = str(self.classification or "").lower()
+        decision = str(self.decision or "").lower()
+        state = str(self.state or "").lower()
+        if "reject" in classification or decision == "reject":
+            return OrderTruthBusinessState.REJECTED
+        if "fail_closed" in classification or "unsupported" in classification:
+            return OrderTruthBusinessState.TRUTH_GAP_FAIL_CLOSED
+        if self.reconciled_qty > 1e-9:
+            if (
+                self.remaining_qty > 1e-9
+                or self.retry_qty > 1e-9
+                or decision == "retry_new_client_order_id"
+            ):
+                return OrderTruthBusinessState.TERMINAL_PARTIAL_WITH_RESIDUAL
+            return OrderTruthBusinessState.CONFIRMED_FILL
+        if decision in {"clear", "clear_live_flat"} or state == "resolved_flat":
+            return OrderTruthBusinessState.TERMINAL_NO_FILL
+        return OrderTruthBusinessState.ACCEPTED_UNCERTAIN
 
 
 @dataclass(frozen=True)
@@ -111,6 +143,20 @@ class OrderTruthSuccessDecision:
             self.fill_status == OrderTruthFillStatus.CONFIRMED_FILL
             and self.reconciled_qty > 1e-9
         )
+
+    @property
+    def business_state(self) -> OrderTruthBusinessState:
+        if self.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
+            if self.remaining_qty > 1e-9:
+                return OrderTruthBusinessState.TERMINAL_PARTIAL_WITH_RESIDUAL
+            return OrderTruthBusinessState.CONFIRMED_FILL
+        if self.fill_status == OrderTruthFillStatus.LIVE_FLAT:
+            return OrderTruthBusinessState.TERMINAL_NO_FILL
+        if self.fill_status == OrderTruthFillStatus.UNSUPPORTED_FAIL_CLOSED:
+            return OrderTruthBusinessState.TRUTH_GAP_FAIL_CLOSED
+        if self.fill_status == OrderTruthFillStatus.CONFIRMED_NO_FILL:
+            return OrderTruthBusinessState.TERMINAL_NO_FILL
+        return OrderTruthBusinessState.ACCEPTED_UNCERTAIN
 
 
 class OrderTruthLedger:

@@ -50,6 +50,9 @@ evidence must map to the matrix before runtime code changes.
   has no executions.
 - Binance MARKET order response has order id/client id with `status=NEW`,
   `PENDING`, or `executedQty=0` and no terminal fill status.
+- Diagnose reports `entry_overhedge_drift_corrected_present` while the affected
+  position is still owner-managed, exchange truth is balanced, and open-order
+  truth is empty.
 - `hedge_leg_filled` increases from live/order truth while
   `maker_remainder_slices` remains non-empty, causing
   `missing_hedge_quantity()` to stay positive after restart or force reconcile.
@@ -157,6 +160,22 @@ filled without `/v5/execution/list` executions. Binance default `NEW` /
 `executedQty=0` remains uncertain. Bitget positive quantity without a valid
 side is an evidence gap/fail-closed condition, not default buy.
 
+All readers should classify order truth through the shared business states:
+`confirmed_fill`, `accepted_uncertain`, `terminal_no_fill`, `rejected`,
+`terminal_partial_with_residual`, and `truth_gap_fail_closed`. The shared
+business vocabulary is the contract; each venue still uses its own supported
+query, execution, live-position, open-order, and account/headroom evidence.
+
+Production acceptance does not require whole-account flatness to close an
+owner-scoped pending-entry correction. `runtime.position_drift_corrected`
+remains blocking unless it is tied to the current managed owner/symbol, exchange
+truth proves balanced long and short live legs, and open-order truth is empty.
+`live-recovered:*` rows and zero matched-quantity rows are recovery evidence,
+not normal owner-managed active positions. Open-order fetch errors are truth
+gaps, not empty open-order truth. If the event carries a `position_id`, that id
+must match the active owner; symbol-only fallback is reserved for older events
+without owner ids.
+
 ## V1 / Exchange Semantics
 
 - V1 keeps accepted maker evidence uncertain until terminal no-fill/fill evidence exists.
@@ -254,6 +273,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-06-10 | PE-14 supervision stale-backlog terminality closure | fixed, deployed, cloud verified | Follow-up root closure for the same CL-064 risk window. The pending-entry terminalizer now owns the V1 supervision stale-clear decision: only zero-fill, no inflight hedge, no cancel requested, resting passive order, progress fetch absent, and live truth proving no open order/position may remove pending. Matching live open order, live position, unavailable truth, any fill, inflight hedge, cancel request, non-resting progress, or existing progress retains pending. RED/GREEN coverage is in `tests/engine/test_pending_entry_terminalizer.py -k supervision_stale_clear` (`4 passed`), the full terminalizer suite reports `11 passed`, final full pytest reports `3782 passed`, `9 skipped`, `1 warning`, and production acceptance for deployed runtime `66a3688` passed with all-account flat/no-open-orders truth. |
 | 2026-06-10 | Hyperliquid exchange-truth account identity false-green | fixed locally, deploy pending | CL-065 closes the root cause where diagnose queried the signer/API-wallet address instead of the configured Hyperliquid account and therefore reported empty `assetPositions` while the configured account had 18 nonzero positions. V2 now preserves explicit account addresses, loads wallet mode in diagnose, treats API/agent wallets as signers for the configured account, fails closed on account-wallet signer/account mismatch, and emits sanitized credential identity so future account/signer drift is visible. Local related diagnose/health gates report `104 passed`, full venue transport reports `401 passed`, and GitNexus detect-changes is low risk with no affected processes. |
 | 2026-06-14 | HOME positive-fill/live-truth conflict and owned single-leg cleanup | fixed, deployed; current cloud watch | CL-078/CL-080 close the recurrence where OKX order detail/local fill evidence and Bybit IOC/hedge ACK could disagree with live account truth, and where an owned pending live-conflict still needed an execution path before pending release. OKX now requires `/api/v5/trade/fills` aggregation and `ctVal` conversion before fill truth; empty fills remain `execution_not_found`. Bybit ACK/order ids are reconciled through execution list before counting hedge filled. Bitget positive fill without valid side fails closed. Pending positive-fill live single legs are owned as `owned_pending_entry_live_conflict`, block as live artifacts, project through lifecycle closure, run owner-scoped reduce-only cleanup when open-order truth is empty and exactly one direction-correct live leg remains, and clear only after fresh account flat plus open-order truth. Cloud `793d28d` verified the old positive-fill cleanup chain through `owned_live_conflict_cleanup_succeeded` and `removed_by_v1_lifecycle_closure`. Zero-fill direct cleanup is code/test closed on the same deployed line, but the post-deploy window has no fresh zero-fill sample that exercised the specialized direct-cleanup event path. A later docs-backfill recheck saw a new HOME matched open position, not a pending live-conflict recurrence, so current cloud acceptance is watch until that active exposure closes; the same recheck exposed and locally fixed an unmapped `reconciliation.entry_flat_not_found_terminal_cleared` lifecycle event. |
+| 2026-06-24 | Active owner-managed overhedge gate scope and order-truth business state | local green; deploy pending | CL-112 makes accepted-order truth readers consume `OrderTruthBusinessState` and lets diagnose close owner-scoped overhedge corrections only when local owner, balanced exchange truth, trusted empty open-order truth, and owner-id matching agree. `live-recovered:*`, zero matched quantity, stale owner ids, or open-order fetch errors remain blockers. See [daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state](../daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state). |
 | 2026-06-24 | Unified order-truth submit contract and hedge-progress FIFO application | `b9f35e3` deployed/cloud verified | CL-111 maps DEXEUSDT and LAYERUSDT into one shared semantic family: ACK/NEW/PENDING plus order id is accepted-uncertain order truth, not `OrderFill(0)`, and every confirmed hedge progress path must consume maker FIFO with the hedge total update. Startup order-status recovery, live-position hydration, force reconciliation, direct hedge submit, and order-truth reconciliation now route through one helper; Binance MARKET submit requests `newOrderRespType=RESULT`; residual repair accepted-order zero-fill stays inflight/truth-gap instead of false completed. Cloud acceptance proved `gate_passed=true`, flat/no-open-orders exchange truth, and no unresolved order-truth gap. See [daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix](../daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix). |
 
 ## Recurrences
