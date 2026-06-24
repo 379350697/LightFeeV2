@@ -70,6 +70,14 @@ reason=unsupported_symbol` are pre-candidate rejections. They must not create a
 candidate lease by themselves; if they follow an existing shortlist artifact,
 they count as terminal/takeover evidence rather than a missing-handoff issue.
 
+Entry prewarm has a wider but non-executing scope. After V1 primary+shadow
+selection, runtime may warm a bounded set of near-promotion candidates so a
+larger Gate/Bitget-inclusive universe does not cold-start quote/OI evidence at
+promotion time. Those events must carry `evidence_role=prewarm_only` and
+`candidate_scope=prewarm_extra`. Prewarm failures are diagnostic refresh
+evidence, not current entry blockers; only `entry_execution` evidence from the
+V1 primary+shadow scope can increment current unresolved entry blockers.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |
@@ -92,6 +100,7 @@ they count as terminal/takeover evidence rather than a missing-handoff issue.
 | 2026-06-23 | OI admission action taxonomy | local green, deploy pending | CL-108 splits `entry_market_evidence_summary.action_counts`: `block_oi_unavailable` is reserved for missing/timeout/rate-limit/unsupported/parse OI evidence, while confirmed available low OI is reported as `block_oi_below_floor` or `block_oi_structural`. Diagnose also reports OI sub-counts and uses `confirmed_oi_below_floor_no_data_backfill` when no data-source action is needed. This is diagnostic taxonomy only; admission remains fail-closed and no OI floor or trading guard is changed. |
 | 2026-06-23 | Stale quote WS/REST revalidate diagnostics | local green, deploy pending | CL-110 carries `sidecar_reason`, `ws_bbo_lease_hit`, `rest_revalidate_attempted`, `rest_revalidate_hit`, and `rest_revalidate_terminal_stale` through quote revalidate events. Fresh WS-BBO or REST evidence clears the stale blocker; REST quotes that remain stale still fail closed with precise buckets such as `rest_resolved_but_stale`. No quote TTL or entry admission rule is loosened. |
 | 2026-06-24 | Gate/Bitget true funding timestamp sources and Gate contracts cache | `5d9c49e` code deployed/cloud verified; docs closure synced | CL-113 replaces synthetic Gate/Bitget funding observation timestamps with official future funding metadata: Bitget `current-fund-rate.nextUpdate`, Gate `contracts.funding_next_apply`, and fail-closed `0` when true future evidence is missing. Cloud smoke confirmed Gate/Bitget BTCUSDT future `funding_timestamp_ms=1782316800000`; Gate contracts metadata reuses the existing 10 minute funding cache so full `/contracts` is not fetched every sidecar cycle. No strategy window, sidecar pairing, quote TTL, OI floor, or trading guard is loosened. |
+| 2026-06-24 | Entry quote/OI prewarm horizon after Gate/Bitget candidate recovery | local reviewed, deploy ready | CL-115 adds a bounded `entry_quote_prewarm_extra_candidate_count=24` near-promotion horizon. Extra candidates only warm quote/OI caches and emit `prewarm_only` evidence; final entry filtering and dispatch remain V1 primary+shadow. Diagnose now separates `prewarm_extra` counters, avoids double-counting paired quote-revalidate/rewarm events, and does not count prewarm-only failures as unresolved blockers. Active venue admission cooldowns, including Aster `max_notional_admission_blocked`, prune before prewarm. |
 
 ## Regression Harness
 

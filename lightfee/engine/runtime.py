@@ -3617,6 +3617,34 @@ class LiveRuntime:
         ]
         return tracked, tracked_candidates
 
+    def _select_entry_prewarm_extra_candidates(self, candidates, tracked_candidates) -> list:
+        extra_count = max(
+            int(
+                getattr(
+                    self.config.strategy,
+                    "entry_quote_prewarm_extra_candidate_count",
+                    0,
+                )
+                or 0
+            ),
+            0,
+        )
+        if extra_count <= 0:
+            return []
+        tracked_pair_ids = {
+            self._candidate_pair_id(candidate)
+            for candidate in list(tracked_candidates or [])
+        }
+        extras: list = []
+        for candidate in list(candidates or []):
+            pair_id = self._candidate_pair_id(candidate)
+            if pair_id in tracked_pair_ids:
+                continue
+            extras.append(candidate)
+            if len(extras) >= extra_count:
+                break
+        return extras
+
     @staticmethod
     def _entry_quote_truth_empty_stats():
         return MarketDataRuntime._entry_quote_truth_empty_stats()
@@ -3654,11 +3682,41 @@ class LiveRuntime:
     def _entry_quote_truth_accept_quote(self, quote: Any, *, now_ms: int):
         return self.market_data_runtime._entry_quote_truth_accept_quote(quote, now_ms=now_ms)
 
-    async def _entry_quote_revalidate_for_candidates(self, candidates: list, *, snapshot, now_ms: int, candidate_scope: str='', skipped_untracked_count: int=0):
-        return await self.market_data_runtime._entry_quote_revalidate_for_candidates(candidates, snapshot=snapshot, now_ms=now_ms, candidate_scope=candidate_scope, skipped_untracked_count=skipped_untracked_count)
+    async def _entry_quote_revalidate_for_candidates(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+        candidate_scope: str = "",
+        skipped_untracked_count: int = 0,
+        evidence_role: str = "entry_execution",
+    ):
+        return await self.market_data_runtime._entry_quote_revalidate_for_candidates(
+            candidates,
+            snapshot=snapshot,
+            now_ms=now_ms,
+            candidate_scope=candidate_scope,
+            skipped_untracked_count=skipped_untracked_count,
+            evidence_role=evidence_role,
+        )
 
-    async def _refresh_entry_candidate_open_interest_evidence(self, candidates: list, *, snapshot, now_ms: int):
-        return await self.market_data_runtime._refresh_entry_candidate_open_interest_evidence(candidates, snapshot=snapshot, now_ms=now_ms)
+    async def _refresh_entry_candidate_open_interest_evidence(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        now_ms: int,
+        evidence_role: str = "entry_execution",
+        candidate_scope: str = "",
+    ):
+        return await self.market_data_runtime._refresh_entry_candidate_open_interest_evidence(
+            candidates,
+            snapshot=snapshot,
+            now_ms=now_ms,
+            evidence_role=evidence_role,
+            candidate_scope=candidate_scope,
+        )
 
     def _clear_local_l2_runtime_state(self) -> None:
         """Drop Local-L2 runtime and persisted snapshots for non-Local-L2 profiles."""
@@ -4369,6 +4427,10 @@ class LiveRuntime:
             tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
                 l2_tracking_tradeable
             )
+            prewarm_extra_candidates = self._select_entry_prewarm_extra_candidates(
+                l2_tracking_tradeable,
+                tracked_candidates,
+            )
             if tracked_candidates:
                 (
                     snapshot_freshness_metrics,
@@ -4414,6 +4476,7 @@ class LiveRuntime:
                 and bool(tracked_candidates)
             )
             skipped_untracked_quote_count = 0
+            prewarm_extra_quote_target_count = 0
             if entry_bbo_prewarm_attempted:
                 all_quote_targets = self._entry_quote_revalidate_targets(
                     l2_tracking_tradeable,
@@ -4425,21 +4488,47 @@ class LiveRuntime:
                     snapshot=snapshot,
                     now_ms=now_ms,
                 )
-                skipped_untracked_quote_count = max(
-                    len(all_quote_targets) - len(tracked_quote_targets),
-                    0,
-                )
-            entry_quote_truth_overlay, _entry_quote_truth_stats = (
-                await self._entry_quote_revalidate_for_candidates(
-                    tracked_candidates,
+                prewarm_extra_quote_targets = self._entry_quote_revalidate_targets(
+                    prewarm_extra_candidates,
                     snapshot=snapshot,
                     now_ms=now_ms,
-                    candidate_scope=(
-                        "v1_primary_shadow" if entry_bbo_prewarm_attempted else ""
-                    ),
-                    skipped_untracked_count=skipped_untracked_quote_count,
                 )
-            )
+                prewarm_extra_quote_target_count = len(prewarm_extra_quote_targets)
+                skipped_untracked_quote_count = max(
+                    len(all_quote_targets)
+                    - len(tracked_quote_targets)
+                    - prewarm_extra_quote_target_count,
+                    0,
+                )
+            if tracked_candidates:
+                entry_quote_truth_overlay, _entry_quote_truth_stats = (
+                    await self._entry_quote_revalidate_for_candidates(
+                        tracked_candidates,
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        candidate_scope=(
+                            "v1_primary_shadow" if entry_bbo_prewarm_attempted else ""
+                        ),
+                        skipped_untracked_count=skipped_untracked_quote_count,
+                        evidence_role="entry_execution",
+                    )
+                )
+            else:
+                entry_quote_truth_overlay = {}
+                _entry_quote_truth_stats = self._entry_quote_truth_empty_stats()
+                _entry_quote_truth_stats["skipped_untracked_count"] = (
+                    skipped_untracked_quote_count
+                )
+                self._entry_quote_truth_record_last_scan(_entry_quote_truth_stats)
+            if entry_bbo_prewarm_attempted and prewarm_extra_candidates:
+                await self._entry_quote_revalidate_for_candidates(
+                    prewarm_extra_candidates,
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    candidate_scope="prewarm_extra",
+                    skipped_untracked_count=skipped_untracked_quote_count,
+                    evidence_role="prewarm_only",
+                )
             emit_stale_quote_diagnostics(
                 entry_quote_keys,
                 resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
@@ -4482,7 +4571,17 @@ class LiveRuntime:
                 entry_freshness_filter_candidates,
                 snapshot=snapshot,
                 now_ms=now_ms,
+                evidence_role="entry_execution",
+                candidate_scope=entry_freshness_filter_scope,
             )
+            if prewarm_extra_candidates:
+                await self._refresh_entry_candidate_open_interest_evidence(
+                    prewarm_extra_candidates,
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    evidence_role="prewarm_only",
+                    candidate_scope="prewarm_extra",
+                )
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 entry_freshness_filter_candidates,
                 snapshot=snapshot,

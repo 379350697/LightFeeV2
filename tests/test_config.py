@@ -321,6 +321,9 @@ class TestConfigValidation:
     def test_ws_bbo_per_venue_budget_default_is_ten(self):
         assert StrategyConfig().entry_ws_bbo_per_venue_budget == 10
 
+    def test_entry_quote_prewarm_extra_candidate_count_default_is_twenty_four(self):
+        assert StrategyConfig().entry_quote_prewarm_extra_candidate_count == 24
+
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])
         issues = validate_config(config)

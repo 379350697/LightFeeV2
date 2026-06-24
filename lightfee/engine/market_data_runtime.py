@@ -1074,6 +1074,27 @@ class MarketDataRuntime:
         }
 
     def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]) -> None:
+        evidence_role = str(stats.get("evidence_role") or "entry_execution")
+        if evidence_role == "prewarm_only":
+            self.ctx.state.last_scan["quote_prewarm_extra_candidate_scope"] = str(
+                stats.get("candidate_scope", "") or ""
+            )
+            self.ctx.state.last_scan["quote_prewarm_extra_candidate_count"] = int(
+                stats.get("candidate_count", 0) or 0
+            )
+            self.ctx.state.last_scan["quote_prewarm_extra_target_count"] = int(
+                stats.get("target_count", 0) or 0
+            )
+            self.ctx.state.last_scan["quote_prewarm_extra_resolved_count"] = int(
+                stats.get("resolved_count", 0) or 0
+            )
+            self.ctx.state.last_scan["quote_prewarm_extra_failed_count"] = int(
+                stats.get("failed_count", 0) or 0
+            )
+            self.ctx.state.last_scan["quote_prewarm_extra_skipped_untracked_count"] = int(
+                stats.get("skipped_untracked_count", 0) or 0
+            )
+            return
         self.ctx.state.last_scan["quote_revalidate_candidate_scope"] = str(
             stats.get("candidate_scope", "") or ""
         )
@@ -1496,10 +1517,12 @@ class MarketDataRuntime:
         now_ms: int,
         candidate_scope: str = "",
         skipped_untracked_count: int = 0,
+        evidence_role: str = "entry_execution",
     ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
         overlay: dict[tuple[str, str], Any] = {}
         stats = self._entry_quote_truth_empty_stats()
         stats["candidate_scope"] = candidate_scope
+        stats["evidence_role"] = evidence_role
         stats["candidate_count"] = len(candidates or [])
         stats["skipped_untracked_count"] = max(int(skipped_untracked_count or 0), 0)
         if (
@@ -1508,11 +1531,12 @@ class MarketDataRuntime:
             or self.ctx.config.runtime.mode == "paper"
         ):
             self._entry_quote_truth_record_last_scan(stats)
-            self._emit_entry_quote_revalidate_probe(
-                stats=stats,
-                candidate_count=len(candidates or []),
-                now_ms=now_ms,
-            )
+            if evidence_role != "prewarm_only":
+                self._emit_entry_quote_revalidate_probe(
+                    stats=stats,
+                    candidate_count=len(candidates or []),
+                    now_ms=now_ms,
+                )
             return overlay, stats
 
         await self._call_ensure_entry_bbo_active_for_candidates(candidates, now_ms)
@@ -1524,11 +1548,12 @@ class MarketDataRuntime:
         stats["all_target_count"] = len(all_targets)
         if not all_targets:
             self._entry_quote_truth_record_last_scan(stats)
-            self._emit_entry_quote_revalidate_probe(
-                stats=stats,
-                candidate_count=len(candidates or []),
-                now_ms=now_ms,
-            )
+            if evidence_role != "prewarm_only":
+                self._emit_entry_quote_revalidate_probe(
+                    stats=stats,
+                    candidate_count=len(candidates or []),
+                    now_ms=now_ms,
+                )
             return overlay, stats
 
         budgeted_keys = set(getattr(self, "_entry_bbo_subscription_budgeted_keys", set()) or set())
@@ -1547,6 +1572,8 @@ class MarketDataRuntime:
                     {
                         **target,
                         "outcome": "rest_fallback_planned",
+                        "candidate_scope": candidate_scope,
+                        "evidence_role": evidence_role,
                         "ts_ms": now_ms,
                     },
                 )
@@ -1571,6 +1598,8 @@ class MarketDataRuntime:
                     "target_count": len(targets),
                     "targets": targets[:24],
                     "wait_budget_ms": min(self._entry_quote_lease_max_age_ms(), 750),
+                    "candidate_scope": candidate_scope,
+                    "evidence_role": evidence_role,
                     "ts_ms": now_ms,
                 },
             )
@@ -1579,6 +1608,8 @@ class MarketDataRuntime:
                 {
                     "target_count": len(targets),
                     "targets": targets[:24],
+                    "candidate_scope": candidate_scope,
+                    "evidence_role": evidence_role,
                     "ts_ms": now_ms,
                 },
             )
@@ -1737,6 +1768,8 @@ class MarketDataRuntime:
                 "rest_revalidate_hit": rest_revalidate_attempted,
                 "rest_revalidate_terminal_stale": False,
                 "outcome": "resolved",
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
                 "ts_ms": now_ms,
             }
             self.ctx.journal.append("runtime.entry_quote_revalidate_resolved", payload)
@@ -1878,6 +1911,8 @@ class MarketDataRuntime:
                 ),
                 "rest_error": str(target.get("rest_error") or ""),
                 "ws_budget_excluded": bool(target.get("ws_budget_excluded")),
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
                 "ts_ms": now_ms,
             }
             self.ctx.journal.append("runtime.entry_quote_revalidate_failed", payload)
@@ -1892,11 +1927,12 @@ class MarketDataRuntime:
                 )
 
         self._entry_quote_truth_record_last_scan(stats)
-        self._emit_entry_quote_revalidate_probe(
-            stats=stats,
-            candidate_count=len(candidates or []),
-            now_ms=now_ms,
-        )
+        if evidence_role != "prewarm_only":
+            self._emit_entry_quote_revalidate_probe(
+                stats=stats,
+                candidate_count=len(candidates or []),
+                now_ms=now_ms,
+            )
         return overlay, stats
 
     def _snapshot_local_l2_state(self) -> None:
@@ -2452,8 +2488,12 @@ class MarketDataRuntime:
         *,
         snapshot,
         now_ms: int,
+        evidence_role: str = "entry_execution",
+        candidate_scope: str = "",
     ) -> dict[str, Any]:
         stats = {
+            "evidence_role": evidence_role,
+            "candidate_scope": candidate_scope,
             "candidate_count": len(candidates or []),
             "target_count": 0,
             "attempt_count": 0,
@@ -2517,9 +2557,17 @@ class MarketDataRuntime:
             for venue, symbol, _quote, status in targets[:24]
         ]
         if not targets:
-            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
-            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
-            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
+            if evidence_role == "prewarm_only":
+                self.ctx.state.last_scan["oi_prewarm_extra_candidate_count"] = stats[
+                    "candidate_count"
+                ]
+                self.ctx.state.last_scan["oi_prewarm_extra_target_count"] = 0
+                self.ctx.state.last_scan["oi_prewarm_extra_resolved_count"] = 0
+                self.ctx.state.last_scan["oi_prewarm_extra_failed_count"] = 0
+            else:
+                self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
+                self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
+                self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
             return stats
 
         refresher = self._entry_open_interest_refresher()
@@ -2533,6 +2581,8 @@ class MarketDataRuntime:
             {
                 "target_count": len(targets),
                 "targets": stats["targets"],
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
                 "ts_ms": now_ms,
             },
         )
@@ -2572,6 +2622,8 @@ class MarketDataRuntime:
                 "open_interest_evidence_reason": reason,
                 "open_interest_quote": open_interest_quote,
                 "elapsed_ms": elapsed_ms,
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
                 "ts_ms": now_ms,
             }
             if status == "available":
@@ -2664,24 +2716,48 @@ class MarketDataRuntime:
                     default_elapsed_ms=max(wall_clock_now_ms() - started_ms, 0),
                 )
 
-        self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
-            "attempt_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
-            "resolved_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
-            "failed_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
-            "timeout_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
-            "unsupported_count"
-        ]
-        self.ctx.state.last_scan[
-            "entry_blocked_after_targeted_refresh_count"
-        ] = stats["blocked_after_targeted_refresh_count"]
+        if evidence_role == "prewarm_only":
+            self.ctx.state.last_scan["oi_prewarm_extra_candidate_scope"] = candidate_scope
+            self.ctx.state.last_scan["oi_prewarm_extra_candidate_count"] = stats[
+                "candidate_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_target_count"] = stats[
+                "target_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_attempt_count"] = stats[
+                "attempt_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_resolved_count"] = stats[
+                "resolved_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_failed_count"] = stats[
+                "failed_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_timeout_count"] = stats[
+                "timeout_count"
+            ]
+            self.ctx.state.last_scan["oi_prewarm_extra_unsupported_count"] = stats[
+                "unsupported_count"
+            ]
+        else:
+            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
+                "attempt_count"
+            ]
+            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
+                "resolved_count"
+            ]
+            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
+                "failed_count"
+            ]
+            self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
+                "timeout_count"
+            ]
+            self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
+                "unsupported_count"
+            ]
+            self.ctx.state.last_scan[
+                "entry_blocked_after_targeted_refresh_count"
+            ] = stats["blocked_after_targeted_refresh_count"]
         return stats
 
     @staticmethod

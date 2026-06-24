@@ -840,7 +840,7 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
 
 
 @pytest.mark.asyncio
-async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
+async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without_expanding_execution_scope(
     tmp_path,
     monkeypatch,
 ):
@@ -867,6 +867,7 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
             max_concurrent_positions=2,
             entry_local_l2_primary_count=2,
             shadow_entry_opportunity_count=1,
+            entry_quote_prewarm_extra_candidate_count=24,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),
@@ -910,6 +911,7 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
     )
 
     prewarm_candidate_counts: list[int] = []
+    quote_revalidate_calls: list[dict[str, int | str]] = []
 
     async def prewarm_without_quotes(candidates, prewarm_now_ms):
         prewarm_candidate_counts.append(len(candidates))
@@ -942,9 +944,28 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
     refresher = RecordingRestRefresher()
     runtime.ws_bbo_rest_refresher = refresher
 
+    original_revalidate = runtime._entry_quote_revalidate_for_candidates
+
+    async def record_revalidate(candidates, *, snapshot, now_ms, candidate_scope="", skipped_untracked_count=0, evidence_role="entry_execution"):
+        quote_revalidate_calls.append({
+            "candidate_count": len(candidates),
+            "candidate_scope": candidate_scope,
+            "evidence_role": evidence_role,
+            "skipped_untracked_count": skipped_untracked_count,
+        })
+        return await original_revalidate(
+            candidates,
+            snapshot=snapshot,
+            now_ms=now_ms,
+            candidate_scope=candidate_scope,
+            skipped_untracked_count=skipped_untracked_count,
+            evidence_role=evidence_role,
+        )
+
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
+    monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", record_revalidate)
 
     runtime.journal.open()
     try:
@@ -959,15 +980,33 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
         if record["kind"] == "runtime.entry_quote_revalidate_probe"
     ][-1]
 
-    assert prewarm_candidate_counts == [3]
-    assert len(refresher.calls) == 6
+    assert prewarm_candidate_counts == [3, 24]
+    assert quote_revalidate_calls == [
+        {
+            "candidate_count": 3,
+            "candidate_scope": "v1_primary_shadow",
+            "evidence_role": "entry_execution",
+            "skipped_untracked_count": 46,
+        },
+        {
+            "candidate_count": 24,
+            "candidate_scope": "prewarm_extra",
+            "evidence_role": "prewarm_only",
+            "skipped_untracked_count": 46,
+        },
+    ]
+    assert len(refresher.calls) == 54
     assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "v1_primary_shadow"
     assert runtime.state.last_scan["quote_revalidate_candidate_count"] == 3
     assert runtime.state.last_scan["quote_revalidate_target_count"] == 6
-    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 94
+    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 46
+    assert runtime.state.last_scan["quote_prewarm_extra_candidate_count"] == 24
+    assert runtime.state.last_scan["quote_prewarm_extra_target_count"] == 48
+    assert runtime.state.last_scan["quote_prewarm_extra_resolved_count"] == 48
+    assert runtime.state.last_scan["quote_prewarm_extra_failed_count"] == 0
     assert probe["candidate_scope"] == "v1_primary_shadow"
     assert probe["candidate_count"] == 3
-    assert probe["skipped_untracked_count"] == 94
+    assert probe["skipped_untracked_count"] == 46
 
 
 @pytest.mark.asyncio
@@ -2783,6 +2822,112 @@ async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entr
         no_entry[-1]["payload"]["reason"]
         == "tradeable_candidates_blocked_by_entry_admission"
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=5000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+            entry_quote_prewarm_extra_candidate_count=24,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    runtime.state.venue_entry_cooldowns["aster:*"] = {
+        "venue": "aster",
+        "symbol": "*",
+        "blocked_symbol": "ESPORTSUSDT",
+        "reason": "max_notional_admission_blocked",
+        "source": "pre_entry_aster_precheck",
+        "block_scope": "venue",
+        "cooldown_scope": "venue",
+        "blocked_until_ms": 130000,
+        "official_doc_url": "https://www.asterdex.com/",
+        "evidence_gap": False,
+        "requested_notional_quote": 50.0,
+        "remaining_openable_notional_quote": 0.0,
+    }
+    candidate = CandidateInput(
+        long_venue="aster",
+        short_venue="bybit",
+        symbol="ESPORTSUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=10.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=10.0,
+        entry_notional_quote=50.0,
+        first_funding_timestamp_ms=400000,
+    )
+    snapshot = SidecarSnapshot(
+        published_at_ms=65000,
+        market_observed_at_ms=65000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "aster:ESPORTSUSDT": QuoteSnapshot(
+                venue="aster",
+                symbol="ESPORTSUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=60000,
+            ),
+            "bybit:ESPORTSUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="ESPORTSUSDT",
+                bid=100.2,
+                ask=101.2,
+                observed_at_ms=60000,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    async def fail_if_prewarmed(candidates, *, snapshot, now_ms, **kwargs):
+        raise AssertionError("active admission cooldown must prune before quote prewarm")
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+    monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", fail_if_prewarmed)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    venue_degraded = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_admission_venue_degraded"
+    ][-1]
+    assert venue_degraded["venue"] == "aster"
+    assert venue_degraded["reason"] == "max_notional_admission_blocked"
+    assert venue_degraded["block_scope"] == "venue"
+    assert venue_degraded["blocked_count"] == 1
+    assert runtime.entry_executor.contexts == []
 
 
 @pytest.mark.asyncio

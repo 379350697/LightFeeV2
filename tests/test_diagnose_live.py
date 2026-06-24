@@ -6516,6 +6516,12 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "blocked_candidate_count": 2,
             "terminal_candidate_rewarm_count": 0,
         },
+        "prewarm_extra": {
+            "targeted_count": 0,
+            "resolved_count": 0,
+            "failed_count": 0,
+            "suppressed_count": 0,
+        },
         "blocker_scope": "entry_candidate_admission",
         "candidate_admission_noise_summary": {
             "blocks_production_gate": False,
@@ -6690,6 +6696,87 @@ def test_entry_market_evidence_summary_distinguishes_low_oi_from_unavailable():
             "reasons": {"perp_open_interest_below_floor": 1},
         },
     ]
+
+
+def test_entry_market_evidence_summary_keeps_prewarm_only_failures_non_blocking():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    events = [
+        {
+            "kind": "runtime.entry_quote_revalidate_failed",
+            "payload": {
+                "venue": "bitget",
+                "symbol": "ALICEUSDT",
+                "reason_bucket": "rest_resolved_but_stale",
+                "evidence_role": "prewarm_only",
+                "candidate_scope": "prewarm_extra",
+            },
+        },
+        {
+            "kind": "runtime.entry_oi_targeted_refresh_failed",
+            "payload": {
+                "venue": "gate",
+                "symbol": "ALICEUSDT",
+                "open_interest_evidence_status": "timeout",
+                "open_interest_evidence_reason": "timeout_waiting_for_oi",
+                "evidence_role": "prewarm_only",
+                "candidate_scope": "prewarm_extra",
+            },
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["blocked_candidate_count"] == 0
+    assert summary["unresolved_blocker_count"] == 0
+    assert summary["action_counts"] == {"refresh_evidence": 2}
+    assert summary["prewarm_extra"] == {
+        "targeted_count": 0,
+        "resolved_count": 0,
+        "failed_count": 2,
+        "suppressed_count": 2,
+    }
+    assert summary["oi"]["failed_count"] == 0
+    assert summary["quote"]["blocked_candidate_count"] == 0
+
+
+def test_entry_market_evidence_summary_dedupes_prewarm_quote_rewarm_counters():
+    from scripts.diagnose_live import _build_entry_market_evidence_summary
+
+    base_payload = {
+        "venue": "bitget",
+        "symbol": "ALICEUSDT",
+        "target_count": 2,
+        "evidence_role": "prewarm_only",
+        "candidate_scope": "prewarm_extra",
+    }
+    events = [
+        {
+            "kind": "runtime.entry_quote_revalidate_targeted",
+            "payload": dict(base_payload),
+        },
+        {
+            "kind": "runtime.entry_ws_bbo_top_candidate_rewarm_started",
+            "payload": dict(base_payload),
+        },
+        {
+            "kind": "runtime.entry_quote_revalidate_resolved",
+            "payload": dict(base_payload),
+        },
+        {
+            "kind": "runtime.entry_ws_bbo_top_candidate_rewarm_succeeded",
+            "payload": dict(base_payload),
+        },
+    ]
+
+    summary = _build_entry_market_evidence_summary(events)
+
+    assert summary["prewarm_extra"] == {
+        "targeted_count": 2,
+        "resolved_count": 1,
+        "failed_count": 0,
+        "suppressed_count": 0,
+    }
 
 
 def test_entry_market_evidence_summary_reports_structural_suppression_backoff():

@@ -4000,6 +4000,10 @@ def _build_entry_market_evidence_summary(
     oi_structural_suppressed_count = 0
     oi_structural_next_recheck_ms = 0
     quote_blocked_candidate_count = 0
+    prewarm_extra_targeted_count = 0
+    prewarm_extra_resolved_count = 0
+    prewarm_extra_failed_count = 0
+    prewarm_extra_suppressed_count = 0
     blocked_owner_stats: dict[str, dict[str, Any]] = {}
 
     for rec in events:
@@ -4010,6 +4014,28 @@ def _build_entry_market_evidence_summary(
         else:
             payload = dict(payload)
             payload.setdefault("event_ts_ms", rec.get("ts_ms", 0))
+        prewarm_only = (
+            str(payload.get("evidence_role") or "").strip().lower() == "prewarm_only"
+            or str(payload.get("candidate_scope") or "").strip().lower()
+            == "prewarm_extra"
+        )
+        if prewarm_only:
+            if kind in {
+                "runtime.entry_quote_revalidate_targeted",
+                "runtime.entry_oi_targeted_refresh_started",
+            }:
+                prewarm_extra_targeted_count += int(payload.get("target_count") or 1)
+            elif kind in {
+                "runtime.entry_quote_revalidate_resolved",
+                "runtime.entry_oi_targeted_refresh_resolved",
+            }:
+                prewarm_extra_resolved_count += 1
+            elif kind in {
+                "runtime.entry_quote_revalidate_failed",
+                "runtime.entry_oi_targeted_refresh_failed",
+                "runtime.entry_quote_rewarm_terminal_stale",
+            }:
+                prewarm_extra_failed_count += 1
         contract = entry_market_evidence_contract(kind, payload)
         if not contract:
             continue
@@ -4119,15 +4145,17 @@ def _build_entry_market_evidence_summary(
             unresolved_blocker_count += 1
         elif action == "diagnostic_recovered_overbudget":
             diagnostic_recovered_overbudget_count += 1
-        elif kind == "runtime.entry_oi_targeted_refresh_failed":
+        elif kind == "runtime.entry_oi_targeted_refresh_failed" and blocks_entry:
             unresolved_blocker_count += 1
         if evidence_class == "oi" and action in {
             "allow_entry_evidence",
             "diagnostic_recovered_overbudget",
         }:
             oi_resolved_count += 1
-        elif kind == "runtime.entry_oi_targeted_refresh_failed":
+        elif kind == "runtime.entry_oi_targeted_refresh_failed" and not prewarm_only:
             oi_failed_count += 1
+        if prewarm_only and not blocks_entry and action == "refresh_evidence":
+            prewarm_extra_suppressed_count += 1
         if len(samples) < 5 and action != "refresh_evidence":
             samples.append({
                 "action": action,
@@ -4220,6 +4248,12 @@ def _build_entry_market_evidence_summary(
         "quote": {
             "blocked_candidate_count": quote_blocked_candidate_count,
             "terminal_candidate_rewarm_count": terminal_candidate_rewarm_count,
+        },
+        "prewarm_extra": {
+            "targeted_count": prewarm_extra_targeted_count,
+            "resolved_count": prewarm_extra_resolved_count,
+            "failed_count": prewarm_extra_failed_count,
+            "suppressed_count": prewarm_extra_suppressed_count,
         },
         "blocker_scope": "entry_candidate_admission",
         "samples": samples,

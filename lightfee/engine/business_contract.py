@@ -149,12 +149,24 @@ def entry_market_evidence_contract(
         "action_taken": "",
         "evidence_class": "",
     }
+    prewarm_only = (
+        str(payload.get("evidence_role") or "").strip().lower() == "prewarm_only"
+        or str(payload.get("candidate_scope") or "").strip().lower() == "prewarm_extra"
+    )
     if text in {
         "runtime.entry_quote_revalidate_failed",
         "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
         "runtime.quote_stale",
         "runtime.order_quote_stale_skipped",
     }:
+        if prewarm_only:
+            return {
+                **base,
+                "evidence_class": "quote",
+                "action": "refresh_evidence",
+                "action_taken": "prewarm_quote_evidence",
+                "terminality": "active",
+            }
         return {
             **base,
             "evidence_class": "quote",
@@ -190,6 +202,14 @@ def entry_market_evidence_contract(
             "terminality": "active",
         }
     if text == "runtime.entry_quote_rewarm_terminal_stale":
+        if prewarm_only:
+            return {
+                **base,
+                "evidence_class": "quote",
+                "action": "refresh_evidence",
+                "action_taken": "prewarm_quote_rewarm_terminal_stale",
+                "terminality": "active",
+            }
         action_taken = str(
             payload.get("action_taken") or "skip_candidate_after_hard_rewarm"
         )
@@ -261,6 +281,14 @@ def entry_market_evidence_contract(
             "terminality": "terminal_evidence_resolved",
         }
     if text == "runtime.entry_oi_targeted_refresh_failed":
+        if prewarm_only:
+            return {
+                **base,
+                "evidence_class": "oi",
+                "action": "refresh_evidence",
+                "action_taken": "prewarm_oi_evidence",
+                "terminality": "active",
+            }
         return {
             **base,
             "evidence_class": "oi",

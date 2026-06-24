@@ -83,6 +83,27 @@ def test_entry_market_evidence_contract_blocks_stale_quote():
     assert result["diagnostic_severity"] == "production_issue"
 
 
+def test_entry_market_evidence_contract_keeps_prewarm_quote_failures_non_blocking():
+    result = entry_market_evidence_contract(
+        "runtime.entry_quote_revalidate_failed",
+        {
+            "venue": "bitget",
+            "symbol": "GATEUSDT",
+            "reason_bucket": "rest_resolved_but_stale",
+            "reason_family": "rest_invalid_quote",
+            "evidence_role": "prewarm_only",
+            "candidate_scope": "prewarm_extra",
+        },
+    )
+
+    assert result["phase"] == "ENTRY_MARKET_EVIDENCE"
+    assert result["evidence_class"] == "quote"
+    assert result["action"] == "refresh_evidence"
+    assert result["blocks_entry"] is False
+    assert result["terminality"] == "active"
+    assert result["diagnostic_severity"] == "info"
+
+
 def test_entry_market_evidence_contract_maps_oi_resolution_and_failure():
     resolved = entry_market_evidence_contract(
         "runtime.entry_oi_targeted_refresh_resolved",
@@ -108,6 +129,26 @@ def test_entry_market_evidence_contract_maps_oi_resolution_and_failure():
     assert failed["action"] == "block_oi_unavailable"
     assert failed["blocks_entry"] is True
     assert failed["terminality"] == "terminal_candidate_block"
+
+
+def test_entry_market_evidence_contract_keeps_prewarm_oi_failures_non_blocking():
+    result = entry_market_evidence_contract(
+        "runtime.entry_oi_targeted_refresh_failed",
+        {
+            "venue": "gate",
+            "symbol": "ALICEUSDT",
+            "previous_open_interest_evidence_status": "deferred_by_cap",
+            "open_interest_evidence_status": "timeout",
+            "open_interest_evidence_reason": "timeout_waiting_for_oi",
+            "evidence_role": "prewarm_only",
+            "candidate_scope": "prewarm_extra",
+        },
+    )
+
+    assert result["evidence_class"] == "oi"
+    assert result["action"] == "refresh_evidence"
+    assert result["blocks_entry"] is False
+    assert result["terminality"] == "active"
 
 
 def test_entry_market_evidence_contract_distinguishes_low_oi_from_unavailable():
