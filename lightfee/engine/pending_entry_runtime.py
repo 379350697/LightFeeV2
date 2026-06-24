@@ -1477,6 +1477,46 @@ class PendingEntryRuntime:
         maker_is_long = pending.maker_leg == "long"
         maker_side = Side.BUY if maker_is_long else Side.SELL
 
+        precheck_maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
+        precheck_hedge_filled = float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0)
+        precheck_balanced = min(precheck_maker_filled, precheck_hedge_filled)
+        precheck_missing_price = (
+            precheck_balanced > 1e-9
+            and (
+                float(getattr(pending, "maker_fill_price", 0.0) or 0.0) <= 0.0
+                or float(getattr(pending, "hedge_fill_price", 0.0) or 0.0) <= 0.0
+            )
+        )
+        if precheck_missing_price:
+            live_truth = await self.ctx._pending_entry_positive_fill_live_truth(
+                pending,
+                entry_id,
+                now_ms,
+            )
+            decision = PendingEntryTerminalizer().decide(
+                pending,
+                live_truth=live_truth,
+            )
+            if decision.outcome == "positive_fill_live_truth_conflict":
+                self.ctx.journal.append(
+                    "pending_entry.terminalizer_decision",
+                    self.ctx._pending_entry_terminalizer_decision_payload(
+                        entry_id,
+                        pending,
+                        decision,
+                        now_ms,
+                    ),
+                )
+                if await self._handle_positive_fill_live_truth_conflict(
+                    pending=pending,
+                    entry_id=entry_id,
+                    decision=decision,
+                    live_truth=live_truth,
+                    now_ms=now_ms,
+                ):
+                    return True
+                return False
+
         if not await self.ctx._ensure_pending_entry_open_fill_details(
             pending,
             entry_id,
@@ -1775,27 +1815,7 @@ class PendingEntryRuntime:
         )
         if not decision.allows_pending_removal:
             if decision.outcome == "positive_fill_live_truth_conflict":
-                pending.uncertain_outcome = True
-                pending.reconcile_next_attempt_ms = max(
-                    int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
-                    now_ms + 1_000,
-                )
-                self.ctx.journal.append(
-                    "pending_entry.positive_fill_live_truth_conflict",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "maker_leg_filled": pending.maker_leg_filled,
-                        "hedge_leg_filled": pending.hedge_leg_filled,
-                        "matched_quantity": decision.matched_quantity,
-                        "residual_quantity": decision.residual_quantity,
-                        "live_long_quantity": decision.live_long_quantity,
-                        "live_short_quantity": decision.live_short_quantity,
-                        "live_balanced_quantity": decision.live_balanced_quantity,
-                        "reason": decision.reason,
-                    },
-                )
-                if await self._cleanup_positive_fill_live_truth_conflict(
+                if await self._handle_positive_fill_live_truth_conflict(
                     pending=pending,
                     entry_id=entry_id,
                     decision=decision,
@@ -1978,6 +1998,43 @@ class PendingEntryRuntime:
                 residual_evidence,
             )
         return True
+
+    async def _handle_positive_fill_live_truth_conflict(
+        self,
+        *,
+        pending: Any,
+        entry_id: str,
+        decision: PendingEntryTerminalDecision,
+        live_truth: PendingEntryLiveTruth,
+        now_ms: int,
+    ) -> bool:
+        pending.uncertain_outcome = True
+        pending.reconcile_next_attempt_ms = max(
+            int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+            now_ms + 1_000,
+        )
+        self.ctx.journal.append(
+            "pending_entry.positive_fill_live_truth_conflict",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "matched_quantity": decision.matched_quantity,
+                "residual_quantity": decision.residual_quantity,
+                "live_long_quantity": decision.live_long_quantity,
+                "live_short_quantity": decision.live_short_quantity,
+                "live_balanced_quantity": decision.live_balanced_quantity,
+                "reason": decision.reason,
+            },
+        )
+        return await self._cleanup_positive_fill_live_truth_conflict(
+            pending=pending,
+            entry_id=entry_id,
+            decision=decision,
+            live_truth=live_truth,
+            now_ms=now_ms,
+        )
 
     def _remove_pending_entry_after_terminal_decision(
         self,

@@ -3957,6 +3957,96 @@ async def test_positive_fill_finalize_cleans_owned_live_single_leg_before_releas
 
 
 @pytest.mark.asyncio
+async def test_positive_fill_missing_maker_price_still_cleans_owned_live_single_leg(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    live_short = PositionSnapshot(
+        venue=Venue.BINANCE,
+        symbol="SYNUSDT",
+        side=Side.SELL,
+        quantity=49.0,
+        entry_price=0.32638,
+        observed_at_ms=1782316440405,
+    )
+    flat_long = PositionSnapshot(
+        venue=Venue.BITGET,
+        symbol="SYNUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1782316440405,
+    )
+    bitget = _OwnedConflictCleanupAdapter(Venue.BITGET)
+    bitget.position_snapshots = [flat_long, flat_long]
+    binance = _OwnedConflictCleanupAdapter(Venue.BINANCE)
+    binance.position_snapshots = [live_short, live_short]
+    binance.default_position_side = Side.SELL
+    binance.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BITGET: bitget,
+            Venue.BINANCE: binance,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1782316404007-SYNUSDT",
+        symbol="SYNUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BINANCE,
+        target_quantity=49.06019072149142,
+        maker_leg="long",
+        maker_order_id="1453705928929603585",
+        maker_client_order_id="3060f61a5c92d1d5de00d1deb4cdac55749e",
+        hedge_order_id="1768090380",
+        hedge_client_order_id="4af602e2a795a6434301ec04211a5005ed9a",
+        maker_leg_filled=49.0,
+        hedge_leg_filled=49.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.32638,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1782316440405,
+    )
+
+    assert finalized is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert pending.pending_id not in runtime.state.open_positions
+    assert binance.place_order_call_count == 1
+    assert binance.last_request is not None
+    assert binance.last_request.reduce_only is True
+    assert binance.last_request.post_only is False
+    assert binance.last_request.time_in_force == TimeInForce.IOC
+    assert binance.last_request.side == Side.BUY
+    assert binance.last_request.quantity == pytest.approx(49.0)
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.finalize_deferred_incomplete_fill" not in kinds
+    assert "entry.opened" not in kinds
+    cleanup = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.owned_live_conflict_cleanup_succeeded"
+    ][-1]
+    assert cleanup["entry_id"] == pending.pending_id
+    assert cleanup["venue"] == "binance"
+    assert cleanup["live_position_side"] == "sell"
+    assert cleanup["live_position_quantity"] == pytest.approx(49.0)
+    conflict = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.positive_fill_live_truth_conflict"
+    ][-1]
+    assert conflict["reason"] == "positive_fill_conflicts_with_live_unmatched_truth"
+
+
+@pytest.mark.asyncio
 async def test_positive_fill_owned_live_single_leg_cleanup_failure_retains_pending(
     config, tmp_journal,
 ):
