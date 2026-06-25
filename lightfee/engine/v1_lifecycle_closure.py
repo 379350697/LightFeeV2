@@ -1183,6 +1183,9 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_admission_symbol_cooldown_armed": (
         V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
     ),
+    "runtime.entry_admission_headroom_advisory": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
     "runtime.venue_cooldown_started": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.entry_admission_venue_degraded": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.auto_fail_closed_entered": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,

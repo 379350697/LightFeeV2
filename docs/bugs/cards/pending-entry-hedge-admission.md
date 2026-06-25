@@ -88,17 +88,27 @@ Deterministic hedge admission reject must:
 
 ## V1 / Exchange Semantics
 
-- Aster `-5018`: V1 detects max-notional submit reject and starts venue entry cooldown with reason `aster_max_notional_limit`. V2 should keep symbol evidence and also create venue-scope cooldown for this family.
+- Aster `remainingOpenableNotionalValue=0` is advisory when account truth is
+  sufficient. If Aster V3 account truth (`accountWithJoinMargin`), fresh
+  position truth, and open-order truth show enough margin, a flat symbol, and no
+  open orders, runtime records `runtime.entry_admission_headroom_advisory` with
+  `reason=aster_headroom_advisory_zero`, `block_scope=none`, and allows submit.
+  A later real exchange reject remains authoritative.
+- Aster real `-5018` max-notional submit rejects are symbol-scoped admission
+  evidence (`aster:SYMBOL`). They must not create `aster:*` cooldown unless the
+  evidence is account-level balance insufficiency, account-level
+  permission/auth failure, or private truth unavailable for the whole venue.
 - Aster V2 private V3 must now do better than V1's post-submit detection:
   non-`reduce_only` new-risk orders precheck
   `remainingOpenableNotionalValue` before submitting. If requested notional is
-  above the remaining headroom, block the whole candidate with
+  above positive remaining headroom, block the whole candidate with
   `max_notional_admission_blocked`; do not shrink one leg and submit a smaller
   one-sided order. Reduce-only close/flatten remains allowed even if headroom
   truth is unavailable. The V3 adapter must source this precheck through the
-  Aster V3 signer client, not generic Binance-HMAC private transport; if truth
-  is unavailable, runtime must still arm symbol + venue admission cooldown with
-  `evidence_gap=true`.
+  Aster V3 signer client, not generic Binance-HMAC private transport. If
+  symbol headroom truth is unavailable, runtime must keep symbol-scoped
+  admission evidence with `evidence_gap=true`; venue-scope cooldown is reserved
+  for account-level or venue-wide private-truth failures.
 - Aster Pro API V3 credentials are API-wallet/Web3 credentials, not Binance
   HMAC credentials. Aster public market data can keep Binance-compatible FAPI
   paths, but private account/order/open-order probes must use Aster V3
@@ -129,13 +139,14 @@ Deterministic hedge admission reject must:
 | 2026-06-08 | Aster Pro API V3 private transport isolation | fixed, deployed through main | Aster private account/order/open-order probes are no longer routed through shared Binance HMAC transport. V2 now keeps public Aster FAPI market data separate from a dedicated V3 Web3 signer client, so V3 API-wallet credentials do not produce false `Signature for this request is not valid` private-truth failures. Review closure also pins `accountWithJoinMargin`, Aster V3 capability truth, and REST V3 order-truth probe paths. Follow-up startup safety and host fixes are in main (`9d037f5`, `6054c47`) and the deployed manifest line. |
 | 2026-06-08 | Production issues 3-7 admission evidence audit | fixed, deployed/cloud verified | Existing admission classifier and venue-scope downgrade coverage stayed authoritative. CL-052 did not add another admission branch; it records that deployment review should verify the already-covered `runtime.entry_admission_blocked`, `runtime.entry_admission_venue_degraded`, `pending_entry.hedge_admission_blocked`, and `entry.aborted` payload fields across the same source/scope/venue/symbol/pair/action/cooldown contract. |
 | 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure now uses `/v5/order/pre-check-order` before maker dispatch when the adapter supports it. `110125/110126/110123` records `runtime.entry_admission_blocked` with `source=pre_entry_bybit_precheck` and prevents maker submit; pending hedge admission handling remains the fallback. |
-| 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | deployed through `039d52c` | Aster V3 and transport submits now share the admission helper, but V3 gets headroom through the dedicated V3 signer client rather than generic HMAC transport. Insufficient or unavailable headroom blocks the candidate before HTTP order submit, emits `runtime.entry_admission_blocked`, arms symbol + venue cooldown, keeps reduce-only cleanup allowed, and no longer retries by shrinking quantity after exchange `-5018`. |
+| 2026-06-18 | Aster `-5018` remaining-openable-notional pre-submit gate | deployed through `039d52c`; superseded by CL-120/CL-121 for Aster scope semantics | Aster V3 and transport submits now share the admission helper, but CL-120 split account funds truth from advisory headroom. Endpoint-zero no longer means wallet exhaustion, and real `-5018` is now symbol-scoped unless account-level or venue-wide private truth proves a broader block. |
 | 2026-06-19 | Two-leg admission selection and single-leg fee-drag guard | deployed through `039d52c` | Entry dispatch now verifies hedge venue/symbol admission after selection and before maker submit. Aster zero headroom, max-notional, and error-only `max_notional_admission_blocked` shapes block pre-submit when truth is available. If a deterministic hedge block is only discovered after maker fill, cleanup still runs through the single-leg fallback, but hard cooldown plus `business_progression_quality_summary.repeated_single_leg_guarded` makes a repeated maker submit on the same route a production issue instead of silent fee churn. |
 | 2026-06-19 | Bybit 110007 and quote-rewarm process-quality closure | deployed through `039d52c`; `106f47e` keeps diagnostics aligned | Bybit `110007` is treated as opening-only deterministic admission cooldown, while reduce-only close remains allowed. Diagnose consumes production-gate truth so historical quote/admission hard-over-budget artifacts remain counted as process issues without becoming current active stuck when exchange truth and lifecycle blockers are clean. `106f47e` keeps that distinction while adding passive-close waiting-event truth payloads, so admission/quote recovered artifacts do not hide live close blockers or create false active stuck. |
 | 2026-06-19 | Centralized business contract for entry sizing/admission diagnostics | `8eadb8e` deployed as clean baseline; unified-contract follow-up local, deploy pending | CL-102 adds `lightfee/engine/business_contract.py` and wires entry quantity plans, admission degraded aggregation keys, business-progression process counters, quote-rewarm handoff evidence, and dual-taker lifecycle mapping through it. HOMEUSDT-style `1856 -> 1800` contract-size adjustment is now explicit evidence, not inferred from later residual repair or terminal state. Unhedgeable quantity must block before maker submit rather than relying on residual repair as the normal path. |
 | 2026-06-21 | Unopened and terminal-flat quantity plans plus cooldown/min-notional lifecycle mapping | `9dee9f3` deployed/cloud verified; terminal quantity-warning residual fixed locally, deploy pending | CL-105 keeps actual unproven opened-entry quantity warnings strict, but moves planner adjustments for unopened admission-blocked candidates and terminal-flat accounting-gap owners into resolved terminal evidence. The local residual follow-up also covers `reconciliation.entry_abandoned_flat` and entry-plan `exchange_step_rounding` when terminal/unopened, residual-repaired, or current clean exchange truth proves no active exposure. `runtime.entry_admission_symbol_cooldown_armed`, `runtime.venue_cooldown_started`, `execution.min_notional_accumulating`, `execution.min_notional_abort_and_flatten`, and `execution.pending_entry_hedge_chunk_buffering` no longer pollute V1 lifecycle acceptance. Entry `execution.dual_taker_armed` remains `PENDING_ENTRY`; exit payloads map separately to `PASSIVE_CLOSE`. |
 | 2026-06-23 | Aster max-notional admission headroom diagnostics | local green, deploy pending | CL-110 keeps Aster `max_notional_admission_blocked` fail-closed and adds actionable diagnosis only: `requested_notional`, `remaining_openable_notional`, computed `notional_gap`, leverage, top blocked symbols, and account/leverage/position-limit/capital advice. It does not auto-shrink quantity or bypass `remainingOpenableNotionalValue`. |
-| 2026-06-24 | Aster max-notional cooldown before entry prewarm | `653b21a` deployed/cloud verified | CL-115 keeps Aster `max_notional_admission_blocked` as a venue-scope new-entry cooldown and verifies it prunes candidates before quote/OI prewarm or maker submit. This reduces empty prewarm churn after Gate/Bitget candidate recovery without weakening the fail-closed admission guard. Cloud log scan after the new service start had no `max_notional_admission_blocked` repeats in the deploy window. |
+| 2026-06-24 | Aster max-notional cooldown before entry prewarm | `653b21a` deployed/cloud verified; superseded by CL-120/CL-121 for Aster scope semantics | CL-115's prewarm pruning remains valid for active admission evidence, but Aster endpoint-zero is now advisory with sufficient account truth and real `-5018` is symbol-scoped. Only account-level insufficiency, permission/auth failure, or venue-wide private-truth outage may arm `aster:*`. |
+| 2026-06-26 | Aster advisory lifecycle mapping and card drift | local green, deploy pending | `runtime.entry_admission_headroom_advisory` is mapped to `DIAGNOSTIC_ONLY`; since-deploy diagnose no longer reports it as unmapped residue. This card now records CL-120 scope semantics: endpoint-zero advisory does not block, real `-5018` is `aster:SYMBOL`, and `aster:*` requires account-level or venue-wide evidence. |
 
 ## Recurrences
 

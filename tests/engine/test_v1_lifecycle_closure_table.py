@@ -171,6 +171,15 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
                 },
             },
             {
+                "kind": "runtime.entry_admission_headroom_advisory",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "LABUSDT",
+                    "reason": "aster_headroom_advisory_zero",
+                    "block_scope": "none",
+                },
+            },
+            {
                 "kind": "runtime.venue_cooldown_started",
                 "payload": {
                     "venue": "aster",
@@ -186,6 +195,7 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
     assert payload["summary"]["entry_allowed"] is False
     assert "runtime.entry_admission_venue_degraded" not in payload["unmapped_event_kinds"]
     assert "runtime.entry_admission_symbol_cooldown_armed" not in payload["unmapped_event_kinds"]
+    assert "runtime.entry_admission_headroom_advisory" not in payload["unmapped_event_kinds"]
     assert "runtime.venue_cooldown_started" not in payload["unmapped_event_kinds"]
     close_rows = [
         row for row in payload["rows"]
@@ -580,6 +590,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.entry_post_only_bbo_repriced",
         "runtime.entry_post_only_reject_cooldown",
         "runtime.entry_admission_blocked",
+        "runtime.entry_admission_headroom_advisory",
         "runtime.entry_blocked_admission_selection",
         "runtime.maker_event_no_ws_bbo_quote",
         "runtime.position_drift_skipped_passive_close_owner",
@@ -664,6 +675,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_exceeded") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.entry_selected_submit_deadline_waiting_on_order_truth") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("runtime.candidate_lease_expired") == "DIAGNOSTIC_ONLY"
+    assert (
+        map_lifecycle_event_kind("runtime.entry_admission_headroom_advisory")
+        == "DIAGNOSTIC_ONLY"
+    )
     assert map_lifecycle_event_kind("execution.min_notional_accumulating") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.min_notional_abort_and_flatten") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.pending_entry_hedge_chunk_buffering") == "PENDING_ENTRY"

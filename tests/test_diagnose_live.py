@@ -1543,6 +1543,66 @@ def test_diagnose_rolls_up_aster_advisory_zero_account_truth():
     assert rollup["headroom_truth_source"] == "account_with_join_margin"
 
 
+def test_diagnose_since_deploy_maps_aster_advisory_zero_lifecycle_event(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+            "pending_residual_repairs": [],
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1781665905362,
+                "kind": "runtime.entry_admission_headroom_advisory",
+                "payload": {
+                    "venue": "aster",
+                    "symbol": "LABUSDT",
+                    "reason": "aster_headroom_advisory_zero",
+                    "source": "aster_headroom_precheck",
+                    "block_scope": "none",
+                    "requested_notional": 16.093647,
+                    "remaining_openable_notional": 0.0,
+                    "remaining_openable_endpoint_value": 0.0,
+                    "required_margin_estimate": 4.02341175,
+                    "available_balance_quote": 60.5,
+                    "position_flat": True,
+                    "open_orders_empty": True,
+                    "account_truth_submit_allowed": True,
+                    "headroom_truth_source": "account_with_join_margin",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LABUSDT",
+            venues=["aster", "bybit"],
+            now_ms=1781665910000,
+        )
+
+        summary = result["entry_admission_cooldown_summary"]
+        assert summary["reason_counts"] == {"aster_headroom_advisory_zero": 1}
+        assert summary["scope_counts"] == {"none": 1}
+        assert summary["advice_counts"] == {
+            "aster_endpoint_zero_advisory_account_truth_submit_allowed": 1
+        }
+        assert result["production_acceptance_gate"]["v1_lifecycle_closure"][
+            "unmapped_event_kinds"
+        ] == []
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_diagnose_exposes_local_order_identifier_reconcile_summary(monkeypatch):
     from scripts import diagnose_live as dl
 
