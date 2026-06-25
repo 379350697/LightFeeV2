@@ -1276,8 +1276,27 @@ def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> boo
         or ""
     ).strip()
     reason = _payload_reason_text(payload)
+    extra = exchange_error.get("extra")
+    extra = extra if isinstance(extra, dict) else {}
+    gate_label = str(extra.get("label") or code or "").strip().lower()
+    gate_message = str(
+        extra.get("message")
+        or exchange_error.get("message")
+        or exchange_error.get("exchange_msg")
+        or ""
+    ).lower()
+    gate_text = " ".join(
+        (reason, str(exchange_error.get("raw_body") or ""), gate_label, gate_message)
+    ).lower()
+    gate_code_text = " ".join((code, gate_label, gate_text)).lower()
+    gate_empty_position = (
+        "reduce_exceeded" in gate_code_text
+        and "empty position" in gate_text
+        and "pending order" not in gate_text
+    )
     return (
         code == "-2022"
+        or gate_empty_position
         or "reduceonly order is rejected" in reason
         or "reduce only order is rejected" in reason
         or "reduce-only order is rejected" in reason

@@ -1043,6 +1043,182 @@ def test_close_order_error_resolution_requires_order_identity_match_for_reduce_o
     }
 
 
+def test_close_order_error_resolution_treats_gate_empty_position_as_terminal_flat():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "HUSDT",
+        "venue": "gate",
+        "client_order_id": "close-leg-1",
+        "exchange_code": "REDUCE_EXCEEDED",
+        "exchange_msg": "empty position",
+        "exchange_error": {
+            "exchange_code": "REDUCE_EXCEEDED",
+            "exchange_msg": "empty position",
+            "raw_body": '{"label":"REDUCE_EXCEEDED","message":"empty position"}',
+            "request_context": {
+                "reduce_only": True,
+                "client_order_id": "close-leg-1",
+            },
+            "extra": {
+                "label": "REDUCE_EXCEEDED",
+                "message": "empty position",
+            },
+        },
+        "request_context": {
+            "reduce_only": True,
+            "client_order_id": "close-leg-1",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_maker_submit_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert result == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
+
+
+def test_close_order_error_resolution_reads_gate_empty_position_from_raw_body_text():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "HUSDT",
+        "venue": "gate",
+        "client_order_id": "close-leg-1",
+        "exchange_error": {
+            "raw_body": '{"label":"REDUCE_EXCEEDED","message":"empty position"}',
+            "request_context": {
+                "reduce_only": True,
+                "client_order_id": "close-leg-1",
+            },
+        },
+        "request_context": {
+            "reduce_only": True,
+            "client_order_id": "close-leg-1",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_maker_submit_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert result == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
+
+
+def test_close_order_error_resolution_reads_gate_empty_position_from_nested_raw_body_with_generic_error():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "HUSDT",
+        "venue": "gate",
+        "client_order_id": "close-leg-1",
+        "error": "HTTP 400",
+        "exchange_error": {
+            "raw_body": '{"label":"REDUCE_EXCEEDED","message":"empty position"}',
+            "request_context": {
+                "reduce_only": True,
+                "client_order_id": "close-leg-1",
+            },
+        },
+        "request_context": {
+            "reduce_only": True,
+            "client_order_id": "close-leg-1",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_maker_submit_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert result == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
+
+
+def test_close_order_error_resolution_does_not_treat_gate_empty_position_without_reduce_only_as_terminal_flat():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "HUSDT",
+        "venue": "gate",
+        "client_order_id": "close-leg-1",
+        "exchange_code": "REDUCE_EXCEEDED",
+        "exchange_msg": "empty position",
+        "request_context": {
+            "reduce_only": False,
+            "client_order_id": "close-leg-1",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_maker_submit_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert result["resolved"] is False
+
+
+def test_close_order_error_resolution_does_not_treat_gate_pending_conflict_as_terminal_flat():
+    payload = {
+        "position_id": "entry-1",
+        "symbol": "HUSDT",
+        "venue": "gate",
+        "client_order_id": "close-leg-1",
+        "exchange_code": "REDUCE_EXCEEDED",
+        "exchange_msg": "pending order blocks reduce order",
+        "exchange_error": {
+            "exchange_code": "REDUCE_EXCEEDED",
+            "exchange_msg": "pending order blocks reduce order",
+            "raw_body": '{"label":"REDUCE_EXCEEDED","message":"pending order blocks reduce order"}',
+            "request_context": {
+                "reduce_only": True,
+                "client_order_id": "close-leg-1",
+            },
+            "extra": {
+                "label": "REDUCE_EXCEEDED",
+                "message": "pending order blocks reduce order",
+            },
+        },
+        "request_context": {
+            "reduce_only": True,
+            "client_order_id": "close-leg-1",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_maker_submit_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=True,
+        has_order_identity=True,
+    )
+
+    assert result["resolved"] is False
+
+
 def test_close_order_error_resolution_reads_nested_exchange_error_payload():
     payload = {
         "position_id": "entry-1",

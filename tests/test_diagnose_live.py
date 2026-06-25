@@ -9283,6 +9283,150 @@ def test_run_diagnose_filters_resolved_binance_post_only_boundary_reject(monkeyp
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_filters_resolved_gate_empty_position_reduce_only_terminal_flat(monkeypatch):
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        state = {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1782349221000,
+        }
+        _write_json(os.path.join(d, "state-current.json"), state)
+        events = [
+            {
+                "ts_ms": 1782349216085,
+                "kind": "exit.passive_close_maker_submit_error",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "venue": "gate",
+                    "operation": "submit_passive_order",
+                    "error": 'HTTP 400: {"label":"REDUCE_EXCEEDED","message":"empty position"}',
+                    "exchange_error": {
+                        "venue": "gate",
+                        "operation": "submit_passive_order",
+                        "http_status": 400,
+                        "raw_body": '{"label":"REDUCE_EXCEEDED","message":"empty position"}',
+                        "exchange_code": "REDUCE_EXCEEDED",
+                        "exchange_msg": "empty position",
+                        "evidence_completeness": "complete",
+                        "missing_evidence": [],
+                        "confidence": "high",
+                        "request_context": {
+                            "symbol": "HUSDT",
+                            "side": "sell",
+                            "quantity": 80.0,
+                            "price": 0.04886,
+                            "reduce_only": True,
+                            "post_only": True,
+                            "client_order_id": "lfex80269f53f7eb34e4",
+                        },
+                        "extra": {
+                            "label": "REDUCE_EXCEEDED",
+                            "message": "empty position",
+                        },
+                    },
+                    "request_context": {
+                        "symbol": "HUSDT",
+                        "side": "sell",
+                        "quantity": 80.0,
+                        "price": 0.04886,
+                        "reduce_only": True,
+                        "post_only": True,
+                        "client_order_id": "lfex80269f53f7eb34e4",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1782349219300,
+                "kind": "order.filled",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "symbol": "HUSDT",
+                    "venue": "gate",
+                    "client_order_id": "lfex80269f53f7eb34e4",
+                    "reason": "terminal_reduce_only",
+                    "exchange_verified_flat": True,
+                },
+            },
+            {
+                "ts_ms": 1782349219400,
+                "kind": "exit.close_chunk_submitted",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "symbol": "HUSDT",
+                    "long_client_order_id": "lfex80269f53f7eb34e4",
+                    "long_outcome": "filled",
+                    "short_outcome": "filled",
+                },
+            },
+            {
+                "ts_ms": 1782349219450,
+                "kind": "exit.reconciliation_abandoned",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "symbol": "HUSDT",
+                    "client_order_id": "lfex80269f53f7eb34e4",
+                    "reason": "exchange_truth_flat",
+                },
+            },
+            {
+                "ts_ms": 1782349219500,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "symbol": "HUSDT",
+                    "reason": "first_stage_capture",
+                    "long_client_order_id": "lfex80269f53f7eb34e4",
+                    "long_closed_qty": 80.0,
+                    "short_closed_qty": 80.0,
+                },
+            },
+            {
+                "ts_ms": 1782349219984,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1782348866794-HUSDT",
+                    "symbol": "HUSDT",
+                    "terminal_state": "flat",
+                    "terminal_reason": "fallback_live_balanced_matched_close_flat_probe",
+                    "problem": False,
+                },
+            },
+        ]
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HUSDT",
+            venues=["gate", "okx"],
+            now_ms=1782349225000,
+        )
+
+        summary = result["resolved_close_order_error_summary"]
+        assert summary["current_exchange_truth_clean"] is True
+        assert summary["reduce_only_terminal_flat_count"] == 1
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        assert result["diagnostic_noise_summary"]["resolved_close_artifact_count"] == 1
+        assert result["diagnostic_noise_summary"]["current_blocker_count"] == 0
+        gate = result["production_acceptance_gate"]
+        assert gate["v1_lifecycle_closure"]["unmapped_event_kinds"] == []
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_keeps_binance_post_only_reject_without_cooldown(monkeypatch):
     import scripts.diagnose_live as dl
 
