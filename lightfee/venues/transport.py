@@ -1977,10 +1977,62 @@ class VenueTransport(MarketDataClient):
             "rule_source": rule_source,
         }
         if quantized_qty <= 0 or not math.isfinite(quantized_qty):
+            raw_notional = (
+                abs(raw_qty * raw_price)
+                if raw_price is not None and math.isfinite(raw_price)
+                else None
+            )
+            next_valid_qty = max(min_qty, quantity_step)
+            if quantity_step > 0 and math.isfinite(next_valid_qty):
+                next_valid_qty = _ceil_to_step(next_valid_qty, quantity_step)
+                next_valid_qty = round(next_valid_qty, _step_decimals(quantity_step))
+            min_qty_notional = (
+                abs(min_qty * raw_price)
+                if raw_price is not None and math.isfinite(raw_price)
+                else None
+            )
+            next_valid_qty_notional = (
+                abs(next_valid_qty * raw_price)
+                if raw_price is not None
+                and math.isfinite(raw_price)
+                and math.isfinite(next_valid_qty)
+                else None
+            )
+            payload["raw_notional"] = raw_notional
+            payload["min_qty_notional"] = min_qty_notional
+            payload["next_valid_qty"] = next_valid_qty
+            payload["next_valid_qty_notional"] = next_valid_qty_notional
             payload["response_classification"] = "precision_rejected"
             payload["reason"] = "quantity_step_rejected"
             self._record_order_diagnostic("order.submit_result", payload)
-            raise OrderSubmitError(SubmitFailureClass.REJECTED, "quantity_step_rejected")
+            detail_parts = [
+                "quantity_step_rejected",
+                f"symbol={request.symbol}",
+                f"raw_qty={raw_qty}",
+                f"quantized_qty={quantized_qty}",
+                f"quantity_step={quantity_step}",
+                f"min_qty={min_qty}",
+            ]
+            if raw_notional is not None:
+                detail_parts.append(f"raw_notional={_format_decimal(raw_notional)}")
+            if min_qty_notional is not None:
+                detail_parts.append(
+                    f"min_qty_notional={_format_decimal(min_qty_notional)}"
+                )
+            if next_valid_qty > 0 and math.isfinite(next_valid_qty):
+                detail_parts.append(f"next_valid_qty={next_valid_qty}")
+            if next_valid_qty_notional is not None:
+                detail_parts.append(
+                    "next_valid_qty_notional="
+                    f"{_format_decimal(next_valid_qty_notional)}"
+                )
+            detail_parts.append(
+                "requested quantity rounds below exchange quantity step/min_qty"
+            )
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                " ".join(detail_parts),
+            )
         if quantized_qty < min_qty:
             payload["response_classification"] = "precision_rejected"
             payload["reason"] = "min_qty_rejected"

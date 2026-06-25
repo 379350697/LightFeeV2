@@ -9668,6 +9668,45 @@ class TestPassivePreflight:
             transport.preflight_order_request(req, symbol_rule=rule)
         assert exc.value.is_rejected
 
+    def test_preflight_step_reject_explains_symbol_qty_and_required_notional(self):
+        from lightfee.core.errors import OrderSubmitError
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        transport = VenueTransport(spec=aster_spec(), mode="paper")
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=0.9269627325614883,
+            price=17.361,
+            client_order_id="lab-too-small",
+        )
+        rule = SymbolRule(
+            tick_size=0.001,
+            qty_step=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            rule_source="exchangeInfo",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc:
+            transport.preflight_order_request(req, symbol_rule=rule)
+
+        message = str(exc.value)
+        assert "quantity_step_rejected" in message
+        assert "symbol=LABUSDT" in message
+        assert "raw_qty=0.9269627325614883" in message
+        assert "quantized_qty=0.0" in message
+        assert "quantity_step=1.0" in message
+        assert "min_qty=1.0" in message
+        assert "raw_notional=16.093" in message
+        assert "min_qty_notional=17.361" in message
+        payload = transport.drain_order_diagnostics()[-1]["payload"]
+        assert payload["reason"] == "quantity_step_rejected"
+        assert payload["raw_notional"] == pytest.approx(16.093)
+        assert payload["min_qty_notional"] == pytest.approx(17.361)
+        assert payload["next_valid_qty"] == pytest.approx(1.0)
+
     def test_preflight_min_notional_rejected(self):
         from lightfee.core.errors import OrderSubmitError
         from lightfee.venues.symbol_rules import SymbolRule
