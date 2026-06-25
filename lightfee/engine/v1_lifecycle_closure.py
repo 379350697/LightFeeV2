@@ -1187,6 +1187,7 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_admission_venue_degraded": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.auto_fail_closed_entered": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.auto_fail_closed_cleanup_failed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.recovery_blocked": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_reconcile_error": V1LifecycleClosurePhase.PENDING_ENTRY.value,

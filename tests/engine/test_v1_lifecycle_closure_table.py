@@ -613,6 +613,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "reconciliation.pending_close_exchange_truth_refreshed",
         "runtime.auto_fail_closed_entered",
         "runtime.auto_fail_closed_cleanup_failed",
+        "runtime.recovery_blocked",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -675,6 +676,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("runtime.auto_fail_closed_cleanup_failed")
         == "RECOVERY_TRUTH"
     )
+    assert map_lifecycle_event_kind("runtime.recovery_blocked") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("pending_entry.release_maker_cancel_requested") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("pending_entry.release_retained_maker_open_order") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("pending_entry.release_maker_terminal_no_open_order") == "PENDING_ENTRY"
