@@ -9687,6 +9687,84 @@ def test_single_leg_recovery_summary_marks_started_without_terminal_unresolved()
     assert summary["unresolved_entry_ids"] == ["entry-auth-stuck"]
 
 
+def test_single_leg_recovery_summary_keeps_maker_release_blocker_unresolved():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000001000,
+            "kind": "pending_entry.single_leg_exposure_recovery_started",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "failed_hedge_venue": "aster",
+                "cleanup_venue": "bitget",
+                "reason": "owned_live_conflict",
+            },
+        },
+        {
+            "ts_ms": 1700000001100,
+            "kind": "pending_entry.single_leg_flatten_succeeded",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "venue": "bitget",
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+            },
+        },
+        {
+            "ts_ms": 1700000001200,
+            "kind": "pending_entry.release_maker_cancel_requested",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "venue": "bitget",
+                "maker_order_id": "1453886799619977220",
+                "maker_client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+                "reason": "cancel_before_pending_release",
+            },
+        },
+        {
+            "ts_ms": 1700000001300,
+            "kind": "pending_entry.release_retained_maker_open_order",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "venue": "bitget",
+                "maker_order_id": "1453886799619977220",
+                "maker_client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+                "reason": "maker_order_not_terminal_before_pending_release",
+            },
+        },
+        {
+            "ts_ms": 1700000001400,
+            "kind": "pending_entry.single_leg_flatten_failed",
+            "payload": {
+                "entry_id": "entry-esports",
+                "symbol": "ESPORTSUSDT",
+                "venue": "bitget",
+                "maker_order_id": "1453886799619977220",
+                "maker_client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+                "reason": "maker_order_not_terminal_before_pending_release",
+            },
+        },
+    ]
+
+    summary = dl._build_single_leg_exposure_recovery_summary(events)
+
+    assert summary["started_count"] == 1
+    assert summary["succeeded_count"] == 1
+    assert summary["failed_count"] == 1
+    assert summary["terminalized_count"] == 0
+    assert summary["unresolved_count"] == 1
+    assert summary["unresolved_entry_ids"] == ["entry-esports"]
+    assert summary["kind_counts"]["pending_entry.release_retained_maker_open_order"] == 1
+    assert (
+        summary["reason_counts"]["maker_order_not_terminal_before_pending_release"]
+        == 2
+    )
+
+
 def test_business_progression_quality_summary_flags_repeated_single_leg_fee_drag():
     import scripts.diagnose_live as dl
 

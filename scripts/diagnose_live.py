@@ -5705,6 +5705,14 @@ def _build_single_leg_exposure_recovery_summary(
     recovery_entry_ids: set[str] = set()
     samples: list[dict[str, Any]] = []
     target_kinds = {
+        "pending_entry.release_maker_cancel_failed",
+        "pending_entry.release_maker_cancel_requested",
+        "pending_entry.release_maker_open_order_truth_unavailable",
+        "pending_entry.release_maker_order_reference_unavailable",
+        "pending_entry.release_maker_order_truth_unavailable",
+        "pending_entry.release_maker_positive_fill_truth_retained",
+        "pending_entry.release_maker_terminal_no_open_order",
+        "pending_entry.release_retained_maker_open_order",
         "pending_entry.single_leg_exposure_recovery_started",
         "pending_entry.single_leg_flatten_submitted",
         "pending_entry.single_leg_flatten_succeeded",
@@ -5734,6 +5742,14 @@ def _build_single_leg_exposure_recovery_summary(
             if kind == "pending_entry.terminalized_after_single_leg_recovery":
                 terminal_entry_ids.add(entry_id)
             elif kind in {
+                "pending_entry.release_maker_cancel_failed",
+                "pending_entry.release_maker_cancel_requested",
+                "pending_entry.release_maker_open_order_truth_unavailable",
+                "pending_entry.release_maker_order_reference_unavailable",
+                "pending_entry.release_maker_order_truth_unavailable",
+                "pending_entry.release_maker_positive_fill_truth_retained",
+                "pending_entry.release_maker_terminal_no_open_order",
+                "pending_entry.release_retained_maker_open_order",
                 "pending_entry.single_leg_exposure_recovery_started",
                 "pending_entry.single_leg_flatten_submitted",
                 "pending_entry.single_leg_flatten_succeeded",

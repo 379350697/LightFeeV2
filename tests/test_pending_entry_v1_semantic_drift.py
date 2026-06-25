@@ -10,6 +10,8 @@ from lightfee.core.domain import (
     OrderFillProbeResult,
     OrderFillProbeStatus,
     OrderFillReconciliation,
+    PassiveOrderProgress,
+    PassiveOrderState,
     PositionSnapshot,
     Side,
     TimeInForce,
@@ -170,7 +172,65 @@ class _LivePositionOpenOrdersAdapter(_LivePositionAdapter):
 
 
 class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
+    def __init__(self, venue: Venue):
+        super().__init__(venue)
+        self.cancel_calls: list[dict] = []
+        self.progress_calls: list[dict] = []
+        self.progress_state = PassiveOrderState.CANCELED
+        self.progress_quantity = 0.0
+
     async def fetch_open_orders(self, symbol):
+        return []
+
+    async def cancel_passive_order(self, symbol, order_id="", client_order_id=None):
+        self.cancel_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
+
+    async def query_passive_order_progress(
+        self,
+        symbol,
+        order_id="",
+        client_order_id=None,
+        side=None,
+    ):
+        self.progress_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "side": side,
+        })
+        return PassiveOrderProgress(
+            venue=self.venue,
+            symbol=symbol,
+            side=side or Side.BUY,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            cumulative_quantity=self.progress_quantity,
+            state=self.progress_state,
+            observed_at_ms=1782365072788,
+        )
+
+
+class _ReleaseGateMakerAdapter(_OwnedConflictCleanupAdapter):
+    def __init__(
+        self,
+        venue: Venue,
+        *,
+        open_order_responses: list[list[dict]] | None = None,
+        progress_state: PassiveOrderState = PassiveOrderState.CANCELED,
+        progress_quantity: float = 0.0,
+    ):
+        super().__init__(venue)
+        self.open_order_responses = list(open_order_responses or [])
+        self.progress_state = progress_state
+        self.progress_quantity = progress_quantity
+
+    async def fetch_open_orders(self, symbol):
+        if self.open_order_responses:
+            return self.open_order_responses.pop(0)
         return []
 
 
@@ -4123,6 +4183,209 @@ async def test_positive_fill_owned_live_single_leg_cleanup_failure_retains_pendi
     assert failed["entry_id"] == pending.pending_id
     assert failed["venue"] == "bybit"
     assert failed["result"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_positive_fill_owned_live_single_leg_retains_pending_when_maker_order_remains_open_after_cleanup(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    live_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="ESPORTSUSDT",
+        side=Side.SELL,
+        quantity=739.0,
+        entry_price=0.03249,
+        observed_at_ms=1782359548085,
+    )
+    open_maker = {
+        "symbol": "ESPORTSUSDT",
+        "orderId": "1453886799619977220",
+        "clientOrderId": "3a113653919f22fadcf3e382ded6e41e0b0a",
+        "side": "buy",
+        "reduceOnly": False,
+    }
+    bitget = _ReleaseGateMakerAdapter(
+        Venue.BITGET,
+        open_order_responses=[
+            [],
+            [],
+            [open_maker],
+        ],
+    )
+    bitget.position_snapshots = [
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="ESPORTSUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782359548085,
+        ),
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="ESPORTSUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782359548589,
+        ),
+    ]
+    bybit = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    bybit.position_snapshots = [live_short, live_short]
+    bybit.default_position_side = Side.SELL
+    bybit.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BITGET: bitget,
+            Venue.BYBIT: bybit,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1782359532641-ESPORTSUSDT",
+        symbol="ESPORTSUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        target_quantity=739.7133610725843,
+        maker_leg="long",
+        maker_order_id="1453886799619977220",
+        maker_client_order_id="3a113653919f22fadcf3e382ded6e41e0b0a",
+        hedge_order_id="f3c7f19b-9361-423c-b078-0f987f754abb",
+        hedge_client_order_id="0108bf38b2a55b903a7d9f2f369745de3450",
+        maker_leg_filled=739.0,
+        hedge_leg_filled=739.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.03249,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1782359548589,
+    )
+
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.pending_id not in runtime.state.open_positions
+    assert bitget.cancel_calls == [{
+        "symbol": "ESPORTSUSDT",
+        "order_id": "1453886799619977220",
+        "client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+    }]
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.terminalized_after_single_leg_recovery" not in kinds
+    assert "pending_entry.owned_live_conflict_cleanup_succeeded" not in kinds
+    failed = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.owned_live_conflict_cleanup_failed"
+    ][-1]
+    assert failed["entry_id"] == pending.pending_id
+    assert failed["result"] == "maker_order_not_terminal_before_pending_release"
+    assert failed["post_cleanup_has_live_open_order"] is True
+    assert failed["reason"] == "maker_order_not_terminal_before_pending_release"
+
+
+@pytest.mark.asyncio
+async def test_positive_fill_owned_live_single_leg_cancels_maker_before_release_and_requires_absent_open_order_truth(
+    config, tmp_journal,
+):
+    _mark_live(config)
+    live_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="ESPORTSUSDT",
+        side=Side.SELL,
+        quantity=739.0,
+        entry_price=0.03249,
+        observed_at_ms=1782359548085,
+    )
+    bitget = _ReleaseGateMakerAdapter(
+        Venue.BITGET,
+        open_order_responses=[
+            [],
+            [],
+            [],
+        ],
+        progress_state=PassiveOrderState.CANCELED,
+        progress_quantity=0.0,
+    )
+    bitget.position_snapshots = [
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="ESPORTSUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782359548085,
+        ),
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="ESPORTSUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782359548589,
+        ),
+    ]
+    bybit = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    bybit.position_snapshots = [live_short, live_short]
+    bybit.default_position_side = Side.SELL
+    bybit.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BITGET: bitget,
+            Venue.BYBIT: bybit,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1782359532641-ESPORTSUSDT",
+        symbol="ESPORTSUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        target_quantity=739.7133610725843,
+        maker_leg="long",
+        maker_order_id="1453886799619977220",
+        maker_client_order_id="3a113653919f22fadcf3e382ded6e41e0b0a",
+        hedge_order_id="f3c7f19b-9361-423c-b078-0f987f754abb",
+        hedge_client_order_id="0108bf38b2a55b903a7d9f2f369745de3450",
+        maker_leg_filled=739.0,
+        hedge_leg_filled=739.0,
+        maker_fill_price=0.0,
+        hedge_fill_price=0.03249,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1782359548589,
+    )
+
+    assert finalized is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert pending.pending_id not in runtime.state.open_positions
+    assert bitget.cancel_calls == [{
+        "symbol": "ESPORTSUSDT",
+        "order_id": "1453886799619977220",
+        "client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+    }]
+    assert bitget.progress_calls == [{
+        "symbol": "ESPORTSUSDT",
+        "order_id": "1453886799619977220",
+        "client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
+        "side": Side.BUY,
+    }]
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "pending_entry.release_maker_cancel_requested" in kinds
+    assert "pending_entry.release_maker_terminal_no_open_order" in kinds
+    assert "pending_entry.terminalized_after_single_leg_recovery" in kinds
 
 
 @pytest.mark.asyncio

@@ -543,6 +543,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "pending_entry.maker_progress_applied",
         "pending_entry.missing_hedge_detected",
         "pending_entry.pending_entry_finalized",
+        "pending_entry.release_maker_cancel_requested",
+        "pending_entry.release_retained_maker_open_order",
+        "pending_entry.release_maker_terminal_no_open_order",
         "pending_entry.removed_by_v1_lifecycle_closure",
         "pending_entry.terminalizer_decision",
         "reconciliation.entry_abandoned_flat",
@@ -608,6 +611,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "execution.min_notional_abort_and_flatten",
         "execution.pending_entry_hedge_chunk_buffering",
         "reconciliation.pending_close_exchange_truth_refreshed",
+        "runtime.auto_fail_closed_entered",
+        "runtime.auto_fail_closed_cleanup_failed",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -665,6 +670,14 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("reconciliation.pending_close_exchange_truth_refreshed")
         == "PASSIVE_CLOSE"
     )
+    assert map_lifecycle_event_kind("runtime.auto_fail_closed_entered") == "RECOVERY_TRUTH"
+    assert (
+        map_lifecycle_event_kind("runtime.auto_fail_closed_cleanup_failed")
+        == "RECOVERY_TRUTH"
+    )
+    assert map_lifecycle_event_kind("pending_entry.release_maker_cancel_requested") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("pending_entry.release_retained_maker_open_order") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("pending_entry.release_maker_terminal_no_open_order") == "PENDING_ENTRY"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

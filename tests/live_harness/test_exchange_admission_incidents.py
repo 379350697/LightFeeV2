@@ -12,6 +12,7 @@ from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
 from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, TimeInForce, Venue
+from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.risk.modes import EngineLifecycle
 from lightfee.venues.aster import AsterAdapter
@@ -618,6 +619,8 @@ class LiveSingleLegCleanupAdapter(FlatAdapter):
         self.fetch_position_calls = 0
         self.place_order_calls = 0
         self.last_request = None
+        self.cancel_calls: list[dict] = []
+        self.progress_calls: list[dict] = []
 
     async def fetch_position(self, symbol: str):
         self.fetch_position_calls += 1
@@ -633,6 +636,37 @@ class LiveSingleLegCleanupAdapter(FlatAdapter):
 
     async def fetch_open_orders(self, symbol: str):
         return []
+
+    async def cancel_passive_order(self, symbol, order_id="", client_order_id=None):
+        self.cancel_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+        })
+
+    async def query_passive_order_progress(
+        self,
+        symbol,
+        order_id="",
+        client_order_id=None,
+        side=None,
+    ):
+        self.progress_calls.append({
+            "symbol": symbol,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "side": side,
+        })
+        return PassiveOrderProgress(
+            venue=self.venue,
+            symbol=symbol,
+            side=side or self.side,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.CANCELED,
+            observed_at_ms=1778787001000,
+        )
 
     async def place_order(self, request):
         self.place_order_calls += 1
@@ -689,6 +723,8 @@ def _pending_for_hedge_reject(
     long_venue: Venue,
     short_venue: Venue,
     maker_leg: str,
+    maker_order_id: str = "",
+    maker_client_order_id: str = "",
 ) -> PendingEntry:
     return PendingEntry(
         pending_id=entry_id,
@@ -700,6 +736,8 @@ def _pending_for_hedge_reject(
         short_side=Side.SELL,
         created_at_ms=1778787000000,
         maker_leg=maker_leg,
+        maker_order_id=maker_order_id,
+        maker_client_order_id=maker_client_order_id,
         maker_leg_filled=4.0,
         hedge_leg_filled=0.0,
         maker_price=1.0,
@@ -769,6 +807,8 @@ async def test_pending_hedge_bybit_auth_invalid_recovers_owned_single_leg_on_mak
             long_venue=Venue.BINANCE,
             short_venue=Venue.BYBIT,
             maker_leg="long",
+            maker_order_id="maker-auth-single-leg",
+            maker_client_order_id="maker-auth-single-leg-cid",
         )
         runtime.state.pending_entries[pending.pending_id] = pending
 
