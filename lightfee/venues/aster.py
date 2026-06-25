@@ -193,6 +193,9 @@ class AsterAdapter(VenueAdapter):
                 order_role="maker" if request.post_only else "hedge",
                 source="aster_headroom_pre_entry_precheck",
                 remaining_openable_provider=self._remaining_openable_provider(),
+                account_risk_provider=self._private.fetch_account_risk_snapshot,
+                position_provider=self._private.fetch_position,
+                open_orders_provider=self._private.fetch_open_orders,
             )
         )
         result = dict(preflight)
@@ -285,6 +288,9 @@ class AsterAdapter(VenueAdapter):
                 order_role="maker" if request.post_only else "hedge",
                 source="aster_headroom_precheck",
                 remaining_openable_provider=self._remaining_openable_provider(),
+                account_risk_provider=self._private.fetch_account_risk_snapshot,
+                position_provider=self._private.fetch_position,
+                open_orders_provider=self._private.fetch_open_orders,
             )
         )
         attempt_payload = dict(preflight)

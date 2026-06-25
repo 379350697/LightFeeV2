@@ -1408,7 +1408,7 @@ def test_run_diagnose_resolves_aster_5018_when_headroom_admission_blocked(monkey
             }
         ]
         assert cooldown_summary["advice_counts"] == {
-            "check_aster_account_leverage_position_limit_or_capital": 1
+            "aster_real_exchange_max_notional_reject_symbol_scoped": 1
         }
         assert result["production_acceptance_gate"]["gate_passed"] is True
     finally:
@@ -1501,6 +1501,46 @@ def test_diagnose_rolls_up_aster_venue_degraded_sample_headroom(monkeypatch):
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_diagnose_rolls_up_aster_advisory_zero_account_truth():
+    from scripts import diagnose_live as dl
+
+    summary = dl._build_entry_admission_cooldown_summary([
+        {
+            "ts_ms": 1781665905362,
+            "kind": "runtime.entry_admission_headroom_advisory",
+            "payload": {
+                "venue": "aster",
+                "symbol": "LABUSDT",
+                "reason": "aster_headroom_advisory_zero",
+                "source": "aster_headroom_precheck",
+                "block_scope": "none",
+                "requested_notional": 16.093647,
+                "remaining_openable_notional": 0.0,
+                "remaining_openable_endpoint_value": 0.0,
+                "required_margin_estimate": 4.02341175,
+                "available_balance_quote": 60.5,
+                "position_flat": True,
+                "open_orders_empty": True,
+                "account_truth_submit_allowed": True,
+                "headroom_truth_source": "account_with_join_margin",
+            },
+        },
+    ])
+
+    assert summary["advice_counts"] == {
+        "aster_endpoint_zero_advisory_account_truth_submit_allowed": 1
+    }
+    rollup = summary["top_blocked_symbols"][0]
+    assert rollup["symbol"] == "LABUSDT"
+    assert rollup["remaining_openable_endpoint_value"] == 0.0
+    assert rollup["required_margin_estimate"] == pytest.approx(4.02341175)
+    assert rollup["available_balance_quote"] == pytest.approx(60.5)
+    assert rollup["position_flat"] is True
+    assert rollup["open_orders_empty"] is True
+    assert rollup["account_truth_submit_allowed"] is True
+    assert rollup["headroom_truth_source"] == "account_with_join_margin"
 
 
 def test_diagnose_exposes_local_order_identifier_reconcile_summary(monkeypatch):

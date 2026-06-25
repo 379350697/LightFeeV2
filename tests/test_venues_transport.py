@@ -55,6 +55,7 @@ from lightfee.venues.specs import (
 )
 from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.transport import (
+    ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
     LiveCredential,
     TransportError,
     TransportErrorCategory,
@@ -570,6 +571,37 @@ class TestBinanceAsterPostSigning:
         assert snapshot.maintenance_margin_quote == pytest.approx(25.1)
         assert snapshot.available_balance_quote == pytest.approx(74.25)
         assert snapshot.source == "aster_v3_account_with_join_margin"
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_account_risk_preserves_flat_account_available_balance(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/accountWithJoinMargin"
+            return httpx.Response(
+                200,
+                json={
+                    "availableBalance": "60.5",
+                    "totalMarginBalance": "60.5",
+                    "totalMaintMargin": "0",
+                },
+            )
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            snapshot = await client.fetch_account_risk_snapshot()
+        finally:
+            await client.close()
+
+        assert snapshot is not None
+        assert snapshot.supported is True
+        assert snapshot.equity_quote == pytest.approx(60.5)
+        assert snapshot.available_balance_quote == pytest.approx(60.5)
+        assert snapshot.maintenance_margin_quote > 0.0
 
     @pytest.mark.asyncio
     async def test_aster_v3_unfiltered_open_orders_consumes_official_weight_40(self):
@@ -5292,7 +5324,112 @@ class TestV1PassiveBusinessFlowParity:
         assert payload["remaining_openable_notional"] == 10.0
         assert payload["notional_gap"] == 20.0
         assert payload["leverage"] == 4
-        assert payload["cooldown_scope"] == "symbol_and_venue"
+        assert payload["cooldown_scope"] == "symbol"
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_passive_submit_allows_advisory_zero_when_account_truth_sufficient(
+        self, monkeypatch,
+    ):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(
+                    tick_size=0.001,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        private_calls = []
+
+        async def fake_request(method, path, *, params=None):
+            private_calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/remainingOpenableNotionalValue":
+                return {"remainingOpenableNotionalValue": "0"}
+            if path == "/fapi/v3/accountWithJoinMargin":
+                return {
+                    "availableBalance": "60.5",
+                    "totalMarginBalance": "60.5",
+                    "totalMaintMargin": "0",
+                    "canTrade": True,
+                }
+            if path == "/fapi/v3/positionRisk":
+                return {
+                    "symbol": "LABUSDT",
+                    "positionAmt": "0",
+                    "entryPrice": "0",
+                    "leverage": "4",
+                }
+            if path == "/fapi/v3/openOrders":
+                return []
+            if path == "/fapi/v3/order":
+                return {
+                    "orderId": "aster-lab-order-1",
+                    "clientOrderId": (params or {}).get("newClientOrderId", ""),
+                    "status": "NEW",
+                    "price": (params or {}).get("price", "0"),
+                    "origQty": (params or {}).get("quantity", "0"),
+                }
+            raise AssertionError(f"unexpected private request: {method} {path}")
+
+        adapter._private._request = fake_request
+        req = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=0.927,
+            price=17.361,
+            post_only=True,
+            client_order_id="aster-maker-lab-advisory-zero",
+        )
+
+        try:
+            ack = await adapter.submit_passive_order(req)
+        finally:
+            await adapter.shutdown()
+
+        assert ack.order_id == "aster-lab-order-1"
+        assert [call[1] for call in private_calls] == [
+            "/fapi/v1/remainingOpenableNotionalValue",
+            "/fapi/v3/accountWithJoinMargin",
+            "/fapi/v3/positionRisk",
+            "/fapi/v3/openOrders",
+            "/fapi/v3/order",
+        ]
+        diagnostics = adapter._transport.drain_order_diagnostics()
+        assert not [
+            event for event in diagnostics
+            if event["kind"] == "runtime.entry_admission_blocked"
+        ]
+        advisory = [
+            event for event in diagnostics
+            if event["kind"] == "runtime.entry_admission_headroom_advisory"
+        ][-1]["payload"]
+        assert advisory["reason"] == "aster_headroom_advisory_zero"
+        assert advisory["remaining_openable_endpoint_value"] == 0.0
+        assert advisory["available_balance_quote"] == pytest.approx(60.5)
+        assert advisory["required_margin_estimate"] == pytest.approx(
+            (0.927 * 17.361) / ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
+        )
+        assert advisory["position_flat"] is True
+        assert advisory["open_orders_empty"] is True
+        assert advisory["headroom_truth_source"] == "account_with_join_margin"
 
     @pytest.mark.asyncio
     async def test_aster_v3_headroom_unavailable_blocks_new_risk_but_not_reduce_only(

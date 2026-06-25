@@ -2855,14 +2855,14 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime.entry_executor = CapturingEntryExecutor()
-    runtime.state.venue_entry_cooldowns["aster:*"] = {
+    runtime.state.venue_entry_cooldowns["aster:ESPORTSUSDT"] = {
         "venue": "aster",
-        "symbol": "*",
+        "symbol": "ESPORTSUSDT",
         "blocked_symbol": "ESPORTSUSDT",
         "reason": "max_notional_admission_blocked",
         "source": "pre_entry_aster_precheck",
-        "block_scope": "venue",
-        "cooldown_scope": "venue",
+        "block_scope": "symbol",
+        "cooldown_scope": "symbol",
         "blocked_until_ms": 130000,
         "official_doc_url": "https://www.asterdex.com/",
         "evidence_gap": False,
@@ -2925,7 +2925,7 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
     ][-1]
     assert venue_degraded["venue"] == "aster"
     assert venue_degraded["reason"] == "max_notional_admission_blocked"
-    assert venue_degraded["block_scope"] == "venue"
+    assert venue_degraded["block_scope"] == "symbol"
     assert venue_degraded["blocked_count"] == 1
     assert runtime.entry_executor.contexts == []
 

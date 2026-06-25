@@ -383,6 +383,9 @@ class EntryDispatchRuntime:
 
             try:
                 await precheck(request)
+                flush = getattr(self.ctx, "_flush_adapter_order_diagnostics", None)
+                if callable(flush):
+                    flush(adapter)
                 continue
             except OrderSubmitError as exc:
                 error_text = str(exc)

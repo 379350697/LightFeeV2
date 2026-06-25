@@ -572,11 +572,6 @@ class LiveRuntime:
             if symbol == "*":
                 return [f"{venue.value}:*"]
             keys.append(f"{venue.value}:*")
-        if venue == Venue.ASTER and reason in {
-            "max_notional_admission_blocked",
-            "aster_headroom_unavailable",
-        }:
-            keys.append(f"{venue.value}:*")
         if venue == Venue.HYPERLIQUID and reason in {
             "insufficient_margin_admission_blocked",
             "insufficient_margin_admission_prefiltered",

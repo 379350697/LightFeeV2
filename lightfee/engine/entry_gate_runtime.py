@@ -30,6 +30,14 @@ _ENTRY_ADMISSION_EVIDENCE_FIELDS = (
     "leverage",
     "headroom_source",
     "headroom_error",
+    "headroom_truth_source",
+    "remaining_openable_endpoint_value",
+    "required_margin_estimate",
+    "available_balance_quote",
+    "position_flat",
+    "open_orders_empty",
+    "account_margin_sufficient",
+    "account_truth_submit_allowed",
     "order_role",
 )
 
@@ -84,6 +92,22 @@ def _normalize_aster_max_notional_evidence(payload: dict[str, Any]) -> None:
         + " on persisted Aster max_notional admission cooldown",
     )
     payload.setdefault("official_doc_url", _ASTER_REMAINING_OPENABLE_DOC_URL)
+
+
+def _is_nonblocking_legacy_aster_venue_headroom_cooldown(
+    state_key: str,
+    payload: dict[str, Any],
+) -> bool:
+    if not state_key.endswith(":*"):
+        return False
+    venue = str(payload.get("venue") or "").lower()
+    reason = str(payload.get("reason") or "")
+    if venue != Venue.ASTER.value:
+        return False
+    return reason in {
+        "max_notional_admission_blocked",
+        "aster_headroom_unavailable",
+    }
 
 
 class EntryGateRuntime:
@@ -761,6 +785,11 @@ class EntryGateRuntime:
                 candidate_payload = dict(
                     self.ctx.state.venue_entry_cooldowns.get(state_key, {}) or {}
                 )
+                if _is_nonblocking_legacy_aster_venue_headroom_cooldown(
+                    state_key,
+                    candidate_payload,
+                ):
+                    continue
                 try:
                     candidate_until_ms = int(
                         candidate_payload.get("blocked_until_ms", 0) or 0

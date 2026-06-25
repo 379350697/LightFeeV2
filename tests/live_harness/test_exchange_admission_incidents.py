@@ -106,13 +106,57 @@ class RejectingAsterPrecheckAdapter(TrustedVenueAdapter):
 
 
 class FakeAsterPrivateHeadroom:
-    def __init__(self, remaining: float | None):
+    def __init__(
+        self,
+        remaining: float | None,
+        *,
+        available_balance_quote: float = 60.0,
+        position_qty: float = 0.0,
+        open_orders: list[dict] | None = None,
+    ):
         self.remaining = remaining
+        self.available_balance_quote = available_balance_quote
+        self.position_qty = position_qty
+        self.open_orders = list(open_orders or [])
         self.calls: list[tuple[str, int]] = []
+        self.account_calls = 0
+        self.position_calls: list[str] = []
+        self.open_order_calls: list[str] = []
 
     async def fetch_remaining_openable_notional(self, symbol: str, leverage: int):
         self.calls.append((symbol, leverage))
         return self.remaining
+
+    async def fetch_account_risk_snapshot(self):
+        self.account_calls += 1
+        return SimpleNamespace(
+            available_balance_quote=self.available_balance_quote,
+            equity_quote=self.available_balance_quote,
+        )
+
+    async def fetch_position(self, symbol: str):
+        self.position_calls.append(symbol)
+        return PositionSnapshot(
+            venue=Venue.ASTER,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=self.position_qty,
+            entry_price=0.0,
+            observed_at_ms=1778787000000,
+        )
+
+    async def fetch_open_orders(self, symbol: str | None = None):
+        self.open_order_calls.append(str(symbol or ""))
+        return list(self.open_orders)
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        return None
 
 
 class FakeAsterRulesCache:
@@ -388,7 +432,7 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
 
             async def execute(self, ctx):
                 self.calls += 1
-                return EntryExecutionResult(route=ExecutionRoute.STANDARD_DUAL_TAKER)
+                return EntryExecutionResult(route=ExecutionRoute.FALLBACK_TO_STANDARD)
 
         executor = CountingExecutor()
         runtime.entry_executor = executor
@@ -407,21 +451,13 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
             "max_notional_admission_blocked"
         )
         symbol_cooldown = runtime.state.venue_entry_cooldowns["aster:HUSDT"]
-        venue_cooldown = runtime.state.venue_entry_cooldowns["aster:*"]
         assert symbol_cooldown["requested_notional"] == pytest.approx(23.90043)
         assert symbol_cooldown["remaining_openable_notional"] == pytest.approx(0.0)
         assert symbol_cooldown["notional_gap"] == pytest.approx(23.90043)
         assert symbol_cooldown["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
         assert symbol_cooldown["headroom_source"] == "exchange_error_text"
         assert symbol_cooldown["order_role"] == "hedge"
-        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == (
-            "venue"
-        )
-        assert venue_cooldown["requested_notional"] == pytest.approx(23.90043)
-        assert venue_cooldown["remaining_openable_notional"] == pytest.approx(0.0)
-        assert venue_cooldown["notional_gap"] == pytest.approx(23.90043)
-        assert venue_cooldown["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
-        assert venue_cooldown["headroom_source"] == "exchange_error_text"
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
 
         clean_candidate = _candidate("CLEANUSDT", "binance", "bybit")
         filtered = runtime._filter_candidates_by_entry_admission(
@@ -465,7 +501,7 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
 
 
 @pytest.mark.asyncio
-async def test_real_aster_adapter_zero_headroom_blocks_before_maker_submit(monkeypatch):
+async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth_sufficient(monkeypatch):
     with tempfile.TemporaryDirectory() as td:
         import lightfee.venues.aster as aster_mod
 
@@ -491,7 +527,7 @@ async def test_real_aster_adapter_zero_headroom_blocks_before_maker_submit(monke
 
             async def execute(self, ctx):
                 self.calls += 1
-                return EntryExecutionResult(route=ExecutionRoute.STANDARD_DUAL_TAKER)
+                return EntryExecutionResult(route=ExecutionRoute.FALLBACK_TO_STANDARD)
 
         executor = CountingExecutor()
         runtime.entry_executor = executor
@@ -502,24 +538,26 @@ async def test_real_aster_adapter_zero_headroom_blocks_before_maker_submit(monke
             price_hint=1.0,
         )
 
-        assert dispatched is False
-        assert executor.calls == 0
+        assert dispatched is True
+        assert executor.calls == 1
         assert private.calls == [
             ("HUSDT", ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE)
         ]
-        assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["reason"] == (
-            "max_notional_admission_blocked"
-        )
+        assert private.account_calls == 1
+        assert private.position_calls == ["HUSDT"]
+        assert private.open_order_calls == ["HUSDT"]
+        assert "aster:HUSDT" not in runtime.state.venue_entry_cooldowns
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
         records = runtime.journal.read_all()
-        assert not [
-            record for record in records
-            if record["kind"] == "order.passive_submitted"
-        ]
         assert [
             record
             for record in records
+            if record["kind"] == "runtime.entry_admission_headroom_advisory"
+        ][-1]["payload"]["reason"] == "aster_headroom_advisory_zero"
+        assert not [
+            record for record in records
             if record["kind"] == "runtime.entry_blocked_admission_selection"
-        ][-1]["payload"]["source"] == "pre_entry_aster_precheck"
+        ]
         runtime.journal.close()
 
 
@@ -1347,16 +1385,20 @@ async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
         assert aster.place_order_calls == 1
         assert pending.pending_id not in runtime.state.pending_entries
         assert runtime.state.venue_entry_cooldowns["aster:LABUSDT"]["block_scope"] == "symbol"
-        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == "venue"
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
         assert runtime._candidate_admission_block(
             _candidate("OTHERUSDT", "aster", "binance"),
             1778787002000,
+        ) is None
+        assert runtime._candidate_admission_block(
+            _candidate("LABUSDT", "aster", "binance"),
+            1778787002000,
         )["reason"] == "max_notional_admission_blocked"
         records = runtime.journal.read_all()
-        assert [
+        assert not [
             record for record in records
             if record["kind"] == "runtime.venue_cooldown_started"
-        ][-1]["payload"]["reason"] == "aster_max_notional_limit"
+        ]
         runtime.journal.close()
 
 
@@ -1398,13 +1440,15 @@ async def test_pending_hedge_aster_max_notional_error_text_aborts_without_retry_
         assert runtime.state.venue_entry_cooldowns["aster:HUSDT"]["block_scope"] == (
             "symbol"
         )
-        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == (
-            "venue"
-        )
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
         assert runtime._candidate_admission_block(
             _candidate("HUSDT", "binance", "aster"),
             1778787002000,
         )["reason"] == "max_notional_admission_blocked"
+        assert runtime._candidate_admission_block(
+            _candidate("OTHERUSDT", "binance", "aster"),
+            1778787002000,
+        ) is None
 
         records = runtime.journal.read_all()
         assert not [
@@ -1418,16 +1462,16 @@ async def test_pending_hedge_aster_max_notional_error_text_aborts_without_retry_
             for record in records
             if record["kind"] == "pending_entry.hedge_admission_blocked"
         ][-1]["payload"]["reason"] == "max_notional_admission_blocked"
-        assert [
+        assert not [
             record
             for record in records
             if record["kind"] == "runtime.venue_cooldown_started"
-        ][-1]["payload"]["reason"] == "aster_max_notional_limit"
+        ]
         runtime.journal.close()
 
 
 @pytest.mark.asyncio
-async def test_pending_hedge_aster_headroom_unavailable_arms_venue_cooldown():
+async def test_pending_hedge_aster_headroom_unavailable_arms_symbol_cooldown():
     with tempfile.TemporaryDirectory() as td:
         aster = RejectingHedgeAdapter("aster_headroom_unavailable")
         runtime = LiveRuntime(
@@ -1451,17 +1495,20 @@ async def test_pending_hedge_aster_headroom_unavailable_arms_venue_cooldown():
         assert driven is False
         assert aster.place_order_calls == 1
         assert runtime.state.venue_entry_cooldowns["aster:LABUSDT"]["block_scope"] == "symbol"
-        assert runtime.state.venue_entry_cooldowns["aster:*"]["block_scope"] == "venue"
-        assert runtime.state.venue_entry_cooldowns["aster:*"]["evidence_gap"] is True
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
         assert runtime._candidate_admission_block(
             _candidate("OTHERUSDT", "aster", "binance"),
             1778787002000,
+        ) is None
+        assert runtime._candidate_admission_block(
+            _candidate("LABUSDT", "aster", "binance"),
+            1778787002000,
         )["reason"] == "aster_headroom_unavailable"
         records = runtime.journal.read_all()
-        assert [
+        assert not [
             record for record in records
             if record["kind"] == "runtime.venue_cooldown_started"
-        ][-1]["payload"]["reason"] == "aster_headroom_unavailable"
+        ]
         runtime.journal.close()
 
 
@@ -1672,7 +1719,7 @@ def test_route_abnormal_cooldown_filters_only_same_directed_route():
             runtime.journal.close()
 
 
-def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
+def test_aster_legacy_venue_scope_headroom_cooldown_does_not_filter_other_aster_routes():
     with tempfile.TemporaryDirectory() as td:
         runtime = _runtime_with_metadata(td)
         runtime.journal.open()
@@ -1708,35 +1755,22 @@ def test_aster_venue_scope_headroom_cooldown_filters_all_aster_routes():
                 stage="candidate_prefilter",
             )
 
-            assert [candidate.symbol for candidate in filtered] == ["CLEANUSDT"]
-            assert runtime._last_entry_admission_filter_blockers == {
-                "max_notional_admission_blocked": 1
-            }
-            sample = runtime._last_entry_admission_filter_samples[0]
-            assert sample["block_scope"] == "venue"
-            assert sample["symbol"] == "LABUSDT"
-            assert sample["blocked_symbol"] == "ESPORTSUSDT"
-            assert sample["requested_notional"] == pytest.approx(23.9706)
-            assert sample["remaining_openable_notional"] == pytest.approx(0.0)
-            assert sample["notional_gap"] == pytest.approx(23.9706)
-            assert sample["leverage"] == ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
-            assert sample["headroom_source"] == "exchange_error_text"
-            degraded_payload = [
-                record["payload"]
+            assert [candidate.symbol for candidate in filtered] == [
+                "LABUSDT",
+                "CLEANUSDT",
+            ]
+            assert runtime._last_entry_admission_filter_blockers == {}
+            assert runtime._last_entry_admission_filter_samples == []
+            assert not [
+                record
                 for record in runtime.journal.read_all()
                 if record["kind"] == "runtime.entry_admission_venue_degraded"
-            ][-1]
-            assert degraded_payload["symbol"] == "ESPORTSUSDT"
-            assert degraded_payload["blocked_symbol"] == "ESPORTSUSDT"
-            assert degraded_payload["requested_notional"] == pytest.approx(23.9706)
-            assert degraded_payload["remaining_openable_notional"] == pytest.approx(0.0)
-            assert degraded_payload["notional_gap"] == pytest.approx(23.9706)
-            assert degraded_payload["samples"][0]["symbol"] == "LABUSDT"
+            ]
         finally:
             runtime.journal.close()
 
 
-def test_legacy_aster_venue_cooldown_without_headroom_becomes_evidence_gap():
+def test_legacy_aster_venue_cooldown_without_headroom_is_nonblocking():
     with tempfile.TemporaryDirectory() as td:
         runtime = _runtime_with_metadata(td)
         runtime.journal.open()
@@ -1762,22 +1796,13 @@ def test_legacy_aster_venue_cooldown_without_headroom_becomes_evidence_gap():
                 stage="candidate_prefilter",
             )
 
-            assert filtered == []
-            sample = runtime._last_entry_admission_filter_samples[0]
-            assert sample["evidence_gap"] is True
-            assert sample["headroom_source"] == "legacy_cooldown_missing_headroom"
-            assert "requested_notional" in sample["headroom_error"]
-            degraded_payload = [
-                record["payload"]
+            assert [candidate.symbol for candidate in filtered] == ["LABUSDT"]
+            assert runtime._last_entry_admission_filter_blockers == {}
+            assert runtime._last_entry_admission_filter_samples == []
+            assert not [
+                record
                 for record in runtime.journal.read_all()
                 if record["kind"] == "runtime.entry_admission_venue_degraded"
-            ][-1]
-            assert degraded_payload["evidence_gap"] is True
-            assert (
-                degraded_payload["headroom_source"]
-                == "legacy_cooldown_missing_headroom"
-            )
-            assert "remaining_openable_notional" in degraded_payload["headroom_error"]
-            assert degraded_payload["samples"][0]["evidence_gap"] is True
+            ]
         finally:
             runtime.journal.close()

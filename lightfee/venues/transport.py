@@ -5787,8 +5787,11 @@ class VenueTransport(MarketDataClient):
         order_role: str,
         source: str,
         remaining_openable_provider: Callable[[str, int], Awaitable[Optional[float]]] | None = None,
+        account_risk_provider: Callable[[], Awaitable[Any]] | None = None,
+        position_provider: Callable[[str], Awaitable[Any]] | None = None,
+        open_orders_provider: Callable[[str], Awaitable[list[Any]]] | None = None,
     ) -> dict[str, Any]:
-        """Block Aster new-risk orders before submit when headroom is unsafe."""
+        """Block Aster new-risk orders only on hard truth, not advisory headroom zero."""
         payload: dict[str, Any] = {}
         if self._spec.venue_id != Venue.ASTER or request.reduce_only:
             return payload
@@ -5859,11 +5862,37 @@ class VenueTransport(MarketDataClient):
         payload.update({
             "aster_headroom_source": "remaining_openable_notional",
             "aster_remaining_openable_notional": remaining,
+            "remaining_openable_endpoint_value": remaining,
             "aster_requested_qty": quantized_qty,
             "aster_requested_notional": requested_notional,
             "aster_headroom_blocked": False,
         })
         if requested_notional > float(remaining) + 1e-9:
+            account_truth: dict[str, Any] = {}
+            if remaining <= 1e-9:
+                account_truth = await self._aster_account_truth_for_advisory_headroom(
+                    venue_sym=venue_sym,
+                    requested_notional=requested_notional,
+                    leverage=ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+                    account_risk_provider=account_risk_provider,
+                    position_provider=position_provider,
+                    open_orders_provider=open_orders_provider,
+                )
+                payload.update(account_truth)
+                if account_truth.get("account_truth_submit_allowed"):
+                    payload["aster_headroom_blocked"] = False
+                    payload["aster_headroom_source"] = "remaining_openable_advisory_zero"
+                    payload["headroom_truth_source"] = "account_with_join_margin"
+                    self._record_aster_headroom_advisory(
+                        request=request,
+                        venue_sym=venue_sym,
+                        requested_notional=requested_notional,
+                        remaining_openable_notional=remaining,
+                        order_role=order_role,
+                        source=source,
+                        extra_payload=account_truth,
+                    )
+                    return payload
             payload["aster_headroom_blocked"] = True
             self._record_aster_headroom_admission_block(
                 request=request,
@@ -5874,6 +5903,7 @@ class VenueTransport(MarketDataClient):
                 source=source,
                 reason="max_notional_admission_blocked",
                 evidence_gap=False,
+                extra_payload=account_truth,
             )
             raise OrderSubmitError(
                 SubmitFailureClass.REJECTED,
@@ -5882,6 +5912,120 @@ class VenueTransport(MarketDataClient):
                 f"remaining_openable_notional={remaining}",
             )
         return payload
+
+    async def _aster_account_truth_for_advisory_headroom(
+        self,
+        *,
+        venue_sym: str,
+        requested_notional: float,
+        leverage: int,
+        account_risk_provider: Callable[[], Awaitable[Any]] | None,
+        position_provider: Callable[[str], Awaitable[Any]] | None,
+        open_orders_provider: Callable[[str], Awaitable[list[Any]]] | None,
+    ) -> dict[str, Any]:
+        required_margin = requested_notional / max(float(leverage or 0), 1.0)
+        payload: dict[str, Any] = {
+            "required_margin_estimate": required_margin,
+            "headroom_truth_source": "remaining_openable_notional",
+        }
+        if (
+            account_risk_provider is None
+            or position_provider is None
+            or open_orders_provider is None
+        ):
+            payload["account_truth_submit_allowed"] = False
+            payload["account_truth_error"] = "aster_account_truth_provider_missing"
+            return payload
+
+        try:
+            snapshot = await account_risk_provider()
+        except Exception as exc:
+            payload["account_truth_submit_allowed"] = False
+            payload["account_truth_error"] = str(exc)[:200]
+            return payload
+        available = _safe_float(
+            getattr(snapshot, "available_balance_quote", None),
+            default=float("nan"),
+        )
+        if not math.isfinite(available):
+            available = _safe_float(
+                getattr(snapshot, "equity_quote", None),
+                default=float("nan"),
+            )
+        payload["available_balance_quote"] = (
+            available if math.isfinite(available) else None
+        )
+
+        try:
+            position = await position_provider(venue_sym)
+            position_qty = abs(
+                _safe_float(getattr(position, "quantity", 0.0), default=0.0)
+            )
+            position_flat = position_qty <= 1e-9
+        except Exception as exc:
+            payload["position_flat"] = False
+            payload["account_truth_submit_allowed"] = False
+            payload["account_truth_error"] = str(exc)[:200]
+            return payload
+        payload["position_flat"] = position_flat
+
+        try:
+            open_orders = await open_orders_provider(venue_sym)
+            open_orders_empty = len(open_orders or []) == 0
+        except Exception as exc:
+            payload["open_orders_empty"] = False
+            payload["account_truth_submit_allowed"] = False
+            payload["account_truth_error"] = str(exc)[:200]
+            return payload
+        payload["open_orders_empty"] = open_orders_empty
+
+        account_sufficient = (
+            math.isfinite(available)
+            and available + 1e-9 >= required_margin
+        )
+        payload["account_margin_sufficient"] = account_sufficient
+        payload["headroom_truth_source"] = "account_with_join_margin"
+        payload["account_truth_submit_allowed"] = bool(
+            account_sufficient and position_flat and open_orders_empty
+        )
+        return payload
+
+    def _record_aster_headroom_advisory(
+        self,
+        *,
+        request: OrderRequest,
+        venue_sym: str,
+        requested_notional: float,
+        remaining_openable_notional: float,
+        order_role: str,
+        source: str,
+        extra_payload: dict[str, Any],
+    ) -> None:
+        payload: dict[str, Any] = {
+            "venue": Venue.ASTER.value,
+            "symbol": venue_sym,
+            "reason": "aster_headroom_advisory_zero",
+            "source": source,
+            "requested_notional": requested_notional,
+            "remaining_openable_notional": remaining_openable_notional,
+            "remaining_openable_endpoint_value": remaining_openable_notional,
+            "notional_gap": max(requested_notional - remaining_openable_notional, 0.0),
+            "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
+            "order_role": order_role,
+            "cooldown_scope": "none",
+            "block_scope": "none",
+            "reduce_only": bool(request.reduce_only),
+            "post_only": bool(request.post_only),
+            "client_order_id": request.client_order_id or "",
+            "response_classification": "aster_headroom_advisory_zero",
+            "evidence_gap": False,
+        }
+        payload.update(extra_payload)
+        payload["account_truth_submit_allowed"] = True
+        self._record_order_diagnostic(
+            "runtime.entry_admission_headroom_advisory",
+            payload,
+        )
 
     def _record_aster_headroom_admission_block(
         self,
@@ -5895,6 +6039,7 @@ class VenueTransport(MarketDataClient):
         reason: str,
         evidence_gap: bool,
         error: str = "",
+        extra_payload: dict[str, Any] | None = None,
     ) -> None:
         notional_gap: float | None = None
         if remaining_openable_notional is not None:
@@ -5912,14 +6057,15 @@ class VenueTransport(MarketDataClient):
             "notional_gap": notional_gap,
             "leverage": ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE,
             "order_role": order_role,
-            "cooldown_scope": "symbol_and_venue",
-            "block_scope": "symbol_and_venue",
+            "cooldown_scope": "symbol",
+            "block_scope": "symbol",
             "reduce_only": bool(request.reduce_only),
             "post_only": bool(request.post_only),
             "client_order_id": request.client_order_id or "",
             "response_classification": reason,
             "evidence_gap": evidence_gap,
         }
+        payload.update(extra_payload or {})
         if error:
             payload["headroom_error"] = error
         self._record_order_diagnostic("runtime.entry_admission_blocked", payload)

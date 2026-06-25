@@ -5471,10 +5471,18 @@ def _build_entry_admission_cooldown_summary(
         for key in (
             "requested_notional",
             "remaining_openable_notional",
+            "remaining_openable_endpoint_value",
             "notional_gap",
             "leverage",
             "headroom_source",
             "headroom_error",
+            "headroom_truth_source",
+            "required_margin_estimate",
+            "available_balance_quote",
+            "position_flat",
+            "open_orders_empty",
+            "account_margin_sufficient",
+            "account_truth_submit_allowed",
         ):
             if normalized.get(key) is None:
                 value = first_value(sample_rows, key)
@@ -5498,6 +5506,7 @@ def _build_entry_admission_cooldown_summary(
         kind = str(rec.get("kind") or "")
         if kind not in {
             "runtime.entry_admission_blocked",
+            "runtime.entry_admission_headroom_advisory",
             "runtime.entry_admission_venue_degraded",
             "runtime.venue_cooldown_started",
         }:
@@ -5567,13 +5576,29 @@ def _build_entry_admission_cooldown_summary(
             headroom_error = str(rollup_payload.get("headroom_error") or "")
             if headroom_error and not rollup.get("headroom_error"):
                 rollup["headroom_error"] = headroom_error
+            for key in (
+                "remaining_openable_endpoint_value",
+                "headroom_truth_source",
+                "required_margin_estimate",
+                "available_balance_quote",
+                "position_flat",
+                "open_orders_empty",
+                "account_margin_sufficient",
+                "account_truth_submit_allowed",
+            ):
+                value = rollup_payload.get(key)
+                if value is not None and rollup.get(key) is None:
+                    rollup[key] = value
             affected_candidates = rollup_payload.get("affected_candidates") or []
             if affected_candidates:
                 existing = set(rollup.get("affected_candidates") or [])
                 existing.update(str(item) for item in affected_candidates if str(item))
                 rollup["affected_candidates"] = sorted(existing)
         if venue == "aster" and reason == "max_notional_admission_blocked":
-            advice = "check_aster_account_leverage_position_limit_or_capital"
+            advice = "aster_real_exchange_max_notional_reject_symbol_scoped"
+            advice_counts[advice] = advice_counts.get(advice, 0) + 1
+        if venue == "aster" and reason == "aster_headroom_advisory_zero":
+            advice = "aster_endpoint_zero_advisory_account_truth_submit_allowed"
             advice_counts[advice] = advice_counts.get(advice, 0) + 1
         if len(samples) < 12:
             samples.append({
@@ -5588,8 +5613,12 @@ def _build_entry_admission_cooldown_summary(
                 "evidence_gap": payload.get("evidence_gap"),
                 "requested_notional": rollup_payload.get("requested_notional"),
                 "remaining_openable_notional": rollup_payload.get("remaining_openable_notional"),
+                "remaining_openable_endpoint_value": rollup_payload.get("remaining_openable_endpoint_value"),
                 "notional_gap": rollup_payload.get("notional_gap"),
                 "leverage": rollup_payload.get("leverage"),
+                "required_margin_estimate": rollup_payload.get("required_margin_estimate"),
+                "available_balance_quote": rollup_payload.get("available_balance_quote"),
+                "headroom_truth_source": rollup_payload.get("headroom_truth_source"),
             })
     top_blocked_symbols = sorted(
         symbol_rollups.values(),

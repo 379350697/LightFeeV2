@@ -428,19 +428,21 @@ class AsterV3Client:
             return None
         equity = _parse_optional_float(data.get("totalMarginBalance"))
         maint = _parse_optional_float(data.get("totalMaintMargin"))
-        if equity is None or maint is None or maint <= 0:
+        available = _parse_optional_float(data.get("availableBalance"))
+        if equity is None:
+            equity = available
+        if equity is None:
             return None
+        maint_for_snapshot = maint if maint is not None and maint > 0 else 1e-9
         snapshot = AccountRiskSnapshot(
             venue=Venue.ASTER,
             equity_quote=equity,
-            maintenance_margin_quote=maint,
-            health_ratio=equity / maint,
+            maintenance_margin_quote=maint_for_snapshot,
+            health_ratio=equity / maint_for_snapshot,
             observed_at_ms=int(time.time() * 1000),
             source="aster_v3_account_with_join_margin",
         )
-        snapshot.available_balance_quote = _parse_optional_float(
-            data.get("availableBalance")
-        )
+        snapshot.available_balance_quote = available
         return snapshot
 
     async def fetch_remaining_openable_notional(
