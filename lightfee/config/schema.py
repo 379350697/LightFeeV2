@@ -164,6 +164,14 @@ class StrategyConfig:
     spread_mean_reversion_min_std_bps: float = 0.05
     spread_mean_reversion_max_half_life_ms: int = 1800000
     spread_ranker_max_candidates: int = 10
+    spread_score_liquidity_weight: float = 8.0
+    spread_score_z_cap: float = 5.0
+    spread_liquidity_small_quote: float = 50.0
+    spread_liquidity_medium_quote: float = 100.0
+    spread_liquidity_large_quote: float = 500.0
+    spread_liquidity_small_penalty_bps: float = 60.0
+    spread_liquidity_medium_penalty_bps: float = 30.0
+    spread_liquidity_sublarge_penalty_bps: float = 10.0
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     execution_buffer_bps: float = 2.0

@@ -13,6 +13,7 @@ from lightfee.spread.reversion import (
 def _quote(
     venue: str,
     *,
+    symbol: str = "BTCUSDT",
     bid: float,
     ask: float,
     observed_at_ms: int,
@@ -22,7 +23,7 @@ def _quote(
 ) -> QuoteSnapshot:
     return QuoteSnapshot(
         venue=venue,
-        symbol="BTCUSDT",
+        symbol=symbol,
         bid=bid,
         ask=ask,
         observed_at_ms=observed_at_ms,
@@ -370,3 +371,72 @@ def test_spread_reversion_blocks_short_history_even_with_enough_samples() -> Non
         )
 
     assert candidates == []
+
+
+def test_spread_scoring_prioritizes_large_capacity_over_extreme_thin_zscore() -> None:
+    tracker = SpreadStatsTracker()
+    cfg = SpreadReversionConfig(
+        min_samples=120,
+        min_history_ms=0,
+        min_fair_price_confidence=0.0,
+        min_liquidity_capacity_ratio=1.25,
+        entry_z=0.0,
+        min_net_edge_bps=0.0,
+        slippage_reserve_bps=0.0,
+        adverse_selection_buffer_bps=0.0,
+        live_notional_quote=20.0,
+        max_gross_quote=20.0,
+        signal_ttl_ms=1_000,
+        quote_skew_ms=250,
+    )
+
+    def pair(
+        symbol: str,
+        spread_bps: float,
+        capacity_quote: float,
+        now_ms: int,
+    ) -> dict[str, QuoteSnapshot]:
+        cheap_ask = 100.0
+        rich_bid = cheap_ask * (1.0 + spread_bps / 10_000.0)
+        top_size = capacity_quote / cheap_ask
+        return {
+            f"cheap:{symbol}": _quote(
+                "cheap",
+                symbol=symbol,
+                bid=cheap_ask - 0.01,
+                ask=cheap_ask,
+                observed_at_ms=now_ms,
+                ask_size=top_size,
+            ),
+            f"rich:{symbol}": _quote(
+                "rich",
+                symbol=symbol,
+                bid=rich_bid,
+                ask=rich_bid + 0.01,
+                observed_at_ms=now_ms,
+                bid_size=top_size,
+            ),
+        }
+
+    candidates = []
+    for i in range(120):
+        now_ms = 500_000 + i
+        thin_spread = 8.0 if i < 119 else 70.0
+        deep_spread = 8.0 if i < 119 else 30.0
+        candidates = build_spread_reversion_candidates(
+            {
+                **pair("THINUSDT", thin_spread, 45.0, now_ms),
+                **pair("DEEPUSDT", deep_spread, 600.0, now_ms),
+            },
+            ["THINUSDT", "DEEPUSDT"],
+            tracker=tracker,
+            config=cfg,
+            now_ms=now_ms,
+        )
+
+    assert [candidate.symbol for candidate in candidates[:2]] == ["DEEPUSDT", "THINUSDT"]
+    thin = next(candidate for candidate in candidates if candidate.symbol == "THINUSDT")
+    deep = next(candidate for candidate in candidates if candidate.symbol == "DEEPUSDT")
+    assert thin.capacity_quote < 50.0
+    assert deep.capacity_quote >= 500.0
+    assert thin.z_score > cfg.score_z_cap

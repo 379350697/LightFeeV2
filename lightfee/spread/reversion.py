@@ -43,6 +43,14 @@ class SpreadReversionConfig:
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
     ranker_max_candidates: int = 10
+    score_liquidity_weight: float = 8.0
+    score_z_cap: float = 5.0
+    liquidity_small_quote: float = 50.0
+    liquidity_medium_quote: float = 100.0
+    liquidity_large_quote: float = 500.0
+    liquidity_small_penalty_bps: float = 60.0
+    liquidity_medium_penalty_bps: float = 30.0
+    liquidity_sublarge_penalty_bps: float = 10.0
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> "SpreadReversionConfig":
@@ -132,6 +140,65 @@ class SpreadReversionConfig:
             ranker_max_candidates=int(
                 getattr(strategy, "spread_ranker_max_candidates", cls.ranker_max_candidates)
                 or 0
+            ),
+            score_liquidity_weight=float(
+                getattr(
+                    strategy,
+                    "spread_score_liquidity_weight",
+                    cls.score_liquidity_weight,
+                )
+                or 0.0
+            ),
+            score_z_cap=float(
+                getattr(strategy, "spread_score_z_cap", cls.score_z_cap) or 0.0
+            ),
+            liquidity_small_quote=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_small_quote",
+                    cls.liquidity_small_quote,
+                )
+                or 0.0
+            ),
+            liquidity_medium_quote=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_medium_quote",
+                    cls.liquidity_medium_quote,
+                )
+                or 0.0
+            ),
+            liquidity_large_quote=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_large_quote",
+                    cls.liquidity_large_quote,
+                )
+                or 0.0
+            ),
+            liquidity_small_penalty_bps=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_small_penalty_bps",
+                    cls.liquidity_small_penalty_bps,
+                )
+                or 0.0
+            ),
+            liquidity_medium_penalty_bps=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_medium_penalty_bps",
+                    cls.liquidity_medium_penalty_bps,
+                )
+                or 0.0
+            ),
+            liquidity_sublarge_penalty_bps=float(
+                getattr(
+                    strategy,
+                    "spread_liquidity_sublarge_penalty_bps",
+                    cls.liquidity_sublarge_penalty_bps,
+                )
+                or 0.0
             ),
         )
 
@@ -395,18 +462,23 @@ def _candidate_for_pair(
     if fair_price_confidence < config.min_fair_price_confidence:
         return None
     mean_quality = quality.quality if quality.entry_allowed else 0.0
+    effective_z_score = _effective_z_score(z_score, config)
+    liquidity_penalty_bps = _liquidity_rank_penalty_bps(capacity_quote, config)
     score = (
         cost.net_edge_bps
-        + max(z_score, 0.0) * 2.0
+        + effective_z_score * 2.0
         + mean_quality * 5.0
         + funding.score_adjustment_bps
-        + liquidity_score * 2.0
+        + liquidity_score * config.score_liquidity_weight
         + fair_price_confidence
+        - liquidity_penalty_bps
     )
     rank_reason = (
         f"score={score:.2f};net_edge_bps={cost.net_edge_bps:.2f};"
-        f"z_score={z_score:.2f};mean_reversion_quality={mean_quality:.2f};"
-        f"liquidity_score={liquidity_score:.2f}"
+        f"z_score={z_score:.2f};effective_z_score={effective_z_score:.2f};"
+        f"mean_reversion_quality={mean_quality:.2f};"
+        f"liquidity_score={liquidity_score:.2f};"
+        f"liquidity_penalty_bps={liquidity_penalty_bps:.2f}"
     )
     return SpreadReversionCandidate(
         candidate_id=_candidate_id(str(long_q.symbol), str(long_q.venue), str(short_q.venue)),
@@ -462,6 +534,31 @@ def _fee_map(venues: list[VenueConfig]) -> dict[str, float]:
 
 def _fee_bps(config: SpreadReversionConfig, venue: str) -> float:
     return float(config.taker_fee_bps_by_venue.get(str(venue).lower(), 0.0) or 0.0)
+
+
+def _effective_z_score(z_score: float, config: SpreadReversionConfig) -> float:
+    score = max(float(z_score or 0.0), 0.0)
+    cap = float(config.score_z_cap or 0.0)
+    if cap <= 0.0:
+        return score
+    return min(score, cap)
+
+
+def _liquidity_rank_penalty_bps(
+    capacity_quote: float,
+    config: SpreadReversionConfig,
+) -> float:
+    capacity = max(float(capacity_quote or 0.0), 0.0)
+    small_quote = max(float(config.liquidity_small_quote or 0.0), 0.0)
+    medium_quote = max(float(config.liquidity_medium_quote or 0.0), small_quote)
+    large_quote = max(float(config.liquidity_large_quote or 0.0), medium_quote)
+    if small_quote > 0.0 and capacity < small_quote:
+        return max(float(config.liquidity_small_penalty_bps or 0.0), 0.0)
+    if medium_quote > 0.0 and capacity < medium_quote:
+        return max(float(config.liquidity_medium_penalty_bps or 0.0), 0.0)
+    if large_quote > 0.0 and capacity < large_quote:
+        return max(float(config.liquidity_sublarge_penalty_bps or 0.0), 0.0)
+    return 0.0
 
 
 def _candidate_id(symbol: str, long_venue: str, short_venue: str) -> str:
