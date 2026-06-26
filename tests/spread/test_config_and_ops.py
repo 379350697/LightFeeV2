@@ -12,6 +12,8 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
 
     assert runtime.spread_sidecar_snapshot_path == "runtime/spread-opportunities-current.json"
     assert runtime.spread_sidecar_refresh_ms == 1000
+    assert runtime.spread_sidecar_source_mode == "sidecar_snapshot"
+    assert runtime.spread_sidecar_direct_fetch_enabled is False
     assert strategy.spread_reversion_enabled is False
     assert strategy.spread_live_notional_quote == 20.0
     assert strategy.spread_max_gross_quote == 50.0
@@ -33,6 +35,8 @@ symbols = ["BTCUSDT"]
 mode = "live"
 spread_sidecar_snapshot_path = "runtime/spread.json"
 spread_sidecar_refresh_ms = 750
+spread_sidecar_source_mode = "direct_market"
+spread_sidecar_direct_fetch_enabled = true
 
 [strategy]
 spread_reversion_enabled = true
@@ -56,6 +60,8 @@ venue = "okx"
 
     assert config.runtime.spread_sidecar_snapshot_path == "runtime/spread.json"
     assert config.runtime.spread_sidecar_refresh_ms == 750
+    assert config.runtime.spread_sidecar_source_mode == "direct_market"
+    assert config.runtime.spread_sidecar_direct_fetch_enabled is True
     assert config.strategy.spread_reversion_enabled is True
     assert config.strategy.spread_live_notional_quote == 25.0
     assert config.strategy.spread_entry_z == 2.25

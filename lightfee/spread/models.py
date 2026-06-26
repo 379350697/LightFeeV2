@@ -64,6 +64,7 @@ class SpreadSnapshot:
     published_at_ms: int = 0
     market_observed_at_ms: int = 0
     snapshot_path: str = ""
+    source_mode: str = ""
     degraded_venues: list[str] = field(default_factory=list)
     degraded_symbols: dict[str, list[str]] = field(default_factory=dict)
     candidates: list[SpreadReversionCandidate] = field(default_factory=list)

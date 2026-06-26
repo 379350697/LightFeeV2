@@ -541,6 +541,8 @@ class MarketDataClient:
         venue_sym: str,
     ) -> dict[str, Any] | None:
         if isinstance(raw, dict):
+            if not raw:
+                return None
             data = raw.get("data")
             if isinstance(data, list):
                 items = data
@@ -595,12 +597,22 @@ class MarketDataClient:
                         params={"symbol": venue_sym},
                     )
                 except Exception as exc:
+                    status = self._binance_style_oi_status_from_error(exc)
+                    if status == "unsupported":
+                        return (
+                            venue_sym,
+                            0.0,
+                            0.0,
+                            observed_at_ms,
+                            "symbol_not_listed_before_http",
+                            "premium_index_symbol_rejected_before_oi_http",
+                        )
                     return (
                         venue_sym,
                         0.0,
                         0.0,
                         observed_at_ms,
-                        self._binance_style_oi_status_from_error(exc),
+                        status,
                         _http_error_reason(exc),
                     )
                 pi_item = self._binance_style_first_symbol_item(raw_pi, venue_sym)
@@ -610,8 +622,8 @@ class MarketDataClient:
                         0.0,
                         0.0,
                         observed_at_ms,
-                        "missing_mark_price",
-                        "missing_mark_price",
+                        "symbol_not_listed_before_http",
+                        "missing_symbol_mark_before_http",
                     )
                 resolved_mark, mark_ok, _mark_key = self._binance_style_parse_required_float(
                     pi_item,
@@ -827,6 +839,12 @@ class MarketDataClient:
 
         candidate_count = len(venue_sym_to_canon)
         cache_hit_count = candidate_count - len(tasks)
+        filtered_before_http_count = sum(
+            1
+            for status_reason in pending_status.values()
+            if status_reason[0] == "symbol_not_listed_before_http"
+        )
+        oi_refresh_attempt_count = max(len(tasks) - filtered_before_http_count, 0)
         for venue_sym, canon in venue_sym_to_canon.items():
             open_interest_quote, mark_price, status, reason = oi_map.get(
                 venue_sym,
@@ -844,7 +862,7 @@ class MarketDataClient:
                 oi_candidate_count=candidate_count,
                 oi_cache_hit_count=cache_hit_count,
                 oi_cache_miss_count=len(tasks),
-                oi_refresh_attempt_count=len(tasks),
+                oi_refresh_attempt_count=oi_refresh_attempt_count,
                 oi_refresh_cap=int(
                     getattr(
                         self,
@@ -926,6 +944,12 @@ class MarketDataClient:
             oi_symbols: list[str] = []
             for sym in venue_sym_to_canon:
                 if sym not in pi_map:
+                    oi_evidence_status[sym] = "symbol_not_listed_before_http"
+                    oi_evidence_reason[sym] = "missing_bulk_premium_index"
+                    continue
+                if sym not in ticker_map:
+                    oi_evidence_status[sym] = "symbol_not_listed_before_http"
+                    oi_evidence_reason[sym] = "missing_bulk_book_ticker"
                     continue
                 oi_candidate_count += 1
                 mark_price = _safe_float(pi_map.get(sym, {}).get("markPrice", 0))
@@ -1045,8 +1069,8 @@ class MarketDataClient:
         for venue_sym, canon in venue_sym_to_canon.items():
             t = ticker_map.get(venue_sym, {})
             pi = pi_map.get(venue_sym, {})
-            if not pi:
-                # V1 parity: not a perpetual contract — no premiumIndex data → skip
+            if not pi and t:
+                # V1 parity: bookTicker-only entries are not perpetual contracts.
                 continue
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,

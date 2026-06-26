@@ -84,6 +84,8 @@ class RuntimeConfig:
     spread_sidecar_snapshot_path: str = "runtime/spread-opportunities-current.json"
     spread_sidecar_refresh_ms: int = 1000
     spread_sidecar_fetch_timeout_s: float = 10.0
+    spread_sidecar_source_mode: str = "sidecar_snapshot"
+    spread_sidecar_direct_fetch_enabled: bool = False
     live_scan_last_good_max_age_ms: int = 600000
     live_scan_recovery_success_count: int = 3
     live_scan_revalidate_edge_buffer_bps: float = 2.0

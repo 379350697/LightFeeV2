@@ -50,6 +50,44 @@ def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
 
 
+def test_run_diagnose_reports_spread_sidecar_snapshot_source():
+    from lightfee.spread.models import SpreadSnapshot
+    from lightfee.spread.publisher import publish_spread_snapshot
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "lifecycle": "RUNNING",
+            "risk_mode": "running",
+            "positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+        })
+        publish_spread_snapshot(
+            SpreadSnapshot(
+                published_at_ms=1_000,
+                market_observed_at_ms=990,
+                source_mode="sidecar_snapshot",
+                degraded_venues=["aster"],
+                candidates=[],
+            ),
+            os.path.join(d, "spread-opportunities-current.json"),
+        )
+
+        result = run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1_500)
+
+        assert result["spread_sidecar_summary"] == {
+            "available": True,
+            "path": os.path.join(d, "spread-opportunities-current.json"),
+            "spread_sidecar_source": "sidecar_snapshot",
+            "candidate_count": 0,
+            "degraded_venues": ["aster"],
+        }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_bitget_duplicate_client_oid_order_error_resolves_by_truth_gap():
     import scripts.diagnose_live as diagnose_live
 
@@ -6751,6 +6789,47 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
         "total_count": 6,
         "unresolved_blocker_count": 1,
         "unresolved_blocker_scope": "entry_candidate_admission",
+    }
+
+
+def test_entry_outcome_summary_counts_public_oi_pre_http_filtered_symbols():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    summary = _build_entry_outcome_summary([
+        {
+            "kind": "execution.entry_liquidity_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "GHOSTUSDT",
+                "reason": "oi_evidence_unavailable",
+                "open_interest_evidence_status": "symbol_not_listed_before_http",
+                "open_interest_evidence_reason": "missing_bulk_book_ticker",
+            },
+        },
+        {
+            "kind": "runtime.entry_oi_targeted_refresh_failed",
+            "payload": {
+                "venue": "aster",
+                "symbol": "GHOSTUSDT",
+                "previous_open_interest_evidence_status": "unavailable",
+                "open_interest_evidence_status": "symbol_not_listed_before_http",
+                "open_interest_evidence_reason": "missing_symbol_mark_before_http",
+                "elapsed_ms": 2,
+            },
+        },
+    ])
+
+    assert summary["oi_liquidity_evidence_counts"] == {
+        "symbol_not_listed_before_http": 1,
+    }
+    assert summary["oi_liquidity_evidence_reason_counts"] == {
+        "missing_bulk_book_ticker": 1,
+    }
+    assert summary["oi_liquidity_health_summary"][
+        "public_oi_pre_http_filtered_count"
+    ] == 2
+    assert summary["oi_targeted_refresh_summary"]["status_counts"] == {
+        "symbol_not_listed_before_http": 1,
     }
 
 

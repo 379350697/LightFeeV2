@@ -458,6 +458,135 @@ class TestProductionSidecarParserRegressions:
         assert ticker.open_interest_evidence_status == "http_error"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [(binance_spec, "binance"), (aster_spec, "aster")],
+    )
+    async def test_binance_style_open_interest_filters_unlisted_symbol_before_http(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class FakeBinanceStyleClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.oi_calls: list[str] = []
+
+            async def _public_get(self, path, params=None):
+                if path == spec.funding_ticker_path:
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == spec.premium_index_path:
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                        },
+                        {
+                            "symbol": "GHOSTUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "10.5",
+                        },
+                    ]
+                if path == spec.volume_24h_path:
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == spec.open_interest_path:
+                    self.oi_calls.append(params["symbol"])
+                    if params["symbol"] == "GHOSTUSDT":
+                        raise AssertionError("unsupported symbol must be filtered before OI HTTP")
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceStyleClient()
+        result = await client._fetch_binance_style(["BTCUSDT", "GHOSTUSDT", "MISSINGUSDT"])
+
+        assert client.oi_calls == ["BTCUSDT"]
+        ghost = result[f"{venue_key}:GHOSTUSDT"]
+        assert ghost.open_interest_quote == 0.0
+        assert ghost.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ghost.open_interest_evidence_reason == "missing_bulk_book_ticker"
+        assert ghost.oi_refresh_attempt_count == 1
+        missing = result[f"{venue_key}:MISSINGUSDT"]
+        assert missing.open_interest_quote == 0.0
+        assert missing.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert missing.open_interest_evidence_reason == "missing_bulk_premium_index"
+        assert missing.oi_refresh_attempt_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [(binance_spec, "binance"), (aster_spec, "aster")],
+    )
+    async def test_binance_style_entry_open_interest_filters_missing_symbol_before_http(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class FakeBinanceStyleClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.calls: list[tuple[str, dict]] = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                if path == spec.premium_index_path:
+                    return {}
+                if path == spec.open_interest_path:
+                    raise AssertionError("missing symbol truth must be filtered before OI HTTP")
+                return {}
+
+        client = FakeBinanceStyleClient()
+        result = await client.fetch_entry_open_interest_evidence(["GHOSTUSDT"])
+
+        ticker = result[f"{venue_key}:GHOSTUSDT"]
+        assert [call[0] for call in client.calls] == [spec.premium_index_path]
+        assert ticker.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ticker.open_interest_evidence_reason == "missing_symbol_mark_before_http"
+        assert ticker.oi_refresh_attempt_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [(binance_spec, "binance"), (aster_spec, "aster")],
+    )
+    async def test_binance_style_entry_open_interest_classifies_symbol_reject_before_oi_http(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class FakeBinanceStyleClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.calls: list[tuple[str, dict]] = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                if path == spec.premium_index_path:
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        'HTTP 400: {"code":-1121,"msg":"Invalid symbol."}',
+                        status_code=400,
+                    )
+                if path == spec.open_interest_path:
+                    raise AssertionError("invalid symbol must be filtered before OI HTTP")
+                return {}
+
+        client = FakeBinanceStyleClient()
+        result = await client.fetch_entry_open_interest_evidence(["GHOSTUSDT"])
+
+        ticker = result[f"{venue_key}:GHOSTUSDT"]
+        assert [call[0] for call in client.calls] == [spec.premium_index_path]
+        assert ticker.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ticker.open_interest_evidence_reason == "premium_index_symbol_rejected_before_oi_http"
+        assert ticker.oi_refresh_attempt_count == 0
+
+    @pytest.mark.asyncio
     async def test_binance_open_interest_429_does_not_drop_quotes(self):
         class FakeBinanceClient(MarketDataClient):
             async def _public_get(self, path, params=None):

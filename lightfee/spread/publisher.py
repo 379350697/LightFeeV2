@@ -55,6 +55,7 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
         published_at_ms=int(data.get("published_at_ms", 0) or 0),
         market_observed_at_ms=int(data.get("market_observed_at_ms", 0) or 0),
         snapshot_path=str(data.get("snapshot_path", "") or ""),
+        source_mode=str(data.get("source_mode", "") or ""),
         degraded_venues=list(data.get("degraded_venues", []) or []),
         degraded_symbols=dict(data.get("degraded_symbols", {}) or {}),
         candidates=candidates,
@@ -67,6 +68,7 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
         "published_at_ms": snapshot.published_at_ms,
         "market_observed_at_ms": snapshot.market_observed_at_ms,
         "snapshot_path": snapshot.snapshot_path,
+        "source_mode": snapshot.source_mode,
         "degraded_venues": list(snapshot.degraded_venues),
         "degraded_symbols": {
             str(key): list(value)

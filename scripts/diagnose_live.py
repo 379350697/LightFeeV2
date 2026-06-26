@@ -3819,6 +3819,7 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "refresh_attempt_count": 0,
         "deferred_count": 0,
         "timeout_count": 0,
+        "public_oi_pre_http_filtered_count": 0,
         "max_refresh_cap": 0,
         "max_refresh_elapsed_ms": 0,
     }
@@ -3881,6 +3882,8 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             oi_liquidity_evidence_counts[status] = (
                 oi_liquidity_evidence_counts.get(status, 0) + 1
             )
+            if status == "symbol_not_listed_before_http":
+                oi_liquidity_health_summary["public_oi_pre_http_filtered_count"] += 1
             reason = str(payload.get("open_interest_evidence_reason") or "unknown")
             oi_liquidity_evidence_reason_counts[reason] = (
                 oi_liquidity_evidence_reason_counts.get(reason, 0) + 1
@@ -3940,6 +3943,8 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
                 oi_targeted_refresh_summary["timeout_count"] += 1
             if status == "unsupported":
                 oi_targeted_refresh_summary["unsupported_count"] += 1
+            if status == "symbol_not_listed_before_http":
+                oi_liquidity_health_summary["public_oi_pre_http_filtered_count"] += 1
         elif kind == "execution.direction_drift_blocked":
             reason = str(payload.get("reason", "") or "")
             if reason:
@@ -7938,6 +7943,30 @@ def _build_conclusion(
 # Main diagnose
 # ---------------------------------------------------------------------------
 
+def _build_spread_sidecar_summary(runtime_dir: str) -> dict[str, Any]:
+    path = Path(runtime_dir) / "spread-opportunities-current.json"
+    try:
+        from lightfee.spread.publisher import load_spread_snapshot
+
+        snapshot = load_spread_snapshot(path)
+    except Exception:
+        snapshot = None
+    if snapshot is None:
+        return {
+            "available": False,
+            "path": str(path),
+            "spread_sidecar_source": "missing_or_malformed",
+            "candidate_count": 0,
+            "degraded_venues": [],
+        }
+    return {
+        "available": True,
+        "path": str(path),
+        "spread_sidecar_source": str(getattr(snapshot, "source_mode", "") or "unknown"),
+        "candidate_count": len(getattr(snapshot, "candidates", []) or []),
+        "degraded_venues": list(getattr(snapshot, "degraded_venues", []) or []),
+    }
+
 def run_diagnose(
     *,
     runtime_dir: str = DEFAULT_RUNTIME_DIR,
@@ -8071,6 +8100,7 @@ def run_diagnose(
     l2_evidence = _build_l2_evidence(all_events)
     snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
+    spread_sidecar_summary = _build_spread_sidecar_summary(runtime_dir)
     production_acceptance_gate = _build_production_acceptance_gate(
         all_events,
         local_state,
@@ -8258,6 +8288,7 @@ def run_diagnose(
         "l2_evidence": l2_evidence,
         "snapshot_evidence": snapshot_evidence,
         "runtime_warnings": runtime_warnings,
+        "spread_sidecar_summary": spread_sidecar_summary,
         "production_acceptance_gate": production_acceptance_gate,
         "evidence_quality": evidence_completeness,
         "conclusion": conclusion,

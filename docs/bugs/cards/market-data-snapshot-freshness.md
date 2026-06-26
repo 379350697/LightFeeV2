@@ -23,6 +23,22 @@ contract is unified at the sidecar snapshot level: slow enrichment may degrade
 metadata, but it must not remove an otherwise usable venue quote or make the
 whole snapshot stale.
 
+The main sidecar is the default public quote/OI truth publisher. Spread-sidecar
+must consume `SidecarSnapshot.quotes` from `runtime.sidecar_snapshot_path` by
+default instead of independently pulling Binance/Aster-compatible quote or OI
+HTTP. If the main snapshot is missing, malformed, or stale, spread-sidecar
+publishes a degraded empty spread snapshot. Direct public fetch is an explicit
+emergency fallback only, and must record `source_mode=direct_market_fallback`.
+
+Binance/Aster-compatible symbol-level OI is gated before OI HTTP. Full sidecar
+OI enrichment may call `/fapi/v1/openInterest` only when bulk `premiumIndex`
+and bulk `bookTicker` both confirm the venue symbol. Missing bulk
+`premiumIndex`/`bookTicker` evidence is diagnostic filtered evidence, while
+bookTicker-only non-perpetual symbols remain skipped. Candidate-scoped OI may
+probe symbol mark truth, but if mark/symbol truth is missing or the mark probe
+rejects the symbol it must return `symbol_not_listed_before_http` rather than
+calling OI and treating the exchange 400 as normal market-data pressure.
+
 Entry readiness is stricter than sidecar publication. Sidecar/last-good data may
 seed shortlist and warm tracking, but execution still needs a fresh validated
 top-book quote lease. Slow OI/liquidity evidence can be cached, capped, deferred,
@@ -101,10 +117,12 @@ V1 primary+shadow scope can increment current unresolved entry blockers.
 | 2026-06-23 | Stale quote WS/REST revalidate diagnostics | local green, deploy pending | CL-110 carries `sidecar_reason`, `ws_bbo_lease_hit`, `rest_revalidate_attempted`, `rest_revalidate_hit`, and `rest_revalidate_terminal_stale` through quote revalidate events. Fresh WS-BBO or REST evidence clears the stale blocker; REST quotes that remain stale still fail closed with precise buckets such as `rest_resolved_but_stale`. No quote TTL or entry admission rule is loosened. |
 | 2026-06-24 | Gate/Bitget true funding timestamp sources and Gate contracts cache | `5d9c49e` code deployed/cloud verified; docs closure synced | CL-113 replaces synthetic Gate/Bitget funding observation timestamps with official future funding metadata: Bitget `current-fund-rate.nextUpdate`, Gate `contracts.funding_next_apply`, and fail-closed `0` when true future evidence is missing. Cloud smoke confirmed Gate/Bitget BTCUSDT future `funding_timestamp_ms=1782316800000`; Gate contracts metadata reuses the existing 10 minute funding cache so full `/contracts` is not fetched every sidecar cycle. No strategy window, sidecar pairing, quote TTL, OI floor, or trading guard is loosened. |
 | 2026-06-24 | Entry quote/OI prewarm horizon after Gate/Bitget candidate recovery | `653b21a` deployed/cloud verified | CL-115 adds a bounded `entry_quote_prewarm_extra_candidate_count=24` near-promotion horizon. Extra candidates only warm quote/OI caches and emit `prewarm_only` evidence; final entry filtering and dispatch remain V1 primary+shadow. Diagnose now separates `prewarm_extra` counters, avoids double-counting paired quote-revalidate/rewarm events, and does not count prewarm-only failures as unresolved blockers. Active venue admission cooldowns, including Aster `max_notional_admission_blocked`, prune before prewarm. Cloud since-deploy diagnose passed with no entry evidence blockers, no quote rewarm timeout, and exchange truth flat/no-open-orders. |
+| 2026-06-27 | Public OI pre-HTTP symbol filter and spread snapshot sharing | local green; deploy pending | CL-123 filters Binance/Aster-compatible OI symbols before OI HTTP when bulk premiumIndex/bookTicker does not confirm tradeability or candidate mark truth is missing/rejected. Spread-sidecar defaults to consuming the main sidecar snapshot and only direct-fetches public data through an explicit fallback config that marks `source_mode=direct_market_fallback`. |
 
 ## Regression Harness
 
 - `tests/venues/test_market_data_client.py`
 - `tests/sidecar/test_sources.py`
+- `tests/spread/test_snapshot_and_service.py`
 - `tests/sidecar/test_v1_parity_lifecycle.py`
 - `tests/ops/test_production_health.py`

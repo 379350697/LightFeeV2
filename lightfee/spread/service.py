@@ -8,6 +8,7 @@ from typing import Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
+from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.models import SpreadSnapshot
 from lightfee.spread.publisher import publish_spread_snapshot
@@ -28,12 +29,23 @@ class SpreadSidecarService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.snapshot_path = config.runtime.spread_sidecar_snapshot_path
+        self.sidecar_snapshot_path = config.runtime.sidecar_snapshot_path
         self.refresh_timeout_s = float(
             getattr(config.runtime, "spread_sidecar_fetch_timeout_s", 10.0) or 10.0
+        )
+        self.source_mode = str(
+            getattr(config.runtime, "spread_sidecar_source_mode", "sidecar_snapshot")
+            or "sidecar_snapshot"
+        ).lower()
+        self.direct_fetch_enabled = bool(
+            getattr(config.runtime, "spread_sidecar_direct_fetch_enabled", False)
         )
         self.signal_config = SpreadReversionConfig.from_app_config(config)
         self.stats = SpreadStatsTracker()
         self._exchange_sources: dict[str, object] = {}
+
+        if self.source_mode != "direct_market" or not self.direct_fetch_enabled:
+            return
 
         from lightfee.sidecar.sources.exchange import ExchangeSource
         from lightfee.venues.transport import EndpointRateLimiter
@@ -62,7 +74,7 @@ class SpreadSidecarService:
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
         observed_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        quotes, degraded_venues = await self._fetch_quotes(observed_ms)
+        quotes, degraded_venues, source_mode = await self._fetch_quotes(observed_ms)
         candidates = build_spread_reversion_candidates(
             quotes,
             list(self.config.symbols),
@@ -74,6 +86,7 @@ class SpreadSidecarService:
             published_at_ms=observed_ms,
             market_observed_at_ms=observed_ms,
             snapshot_path=str(self.snapshot_path),
+            source_mode=source_mode,
             degraded_venues=sorted(degraded_venues),
             candidates=candidates,
         )
@@ -81,6 +94,42 @@ class SpreadSidecarService:
         return snapshot
 
     async def _fetch_quotes(
+        self,
+        observed_ms: int,
+    ) -> tuple[dict[str, QuoteSnapshot], set[str], str]:
+        if self.source_mode == "direct_market" and self.direct_fetch_enabled:
+            quotes, degraded_venues = await self._fetch_quotes_direct(observed_ms)
+            return quotes, degraded_venues, "direct_market_fallback"
+
+        snapshot = load_snapshot(self.sidecar_snapshot_path)
+        configured_venues = {
+            str(getattr(vc, "venue", "") or "").lower()
+            for vc in self.config.venues
+            if str(getattr(vc, "venue", "") or "").strip()
+        }
+        if snapshot is None:
+            return {}, configured_venues, "sidecar_snapshot_unavailable"
+
+        max_age_ms = int(
+            getattr(self.config.runtime, "sidecar_snapshot_max_age_ms", 10000) or 10000
+        )
+        published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
+        if published_at_ms <= 0 or observed_ms - published_at_ms > max_age_ms:
+            return {}, configured_venues, "sidecar_snapshot_stale"
+
+        quotes: dict[str, QuoteSnapshot] = {}
+        for key, quote in (getattr(snapshot, "quotes", {}) or {}).items():
+            if int(getattr(quote, "observed_at_ms", 0) or 0) <= 0:
+                quote.observed_at_ms = observed_ms
+            quotes[str(key)] = quote
+        degraded_venues = {
+            str(venue).lower()
+            for venue in (getattr(snapshot, "degraded_venues", []) or [])
+            if str(venue)
+        }
+        return quotes, degraded_venues, "sidecar_snapshot"
+
+    async def _fetch_quotes_direct(
         self,
         observed_ms: int,
     ) -> tuple[dict[str, QuoteSnapshot], set[str]]:
