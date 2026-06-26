@@ -44,7 +44,12 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
     candidates = []
     for raw in data.get("candidates", []) or []:
         if isinstance(raw, dict):
-            candidates.append(SpreadReversionCandidate(**raw))
+            candidate_data = dict(raw)
+            if "fair_price" not in candidate_data and "fair_price_bps" in candidate_data:
+                candidate_data["fair_price"] = candidate_data.pop("fair_price_bps")
+            else:
+                candidate_data.pop("fair_price_bps", None)
+            candidates.append(SpreadReversionCandidate(**candidate_data))
     return SpreadSnapshot(
         schema_version=1,
         published_at_ms=int(data.get("published_at_ms", 0) or 0),
@@ -94,6 +99,19 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
                 "quote_skew_ms": c.quote_skew_ms,
                 "funding_timestamp_ms": c.funding_timestamp_ms,
                 "first_funding_timestamp_ms": c.first_funding_timestamp_ms,
+                "fair_price": c.fair_price,
+                "venue_premium_bps": c.venue_premium_bps,
+                "fair_price_confidence": c.fair_price_confidence,
+                "mean_reversion_quality": c.mean_reversion_quality,
+                "half_life_ms": c.half_life_ms,
+                "hold_time_hint_ms": c.hold_time_hint_ms,
+                "gross_edge_bps": c.gross_edge_bps,
+                "funding_carry_bps": c.funding_carry_bps,
+                "liquidity_score": c.liquidity_score,
+                "venue_health_score": c.venue_health_score,
+                "score": c.score,
+                "rank_reason": c.rank_reason,
+                "degradation_state": c.degradation_state,
             }
             for c in snapshot.candidates
         ],

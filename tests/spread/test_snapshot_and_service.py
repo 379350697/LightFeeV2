@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from lightfee.config.schema import AppConfig, RuntimeConfig, StrategyConfig, VenueConfig
@@ -28,6 +30,7 @@ def _candidate() -> SpreadReversionCandidate:
         entry_notional_quote=20.0,
         capacity_quote=100.0,
         signal_status="entry_ready",
+        fair_price=100.05,
     )
 
 
@@ -45,6 +48,9 @@ def test_spread_snapshot_round_trips_without_funding_candidate_shape(tmp_path) -
     assert loaded is not None
     assert loaded.schema_version == 1
     assert loaded.candidates[0].strategy_bucket == "spread_reversion"
+    raw = json.loads(path.read_text())
+    assert raw["candidates"][0]["fair_price"] == pytest.approx(100.05)
+    assert "fair_price_bps" not in raw["candidates"][0]
     assert not hasattr(loaded.candidates[0], "opportunity_type")
 
 

@@ -40,6 +40,19 @@ class SpreadReversionCandidate:
     quote_skew_ms: int = 0
     funding_timestamp_ms: int = 0
     first_funding_timestamp_ms: int = 0
+    fair_price: float = 0.0
+    venue_premium_bps: float = 0.0
+    fair_price_confidence: float = 0.0
+    mean_reversion_quality: float = 0.0
+    half_life_ms: int = 0
+    hold_time_hint_ms: int = 0
+    gross_edge_bps: float = 0.0
+    funding_carry_bps: float = 0.0
+    liquidity_score: float = 0.0
+    venue_health_score: float = 1.0
+    score: float = 0.0
+    rank_reason: str = ""
+    degradation_state: str = "healthy"
 
 
 @dataclass(frozen=True)

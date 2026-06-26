@@ -8,9 +8,18 @@ from dataclasses import dataclass, field
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.models import SpreadReversionCandidate
-
-
-_FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000
+from lightfee.spread.modules import (
+    CandidateSource,
+    CostModel,
+    DegradationState,
+    FairPriceAssessment,
+    FairPriceModel,
+    FundingAwarenessModel,
+    LiquidityAndVenueHealthGate,
+    MeanReversionQualityModel,
+    SpreadRanker,
+    ZScoreSignalModel,
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +35,11 @@ class SpreadReversionConfig:
     slippage_reserve_bps: float = 2.0
     adverse_selection_buffer_bps: float = 1.0
     expected_hold_ms: int = 30 * 60 * 1000
+    fair_price_max_venue_premium_bps: float = 150.0
+    fair_price_min_venues: int = 3
+    mean_reversion_min_std_bps: float = 0.05
+    mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
+    ranker_max_candidates: int = 0
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> "SpreadReversionConfig":
@@ -64,6 +78,38 @@ class SpreadReversionConfig:
             ),
             expected_hold_ms=int(
                 getattr(strategy, "spread_expected_hold_ms", cls.expected_hold_ms) or 0
+            ),
+            fair_price_max_venue_premium_bps=float(
+                getattr(
+                    strategy,
+                    "spread_fair_price_max_venue_premium_bps",
+                    cls.fair_price_max_venue_premium_bps,
+                )
+                or 0.0
+            ),
+            fair_price_min_venues=int(
+                getattr(strategy, "spread_fair_price_min_venues", cls.fair_price_min_venues)
+                or 0
+            ),
+            mean_reversion_min_std_bps=float(
+                getattr(
+                    strategy,
+                    "spread_mean_reversion_min_std_bps",
+                    cls.mean_reversion_min_std_bps,
+                )
+                or 0.0
+            ),
+            mean_reversion_max_half_life_ms=int(
+                getattr(
+                    strategy,
+                    "spread_mean_reversion_max_half_life_ms",
+                    cls.mean_reversion_max_half_life_ms,
+                )
+                or 0
+            ),
+            ranker_max_candidates=int(
+                getattr(strategy, "spread_ranker_max_candidates", cls.ranker_max_candidates)
+                or 0
             ),
         )
 
@@ -148,19 +194,45 @@ def build_spread_reversion_candidates(
     now_ms: int,
 ) -> list[SpreadReversionCandidate]:
     candidates: list[SpreadReversionCandidate] = []
+    source = CandidateSource()
+    fair_price_model = FairPriceModel(
+        max_venue_premium_bps=config.fair_price_max_venue_premium_bps,
+        min_venues_for_filter=config.fair_price_min_venues,
+    )
+    zscore_model = ZScoreSignalModel()
+    quality_model = MeanReversionQualityModel(
+        min_std_bps=config.mean_reversion_min_std_bps,
+        max_half_life_ms=config.mean_reversion_max_half_life_ms,
+    )
+    cost_model = CostModel()
+    funding_model = FundingAwarenessModel(expected_hold_ms=config.expected_hold_ms)
+    liquidity_gate = LiquidityAndVenueHealthGate()
+
+    fair_price_by_symbol: dict[str, dict[str, FairPriceAssessment]] = {}
     for symbol in symbols:
         symbol_quotes = [
             q for q in quotes.values()
             if str(getattr(q, "symbol", "") or "").upper() == symbol.upper()
         ]
-        if len(symbol_quotes) < 2:
-            continue
-        for i, left in enumerate(symbol_quotes):
-            for right in symbol_quotes[i + 1:]:
-                candidate = _candidate_for_pair(left, right, tracker, config, now_ms)
-                if candidate is not None:
-                    candidates.append(candidate)
-    return sorted(candidates, key=lambda c: (c.net_edge_bps, c.z_score), reverse=True)
+        fair_price_by_symbol[symbol.upper()] = fair_price_model.assess(symbol_quotes)
+    for left, right in source.iter_pairs(quotes, symbols):
+        symbol = str(getattr(left, "symbol", "") or "").upper()
+        candidate = _candidate_for_pair(
+            left,
+            right,
+            tracker,
+            config,
+            now_ms,
+            fair_price=fair_price_by_symbol.get(symbol, {}),
+            zscore_model=zscore_model,
+            quality_model=quality_model,
+            cost_model=cost_model,
+            funding_model=funding_model,
+            liquidity_gate=liquidity_gate,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return SpreadRanker(max_candidates=config.ranker_max_candidates).rank(candidates)
 
 
 def _candidate_for_pair(
@@ -169,6 +241,13 @@ def _candidate_for_pair(
     tracker: SpreadStatsTracker,
     config: SpreadReversionConfig,
     now_ms: int,
+    *,
+    fair_price: dict[str, FairPriceAssessment],
+    zscore_model: ZScoreSignalModel,
+    quality_model: MeanReversionQualityModel,
+    cost_model: CostModel,
+    funding_model: FundingAwarenessModel,
+    liquidity_gate: LiquidityAndVenueHealthGate,
 ) -> SpreadReversionCandidate | None:
     left_mid = _mid(left)
     right_mid = _mid(right)
@@ -182,7 +261,20 @@ def _candidate_for_pair(
         long_q, short_q = right, left
         long_mid, short_mid = right_mid, left_mid
 
-    if not _quote_fresh(long_q, short_q, now_ms, config):
+    long_fair = fair_price.get(str(long_q.venue).lower())
+    short_fair = fair_price.get(str(short_q.venue).lower())
+    if (long_fair is not None and not long_fair.eligible) or (
+        short_fair is not None and not short_fair.eligible
+    ):
+        return None
+
+    if not liquidity_gate.quote_fresh(
+        long_q,
+        short_q,
+        now_ms=now_ms,
+        signal_ttl_ms=config.signal_ttl_ms,
+        quote_skew_ms=config.quote_skew_ms,
+    ):
         return None
 
     reference_mid = (long_mid + short_mid) / 2.0
@@ -195,33 +287,77 @@ def _candidate_for_pair(
     )
     if stats.sample_count < max(config.min_samples, 1):
         return None
-    if stats.std_bps <= 0.0:
-        z_score = 0.0
-    else:
-        z_score = (spread_mid_bps - stats.mean_bps) / stats.std_bps
+    z_score = zscore_model.z_score(
+        spread_mid_bps=spread_mid_bps,
+        mean_bps=stats.mean_bps,
+        std_bps=stats.std_bps,
+    )
     if z_score < config.entry_z:
+        return None
+    quality = quality_model.assess(
+        z_score=z_score,
+        sample_count=stats.sample_count,
+        rolling_std_bps=stats.std_bps,
+    )
+    if not quality.entry_allowed and config.entry_z > 0.0:
         return None
 
     executable_spread_bps = 0.0
     if short_q.bid > 0.0 and long_q.ask > 0.0:
         executable_spread_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10_000.0
     fee_bps = _fee_bps(config, long_q.venue) + _fee_bps(config, short_q.venue)
-    funding_carry_cost_bps = _funding_carry_cost_bps(long_q, short_q, config)
-    net_edge_bps = (
-        executable_spread_bps
-        - fee_bps
-        - config.slippage_reserve_bps
-        - config.adverse_selection_buffer_bps
-        - funding_carry_cost_bps
+    funding = funding_model.assess(
+        long_funding_rate_bps=float(getattr(long_q, "funding_rate_bps", 0.0) or 0.0),
+        short_funding_rate_bps=float(getattr(short_q, "funding_rate_bps", 0.0) or 0.0),
     )
-    if net_edge_bps < config.min_net_edge_bps:
+    cost = cost_model.assess(
+        executable_spread_bps=executable_spread_bps,
+        fee_bps=fee_bps,
+        slippage_reserve_bps=config.slippage_reserve_bps,
+        adverse_selection_buffer_bps=config.adverse_selection_buffer_bps,
+        funding_carry_bps=funding.carry_cost_bps,
+    )
+    if cost.net_edge_bps < config.min_net_edge_bps:
         return None
 
     quote_skew = abs(int(long_q.observed_at_ms or 0) - int(short_q.observed_at_ms or 0))
     entry_notional = min(config.live_notional_quote, config.max_gross_quote)
     if entry_notional <= 0.0:
         return None
-    capacity_quote = _capacity_quote(long_q, short_q, entry_notional)
+    capacity_quote = liquidity_gate.capacity_quote(long_q, short_q, entry_notional)
+    liquidity_score = liquidity_gate.liquidity_score(
+        capacity_quote=capacity_quote,
+        entry_notional_quote=entry_notional,
+    )
+    if long_fair is not None:
+        fair_price_value = long_fair.fair_price
+    elif short_fair is not None:
+        fair_price_value = short_fair.fair_price
+    else:
+        fair_price_value = reference_mid
+    venue_premium_bps = (
+        (abs(long_fair.premium_bps) + abs(short_fair.premium_bps)) / 2.0
+        if long_fair is not None and short_fair is not None
+        else 0.0
+    )
+    fair_price_confidence = max(
+        long_fair.confidence if long_fair is not None else 0.0,
+        short_fair.confidence if short_fair is not None else 0.0,
+    )
+    mean_quality = quality.quality if quality.entry_allowed else 0.0
+    score = (
+        cost.net_edge_bps
+        + max(z_score, 0.0) * 2.0
+        + mean_quality * 5.0
+        + funding.score_adjustment_bps
+        + liquidity_score * 2.0
+        + fair_price_confidence
+    )
+    rank_reason = (
+        f"score={score:.2f};net_edge_bps={cost.net_edge_bps:.2f};"
+        f"z_score={z_score:.2f};mean_reversion_quality={mean_quality:.2f};"
+        f"liquidity_score={liquidity_score:.2f}"
+    )
     return SpreadReversionCandidate(
         candidate_id=_candidate_id(str(long_q.symbol), str(long_q.venue), str(short_q.venue)),
         symbol=str(long_q.symbol).upper(),
@@ -232,7 +368,7 @@ def _candidate_for_pair(
         rolling_mean_bps=stats.mean_bps,
         rolling_std_bps=stats.std_bps,
         z_score=z_score,
-        net_edge_bps=net_edge_bps,
+        net_edge_bps=cost.net_edge_bps,
         sample_count=stats.sample_count,
         signal_ts_ms=now_ms,
         long_quote_ts_ms=int(long_q.observed_at_ms or 0),
@@ -243,8 +379,21 @@ def _candidate_for_pair(
         fee_bps=fee_bps,
         slippage_reserve_bps=config.slippage_reserve_bps,
         adverse_selection_buffer_bps=config.adverse_selection_buffer_bps,
-        funding_carry_cost_bps=funding_carry_cost_bps,
+        funding_carry_cost_bps=funding.carry_cost_bps,
         quote_skew_ms=quote_skew,
+        fair_price=fair_price_value,
+        venue_premium_bps=venue_premium_bps,
+        fair_price_confidence=fair_price_confidence,
+        mean_reversion_quality=mean_quality,
+        half_life_ms=quality.half_life_ms,
+        hold_time_hint_ms=quality.hold_time_hint_ms,
+        gross_edge_bps=cost.gross_edge_bps,
+        funding_carry_bps=funding.carry_cost_bps,
+        liquidity_score=liquidity_score,
+        venue_health_score=1.0,
+        score=score,
+        rank_reason=rank_reason,
+        degradation_state=DegradationState.HEALTHY.value,
     )
 
 
@@ -260,49 +409,6 @@ def _fee_map(venues: list[VenueConfig]) -> dict[str, float]:
 
 def _fee_bps(config: SpreadReversionConfig, venue: str) -> float:
     return float(config.taker_fee_bps_by_venue.get(str(venue).lower(), 0.0) or 0.0)
-
-
-def _funding_carry_cost_bps(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    config: SpreadReversionConfig,
-) -> float:
-    hold_ratio = max(float(config.expected_hold_ms or 0), 0.0) / _FUNDING_INTERVAL_MS
-    long_rate = float(getattr(long_q, "funding_rate_bps", 0.0) or 0.0)
-    short_rate = float(getattr(short_q, "funding_rate_bps", 0.0) or 0.0)
-    carry_bps = (long_rate - short_rate) * hold_ratio
-    return max(carry_bps, 0.0)
-
-
-def _quote_fresh(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    now_ms: int,
-    config: SpreadReversionConfig,
-) -> bool:
-    long_ts = int(getattr(long_q, "observed_at_ms", 0) or 0)
-    short_ts = int(getattr(short_q, "observed_at_ms", 0) or 0)
-    if long_ts <= 0 or short_ts <= 0:
-        return False
-    ttl = max(int(config.signal_ttl_ms or 0), 0)
-    if ttl and (now_ms - long_ts > ttl or now_ms - short_ts > ttl):
-        return False
-    skew = max(int(config.quote_skew_ms or 0), 0)
-    if skew and abs(long_ts - short_ts) > skew:
-        return False
-    return True
-
-
-def _capacity_quote(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    fallback_notional: float,
-) -> float:
-    long_capacity = float(getattr(long_q, "ask_size", 0.0) or 0.0) * float(long_q.ask or 0.0)
-    short_capacity = float(getattr(short_q, "bid_size", 0.0) or 0.0) * float(short_q.bid or 0.0)
-    if long_capacity > 0.0 and short_capacity > 0.0:
-        return min(long_capacity, short_capacity)
-    return fallback_notional
 
 
 def _candidate_id(symbol: str, long_venue: str, short_venue: str) -> str:

@@ -6,6 +6,7 @@ from lightfee.spread.controller import (
     SpreadTradingState,
 )
 from lightfee.spread.models import SpreadReversionCandidate, SpreadPosition
+from lightfee.spread.modules import DegradationState
 
 
 def _candidate(**overrides) -> SpreadReversionCandidate:
@@ -130,3 +131,44 @@ def test_spread_controller_exits_on_convergence_or_time_stop() -> None:
     assert convergence.reason == "spread_converged"
     assert time_stop.allowed is True
     assert time_stop.reason == "spread_max_hold_elapsed"
+
+
+def test_spread_controller_uses_degradation_state_before_forced_exit() -> None:
+    cfg = StrategyConfig(spread_reversion_enabled=True)
+    controller = SpreadTradingController(cfg)
+    position = SpreadPosition(
+        position_id="spread-1",
+        symbol="BTCUSDT",
+        long_venue="cheap",
+        short_venue="rich",
+        entry_spread_bps=20.0,
+        entry_z_score=2.5,
+        entry_notional_quote=20.0,
+        opened_at_ms=1_000,
+    )
+
+    missing = controller.evaluate_exit(position, None, now_ms=10_000)
+    observe = controller.evaluate_exit(
+        position,
+        _candidate(degradation_state=DegradationState.OBSERVE_DEGRADED.value),
+        now_ms=10_000,
+    )
+    protective = controller.evaluate_exit(
+        position,
+        _candidate(degradation_state=DegradationState.PROTECTIVE_EXIT_READY.value),
+        now_ms=10_000,
+    )
+    recovery = controller.evaluate_exit(
+        position,
+        _candidate(degradation_state=DegradationState.RECOVERY_REQUIRED.value),
+        now_ms=10_000,
+    )
+
+    assert missing.allowed is False
+    assert missing.reason == "spread_exit_observe_degraded"
+    assert observe.allowed is False
+    assert observe.reason == "spread_exit_observe_degraded"
+    assert protective.allowed is True
+    assert protective.reason == "spread_protective_exit_ready"
+    assert recovery.allowed is False
+    assert recovery.reason == "spread_recovery_required"

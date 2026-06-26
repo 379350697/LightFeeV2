@@ -156,6 +156,11 @@ class StrategyConfig:
     spread_slippage_reserve_bps: float = 2.0
     spread_adverse_selection_buffer_bps: float = 1.0
     spread_expected_hold_ms: int = 1800000
+    spread_fair_price_max_venue_premium_bps: float = 150.0
+    spread_fair_price_min_venues: int = 3
+    spread_mean_reversion_min_std_bps: float = 0.05
+    spread_mean_reversion_max_half_life_ms: int = 1800000
+    spread_ranker_max_candidates: int = 0
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     execution_buffer_bps: float = 2.0

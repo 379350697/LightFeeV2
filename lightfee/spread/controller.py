@@ -15,6 +15,7 @@ from lightfee.spread.models import (
     SpreadReversionCandidate,
     SpreadTradingState,
 )
+from lightfee.spread.modules import DegradationState, ExitRiskClassifier
 
 
 class SpreadTradingController:
@@ -91,7 +92,13 @@ class SpreadTradingController:
         if max_hold > 0 and now_ms - int(position.opened_at_ms or 0) > max_hold:
             return self._exit(position, "spread_max_hold_elapsed")
         if candidate is None:
-            return SpreadDecision(False, "spread_exit_signal_missing")
+            return self._degradation_decision(
+                position,
+                ExitRiskClassifier().classify(signal_missing=True),
+            )
+        degradation = self._degradation_state(candidate)
+        if degradation is not DegradationState.HEALTHY:
+            return self._degradation_decision(position, degradation)
         stop_z = float(getattr(self.strategy, "spread_stop_z", 3.5) or 0.0)
         if stop_z > 0.0 and float(candidate.z_score) >= stop_z:
             return self._exit(position, "spread_stop_z_reached")
@@ -124,6 +131,28 @@ class SpreadTradingController:
     ) -> bool:
         symbol = candidate.symbol.upper()
         return any(pos.symbol.upper() == symbol for pos in state.open_positions)
+
+    @staticmethod
+    def _degradation_state(candidate: SpreadReversionCandidate) -> DegradationState:
+        try:
+            return DegradationState(str(candidate.degradation_state or "healthy"))
+        except ValueError:
+            return DegradationState.OBSERVE_DEGRADED
+
+    def _degradation_decision(
+        self,
+        position: SpreadPosition,
+        state: DegradationState,
+    ) -> SpreadDecision:
+        if state is DegradationState.RECOVERY_REQUIRED:
+            return SpreadDecision(False, "spread_recovery_required")
+        if state is DegradationState.FORCED_EXIT:
+            return self._exit(position, "spread_forced_exit")
+        if state is DegradationState.PROTECTIVE_EXIT_READY:
+            return self._exit(position, "spread_protective_exit_ready")
+        if state is DegradationState.OBSERVE_DEGRADED:
+            return SpreadDecision(False, "spread_exit_observe_degraded")
+        return SpreadDecision(False, "spread_exit_not_due")
 
     @staticmethod
     def _exit(position: SpreadPosition, reason: str) -> SpreadDecision:
