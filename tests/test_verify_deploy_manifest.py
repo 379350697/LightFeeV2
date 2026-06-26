@@ -85,7 +85,11 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert 'LOCAL="${LIGHTFEE_DEPLOY_LOCAL:-$DEFAULT_LOCAL}"' in script
     assert 'if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then' in script
     assert 'echo "=== Remote-local deploy mode: skipping rsync/scp ==="' in script
-    assert 'systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service' in script
+    assert (
+        "systemctl daemon-reload && systemctl restart lightfee-sidecar.service "
+        "&& systemctl restart lightfee-spread-sidecar.service "
+        "&& systemctl restart lightfee-live.service"
+    ) in script
 
 
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):

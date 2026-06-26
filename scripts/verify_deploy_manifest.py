@@ -282,7 +282,7 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"
 
   echo "=== Restarting production services ==="
-  systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service
+  systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
 
   echo "=== Verifying production health ==="
   env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict
@@ -310,7 +310,7 @@ echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Restarting production services ==="
-ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service"
+ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
 
 echo "=== Verifying production health ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
