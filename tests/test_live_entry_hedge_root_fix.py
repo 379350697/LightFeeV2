@@ -1909,6 +1909,7 @@ class _FakeVenueAdapter:
         self._fetch_order_fill_reconciliation_calls: list[tuple[str, str, str | None]] = []
         self._query_passive_progress_calls: list[tuple[str, str, str | None]] = []
         self._cancel_passive_order_calls: list[tuple[str, str, str | None]] = []
+        self.auto_apply_reduce_only_fill = True
 
     @property
     def venue(self) -> Venue:
@@ -1926,6 +1927,7 @@ class _FakeVenueAdapter:
     async def place_order(self, request: OrderRequest) -> OrderFill:
         self._place_order_calls.append(request)
         if self.place_order_fill is not None:
+            self._apply_reduce_only_fill(request, self.place_order_fill)
             return self.place_order_fill
         if self.place_order_raises is not None:
             raise self.place_order_raises
@@ -1935,6 +1937,28 @@ class _FakeVenueAdapter:
             side=request.side,
             quantity=0.0,
             price=0.0,
+        )
+
+    def _apply_reduce_only_fill(self, request: OrderRequest, fill: OrderFill) -> None:
+        if not self.auto_apply_reduce_only_fill or not request.reduce_only:
+            return
+        if self.position is None:
+            return
+        filled_qty = abs(float(fill.quantity or 0.0))
+        if filled_qty <= 1e-12:
+            return
+        live_qty = abs(float(self.position.quantity or 0.0))
+        remaining_qty = max(live_qty - filled_qty, 0.0)
+        if remaining_qty <= 1e-9:
+            self.position = None
+            return
+        self.position = PositionSnapshot(
+            venue=self.position.venue,
+            symbol=self.position.symbol,
+            side=self.position.side,
+            quantity=remaining_qty,
+            entry_price=self.position.entry_price,
+            observed_at_ms=self.position.observed_at_ms,
         )
 
     async def fetch_order_fill_reconciliation(
@@ -3931,24 +3955,29 @@ class TestRealPathAbortCleanupDeadline:
 
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
+        live_position = PositionSnapshot(
+            venue=Venue.HYPERLIQUID,
+            symbol="SUPERUSDT",
+            side=Side.BUY,
+            quantity=200.0,
+            entry_price=0.162,
+            observed_at_ms=1779422875621,
+        )
+
         class _TransportBackedAdapter:
             venue = Venue.HYPERLIQUID
 
             async def fetch_position(self, symbol: str) -> PositionSnapshot | None:
-                return PositionSnapshot(
-                    venue=Venue.HYPERLIQUID,
-                    symbol=symbol,
-                    side=Side.BUY,
-                    quantity=200.0,
-                    entry_price=0.162,
-                    observed_at_ms=1779422875621,
-                )
+                return live_position
 
             async def place_order(self, request: OrderRequest) -> OrderFill:
+                nonlocal live_position
                 assert request.price is None
                 assert request.reduce_only is True
                 assert request.time_in_force == TimeInForce.IOC
-                return await transport.place_order(request)
+                fill = await transport.place_order(request)
+                live_position = None
+                return fill
 
         runtime._venue_adapters[Venue.HYPERLIQUID] = _TransportBackedAdapter()
         try:
@@ -4214,6 +4243,7 @@ class TestRealPathAbortCleanupDeadline:
                         entry_price=0.03321,
                         observed_at_ms=1200,
                     ),
+                    None,
                 ]
 
             async def fetch_position(self, symbol):
@@ -4343,6 +4373,7 @@ class TestRealPathAbortCleanupDeadline:
                         venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
                         quantity=400.0, entry_price=0.011, observed_at_ms=1200,
                     ),
+                    None,
                 ]
 
             async def fetch_position(self, symbol):
@@ -5654,8 +5685,7 @@ class TestCleanupPartialFillVerification:
         )
 
         assert result is True
-        # Only one fetch_position call (no re-verify needed)
-        assert len(fake._fetch_position_calls) == 1
+        assert fake._fetch_position_calls == ["POLYXUSDT", "POLYXUSDT"]
 
 
 class TestAbortAdapterAbsentAndFetchException:
@@ -5887,6 +5917,7 @@ class TestDeadlineBreachCleanupPartial:
         runtime.reconciler = _FakeReconciler()
         for ven in (Venue.BYBIT, Venue.HYPERLIQUID):
             fake = _FakeVenueAdapter(ven)
+            fake.auto_apply_reduce_only_fill = False
             fake.position = PositionSnapshot(
                 venue=ven, symbol="POLYXUSDT", side=Side.BUY,
                 quantity=425.0, entry_price=1.0, observed_at_ms=1000,

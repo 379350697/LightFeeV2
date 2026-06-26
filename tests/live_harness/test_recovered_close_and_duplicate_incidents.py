@@ -157,6 +157,15 @@ class _BybitDuplicateOldFillLiveNonzeroAdapter:
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         self.fetch_position_calls.append(symbol)
+        if len(self.fetch_position_calls) >= 4:
+            return PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="BIOUSDT",
+                side=Side.BUY,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=1779803978233 + len(self.fetch_position_calls),
+            )
         return PositionSnapshot(
             venue=Venue.BYBIT,
             symbol="BIOUSDT",

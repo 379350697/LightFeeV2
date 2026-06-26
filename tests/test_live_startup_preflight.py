@@ -59,6 +59,7 @@ def make_test_config(temp_dir: str) -> AppConfig:
             max_concurrent_positions=2,
             local_l2_enabled=False,
             local_l2_ws_enabled=False,
+            pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(Path(temp_dir) / "events.jsonl"),
@@ -586,7 +587,7 @@ class TestRuntimePreflight:
                 'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
                 "max_notional_admission_blocked",
                 "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
-                False,
+                True,
             ),
         ],
     )

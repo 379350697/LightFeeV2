@@ -310,6 +310,11 @@ class TestFixtureDrivenPosition:
                 }
             })
             transport._okx_swap_instruments_loaded = True
+        if venue_id == Venue.GATE:
+            transport.set_symbol_metadata({
+                "BTC_USDT": {"quanto_multiplier": "0.0001"},
+                "BTCUSDT": {"quanto_multiplier": "0.0001"},
+            })
 
         try:
             pos = await adapter.fetch_position(symbol)
@@ -582,6 +587,17 @@ class TestAsterOrderRequestShape:
                 assert symbol == "HUSDT"
                 assert leverage > 0
                 return 1_000_000.0
+
+            async def fetch_account_risk_snapshot(self):
+                return None
+
+            async def fetch_position(self, symbol: str):
+                assert symbol == "HUSDT"
+                return None
+
+            async def fetch_open_orders(self, symbol: str):
+                assert symbol == "HUSDT"
+                return []
 
         monkeypatch.setattr(
             "lightfee.venues.transport.get_symbol_rules_cache",

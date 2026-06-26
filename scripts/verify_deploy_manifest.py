@@ -39,6 +39,7 @@ CRITICAL_FILES = [
     "scripts/verify_production_services.py",
     "deploy/systemd/lightfee-live.service",
     "deploy/systemd/lightfee-sidecar.service",
+    "deploy/systemd/lightfee-spread-sidecar.service",
     "deploy/network/NetworkManager-lightfee-dns.conf",
 ]
 
@@ -222,7 +223,7 @@ def check_deploy_version_matches(remote_host: str, remote_path: str, ssh_port: i
         return False
 
     if remote_ver != local_head:
-        print(f"  MISMATCH .deploy_version:")
+        print("  MISMATCH .deploy_version:")
         print(f"    local:  {local_head}")
         print(f"    remote: {remote_ver}")
         return False
@@ -411,7 +412,7 @@ def main() -> None:
         print("\nPASS: all critical files verified")
 
     elif args.remote:
-        print(f"Building local manifest...")
+        print("Building local manifest...")
         manifest = build_manifest(root)
         print(f"Manifest: {len(manifest)} files")
 

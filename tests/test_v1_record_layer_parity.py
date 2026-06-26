@@ -24,6 +24,7 @@ from typing import Optional as _Optional
 
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     Side,
     TimeInForce,
@@ -746,7 +747,20 @@ class TestV1ReconciliationClientOrderId:
         long_adapter = FakeAdapter(Venue.BINANCE)
         short_adapter = FakeAdapter(Venue.OKX)
         # Preload a fill result that will be returned for the clientOrderId lookup
-        expected_fill = _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "real-order-123")
+        expected_fill = OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            average_price=50000.0,
+            order_id="real-order-123",
+            metadata={
+                "queried_endpoints": ["fetch_order_fill_reconciliation"],
+                "response_classification": "filled_after_client_order_id_lookup",
+                "raw_exchange_status": "filled",
+                "evidence_source": "fetch_order_fill_reconciliation",
+            },
+        )
         long_adapter.fetch_order_fill_results = [expected_fill]
 
         reconciler = OrderReconciler(adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter})

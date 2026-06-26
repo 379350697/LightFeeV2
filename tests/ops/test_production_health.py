@@ -1159,9 +1159,17 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
+    spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
+    assert analyze_systemd_unit("lightfee-spread-sidecar.service", spread_sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
+
+
+def test_spread_sidecar_systemd_template_uses_module_entrypoint():
+    text = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
+    assert ".venv/bin/python3 -m lightfee.apps.spread_sidecar" in text
+    assert ".venv/bin/lightfee-spread-sidecar" not in text
 
 
 def test_deploy_dns_template_prefers_verified_resolver():

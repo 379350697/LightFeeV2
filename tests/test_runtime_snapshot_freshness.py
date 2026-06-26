@@ -165,6 +165,13 @@ def _quote_with_liquidity(
     )
 
 
+def _entry_flow_strategy_config(**kwargs) -> StrategyConfig:
+    return StrategyConfig(
+        pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
+        **kwargs,
+    )
+
+
 def _read_journal_records(path) -> list[dict]:
     return [
         json.loads(line)
@@ -441,7 +448,7 @@ async def test_runtime_entry_quote_revalidate_prewarm_resolves_stale_top_candida
             max_order_quote_age_ms=5_000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=1_500,
@@ -608,7 +615,7 @@ async def test_runtime_last_good_top_candidate_requires_entry_quote_truth(
             max_order_quote_age_ms=5_000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=1_500,
@@ -721,7 +728,7 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
             max_order_quote_age_ms=5_000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -857,7 +864,7 @@ async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without
             live_scan_recovery_success_count=1,
             debug_journal_diagnostics_enabled=True,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -1026,7 +1033,7 @@ async def test_runtime_entry_quote_revalidate_budget_excluded_top_candidate_uses
             max_order_quote_age_ms=5_000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -2529,7 +2536,7 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
             max_order_quote_age_ms=5000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -2631,7 +2638,7 @@ async def test_runtime_ignores_non_candidate_stale_quotes_for_entry_blockers(tmp
             max_order_quote_age_ms=5000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -2734,7 +2741,7 @@ async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entr
             max_order_quote_age_ms=5000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -2941,7 +2948,7 @@ async def test_runtime_invalid_quote_decision_carries_sanitized_quote_evidence(t
             max_order_quote_age_ms=600000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -3029,7 +3036,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
             sidecar_perp_liquidity_budget_ms=3000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -4084,7 +4091,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
             sidecar_perp_liquidity_budget_ms=30000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -4172,7 +4179,7 @@ async def test_runtime_does_not_skip_fresh_quote_and_l2_for_20s_perp_liquidity_a
             sidecar_perp_liquidity_budget_ms=3000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -4318,7 +4325,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             sidecar_perp_liquidity_budget_ms=3000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -4381,7 +4388,7 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
             live_scan_last_good_max_age_ms=600000,
             live_scan_recovery_success_count=1,
         ),
-        strategy=StrategyConfig(
+        strategy=_entry_flow_strategy_config(
             local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,

@@ -21,7 +21,6 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 
 # Process name patterns to count
@@ -30,6 +29,13 @@ SIDECAR_PATTERNS = [
     "lightfee.apps.sidecar",
     "lightfee-sidecar",
     "lightfee_sidecar",
+]
+
+SPREAD_SIDECAR_PATTERNS = [
+    "lightfee.apps.spread_sidecar",
+    "lightfee-spread-sidecar",
+    "lightfee_spread_sidecar",
+    "spread_sidecar",
 ]
 
 LIVE_PATTERNS = [
@@ -53,7 +59,6 @@ def get_process_list() -> list[dict]:
             return []
 
         processes = []
-        header = lines[0]
         for line in lines[1:]:
             parts = line.split(None, 10)
             if len(parts) < 11:
@@ -77,6 +82,8 @@ def check_lsof_snapshot_writers() -> list[int]:
     snapshot_paths = [
         "runtime/opportunity-input-snapshot.json",
         "/opt/lightfee-v2/runtime/opportunity-input-snapshot.json",
+        "runtime/spread-opportunities-current.json",
+        "/opt/lightfee-v2/runtime/spread-opportunities-current.json",
     ]
     for sp in snapshot_paths:
         try:
@@ -171,6 +178,11 @@ def main() -> None:
     sidecars = count_matching(processes, SIDECAR_PATTERNS)
     sidecar_ok = check_singleton("sidecar", sidecars)
 
+    # Check spread sidecar processes
+    print("\n--- Spread Sidecar Processes ---")
+    spread_sidecars = count_matching(processes, SPREAD_SIDECAR_PATTERNS)
+    spread_sidecar_ok = check_singleton("spread-sidecar", spread_sidecars)
+
     # Check live runtime processes
     print("\n--- Live Runtime Processes ---")
     lives = count_matching(processes, LIVE_PATTERNS)
@@ -191,18 +203,21 @@ def main() -> None:
 
     # Summary
     print("\n=== Summary ===")
-    all_ok = sidecar_ok and live_ok
+    all_ok = sidecar_ok and spread_sidecar_ok and live_ok
     status = "PASS" if all_ok else "FAIL"
     print(f"Status: {status}")
-    print(f"  sidecar processes: {len(sidecars)} (limit: 1)")
-    print(f"  live processes:    {len(lives)} (limit: 1)")
-    print(f"  snapshot writers:  {len(writers)}")
+    print(f"  sidecar processes:        {len(sidecars)} (limit: 1)")
+    print(f"  spread-sidecar processes: {len(spread_sidecars)} (limit: 1)")
+    print(f"  live processes:           {len(lives)} (limit: 1)")
+    print(f"  snapshot writers:         {len(writers)}")
 
     # Handle --kill-extra
     if args.kill_extra and not all_ok:
         print("\n=== Killing Extra Processes ===")
         if len(sidecars) > 1:
             kill_extras("sidecar", sidecars)
+        if len(spread_sidecars) > 1:
+            kill_extras("spread-sidecar", spread_sidecars)
         if len(lives) > 1:
             kill_extras("live", lives)
 
@@ -210,9 +225,13 @@ def main() -> None:
         time.sleep(1)
         processes2 = get_process_list()
         sidecars2 = count_matching(processes2, SIDECAR_PATTERNS)
+        spread_sidecars2 = count_matching(processes2, SPREAD_SIDECAR_PATTERNS)
         lives2 = count_matching(processes2, LIVE_PATTERNS)
-        all_ok = len(sidecars2) <= 1 and len(lives2) <= 1
-        print(f"\nAfter cleanup: sidecar={len(sidecars2)}, live={len(lives2)}")
+        all_ok = len(sidecars2) <= 1 and len(spread_sidecars2) <= 1 and len(lives2) <= 1
+        print(
+            f"\nAfter cleanup: sidecar={len(sidecars2)}, "
+            f"spread-sidecar={len(spread_sidecars2)}, live={len(lives2)}"
+        )
         print(f"Status: {'PASS' if all_ok else 'FAIL (manual intervention needed)'}")
 
     if args.strict and not all_ok:

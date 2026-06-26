@@ -21,6 +21,10 @@ def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch
     assert "lightfee/engine/runtime.py" in generated
 
 
+def test_spread_sidecar_template_is_deploy_critical():
+    assert "deploy/systemd/lightfee-spread-sidecar.service" in manifest.CRITICAL_FILES
+
+
 def _stub_manifest_generation(monkeypatch):
     monkeypatch.setattr(manifest, "build_manifest", lambda root: {"lightfee/engine/runtime.py": "abc"})
 

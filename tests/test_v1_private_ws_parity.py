@@ -1478,6 +1478,7 @@ class TestGateWorkerLifecycle:
         """futures.positions update → position cache populated."""
         transport = _FakeTransport(venue=Venue.GATE)
         transport._spec.rest_url = "https://api.gateio.ws/api/v4"
+        transport._symbol_metadata["ETHUSDT"] = {"quanto_multiplier": "1"}
 
         # _venue_symbol is identity → symbol_map maps ETHUSDT→ETHUSDT
         # So Gate contract in message must match the canonical symbol

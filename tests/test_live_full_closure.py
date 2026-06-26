@@ -280,16 +280,42 @@ class TestLiveFullClosure:
 
             runtime = LiveRuntime(config)
             await runtime.start()
-            runtime.passive_close_executor = PassiveCloseExecutor({}, runtime.journal)
+            class FlatAdapter(FakeVenueAdapter):
+                async def fetch_open_orders(self, symbol: str) -> list[dict]:
+                    return []
+
+                async def fetch_all_positions(self) -> list[PositionSnapshot]:
+                    return []
+
+            runtime.passive_close_executor = PassiveCloseExecutor(
+                {
+                    Venue.BINANCE: FlatAdapter(Venue.BINANCE),
+                    Venue.OKX: FlatAdapter(Venue.OKX),
+                },
+                runtime.journal,
+            )
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
             runtime.state.risk_mode = GlobalRiskMode.RUNNING
             runtime.state.recovery_blocked_reason = (
                 "startup_recovery_pending_work_without_open_positions"
             )
             runtime.state.recovery_blocked_at_ms = 1234
+            position = OpenPosition(
+                position_id="entry-orphan",
+                symbol="BTCUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                long_quantity=0.01,
+                short_quantity=0.01,
+                long_entry_price=50000.0,
+                short_entry_price=50010.0,
+                opened_at_ms=1000,
+                matched_quantity=0.01,
+            )
             runtime.state.pending_passive_closes["entry-orphan"] = PendingPassiveClose(
                 position_id="entry-orphan",
                 reason="funding_capture",
+                position_snapshot=position,
             )
 
             await runtime._maybe_tick_passive_close(5000)

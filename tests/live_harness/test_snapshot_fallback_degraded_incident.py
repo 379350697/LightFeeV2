@@ -97,6 +97,7 @@ def _runtime(tmp_path) -> LiveRuntime:
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
             max_liquidity_snapshot_age_ms=5000,
+            pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),

@@ -34,6 +34,7 @@ dev = [
 [project.scripts]
 lightfee-live = "lightfee.apps.live:main"
 lightfee-sidecar = "lightfee.apps.sidecar:main"
+lightfee-spread-sidecar = "lightfee.apps.spread_sidecar:main"
 lightfee-scheduler = "lightfee.apps.scheduler:main"
 lightfee-ops = "lightfee.apps.ops:main"
 lightfee-report = "lightfee.apps.report:main"
