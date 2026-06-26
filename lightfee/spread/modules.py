@@ -253,7 +253,18 @@ class LiquidityAndVenueHealthGate:
         )
         if long_capacity > 0.0 and short_capacity > 0.0:
             return min(long_capacity, short_capacity)
-        return float(fallback_notional or 0.0)
+        return 0.0
+
+    def liquidity_evidence_status(
+        self,
+        long_q: QuoteSnapshot,
+        short_q: QuoteSnapshot,
+    ) -> str:
+        long_has_size = float(getattr(long_q, "ask_size", 0.0) or 0.0) > 0.0
+        short_has_size = float(getattr(short_q, "bid_size", 0.0) or 0.0) > 0.0
+        if not long_has_size or not short_has_size:
+            return "missing_top_book_size"
+        return "top_book_size_available"
 
     def liquidity_score(self, *, capacity_quote: float, entry_notional_quote: float) -> float:
         notional = float(entry_notional_quote or 0.0)
@@ -264,7 +275,8 @@ class LiquidityAndVenueHealthGate:
 
 class SpreadRanker:
     def __init__(self, *, max_candidates: int = 0) -> None:
-        self.max_candidates = max(int(max_candidates or 0), 0)
+        configured = int(max_candidates or 0)
+        self.max_candidates = configured if configured > 0 else 10
 
     def rank(
         self,
@@ -283,7 +295,7 @@ class SpreadRanker:
         used_symbols: set[str] = set()
         for candidate in ranked:
             symbol = str(candidate.symbol or "").upper()
-            if self.max_candidates and symbol in used_symbols:
+            if symbol in used_symbols:
                 continue
             used_symbols.add(symbol)
             if not candidate.rank_reason:
@@ -298,7 +310,7 @@ class SpreadRanker:
                     }
                 )
             selected.append(candidate)
-            if self.max_candidates and len(selected) >= self.max_candidates:
+            if len(selected) >= self.max_candidates:
                 break
         return selected
 

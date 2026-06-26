@@ -53,6 +53,9 @@ class SpreadReversionCandidate:
     score: float = 0.0
     rank_reason: str = ""
     degradation_state: str = "healthy"
+    liquidity_evidence_status: str = ""
+    screening_reasons: list[str] = field(default_factory=list)
+    history_age_ms: int = 0
 
 
 @dataclass(frozen=True)

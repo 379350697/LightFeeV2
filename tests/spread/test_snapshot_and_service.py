@@ -31,6 +31,9 @@ def _candidate() -> SpreadReversionCandidate:
         capacity_quote=100.0,
         signal_status="entry_ready",
         fair_price=100.05,
+        liquidity_evidence_status="top_book_size_available",
+        screening_reasons=[],
+        history_age_ms=300_000,
     )
 
 
@@ -50,8 +53,12 @@ def test_spread_snapshot_round_trips_without_funding_candidate_shape(tmp_path) -
     assert loaded.candidates[0].strategy_bucket == "spread_reversion"
     raw = json.loads(path.read_text())
     assert raw["candidates"][0]["fair_price"] == pytest.approx(100.05)
+    assert raw["candidates"][0]["liquidity_evidence_status"] == "top_book_size_available"
+    assert raw["candidates"][0]["screening_reasons"] == []
+    assert raw["candidates"][0]["history_age_ms"] == 300_000
     assert "fair_price_bps" not in raw["candidates"][0]
     assert not hasattr(loaded.candidates[0], "opportunity_type")
+    assert loaded.candidates[0].liquidity_evidence_status == "top_book_size_available"
 
 
 @pytest.mark.asyncio
@@ -64,6 +71,9 @@ async def test_spread_sidecar_service_publishes_independent_snapshot(tmp_path) -
         strategy=StrategyConfig(
             spread_reversion_enabled=True,
             spread_min_samples=2,
+            spread_min_history_ms=0,
+            spread_min_fair_price_confidence=0.0,
+            spread_min_liquidity_capacity_ratio=1.0,
             spread_entry_z=0.0,
             spread_min_net_edge_bps=0.0,
         ),
@@ -84,6 +94,8 @@ async def test_spread_sidecar_service_publishes_independent_snapshot(tmp_path) -
                         symbol="BTCUSDT",
                         bid=99.9,
                         ask=100.0,
+                        bid_size=10.0,
+                        ask_size=10.0,
                         observed_at_ms=10_000,
                     )
                 }
@@ -93,6 +105,8 @@ async def test_spread_sidecar_service_publishes_independent_snapshot(tmp_path) -
                     symbol="BTCUSDT",
                     bid=101.0,
                     ask=101.1,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=10_000,
                 )
             }

@@ -145,7 +145,7 @@ class StrategyConfig:
     spread_live_notional_quote: float = 20.0
     spread_max_gross_quote: float = 50.0
     spread_max_concurrent_positions: int = 1
-    spread_min_samples: int = 20
+    spread_min_samples: int = 120
     spread_entry_z: float = 2.0
     spread_exit_z: float = 0.5
     spread_stop_z: float = 3.5
@@ -158,9 +158,12 @@ class StrategyConfig:
     spread_expected_hold_ms: int = 1800000
     spread_fair_price_max_venue_premium_bps: float = 150.0
     spread_fair_price_min_venues: int = 3
+    spread_min_fair_price_confidence: float = 1.0
+    spread_min_liquidity_capacity_ratio: float = 1.25
+    spread_min_history_ms: int = 300000
     spread_mean_reversion_min_std_bps: float = 0.05
     spread_mean_reversion_max_half_life_ms: int = 1800000
-    spread_ranker_max_candidates: int = 0
+    spread_ranker_max_candidates: int = 10
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     execution_buffer_bps: float = 2.0

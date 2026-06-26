@@ -37,9 +37,12 @@ class SpreadReversionConfig:
     expected_hold_ms: int = 30 * 60 * 1000
     fair_price_max_venue_premium_bps: float = 150.0
     fair_price_min_venues: int = 3
+    min_fair_price_confidence: float = 1.0
+    min_liquidity_capacity_ratio: float = 1.25
+    min_history_ms: int = 300_000
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
-    ranker_max_candidates: int = 0
+    ranker_max_candidates: int = 10
 
     @classmethod
     def from_app_config(cls, config: AppConfig) -> "SpreadReversionConfig":
@@ -91,6 +94,25 @@ class SpreadReversionConfig:
                 getattr(strategy, "spread_fair_price_min_venues", cls.fair_price_min_venues)
                 or 0
             ),
+            min_fair_price_confidence=float(
+                getattr(
+                    strategy,
+                    "spread_min_fair_price_confidence",
+                    cls.min_fair_price_confidence,
+                )
+                or 0.0
+            ),
+            min_liquidity_capacity_ratio=float(
+                getattr(
+                    strategy,
+                    "spread_min_liquidity_capacity_ratio",
+                    cls.min_liquidity_capacity_ratio,
+                )
+                or 0.0
+            ),
+            min_history_ms=int(
+                getattr(strategy, "spread_min_history_ms", cls.min_history_ms) or 0
+            ),
             mean_reversion_min_std_bps=float(
                 getattr(
                     strategy,
@@ -128,6 +150,14 @@ class SpreadStatsSnapshot:
     sample_count: int
     mean_bps: float
     std_bps: float
+    first_observed_ms: int = 0
+    last_observed_ms: int = 0
+
+    @property
+    def history_age_ms(self) -> int:
+        if self.first_observed_ms <= 0 or self.last_observed_ms <= 0:
+            return 0
+        return max(self.last_observed_ms - self.first_observed_ms, 0)
 
 
 @dataclass
@@ -135,8 +165,15 @@ class _WelfordState:
     count: int = 0
     mean: float = 0.0
     m2: float = 0.0
+    first_observed_ms: int = 0
+    last_observed_ms: int = 0
 
-    def update(self, value: float) -> SpreadStatsSnapshot:
+    def update(self, value: float, *, observed_at_ms: int = 0) -> SpreadStatsSnapshot:
+        observed_ms = int(observed_at_ms or 0)
+        if observed_ms > 0:
+            if self.first_observed_ms <= 0:
+                self.first_observed_ms = observed_ms
+            self.last_observed_ms = observed_ms
         self.count += 1
         delta = value - self.mean
         self.mean += delta / self.count
@@ -153,6 +190,8 @@ class _WelfordState:
             sample_count=self.count,
             mean_bps=self.mean,
             std_bps=std,
+            first_observed_ms=self.first_observed_ms,
+            last_observed_ms=self.last_observed_ms,
         )
 
 
@@ -168,12 +207,14 @@ class SpreadStatsTracker:
         long_venue: str,
         short_venue: str,
         spread_mid_bps: float,
+        *,
+        observed_at_ms: int = 0,
     ) -> SpreadStatsSnapshot:
         state = self._states.setdefault(
             _key(symbol, long_venue, short_venue),
             _WelfordState(),
         )
-        return state.update(spread_mid_bps)
+        return state.update(spread_mid_bps, observed_at_ms=observed_at_ms)
 
     def snapshot(
         self,
@@ -284,8 +325,11 @@ def _candidate_for_pair(
         str(long_q.venue),
         str(short_q.venue),
         spread_mid_bps,
+        observed_at_ms=now_ms,
     )
     if stats.sample_count < max(config.min_samples, 1):
+        return None
+    if config.min_history_ms > 0 and stats.history_age_ms < config.min_history_ms:
         return None
     z_score = zscore_model.z_score(
         spread_mid_bps=spread_mid_bps,
@@ -324,7 +368,11 @@ def _candidate_for_pair(
     entry_notional = min(config.live_notional_quote, config.max_gross_quote)
     if entry_notional <= 0.0:
         return None
+    liquidity_evidence_status = liquidity_gate.liquidity_evidence_status(long_q, short_q)
     capacity_quote = liquidity_gate.capacity_quote(long_q, short_q, entry_notional)
+    required_capacity = entry_notional * max(config.min_liquidity_capacity_ratio, 0.0)
+    if required_capacity > 0.0 and capacity_quote < required_capacity:
+        return None
     liquidity_score = liquidity_gate.liquidity_score(
         capacity_quote=capacity_quote,
         entry_notional_quote=entry_notional,
@@ -344,6 +392,8 @@ def _candidate_for_pair(
         long_fair.confidence if long_fair is not None else 0.0,
         short_fair.confidence if short_fair is not None else 0.0,
     )
+    if fair_price_confidence < config.min_fair_price_confidence:
+        return None
     mean_quality = quality.quality if quality.entry_allowed else 0.0
     score = (
         cost.net_edge_bps
@@ -394,6 +444,9 @@ def _candidate_for_pair(
         score=score,
         rank_reason=rank_reason,
         degradation_state=DegradationState.HEALTHY.value,
+        liquidity_evidence_status=liquidity_evidence_status,
+        screening_reasons=[],
+        history_age_ms=stats.history_age_ms,
     )
 
 

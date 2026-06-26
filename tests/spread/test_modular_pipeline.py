@@ -71,6 +71,9 @@ def test_fair_price_model_filters_single_venue_outlier_before_pair_scoring() -> 
     tracker = SpreadStatsTracker()
     cfg = SpreadReversionConfig(
         min_samples=1,
+        min_history_ms=0,
+        min_fair_price_confidence=0.0,
+        min_liquidity_capacity_ratio=1.0,
         entry_z=0.0,
         min_net_edge_bps=0.0,
         slippage_reserve_bps=0.0,
@@ -134,18 +137,24 @@ def test_spread_ranker_takes_top_candidates_without_symbol_conflicts() -> None:
     assert all(c.rank_reason for c in ranked)
 
 
-def test_spread_ranker_preserves_all_ranked_candidates_when_uncapped() -> None:
+def test_spread_ranker_defaults_to_top_ten_with_symbol_dedup() -> None:
     ranker = SpreadRanker(max_candidates=0)
 
     ranked = ranker.rank(
         [
-            _candidate(candidate_id="low", symbol="BTCUSDT", score=8.0),
-            _candidate(candidate_id="best-btc", symbol="BTCUSDT", score=14.0),
-            _candidate(candidate_id="best-eth", symbol="ETHUSDT", score=11.0),
+            _candidate(candidate_id=f"eth-{i}", symbol=f"ETH{i}USDT", score=float(i))
+            for i in range(12)
+        ]
+        + [
+            _candidate(candidate_id="low-btc", symbol="BTCUSDT", score=100.0),
+            _candidate(candidate_id="best-btc", symbol="BTCUSDT", score=101.0),
         ]
     )
 
-    assert [c.candidate_id for c in ranked] == ["best-btc", "best-eth", "low"]
+    assert len(ranked) == 10
+    assert "best-btc" in [c.candidate_id for c in ranked]
+    assert "low-btc" not in [c.candidate_id for c in ranked]
+    assert len({c.symbol for c in ranked}) == len(ranked)
 
 
 @pytest.mark.parametrize(

@@ -112,6 +112,9 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
                 "score": c.score,
                 "rank_reason": c.rank_reason,
                 "degradation_state": c.degradation_state,
+                "liquidity_evidence_status": c.liquidity_evidence_status,
+                "screening_reasons": list(c.screening_reasons),
+                "history_age_ms": c.history_age_ms,
             }
             for c in snapshot.candidates
         ],

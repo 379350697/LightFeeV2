@@ -16,6 +16,11 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_live_notional_quote == 20.0
     assert strategy.spread_max_gross_quote == 50.0
     assert strategy.spread_max_concurrent_positions == 1
+    assert strategy.spread_min_samples == 120
+    assert strategy.spread_min_fair_price_confidence == 1.0
+    assert strategy.spread_min_liquidity_capacity_ratio == 1.25
+    assert strategy.spread_min_history_ms == 300_000
+    assert strategy.spread_ranker_max_candidates == 10
 
 
 def test_loads_spread_reversion_config_without_loader_changes(tmp_path) -> None:
@@ -33,6 +38,10 @@ spread_sidecar_refresh_ms = 750
 spread_reversion_enabled = true
 spread_live_notional_quote = 25.0
 spread_entry_z = 2.25
+spread_min_fair_price_confidence = 0.5
+spread_min_liquidity_capacity_ratio = 1.5
+spread_min_history_ms = 600000
+spread_ranker_max_candidates = 3
 
 [[venues]]
 venue = "binance"
@@ -50,6 +59,10 @@ venue = "okx"
     assert config.strategy.spread_reversion_enabled is True
     assert config.strategy.spread_live_notional_quote == 25.0
     assert config.strategy.spread_entry_z == 2.25
+    assert config.strategy.spread_min_fair_price_confidence == 0.5
+    assert config.strategy.spread_min_liquidity_capacity_ratio == 1.5
+    assert config.strategy.spread_min_history_ms == 600_000
+    assert config.strategy.spread_ranker_max_candidates == 3
 
 
 def test_spread_sidecar_systemd_unit_is_validated_like_sidecar() -> None:
