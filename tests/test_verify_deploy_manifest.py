@@ -92,6 +92,22 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     ) in script
 
 
+def test_generate_deploy_script_computes_deploy_version_at_runtime(tmp_path, monkeypatch):
+    _stub_manifest_generation(monkeypatch)
+
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+
+    assert 'DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse --short HEAD)"' in script
+    assert 'echo "$DEPLOY_VERSION" > "$REMOTE_PATH/.deploy_version"' in script
+    assert 'echo "$DEPLOY_VERSION" | ssh $SSH_OPTS root@38.60.253.248 "cat > /opt/lightfee-v2/.deploy_version"' in script
+    assert 'echo "abc123" > "$REMOTE_PATH/.deploy_version"' not in script
+
+
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):
     local_manifest = {path: "abc" for path in manifest.CRITICAL_FILES}
     calls = []
