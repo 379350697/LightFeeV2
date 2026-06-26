@@ -16,6 +16,17 @@ decision path short.
 - Gate futures contract sizing family: `INSUFFICIENT_AVAILABLE` with
   `quantity_units=base_to_gate_contracts`, `contract_qty`, and
   `contract_multiplier`.
+- Gate futures progress/fill quantity family: adapter boundary must convert
+  `fill_total`/WS `fill_total` contract counts to engine base quantity before
+  pending-entry maker progress or missing-hedge accounting.
+- Pending-entry pre-submit hedgeability guard:
+  `runtime.entry_blocked_pre_submit_hedgeability` with
+  `reason=maker_fill_increment_below_hedge_min_chunk` or
+  `maker_fill_unit_truth_unavailable`.
+- Cleanup terminal-release lag:
+  `entry.cleanup_leg_exposure_truth_blocked` with
+  `reason=cleanup_terminal_truth_not_fresh` or
+  `maker_cleanup_position_still_live_after_reduce_only`.
 - `execution.entry_quantity_plan` with `quantity_contract_status` and
   `unhedgeable_residual_quantity`.
 - `execution.entry_quantity_plan` with `quantity_plan_reason=planner_quantity_adjustment`
@@ -85,6 +96,20 @@ Deterministic hedge admission reject must:
     `OrderRequest.quantity` is base quantity. Live Gate order sizing must use
     official contract metadata (`quanto_multiplier`, `order_size_round`,
     `order_size_min`) and fail closed when that metadata is missing.
+19. Engine pending-entry/missing-hedge/maker-progress quantities are base
+    quantities. Gate REST/WS order-progress parsers must convert contract
+    counts to base at the venue boundary and retain raw contract evidence in
+    diagnostics where available.
+20. Before submitting a passive maker entry, runtime must prove that the
+    smallest observable maker fill increment can be legally hedged on the
+    hedge venue. If maker unit truth is missing, or the maker increment is
+    below the hedge venue min-notional/step chunk, block at symbol/candidate
+    scope before maker submit. The guard is configurable, but disabled mode
+    must emit an explicit advisory with unit evidence.
+21. Reduce-only cleanup fills are execution evidence, not terminal owner
+    release truth. Pending-entry abort/cleanup release requires fresh flat
+    position truth and, where a maker order reference exists, terminal order
+    truth before owner removal.
 
 ## V1 / Exchange Semantics
 
@@ -181,10 +206,11 @@ Deterministic hedge admission reject must:
 5. For Aster `-5018`, first check whether `runtime.entry_admission_blocked`
    appeared before HTTP order submit with
    `reason=max_notional_admission_blocked`,
-   `source=aster_headroom_precheck`, and
-   `cooldown_scope=symbol_and_venue`. If the exchange returned `-5018` first,
-   check fallback source `exchange_5018_fallback`; it must not retry with a
-   shrunken one-sided quantity.
+   `source=aster_headroom_precheck`, and symbol scope (`aster:SYMBOL`). If the
+   exchange returned `-5018` first, check fallback source
+   `exchange_5018_fallback`; it must not retry with a shrunken one-sided
+   quantity. `aster:*` is valid only for account-level insufficiency,
+   permission/auth failure, or venue-wide private-truth unavailability.
 6. If a maker fill happened before a deterministic hedge admission block,
    confirm cleanup emits single-leg recovery evidence and immediately arms hard
    cooldown for the route. Then check `business_progression_quality_summary`

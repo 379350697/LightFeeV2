@@ -171,6 +171,39 @@ class _LivePositionOpenOrdersAdapter(_LivePositionAdapter):
         return []
 
 
+class _FullCleanupFillButStillLiveAdapter(_NoFillReconciliationAdapter):
+    def __init__(self):
+        self.venue = Venue.GATE
+        self.fetch_position_calls = 0
+        self.place_order_calls = []
+
+    async def fetch_position(self, symbol):
+        self.fetch_position_calls += 1
+        return PositionSnapshot(
+            venue=Venue.GATE,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=400.0,
+            entry_price=0.03291,
+            observed_at_ms=1782442540000 + self.fetch_position_calls,
+        )
+
+    async def place_order(self, request):
+        self.place_order_calls.append(request)
+        return make_fake_fill(
+            Venue.GATE,
+            request.symbol,
+            request.side,
+            quantity=request.quantity,
+            price=0.03291,
+            order_id="gate-cleanup-filled",
+            filled_at_ms=1782442541000,
+        )
+
+    def drain_order_diagnostics(self):
+        return []
+
+
 class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
     def __init__(self, venue: Venue):
         super().__init__(venue)
@@ -3710,6 +3743,33 @@ async def test_uncertain_maker_order_live_position_does_not_apply_maker_progress
     assert deferred[-1]["leg"] == "maker"
     assert deferred[-1]["status"] == "uncertain"
     assert deferred[-1]["reason"] == "order_terminality_not_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_full_fill_still_requires_fresh_flat_position_truth(config, tmp_journal):
+    _mark_live(config)
+    adapter = _FullCleanupFillButStillLiveAdapter()
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: adapter})
+    runtime.journal = tmp_journal
+
+    cleaned = await runtime._cleanup_failed_leg_exposure(
+        Venue.GATE,
+        "SIRENUSDT",
+        "entry-1782442538834-SIRENUSDT",
+        "min_notional_abort_and_flatten",
+    )
+
+    assert cleaned is False
+    assert len(adapter.place_order_calls) == 3
+    assert adapter.fetch_position_calls >= 2
+    events = tmp_journal.read_all()
+    blockers = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "entry.cleanup_leg_exposure_truth_blocked"
+    ]
+    assert blockers[-1]["reason"] == "maker_cleanup_position_still_live_after_reduce_only"
+    assert blockers[-1]["live_quantity"] == pytest.approx(400.0)
 
 
 @pytest.mark.asyncio

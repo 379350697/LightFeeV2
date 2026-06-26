@@ -208,6 +208,7 @@ class StrategyConfig:
     pending_entry_max_lifetime_ms: int = 30000
     pending_entry_force_abort_after_zero_fill_ms: int = 12000
     pending_entry_force_fallback_when_tradeable: bool = False
+    pending_entry_pre_submit_hedgeable_fill_guard_enabled: bool = True
     pending_entry_phase_zero_fill_budget: int = 2
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000

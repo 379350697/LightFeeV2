@@ -5861,6 +5861,8 @@ def _build_business_progression_quality_summary(
     deterministic_reject_after_submit_count = 0
     entry_quantity_contract_blocked_count = 0
     close_reconciliation_evidence_gap_count = 0
+    cleanup_release_truth_blocked_count = 0
+    cleanup_release_truth_blocked_samples: list[dict[str, Any]] = []
     close_reconciliation_evidence_gap_summary = {
         "count": 0,
         "terminal_flat_accounting_gap_count": 0,
@@ -6036,6 +6038,26 @@ def _build_business_progression_quality_summary(
 
         if kind == "runtime.entry_blocked_admission_selection":
             pre_submit_blocked += int(payload.get("blocked_count") or 1)
+        elif kind == "runtime.entry_blocked_pre_submit_hedgeability":
+            pre_submit_blocked += int(payload.get("blocked_count") or 1)
+        elif kind == "entry.cleanup_leg_exposure_truth_blocked":
+            cleanup_release_truth_blocked_count += 1
+            if len(cleanup_release_truth_blocked_samples) < 12:
+                cleanup_release_truth_blocked_samples.append(
+                    {
+                        "entry_id": entry_id(payload),
+                        "venue": venue_value(payload, "venue"),
+                        "symbol": str(payload.get("symbol") or ""),
+                        "reason": str(payload.get("reason") or ""),
+                        "live_quantity": float(payload.get("live_quantity") or 0.0),
+                        "target_qty": float(payload.get("target_qty") or 0.0),
+                        "cleanup_client_order_id": str(
+                            payload.get("cleanup_client_order_id")
+                            or payload.get("client_order_id")
+                            or ""
+                        ),
+                    }
+                )
         elif kind == "execution.entry_quantity_plan":
             plan_entry_id = entry_id(payload)
             if plan_entry_id:
@@ -6282,6 +6304,8 @@ def _build_business_progression_quality_summary(
         "close_reconciliation_evidence_gap_summary": (
             close_reconciliation_evidence_gap_summary
         ),
+        "cleanup_release_truth_blocked_count": cleanup_release_truth_blocked_count,
+        "cleanup_release_truth_blocked_samples": cleanup_release_truth_blocked_samples,
         "admission_degraded_suppressed_count": admission_degraded_suppressed_count,
         "passive_close_resolved_without_terminal_truth_count": len(
             passive_close_resolved_without_terminal_truth_entries

@@ -1274,6 +1274,12 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_blocked_admission_selection": (
         V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
     ),
+    "runtime.entry_blocked_pre_submit_hedgeability": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
+    "runtime.entry_pre_submit_hedgeability_advisory": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
     "execution.entry_quantity_plan": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.entry_selected": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
@@ -1301,6 +1307,9 @@ _EVENT_KIND_PHASES = {
     "execution.passive_phase_switched": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "entry.abort_maker_cancel_requested": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.cleanup_leg_exposure": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "entry.cleanup_leg_exposure_truth_blocked": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "entry.aborted": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.passive_unfilled": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.entry_abandoned_flat": (

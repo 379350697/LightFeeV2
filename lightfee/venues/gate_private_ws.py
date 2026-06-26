@@ -64,6 +64,7 @@ def _handle_gate_order_data(
     data: list[dict[str, Any]],
     symbol_map: dict[str, str],
     private_state,
+    contract_multiplier_map: dict[str, float] | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     for row in data:
@@ -73,7 +74,15 @@ def _handle_gate_order_data(
             continue
         order_id = str(row.get("id", ""))
         client_id = row.get("text", "")
-        filled_qty = float(row.get("fill_total", 0) or 0)
+        filled_contracts = float(row.get("fill_total", 0) or 0)
+        contract_multiplier = (
+            float(contract_multiplier_map.get(contract, 0.0) or 0.0)
+            if contract_multiplier_map is not None
+            else 1.0
+        )
+        if contract_multiplier_map is not None and contract_multiplier <= 0.0:
+            continue
+        filled_qty = abs(filled_contracts) * contract_multiplier
         avg_price = float(row.get("fill_price", 0) or 0)
         fee_quote = float(row.get("fee", 0) or 0)
         status = row.get("finish_as", row.get("status", ""))
@@ -96,6 +105,7 @@ def _handle_gate_position_data(
     data: list[dict[str, Any]],
     symbol_map: dict[str, str],
     private_state,
+    contract_multiplier_map: dict[str, float] | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     for row in data:
@@ -103,7 +113,15 @@ def _handle_gate_position_data(
         symbol = symbol_map.get(contract)
         if symbol is None:
             continue
-        size = float(row.get("size", 0) or 0)
+        size_contracts = float(row.get("size", 0) or 0)
+        contract_multiplier = (
+            float(contract_multiplier_map.get(contract, 0.0) or 0.0)
+            if contract_multiplier_map is not None
+            else 1.0
+        )
+        if contract_multiplier_map is not None and contract_multiplier <= 0.0:
+            continue
+        size = size_contracts * contract_multiplier
         ts = int(row.get("update_time_ms", _now_ms()))
         loop.create_task(private_state.update_position(symbol, size, ts))
 
@@ -112,6 +130,7 @@ def handle_gate_private_message(
     private_state,
     symbol_map: dict[str, str],
     raw: str,
+    contract_multiplier_map: dict[str, float] | None = None,
 ) -> None:
     """V1 handle_gate_private_message()."""
     try:
@@ -130,14 +149,70 @@ def handle_gate_private_message(
     # Data messages
     if isinstance(result, list):
         if channel == "futures.orders":
-            _handle_gate_order_data(result, symbol_map, private_state)
+            _handle_gate_order_data(
+                result,
+                symbol_map,
+                private_state,
+                contract_multiplier_map=contract_multiplier_map,
+            )
         elif channel == "futures.positions":
-            _handle_gate_position_data(result, symbol_map, private_state)
+            _handle_gate_position_data(
+                result,
+                symbol_map,
+                private_state,
+                contract_multiplier_map=contract_multiplier_map,
+            )
     elif isinstance(result, dict):
         if channel == "futures.orders":
-            _handle_gate_order_data([result], symbol_map, private_state)
+            _handle_gate_order_data(
+                [result],
+                symbol_map,
+                private_state,
+                contract_multiplier_map=contract_multiplier_map,
+            )
         elif channel == "futures.positions":
-            _handle_gate_position_data([result], symbol_map, private_state)
+            _handle_gate_position_data(
+                [result],
+                symbol_map,
+                private_state,
+                contract_multiplier_map=contract_multiplier_map,
+            )
+
+
+def _gate_contract_multiplier_from_metadata(metadata: Any) -> float:
+    if not isinstance(metadata, dict):
+        return 0.0
+    for field in (
+        "quanto_multiplier",
+        "quantoMultiplier",
+        "contract_multiplier",
+        "contractMultiplier",
+        "contract_size",
+        "contractSize",
+        "ct_val",
+        "ctVal",
+    ):
+        try:
+            value = float(metadata.get(field) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0.0:
+            return value
+    return 0.0
+
+
+def _build_gate_contract_multiplier_map(transport, symbol_map: dict[str, str]) -> dict[str, float]:
+    metadata_map = getattr(transport, "_symbol_metadata", {}) or {}
+    result: dict[str, float] = {}
+    for venue_symbol, symbol in symbol_map.items():
+        multiplier = _gate_contract_multiplier_from_metadata(
+            metadata_map.get(venue_symbol)
+        )
+        if multiplier <= 0.0:
+            multiplier = _gate_contract_multiplier_from_metadata(metadata_map.get(symbol))
+        if multiplier > 0.0:
+            result[venue_symbol] = multiplier
+    return result
 
 
 async def _gate_private_ws_loop(
@@ -147,6 +222,7 @@ async def _gate_private_ws_loop(
     ws_url: str,
     symbol_map: dict[str, str],
     private_state,
+    contract_multiplier_map: dict[str, float],
     unhealthy_after_failures: int,
     reconnect_initial_ms: int,
     reconnect_max_ms: int,
@@ -235,7 +311,12 @@ async def _gate_private_ws_loop(
                     continue
 
                 try:
-                    handle_gate_private_message(private_state, symbol_map, message)
+                    handle_gate_private_message(
+                        private_state,
+                        symbol_map,
+                        message,
+                        contract_multiplier_map=contract_multiplier_map,
+                    )
                     transport.record_private_ws_success(_now_ms())
                 except Exception as e:
                     logger.debug("gate private ws message ignored: %s", e)
@@ -268,6 +349,7 @@ def start_gate_private_ws(transport, symbols: list[str]) -> None:
     ws_url = _gate_ws_url(base_url)
     private_state = transport._private_ws_state
     symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    contract_multiplier_map = _build_gate_contract_multiplier_map(transport, symbol_map)
 
     task = asyncio.create_task(
         _gate_private_ws_loop(
@@ -277,6 +359,7 @@ def start_gate_private_ws(transport, symbols: list[str]) -> None:
             ws_url=ws_url,
             symbol_map=symbol_map,
             private_state=private_state,
+            contract_multiplier_map=contract_multiplier_map,
             unhealthy_after_failures=5,
             reconnect_initial_ms=1_000,
             reconnect_max_ms=60_000,

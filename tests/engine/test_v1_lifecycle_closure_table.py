@@ -180,6 +180,23 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
                 },
             },
             {
+                "kind": "runtime.entry_blocked_pre_submit_hedgeability",
+                "payload": {
+                    "venue": "gate",
+                    "symbol": "SIRENUSDT",
+                    "reason": "maker_fill_increment_below_hedge_min_chunk",
+                },
+            },
+            {
+                "kind": "runtime.entry_pre_submit_hedgeability_advisory",
+                "payload": {
+                    "venue": "gate",
+                    "symbol": "SIRENUSDT",
+                    "reason": "maker_fill_increment_below_hedge_min_chunk",
+                    "guard_disabled": True,
+                },
+            },
+            {
                 "kind": "runtime.venue_cooldown_started",
                 "payload": {
                     "venue": "aster",
@@ -196,6 +213,8 @@ def test_owned_pending_passive_close_projects_as_passive_close_blocker():
     assert "runtime.entry_admission_venue_degraded" not in payload["unmapped_event_kinds"]
     assert "runtime.entry_admission_symbol_cooldown_armed" not in payload["unmapped_event_kinds"]
     assert "runtime.entry_admission_headroom_advisory" not in payload["unmapped_event_kinds"]
+    assert "runtime.entry_blocked_pre_submit_hedgeability" not in payload["unmapped_event_kinds"]
+    assert "runtime.entry_pre_submit_hedgeability_advisory" not in payload["unmapped_event_kinds"]
     assert "runtime.venue_cooldown_started" not in payload["unmapped_event_kinds"]
     close_rows = [
         row for row in payload["rows"]
@@ -592,6 +611,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.entry_admission_blocked",
         "runtime.entry_admission_headroom_advisory",
         "runtime.entry_blocked_admission_selection",
+        "runtime.entry_blocked_pre_submit_hedgeability",
+        "runtime.entry_pre_submit_hedgeability_advisory",
         "runtime.maker_event_no_ws_bbo_quote",
         "runtime.position_drift_skipped_passive_close_owner",
         "execution.hedge_deadline_breached",
@@ -611,6 +632,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.entry_quote_rewarm_terminal_stale",
         "execution.dual_taker_armed",
         "entry.hedge_drive_cancel_replace",
+        "entry.cleanup_leg_exposure_truth_blocked",
         "runtime.maker_event_lane_wake",
         "runtime.maker_event_reprice",
         "runtime.maker_event_reprice_error",
@@ -679,9 +701,18 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("runtime.entry_admission_headroom_advisory")
         == "DIAGNOSTIC_ONLY"
     )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_blocked_pre_submit_hedgeability")
+        == "PENDING_ENTRY"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_pre_submit_hedgeability_advisory")
+        == "DIAGNOSTIC_ONLY"
+    )
     assert map_lifecycle_event_kind("execution.min_notional_accumulating") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.min_notional_abort_and_flatten") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("execution.pending_entry_hedge_chunk_buffering") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("entry.cleanup_leg_exposure_truth_blocked") == "PENDING_ENTRY"
     assert (
         map_lifecycle_event_kind("reconciliation.pending_close_exchange_truth_refreshed")
         == "PASSIVE_CLOSE"

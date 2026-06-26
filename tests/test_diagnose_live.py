@@ -7711,6 +7711,8 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
                 "blocking_count": 0,
                 "samples": [],
             },
+            "cleanup_release_truth_blocked_count": 0,
+            "cleanup_release_truth_blocked_samples": [],
             "admission_degraded_suppressed_count": 0,
             "passive_close_resolved_without_terminal_truth_count": 0,
             "passive_close_truth_lag_resolved_count": 0,
@@ -9942,6 +9944,70 @@ def test_business_progression_quality_summary_flags_repeated_single_leg_fee_drag
     assert summary["repeated_single_leg_guarded"]["samples"][0]["venue_symbol"] == (
         "aster:HUSDT"
     )
+
+
+def test_diagnose_maps_pending_entry_hedgeability_and_cleanup_truth_blockers():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000000000,
+            "kind": "runtime.entry_blocked_pre_submit_hedgeability",
+            "payload": {
+                "symbol": "SIRENUSDT",
+                "long_venue": "gate",
+                "short_venue": "bybit",
+                "maker_venue": "gate",
+                "hedge_venue": "bybit",
+                "reason": "maker_fill_increment_below_hedge_min_chunk",
+                "maker_fill_increment_base": 0.01,
+                "min_hedgeable_chunk": 1.0,
+                "cooldown_scope": "symbol",
+                "guard_enabled": True,
+            },
+        },
+        {
+            "ts_ms": 1700000000100,
+            "kind": "entry.cleanup_leg_exposure_truth_blocked",
+            "payload": {
+                "entry_id": "entry-siren-1",
+                "symbol": "SIRENUSDT",
+                "venue": "gate",
+                "reason": "maker_cleanup_position_still_live_after_reduce_only",
+                "live_quantity": 400.0,
+                "target_qty": 400.0,
+                "cleanup_client_order_id": "gate-cleanup-1",
+            },
+        },
+    ]
+
+    summary = dl._build_business_progression_quality_summary(events)
+    gate = dl._build_production_acceptance_gate(
+        events,
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        now_ms=1700000000200,
+    )
+
+    assert summary["pre_submit_blocked"] == 1
+    assert summary["cleanup_release_truth_blocked_count"] == 1
+    assert summary["cleanup_release_truth_blocked_samples"][0]["live_quantity"] == pytest.approx(400.0)
+    assert gate["v1_lifecycle_closure"]["unmapped_event_kinds"] == []
 
 
 def test_business_progression_quality_summary_flags_route_cooldown_fee_drag():

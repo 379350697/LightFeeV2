@@ -8119,6 +8119,57 @@ class LiveRuntime:
                 seed = f"{seed}:attempt:{attempt}"
             return generate_exchange_cid(seed, "c", venue)
 
+        async def verify_cleanup_terminal_flat(
+            *,
+            attempt: int,
+            max_attempts: int,
+            cleanup_client_order_id: str,
+            target_qty: float,
+            fill_qty: float,
+        ) -> bool:
+            try:
+                verify_pos = await adapter.fetch_position(symbol)
+            except Exception as e:
+                self.journal.append(
+                    "entry.cleanup_leg_exposure_truth_blocked",
+                    {
+                        "entry_id": entry_id,
+                        "stage": stage,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "reason": "cleanup_terminal_truth_not_fresh",
+                        "target_qty": target_qty,
+                        "fill_qty": fill_qty,
+                        "cleanup_client_order_id": cleanup_client_order_id,
+                        "client_order_id": cleanup_client_order_id,
+                        "raw_error": str(e)[:500],
+                    },
+                )
+                return False
+            if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
+                return True
+            self.journal.append(
+                "entry.cleanup_leg_exposure_truth_blocked",
+                {
+                    "entry_id": entry_id,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "reason": "maker_cleanup_position_still_live_after_reduce_only",
+                    "target_qty": target_qty,
+                    "fill_qty": fill_qty,
+                    "live_quantity": abs(float(verify_pos.quantity or 0.0)),
+                    "live_side": verify_pos.side.value,
+                    "cleanup_client_order_id": cleanup_client_order_id,
+                    "client_order_id": cleanup_client_order_id,
+                },
+            )
+            return False
+
         max_attempts = 3
         retry_quantity_by_attempt: dict[int, float] = {}
         for attempt in range(1, max_attempts + 1):
@@ -8201,18 +8252,18 @@ class LiveRuntime:
                 fill = await adapter.place_order(req)
                 self._flush_adapter_order_diagnostics(adapter)
 
-                # V1: cleanup success needs EITHER fill covering target qty
-                # OR verified-flat position after partial/ambiguous fill.
+                # A reduce-only IOC fill is execution evidence, not terminal
+                # owner-release truth. Re-probe fresh position truth before
+                # clearing any pending/recovery owner.
                 target_qty = cleanup_quantity
-                if fill.quantity >= target_qty - 1e-9:
+                if await verify_cleanup_terminal_flat(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    cleanup_client_order_id=cleanup_client_order_id,
+                    target_qty=target_qty,
+                    fill_qty=float(fill.quantity or 0.0),
+                ):
                     return True
-
-                try:
-                    verify_pos = await adapter.fetch_position(symbol)
-                    if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
-                        return True
-                except Exception:
-                    pass
             except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
                 private_health = classify_private_health_error(venue, str(e))
@@ -8294,12 +8345,14 @@ class LiveRuntime:
                         },
                     )
                     continue
-                try:
-                    verify_pos = await adapter.fetch_position(symbol)
-                    if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
-                        return True
-                except Exception:
-                    pass
+                if await verify_cleanup_terminal_flat(
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    cleanup_client_order_id=cleanup_client_order_id,
+                    target_qty=cleanup_quantity,
+                    fill_qty=0.0,
+                ):
+                    return True
 
             if attempt >= max_attempts:
                 return False

@@ -341,6 +341,35 @@ class TestGatePrivateParser:
         assert update is not None
         assert update.filled_quantity == 0.01
 
+    @pytest.mark.asyncio
+    async def test_order_update_converts_contract_fill_total_to_base_quantity(self):
+        state = PrivateWsState()
+        symbol_map = {"SIREN_USDT": "SIRENUSDT"}
+        contract_multiplier_map = {"SIREN_USDT": 100.0}
+        raw = json.dumps({
+            "channel": "futures.orders",
+            "event": "update",
+            "result": [{
+                "contract": "SIREN_USDT", "id": "gate-siren-1",
+                "text": "gate-siren-client-1",
+                "fill_total": "4", "fill_price": "0.03291",
+                "fee": "0.001", "finish_as": "PARTIAL",
+                "finish_time_ms": 1782442539834,
+            }],
+        })
+
+        handle_gate_private_message(
+            state,
+            symbol_map,
+            raw,
+            contract_multiplier_map=contract_multiplier_map,
+        )
+        await asyncio_sleep_short()
+
+        update = state.order_by_order_id("gate-siren-1")
+        assert update is not None
+        assert update.filled_quantity == pytest.approx(400.0)
+
 
 # ---------------------------------------------------------------------------
 # Aster parser fixtures

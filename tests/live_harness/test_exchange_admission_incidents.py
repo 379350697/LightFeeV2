@@ -38,10 +38,16 @@ class TrustedVenueAdapter:
         }
 
 
+def make_harness_config(tmp_path: str):
+    config = make_test_config(tmp_path)
+    config.strategy.pending_entry_pre_submit_hedgeable_fill_guard_enabled = False
+    return config
+
+
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
     adapter = TrustedVenueAdapter()
     return LiveRuntime(
-        make_test_config(tmp_path),
+        make_harness_config(tmp_path),
         venue_adapters={
             Venue.ASTER: adapter,
             Venue.BINANCE: adapter,
@@ -351,7 +357,7 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
             "bybit order precheck failed: bybit retCode=33004 retMsg=Your api key has expired"
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.BYBIT: bybit,
@@ -419,7 +425,7 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
             "remaining_openable_notional=0.0"
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,
@@ -514,7 +520,7 @@ async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth
             lambda: FakeAsterRulesCache(),
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,
@@ -790,7 +796,7 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
             "bybit retCode=110126 retMsg=must sign required agreement"
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.ASTER: FlatAdapter(), Venue.BYBIT: bybit},
         )
         runtime.journal.open()
@@ -835,7 +841,7 @@ async def test_pending_hedge_bybit_auth_invalid_recovers_owned_single_leg_on_mak
             Venue.BYBIT,
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
         )
         runtime.journal.open()
@@ -893,7 +899,7 @@ async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_truth_unava
             Venue.BYBIT,
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
         )
         runtime.journal.open()
@@ -940,7 +946,7 @@ async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_maker_order
             Venue.BYBIT,
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
         )
         runtime.journal.open()
@@ -986,7 +992,7 @@ async def test_pending_hedge_bybit_auth_invalid_keeps_risk_only_when_reduce_only
             Venue.BYBIT,
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
         )
         runtime.journal.open()
@@ -1025,7 +1031,7 @@ async def test_pending_hedge_binance_leverage_reject_aborts_without_retry():
             'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}'
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.BINANCE: binance},
         )
         runtime.journal.open()
@@ -1070,7 +1076,7 @@ async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_witho
             "Insufficient margin to place order. asset=40"
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={
                 Venue.BYBIT: FlatAdapter(),
                 Venue.HYPERLIQUID: hyperliquid,
@@ -1154,7 +1160,7 @@ async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_witho
 def test_hyperliquid_venue_cooldown_prunes_new_entry_candidates_before_shortlist():
     with tempfile.TemporaryDirectory() as td:
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: FlatAdapter()},
         )
         runtime.journal.open()
@@ -1236,7 +1242,7 @@ async def test_hyperliquid_scan_start_balance_prefilter_arms_venue_cooldown():
             )
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.HYPERLIQUID: hyperliquid},
         )
         runtime.journal.open()
@@ -1283,7 +1289,7 @@ async def test_hyperliquid_candidate_balance_prefilter_prunes_only_underfunded_c
             )
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
         )
         runtime.journal.open()
@@ -1329,7 +1335,7 @@ async def test_hyperliquid_balance_unavailable_blocks_entry_with_evidence_gap():
         now_ms = 1778787002000
         hyperliquid = BalanceAdapter(error=RuntimeError("clearinghouse unavailable"))
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
         )
         runtime.journal.open()
@@ -1364,7 +1370,7 @@ async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
             'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}'
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
         )
         runtime.journal.open()
@@ -1410,7 +1416,7 @@ async def test_pending_hedge_aster_max_notional_error_text_aborts_without_retry_
             "remaining_openable_notional=0.0"
         )
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
         )
         runtime.journal.open()
@@ -1475,7 +1481,7 @@ async def test_pending_hedge_aster_headroom_unavailable_arms_symbol_cooldown():
     with tempfile.TemporaryDirectory() as td:
         aster = RejectingHedgeAdapter("aster_headroom_unavailable")
         runtime = LiveRuntime(
-            make_test_config(td),
+            make_harness_config(td),
             venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
         )
         runtime.journal.open()

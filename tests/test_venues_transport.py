@@ -8342,6 +8342,43 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert result is not None
         assert result.cumulative_quantity == pytest.approx(1600.0)
 
+    def test_gate_passive_progress_fill_total_is_converted_from_contracts_to_base_quantity(self):
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import gate_spec
+
+        transport = VenueTransport(spec=gate_spec(), mode="paper")
+        transport.set_symbol_metadata(
+            {
+                "SIREN_USDT": {
+                    "name": "SIREN_USDT",
+                    "quanto_multiplier": "100",
+                    "order_size_min": "1",
+                    "order_size_round": "1",
+                }
+            }
+        )
+        raw = {
+            "data": {
+                "contract": "SIREN_USDT",
+                "id": "gate-progress-1",
+                "text": "gate-progress-cid",
+                "fill_total": "4",
+                "fill_price": "0.03291",
+                "status": "open",
+            }
+        }
+
+        progress = transport._parse_passive_order_progress(
+            raw,
+            gate_spec(),
+            "SIREN_USDT",
+            1782442539834,
+        )
+
+        assert progress is not None
+        assert progress.cumulative_quantity == pytest.approx(400.0)
+        assert progress.order_id == "gate-progress-1"
+
     def test_okx_passive_progress_missing_ct_val_is_evidence_gap(self):
         from lightfee.venues.transport import VenueTransport
         from lightfee.venues.specs import okx_spec

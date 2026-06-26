@@ -7556,15 +7556,31 @@ class VenueTransport(MarketDataClient):
         side_raw = str(data.get("side", "buy")).upper()
         side = Side.BUY if side_raw in ("BUY", "LONG") else Side.SELL
 
-        cum_qty = float(data.get("cumQty", data.get("executedQty",
-                      data.get("filledSize", data.get("filledQty",
-                      data.get("baseVolume", data.get("filled_total", data.get("accFillSz",
-                      data.get("fillSz", data.get("cumExecQty", data.get("size", 0)))))))))))
+        cum_qty_raw = (
+            data.get("cumQty")
+            or data.get("executedQty")
+            or data.get("filledSize")
+            or data.get("filledQty")
+            or data.get("baseVolume")
+            or data.get("fill_total")
+            or data.get("filled_total")
+            or data.get("accFillSz")
+            or data.get("fillSz")
+            or data.get("cumExecQty")
+            or data.get("size")
+            or 0
+        )
+        cum_qty = float(cum_qty_raw)
         if spec.venue_id == Venue.OKX and cum_qty > 0.0:
             contract_size = self._okx_cached_contract_size_for_progress(data, venue_sym)
             if contract_size <= 0.0:
                 return None
             cum_qty = self._okx_contracts_to_base_quantity(cum_qty, contract_size)
+        if spec.venue_id == Venue.GATE and cum_qty > 0.0:
+            contract_size = self._gate_cached_contract_size_for_progress(data, venue_sym)
+            if contract_size <= 0.0:
+                return None
+            cum_qty = self._gate_contracts_to_base_quantity(cum_qty, contract_size)
         avg_price = float(data.get("avgPrice", data.get("priceAvg",
                          data.get("fillPriceAvg", data.get("averagePrice",
                          data.get("avgPx", data.get("price", 0)))))))
@@ -7630,6 +7646,43 @@ class VenueTransport(MarketDataClient):
             if not isinstance(metadata, dict):
                 continue
             for field in ("ct_val", "ctVal", "contract_size", "contractSize"):
+                value = _safe_float(metadata.get(field), default=0.0)
+                if value > 0.0:
+                    return value
+        return 0.0
+
+    def _gate_cached_contract_size_for_progress(
+        self,
+        data: dict[str, Any],
+        venue_sym: str,
+    ) -> float:
+        keys = [
+            str(data.get("contract", "") or ""),
+            str(data.get("symbol", "") or ""),
+            venue_sym,
+        ]
+        if self._spec.symbol_from_venue is not None:
+            for key in tuple(keys):
+                if not key:
+                    continue
+                try:
+                    keys.append(self._spec.symbol_from_venue(key))
+                except Exception:
+                    pass
+        for key in keys:
+            metadata = self._symbol_metadata.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            for field in (
+                "quanto_multiplier",
+                "quantoMultiplier",
+                "contract_multiplier",
+                "contractMultiplier",
+                "contract_size",
+                "contractSize",
+                "ct_val",
+                "ctVal",
+            ):
                 value = _safe_float(metadata.get(field), default=0.0)
                 if value > 0.0:
                     return value
