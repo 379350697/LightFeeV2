@@ -270,7 +270,26 @@ class LiquidityAndVenueHealthGate:
         notional = float(entry_notional_quote or 0.0)
         if notional <= 0.0:
             return 0.0
-        return min(max(float(capacity_quote or 0.0) / notional, 0.0), 1.0)
+        capacity = max(float(capacity_quote or 0.0), 0.0)
+        ratio = capacity / notional
+        tiers = (
+            (0.0, 0.0),
+            (1.25, 0.25),
+            (2.5, 0.5),
+            (5.0, 0.75),
+            (25.0, 1.0),
+        )
+        for (lower_ratio, lower_score), (upper_ratio, upper_score) in zip(
+            tiers,
+            tiers[1:],
+        ):
+            if ratio <= upper_ratio:
+                span = upper_ratio - lower_ratio
+                if span <= 0.0:
+                    return upper_score
+                progress = (ratio - lower_ratio) / span
+                return lower_score + progress * (upper_score - lower_score)
+        return 1.0
 
 
 class SpreadRanker:

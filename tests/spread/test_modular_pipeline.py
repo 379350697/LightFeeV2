@@ -8,6 +8,7 @@ from lightfee.spread.modules import (
     DegradationState,
     ExitRiskClassifier,
     FundingAwarenessModel,
+    LiquidityAndVenueHealthGate,
     MeanReversionQualityModel,
     SpreadRanker,
 )
@@ -121,6 +122,34 @@ def test_funding_awareness_scores_direction_without_flipping_spread_legs() -> No
     assert tailwind.carry_cost_bps == 0.0
     assert headwind.score_adjustment_bps < 0.0
     assert headwind.carry_cost_bps > 0.0
+
+
+def test_liquidity_score_tiers_depth_instead_of_flat_pass() -> None:
+    gate = LiquidityAndVenueHealthGate()
+
+    assert gate.liquidity_score(
+        capacity_quote=25.0,
+        entry_notional_quote=20.0,
+    ) == pytest.approx(0.25)
+    assert gate.liquidity_score(
+        capacity_quote=50.0,
+        entry_notional_quote=20.0,
+    ) == pytest.approx(0.50)
+    assert gate.liquidity_score(
+        capacity_quote=100.0,
+        entry_notional_quote=20.0,
+    ) == pytest.approx(0.75)
+    assert gate.liquidity_score(
+        capacity_quote=500.0,
+        entry_notional_quote=20.0,
+    ) == pytest.approx(1.00)
+    assert gate.liquidity_score(
+        capacity_quote=34.0,
+        entry_notional_quote=20.0,
+    ) < gate.liquidity_score(
+        capacity_quote=77.0,
+        entry_notional_quote=20.0,
+    )
 
 
 def test_spread_ranker_takes_top_candidates_without_symbol_conflicts() -> None:
