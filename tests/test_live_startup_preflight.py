@@ -2609,6 +2609,49 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_live_mismatch_flat_truth_releases_fail_closed_latch(self):
+        """A later account-truth pass closes a startup mismatch-flatten latch."""
+
+        class FlatTruthAdapter(FakeVenueAdapter):
+            def supported_symbols(self) -> list[str]:
+                return ["BTCUSDT"]
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = (
+                "live_position_mismatch_flatten_failed"
+            )
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            events = runtime.journal.read_all()
+            assert any(
+                event["kind"] == "recovery.ledger_clear"
+                and event["payload"].get("reason") == "core_running_clean"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_flat_truth_clears_stale_risk_only_lifecycle_without_block_reason(self):
         """Production stale latch: core is clean but lifecycle stayed risk_only."""
 
@@ -4084,7 +4127,8 @@ class TestRateLimitConfigManagerStartup:
 
     def test_rate_limit_config_manager_accepts_config_path_param(self):
         from lightfee.rate_limit.config import RateLimitConfigManager
-        import tempfile, os
+        import os
+        import tempfile
 
         with tempfile.TemporaryDirectory() as td:
             rl_path = os.path.join(td, "rate_limits.toml")

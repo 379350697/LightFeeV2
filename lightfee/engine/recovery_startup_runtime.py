@@ -1349,7 +1349,11 @@ class RecoveryStartupRuntime:
         if (
             recovery_result == "no_live_positions"
             and self.ctx.state.recovery_blocked_reason
-            in {"unpaired_live_position", "owned_pending_entry_live_conflict"}
+            in {
+                "live_position_mismatch_flatten_failed",
+                "owned_pending_entry_live_conflict",
+                "unpaired_live_position",
+            }
             and (
                 not self.ctx._has_local_recovery_work()
                 or self.ctx._only_active_unpaired_live_position_recovery_work()
