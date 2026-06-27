@@ -12,8 +12,8 @@ Rust references:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
@@ -25,7 +25,6 @@ from lightfee.engine.state import (
     EngineState,
     HedgeInflight,
     OpenPosition,
-    OperatorControlState,
     PassiveOrderManagerRuntime,
     PassiveExecutionPhase,
     PassivePhaseState,
@@ -39,11 +38,12 @@ from lightfee.engine.state import (
     RecoveryWorkSnapshot,
     normalize_pending_close_reconciliations,
 )
-from lightfee.core.domain import Side, Venue
+from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.engine.recovery_decision_core import (
+    COMPLETE_TRUTH_ONLY_CLEARABLE_BLOCK_REASONS,
     CORE_OWNED_BLOCK_REASONS,
     LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS,
     RecoveryDecision,
@@ -1521,10 +1521,14 @@ def clear_legacy_recovery_block_via_core(
         return False
     if not core_decision.clear_previous_block:
         return False
-    if core_decision.kind not in {
-        RecoveryDecisionKind.RUNNING_CLEAN,
-        RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
-    }:
+    if state.recovery_blocked_reason in COMPLETE_TRUTH_ONLY_CLEARABLE_BLOCK_REASONS:
+        allowed_kinds = {RecoveryDecisionKind.RUNNING_CLEAN}
+    else:
+        allowed_kinds = {
+            RecoveryDecisionKind.RUNNING_CLEAN,
+            RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+        }
+    if core_decision.kind not in allowed_kinds:
         return False
     if core_decision.block_reason or not core_decision.entry_allowed:
         return False
@@ -1660,7 +1664,6 @@ def normalize_engine_state(state: EngineState) -> None:
         state.live_recovery_reduce_only_pairs = deduped_pairs
 
     # 7. PassivePhaseState fill: ensure empty phase states have defaults
-    from lightfee.engine.state import PassivePhaseState
     for ppc in state.pending_passive_closes.values():
         ps = ppc.phase_state
         if ps.phase_started_at_ms == 0:

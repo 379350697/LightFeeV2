@@ -180,6 +180,43 @@ def test_evidence_gap_does_not_clear_prior_live_artifact_block():
     assert decision.clear_previous_block is False
 
 
+def test_evidence_gap_does_not_clear_prior_live_mismatch_flatten_failure():
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(),
+        pending_entries=(),
+        residual_repairs=(),
+        passive_closes=(),
+        exchange_truth=ExchangeTruthSnapshot(available=False, confidence="low"),
+        prior_recovery_block_reason="live_position_mismatch_flatten_failed",
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.block_reason is None
+    assert decision.clear_previous_block is False
+
+
+def test_complete_flat_truth_clears_prior_live_mismatch_flatten_failure():
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(),
+        pending_entries=(),
+        residual_repairs=(),
+        passive_closes=(),
+        exchange_truth=ExchangeTruthSnapshot(available=True, confidence="high"),
+        prior_recovery_block_reason="live_position_mismatch_flatten_failed",
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+    assert decision.entry_allowed is True
+    assert decision.block_reason is None
+    assert decision.clear_previous_block is True
+    assert decision.clear_reason == "core_running_clean"
+
+
 def test_nonblocking_ambiguous_evidence_item_does_not_require_truth():
     snapshot = RecoveryEvidenceSnapshot(
         local_open_positions=(),

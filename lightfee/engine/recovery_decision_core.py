@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping
 
@@ -33,8 +33,15 @@ LIVE_ARTIFACT_BLOCK_REASONS = frozenset(
 
 LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS = frozenset(
     {
+        "live_position_mismatch_flatten_failed",
         "position_drift_correction_failed",
         "startup_recovery_pending_work_without_open_positions",
+    }
+)
+
+COMPLETE_TRUTH_ONLY_CLEARABLE_BLOCK_REASONS = frozenset(
+    {
+        "live_position_mismatch_flatten_failed",
     }
 )
 
@@ -43,7 +50,9 @@ CORE_CLEARABLE_BLOCK_REASONS = (
 )
 
 EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS = (
-    CORE_CLEARABLE_BLOCK_REASONS - LIVE_ARTIFACT_BLOCK_REASONS
+    CORE_CLEARABLE_BLOCK_REASONS
+    - LIVE_ARTIFACT_BLOCK_REASONS
+    - COMPLETE_TRUTH_ONLY_CLEARABLE_BLOCK_REASONS
 )
 
 class RecoveryEvidenceClass(StrEnum):

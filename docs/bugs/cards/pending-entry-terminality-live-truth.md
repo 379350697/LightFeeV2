@@ -64,6 +64,9 @@ evidence must map to the matrix before runtime code changes.
 - `ambiguous_exchange_truth`
 - local state is flat while exchange truth has a non-reduce-only open maker
   order.
+- `recovery_blocked_reason=live_position_mismatch_flatten_failed` remains after
+  exchange truth is high-confidence flat/no-open-orders and recovery core is
+  `RUNNING_CLEAN`.
 - Passive progress is terminal/no-fill, such as Bybit execution history
   `execution_not_found` represented as `canceled`, while realtime open-order
   truth still has a matching non-reduce-only maker order.
@@ -152,6 +155,10 @@ A live position with a pending-entry positive-fill owner is still a live
 artifact: it becomes `owned_pending_entry_live_conflict`, blocks all new entry
 risk, and must be managed through cleanup/flatten-or-block until fresh account
 position and open-order truth prove flat.
+`live_position_mismatch_flatten_failed` is complete-truth-only clearable: it
+must not clear on unavailable or partial evidence, but once high-confidence
+exchange truth proves flat/no-open-orders and the recovery core returns
+`RUNNING_CLEAN`, the stale latch must clear back to running.
 
 Venue order truth is layered. ACK/order accepted, order detail/status, actual
 fills/executions, and live position truth are different evidence classes. OKX
