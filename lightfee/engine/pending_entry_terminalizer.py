@@ -7,7 +7,7 @@ Runtime code still performs the actual I/O and state mutation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, MutableMapping
 
 
@@ -21,6 +21,7 @@ class PendingEntryLiveTruth:
     live_long_quantity: float = 0.0
     live_short_quantity: float = 0.0
     live_balanced_quantity: float = 0.0
+    live_position_details: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

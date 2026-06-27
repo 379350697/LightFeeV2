@@ -748,6 +748,15 @@ class TestBitgetPassiveProgressEndpoint:
         assert result.order_id == "o-uta-1"
         assert result.client_order_id == "c-uta-1"
         assert result.last_fill_time_ms == 1700000002000
+        assert result.evidence["progress_source"] == "bitget_rest_private_reconciliation_merge"
+        assert result.evidence["detail_present"] is True
+        assert result.evidence["private_progress_present"] is False
+        assert result.evidence["reconciliation_present"] is True
+        assert result.evidence["detail_status"] == "partially_filled"
+        assert result.evidence["detail_cumulative_quantity"] == pytest.approx(0.075)
+        assert result.evidence["reconciliation_quantity"] == pytest.approx(0.075)
+        assert result.evidence["merged_cumulative_quantity"] == pytest.approx(0.075)
+        assert result.evidence["state"] == "partially_filled"
         # Must NOT use place-order
         place_order_calls = [c for c in calls if "place-order" in str(c)]
         assert len(place_order_calls) == 0

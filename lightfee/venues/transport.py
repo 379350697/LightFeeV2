@@ -7461,6 +7461,35 @@ class VenueTransport(MarketDataClient):
                 # status regardless of quantity (bitget.rs:3795)
                 state = PassiveOrderState.UNKNOWN
 
+        progress_evidence = {
+            "progress_source": "bitget_rest_private_reconciliation_merge",
+            "detail_present": detail_data is not None,
+            "private_progress_present": private_progress is not None,
+            "reconciliation_present": reconciliation is not None,
+            "detail_status": _btg_status_str,
+            "detail_original_quantity": _btg_original_qty,
+            "detail_cumulative_quantity": (
+                float(getattr(detail_progress, "cumulative_quantity", 0.0) or 0.0)
+                if detail_data is not None
+                else 0.0
+            ),
+            "private_cumulative_quantity": (
+                float(getattr(private_progress, "cumulative_quantity", 0.0) or 0.0)
+                if private_progress is not None
+                else 0.0
+            ),
+            "reconciliation_quantity": (
+                float(getattr(reconciliation, "quantity", 0.0) or 0.0)
+                if reconciliation is not None
+                else 0.0
+            ),
+            "merged_cumulative_quantity": float(
+                getattr(merged, "cumulative_quantity", 0.0) or 0.0
+            ),
+            "merged_source": str(getattr(merged, "source", "") or ""),
+            "state": state.value,
+        }
+
         # 6. V1: detail None + private None + 0 fill → None
         if detail_data is None and private_progress is None and merged.cumulative_quantity <= 0.0:
             return None
@@ -7486,6 +7515,7 @@ class VenueTransport(MarketDataClient):
             last_fill_time_ms=merged.last_fill_at_ms or 0,
             state=state,
             observed_at_ms=now_ms,
+            evidence=progress_evidence,
         )
 
     async def _fetch_bitget_order_detail(

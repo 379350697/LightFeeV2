@@ -7782,6 +7782,84 @@ def test_phase_duration_summary_splits_historical_terminalized_from_current_over
     } == {"entry-historical"}
 
 
+def test_phase_duration_summary_terminalizes_v1_lifecycle_removed_pending_entry():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "execution.entry_selected",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "runtime.pending_entry_registered",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+                "maker_order_id": "1454703380591702016",
+                "outcome": "maker_resting",
+            },
+        },
+        {
+            "ts_ms": 421_000,
+            "kind": "pending_entry.positive_fill_live_truth_conflict",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "positive_fill_conflicts_with_live_unmatched_truth",
+            },
+        },
+        {
+            "ts_ms": 422_000,
+            "kind": "pending_entry.owned_live_conflict_cleanup_succeeded",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+            },
+        },
+        {
+            "ts_ms": 423_000,
+            "kind": "pending_entry.removed_by_v1_lifecycle_closure",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "owned_live_conflict_cleanup_succeeded",
+                "closure_phase": "PENDING_ENTRY",
+            },
+        },
+        {
+            "ts_ms": 424_000,
+            "kind": "pending_entry.terminalized_after_single_leg_recovery",
+            "payload": {
+                "entry_id": "entry-1782554218097-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "owned_live_conflict_cleanup_succeeded",
+            },
+        },
+        {
+            "ts_ms": 1_300_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+    phase_summary = summary["phase_duration_summary"]
+
+    assert phase_summary["current_hard_over_budget_count"] == 0
+    assert phase_summary["historical_terminalized_hard_over_budget_count"] == 1
+    historical_samples = phase_summary["historical_terminalized_hard_over_budget_samples"]
+    assert {sample["artifact_id"] for sample in historical_samples} == {
+        "entry-1782554218097-LABUSDT"
+    }
+    assert phase_summary["current_hard_over_budget_samples"] == []
+
+
 def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
     from scripts.diagnose_live import _build_entry_outcome_summary
 

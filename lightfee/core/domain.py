@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 
 class Venue(Enum):
@@ -333,6 +333,7 @@ class PassiveOrderProgress:
     last_fill_time_ms: int = 0
     state: PassiveOrderState = PassiveOrderState.UNKNOWN
     observed_at_ms: int = 0
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     @property
     def remaining_quantity(self) -> float:

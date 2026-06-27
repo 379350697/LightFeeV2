@@ -1433,6 +1433,7 @@ class PendingEntryRuntime:
                 live_long_quantity=live_long_quantity,
                 live_short_quantity=live_short_quantity,
                 live_balanced_quantity=min(live_long_quantity, live_short_quantity),
+                live_position_details=live_position_details,
             )
 
         has_live_position = any(qty > 1e-9 for qty in live_positions.values())
@@ -1445,6 +1446,7 @@ class PendingEntryRuntime:
             live_long_quantity=live_long_quantity,
             live_short_quantity=live_short_quantity,
             live_balanced_quantity=live_balanced_quantity,
+            live_position_details=live_position_details,
         )
 
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
@@ -2013,6 +2015,40 @@ class PendingEntryRuntime:
             int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
             now_ms + 1_000,
         )
+        maker_order_id, maker_client_order_id = (
+            self.ctx._pending_entry_maker_order_identifiers(pending)
+        )
+        maker_fill_truth = {
+            "maker_venue": pending.maker_venue().value,
+            "hedge_venue": pending.hedge_venue().value,
+            "maker_side": pending.maker_side().value,
+            "hedge_side": pending.hedge_side().value,
+            "maker_order_id": maker_order_id,
+            "maker_client_order_id": maker_client_order_id,
+            "hedge_order_id": str(getattr(pending, "hedge_order_id", "") or ""),
+            "hedge_client_order_id": str(
+                getattr(pending, "hedge_client_order_id", "") or ""
+            ),
+            "maker_leg_filled": float(
+                getattr(pending, "maker_leg_filled", 0.0) or 0.0
+            ),
+            "hedge_leg_filled": float(
+                getattr(pending, "hedge_leg_filled", 0.0) or 0.0
+            ),
+            "maker_fill_price": float(
+                getattr(pending, "maker_fill_price", 0.0) or 0.0
+            ),
+            "hedge_fill_price": float(
+                getattr(pending, "hedge_fill_price", 0.0) or 0.0
+            ),
+            "maker_fill_timestamp_quality": str(
+                getattr(pending, "maker_fill_timestamp_quality", "") or ""
+            ),
+            "hedge_fill_timestamp_quality": str(
+                getattr(pending, "hedge_fill_timestamp_quality", "") or ""
+            ),
+            "truth_contract": "positive_fill_requires_direction_correct_live_balance",
+        }
         self.ctx.journal.append(
             "pending_entry.positive_fill_live_truth_conflict",
             {
@@ -2026,6 +2062,10 @@ class PendingEntryRuntime:
                 "live_short_quantity": decision.live_short_quantity,
                 "live_balanced_quantity": decision.live_balanced_quantity,
                 "reason": decision.reason,
+                "maker_fill_truth": maker_fill_truth,
+                "live_position_details": dict(
+                    getattr(live_truth, "live_position_details", {}) or {}
+                ),
             },
         )
         return await self._cleanup_positive_fill_live_truth_conflict(
@@ -2174,6 +2214,12 @@ class PendingEntryRuntime:
         )
         maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
         target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
+        passive_order = getattr(pending, "passive_order", None)
+        passive_progress_state = getattr(
+            getattr(passive_order, "last_progress_state", None),
+            "value",
+            str(getattr(passive_order, "last_progress_state", "") or ""),
+        )
         base_evidence = {
             "entry_id": entry_id,
             "symbol": pending.symbol,
@@ -2183,6 +2229,16 @@ class PendingEntryRuntime:
             "maker_client_order_id": client_order_id,
             "maker_leg_filled": maker_filled,
             "target_quantity": target_quantity,
+            "progress_state": passive_progress_state,
+            "cumulative_quantity": float(
+                getattr(passive_order, "fill_checkpoint_quantity", 0.0) or 0.0
+            ) if passive_order is not None else 0.0,
+            "passive_fill_checkpoint_quantity": float(
+                getattr(passive_order, "fill_checkpoint_quantity", 0.0) or 0.0
+            ) if passive_order is not None else 0.0,
+            "passive_fill_checkpoint_last_fill_at_ms": int(
+                getattr(passive_order, "fill_checkpoint_last_fill_at_ms", 0) or 0
+            ) if passive_order is not None else 0,
             "source": reason,
         }
 
@@ -2592,6 +2648,7 @@ class PendingEntryRuntime:
                 "live_position_quantity": live_quantity,
                 "post_cleanup_live_long_quantity": post_long,
                 "post_cleanup_live_short_quantity": post_short,
+                "maker_release_evidence": maker_release,
                 "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
             },
         )
@@ -2606,6 +2663,7 @@ class PendingEntryRuntime:
                 "live_position_quantity": live_quantity,
                 "post_cleanup_live_long_quantity": post_long,
                 "post_cleanup_live_short_quantity": post_short,
+                "maker_release_evidence": maker_release,
                 "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
                 "source": "owned_pending_entry_live_conflict",
                 "ts_ms": now_ms,

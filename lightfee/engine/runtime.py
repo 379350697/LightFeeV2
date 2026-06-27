@@ -5660,15 +5660,21 @@ class LiveRuntime:
                 prev_filled = pending.maker_leg_filled
                 progress_changed = apply_pending_entry_passive_progress(pending, progress)
                 if progress_changed and progress.cumulative_quantity > prev_filled:
+                    progress_payload = {
+                        "entry_id": entry_id, "symbol": pending.symbol,
+                        "prev_filled": prev_filled,
+                        "new_filled": progress.cumulative_quantity,
+                        "state": progress.state.value,
+                        "venue": str(maker_venue),
+                    }
+                    progress_evidence = dict(
+                        getattr(progress, "evidence", {}) or {}
+                    )
+                    if progress_evidence:
+                        progress_payload["progress_evidence"] = progress_evidence
                     self.journal.append(
                         "passive_maintenance.maker_progress",
-                        {
-                            "entry_id": entry_id, "symbol": pending.symbol,
-                            "prev_filled": prev_filled,
-                            "new_filled": progress.cumulative_quantity,
-                            "state": progress.state.value,
-                            "venue": str(maker_venue),
-                        },
+                        progress_payload,
                     )
                     if (
                         pending.missing_hedge_quantity() > 1e-9

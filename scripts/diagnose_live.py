@@ -4984,6 +4984,8 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         "entry.aborted",
         "entry.opened",
         "entry.passive_unfilled",
+        "pending_entry.removed_by_v1_lifecycle_closure",
+        "pending_entry.terminalized_after_single_leg_recovery",
         "runtime.position_opened",
     }
     close_terminal_kinds = {

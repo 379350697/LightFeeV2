@@ -21,7 +21,7 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.engine.state import OpenPosition, PendingEntry, PendingPassiveOrder
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -211,6 +211,7 @@ class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
         self.progress_calls: list[dict] = []
         self.progress_state = PassiveOrderState.CANCELED
         self.progress_quantity = 0.0
+        self.progress_evidence: dict[str, object] = {}
 
     async def fetch_open_orders(self, symbol):
         return []
@@ -244,6 +245,7 @@ class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
             cumulative_quantity=self.progress_quantity,
             state=self.progress_state,
             observed_at_ms=1782365072788,
+            evidence=dict(self.progress_evidence),
         )
 
 
@@ -4074,6 +4076,175 @@ async def test_positive_fill_finalize_cleans_owned_live_single_leg_before_releas
     assert cleanup["live_position_quantity"] == pytest.approx(1600.0)
     assert cleanup["post_cleanup_live_long_quantity"] == pytest.approx(0.0)
     assert cleanup["post_cleanup_live_short_quantity"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_positive_fill_live_truth_conflict_records_maker_and_live_truth_evidence(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    live_short = PositionSnapshot(
+        venue=Venue.OKX,
+        symbol="LABUSDT",
+        side=Side.SELL,
+        quantity=2.0,
+        entry_price=18.29,
+        observed_at_ms=1782554233984,
+    )
+    bitget = _OwnedConflictCleanupAdapter(Venue.BITGET)
+    bitget.position_snapshots = [
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782554233984,
+        ),
+        PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="LABUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1782554234984,
+        ),
+    ]
+    bitget.progress_state = PassiveOrderState.FILLED
+    bitget.progress_quantity = 2.0
+    okx = _OwnedConflictCleanupAdapter(Venue.OKX)
+    okx.position_snapshots = [live_short, live_short]
+    okx.default_position_side = Side.SELL
+    okx.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BITGET: bitget,
+            Venue.OKX: okx,
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-1782554218097-LABUSDT",
+        symbol="LABUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.OKX,
+        target_quantity=2.0,
+        maker_leg="long",
+        maker_order_id="1454703380591702016",
+        maker_client_order_id="50705d-maker",
+        hedge_order_id="3692726791063838720",
+        hedge_client_order_id="63bbb-hedge",
+        maker_leg_filled=2.0,
+        hedge_leg_filled=2.0,
+        maker_fill_price=18.289,
+        hedge_fill_price=18.29,
+        passive_order=PendingPassiveOrder(
+            order_id="1454703380591702016",
+            client_order_id="50705d-maker",
+            target_quantity=2.0,
+            last_progress_state=PassiveOrderState.FILLED,
+            fill_checkpoint_quantity=2.0,
+            fill_checkpoint_last_fill_at_ms=1782554233984,
+        ),
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    finalized = await runtime._finalize_pending_entry(
+        pending,
+        pending.pending_id,
+        1782554233984,
+    )
+
+    assert finalized is True
+    events = tmp_journal.read_all()
+    kinds = [event["kind"] for event in events]
+    assert "entry.opened" not in kinds
+    conflict = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.positive_fill_live_truth_conflict"
+    ][-1]
+    assert conflict["entry_id"] == pending.pending_id
+    assert conflict["maker_fill_truth"]["maker_venue"] == "bitget"
+    assert conflict["maker_fill_truth"]["hedge_venue"] == "okx"
+    assert conflict["maker_fill_truth"]["maker_order_id"] == "1454703380591702016"
+    assert conflict["live_position_details"]["bitget"]["matched_quantity"] == pytest.approx(0.0)
+    assert conflict["live_position_details"]["okx"]["matched_quantity"] == pytest.approx(2.0)
+    cleanup = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "pending_entry.owned_live_conflict_cleanup_succeeded"
+    ][-1]
+    assert cleanup["maker_release_evidence"]["result"] == (
+        "maker_terminal_before_pending_release"
+    )
+    assert cleanup["maker_release_evidence"]["progress_state"] == "filled"
+    assert cleanup["maker_release_evidence"]["cumulative_quantity"] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_passive_maintenance_maker_progress_preserves_exchange_progress_evidence(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    bitget = _OwnedConflictCleanupAdapter(Venue.BITGET)
+    bitget.progress_state = PassiveOrderState.PARTIALLY_FILLED
+    bitget.progress_quantity = 1.25
+    bitget.progress_evidence = {
+        "progress_source": "bitget_rest_private_reconciliation_merge",
+        "detail_present": True,
+        "private_progress_present": False,
+        "reconciliation_present": False,
+        "detail_cumulative_quantity": 1.25,
+        "merged_cumulative_quantity": 1.25,
+    }
+    runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+    runtime.journal = tmp_journal
+
+    async def _defer_missing_hedge(*args, **kwargs):
+        return False
+
+    runtime._drive_missing_hedge_live = _defer_missing_hedge
+    pending = _pending_entry(
+        pending_id="entry-1782554218097-LABUSDT",
+        symbol="LABUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.OKX,
+        target_quantity=2.0,
+        maker_leg="long",
+        maker_order_id="1454703380591702016",
+        maker_client_order_id="50705d-maker",
+        hedge_order_id="",
+        hedge_client_order_id="",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        passive_order=PendingPassiveOrder(
+            order_id="1454703380591702016",
+            client_order_id="50705d-maker",
+            target_quantity=2.0,
+            accepted_at_ms=1782554218097,
+            last_progress_state=PassiveOrderState.OPEN,
+        ),
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._maintain_pending_entry_passive_orders(now_ms=1782554218197)
+
+    events = tmp_journal.read_all()
+    maker_progress = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "passive_maintenance.maker_progress"
+    ][-1]
+    assert maker_progress["entry_id"] == pending.pending_id
+    assert maker_progress["progress_evidence"]["progress_source"] == (
+        "bitget_rest_private_reconciliation_merge"
+    )
+    assert maker_progress["progress_evidence"]["detail_present"] is True
+    assert maker_progress["progress_evidence"]["merged_cumulative_quantity"] == pytest.approx(1.25)
 
 
 @pytest.mark.asyncio
