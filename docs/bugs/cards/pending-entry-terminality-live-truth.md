@@ -83,6 +83,11 @@ evidence must map to the matrix before runtime code changes.
   position truth is flat on both close venues.
 - pending-close reconciliation drops close venues from supervision after
   `open_positions` is empty.
+- `pending_entry.hedge_submit_result` or `recovery.hedge_submit_error` contains
+  an exchange accepted order id/client id but no confirmed fill quantity.
+- `metadata.hedge_accepted_order_truth_gap`,
+  `pending_entry.accepted_order_truth_gap_registered`, or
+  `pending_entry_order_truth_gap_count`.
 
 ## Current Effective Rule
 
@@ -171,6 +176,15 @@ contracts to base with `ctVal`. Bybit market/IOC ACK cannot count as hedge
 filled without `/v5/execution/list` executions. Binance default `NEW` /
 `executedQty=0` remains uncertain. Bitget positive quantity without a valid
 side is an evidence gap/fail-closed condition, not default buy.
+
+Pending-entry hedge ACK-only accepted orders are owner-scoped order-truth work.
+An accepted order id/client id with missing fill confirmation must create
+`metadata.hedge_accepted_order_truth_gap`, persist through state snapshots, and
+block duplicate hedge submit until the shared accepted-order truth resolver
+proves one of: confirmed fill, no fill/no open order/no live hedge exposure, an
+open order still present, or truth unavailable. Abort/cleanup may remove the
+pending entry only after that current exchange truth proves the accepted hedge
+order did not fill, has no open order, and left no abnormal live exposure.
 
 All readers should classify order truth through the shared business states:
 `confirmed_fill`, `accepted_uncertain`, `terminal_no_fill`, `rejected`,

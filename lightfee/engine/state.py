@@ -1278,6 +1278,7 @@ class EngineState:
                     "long_side": p.long_side.value,
                     "short_side": p.short_side.value,
                     "created_at_ms": p.created_at_ms,
+                    "metadata": p.metadata,
                     "maker_order_id": p.maker_order_id,
                     "hedge_order_id": p.hedge_order_id,
                     "maker_client_order_id": p.maker_client_order_id,

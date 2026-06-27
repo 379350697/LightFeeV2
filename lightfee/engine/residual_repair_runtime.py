@@ -29,8 +29,8 @@ from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
 )
-from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
-from lightfee.engine.reconciliation import _recon_fill_price
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
+from lightfee.engine.order_truth_resolution import resolve_accepted_order_truth
 from lightfee.engine.recovery_decision_core import (
     CORE_CLEARABLE_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
@@ -1297,171 +1297,37 @@ class ResidualRepairRuntime:
         accepted_client_order_id: str,
         now_ms: int,
     ) -> tuple[str, OrderFill | None, dict[str, Any]]:
-        payload: dict[str, Any] = {
-            "accepted_order_id": accepted_order_id,
-            "accepted_client_order_id": accepted_client_order_id,
-            "accepted_order_truth_gap": True,
-            "order_truth_state": str(
-                task.get("order_truth_state") or "ack_only_accepted"
-            ),
-            "truth_required_by": "accepted_order_truth_gap",
-            "terminal_without_truth": False,
-            "next_action": "reconcile_accepted_order_or_probe_live_position",
-            "order_truth_probe_paths": self._order_truth_probe_paths(repair_venue),
-        }
-
-        fetch_reconciliation = getattr(adapter, "fetch_order_fill_reconciliation", None)
-        if callable(fetch_reconciliation) and (accepted_order_id or accepted_client_order_id):
-            try:
-                reconciliation = await fetch_reconciliation(
-                    symbol,
-                    accepted_order_id,
-                    accepted_client_order_id or None,
-                )
-                self._flush_adapter_order_diagnostics(adapter)
-            except Exception as e:
-                payload["fill_reconciliation_result"] = "error"
-                payload["fill_reconciliation_error"] = str(e) or e.__class__.__name__
-                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(
-                    "truth_unavailable"
-                )
-                payload["resolution_state"] = decision.state
-                payload["ledger_decision"] = decision.decision
-                return "truth_unavailable", None, payload
-
-            truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
-                venue=repair_venue,
-                symbol=symbol,
-                order_id=accepted_order_id,
-                client_order_id=accepted_client_order_id,
-                target_qty=self._safe_positive_float(
-                    task.get("repair_quantity")
-                    or task.get("quantity")
-                    or task.get("requested_quantity")
-                    or baseline
-                ),
-                reconciliation=reconciliation,
-                metadata=(
-                    getattr(reconciliation, "metadata", None)
-                    if reconciliation is not None
-                    else None
-                ),
-            )
-            payload.update(
-                {
-                    "order_truth_fill_status": truth_decision.fill_status.value,
-                    "order_truth_evidence_status": (
-                        truth_decision.evidence_status.value
-                    ),
-                    "order_truth_decision": truth_decision.decision,
-                    "order_truth_missing_evidence": list(
-                        truth_decision.missing_evidence
-                    ),
-                    "terminal_without_truth": (
-                        truth_decision.terminal_without_truth
-                    ),
-                }
-            )
-            if truth_decision.fill_status == OrderTruthFillStatus.CONFIRMED_FILL:
-                payload["fill_reconciliation_result"] = "filled"
-                fill = OrderFill(
-                    venue=repair_venue,
-                    symbol=symbol,
-                    side=getattr(reconciliation, "side", repair_side) or repair_side,
-                    quantity=truth_decision.reconciled_qty,
-                    price=_recon_fill_price(reconciliation),
-                    order_id=(
-                        str(getattr(reconciliation, "order_id", "") or "")
-                        or accepted_order_id
-                    ),
-                    client_order_id=(
-                        str(getattr(reconciliation, "client_order_id", "") or "")
-                        or accepted_client_order_id
-                        or None
-                    ),
-                    fee_quote=getattr(reconciliation, "fee_quote", None),
-                    filled_at_ms=int(
-                        getattr(reconciliation, "filled_at_ms", 0) or now_ms
-                    ),
-                )
-                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("filled")
-                payload["resolution_state"] = decision.state
-                payload["ledger_decision"] = decision.decision
-                return "filled", fill, payload
-            if (
-                reconciliation is not None
-                and self._close_reconciliation_fill_qty(reconciliation) > 1e-12
-            ):
-                payload["fill_reconciliation_result"] = (
-                    "truth_gap"
-                    if truth_decision.fill_status == OrderTruthFillStatus.TRUTH_GAP
-                    else truth_decision.fill_status.value
-                )
-                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
-                payload["resolution_state"] = decision.state
-                payload["ledger_decision"] = decision.decision
-                return "truth_gap", None, payload
-            payload["fill_reconciliation_result"] = "missing_or_zero_fill"
-        else:
-            payload["fill_reconciliation_result"] = "not_available"
-
-        live_positions: dict[Venue, PositionSnapshot | None] = {}
-        open_order_count = 0
-        open_order_counts_by_venue: dict[str, int] = {}
-        for probe_venue in probe_venues:
-            probe_adapter = self.get_venue_adapter(probe_venue)
-            if probe_adapter is None:
-                continue
-            try:
-                live_positions[probe_venue] = await probe_adapter.fetch_position(symbol)
-                open_orders = await self._fetch_residual_repair_open_orders(
-                    probe_adapter,
-                    probe_venue,
-                    symbol,
-                )
-            except Exception as e:
-                payload["live_truth_error"] = str(e) or e.__class__.__name__
-                decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(
-                    "truth_unavailable"
-                )
-                payload["resolution_state"] = decision.state
-                payload["ledger_decision"] = decision.decision
-                return "truth_unavailable", None, payload
-            venue_open_order_count = len(open_orders)
-            open_order_count += venue_open_order_count
-            open_order_counts_by_venue[probe_venue.value] = venue_open_order_count
-
-        live_position = live_positions.get(repair_venue)
-        live_size = self._signed_position_size(live_position)
-        if repair_side == Side.SELL:
-            live_excess_quantity = max(live_size - baseline, 0.0)
-        else:
-            live_excess_quantity = max(baseline - live_size, 0.0)
-        payload.update(
-            {
-                "open_order_count": open_order_count,
-                "open_order_counts_by_venue": open_order_counts_by_venue,
-                "live_truth_venues": [venue.value for venue in probe_venues],
-                "live_positions": self._live_positions_evidence(live_positions),
-                "live_excess_quantity": live_excess_quantity,
-                "baseline_quantity": baseline,
-                "live_size": live_size,
-            }
+        target_qty = self._safe_positive_float(
+            task.get("repair_quantity")
+            or task.get("quantity")
+            or task.get("requested_quantity")
+            or baseline
         )
-        if open_order_count > 0:
-            decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("open_order_present")
-            payload["resolution_state"] = decision.state
-            payload["ledger_decision"] = decision.decision
-            return "open_order_present", None, payload
-        if live_excess_quantity <= 1e-9:
-            decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("live_flat")
-            payload["resolution_state"] = decision.state
-            payload["ledger_decision"] = decision.decision
-            return "live_flat", None, payload
-        decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision("truth_gap")
-        payload["resolution_state"] = decision.state
-        payload["ledger_decision"] = decision.decision
-        return "truth_gap", None, payload
+        resolution = await resolve_accepted_order_truth(
+            adapter=adapter,
+            venue=repair_venue,
+            side=repair_side,
+            symbol=symbol,
+            target_qty=target_qty,
+            accepted_order_id=accepted_order_id,
+            accepted_client_order_id=accepted_client_order_id,
+            now_ms=now_ms,
+            probe_venues=probe_venues,
+            get_adapter=self.get_venue_adapter,
+            fetch_open_orders=self._fetch_residual_repair_open_orders,
+            baseline_quantity=baseline,
+            live_excess_mode="residual_baseline",
+        )
+        payload = {
+            **resolution.payload,
+            "order_truth_state": str(
+                task.get("order_truth_state")
+                or resolution.payload.get("order_truth_state")
+                or "ack_only_accepted"
+            ),
+        }
+        self._flush_adapter_order_diagnostics(adapter)
+        return resolution.status, resolution.fill, payload
 
     def _retain_residual_repair_accepted_order_gap(
         self,

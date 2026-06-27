@@ -2616,6 +2616,296 @@ class TestRealPathAbortCleanupDeadline:
         assert payload["next_action"] == "reconcile_accepted_order_or_probe_live_position"
 
     @pytest.mark.asyncio
+    async def test_ack_only_hedge_submit_registers_owner_scoped_truth_gap(self, tmp_path):
+        """ACK-only hedge submit must become pending-entry owned order-truth work."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-oid-1) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "ack-oid-1"
+        error.accepted_client_order_id = "ack-client-1"
+        error.fill_confirmation_missing_fields = ["executedQty", "cumQty"]
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+
+        pending = PendingEntry(
+            pending_id="entry-ack-owner-gap",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=26.0,
+            maker_fill_price=0.5,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+            maker_order_id="maker-oid-velvet",
+            maker_client_order_id="maker-cid-velvet",
+        )
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+
+        assert driven is False
+        gap = pending.metadata.get("hedge_accepted_order_truth_gap")
+        assert gap is not None
+        assert gap["accepted_order_truth_gap"] is True
+        assert gap["truth_required_by"] == "accepted_order_truth_gap"
+        assert gap["entry_id"] == pending.pending_id
+        assert gap["venue"] == "bybit"
+        assert gap["symbol"] == "VELVETUSDT"
+        assert gap["side"] == "sell"
+        assert gap["quantity"] == pytest.approx(26.0)
+        assert gap["accepted_order_id"] == "ack-oid-1"
+        assert gap["accepted_client_order_id"] == "ack-client-1"
+        assert gap["attempt"] == 1
+        assert gap["submitted_at_ms"] == 2000
+        assert gap["order_truth_state"] in {"accepted_uncertain", "ack_only_accepted"}
+        assert gap["next_action"] == "reconcile_accepted_order_or_probe_live_position"
+        assert "fill not confirmed" in gap["last_error"]
+        assert pending.hedge_inflight is not None
+        assert pending.hedge_inflight.client_order_id == pending.hedge_client_order_id
+
+        events = runtime.journal.read_all()
+        registered = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "pending_entry.accepted_order_truth_gap_registered"
+        ]
+        assert registered
+        assert registered[-1]["accepted_order_id"] == "ack-oid-1"
+        assert registered[-1]["accepted_client_order_id"] == "ack-client-1"
+
+    def test_pending_entry_metadata_is_persisted_in_state_snapshot(self):
+        """Pending-entry order-truth gap metadata must survive snapshot/recovery."""
+        from lightfee.engine.state import EngineState
+
+        state = EngineState()
+        pending = PendingEntry(
+            pending_id="entry-metadata-gap",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            metadata={
+                "hedge_accepted_order_truth_gap": {
+                    "accepted_order_truth_gap": True,
+                    "accepted_order_id": "ack-oid-1",
+                    "accepted_client_order_id": "ack-client-1",
+                }
+            },
+        )
+        state.pending_entries[pending.pending_id] = pending
+
+        snapshot = state.to_dict()
+
+        assert snapshot["pending_entries"][pending.pending_id]["metadata"] == pending.metadata
+
+    @pytest.mark.asyncio
+    async def test_accepted_hedge_gap_retains_open_order_without_duplicate_submit(self, tmp_path):
+        """Open-order truth keeps the ACK-only hedge owned and blocks duplicate submit."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-open-order) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "ack-open-order"
+        error.accepted_client_order_id = "ack-open-client"
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = PendingEntry(
+            pending_id="entry-ack-open-order",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=26.0,
+            maker_fill_price=0.5,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+
+        first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+        hedge_adapter.open_orders = [{"orderId": "ack-open-order"}]
+        second = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2500)
+
+        assert first is False
+        assert second is False
+        assert len(hedge_adapter._place_order_calls) == 1
+        gap = pending.metadata["hedge_accepted_order_truth_gap"]
+        assert gap["last_status"] == "open_order_present"
+        assert pending.hedge_inflight is not None
+
+    @pytest.mark.asyncio
+    async def test_abort_retains_pending_entry_with_unresolved_accepted_hedge_gap(self, tmp_path):
+        """Abort cleanup cannot remove pending while accepted hedge truth is open."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-abort-order) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "ack-abort-order"
+        error.accepted_client_order_id = "ack-abort-client"
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = PendingEntry(
+            pending_id="entry-ack-abort-retain",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=26.0,
+            maker_fill_price=0.5,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+        hedge_adapter.open_orders = [{"orderId": "ack-abort-order"}]
+        removed = await runtime._abort_pending_entry(
+            pending,
+            pending.pending_id,
+            "test_deadline_abort",
+        )
+
+        assert removed is False
+        assert runtime.state.pending_entries[pending.pending_id] is pending
+        assert pending.metadata["hedge_accepted_order_truth_gap"]["last_status"] == (
+            "open_order_present"
+        )
+        assert pending.hedge_inflight is not None
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.abort_truth_gate_retained" in kinds
+        assert "entry.aborted" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_accepted_hedge_gap_reconciled_fill_applies_progress(self, tmp_path):
+        """Accepted hedge order fill truth must resolve the owner gap and fill hedge."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-filled-order) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "ack-filled-order"
+        error.accepted_client_order_id = "ack-filled-client"
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = PendingEntry(
+            pending_id="entry-ack-filled-order",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=26.0,
+            maker_fill_price=0.5,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+
+        first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="VELVETUSDT",
+            side=Side.SELL,
+            quantity=26.0,
+            average_price=0.499,
+            order_id="ack-filled-order",
+            client_order_id="ack-filled-client",
+            filled_at_ms=2300,
+            metadata={
+                "evidence_source": "bybit_execution_list",
+                "queried_endpoints": ["/v5/execution/list"],
+                "response_classification": "filled",
+            },
+        )
+        second = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2500)
+
+        assert first is False
+        assert second is True
+        assert pending.hedge_leg_filled == pytest.approx(26.0)
+        assert pending.hedge_order_id == "ack-filled-order"
+        assert pending.hedge_inflight is None
+        assert "hedge_accepted_order_truth_gap" not in pending.metadata
+        assert pending.outcome == "filled"
+        assert len(hedge_adapter._place_order_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_accepted_hedge_gap_live_flat_clears_for_new_cid_retry(self, tmp_path):
+        """Clean live-flat truth clears ACK-only gap and the next tick retries with a new CID."""
+
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        error = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-flat-order) but fill not confirmed",
+        )
+        error.order_ack_only = True
+        error.accepted_order_id = "ack-flat-order"
+        error.accepted_client_order_id = "ack-flat-client"
+        hedge_adapter.place_order_raises = error
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = PendingEntry(
+            pending_id="entry-ack-live-flat",
+            symbol="VELVETUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.BYBIT,
+            target_quantity=26.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=26.0,
+            maker_fill_price=0.5,
+            hedge_leg_filled=0.0,
+            uncertain_outcome=True,
+        )
+
+        first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
+        first_cid = pending.hedge_client_order_id
+        second = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2500)
+        hedge_adapter.place_order_raises = None
+        third = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 3000)
+
+        assert first is False
+        assert second is False
+        assert third is False
+        assert "hedge_accepted_order_truth_gap" not in pending.metadata
+        assert pending.hedge_inflight is None
+        assert len(hedge_adapter._place_order_calls) == 2
+        assert hedge_adapter._place_order_calls[1].client_order_id != first_cid
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_auth_signing_reject_is_non_retryable(self, tmp_path):
         """HL auth/signing rejection fails closed and does not spin retries."""
 

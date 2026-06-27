@@ -1193,6 +1193,12 @@ _EVENT_KIND_PHASES = {
     "runtime.recovery_blocked": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.position_lifecycle_terminal": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "pending_entry.force_terminalized": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "pending_entry.accepted_order_truth_gap_registered": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
+    "pending_entry.accepted_order_truth_gap_resolved": (
+        V1LifecycleClosurePhase.PENDING_ENTRY.value
+    ),
     "reconciliation.entry_reconcile_error": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "reconciliation.pending_close_backfill_retained": (
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value

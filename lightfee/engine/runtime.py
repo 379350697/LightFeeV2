@@ -60,6 +60,10 @@ from lightfee.engine.order_truth_ledger import (
     ORDER_TRUTH_LEDGER,
     OrderTruthFillStatus,
 )
+from lightfee.engine.order_truth_resolution import (
+    open_order_items,
+    resolve_accepted_order_truth,
+)
 from lightfee.engine.recovery import (
     recover_from_snapshot,
     build_recovery_dedup_index,
@@ -7620,6 +7624,64 @@ class LiveRuntime:
         hedge_venue = pending.hedge_venue()
         symbol = pending.symbol
 
+        if self._pending_entry_hedge_accepted_order_truth_gap(pending) is not None:
+            gap_filled = await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                pending,
+                entry_id,
+                wall_clock_now_ms(),
+            )
+            gap = self._pending_entry_hedge_accepted_order_truth_gap(pending)
+            if gap is not None:
+                enter_fail_closed(self.state)
+                self.state.last_error = reason
+                pending.uncertain_outcome = True
+                pending.reconcile_next_attempt_ms = max(
+                    int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+                    wall_clock_now_ms() + 1_000,
+                )
+                self.journal.append(
+                    "pending_entry.abort_truth_gate_retained",
+                    {
+                        "entry_id": entry_id,
+                        "owner_id": entry_id,
+                        "symbol": symbol,
+                        "reason": reason,
+                        "truth_gate_decision": (
+                            "retain_pending_accepted_order_truth_gap"
+                        ),
+                        "decision": "retain_pending",
+                        "accepted_order_truth_gap": True,
+                        "accepted_order_id": str(
+                            gap.get("accepted_order_id") or ""
+                        ),
+                        "accepted_client_order_id": str(
+                            gap.get("accepted_client_order_id") or ""
+                        ),
+                        "order_truth_state": str(
+                            gap.get("order_truth_state") or ""
+                        ),
+                        "next_action": str(gap.get("next_action") or ""),
+                    },
+                )
+                return False
+            if gap_filled or (
+                pending.missing_hedge_quantity() <= 1e-9
+                and pending.maker_completed()
+            ):
+                self.journal.append(
+                    "pending_entry.abort_deferred_after_accepted_order_truth_resolution",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": symbol,
+                        "reason": reason,
+                        "gap_filled": gap_filled,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "missing_hedge": pending.missing_hedge_quantity(),
+                    },
+                )
+                return False
+
         abort_gate = await self._pending_entry_abort_truth_gate(
             pending,
             entry_id,
@@ -8766,6 +8828,41 @@ class LiveRuntime:
             if not pending.startup_recovery_ready():
                 continue
 
+            if self._pending_entry_hedge_accepted_order_truth_gap(pending) is not None:
+                gap_filled = await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                    pending,
+                    entry_id,
+                    now_ms,
+                )
+                if self._pending_entry_hedge_accepted_order_truth_gap(pending) is not None:
+                    pending.reconcile_attempt += 1
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    continue
+                if (
+                    gap_filled
+                    and pending.missing_hedge_quantity() <= 1e-9
+                    and pending.maker_completed()
+                ):
+                    if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                        await self._complete_pending_entry_terminal_removal(
+                            entry_id,
+                            reason="accepted_order_truth_gap_filled_entry",
+                            symbol=pending.symbol,
+                            now_ms=now_ms,
+                        )
+                        self.journal.append(
+                            "recovery.pending_entry_finalized",
+                            {
+                                "entry_id": entry_id,
+                                "symbol": pending.symbol,
+                                "reason": "accepted_order_truth_gap_filled_entry",
+                            },
+                        )
+                    else:
+                        pending.reconcile_attempt += 1
+                        self._apply_reconcile_backoff(pending, now_ms)
+                    continue
+
             if await self._maybe_finalize_pending_entry_terminal_hedge_dust(
                 pending,
                 entry_id,
@@ -9525,6 +9622,210 @@ class LiveRuntime:
         """
         return False
 
+    async def _fetch_pending_entry_order_truth_open_orders(
+        self,
+        adapter: Any,
+        venue: Venue,
+        symbol: str,
+    ) -> list[Any]:
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if callable(fetch_open_orders):
+            return open_order_items(await fetch_open_orders(symbol))
+        return await self.residual_repair_runtime._fetch_residual_repair_open_orders(
+            adapter,
+            venue,
+            symbol,
+        )
+
+    def _register_pending_entry_hedge_accepted_order_truth_gap(
+        self,
+        *,
+        pending: Any,
+        entry_id: str,
+        hedge_venue: Venue,
+        hedge_side: Side,
+        quantity: float,
+        attempt: int,
+        submitted_at_ms: int,
+        error: OrderSubmitError,
+        evidence: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        accepted_order_id = str(
+            evidence.get("accepted_order_id")
+            or getattr(error, "accepted_order_id", "")
+            or ""
+        )
+        accepted_client_order_id = str(
+            evidence.get("accepted_client_order_id")
+            or getattr(error, "accepted_client_order_id", "")
+            or getattr(pending, "hedge_client_order_id", "")
+            or ""
+        )
+        is_gap = (
+            evidence.get("accepted_order_truth_gap") is True
+            or evidence.get("truth_required_by") == "accepted_order_truth_gap"
+            or bool(accepted_order_id or accepted_client_order_id)
+            and ORDER_TRUTH_LEDGER.is_order_truth_gap(error)
+        )
+        if not is_gap:
+            return None
+
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        pending.metadata = metadata
+        decision = ORDER_TRUTH_LEDGER.truth_gap_status_decision(
+            str(evidence.get("order_truth_state") or "accepted_uncertain")
+        )
+        gap = {
+            "kind": "accepted_order_truth_gap",
+            "accepted_order_truth_gap": True,
+            "truth_required_by": "accepted_order_truth_gap",
+            "terminal_without_truth": False,
+            "entry_id": entry_id,
+            "venue": hedge_venue.value,
+            "symbol": pending.symbol,
+            "side": hedge_side.value,
+            "quantity": float(quantity or 0.0),
+            "accepted_order_id": accepted_order_id,
+            "accepted_client_order_id": accepted_client_order_id,
+            "attempt": int(attempt or 0),
+            "submitted_at_ms": int(submitted_at_ms or 0),
+            "order_truth_state": str(
+                evidence.get("order_truth_state") or decision.business_state.value
+            ),
+            "ledger_decision": decision.decision,
+            "next_action": "reconcile_accepted_order_or_probe_live_position",
+            "last_error": str(error),
+            "order_truth_probe_paths": self._order_truth_probe_paths(hedge_venue),
+        }
+        metadata["hedge_accepted_order_truth_gap"] = gap
+        if pending.hedge_inflight is None:
+            pending.hedge_inflight = HedgeInflight(
+                client_order_id=accepted_client_order_id,
+                venue=hedge_venue,
+                side=hedge_side,
+                quantity=float(quantity or 0.0),
+                attempt=int(attempt or 0),
+                submitted_at_ms=int(submitted_at_ms or 0),
+            )
+        self.journal.append(
+            "pending_entry.accepted_order_truth_gap_registered",
+            dict(gap),
+        )
+        return gap
+
+    def _clear_pending_entry_hedge_accepted_order_truth_gap(self, pending: Any) -> None:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        metadata.pop("hedge_accepted_order_truth_gap", None)
+        pending.metadata = metadata
+
+    def _pending_entry_hedge_accepted_order_truth_gap(
+        self, pending: Any,
+    ) -> dict[str, Any] | None:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        gap = metadata.get("hedge_accepted_order_truth_gap")
+        if isinstance(gap, dict) and gap.get("accepted_order_truth_gap"):
+            return gap
+        return None
+
+    async def _resolve_pending_entry_hedge_accepted_order_truth_gap(
+        self,
+        pending: Any,
+        entry_id: str,
+        now_ms: int,
+    ) -> bool:
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        gap = metadata.get("hedge_accepted_order_truth_gap")
+        if not isinstance(gap, dict) or not gap.get("accepted_order_truth_gap"):
+            return False
+
+        hedge_venue = pending.hedge_venue()
+        adapter = self.get_venue_adapter(hedge_venue)
+        if adapter is None:
+            return False
+
+        resolution = await resolve_accepted_order_truth(
+            adapter=adapter,
+            venue=hedge_venue,
+            side=pending.hedge_side(),
+            symbol=pending.symbol,
+            target_qty=float(gap.get("quantity") or pending.missing_hedge_quantity() or 0.0),
+            accepted_order_id=str(gap.get("accepted_order_id") or ""),
+            accepted_client_order_id=str(
+                gap.get("accepted_client_order_id")
+                or getattr(pending, "hedge_client_order_id", "")
+                or ""
+            ),
+            now_ms=now_ms,
+            probe_venues=[hedge_venue],
+            get_adapter=self.get_venue_adapter,
+            fetch_open_orders=self._fetch_pending_entry_order_truth_open_orders,
+        )
+        payload = {
+            "entry_id": entry_id,
+            "symbol": pending.symbol,
+            "venue": hedge_venue.value,
+            "status": resolution.status,
+            **resolution.payload,
+        }
+        if resolution.status == "filled" and resolution.fill is not None:
+            fill = resolution.fill
+            apply_pending_entry_hedge_progress(
+                pending,
+                new_total_quantity=pending.hedge_leg_filled + fill.quantity,
+                price=fill.price,
+                order_id=fill.order_id,
+                observed_at_ms=getattr(fill, "filled_at_ms", 0),
+                now_ms=now_ms,
+                quality=(
+                    "exchange_fill_exact"
+                    if getattr(fill, "filled_at_ms", 0)
+                    else "observed"
+                ),
+            )
+            pending.hedge_inflight = None
+            ensure_pending_entry_phase_state(pending).hedge_deadline_at_ms = None
+            note_pending_entry_hedge_filled(pending)
+            self._clear_pending_entry_hedge_accepted_order_truth_gap(pending)
+            if pending.missing_hedge_quantity() <= 1e-9:
+                pending.uncertain_outcome = False
+                pending.outcome = "filled"
+            self.journal.append(
+                "pending_entry.accepted_order_truth_gap_resolved",
+                payload,
+            )
+            return True
+        if resolution.status in {"live_flat", "terminal_no_fill"}:
+            pending.hedge_inflight = None
+            ensure_pending_entry_phase_state(pending).hedge_deadline_at_ms = None
+            self._clear_pending_entry_hedge_accepted_order_truth_gap(pending)
+            self.journal.append(
+                "pending_entry.accepted_order_truth_gap_resolved",
+                payload,
+            )
+            return False
+
+        metadata["hedge_accepted_order_truth_gap"] = {
+            **gap,
+            "order_truth_state": str(payload.get("resolution_state") or "unresolved"),
+            "ledger_decision": str(payload.get("ledger_decision") or "backoff_recheck"),
+            "last_status": resolution.status,
+            "last_error": str(
+                payload.get("live_truth_error")
+                or payload.get("fill_reconciliation_error")
+                or gap.get("last_error")
+                or ""
+            ),
+        }
+        pending.metadata = metadata
+        self.journal.append(
+            "pending_entry.accepted_order_truth_gap_registered",
+            {
+                **payload,
+                "retained": True,
+            },
+        )
+        return False
+
     async def _recover_drive_missing_hedge(self, pending, reason: str) -> bool:
         """Submit a hedge order for the missing quantity.
 
@@ -9548,8 +9849,18 @@ class LiveRuntime:
                 {"entry_id": pending.pending_id, "reason": reason},
             )
             return False
+        if self._pending_entry_hedge_accepted_order_truth_gap(pending) is not None:
+            return await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                pending,
+                pending.pending_id,
+                wall_clock_now_ms(),
+            )
         if pending.hedge_inflight is not None:
-            return False
+            return await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                pending,
+                pending.pending_id,
+                wall_clock_now_ms(),
+            )
 
         try:
             from lightfee.core.domain import OrderRequest
@@ -9749,6 +10060,24 @@ class LiveRuntime:
                 pending.hedge_inflight = None
                 phase_state = ensure_pending_entry_phase_state(pending)
                 phase_state.hedge_deadline_at_ms = None
+            evidence = self._order_submit_error_runtime_evidence(
+                e,
+                venue=hedge_venue,
+                operation="place_order",
+                request=req,
+                default_client_order_id=hedge_client_order_id,
+            )
+            self._register_pending_entry_hedge_accepted_order_truth_gap(
+                pending=pending,
+                entry_id=pending.pending_id,
+                hedge_venue=hedge_venue,
+                hedge_side=pending.hedge_side(),
+                quantity=normalized,
+                attempt=getattr(pending, "hedge_attempt_count", 0),
+                submitted_at_ms=now_ms,
+                error=e,
+                evidence=evidence,
+            )
             self.journal.append(
                 "recovery.hedge_submit_error",
                 {
@@ -9803,11 +10132,22 @@ class LiveRuntime:
         if missing <= 1e-9:
             return False
 
+        if self._pending_entry_hedge_accepted_order_truth_gap(pending) is not None:
+            return await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                pending,
+                entry_id,
+                now_ms,
+            )
+
         # Idempotency: skip if a hedge is already inflight
         if pending.hedge_inflight is not None:
             # Do not retry while inflight; reconciliation will clear it
             # after order/fills/position prove no hedge exists.
-            return False
+            return await self._resolve_pending_entry_hedge_accepted_order_truth_gap(
+                pending,
+                entry_id,
+                now_ms,
+            )
 
         # Terminal: do not drive hedge from a residual repair state
         if pending.repair_state:
@@ -10161,6 +10501,17 @@ class LiveRuntime:
                         else hedge_cloid
                     ),
                 )
+            )
+            self._register_pending_entry_hedge_accepted_order_truth_gap(
+                pending=pending,
+                entry_id=entry_id,
+                hedge_venue=hedge_venue,
+                hedge_side=pending.hedge_side(),
+                quantity=normalized,
+                attempt=attempt,
+                submitted_at_ms=now_ms,
+                error=e,
+                evidence=error_payload,
             )
             self.journal.append(
                 "pending_entry.hedge_submit_result",

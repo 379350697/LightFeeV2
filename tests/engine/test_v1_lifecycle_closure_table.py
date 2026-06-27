@@ -569,6 +569,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "passive_maintenance.zero_fill_cycle",
         "pending_entry.hedge_submit_attempt",
         "pending_entry.hedge_submit_result",
+        "pending_entry.accepted_order_truth_gap_registered",
+        "pending_entry.accepted_order_truth_gap_resolved",
         "pending_entry.maker_progress_applied",
         "pending_entry.missing_hedge_detected",
         "pending_entry.pending_entry_finalized",

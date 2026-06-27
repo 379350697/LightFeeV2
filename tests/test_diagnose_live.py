@@ -3462,6 +3462,61 @@ def test_acceptance_gate_resolved_order_truth_gap_is_green_when_fail_closed_but_
     assert gate["gate_passed"] is True
 
 
+def test_acceptance_gate_reports_pending_entry_order_truth_gap_from_current_state():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 1,
+            "pending_entries": [
+                {
+                    "pending_id": "entry-ack",
+                    "symbol": "VELVETUSDT",
+                    "metadata": {
+                        "hedge_accepted_order_truth_gap": {
+                            "accepted_order_truth_gap": True,
+                            "entry_id": "entry-ack",
+                            "symbol": "VELVETUSDT",
+                            "venue": "bybit",
+                            "accepted_order_id": "accepted-order-1",
+                            "accepted_client_order_id": "accepted-client-1",
+                            "order_truth_state": "ack_only_accepted",
+                            "next_action": (
+                                "reconcile_accepted_order_or_probe_live_position"
+                            ),
+                        }
+                    },
+                }
+            ],
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["pending_entry_order_truth_gap_count"] == 1
+    sample = gate["pending_entry_order_truth_gap_summary"]["samples"][0]
+    assert sample["entry_id"] == "entry-ack"
+    assert sample["accepted_order_id"] == "accepted-order-1"
+    assert sample["accepted_client_order_id"] == "accepted-client-1"
+    assert "pending_entry_order_truth_gap_unresolved" in gate["blocking_reasons"]
+    assert gate["exception_conclusions"]["pending_entry_order_truth_gap"] == (
+        "order_truth_gap_unresolved"
+    )
+    assert gate["gate_passed"] is False
+
+
 def test_run_diagnose_weak_order_truth_resolution_does_not_green(monkeypatch):
     from scripts import diagnose_live as dl
 

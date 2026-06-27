@@ -559,6 +559,7 @@ def _build_local_state(
         "risk_mode": str(state.get("risk_mode", "unknown")),
         "open_position_count": int(state.get("open_position_count", 0) or 0),
         "pending_entry_count": int(state.get("pending_entry_count", 0) or 0),
+        "pending_entries": state.get("pending_entries", []),
         "pending_close_count": int(state.get("pending_close_count", 0) or 0),
         "positions": positions,
         "last_tick_ms": int(state.get("last_tick_ms", 0) or 0),
@@ -7095,6 +7096,16 @@ def _build_production_acceptance_gate(
         local_state,
         exchange_truth,
     )
+    pending_entry_order_truth_gap_summary = (
+        _build_pending_entry_order_truth_gap_summary(local_state)
+    )
+    pending_entry_order_truth_gap_count = int(
+        pending_entry_order_truth_gap_summary.get("count", 0) or 0
+    )
+    if pending_entry_order_truth_gap_count:
+        exception_conclusions["pending_entry_order_truth_gap"] = (
+            "order_truth_gap_unresolved"
+        )
     recovery_decision = _recovery_decision_payload(local_state, exchange_truth)
     v1_lifecycle_closure = _v1_lifecycle_closure_payload(
         local_state,
@@ -7319,6 +7330,8 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("local_l2_residual_runtime_enabled")
     if unresolved_order_truth_gap_count:
         blocking_reasons.append("order_truth_gap_unresolved")
+    if pending_entry_order_truth_gap_count:
+        blocking_reasons.append("pending_entry_order_truth_gap_unresolved")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -7338,6 +7351,7 @@ def _build_production_acceptance_gate(
         ),
         "resolved_order_truth_gap": resolved_order_truth_gap_count,
         "unresolved_order_truth_gap": unresolved_order_truth_gap_count,
+        "pending_entry_order_truth_gap": pending_entry_order_truth_gap_count,
         "blocking_required_truth": (
             required_position_truth_unavailable_count
             if exception_conclusions.get("blocking_required_truth")
@@ -7436,6 +7450,12 @@ def _build_production_acceptance_gate(
         "remaining_position_slots": remaining_position_slots,
         "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
+        "pending_entry_order_truth_gap_count": (
+            pending_entry_order_truth_gap_count
+        ),
+        "pending_entry_order_truth_gap_summary": (
+            pending_entry_order_truth_gap_summary
+        ),
         "pending_close_count": pending_close_count,
         "pending_close_reconciliation_count": pending_close_reconciliation_count,
         "pending_close_reconciliation_blocking_count": (
@@ -7608,6 +7628,48 @@ def _pending_expected_legs(
             }
         )
     return legs
+
+
+def _build_pending_entry_order_truth_gap_summary(
+    local_state: dict[str, Any],
+) -> dict[str, Any]:
+    samples: list[dict[str, Any]] = []
+    for pending in _state_collection_or_count(
+        local_state,
+        "pending_entries",
+        "pending_entry_count",
+    ):
+        if not isinstance(pending, dict):
+            continue
+        metadata = pending.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        gap = metadata.get("hedge_accepted_order_truth_gap")
+        if not isinstance(gap, dict) or gap.get("accepted_order_truth_gap") is not True:
+            continue
+        samples.append(
+            {
+                "entry_id": str(
+                    gap.get("entry_id")
+                    or pending.get("pending_id")
+                    or pending.get("entry_id")
+                    or ""
+                ),
+                "symbol": str(gap.get("symbol") or pending.get("symbol") or ""),
+                "venue": str(gap.get("venue") or ""),
+                "accepted_order_id": str(gap.get("accepted_order_id") or ""),
+                "accepted_client_order_id": str(
+                    gap.get("accepted_client_order_id") or ""
+                ),
+                "order_truth_state": str(gap.get("order_truth_state") or ""),
+                "next_action": str(gap.get("next_action") or ""),
+                "last_status": str(gap.get("last_status") or ""),
+            }
+        )
+    return {
+        "count": len(samples),
+        "samples": samples[:10],
+    }
 
 
 def _maker_leg_text(value: Any) -> str:
