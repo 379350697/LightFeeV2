@@ -20,6 +20,10 @@ from lightfee.engine.execution_planner import (
     ExecutionRoute,
     plan_incremental_entry_execution,
 )
+from lightfee.engine.pending_entry_admission import (
+    PendingEntryAdmissionCore,
+    PendingEntryAdmissionRequest,
+)
 from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     is_client_order_id_duplicate,
@@ -713,139 +717,6 @@ class EntryDispatchRuntime:
         except Exception:
             return {}
         return metadata if isinstance(metadata, dict) else {}
-
-    @staticmethod
-    def _metadata_positive_float(metadata: dict[str, Any], aliases: tuple[str, ...]) -> float:
-        for alias in aliases:
-            value = metadata.get(alias)
-            try:
-                numeric = float(value or 0.0)
-            except (TypeError, ValueError):
-                numeric = 0.0
-            if math.isfinite(numeric) and numeric > 0.0:
-                return numeric
-        return 0.0
-
-    def _maker_fill_increment_evidence(
-        self,
-        *,
-        maker_venue: Venue,
-        symbol: str,
-        maker_quantity_step: float | None,
-    ) -> dict[str, Any]:
-        metadata = self._entry_passive_metadata(maker_venue, symbol)
-        evidence: dict[str, Any] = {
-            "maker_venue": maker_venue.value,
-            "maker_fill_increment_base": 0.0,
-            "quantity_units": str(metadata.get("quantity_units") or "base"),
-            "maker_quantity_step": float(maker_quantity_step or 0.0),
-            "maker_increment_source": "unavailable",
-        }
-        if maker_venue is Venue.GATE:
-            contract_multiplier = self._metadata_positive_float(
-                metadata,
-                (
-                    "contract_multiplier",
-                    "contractMultiplier",
-                    "quanto_multiplier",
-                    "quantoMultiplier",
-                    "contract_size",
-                    "contractSize",
-                    "ct_val",
-                    "ctVal",
-                ),
-            )
-            contract_step = self._metadata_positive_float(
-                metadata,
-                (
-                    "contract_step",
-                    "order_size_round",
-                    "orderSizeRound",
-                    "lot_size",
-                    "lotSize",
-                ),
-            )
-            evidence.update(
-                {
-                    "raw_contract_step": float(contract_step or 0.0),
-                    "contract_multiplier": float(contract_multiplier or 0.0),
-                    "quantity_units": "gate_contracts_to_base",
-                }
-            )
-            if contract_multiplier <= 0.0 or contract_step <= 0.0:
-                evidence["reason"] = "maker_fill_unit_truth_unavailable"
-                return evidence
-            evidence["maker_fill_increment_base"] = float(contract_step * contract_multiplier)
-            evidence["maker_increment_source"] = "gate_contract_step_multiplier"
-            return evidence
-
-        increment = self._metadata_positive_float(
-            metadata,
-            ("quantity_step", "step_size", "qtyStep", "base_step", "baseStep"),
-        )
-        if increment <= 0.0:
-            increment = float(maker_quantity_step or 0.0)
-        if increment <= 0.0:
-            evidence["reason"] = "maker_fill_unit_truth_unavailable"
-            return evidence
-        evidence["maker_fill_increment_base"] = float(increment)
-        evidence["maker_increment_source"] = "base_quantity_step"
-        return evidence
-
-    def _pending_entry_pre_submit_hedgeability_blocker(
-        self,
-        *,
-        candidate,
-        now_ms: int,
-        long_venue: Venue,
-        short_venue: Venue,
-        maker_venue: Venue,
-        hedge_venue: Venue,
-        maker_quantity_step: float | None,
-        hedge_quantity_step: float | None,
-        min_hedgeable_chunk: float,
-        entry_type: EntryType,
-    ) -> dict[str, Any] | None:
-        if entry_type is not EntryType.PASSIVE_INCREMENTAL:
-            return None
-        maker_evidence = self._maker_fill_increment_evidence(
-            maker_venue=maker_venue,
-            symbol=candidate.symbol,
-            maker_quantity_step=maker_quantity_step,
-        )
-        hedge_min_chunk = max(
-            float(min_hedgeable_chunk or 0.0),
-            float(hedge_quantity_step or 0.0),
-        )
-        maker_increment = float(maker_evidence.get("maker_fill_increment_base") or 0.0)
-        reason = str(maker_evidence.get("reason") or "")
-        if not reason and (maker_increment <= 0.0 or hedge_min_chunk <= 0.0):
-            reason = "maker_fill_unit_truth_unavailable"
-        if not reason and maker_increment + 1e-12 < hedge_min_chunk:
-            reason = "maker_fill_increment_below_hedge_min_chunk"
-        if not reason:
-            return None
-        guard_enabled = bool(
-            getattr(
-                self.ctx.config.strategy,
-                "pending_entry_pre_submit_hedgeable_fill_guard_enabled",
-                True,
-            )
-        )
-        return {
-            **maker_evidence,
-            "symbol": candidate.symbol,
-            "long_venue": long_venue.value,
-            "short_venue": short_venue.value,
-            "hedge_venue": hedge_venue.value,
-            "reason": reason,
-            "min_hedgeable_chunk": float(hedge_min_chunk or 0.0),
-            "hedge_quantity_step": float(hedge_quantity_step or 0.0),
-            "cooldown_scope": "symbol",
-            "guard_enabled": guard_enabled,
-            "guard_disabled": not guard_enabled,
-            "ts_ms": now_ms,
-        }
 
     @staticmethod
     def _entry_quantity_plan_reason(
@@ -2135,43 +2006,77 @@ class EntryDispatchRuntime:
         hedge_quantity_step = (
             short_quantity_step if maker_leg == Side.BUY else long_quantity_step
         )
-        hedgeability_blocker = self._pending_entry_pre_submit_hedgeability_blocker(
-            candidate=candidate,
-            now_ms=now_ms,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            maker_venue=maker_venue,
-            hedge_venue=hedge_venue,
-            maker_quantity_step=maker_quantity_step,
-            hedge_quantity_step=hedge_quantity_step,
-            min_hedgeable_chunk=min_hedgeable_chunk,
-            entry_type=entry_type,
-        )
-        if hedgeability_blocker is not None:
-            if hedgeability_blocker["guard_enabled"]:
-                self.ctx.journal.append(
-                    "runtime.entry_blocked_pre_submit_hedgeability",
-                    hedgeability_blocker,
-                )
-                self.ctx.journal.append(
-                    "review.candidate_rejected",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "rejected_stage": "pre_submit_hedgeability_guard",
-                        "rejected_reason": hedgeability_blocker["reason"],
-                        "ranking_edge_bps": candidate.ranking_edge_bps,
-                        "expected_edge_bps": candidate.expected_edge_bps,
-                        "funding_edge_bps": candidate.funding_edge_bps,
-                        "ts_ms": now_ms,
-                    },
-                )
-                return False
-            self.ctx.journal.append(
-                "runtime.entry_pre_submit_hedgeability_advisory",
-                hedgeability_blocker,
+        hedgeability_guard_enabled = bool(
+            getattr(
+                self.ctx.config.strategy,
+                "pending_entry_pre_submit_hedgeable_fill_guard_enabled",
+                True,
             )
+        )
+        small_fill_buffer_enabled = (
+            float(
+                getattr(
+                    self.ctx.config.strategy,
+                    "passive_small_fill_buffer_notional_quote",
+                    0.0,
+                )
+                or 0.0
+            )
+            > 0.0
+            and int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "passive_small_fill_buffer_max_wait_ms",
+                    0,
+                )
+                or 0
+            )
+            > 0
+        )
+        hedgeability_decision = PendingEntryAdmissionCore.decide(
+            PendingEntryAdmissionRequest(
+                symbol=candidate.symbol,
+                long_venue=long_venue.value,
+                short_venue=short_venue.value,
+                maker_venue=maker_venue.value,
+                hedge_venue=hedge_venue.value,
+                entry_type=entry_type.value,
+                maker_metadata=self._entry_passive_metadata(
+                    maker_venue,
+                    candidate.symbol,
+                ),
+                maker_quantity_step=maker_quantity_step,
+                hedge_quantity_step=hedge_quantity_step,
+                min_hedgeable_chunk=min_hedgeable_chunk,
+                full_target_quantity=plan.full_target_quantity,
+                initial_maker_target_quantity=plan.initial_maker_target_quantity,
+                guard_enabled=hedgeability_guard_enabled,
+                small_fill_buffer_enabled=small_fill_buffer_enabled,
+                ts_ms=now_ms,
+            )
+        )
+        if hedgeability_decision.event_kind:
+            self.ctx.journal.append(
+                hedgeability_decision.event_kind,
+                hedgeability_decision.payload or {},
+            )
+        if not hedgeability_decision.can_submit:
+            payload = hedgeability_decision.payload or {}
+            self.ctx.journal.append(
+                "review.candidate_rejected",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "rejected_stage": "pre_submit_hedgeability_guard",
+                    "rejected_reason": payload.get("reason", ""),
+                    "ranking_edge_bps": candidate.ranking_edge_bps,
+                    "expected_edge_bps": candidate.expected_edge_bps,
+                    "funding_edge_bps": candidate.funding_edge_bps,
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
 
         if is_client_order_id_duplicate(maker_cid, self.ctx._recovery_dedup_index):
             self.ctx.journal.append(

@@ -21,8 +21,11 @@ decision path short.
   pending-entry maker progress or missing-hedge accounting.
 - Pending-entry pre-submit hedgeability guard:
   `runtime.entry_blocked_pre_submit_hedgeability` with
-  `reason=maker_fill_increment_below_hedge_min_chunk` or
-  `maker_fill_unit_truth_unavailable`.
+  `reason=maker_fill_unit_truth_unavailable` or
+  `reason=planned_maker_clip_below_hedge_min_chunk`; small maker increments
+  below the hedge chunk should produce
+  `runtime.entry_pre_submit_hedgeability_advisory` when the planned maker clip
+  is hedgeable and V1 small-fill buffering is enabled.
 - Cleanup terminal-release lag:
   `entry.cleanup_leg_exposure_truth_blocked` with
   `reason=cleanup_terminal_truth_not_fresh` or
@@ -100,12 +103,16 @@ Deterministic hedge admission reject must:
     quantities. Gate REST/WS order-progress parsers must convert contract
     counts to base at the venue boundary and retain raw contract evidence in
     diagnostics where available.
-20. Before submitting a passive maker entry, runtime must prove that the
-    smallest observable maker fill increment can be legally hedged on the
-    hedge venue. If maker unit truth is missing, or the maker increment is
-    below the hedge venue min-notional/step chunk, block at symbol/candidate
-    scope before maker submit. The guard is configurable, but disabled mode
-    must emit an explicit advisory with unit evidence.
+20. Before submitting a passive maker entry, runtime must use the shared
+    pending-entry admission decision core. Pre-submit admission proves that
+    the planned maker clip and full target can form a hedgeable chunk. If maker
+    unit truth is missing, or the planned maker clip is below the hedge venue
+    min-notional/step chunk, block at symbol/candidate scope before maker
+    submit. If the smallest observable maker fill increment is below the hedge
+    chunk but the planned clip is hedgeable and V1 small-fill buffering is
+    enabled, allow submit and emit
+    `runtime.entry_pre_submit_hedgeability_advisory` with unit evidence; the
+    post-fill pending-entry hedge-delta path owns buffering and release.
 21. Reduce-only cleanup fills are execution evidence, not terminal owner
     release truth. Pending-entry abort/cleanup release requires fresh flat
     position truth and, where a maker order reference exists, terminal order

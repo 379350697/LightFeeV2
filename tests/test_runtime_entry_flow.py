@@ -2558,7 +2558,7 @@ class TestPlannerDispatchIntegration:
         assert payload["venue_quantity_metadata"]["okx"]["quantity_step"] == pytest.approx(100.0)
 
     @pytest.mark.asyncio
-    async def test_dispatch_entry_blocks_passive_maker_when_fill_increment_is_below_hedge_min_chunk(
+    async def test_dispatch_entry_allows_hedgeable_plan_when_fill_increment_uses_small_fill_buffer(
         self, config, tmp_journal,
     ):
         config.strategy.maker_initial_slice_ratio = 1.0
@@ -2621,6 +2621,84 @@ class TestPlannerDispatchIntegration:
 
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
 
+        assert dispatched is True
+        assert executor.called is True
+        records = runtime.journal.read_all()
+        blockers = [
+            r["payload"]
+            for r in records
+            if r["kind"] == "runtime.entry_blocked_pre_submit_hedgeability"
+        ]
+        assert blockers == []
+        advisory = [
+            r["payload"]
+            for r in records
+            if r["kind"] == "runtime.entry_pre_submit_hedgeability_advisory"
+        ][-1]
+        assert advisory["reason"] == "maker_fill_increment_below_hedge_min_chunk"
+        assert advisory["maker_fill_increment_base"] == pytest.approx(0.01)
+        assert advisory["min_hedgeable_chunk"] == pytest.approx(1.0)
+        assert advisory["small_fill_buffer_required"] is True
+        assert advisory["planned_clip_hedgeable"] is True
+        assert advisory["cooldown_scope"] == "symbol"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_fail_closes_gate_when_quantity_metadata_is_missing(
+        self, config, tmp_journal,
+    ):
+        config.strategy.maker_initial_slice_ratio = 1.0
+        config.strategy.min_entry_leg_notional_quote = 1.0
+        config.strategy.pending_entry_pre_submit_hedgeable_fill_guard_enabled = True
+        gate = FakeVenueAdapter(
+            Venue.GATE,
+            passive_metadata_payload={},
+        )
+        bybit = FakeVenueAdapter(
+            Venue.BYBIT,
+            passive_metadata_payload={
+                "min_notional": 1.0,
+                "min_quantity": 0.001,
+                "quantity_step": 0.001,
+            },
+        )
+        adapters = {Venue.GATE: gate, Venue.BYBIT: bybit}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="gate",
+            short_venue="bybit",
+            symbol="TINYUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=50.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
         assert dispatched is False
         assert executor.called is False
         records = runtime.journal.read_all()
@@ -2629,10 +2707,15 @@ class TestPlannerDispatchIntegration:
             for r in records
             if r["kind"] == "runtime.entry_blocked_pre_submit_hedgeability"
         ]
-        assert blockers[-1]["reason"] == "maker_fill_increment_below_hedge_min_chunk"
-        assert blockers[-1]["maker_fill_increment_base"] == pytest.approx(0.01)
-        assert blockers[-1]["min_hedgeable_chunk"] == pytest.approx(1.0)
-        assert blockers[-1]["cooldown_scope"] == "symbol"
+        assert blockers == []
+        skipped = [
+            r["payload"]
+            for r in records
+            if r["kind"] == "runtime.entry_skipped_quantity_metadata_missing"
+        ][-1]
+        assert skipped["reason"] == "quantity_metadata_missing"
+        assert skipped["missing_venues"] == ["gate"]
+        assert skipped["missing_fields"]["gate"] == ["metadata"]
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_guard_disabled_allows_passive_submit_but_logs_unit_evidence(
