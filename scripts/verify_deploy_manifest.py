@@ -46,10 +46,14 @@ CRITICAL_FILES = [
 # --- Files/dirs to exclude from sync ---
 EXCLUDE_PATTERNS = [
     ".deploy_manifest.json",  # generated artifact; self-hash cannot be stable
+    ".deploy_version",        # remote runtime metadata; rewritten after sync
     ".venv",
     "__pycache__",
     "*.pyc",
     ".git",
+    ".gitnexus/",             # local code-index/cache data
+    ".pytest_cache/",
+    ".ruff_cache/",
     "config/live.toml",       # local secrets
     "config/*.local.toml",    # local secrets
     "runtime/",               # runtime output

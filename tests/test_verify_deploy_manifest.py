@@ -108,6 +108,28 @@ def test_generate_deploy_script_computes_deploy_version_at_runtime(tmp_path, mon
     assert 'echo "abc123" > "$REMOTE_PATH/.deploy_version"' not in script
 
 
+def test_generate_deploy_script_preserves_remote_version_and_skips_local_caches(
+    tmp_path, monkeypatch
+):
+    _stub_manifest_generation(monkeypatch)
+
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+
+    rsync_line = next(line for line in script.splitlines() if line.startswith("rsync "))
+    for pattern in (
+        ".deploy_version",
+        ".gitnexus/",
+        ".pytest_cache/",
+        ".ruff_cache/",
+    ):
+        assert f"--exclude {pattern}" in rsync_line
+
+
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):
     local_manifest = {path: "abc" for path in manifest.CRITICAL_FILES}
     calls = []
