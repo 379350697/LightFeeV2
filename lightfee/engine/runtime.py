@@ -2001,6 +2001,9 @@ class LiveRuntime:
             self.passive_close_executor.set_l2_quote_resolver(
                 self._resolve_close_price_hint_quote_with_source
             )
+            self.passive_close_executor.set_close_price_evidence_rewarmer(
+                self.close_runtime._rewarm_close_price_evidence
+            )
             # Inject close executor for DUAL_TAKER fallback
             if self.close_executor is not None:
                 self.passive_close_executor.set_close_executor(self.close_executor)

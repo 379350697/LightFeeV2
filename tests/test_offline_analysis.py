@@ -1616,6 +1616,57 @@ class TestProductionBlockerAnalyzer:
             "oi_targeted_max_elapsed_ms": 101,
         }
 
+    def test_strategy_candidate_funnel_audit_groups_blockers_without_config_advice(self):
+        from scripts.analyze_production_blockers import build_strategy_candidate_funnel_audit
+
+        audit = build_strategy_candidate_funnel_audit([
+            {
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {
+                    "top_quote_blocker_buckets": {"quote_stale": 3},
+                    "open_interest_blocker_counts": {"oi_below_floor": 2},
+                    "execution_liquidity_blocked_counts": {"insufficient_depth": 1},
+                    "entry_admission_blocker_counts": {
+                        "maker_fill_unit_truth_unavailable": 1,
+                        "position_capacity_full": 1,
+                        "entry_waiting_for_finalization_window_too_early": 1,
+                    },
+                },
+            },
+            {
+                "kind": "execution.entry_liquidity_blocked",
+                "payload": {
+                    "reason": "open_interest_unavailable",
+                    "open_interest_evidence_status": "deferred_by_cap",
+                },
+            },
+            {
+                "kind": "startup.trading_preflight",
+                "payload": {
+                    "venues": {
+                        "hyperliquid": {
+                            "status": "failed",
+                            "reason": "account_wallet_signer_mismatch",
+                        }
+                    }
+                },
+            },
+        ])
+
+        assert audit["category_counts"] == {
+            "admission": 1,
+            "capacity": 1,
+            "finalization_window": 1,
+            "oi_liquidity": 4,
+            "quote": 3,
+            "venue_readiness": 1,
+        }
+        assert audit["top_reasons"][0]["reason"] == "quote_stale"
+        rendered = json.dumps(audit, sort_keys=True)
+        assert "lower" not in rendered
+        assert "raise" not in rendered
+        assert "config" not in rendered
+
 
 def _code_side_blocker_incident_records():
     return [

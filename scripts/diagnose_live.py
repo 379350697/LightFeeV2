@@ -110,6 +110,9 @@ L2_WARNING_KINDS = frozenset({
     "runtime.snapshot_degraded",
     "runtime.entry_blocked_local_l2_selection",
     "runtime.entry_local_l2_readiness_diagnostics",
+    "runtime.close_price_evidence_rewarm_failed",
+    "runtime.passive_close_readiness_blocked",
+    "exit.passive_close_maker_terminal_no_fill",
     "scan.no_entry_diagnostics",
 })
 
@@ -3274,7 +3277,13 @@ def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
     missing_l2_count = 0
     stale_rebuild_count = 0
     sequence_gap_count = 0
+    close_readiness_blocked_count = 0
+    close_readiness_rewarm_failed_count = 0
+    close_readiness_missing_tick_count = 0
+    close_readiness_would_take_count = 0
+    passive_close_maker_terminal_no_fill_count = 0
     details: list[dict[str, Any]] = []
+    close_readiness_samples: list[dict[str, Any]] = []
 
     for rec in events:
         kind = str(rec.get("kind", ""))
@@ -3315,12 +3324,63 @@ def _build_l2_evidence(events: list[dict[str, Any]]) -> dict[str, Any]:
                     int(v) for v in reason_totals.values()
                     if isinstance(v, (int, float))
                 )
+        elif kind == "runtime.close_price_evidence_rewarm_failed":
+            close_readiness_rewarm_failed_count += 1
+            if len(close_readiness_samples) < 20:
+                close_readiness_samples.append({
+                    "kind": kind,
+                    "position_id": str(payload.get("position_id") or ""),
+                    "venue": str(payload.get("venue") or ""),
+                    "symbol": str(payload.get("symbol") or ""),
+                    "reason": str(payload.get("outcome") or payload.get("reason") or ""),
+                    "ts_ms": rec.get("ts_ms", 0),
+                })
+        elif kind == "runtime.passive_close_readiness_blocked":
+            close_readiness_blocked_count += 1
+            reasons = payload.get("reasons", []) or []
+            if isinstance(reasons, str):
+                reasons = [reasons]
+            readiness_items = payload.get("readiness", []) or []
+            saw_leg_missing_tick = False
+            if isinstance(readiness_items, list):
+                for item in readiness_items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_reasons = item.get("reasons", []) or []
+                    if isinstance(item_reasons, str):
+                        item_reasons = [item_reasons]
+                    if "missing_tick_size" in {str(r) for r in item_reasons}:
+                        close_readiness_missing_tick_count += 1
+                        saw_leg_missing_tick = True
+                    if item.get("would_take") is True or "post_only_would_take" in {
+                        str(r) for r in item_reasons
+                    }:
+                        close_readiness_would_take_count += 1
+            if not saw_leg_missing_tick and any(str(reason) == "missing_tick_size" for reason in reasons):
+                close_readiness_missing_tick_count += 1
+            if len(close_readiness_samples) < 20:
+                close_readiness_samples.append({
+                    "kind": kind,
+                    "position_id": str(payload.get("position_id") or ""),
+                    "venue": "",
+                    "symbol": str(payload.get("symbol") or ""),
+                    "reason": ",".join(str(reason) for reason in reasons),
+                    "ts_ms": rec.get("ts_ms", 0),
+                })
+        elif kind == "exit.passive_close_maker_terminal_no_fill":
+            passive_close_maker_terminal_no_fill_count += 1
 
     return {
         "missing_l2_or_tick_count": missing_l2_count,
         "stale_rebuild_count": stale_rebuild_count,
         "sequence_gap_count": sequence_gap_count,
         "details": details[:20],
+        "close_readiness_blocked_count": close_readiness_blocked_count,
+        "close_readiness_rewarm_failed_count": close_readiness_rewarm_failed_count,
+        "close_readiness_missing_tick_count": close_readiness_missing_tick_count,
+        "close_readiness_would_take_count": close_readiness_would_take_count,
+        "passive_close_maker_terminal_no_fill_count": passive_close_maker_terminal_no_fill_count,
+        "close_readiness_samples": close_readiness_samples[:20],
     }
 
 

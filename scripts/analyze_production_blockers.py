@@ -615,6 +615,109 @@ def build_code_side_blocker_view(
     )
 
 
+def _candidate_funnel_category(reason: str) -> str:
+    reason = str(reason or "").lower()
+    if "finalization_window" in reason or "too_early" in reason:
+        return "finalization_window"
+    if "capacity" in reason or "slot" in reason or "max_position" in reason:
+        return "capacity"
+    if (
+        "open_interest" in reason
+        or reason.startswith("oi_")
+        or "liquidity" in reason
+        or "depth" in reason
+    ):
+        return "oi_liquidity"
+    if "quote" in reason or "bbo" in reason or "stale" in reason:
+        return "quote"
+    if "venue" in reason or "preflight" in reason or "wallet" in reason or "signer" in reason:
+        return "venue_readiness"
+    return "admission"
+
+
+def build_strategy_candidate_funnel_audit(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    category_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+
+    def add_reason(reason: str, count: int = 1, *, category: str | None = None) -> None:
+        clean_reason = str(reason or "unknown")
+        safe_count = max(0, int(count or 0))
+        if safe_count <= 0:
+            return
+        selected_category = category or _candidate_funnel_category(clean_reason)
+        category_counts[selected_category] += safe_count
+        reason_counts[clean_reason] += safe_count
+
+    for record in records:
+        kind = str(record.get("kind", "") or "")
+        payload = _payload(record)
+        if kind == "scan.no_entry_diagnostics":
+            for reason, count in (payload.get("top_quote_blocker_buckets", {}) or {}).items():
+                add_reason(str(reason), int(count or 0), category="quote")
+            for reason, count in (payload.get("snapshot_freshness_blocked_counts", {}) or {}).items():
+                add_reason(str(reason), int(count or 0), category="quote")
+            for reason, count in (payload.get("open_interest_blocker_counts", {}) or {}).items():
+                add_reason(str(reason), int(count or 0), category="oi_liquidity")
+            for reason, count in (payload.get("execution_liquidity_blocked_counts", {}) or {}).items():
+                add_reason(str(reason), int(count or 0), category="oi_liquidity")
+            for reason, count in (payload.get("entry_admission_blocker_counts", {}) or {}).items():
+                add_reason(str(reason), int(count or 0))
+            for reason, count in (payload.get("entry_ws_bbo_blocker_counts", {}) or {}).items():
+                add_reason(str(reason), int(count or 0), category="quote")
+        elif kind == "execution.entry_liquidity_blocked":
+            status = str(payload.get("open_interest_evidence_status") or "")
+            reason = str(payload.get("reason") or status or "entry_liquidity_blocked")
+            add_reason(reason, 1, category="oi_liquidity")
+        elif kind in {
+            "runtime.entry_quote_revalidate_failed",
+            "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
+            "runtime.snapshot_freshness_decision",
+        }:
+            reason = str(
+                payload.get("reason_bucket")
+                or payload.get("outcome")
+                or payload.get("reason")
+                or kind
+            )
+            add_reason(reason, 1, category="quote")
+        elif kind == "startup.trading_preflight":
+            venues = payload.get("venues", {}) or {}
+            if isinstance(venues, dict):
+                for venue, view in venues.items():
+                    if not isinstance(view, dict):
+                        continue
+                    if str(view.get("status") or "").lower() == "failed":
+                        reason = str(view.get("reason") or "preflight_failed")
+                        add_reason(f"{venue}:{reason}", 1, category="venue_readiness")
+
+    suggestions = []
+    if category_counts.get("quote", 0):
+        suggestions.append("audit_quote_freshness_and_rewarm_coverage")
+    if category_counts.get("oi_liquidity", 0):
+        suggestions.append("audit_oi_liquidity_evidence_path")
+    if category_counts.get("admission", 0):
+        suggestions.append("audit_admission_truth_inputs")
+    if category_counts.get("capacity", 0):
+        suggestions.append("audit_capacity_and_pending_work")
+    if category_counts.get("venue_readiness", 0):
+        suggestions.append("audit_venue_private_readiness")
+    if category_counts.get("finalization_window", 0):
+        suggestions.append("separate_expected_finalization_wait_from_blockers")
+
+    return {
+        "enabled": True,
+        "mode": "advice_only_no_parameter_change",
+        "category_counts": dict(sorted(category_counts.items())),
+        "top_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in reason_counts.most_common(10)
+        ],
+        "suggestions": suggestions,
+    }
+
+
 def _has_official_sequence_evidence(payload: dict[str, Any]) -> bool:
     return has_official_sequence_rebuild_evidence(payload)
 
@@ -778,6 +881,7 @@ def analyze_event_file(
         nonblocking_bulk_probe_details: dict[tuple[str, str], dict[str, Any]] = {}
         candidate_starvation_reasons: Counter[str] = Counter()
         candidate_starvation_symbols: Counter[str] = Counter()
+        window_records: list[dict[str, Any]] = []
         incident_conclusions: dict[str, str] = {}
         w_first = 0
         w_last = 0
@@ -846,6 +950,7 @@ def analyze_event_file(
             ts_ms = int(record.get("ts_ms", 0) or 0)
             if ts_ms < since_ms:
                 continue
+            window_records.append(record)
             kind = str(record.get("kind", "") or "")
             payload = _payload(record)
             event_counts[kind] += 1
@@ -1087,6 +1192,9 @@ def analyze_event_file(
                 filtered_out_counts=code_side_filtered_counts,
                 exclude_strategy=exclude_strategy,
                 exclude_liquidity=exclude_liquidity,
+            ),
+            "strategy_candidate_funnel_audit": build_strategy_candidate_funnel_audit(
+                window_records
             ),
             "blocker_reason_counts": blocker_reason_counts,
             "nonblocking_bulk_probe_summary": {

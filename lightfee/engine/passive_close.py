@@ -292,6 +292,38 @@ def ops_token_available(
     return pending.ops_count_this_window < profile.ops_budget_per_window
 
 
+@dataclass(frozen=True)
+class PassiveCloseReadiness:
+    status: str
+    maker_leg: ActiveMakerLeg
+    venue: Venue
+    symbol: str
+    price_hint: float
+    tick_size: float
+    quote: tuple[float, float] | None
+    aligned_price: float
+    would_take: bool
+    reasons: tuple[str, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "maker_leg": self.maker_leg.value,
+            "venue": self.venue.value,
+            "symbol": self.symbol,
+            "price_hint": self.price_hint,
+            "tick_size": self.tick_size,
+            "quote": (
+                {"bid": self.quote[0], "ask": self.quote[1]}
+                if self.quote is not None
+                else None
+            ),
+            "aligned_price": self.aligned_price,
+            "would_take": self.would_take,
+            "reasons": list(self.reasons),
+        }
+
+
 class PassiveCloseExecutor:
     """V1 passive close executor: maker+taker close with GTC post-only maker leg.
 
@@ -333,6 +365,7 @@ class PassiveCloseExecutor:
         self._l2_mid_resolver: Optional[callable] = None
         # Inject L2 top-of-book resolver for V1 passive tick inference.
         self._l2_quote_resolver: Optional[callable] = None
+        self._close_price_evidence_rewarmer: Optional[callable] = None
         # Inject aggressive close executor for fallback (set by runtime after construction)
         self._close_executor: Optional[object] = None
         self._last_maker_progress_error: dict[str, Any] | None = None
@@ -370,6 +403,9 @@ class PassiveCloseExecutor:
 
     def set_l2_quote_resolver(self, resolver: callable) -> None:
         self._l2_quote_resolver = resolver
+
+    def set_close_price_evidence_rewarmer(self, rewarmer: callable) -> None:
+        self._close_price_evidence_rewarmer = rewarmer
 
     def set_close_executor(self, executor: object) -> None:
         self._close_executor = executor
@@ -1300,6 +1336,61 @@ class PassiveCloseExecutor:
                 )
                 return await self._fallback_to_aggressive_close(state, pending, position)
 
+            if self._passive_close_should_preflight_maker_readiness(pending):
+                readiness = await self._select_passive_close_readiness(
+                    pending,
+                    position,
+                    now_ms=now_ms,
+                )
+                ready = next(
+                    (item for item in readiness if item.status == "ready"),
+                    None,
+                )
+                if ready is None:
+                    pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                    self._journal.append(
+                        "runtime.passive_close_readiness_blocked",
+                        {
+                            "position_id": position_id,
+                            "symbol": position.symbol,
+                            "reason": pending.reason,
+                            "decision": "retain_pending",
+                            "next_retry_at_ms": pending.next_retry_at_ms,
+                            "reasons": sorted(
+                                {
+                                    reason
+                                    for item in readiness
+                                    for reason in item.reasons
+                                }
+                            ),
+                            "readiness": [item.to_payload() for item in readiness],
+                        },
+                    )
+                    return False
+                switched = ready.maker_leg != pending.phase_state.active_maker_leg
+                if switched:
+                    pending.phase_state.active_maker_leg = ready.maker_leg
+                    pending.phase_state.maker_order_id = ""
+                    pending.phase_state.maker_client_order_id = ""
+                    pending.phase_state.maker_resting_limit_price = None
+                    pending.phase_state.maker_resting_since_ms = 0
+                self._journal.append(
+                    "runtime.passive_close_readiness_ready",
+                    {
+                        "position_id": position_id,
+                        "symbol": position.symbol,
+                        "reason": pending.reason,
+                        "maker_leg": ready.maker_leg.value,
+                        "venue": ready.venue.value,
+                        "price_hint": ready.price_hint,
+                        "tick_size": ready.tick_size,
+                        "aligned_price": ready.aligned_price,
+                        "would_take": ready.would_take,
+                        "switched_maker_leg": switched,
+                        "readiness": [item.to_payload() for item in readiness],
+                    },
+                )
+
             # Determine maker leg metadata
             maker_leg = pending.phase_state.active_maker_leg
             if maker_leg == ActiveMakerLeg.LONG:
@@ -1941,6 +2032,116 @@ class PassiveCloseExecutor:
             # Inter-cycle delay for polling
             if wait_until_terminal:
                 await asyncio.sleep(self._config.progress_poll_interval_ms / 1000.0)
+
+    def _passive_close_should_preflight_maker_readiness(
+        self,
+        pending: PendingPassiveClose,
+    ) -> bool:
+        if getattr(self, "_l2_quote_resolver", None) is None:
+            return False
+        phase = pending.phase_state
+        if phase.phase == PassiveExecutionPhase.DUAL_TAKER:
+            return False
+        if phase.maker_order_id or phase.maker_client_order_id:
+            return False
+        if pending.maker_fill.quantity > 1e-9 or pending.hedge_fill.quantity > 1e-9:
+            return False
+        return True
+
+    async def _select_passive_close_readiness(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        now_ms: int,
+    ) -> list[PassiveCloseReadiness]:
+        active = pending.phase_state.active_maker_leg
+        alternate = (
+            ActiveMakerLeg.SHORT
+            if active == ActiveMakerLeg.LONG
+            else ActiveMakerLeg.LONG
+        )
+        rewarmer = self._close_price_evidence_rewarmer
+        if callable(rewarmer):
+            await rewarmer(
+                [
+                    (position.long_venue.value, position.symbol),
+                    (position.short_venue.value, position.symbol),
+                ],
+                now_ms=now_ms,
+            )
+        readiness = [
+            await self._passive_close_readiness_for_leg(position, active),
+            await self._passive_close_readiness_for_leg(position, alternate),
+        ]
+        self._journal.append(
+            "runtime.passive_close_readiness_rewarm_attempted",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "reason": pending.reason,
+                "phase": pending.phase_state.phase.value,
+                "readiness": [item.to_payload() for item in readiness],
+                "ts_ms": now_ms,
+            },
+        )
+        return readiness
+
+    async def _passive_close_readiness_for_leg(
+        self,
+        position: OpenPosition,
+        maker_leg: ActiveMakerLeg,
+    ) -> PassiveCloseReadiness:
+        if maker_leg == ActiveMakerLeg.LONG:
+            venue = position.long_venue
+            side = Side.SELL
+        else:
+            venue = position.short_venue
+            side = Side.BUY
+
+        price_hint = self._resolve_local_l2_mid(venue, position.symbol)
+        tick_size = await self._get_passive_tick_size(
+            venue,
+            position.symbol,
+            target_price=price_hint,
+            side=side,
+        )
+        quote = self._resolve_local_l2_quote(venue, position.symbol)
+        aligned_price = (
+            align_passive_price_to_tick(price_hint, tick_size, side)
+            if price_hint > 0.0 and tick_size > 0.0
+            else 0.0
+        )
+        would_take = (
+            self._post_only_price_would_take(side, aligned_price, quote)
+            if aligned_price > 0.0
+            else False
+        )
+
+        reasons: list[str] = []
+        if price_hint <= 0.0:
+            reasons.append("missing_price_hint")
+        if tick_size <= 0.0:
+            reasons.append("missing_tick_size")
+        if quote is None:
+            reasons.append("missing_quote")
+        if price_hint > 0.0 and tick_size > 0.0 and aligned_price <= 0.0:
+            reasons.append("invalid_aligned_price")
+        if would_take:
+            reasons.append("post_only_would_take")
+
+        return PassiveCloseReadiness(
+            status="ready" if not reasons else "blocked",
+            maker_leg=maker_leg,
+            venue=venue,
+            symbol=position.symbol,
+            price_hint=price_hint,
+            tick_size=tick_size,
+            quote=quote,
+            aligned_price=aligned_price,
+            would_take=would_take,
+            reasons=tuple(reasons),
+        )
 
     # ------------------------------------------------------------------
     # Submit maker order

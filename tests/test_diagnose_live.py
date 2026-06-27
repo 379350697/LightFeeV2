@@ -211,6 +211,61 @@ def test_l2_evidence_excludes_legacy_ws_bbo_selection_events():
     ]
 
 
+def test_l2_evidence_tracks_passive_close_readiness_gap_and_no_fill():
+    from scripts.diagnose_live import _build_l2_evidence
+
+    evidence = _build_l2_evidence([
+        {
+            "ts_ms": 1779810002000,
+            "kind": "runtime.passive_close_readiness_blocked",
+            "payload": {
+                "position_id": "pos-close-1",
+                "symbol": "BTCUSDT",
+                "reasons": ["missing_tick_size", "post_only_would_take"],
+                "readiness": [
+                    {
+                        "venue": "binance",
+                        "maker_leg": "long",
+                        "reasons": ["post_only_would_take"],
+                        "would_take": True,
+                    },
+                    {
+                        "venue": "bybit",
+                        "maker_leg": "short",
+                        "reasons": ["missing_tick_size"],
+                        "would_take": False,
+                    },
+                ],
+            },
+        },
+        {
+            "ts_ms": 1779810003000,
+            "kind": "runtime.close_price_evidence_rewarm_failed",
+            "payload": {
+                "venue": "bybit",
+                "symbol": "BTCUSDT",
+                "outcome": "rest_topbook_unavailable",
+            },
+        },
+        {
+            "ts_ms": 1779810004000,
+            "kind": "exit.passive_close_maker_terminal_no_fill",
+            "payload": {
+                "position_id": "pos-close-1",
+                "maker_venue": "binance",
+                "symbol": "BTCUSDT",
+            },
+        },
+    ])
+
+    assert evidence["close_readiness_blocked_count"] == 1
+    assert evidence["close_readiness_rewarm_failed_count"] == 1
+    assert evidence["close_readiness_missing_tick_count"] == 1
+    assert evidence["close_readiness_would_take_count"] == 1
+    assert evidence["passive_close_maker_terminal_no_fill_count"] == 1
+    assert evidence["close_readiness_samples"][0]["position_id"] == "pos-close-1"
+
+
 def test_snapshot_stale_and_degraded_are_reported_outside_l2_evidence():
     from scripts.diagnose_live import _build_l2_evidence, _build_snapshot_evidence
 

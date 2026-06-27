@@ -88,6 +88,223 @@ def _open_journal():
     return j
 
 
+class PassiveCloseReadinessAdapter:
+    def __init__(self) -> None:
+        self.submit_calls: list[OrderRequest] = []
+
+    async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
+        self.submit_calls.append(request)
+        return PassiveOrderAck(
+            order_id="maker-1",
+            client_order_id=request.client_order_id or "maker-cid",
+            resting_quantity=request.quantity,
+            accepted_at_ms=1_000,
+        )
+
+    async def fetch_maker_progress(self, symbol: str, order_id: str) -> PassiveOrderProgress:
+        return PassiveOrderProgress(state=PassiveOrderState.OPEN, cumulative_quantity=0.0)
+
+
+@pytest.mark.asyncio
+async def test_passive_close_readiness_blocks_maker_submit_when_tick_and_quote_missing():
+    journal = _open_journal()
+    try:
+        binance = PassiveCloseReadinessAdapter()
+        bybit = PassiveCloseReadinessAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: None)
+        state = EngineState()
+        position = OpenPosition(
+            position_id="pos-readiness-missing",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=1.0,
+            short_entry_price=1.0,
+            opened_at_ms=1_000,
+            matched_quantity=1.0,
+        )
+
+        pending = await executor.start_pending_passive_close(
+            state,
+            position,
+            "funding_capture",
+            long_price_hint=1.0,
+            short_price_hint=1.0,
+        )
+        assert pending is not None
+
+        resolved = await executor.drive_pending_passive_close(
+            state,
+            position.position_id,
+            wait_until_terminal=False,
+        )
+
+        assert resolved is False
+        assert position.position_id in state.pending_passive_closes
+        assert binance.submit_calls == []
+        assert bybit.submit_calls == []
+        records = journal.read_all()
+        blocked = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "runtime.passive_close_readiness_blocked"
+        ]
+        assert blocked
+        assert blocked[-1]["position_id"] == position.position_id
+        assert blocked[-1]["decision"] == "retain_pending"
+        assert "missing_quote" in blocked[-1]["reasons"]
+        assert "missing_tick_size" in blocked[-1]["reasons"]
+    finally:
+        journal.close()
+
+
+@pytest.mark.asyncio
+async def test_passive_close_readiness_selects_ready_leg_when_preferred_would_take():
+    journal = _open_journal()
+    try:
+        binance = PassiveCloseReadinessAdapter()
+        bybit = PassiveCloseReadinessAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+
+        def mid_resolver(venue: Venue, symbol: str) -> float:
+            return 1.0
+
+        def quote_resolver(venue: Venue, symbol: str):
+            if venue == Venue.BINANCE:
+                return (1.0, 1.01)
+            return (0.99, 1.01)
+
+        executor.set_l2_mid_resolver(mid_resolver)
+        executor.set_l2_quote_resolver(quote_resolver)
+        state = EngineState()
+        position = OpenPosition(
+            position_id="pos-readiness-switch",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=1.0,
+            short_entry_price=1.0,
+            opened_at_ms=1_000,
+            matched_quantity=1.0,
+        )
+        pending = await executor.start_pending_passive_close(
+            state,
+            position,
+            "funding_capture",
+            long_price_hint=1.0,
+            short_price_hint=1.0,
+        )
+        assert pending is not None
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.LONG
+        pending.phase_state.preferred_maker_leg = ActiveMakerLeg.LONG
+
+        resolved = await executor.drive_pending_passive_close(
+            state,
+            position.position_id,
+            wait_until_terminal=False,
+        )
+
+        assert resolved is False
+        assert binance.submit_calls == []
+        assert len(bybit.submit_calls) == 1
+        assert bybit.submit_calls[-1].side == Side.BUY
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.SHORT
+        ready = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.passive_close_readiness_ready"
+        ]
+        assert ready
+        assert ready[-1]["maker_leg"] == "short"
+        assert ready[-1]["switched_maker_leg"] is True
+    finally:
+        journal.close()
+
+
+@pytest.mark.asyncio
+async def test_passive_close_readiness_rewarm_success_allows_maker_submit():
+    journal = _open_journal()
+    try:
+        binance = PassiveCloseReadinessAdapter()
+        bybit = PassiveCloseReadinessAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        mids: dict[tuple[Venue, str], float] = {}
+        quotes: dict[tuple[Venue, str], tuple[float, float]] = {}
+        rewarm_keys: list[list[tuple[str, str]]] = []
+
+        executor.set_l2_mid_resolver(
+            lambda venue, symbol: mids.get((venue, symbol), 0.0)
+        )
+        executor.set_l2_quote_resolver(
+            lambda venue, symbol: quotes.get((venue, symbol))
+        )
+
+        async def rewarm(keys, *, now_ms):
+            rewarm_keys.append(list(keys))
+            mids[(Venue.BINANCE, "BTCUSDT")] = 1.0
+            mids[(Venue.BYBIT, "BTCUSDT")] = 1.0
+            quotes[(Venue.BINANCE, "BTCUSDT")] = (0.99, 1.01)
+            quotes[(Venue.BYBIT, "BTCUSDT")] = (0.99, 1.01)
+            return {}
+
+        executor.set_close_price_evidence_rewarmer(rewarm)
+        state = EngineState()
+        position = OpenPosition(
+            position_id="pos-readiness-rewarm",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=1.0,
+            short_entry_price=1.0,
+            opened_at_ms=1_000,
+            matched_quantity=1.0,
+        )
+        pending = await executor.start_pending_passive_close(
+            state,
+            position,
+            "funding_capture",
+            long_price_hint=0.0,
+            short_price_hint=0.0,
+        )
+        assert pending is not None
+
+        resolved = await executor.drive_pending_passive_close(
+            state,
+            position.position_id,
+            wait_until_terminal=False,
+        )
+
+        assert resolved is False
+        assert rewarm_keys == [[("binance", "BTCUSDT"), ("bybit", "BTCUSDT")]]
+        assert len(binance.submit_calls) == 1
+        ready = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.passive_close_readiness_ready"
+        ]
+        assert ready
+        assert ready[-1]["maker_leg"] == "long"
+    finally:
+        journal.close()
+
+
 def _make_position(**overrides) -> OpenPosition:
     defaults = dict(
         position_id="p001",

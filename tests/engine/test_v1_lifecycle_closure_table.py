@@ -592,6 +592,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.close_price_evidence_stale",
         "runtime.close_price_evidence_ws_bbo_used",
         "runtime.close_price_evidence_ws_rewarm_succeeded",
+        "runtime.passive_close_readiness_ready",
+        "runtime.passive_close_readiness_blocked",
+        "runtime.passive_close_readiness_rewarm_attempted",
         "runtime.passive_close_deadline_fallback_armed",
         "runtime.entry_dispatched",
         "runtime.funding_capture_state_updated",
@@ -671,6 +674,12 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("runtime.stale_risk_state_aligned") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.stale_risk_state_alignment_blocked") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.close_price_evidence_missing") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("runtime.passive_close_readiness_ready") == "PASSIVE_CLOSE"
+    assert map_lifecycle_event_kind("runtime.passive_close_readiness_blocked") == "PASSIVE_CLOSE"
+    assert (
+        map_lifecycle_event_kind("runtime.passive_close_readiness_rewarm_attempted")
+        == "PASSIVE_CLOSE"
+    )
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
         == "ENTRY_QUOTE_LEASE"
