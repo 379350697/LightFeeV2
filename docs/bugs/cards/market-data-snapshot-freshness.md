@@ -39,6 +39,22 @@ probe symbol mark truth, but if mark/symbol truth is missing or the mark probe
 rejects the symbol it must return `symbol_not_listed_before_http` rather than
 calling OI and treating the exchange 400 as normal market-data pressure.
 
+The same pre-HTTP eligibility principle also applies to symbol-scoped private
+truth probes, but it is a separate business domain from public OI. Aster
+`fetch_position(symbol)` and `fetch_open_orders(symbol)` may skip V3 private
+HTTP only when the adapter catalog proves the venue symbol is unsupported, and
+must classify the evidence as
+`symbol_not_listed_before_private_truth_http`. Missing catalog truth is not
+permission to invent flat/no-open-order truth; it remains `truth_unavailable`
+and preserves the existing live probe behavior. Account-level unfiltered
+private truth must remain available and must not be blocked by one unsupported
+candidate symbol.
+
+Diagnose must count public OI and private truth filters separately:
+`public_oi_pre_http_filtered_count` is market-data/OI evidence, while
+`private_truth_pre_http_filtered_count` is position/open-order truth evidence.
+Neither is an order failure or abnormal position by itself.
+
 Entry readiness is stricter than sidecar publication. Sidecar/last-good data may
 seed shortlist and warm tracking, but execution still needs a fresh validated
 top-book quote lease. Slow OI/liquidity evidence can be cached, capped, deferred,
@@ -118,6 +134,7 @@ V1 primary+shadow scope can increment current unresolved entry blockers.
 | 2026-06-24 | Gate/Bitget true funding timestamp sources and Gate contracts cache | `5d9c49e` code deployed/cloud verified; docs closure synced | CL-113 replaces synthetic Gate/Bitget funding observation timestamps with official future funding metadata: Bitget `current-fund-rate.nextUpdate`, Gate `contracts.funding_next_apply`, and fail-closed `0` when true future evidence is missing. Cloud smoke confirmed Gate/Bitget BTCUSDT future `funding_timestamp_ms=1782316800000`; Gate contracts metadata reuses the existing 10 minute funding cache so full `/contracts` is not fetched every sidecar cycle. No strategy window, sidecar pairing, quote TTL, OI floor, or trading guard is loosened. |
 | 2026-06-24 | Entry quote/OI prewarm horizon after Gate/Bitget candidate recovery | `653b21a` deployed/cloud verified | CL-115 adds a bounded `entry_quote_prewarm_extra_candidate_count=24` near-promotion horizon. Extra candidates only warm quote/OI caches and emit `prewarm_only` evidence; final entry filtering and dispatch remain V1 primary+shadow. Diagnose now separates `prewarm_extra` counters, avoids double-counting paired quote-revalidate/rewarm events, and does not count prewarm-only failures as unresolved blockers. Active venue admission cooldowns, including Aster `max_notional_admission_blocked`, prune before prewarm. Cloud since-deploy diagnose passed with no entry evidence blockers, no quote rewarm timeout, and exchange truth flat/no-open-orders. |
 | 2026-06-27 | Public OI pre-HTTP symbol filter and spread snapshot sharing | code fix `d2d89af` deployed/cloud verified | CL-123 filters Binance/Aster-compatible OI symbols before OI HTTP when bulk premiumIndex/bookTicker does not confirm tradeability or candidate mark truth is missing/rejected. Spread-sidecar defaults to consuming the main sidecar snapshot and only direct-fetches public data through an explicit fallback config that marks `source_mode=direct_market_fallback`. |
+| 2026-06-27 | Private truth pre-HTTP symbol filter and spread source-state classification | local green, deploy pending | CL-124 adds shared `venue_symbol_eligibility(...)` for Aster private position/open-order probes, reports `symbol_not_listed_before_private_truth_http` before V3 private HTTP, keeps account-level unfiltered truth untouched, and splits spread stale source evidence into current degraded vs `transient_stale_recovered`. No quote/OI threshold, entry sizing, order, close, or recovery behavior is changed. |
 
 ## Regression Harness
 

@@ -66,6 +66,10 @@ from lightfee.offline.analysis.journal import (
 )
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 from lightfee.ops.position_side_semantics import side_matches_business_leg
+from lightfee.venues.symbol_eligibility import (
+    PRIVATE_TRUTH_UNSUPPORTED_REASON,
+    venue_symbol_eligibility,
+)
 from lightfee.venues.specs import VenueOperation
 
 # Schema version — bump when output shape changes
@@ -944,6 +948,39 @@ def _unsupported_symbol_probe_error(exc: Exception) -> bool:
     )
 
 
+async def _private_symbol_eligibility_for_probe(adapter: Any, symbol: str):
+    venue = _venue_from_probe_text(str(getattr(adapter, "venue", "")))
+    if venue != Venue.ASTER:
+        return None
+    supported_provider = getattr(adapter, "supported_symbols", None)
+    supported_symbols: list[str] = []
+    if callable(supported_provider):
+        try:
+            supported_symbols = list(supported_provider() or [])
+        except Exception:
+            supported_symbols = []
+    if not supported_symbols:
+        ensure_catalog = getattr(adapter, "ensure_supported_symbols_loaded", None)
+        if callable(ensure_catalog):
+            try:
+                result = ensure_catalog()
+                if hasattr(result, "__await__"):
+                    await result
+                supported_symbols = (
+                    list(supported_provider() or [])
+                    if callable(supported_provider)
+                    else []
+                )
+            except Exception:
+                supported_symbols = []
+    return venue_symbol_eligibility(
+        venue,
+        symbol,
+        supported_symbols=supported_symbols,
+        venue_symbol=_probe_venue_symbol(adapter, symbol),
+    )
+
+
 async def _fetch_venue_positions(
     adapter: Any, symbols: list[str],
 ) -> tuple[dict[str, Any], set[str], set[str], dict[str, Any]]:
@@ -994,6 +1031,17 @@ async def _fetch_venue_positions(
         return positions, succeeded, failed, evidence
 
     for sym in symbols:
+        eligibility = await _private_symbol_eligibility_for_probe(adapter, sym)
+        if eligibility is not None and eligibility.unsupported_before_http:
+            succeeded.add(sym)
+            evidence[sym] = {
+                "classification": "unsupported_symbol_flat",
+                "venue_symbol": eligibility.venue_symbol,
+                "reason": PRIVATE_TRUTH_UNSUPPORTED_REASON,
+                "catalog_loaded": eligibility.catalog_loaded,
+                "supported_symbol_count": eligibility.supported_symbol_count,
+            }
+            continue
         try:
             pos = await adapter.fetch_position(sym)
             qty = float(getattr(pos, "quantity", 0) or 0)
@@ -1175,6 +1223,18 @@ async def _fetch_venue_open_orders(
 
     for sym in symbols:
         venue_symbol = _probe_venue_symbol(adapter, sym)
+        eligibility = await _private_symbol_eligibility_for_probe(adapter, sym)
+        if eligibility is not None and eligibility.unsupported_before_http:
+            orders[sym] = []
+            succeeded.add(sym)
+            evidence[sym] = {
+                "classification": "unsupported_symbol_no_open_orders",
+                "venue_symbol": eligibility.venue_symbol,
+                "reason": PRIVATE_TRUTH_UNSUPPORTED_REASON,
+                "catalog_loaded": eligibility.catalog_loaded,
+                "supported_symbol_count": eligibility.supported_symbol_count,
+            }
+            continue
         try:
             contract_venue = _venue_from_probe_text(venue)
             if contract_venue == Venue.ASTER:
@@ -1377,6 +1437,14 @@ async def _build_exchange_truth_async_inner(
         # Only count venue as available if at least one position OR order query succeeded
         any_success = bool(pos_succeeded) or bool(ord_succeeded)
         any_failure = bool(pos_failed) or bool(ord_failed)
+        private_filtered_symbols = sorted(
+            {
+                sym
+                for evidence_items in (pos_evidence, ord_evidence)
+                for sym, item in evidence_items.items()
+                if item.get("reason") == PRIVATE_TRUTH_UNSUPPORTED_REASON
+            }
+        )
 
         fetch_status[venue] = {
             "status": "partial" if (any_success and any_failure) else (
@@ -1394,6 +1462,7 @@ async def _build_exchange_truth_async_inner(
                 sym for sym, item in ord_evidence.items()
                 if item.get("classification") == "unsupported_symbol_no_open_orders"
             ),
+            "private_truth_pre_http_filtered_symbols": private_filtered_symbols,
         }
 
         if any_success:
@@ -1445,6 +1514,11 @@ async def _build_exchange_truth_async_inner(
         "has_nonzero_position": has_any_position,
         "has_open_order": has_any_open_order,
         "fetch_status": fetch_status,
+        "private_truth_pre_http_filtered_count": sum(
+            len(fs.get("private_truth_pre_http_filtered_symbols") or [])
+            for fs in fetch_status.values()
+            if isinstance(fs, dict)
+        ),
         "errors": errors,
         "missing_evidence": missing,
     })
@@ -7943,7 +8017,12 @@ def _build_conclusion(
 # Main diagnose
 # ---------------------------------------------------------------------------
 
-def _build_spread_sidecar_summary(runtime_dir: str) -> dict[str, Any]:
+def _build_spread_sidecar_summary(
+    runtime_dir: str,
+    *,
+    now_ms: int = 0,
+    sidecar_snapshot_max_age_ms: int = 10_000,
+) -> dict[str, Any]:
     path = Path(runtime_dir) / "spread-opportunities-current.json"
     try:
         from lightfee.spread.publisher import load_spread_snapshot
@@ -7959,10 +8038,40 @@ def _build_spread_sidecar_summary(runtime_dir: str) -> dict[str, Any]:
             "candidate_count": 0,
             "degraded_venues": [],
         }
+    source = str(getattr(snapshot, "source_mode", "") or "unknown")
+    source_state = "current_ok"
+    current_degraded = False
+    main_age_ms: int | None = None
+    if source in {
+        "sidecar_snapshot_stale",
+        "sidecar_snapshot_unavailable",
+        "missing_or_malformed",
+    }:
+        source_state = "current_source_degraded"
+        current_degraded = True
+    if source == "sidecar_snapshot_stale":
+        try:
+            from lightfee.sidecar.publisher import load_snapshot
+
+            main_snapshot = load_snapshot(
+                Path(runtime_dir) / "opportunity-input-snapshot.json"
+            )
+        except Exception:
+            main_snapshot = None
+        observed_now_ms = int(now_ms or time.time() * 1000)
+        main_published_ms = int(getattr(main_snapshot, "published_at_ms", 0) or 0)
+        if main_published_ms > 0:
+            main_age_ms = observed_now_ms - main_published_ms
+        if main_age_ms is not None and 0 <= main_age_ms <= sidecar_snapshot_max_age_ms:
+            source_state = "transient_stale_recovered"
+            current_degraded = False
     return {
         "available": True,
         "path": str(path),
-        "spread_sidecar_source": str(getattr(snapshot, "source_mode", "") or "unknown"),
+        "spread_sidecar_source": source,
+        "spread_sidecar_source_state": source_state,
+        "spread_sidecar_current_degraded": current_degraded,
+        "main_sidecar_snapshot_age_ms": main_age_ms,
         "candidate_count": len(getattr(snapshot, "candidates", []) or []),
         "degraded_venues": list(getattr(snapshot, "degraded_venues", []) or []),
     }
@@ -8100,7 +8209,7 @@ def run_diagnose(
     l2_evidence = _build_l2_evidence(all_events)
     snapshot_evidence = _build_snapshot_evidence(all_events)
     runtime_warnings = _build_runtime_warnings(all_events)
-    spread_sidecar_summary = _build_spread_sidecar_summary(runtime_dir)
+    spread_sidecar_summary = _build_spread_sidecar_summary(runtime_dir, now_ms=now_ms)
     production_acceptance_gate = _build_production_acceptance_gate(
         all_events,
         local_state,

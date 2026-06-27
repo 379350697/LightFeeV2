@@ -80,9 +80,53 @@ def test_run_diagnose_reports_spread_sidecar_snapshot_source():
             "available": True,
             "path": os.path.join(d, "spread-opportunities-current.json"),
             "spread_sidecar_source": "sidecar_snapshot",
+            "spread_sidecar_source_state": "current_ok",
+            "spread_sidecar_current_degraded": False,
+            "main_sidecar_snapshot_age_ms": None,
             "candidate_count": 0,
             "degraded_venues": ["aster"],
         }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_fresh():
+    from lightfee.sidecar.publisher import publish_snapshot
+    from lightfee.sidecar.snapshot import SidecarSnapshot
+    from lightfee.spread.models import SpreadSnapshot
+    from lightfee.spread.publisher import publish_spread_snapshot
+    import scripts.diagnose_live as diagnose_live
+
+    d = _make_tmpdir()
+    try:
+        publish_snapshot(
+            SidecarSnapshot(
+                published_at_ms=10_000,
+                market_observed_at_ms=9_900,
+                source_mode="direct_market",
+                quotes={},
+                candidates=[],
+            ),
+            os.path.join(d, "opportunity-input-snapshot.json"),
+        )
+        publish_spread_snapshot(
+            SpreadSnapshot(
+                published_at_ms=10_100,
+                market_observed_at_ms=10_100,
+                source_mode="sidecar_snapshot_stale",
+                degraded_venues=["aster", "binance"],
+                candidates=[],
+            ),
+            os.path.join(d, "spread-opportunities-current.json"),
+        )
+
+        summary = diagnose_live._build_spread_sidecar_summary(d, now_ms=10_500)
+
+        assert summary["spread_sidecar_source"] == "sidecar_snapshot_stale"
+        assert summary["spread_sidecar_source_state"] == "transient_stale_recovered"
+        assert summary["spread_sidecar_current_degraded"] is False
+        assert summary["main_sidecar_snapshot_age_ms"] == 500
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -5744,6 +5788,109 @@ def test_exchange_truth_classifies_unsupported_position_symbol_as_flat_with_evid
     assert failed == set()
     assert evidence["PRLUSDT"]["classification"] == "unsupported_symbol_flat"
     assert "Instrument ID does not exist" in evidence["PRLUSDT"]["error"]
+
+
+def test_exchange_truth_filters_aster_private_unsupported_symbol_before_http():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        def _venue_symbol(self, symbol):
+            return str(symbol)
+
+    class FakeAdapter:
+        venue = "aster"
+
+        def __init__(self):
+            self._transport = FakeTransport()
+
+        def supported_symbols(self):
+            return ["BTCUSDT"]
+
+        async def fetch_position(self, symbol):
+            self._transport.calls.append(("position", symbol))
+            raise AssertionError("unsupported Aster symbol must be filtered before private position HTTP")
+
+        async def fetch_open_orders(self, symbol=None):
+            self._transport.calls.append(("open_orders", symbol))
+            raise AssertionError("unsupported Aster symbol must be filtered before private openOrders HTTP")
+
+    adapter = FakeAdapter()
+
+    positions, pos_succeeded, pos_failed, pos_evidence = asyncio.run(
+        dl._fetch_venue_positions(adapter, ["SIREN_USDT"])
+    )
+    orders, ord_succeeded, ord_failed, ord_evidence = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, ["SIREN_USDT"])
+    )
+
+    assert adapter._transport.calls == []
+    assert positions == {}
+    assert orders == {"SIREN_USDT": []}
+    assert pos_succeeded == {"SIREN_USDT"}
+    assert ord_succeeded == {"SIREN_USDT"}
+    assert pos_failed == set()
+    assert ord_failed == set()
+    assert pos_evidence["SIREN_USDT"]["classification"] == "unsupported_symbol_flat"
+    assert pos_evidence["SIREN_USDT"]["reason"] == "symbol_not_listed_before_private_truth_http"
+    assert ord_evidence["SIREN_USDT"]["classification"] == "unsupported_symbol_no_open_orders"
+    assert ord_evidence["SIREN_USDT"]["reason"] == "symbol_not_listed_before_private_truth_http"
+
+
+def test_exchange_truth_builder_counts_aster_private_pre_http_filtered_symbols(monkeypatch):
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeAdapter:
+        venue = "aster"
+
+        def __init__(self):
+            self._transport = type(
+                "FakeTransport",
+                (),
+                {"_venue_symbol": staticmethod(lambda symbol: str(symbol))},
+            )()
+
+        def supported_symbols(self):
+            return ["BTCUSDT"]
+
+        async def fetch_position(self, symbol):
+            raise AssertionError("unsupported Aster position probe must be filtered before HTTP")
+
+        async def fetch_open_orders(self, symbol=None):
+            raise AssertionError("unsupported Aster open-order probe must be filtered before HTTP")
+
+        async def shutdown(self):
+            pass
+
+    monkeypatch.setattr(dl, "_load_venue_credential", lambda venue: object())
+    monkeypatch.setattr(
+        dl,
+        "_create_readonly_adapter",
+        lambda venue, credential, rate_limiter=None: FakeAdapter(),
+    )
+
+    truth = asyncio.run(
+        dl._build_exchange_truth_async_inner(
+            "/tmp",
+            ["SIREN_USDT"],
+            venues=["aster"],
+            readonly_rate_limiter=None,
+        )
+    )
+
+    assert truth["available"] is True
+    assert truth["confidence"] == "high"
+    assert truth["has_nonzero_position"] is False
+    assert truth["has_open_order"] is False
+    assert truth["private_truth_pre_http_filtered_count"] == 1
+    assert truth["missing_evidence"] == []
+    assert truth["fetch_status"]["aster"]["private_truth_pre_http_filtered_symbols"] == [
+        "SIREN_USDT"
+    ]
 
 
 def test_exchange_truth_classifies_okx_instrument_missing_metadata_as_flat():

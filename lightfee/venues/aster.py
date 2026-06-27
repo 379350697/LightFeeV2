@@ -6,6 +6,7 @@ Aster Pro API V3 and do not share Binance HMAC signing.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -16,11 +17,16 @@ from lightfee.core.domain import (
     PassiveOrderAck,
     PassiveOrderProgress,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.aster_v3 import AsterV3Client
+from lightfee.venues.symbol_eligibility import (
+    VenueSymbolEligibility,
+    venue_symbol_eligibility,
+)
 from lightfee.venues.specs import aster_spec
 from lightfee.venues.transport import (
     LiveCredential,
@@ -122,6 +128,23 @@ class AsterAdapter(VenueAdapter):
                 continue
             metadata[symbol] = dict(row)
         self._transport.set_symbol_metadata(metadata)
+
+    async def _private_symbol_eligibility(
+        self,
+        symbol: str,
+    ) -> VenueSymbolEligibility:
+        if not self._transport._symbol_metadata:
+            try:
+                await self.ensure_supported_symbols_loaded()
+            except Exception:
+                pass
+        venue_symbol = self._transport._venue_symbol(symbol)
+        return venue_symbol_eligibility(
+            Venue.ASTER,
+            symbol,
+            supported_symbols=self.supported_symbols(),
+            venue_symbol=venue_symbol,
+        )
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
@@ -314,6 +337,16 @@ class AsterAdapter(VenueAdapter):
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
         if self._private is not None:
+            eligibility = await self._private_symbol_eligibility(symbol)
+            if eligibility.unsupported_before_http:
+                return PositionSnapshot(
+                    venue=Venue.ASTER,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=int(time.time() * 1000),
+                )
             return await self._private.fetch_position(symbol)
         if self._mode == "live":
             raise self._private_unavailable()
@@ -356,6 +389,10 @@ class AsterAdapter(VenueAdapter):
 
     async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         if self._private is not None:
+            if symbol:
+                eligibility = await self._private_symbol_eligibility(symbol)
+                if eligibility.unsupported_before_http:
+                    return []
             return await self._private.fetch_open_orders(symbol)
         if self._mode == "live":
             raise self._private_unavailable()

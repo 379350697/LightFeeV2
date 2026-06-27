@@ -7366,6 +7366,123 @@ class TestAsterAdapterSymbolCatalog:
 
         assert adapter.supported_symbols() == ["BTCUSDT"]
 
+    @pytest.mark.asyncio
+    async def test_private_position_unsupported_symbol_returns_flat_before_v3_http(self):
+        adapter = AsterAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({"BTCUSDT": {"symbol": "BTCUSDT"}})
+        calls: list[str] = []
+
+        class FakePrivate:
+            async def fetch_position(self, symbol):
+                calls.append(symbol)
+                raise AssertionError("unsupported symbol must not hit Aster V3 positionRisk")
+
+        adapter._private = FakePrivate()
+
+        position = await adapter.fetch_position("SIREN_USDT")
+
+        assert calls == []
+        assert position.venue == Venue.ASTER
+        assert position.symbol == "SIREN_USDT"
+        assert position.quantity == 0.0
+
+    @pytest.mark.asyncio
+    async def test_private_open_orders_unsupported_symbol_returns_empty_before_v3_http(self):
+        adapter = AsterAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({"BTCUSDT": {"symbol": "BTCUSDT"}})
+        calls: list[str] = []
+
+        class FakePrivate:
+            async def fetch_open_orders(self, symbol=None):
+                calls.append(str(symbol))
+                raise AssertionError("unsupported symbol must not hit Aster V3 openOrders")
+
+        adapter._private = FakePrivate()
+
+        rows = await adapter.fetch_open_orders("SAHARA-USDT-SWAP")
+
+        assert calls == []
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_private_unfiltered_open_orders_still_uses_v3_http(self):
+        adapter = AsterAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({"BTCUSDT": {"symbol": "BTCUSDT"}})
+        calls: list[object] = []
+
+        class FakePrivate:
+            async def fetch_open_orders(self, symbol=None):
+                calls.append(symbol)
+                return [{"symbol": "BTCUSDT", "orderId": "1"}]
+
+        adapter._private = FakePrivate()
+
+        rows = await adapter.fetch_open_orders(None)
+
+        assert calls == [None]
+        assert rows == [{"symbol": "BTCUSDT", "orderId": "1"}]
+
+    @pytest.mark.asyncio
+    async def test_private_supported_symbol_still_uses_v3_http(self):
+        adapter = AsterAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({"BTCUSDT": {"symbol": "BTCUSDT"}})
+        position_calls: list[str] = []
+        open_order_calls: list[str | None] = []
+
+        class FakePrivate:
+            async def fetch_position(self, symbol):
+                position_calls.append(symbol)
+                return PositionSnapshot(
+                    venue=Venue.ASTER,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.5,
+                    entry_price=100.0,
+                    observed_at_ms=123,
+                )
+
+            async def fetch_open_orders(self, symbol=None):
+                open_order_calls.append(symbol)
+                return [{"symbol": symbol, "orderId": "live"}]
+
+        adapter._private = FakePrivate()
+
+        position = await adapter.fetch_position("BTCUSDT")
+        rows = await adapter.fetch_open_orders("BTCUSDT")
+
+        assert position_calls == ["BTCUSDT"]
+        assert open_order_calls == ["BTCUSDT"]
+        assert position.quantity == 0.5
+        assert rows == [{"symbol": "BTCUSDT", "orderId": "live"}]
+
+    @pytest.mark.asyncio
+    async def test_private_catalog_unavailable_does_not_invent_unsupported_truth(self):
+        adapter = AsterAdapter(mode="paper")
+        calls: list[str] = []
+
+        async def failing_catalog():
+            raise RuntimeError("catalog unavailable")
+
+        class FakePrivate:
+            async def fetch_position(self, symbol):
+                calls.append(symbol)
+                return PositionSnapshot(
+                    venue=Venue.ASTER,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=123,
+                )
+
+        adapter.ensure_supported_symbols_loaded = failing_catalog  # type: ignore[method-assign]
+        adapter._private = FakePrivate()
+
+        position = await adapter.fetch_position("UNKNOWNUSDT")
+
+        assert calls == ["UNKNOWNUSDT"]
+        assert position.quantity == 0.0
+
 
 class TestGateAdapterSymbolCatalog:
     @pytest.mark.asyncio
