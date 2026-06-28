@@ -2204,6 +2204,7 @@ _ORDER_TRUTH_GAP_REGISTERED_KINDS = frozenset({
     "exit.accepted_order_truth_gap_registered",
 })
 _ORDER_TRUTH_GAP_RESOLUTION_KINDS = frozenset({
+    "exit.accepted_order_truth_gap_resolved",
     "exit.passive_close_hedge_confirmed_after_ack",
     "exit.passive_close_hedge_reconciled_after_error",
     "exit.passive_close_hedge_duplicate_client_order_reconciled",
@@ -2380,6 +2381,11 @@ def _payload_is_terminal_zero_qty_truth_probe_retained(
 
 
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
+    if kind == "exit.accepted_order_truth_gap_resolved":
+        return str(payload.get("resolution_status") or "").lower() in {
+            "filled",
+            "live_flat",
+        }
     if kind in {
         "exit.passive_close_hedge_confirmed_after_ack",
         "exit.passive_close_hedge_reconciled_after_error",
@@ -2768,6 +2774,11 @@ def _build_resolved_close_order_error_summary(
                 "already_flat",
                 "completed",
                 "flat",
+            }
+        elif kind == "exit.accepted_order_truth_gap_resolved":
+            terminal = str(payload.get("resolution_status") or "").lower() in {
+                "filled",
+                "live_flat",
             }
         elif kind in {"order.filled", "exit.close_chunk_submitted", "exit.closed"}:
             terminal = True

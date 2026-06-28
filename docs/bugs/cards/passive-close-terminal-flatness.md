@@ -167,6 +167,14 @@ alone is not success evidence.
 - An accepted taker hedge ACK without fill confirmation is not a terminal close
   fill. It must carry order-truth probe paths and stay in reconcile/live-truth
   flow before passive close can advance or clear.
+- For Aster and any venue that returns an accepted close order identity with
+  zero immediate fill, the ACK is accepted-order truth work, not ordinary
+  `zero_fill`. Register `accepted_order_truth_gap`, keep the passive-close
+  owner, and resolve only through confirmed fill or live-flat truth that carries
+  the accepted order/client identity. Later Aster `-2022 ReduceOnly Order is
+  rejected` is historical terminal evidence only when that identity chain
+  matches; a same-position terminal flat event without order identity is still
+  unresolved.
 - OKX amend `50115 Invalid request type` from the amend-order endpoint is an
   amend-path capability failure for that call. Route through cancel-replace and
   keep the existing double-order guard.
@@ -199,6 +207,7 @@ alone is not success evidence.
 | 2026-06-21 | Terminal-zero truth-probe retain-pending split from maker submit errors | local green, deploy pending | Latest cloud showed one `exit.passive_close_maker_submit_error` whose payload was not an exchange submit failure: `reason=terminal_zero_qty_live_truth_not_flat`, `decision=retain_pending`, followed by terminal close resolution and clean exchange truth. Diagnose now splits this shape into `truth_probe_retain_pending_*` terminal-zero summary fields and filters it from `order_error_evidence` only after same-position terminal evidence; unproven maker submit errors remain active. |
 | 2026-06-23 | Close artifact diagnostic downgrade requires trusted identity | local green, deploy pending | CL-110 tightens Binance/Aster `-2022` and zero-fill diagnostic downgrade: clean exchange truth plus same-position terminal flat is not enough without same-order/client identity. `diagnostic_noise_summary` now trusts only resolved truth-gap, terminal-zero-qty, or close-terminal summaries; unmatched artifacts remain `current_blocker/unresolved_close_artifact`. `reconciliation.pending_close_exchange_truth_refreshed` maps to V1 `PASSIVE_CLOSE`. |
 | 2026-06-28 | ACT recovered funding close lifecycle | fixed in `904bb23`, deployed/cloud verified | CL-131 restores V1 close semantics for recovered live positions: startup recovery must hydrate funding timestamps and maker-leg hints from owner/pending journal or quote truth before creating a managed open position, and missing funding truth emits `recovery.recovered_position_funding_timestamp_missing` instead of a silent never-close state. Recovery ownership now canonicalizes OKX raw symbols such as `ACT-USDT-SWAP` to `ACTUSDT` across ledger, owner index, unpaired recovery, and V1 closure. Cloud ACT closed through normal passive/fallback close; final truth is running, exchange flat/no-open-orders, no pending close, and V1 `RUNNING_CLEAN`. |
+| 2026-06-29 | Aster accepted close ACK truth-gap identity closure | local green, deploy pending | CL-133 turns accepted 0-fill Aster close ACKs into `accepted_order_truth_gap` work rather than ordinary `zero_fill`; diagnose now treats `exit.accepted_order_truth_gap_resolved` as terminal only for `filled/live_flat` and requires matching order/client identity before downgrading Aster `-2022` reduce-only artifacts. |
 
 ## Recurrences
 
@@ -218,6 +227,7 @@ alone is not success evidence.
 | 2026-06-21 | `HOMEUSDT`, `ESPORTSUSDT`, Binance close `-5022`/`-2022` families | `cfd0644`, deployed baseline `9dee9f3`, terminal quantity-warning residual fixed locally | cloud baseline flat/no-open-orders, no exact `-5022`/`-2022`, and passive close artifacts resolved; residual root fix closes min-notional lifecycle and terminal/unopened quantity warning diagnostics | [daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure](../daily/2026-06-21.md#cluster-cl-105---latest-deploy-2-7-root-fix-semantic-closure) |
 | 2026-06-23 | Binance/Aster reduce-only diagnostic noise and pending-close exchange-truth refresh mapping | working tree | local green; deploy pending | [daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics](../daily/2026-06-23.md#cluster-cl-110---aster-admission-close-artifact-noise-lifecycle-and-stale-quote-diagnostics) |
 | 2026-06-24 | Bitget `40786 Duplicate clientOid` close/recovery truth closure | `4ddbd07` | deployed/cloud verified; duplicate-client truth closure no longer leaves unresolved close residue when exchange truth is clean | [daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure](../daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure) |
+| 2026-06-29 | `LABUSDT` Aster accepted close ACK / Aster `-2022` reduce-only artifact family | working tree from `5cf0c57` | local full suite green; deploy pending | [daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure](../daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure) |
 
 ## Regression Harness
 

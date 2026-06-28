@@ -3812,7 +3812,6 @@ class PassiveCloseExecutor:
         ack_client_order_id = str(getattr(fill, "client_order_id", "") or hedge_cid)
         if (
             filled_qty <= 1e-12
-            and hedge_venue == Venue.BYBIT
             and (ack_order_id or ack_client_order_id)
             and callable(getattr(adapter, "fetch_order_fill_reconciliation", None))
         ):
@@ -3938,6 +3937,49 @@ class PassiveCloseExecutor:
                     ),
                     "decision": "retain_pending_without_resubmit",
                 },
+            )
+            truth_gap_payload = {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": hedge_venue.value,
+                "hedge_venue": hedge_venue.value,
+                "hedge_leg": hedge_leg_label,
+                "accepted_order_id": ack_order_id,
+                "accepted_client_order_id": ack_client_order_id,
+                "requested": delta,
+                "fill_reconciliation_result": (
+                    "error" if reconciliation_error else "missing_or_zero_fill"
+                ),
+                "fill_reconciliation_error": reconciliation_error,
+                "order_truth_fill_status": truth_decision.fill_status.value,
+                "order_truth_evidence_status": truth_decision.evidence_status.value,
+                "order_truth_decision": truth_decision.decision,
+                "order_truth_missing_evidence": list(truth_decision.missing_evidence),
+                "accepted_order_truth_gap": True,
+                "truth_required_by": "accepted_order_truth_gap",
+                "next_action": "reconcile_accepted_order_or_probe_live_position",
+            }
+            self._register_accepted_order_truth_gap(
+                state,
+                pending,
+                position,
+                venue=hedge_venue,
+                leg_label=hedge_leg_label,
+                operation="place_order",
+                source="passive_close_hedge_ack_unconfirmed",
+                payload=truth_gap_payload,
+                request=request,
+                quantity=normalized_delta,
+            )
+            return HedgeDeltaResult(
+                requested=delta,
+                filled=0.0,
+                residual=delta,
+                success=False,
+                error="accepted_order_truth_gap_pending",
+                truth_gap=True,
+                accepted_order_id=ack_order_id,
+                accepted_client_order_id=ack_client_order_id,
             )
         residual = max(delta - filled_qty, 0.0)
         success = residual < 1e-12
@@ -5548,6 +5590,18 @@ class PassiveCloseExecutor:
         )
 
         extra_payload = dict(extra or {})
+        terminal_identity_fields: dict[str, Any] = {}
+        for key in (
+            "accepted_order_id",
+            "accepted_client_order_id",
+            "accepted_order_ids",
+            "accepted_client_order_ids",
+            "order_id",
+            "client_order_id",
+        ):
+            value = extra_payload.get(key)
+            if value:
+                terminal_identity_fields[key] = value
         closure_fields = dict(extra_payload.get("closure_fields") or {})
         if not closure_fields:
             closure_fields = {
@@ -5598,6 +5652,7 @@ class PassiveCloseExecutor:
                 "resolved_at_ms": now_ms,
                 "exchange_truth": truth_payload,
                 "exit_shadow_id": _exit_shadow_id_for_pending(pending),
+                **terminal_identity_fields,
                 **closure_fields,
             },
         )

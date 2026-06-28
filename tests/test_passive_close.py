@@ -5103,6 +5103,81 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_hedge_deadline_fail_closed" not in kinds
         assert "exit.compensated" not in kinds
 
+    def test_aster_zero_fill_ack_registers_truth_gap_without_resubmit(self):
+        """Aster accepted 0-fill close ACK is order-truth work, not a zero-fill retry."""
+        journal = _open_journal()
+
+        adapter = _mock_adapter_with_tick(Venue.ASTER)
+        adapter.place_order = AsyncMock(
+            return_value=OrderFill(
+                venue=Venue.ASTER,
+                symbol="LABUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                price=17.0135,
+                order_id="739460853",
+                client_order_id="lfxldd31734bab55bf3f",
+            )
+        )
+        adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        executor = PassiveCloseExecutor({Venue.ASTER: adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 17.0135)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (17.013, 17.014))
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1782665524395-LABUSDT",
+            symbol="LABUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            matched_quantity=1.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=1.0, average_price=17.158),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+
+        result = asyncio.run(
+            executor._submit_hedge_for_delta(
+                state,
+                pending,
+                position,
+                1.0,
+                maker_terminal=True,
+            )
+        )
+
+        assert result.success is False
+        assert result.truth_gap is True
+        assert result.accepted_order_id == "739460853"
+        assert result.accepted_client_order_id == "lfxldd31734bab55bf3f"
+        assert adapter.place_order.await_count == 1
+        assert len(state.pending_close_reconciliations) == 1
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["kind"] == "accepted_order_truth_gap"
+        assert reconciliation["venue"] == "aster"
+        assert reconciliation["leg"] == "long"
+        assert reconciliation["accepted_order_truth_gap"] is True
+        assert reconciliation["original_payload"]["accepted_order_id"] == "739460853"
+        assert reconciliation["original_payload"]["accepted_client_order_id"] == (
+            "lfxldd31734bab55bf3f"
+        )
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.accepted_order_truth_gap_registered" in kinds
+        assert "exit.passive_close_hedge_ack_unconfirmed" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
+
     def test_ack_only_terminal_hedge_not_flat_retains_pending_without_fake_green(self):
         """ACK-only truth gap remains pending when live position truth is not flat."""
         journal = _open_journal()

@@ -3671,6 +3671,211 @@ def test_run_diagnose_resolves_bybit_ack_only_after_reconciliation_and_flat_trut
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_resolves_aster_reduce_only_reject_after_accepted_gap_live_flat(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1782666310000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1782666306600,
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "leg": "long",
+                    "accepted_order_id": "739460853",
+                    "accepted_client_order_id": "lfxldd31734bab55bf3f",
+                    "truth_required_by": "accepted_order_truth_gap",
+                },
+            },
+            {
+                "ts_ms": 1782666306680,
+                "kind": "order.uncertain",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "operation": "place_order",
+                    "accepted_order_truth_gap": True,
+                    "accepted_order_id": "739460853",
+                    "accepted_client_order_id": "lfxldd31734bab55bf3f",
+                    "request_context": {
+                        "symbol": "LABUSDT",
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfxldd31734bab55bf3f",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1782666307887,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "operation": "place_order",
+                    "error": "aster_v3 POST /fapi/v3/order rejected status=400",
+                    "exchange_code": "-2022",
+                    "exchange_msg": "ReduceOnly Order is rejected.",
+                    "exchange_error": {
+                        "venue": "aster",
+                        "exchange_code": "-2022",
+                        "exchange_msg": "ReduceOnly Order is rejected.",
+                        "raw_body": "{\"code\":-2022,\"msg\":\"ReduceOnly Order is rejected.\"}",
+                    },
+                    "request_context": {
+                        "symbol": "LABUSDT",
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfxldd31734bab55bf3f",
+                    },
+                },
+            },
+            {
+                "ts_ms": 1782666308827,
+                "kind": "exit.accepted_order_truth_gap_resolved",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "leg": "long",
+                    "accepted_order_id": "739460853",
+                    "accepted_client_order_id": "lfxldd31734bab55bf3f",
+                    "resolution_status": "live_flat",
+                    "decision": "clear_gap",
+                },
+            },
+            {
+                "ts_ms": 1782666309827,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "resolution_source": "fallback_live_balanced_matched_close_flat_probe",
+                    "long_closed_qty": 1.0,
+                    "short_closed_qty": 1.0,
+                    "live_flat_terminal": True,
+                    "problem": False,
+                    "exchange_truth": {
+                        "truth_available": True,
+                        "positions_flat": True,
+                        "open_orders_flat": True,
+                    },
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LABUSDT",
+            venues=["aster"],
+            now_ms=1782666315000,
+        )
+
+        summary = result["resolved_close_order_error_summary"]
+        assert summary["reduce_only_terminal_flat_count"] == 1
+        assert "accepted_client_order_id:lfxldd31734bab55bf3f" in summary["resolved_identities"]
+        assert result["order_error_evidence"] == []
+        assert result["top_exchange_errors"] == []
+        assert result["conclusion"]["status"] == "healthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_keeps_aster_reduce_only_reject_unresolved_without_order_identity(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1782666310000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1782666307887,
+                "kind": "order.rejected",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "operation": "place_order",
+                    "exchange_code": "-2022",
+                    "exchange_msg": "ReduceOnly Order is rejected.",
+                    "request_context": {
+                        "symbol": "LABUSDT",
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "reduce_only": True,
+                    },
+                },
+            },
+            {
+                "ts_ms": 1782666309827,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1782665524395-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "live_flat_terminal": True,
+                    "problem": False,
+                    "exchange_truth": {
+                        "truth_available": True,
+                        "positions_flat": True,
+                        "open_orders_flat": True,
+                    },
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="LABUSDT",
+            venues=["aster"],
+            now_ms=1782666315000,
+        )
+
+        assert result["resolved_close_order_error_summary"]["count"] == 0
+        assert len(result["order_error_evidence"]) == 1
+        assert result["conclusion"]["status"] != "healthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_resolved_order_truth_gap_is_green_when_fail_closed_but_flat():
     from scripts.diagnose_live import _build_production_acceptance_gate
 
