@@ -60,6 +60,7 @@ from lightfee.engine.order_submit_uncertainty import (
     is_order_truth_gap,
 )
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
+from lightfee.engine.order_truth_resolution import resolve_accepted_order_truth
 from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
@@ -1068,6 +1069,203 @@ class PassiveCloseExecutor:
                 pass
         return recorded
 
+    async def _resolve_existing_close_accepted_order_truth_gap(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        venue: Venue,
+        leg_label: str,
+        side: Side,
+        target_qty: float,
+        source: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        active_truth_gap = self._active_hedge_truth_gap_reconciliation(
+            state,
+            pending,
+            hedge_venue=venue,
+            hedge_leg=leg_label,
+        )
+        if active_truth_gap is None:
+            return {"handled": False, "status": "none"}
+
+        order_id, client_order_id = self._accepted_order_truth_gap_identity(
+            active_truth_gap,
+            hedge_venue=venue,
+            hedge_leg=leg_label,
+        )
+        if not order_id and not client_order_id:
+            return {"handled": False, "status": "missing_order_identity"}
+
+        adapter = self._adapter(venue)
+        if adapter is None:
+            active_truth_gap["order_truth_state"] = "truth_unavailable"
+            active_truth_gap["next_action"] = "restore_adapter_then_reconcile"
+            self._journal.append(
+                "exit.accepted_order_truth_gap_retry_blocked",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "resolution_status": "truth_unavailable",
+                    "decision": "retain_pending",
+                    "source": source,
+                    "reason": "adapter_missing",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return {"handled": True, "status": "truth_unavailable", "cleared": False}
+
+        async def fetch_open_orders(
+            _adapter: Any,
+            open_order_venue: Venue,
+            symbol: str,
+        ) -> list[Any]:
+            items, error = await self._fetch_venue_open_order_items(
+                open_order_venue,
+                symbol,
+                self._adapters,
+            )
+            if error:
+                raise RuntimeError(error)
+            return list(items or [])
+
+        result = await resolve_accepted_order_truth(
+            adapter=adapter,
+            venue=venue,
+            side=side,
+            symbol=position.symbol,
+            target_qty=float(
+                active_truth_gap.get("requested_quantity") or target_qty or 0.0
+            ),
+            accepted_order_id=order_id,
+            accepted_client_order_id=client_order_id,
+            now_ms=now_ms,
+            probe_venues=[venue],
+            get_adapter=self._adapter,
+            fetch_open_orders=fetch_open_orders,
+        )
+        payload = dict(result.payload)
+        active_truth_gap["order_truth_state"] = result.status
+        active_truth_gap["ledger_resolution_state"] = str(
+            payload.get("resolution_state") or ""
+        )
+        active_truth_gap["next_action"] = str(
+            payload.get("next_action")
+            or "reconcile_accepted_order_or_probe_live_position"
+        )
+        active_truth_gap["last_resolution_payload"] = payload
+        active_truth_gap["last_resolution_status"] = result.status
+        active_truth_gap["last_resolution_ms"] = now_ms
+
+        if result.status == "filled" and result.fill is not None:
+            recorded_qty = self._recorded_passive_close_leg_fill_qty(
+                pending,
+                hedge_leg=leg_label,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+            delta_qty = max(0.0, float(result.fill.quantity or 0.0) - recorded_qty)
+            if delta_qty > 1e-12:
+                fill = replace(result.fill, quantity=delta_qty)
+                leg = PersistedCloseExecutionLeg(
+                    fill=fill,
+                    client_order_id=fill.client_order_id or client_order_id,
+                    submit_started_at_ms=now_ms,
+                )
+                if leg_label == "short":
+                    pending.short_legs.append(leg)
+                else:
+                    pending.long_legs.append(leg)
+            state.remove_pending_close_reconciliation(active_truth_gap)
+            self._journal.append(
+                "exit.accepted_order_truth_gap_resolved",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "resolution_status": result.status,
+                    "decision": "apply_fill",
+                    "filled_quantity": float(result.fill.quantity or 0.0),
+                    "recorded_quantity": recorded_qty,
+                    "source": source,
+                },
+            )
+            cleared = await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="accepted_order_truth_gap_filled",
+                extra={
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "resolution_status": result.status,
+                },
+            )
+            if not cleared:
+                pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return {"handled": True, "status": result.status, "cleared": cleared}
+
+        if result.status == "live_flat":
+            state.remove_pending_close_reconciliation(active_truth_gap)
+            self._journal.append(
+                "exit.accepted_order_truth_gap_resolved",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "resolution_status": result.status,
+                    "decision": "clear_gap",
+                    "source": source,
+                },
+            )
+            cleared = await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="accepted_order_truth_gap_live_flat",
+                extra={
+                    "accepted_order_id": order_id,
+                    "accepted_client_order_id": client_order_id,
+                    "resolution_status": result.status,
+                },
+            )
+            if not cleared:
+                pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return {"handled": True, "status": result.status, "cleared": cleared}
+
+        self._journal.append(
+            "exit.accepted_order_truth_gap_retry_blocked",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value,
+                "leg": leg_label,
+                "accepted_order_id": order_id,
+                "accepted_client_order_id": client_order_id,
+                "resolution_status": result.status,
+                "decision": "retain_pending",
+                "source": source,
+                "order_truth_state": active_truth_gap.get("order_truth_state"),
+                "next_action": active_truth_gap.get("next_action"),
+                "open_order_count": payload.get("open_order_count"),
+                "live_quantity": payload.get("live_quantity"),
+            },
+        )
+        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+        return {"handled": True, "status": result.status, "cleared": False}
+
     def _defer_final_hedge_truth_gap(
         self,
         pending: PendingPassiveClose,
@@ -2071,9 +2269,28 @@ class PassiveCloseExecutor:
                 now_ms=now_ms,
             )
         readiness = [
-            await self._passive_close_readiness_for_leg(position, active),
-            await self._passive_close_readiness_for_leg(position, alternate),
+            await self._passive_close_readiness_for_leg(
+                position,
+                active,
+            ),
+            await self._passive_close_readiness_for_leg(
+                position,
+                alternate,
+            ),
         ]
+        if (
+            int(pending.phase_state.zero_fill_cycles_in_phase or 0) > 0
+            and readiness[1].status == "ready"
+        ):
+            readiness[0] = replace(
+                readiness[0],
+                status="blocked",
+                reasons=tuple(
+                    dict.fromkeys(
+                        [*readiness[0].reasons, "recent_maker_zero_fill"]
+                    )
+                ),
+            )
         self._journal.append(
             "runtime.passive_close_readiness_rewarm_attempted",
             {
@@ -2129,7 +2346,6 @@ class PassiveCloseExecutor:
             reasons.append("invalid_aligned_price")
         if would_take:
             reasons.append("post_only_would_take")
-
         return PassiveCloseReadiness(
             status="ready" if not reasons else "blocked",
             maker_leg=maker_leg,
@@ -5958,6 +6174,21 @@ class PassiveCloseExecutor:
         adapter = self._adapter(venue)
         if adapter is None:
             return False
+
+        now_ms = self._now_ms()
+        existing_truth_gap = await self._resolve_existing_close_accepted_order_truth_gap(
+            state,
+            pending,
+            position,
+            venue=venue,
+            leg_label=leg_label,
+            side=close_side,
+            target_qty=live_qty,
+            source="passive_close_live_one_sided_existing_truth_gap",
+            now_ms=now_ms,
+        )
+        if existing_truth_gap.get("handled"):
+            return bool(existing_truth_gap.get("cleared"))
 
         open_order_items, open_order_error = await self._fetch_venue_open_order_items(
             venue,

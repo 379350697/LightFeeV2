@@ -8350,6 +8350,14 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "passive_close_actionable_single_leg_wait_count": 0,
             "risk_only_live_single_leg_exposure_count": 0,
             "passive_close_final_truth_actions": {},
+            "close_cost_inefficiency_summary": {
+                "count": 0,
+                "blocking_count": 0,
+                "maker_no_fill_count": 0,
+                "zero_fill_cycle_count": 0,
+                "fallback_after_zero_fill_count": 0,
+                "samples": [],
+            },
             "repeated_single_leg_guarded": {
                 "violation_count": 0,
                 "severity": "ok",
@@ -8489,6 +8497,85 @@ def test_business_progression_quality_counts_passive_close_truth_lag_as_recovere
     assert business["passive_close_resolved_without_terminal_truth_count"] == 1
     assert business["passive_close_truth_lag_resolved_count"] == 1
     assert business["recovered_but_counted_issue_count"] == 1
+    assert business["active_stuck_count"] == 0
+
+
+def test_business_progression_quality_reports_close_cost_inefficiency_as_non_blocking():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-close-cost",
+                "symbol": "LABUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_maker_terminal_no_fill",
+            "payload": {
+                "position_id": "entry-close-cost",
+                "symbol": "LABUSDT",
+                "maker_venue": "aster",
+                "maker_leg": "long",
+                "order_id": "maker-1",
+            },
+        },
+        {
+            "ts_ms": 2_500,
+            "kind": "execution.passive_cycle_zero_fill",
+            "payload": {
+                "position_id": "entry-close-cost",
+                "symbol": "LABUSDT",
+                "zero_fill_cycles": 1,
+                "max_zero_fill_cycles": 3,
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "exit.passive_close_dual_taker_drive",
+            "payload": {
+                "position_id": "entry-close-cost",
+                "symbol": "LABUSDT",
+            },
+        },
+        {
+            "ts_ms": 4_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-close-cost",
+                "symbol": "LABUSDT",
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                },
+            },
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate={
+            "gate_passed": True,
+            "exchange_truth_flat": True,
+            "exchange_truth_no_open_orders": True,
+            "blocking_reasons": [],
+            "v1_lifecycle_summary": {"blocking_row_count": 0},
+        },
+    )
+
+    summary = business["close_cost_inefficiency_summary"]
+    assert summary["count"] == 1
+    assert summary["blocking_count"] == 0
+    assert summary["maker_no_fill_count"] == 1
+    assert summary["zero_fill_cycle_count"] == 1
+    assert summary["fallback_after_zero_fill_count"] == 1
+    assert summary["samples"][0]["position_id"] == "entry-close-cost"
+    assert summary["samples"][0]["status"] == "terminal_resolved"
     assert business["active_stuck_count"] == 0
 
 

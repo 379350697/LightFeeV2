@@ -234,6 +234,132 @@ async def test_passive_close_readiness_selects_ready_leg_when_preferred_would_ta
 
 
 @pytest.mark.asyncio
+async def test_passive_close_readiness_blocks_recent_zero_fill_leg_and_switches():
+    journal = _open_journal()
+    try:
+        binance = PassiveCloseReadinessAdapter()
+        bybit = PassiveCloseReadinessAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.99, 1.01))
+        state = EngineState()
+        position = OpenPosition(
+            position_id="pos-readiness-zero-fill",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=1.0,
+            short_entry_price=1.0,
+            opened_at_ms=1_000,
+            matched_quantity=1.0,
+        )
+        pending = await executor.start_pending_passive_close(
+            state,
+            position,
+            "funding_capture",
+            long_price_hint=1.0,
+            short_price_hint=1.0,
+        )
+        assert pending is not None
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.LONG
+        pending.phase_state.zero_fill_cycles_in_phase = 1
+
+        resolved = await executor.drive_pending_passive_close(
+            state,
+            position.position_id,
+            wait_until_terminal=False,
+        )
+
+        assert resolved is False
+        assert binance.submit_calls == []
+        assert len(bybit.submit_calls) == 1
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.SHORT
+        ready = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.passive_close_readiness_ready"
+        ]
+        assert ready
+        readiness = ready[-1]["readiness"]
+        long_readiness = next(item for item in readiness if item["maker_leg"] == "long")
+        assert long_readiness["status"] == "blocked"
+        assert "recent_maker_zero_fill" in long_readiness["reasons"]
+        assert ready[-1]["maker_leg"] == "short"
+    finally:
+        journal.close()
+
+
+@pytest.mark.asyncio
+async def test_passive_close_readiness_keeps_recent_zero_fill_leg_when_alternate_not_ready():
+    journal = _open_journal()
+    try:
+        binance = PassiveCloseReadinessAdapter()
+        bybit = PassiveCloseReadinessAdapter()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0)
+        executor.set_l2_quote_resolver(
+            lambda venue, symbol: (0.99, 1.01) if venue == Venue.BINANCE else None
+        )
+        state = EngineState()
+        position = OpenPosition(
+            position_id="pos-readiness-zero-fill-single-ready",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=1.0,
+            short_entry_price=1.0,
+            opened_at_ms=1_000,
+            matched_quantity=1.0,
+        )
+        pending = await executor.start_pending_passive_close(
+            state,
+            position,
+            "funding_capture",
+            long_price_hint=1.0,
+            short_price_hint=1.0,
+        )
+        assert pending is not None
+        pending.phase_state.active_maker_leg = ActiveMakerLeg.LONG
+        pending.phase_state.zero_fill_cycles_in_phase = 1
+
+        resolved = await executor.drive_pending_passive_close(
+            state,
+            position.position_id,
+            wait_until_terminal=False,
+        )
+
+        assert resolved is False
+        assert len(binance.submit_calls) == 1
+        assert bybit.submit_calls == []
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG
+        ready = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "runtime.passive_close_readiness_ready"
+        ]
+        assert ready
+        readiness = ready[-1]["readiness"]
+        long_readiness = next(item for item in readiness if item["maker_leg"] == "long")
+        short_readiness = next(item for item in readiness if item["maker_leg"] == "short")
+        assert long_readiness["status"] == "ready"
+        assert "recent_maker_zero_fill" not in long_readiness["reasons"]
+        assert short_readiness["status"] == "blocked"
+        assert "missing_quote" in short_readiness["reasons"]
+    finally:
+        journal.close()
+
+
+@pytest.mark.asyncio
 async def test_passive_close_readiness_rewarm_success_allows_maker_submit():
     journal = _open_journal()
     try:
@@ -3051,7 +3177,7 @@ class TestFallbackResidualReal:
         state.open_positions[position.position_id] = position
         state.pending_passive_closes[position.position_id] = pending
 
-        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
 
         result = asyncio.run(
@@ -3152,6 +3278,206 @@ class TestFallbackResidualReal:
         kinds = [record["kind"] for record in journal.read_all()]
         assert "exit.passive_close_live_one_sided_truth_gap" in kinds
         assert "exit.passive_close_live_one_sided_flatten" not in kinds
+
+    def test_one_sided_flatten_resolves_existing_accepted_truth_gap_before_retry(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-existing-gap",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ack-close-order",
+            "client_order_id": "ack-close-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-close-order",
+                "client_order_id": "ack-close-cid",
+            }],
+            "requested_quantity": 20.0,
+            "order_truth_state": "ack_only_accepted",
+            "truth_required_by": "accepted_order_truth_gap",
+        })
+
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            entry_price=1.0211,
+            observed_at_ms=2_000,
+        ))
+        bybit.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            price=1.0211,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is False
+        bybit.fetch_order_fill_reconciliation.assert_awaited_once_with(
+            "BEATUSDT",
+            "ack-close-order",
+            "ack-close-cid",
+        )
+        bybit.place_order.assert_not_called()
+        assert len(state.pending_close_reconciliations) == 1
+        assert state.pending_close_reconciliations[0]["order_truth_state"] == "truth_gap"
+        records = journal.read_all()
+        blocked = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.accepted_order_truth_gap_retry_blocked"
+        ]
+        assert blocked
+        assert blocked[-1]["resolution_status"] == "truth_gap"
+        assert blocked[-1]["decision"] == "retain_pending"
+
+    def test_one_sided_flatten_clears_existing_accepted_truth_gap_when_live_flat(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-gap-flat",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ack-flat-order",
+            "client_order_id": "ack-flat-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-flat-order",
+                "client_order_id": "ack-flat-cid",
+            }],
+            "requested_quantity": 20.0,
+            "order_truth_state": "ack_only_accepted",
+            "truth_required_by": "accepted_order_truth_gap",
+        })
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_000,
+        ))
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_000,
+        ))
+        bybit.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.place_order = AsyncMock(return_value=_make_order_fill())
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is True
+        bybit.place_order.assert_not_called()
+        assert state.pending_close_reconciliations == []
+        assert position.position_id not in state.pending_passive_closes
+        resolved = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert resolved
+        assert resolved[-1]["resolution_status"] == "live_flat"
+        assert resolved[-1]["decision"] == "clear_gap"
 
     def test_live_flat_clear_passes_real_exchange_truth_to_recovery_core(self):
         journal = _open_journal()

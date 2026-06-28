@@ -6228,6 +6228,35 @@ def _build_business_progression_quality_summary(
     passive_close_actionable_single_leg_wait_count = 0
     passive_close_final_truth_actions: dict[str, int] = {}
     risk_only_live_single_leg_exposure_count = 0
+    close_cost_entries: dict[str, dict[str, Any]] = {}
+
+    def close_cost_entry(payload: dict[str, Any]) -> dict[str, Any] | None:
+        cost_position_id = entry_id(payload)
+        if not cost_position_id:
+            return None
+        entry = close_cost_entries.setdefault(
+            cost_position_id,
+            {
+                "position_id": cost_position_id,
+                "symbol": str(payload.get("symbol") or ""),
+                "maker_no_fill_count": 0,
+                "zero_fill_cycle_count": 0,
+                "fallback_after_zero_fill_count": 0,
+                "venues": set(),
+                "maker_legs": set(),
+                "terminal_resolved": False,
+            },
+        )
+        if payload.get("symbol") and not entry.get("symbol"):
+            entry["symbol"] = str(payload.get("symbol") or "")
+        for key in ("venue", "maker_venue", "hedge_venue"):
+            venue = venue_value(payload, key)
+            if venue:
+                entry["venues"].add(venue)
+        maker_leg = str(payload.get("maker_leg") or payload.get("leg") or "")
+        if maker_leg:
+            entry["maker_legs"].add(maker_leg)
+        return entry
 
     def gate_currently_green() -> bool:
         if not isinstance(production_acceptance_gate, dict):
@@ -6544,6 +6573,30 @@ def _build_business_progression_quality_summary(
                 )
             if final_truth_action == "flatten_remaining_live_leg":
                 passive_close_actionable_single_leg_wait_count += 1
+        elif kind == "exit.passive_close_maker_terminal_no_fill":
+            entry = close_cost_entry(payload)
+            if entry is not None:
+                entry["maker_no_fill_count"] += 1
+        elif kind == "execution.passive_cycle_zero_fill":
+            entry = close_cost_entry(payload)
+            if entry is not None:
+                entry["zero_fill_cycle_count"] += 1
+        elif kind in {
+            "exit.passive_close_dual_taker_drive",
+            "exit.passive_close_fallback_terminal_flat",
+            "exit.passive_close_live_matched_close",
+        }:
+            entry = close_cost_entry(payload)
+            if entry is not None and int(entry.get("zero_fill_cycle_count") or 0) > 0:
+                entry["fallback_after_zero_fill_count"] += 1
+        if kind in {
+            "exit.passive_close_resolved",
+            "exit.passive_close_fallback_terminal_flat",
+            "runtime.position_lifecycle_terminal",
+        }:
+            entry = close_cost_entry(payload)
+            if entry is not None and passive_close_has_terminal_truth(payload):
+                entry["terminal_resolved"] = True
 
         if kind in {
             "runtime.entry_admission_blocked",
@@ -6662,6 +6715,59 @@ def _build_business_progression_quality_summary(
             - len(recovered_but_counted_entries),
             0,
         )
+    close_cost_samples: list[dict[str, Any]] = []
+    close_cost_count = 0
+    close_cost_blocking_count = 0
+    close_cost_maker_no_fill_count = 0
+    close_cost_zero_fill_cycle_count = 0
+    close_cost_fallback_after_zero_fill_count = 0
+    for entry in close_cost_entries.values():
+        maker_no_fill_count = int(entry.get("maker_no_fill_count") or 0)
+        zero_fill_cycle_count = int(entry.get("zero_fill_cycle_count") or 0)
+        fallback_after_zero_fill_count = int(
+            entry.get("fallback_after_zero_fill_count") or 0
+        )
+        if maker_no_fill_count <= 0 and zero_fill_cycle_count <= 0:
+            continue
+        close_cost_count += 1
+        close_cost_maker_no_fill_count += maker_no_fill_count
+        close_cost_zero_fill_cycle_count += zero_fill_cycle_count
+        close_cost_fallback_after_zero_fill_count += fallback_after_zero_fill_count
+        terminal_resolved = bool(entry.get("terminal_resolved"))
+        if not terminal_resolved and not gate_currently_green():
+            close_cost_blocking_count += 1
+        if len(close_cost_samples) < 12:
+            close_cost_samples.append(
+                {
+                    "position_id": str(entry.get("position_id") or ""),
+                    "symbol": str(entry.get("symbol") or ""),
+                    "status": (
+                        "terminal_resolved"
+                        if terminal_resolved
+                        else "unresolved_cost_trace"
+                    ),
+                    "maker_no_fill_count": maker_no_fill_count,
+                    "zero_fill_cycle_count": zero_fill_cycle_count,
+                    "fallback_after_zero_fill_count": (
+                        fallback_after_zero_fill_count
+                    ),
+                    "venues": sorted(entry.get("venues") or []),
+                    "maker_legs": sorted(entry.get("maker_legs") or []),
+                    "next_action": (
+                        "tighten_close_maker_viability_source_gate"
+                        if terminal_resolved
+                        else "verify_exchange_truth_before_classifying_noise"
+                    ),
+                }
+            )
+    close_cost_inefficiency_summary = {
+        "count": close_cost_count,
+        "blocking_count": close_cost_blocking_count,
+        "maker_no_fill_count": close_cost_maker_no_fill_count,
+        "zero_fill_cycle_count": close_cost_zero_fill_cycle_count,
+        "fallback_after_zero_fill_count": close_cost_fallback_after_zero_fill_count,
+        "samples": close_cost_samples,
+    }
     return {
         "pre_submit_blocked": pre_submit_blocked,
         "single_leg_created": single_leg_created,
@@ -6710,6 +6816,7 @@ def _build_business_progression_quality_summary(
         "passive_close_final_truth_actions": dict(
             sorted(passive_close_final_truth_actions.items())
         ),
+        "close_cost_inefficiency_summary": close_cost_inefficiency_summary,
         "repeated_single_leg_guarded": {
             "violation_count": violation_count,
             "severity": "production_issue" if violation_count else "ok",
