@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
+from lightfee.engine.recovery_symbol_identity import canonical_recovery_symbol
 
 
 @dataclass
@@ -186,7 +187,7 @@ class RecoveryOwnerIndex:
                 position_specs = ()
             if not order_id and not client_order_id and not position_specs:
                 continue
-            symbol = _text(payload.get("symbol")).upper()
+            symbol = canonical_recovery_symbol(payload.get("symbol"))
             is_passive_close = kind.startswith("exit.passive_close")
             owner = RecoveryOwner(
                 owner_type=(
@@ -332,7 +333,7 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 
 def _symbol(obj: Any) -> str:
-    return _text(_get(obj, "symbol", "")).upper()
+    return canonical_recovery_symbol(_get(obj, "symbol", ""), _venue(obj))
 
 
 def _venue(obj: Any) -> str:
@@ -437,7 +438,7 @@ def _journal_position_specs(
         and outcome != "positive_fill_live_truth_conflict"
     ):
         return ()
-    symbol = _text(payload.get("symbol")).upper()
+    symbol = canonical_recovery_symbol(payload.get("symbol"))
     if not symbol:
         return ()
     specs: list[tuple[str, str, float]] = []

@@ -73,6 +73,37 @@ def make_test_config(temp_dir: str) -> AppConfig:
 _ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
 
 
+def _write_recovered_position_funding_event(
+    config: AppConfig,
+    *,
+    symbol: str = "BTCUSDT",
+    long_venue: str = "binance",
+    short_venue: str = "okx",
+    funding_ms: int = _ADMISSIBLE_FIRST_FUNDING_MS,
+) -> None:
+    path = Path(config.persistence.event_log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "seq": 1,
+        "run_id": "test",
+        "ts_ms": funding_ms - 300_000,
+        "kind": "runtime.pending_entry_registered",
+        "payload": {
+            "entry_id": f"entry-{symbol.lower()}",
+            "symbol": symbol,
+            "long_venue": long_venue,
+            "short_venue": short_venue,
+            "funding_timestamp_ms": funding_ms,
+            "first_funding_timestamp_ms": funding_ms,
+            "long_funding_timestamp_ms": funding_ms,
+            "short_funding_timestamp_ms": funding_ms,
+            "second_funding_timestamp_ms": 0,
+            "opportunity_type": "aligned",
+        },
+    }
+    path.write_text(json.dumps(record) + "\n")
+
+
 def _admissible_dispatch_candidate(
     *,
     symbol: str,
@@ -893,6 +924,12 @@ class TestRuntimePreflight:
         """Startup must not report zero positions when exchanges already hold a pair."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
+            _write_recovered_position_funding_event(
+                config,
+                long_venue="binance",
+                short_venue="okx",
+                funding_ms=1700000000000,
+            )
             binance = FakeVenueAdapter(Venue.BINANCE)
             okx = FakeVenueAdapter(Venue.OKX)
             binance.position_snapshots = [
@@ -930,6 +967,7 @@ class TestRuntimePreflight:
             assert pos.long_venue == Venue.BINANCE
             assert pos.short_venue == Venue.OKX
             assert pos.matched_quantity == pytest.approx(0.02)
+            assert pos.funding_timestamp_ms == 1700000000000
 
             records = [
                 json.loads(line)
@@ -957,6 +995,12 @@ class TestRuntimePreflight:
 
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
+            _write_recovered_position_funding_event(
+                config,
+                long_venue="binance",
+                short_venue="okx",
+                funding_ms=1700000000000,
+            )
             binance = BulkOnlyAdapter(
                 Venue.BINANCE,
                 [
@@ -995,6 +1039,8 @@ class TestRuntimePreflight:
             assert binance.fetch_all_positions_call_count == 1
             assert okx.fetch_all_positions_call_count == 1
             assert len(runtime.state.open_positions) == 1
+            pos = next(iter(runtime.state.open_positions.values()))
+            assert pos.funding_timestamp_ms == 1700000000000
 
     @pytest.mark.asyncio
     async def test_startup_probe_symbols_include_static_config_when_resolved_subset(self):
@@ -2222,6 +2268,22 @@ class TestRuntimePreflight:
 
             await runtime.start()
             assert len(runtime.state.open_positions) == 0
+            runtime.journal.append(
+                "runtime.pending_entry_registered",
+                {
+                    "entry_id": "entry-btcusdt",
+                    "symbol": "BTCUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "funding_timestamp_ms": 1700000005000,
+                    "first_funding_timestamp_ms": 1700000005000,
+                    "long_funding_timestamp_ms": 1700000005000,
+                    "short_funding_timestamp_ms": 1700000005000,
+                    "second_funding_timestamp_ms": 0,
+                    "opportunity_type": "aligned",
+                },
+                ts_ms=1700000004000,
+            )
 
             binance.position_snapshots = [
                 PositionSnapshot(
@@ -2251,6 +2313,7 @@ class TestRuntimePreflight:
             pos = next(iter(runtime.state.open_positions.values()))
             assert pos.symbol == "BTCUSDT"
             assert pos.matched_quantity == pytest.approx(0.03)
+            assert pos.funding_timestamp_ms == 1700000005000
 
     @pytest.mark.asyncio
     async def test_runtime_live_recovery_clears_stale_pending_without_open_block(self):
@@ -2266,6 +2329,22 @@ class TestRuntimePreflight:
 
             await runtime.start()
             assert len(runtime.state.open_positions) == 0
+            runtime.journal.append(
+                "runtime.pending_entry_registered",
+                {
+                    "entry_id": "entry-btcusdt",
+                    "symbol": "BTCUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "funding_timestamp_ms": 1700000005000,
+                    "first_funding_timestamp_ms": 1700000005000,
+                    "long_funding_timestamp_ms": 1700000005000,
+                    "short_funding_timestamp_ms": 1700000005000,
+                    "second_funding_timestamp_ms": 0,
+                    "opportunity_type": "aligned",
+                },
+                ts_ms=1700000004000,
+            )
 
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
             runtime.state.risk_mode = GlobalRiskMode.RUNNING

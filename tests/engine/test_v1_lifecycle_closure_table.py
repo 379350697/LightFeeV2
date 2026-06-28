@@ -598,6 +598,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "recovery.unpaired_live_position_cleanup_succeeded",
         "recovery.unpaired_live_position_cleanup_failed",
         "recovery.unpaired_live_position_terminal_flat",
+        "recovery.unpaired_live_position_owner_reassociated",
+        "recovery.recovered_position_funding_timestamp_missing",
         "scan.no_entry_diagnostics",
         "startup.order_path_preflight",
         "startup.trading_preflight",

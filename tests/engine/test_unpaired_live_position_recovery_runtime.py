@@ -10,6 +10,7 @@ import pytest
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.recovery_startup_runtime import RecoveryStartupRuntime
 from lightfee.engine.state import EngineState
 from lightfee.engine.unpaired_live_position_recovery import (
@@ -541,6 +542,61 @@ def test_ledger_clean_terminalizes_stale_unpaired_recovery(tmp_path: Path) -> No
     assert record["terminal_status"] == "flat"
     assert record["last_error"] == ""
     assert "recovery.unpaired_live_position_terminal_flat" in _kinds(ctx)
+
+
+def test_owned_live_position_does_not_terminal_flat_stale_unpaired_record(
+    tmp_path: Path,
+) -> None:
+    ctx = _ctx(tmp_path)
+    runtime = UnpairedLivePositionRecoveryRuntime(ctx)
+    runtime.register_from_ledger(
+        _ledger_for_position(
+            symbol="ACT-USDT-SWAP",
+            venue=Venue.OKX,
+            side="sell",
+            quantity=5385.0,
+            entry_price=0.008904,
+        ),
+        now_ms=1_000,
+    )
+    local = {
+        "open_positions": [
+            {
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "long_venue": "binance",
+                "short_venue": "okx",
+            }
+        ],
+        "pending_entries": [],
+    }
+    owner_index = RecoveryOwnerIndex.from_state(local)
+
+    runtime.register_from_ledger(
+        RecoveryLedger.from_local_and_exchange_truth(
+            local=local,
+            exchange_truth={
+                "positions": [
+                    {
+                        "venue": "okx",
+                        "symbol": "ACT-USDT-SWAP",
+                        "side": "sell",
+                        "quantity": 5385.0,
+                        "entry_price": 0.008904,
+                    }
+                ],
+                "open_orders": [],
+            },
+            owner_index=owner_index,
+        ),
+        now_ms=2_000,
+    )
+
+    record = ctx.state.unpaired_live_position_recoveries[0]
+    assert record["terminal_status"] == "owner_reassociated"
+    kinds = _kinds(ctx)
+    assert "recovery.unpaired_live_position_owner_reassociated" in kinds
+    assert "recovery.unpaired_live_position_terminal_flat" not in kinds
 
 
 def test_has_local_recovery_work_tracks_only_active_unpaired_work(tmp_path: Path) -> None:

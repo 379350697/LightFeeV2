@@ -90,6 +90,35 @@ def test_live_position_matches_open_position_owner():
     assert owner.confidence == "proven"
 
 
+def test_okx_venue_symbol_matches_canonical_open_position_owner():
+    index = RecoveryOwnerIndex.from_state(
+        {
+            "open_positions": [
+                {
+                    "position_id": "live-recovered:ACTUSDT:binance->okx",
+                    "symbol": "ACTUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                }
+            ]
+        }
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="okx",
+            symbol="ACT-USDT-SWAP",
+            side="sell",
+            quantity=5385.0,
+        )
+    )
+
+    assert owner.owner_type == "open_position"
+    assert owner.owner_id == "live-recovered:ACTUSDT:binance->okx"
+    assert owner.confidence == "proven"
+
+
 def test_positive_fill_pending_entry_owns_expected_live_position():
     index = RecoveryOwnerIndex.from_state(
         {

@@ -16,6 +16,7 @@ import pytest
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.engine.exit_decision import aligned_settlement_delay_elapsed
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.passive_close import PassiveCloseExecutor
 from lightfee.engine.state import EngineState, OpenPosition, PendingEntry, PendingPassiveClose
@@ -205,6 +206,123 @@ class TestLiveFullClosure:
             records = runtime.journal.read_all()
             kinds = [r["kind"] for r in records]
             assert "runtime.snapshot_missing" in kinds
+
+    def test_startup_recovered_position_hydrates_funding_metadata_from_entry_journal(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            funding_ms = 1_782_633_600_000
+            runtime.journal.append(
+                "runtime.pending_entry_registered",
+                {
+                    "entry_id": "entry-act",
+                    "symbol": "ACTUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "funding_timestamp_ms": funding_ms,
+                    "first_funding_timestamp_ms": funding_ms,
+                    "long_funding_timestamp_ms": funding_ms,
+                    "short_funding_timestamp_ms": 0,
+                    "second_funding_timestamp_ms": 0,
+                    "opportunity_type": "aligned",
+                    "entry_maker_leg": "long",
+                    "exit_maker_leg": "short",
+                },
+                ts_ms=funding_ms - 360_000,
+            )
+
+            created, recovered_indices = runtime._hydrate_balanced_startup_live_positions(
+                [
+                    (
+                        "ACTUSDT",
+                        PositionSnapshot(
+                            venue=Venue.BINANCE,
+                            symbol="ACTUSDT",
+                            side=Side.BUY,
+                            quantity=5385.0,
+                            entry_price=0.0089,
+                            observed_at_ms=funding_ms + 1_200_000,
+                        ),
+                    ),
+                    (
+                        "ACTUSDT",
+                        PositionSnapshot(
+                            venue=Venue.OKX,
+                            symbol="ACT-USDT-SWAP",
+                            side=Side.SELL,
+                            quantity=5385.0,
+                            entry_price=0.008904,
+                            observed_at_ms=funding_ms + 1_200_000,
+                        ),
+                    ),
+                ],
+                funding_ms + 1_200_000,
+                source="startup_live_position_probe",
+            )
+
+            assert created == 1
+            assert recovered_indices == {0, 1}
+            position = runtime.state.open_positions[
+                "live-recovered:ACTUSDT:binance->okx"
+            ]
+            assert position.funding_timestamp_ms == funding_ms
+            assert position.long_funding_timestamp_ms == funding_ms
+            assert position.short_funding_timestamp_ms == 0
+            assert position.opportunity_type == "aligned"
+            assert position.entry_maker_leg == "long"
+            assert position.exit_maker_leg == "short"
+            assert aligned_settlement_delay_elapsed(
+                position,
+                funding_ms + 1_200_000,
+                delay_ms=1,
+            )
+
+    def test_startup_recovered_position_without_funding_metadata_is_not_opened(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+
+            created, recovered_indices = runtime._hydrate_balanced_startup_live_positions(
+                [
+                    (
+                        "ACTUSDT",
+                        PositionSnapshot(
+                            venue=Venue.BINANCE,
+                            symbol="ACTUSDT",
+                            side=Side.BUY,
+                            quantity=5385.0,
+                            entry_price=0.0089,
+                            observed_at_ms=1_000_000,
+                        ),
+                    ),
+                    (
+                        "ACTUSDT",
+                        PositionSnapshot(
+                            venue=Venue.OKX,
+                            symbol="ACT-USDT-SWAP",
+                            side=Side.SELL,
+                            quantity=5385.0,
+                            entry_price=0.008904,
+                            observed_at_ms=1_000_000,
+                        ),
+                    ),
+                ],
+                1_000_000,
+                source="startup_live_position_probe",
+            )
+
+            assert created == 0
+            assert recovered_indices == set()
+            assert runtime.state.open_positions == {}
+            records = runtime.journal.read_all()
+            event = records[-1]
+            assert event["kind"] == "recovery.recovered_position_funding_timestamp_missing"
+            assert event["payload"]["symbol"] == "ACTUSDT"
+            assert event["payload"]["reason"] == (
+                "recovered_position_funding_timestamp_missing"
+            )
 
     @pytest.mark.asyncio
     async def test_active_position_tick(self):

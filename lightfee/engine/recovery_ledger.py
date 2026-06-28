@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from lightfee.engine.recovery_symbol_identity import canonical_recovery_symbol
+
 EPSILON = 1e-9
 
 GLOBAL_BLOCKING_KINDS = frozenset(
@@ -617,10 +619,13 @@ def _flatten_exchange_collection(value: Any) -> list[Any]:
 
 
 def _symbol(obj: Any) -> str:
-    symbol = str(_get(obj, "symbol", "") or "").upper()
+    symbol = canonical_recovery_symbol(_get(obj, "symbol", ""), _venue(obj))
     if symbol:
         return symbol
-    return str(_get(_get(obj, "position_snapshot", {}), "symbol", "") or "").upper()
+    return canonical_recovery_symbol(
+        _get(_get(obj, "position_snapshot", {}), "symbol", ""),
+        _venue(obj),
+    )
 
 
 def _venue(obj: Any) -> str:

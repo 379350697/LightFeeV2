@@ -1169,6 +1169,8 @@ _EVENT_KIND_PHASES = {
     "recovery.unpaired_live_position_cleanup_succeeded": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.unpaired_live_position_cleanup_failed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.unpaired_live_position_terminal_flat": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.unpaired_live_position_owner_reassociated": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.recovered_position_funding_timestamp_missing": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "scan.no_entry_diagnostics": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "scan.strategy_shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,

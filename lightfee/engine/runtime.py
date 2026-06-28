@@ -9,7 +9,7 @@ import math
 import sys
 from collections import Counter
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
@@ -77,6 +77,7 @@ from lightfee.engine.recovery_decision_core import (
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_startup_runtime import RecoveryStartupRuntime
+from lightfee.engine.recovery_symbol_identity import canonical_recovery_symbol
 from lightfee.engine.market_data_runtime import MarketDataRuntime
 from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
 from lightfee.engine.pending_entry_runtime import (
@@ -100,6 +101,27 @@ from lightfee.engine.v1_lifecycle_closure import (
 
 if TYPE_CHECKING:
     from lightfee.engine.entry_sync import HedgeDriveResult
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        result = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return result if result > 0 else 0
+
+
+def _mapping_or_attr(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, Mapping):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value or "")
+
 
 from lightfee.engine.pending_entry_lifecycle import (
     advance_pending_entry_zero_fill_phase,
@@ -3291,6 +3313,27 @@ class LiveRuntime:
                 f"{long_pos.venue.value}->{short_pos.venue.value}"
             )
             matched_quantity = abs(long_pos.quantity)
+            funding_context = self._startup_recovered_position_funding_context(
+                symbol,
+                long_pos.venue,
+                short_pos.venue,
+            )
+            if int(funding_context.get("funding_timestamp_ms", 0) or 0) <= 0:
+                self.journal.append(
+                    "recovery.recovered_position_funding_timestamp_missing",
+                    {
+                        "position_id": position_id,
+                        "symbol": symbol,
+                        "long_venue": long_pos.venue.value,
+                        "short_venue": short_pos.venue.value,
+                        "quantity": matched_quantity,
+                        "source": source,
+                        "reason": "recovered_position_funding_timestamp_missing",
+                        "next_action": "operator_reconcile_or_rehydrate_from_entry_journal",
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
             position = OpenPosition(
                 position_id=position_id,
                 symbol=symbol,
@@ -3303,6 +3346,33 @@ class LiveRuntime:
                 opened_at_ms=now_ms,
                 matched_quantity=matched_quantity,
                 opportunity_hint_source=source,
+                funding_timestamp_ms=int(
+                    funding_context.get("funding_timestamp_ms", 0) or 0
+                ),
+                long_funding_timestamp_ms=int(
+                    funding_context.get("long_funding_timestamp_ms", 0) or 0
+                ),
+                short_funding_timestamp_ms=int(
+                    funding_context.get("short_funding_timestamp_ms", 0) or 0
+                ),
+                second_funding_timestamp_ms=int(
+                    funding_context.get("second_funding_timestamp_ms", 0) or 0
+                ),
+                opportunity_type=str(
+                    funding_context.get("opportunity_type") or "aligned"
+                ),
+                first_funding_leg=str(
+                    funding_context.get("first_funding_leg") or ""
+                ),
+                entry_maker_leg=str(
+                    funding_context.get("entry_maker_leg") or ""
+                ),
+                exit_maker_leg=str(
+                    funding_context.get("exit_maker_leg") or ""
+                ),
+                entry_notional_quote=matched_quantity * (
+                    long_pos.entry_price or short_pos.entry_price or 0.0
+                ),
             )
             self.state.open_positions[position_id] = position
             recovered_indices.update({long_idx, short_idx})
@@ -3321,6 +3391,16 @@ class LiveRuntime:
                     "opened_at_ms": position.opened_at_ms,
                     "matched_quantity": position.matched_quantity,
                     "opportunity_hint_source": position.opportunity_hint_source,
+                    "funding_timestamp_ms": position.funding_timestamp_ms,
+                    "first_funding_timestamp_ms": position.funding_timestamp_ms,
+                    "long_funding_timestamp_ms": position.long_funding_timestamp_ms,
+                    "short_funding_timestamp_ms": position.short_funding_timestamp_ms,
+                    "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
+                    "opportunity_type": position.opportunity_type,
+                    "first_funding_leg": position.first_funding_leg,
+                    "entry_maker_leg": position.entry_maker_leg,
+                    "exit_maker_leg": position.exit_maker_leg,
+                    "funding_context_source": funding_context.get("source", ""),
                     "source": source,
                     "ts_ms": now_ms,
                 },
@@ -3328,6 +3408,154 @@ class LiveRuntime:
             created += 1
 
         return created, recovered_indices
+
+    def _startup_recovered_position_funding_context(
+        self,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> dict[str, Any]:
+        journal_context = self._startup_recovered_position_funding_context_from_journal(
+            symbol,
+            long_venue,
+            short_venue,
+        )
+        if journal_context:
+            return journal_context
+        return self._startup_recovered_position_funding_context_from_quotes(
+            symbol,
+            long_venue,
+            short_venue,
+        )
+
+    def _startup_recovered_position_funding_context_from_journal(
+        self,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> dict[str, Any]:
+        target_symbol = canonical_recovery_symbol(symbol)
+        target_long = long_venue.value
+        target_short = short_venue.value
+        best: dict[str, Any] = {}
+        for event in self.journal.read_all():
+            payload = event.get("payload", {})
+            if not isinstance(payload, Mapping):
+                continue
+            if canonical_recovery_symbol(payload.get("symbol")) != target_symbol:
+                continue
+            event_long = _text(payload.get("long_venue")).lower()
+            event_short = _text(payload.get("short_venue")).lower()
+            if event_long and event_long != target_long:
+                continue
+            if event_short and event_short != target_short:
+                continue
+            context = self._funding_context_from_payload(
+                payload,
+                source="entry_journal",
+            )
+            if int(context.get("funding_timestamp_ms", 0) or 0) > 0:
+                best = context
+        return best
+
+    def _startup_recovered_position_funding_context_from_quotes(
+        self,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> dict[str, Any]:
+        snapshot = self._last_good_snapshot
+        quotes = getattr(snapshot, "quotes", {}) if snapshot is not None else {}
+        if not isinstance(quotes, Mapping):
+            return {}
+        long_ts = self._funding_timestamp_from_snapshot_quotes(
+            quotes,
+            symbol,
+            long_venue,
+        )
+        short_ts = self._funding_timestamp_from_snapshot_quotes(
+            quotes,
+            symbol,
+            short_venue,
+        )
+        positive = [ts for ts in (long_ts, short_ts) if ts > 0]
+        if not positive:
+            return {}
+        first_ts = min(positive)
+        second_ts = max(positive) if len(positive) > 1 else 0
+        return {
+            "source": "sidecar_quote_truth",
+            "funding_timestamp_ms": first_ts,
+            "long_funding_timestamp_ms": long_ts,
+            "short_funding_timestamp_ms": short_ts,
+            "second_funding_timestamp_ms": second_ts if second_ts > first_ts else 0,
+            "opportunity_type": "staggered" if second_ts > first_ts else "aligned",
+            "first_funding_leg": (
+                "long" if long_ts > 0 and long_ts == first_ts else "short"
+            ),
+        }
+
+    @staticmethod
+    def _funding_timestamp_from_snapshot_quotes(
+        quotes: Mapping[Any, Any],
+        symbol: str,
+        venue: Venue,
+    ) -> int:
+        target_symbol = canonical_recovery_symbol(symbol, venue)
+        target_venue = venue.value
+        for key, quote in quotes.items():
+            quote_symbol = _mapping_or_attr(quote, "symbol", "")
+            quote_venue = _mapping_or_attr(quote, "venue", "")
+            if isinstance(key, tuple) and len(key) >= 2:
+                quote_venue = quote_venue or key[0]
+                quote_symbol = quote_symbol or key[1]
+            elif isinstance(key, str) and ":" in key:
+                key_venue, key_symbol = key.split(":", 1)
+                quote_venue = quote_venue or key_venue
+                quote_symbol = quote_symbol or key_symbol
+            if str(quote_venue or "").lower() != target_venue:
+                continue
+            if canonical_recovery_symbol(quote_symbol, venue) != target_symbol:
+                continue
+            ts = _positive_int(_mapping_or_attr(quote, "funding_timestamp_ms", 0))
+            if ts > 0:
+                return ts
+        return 0
+
+    @staticmethod
+    def _funding_context_from_payload(
+        payload: Mapping[str, Any],
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        long_ts = _positive_int(payload.get("long_funding_timestamp_ms", 0))
+        short_ts = _positive_int(payload.get("short_funding_timestamp_ms", 0))
+        first_ts = _positive_int(
+            payload.get("first_funding_timestamp_ms")
+            or payload.get("funding_timestamp_ms")
+        )
+        if first_ts <= 0:
+            positive = [ts for ts in (long_ts, short_ts) if ts > 0]
+            first_ts = min(positive) if positive else 0
+        second_ts = _positive_int(payload.get("second_funding_timestamp_ms", 0))
+        if second_ts <= 0 and long_ts > 0 and short_ts > 0:
+            later = max(long_ts, short_ts)
+            if later > first_ts:
+                second_ts = later
+        opportunity_type = str(payload.get("opportunity_type") or "").lower()
+        if opportunity_type not in {"aligned", "staggered"}:
+            opportunity_type = "staggered" if second_ts > first_ts > 0 else "aligned"
+        return {
+            "source": source,
+            "funding_timestamp_ms": first_ts,
+            "long_funding_timestamp_ms": long_ts,
+            "short_funding_timestamp_ms": short_ts,
+            "second_funding_timestamp_ms": second_ts,
+            "opportunity_type": opportunity_type,
+            "first_funding_leg": str(payload.get("first_funding_leg") or ""),
+            "entry_maker_leg": str(payload.get("entry_maker_leg") or ""),
+            "exit_maker_leg": str(payload.get("exit_maker_leg") or ""),
+        }
 
     def _has_open_position_pair(
         self, symbol: str, long_venue: Venue, short_venue: Venue

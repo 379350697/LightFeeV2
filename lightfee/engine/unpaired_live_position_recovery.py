@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from lightfee.core.domain import OrderRequest, PositionSnapshot, Side, TimeInForce, Venue
 from lightfee.engine.recovery_ledger import RecoveryLedger, RecoveryWorkItem
+from lightfee.engine.recovery_symbol_identity import canonical_recovery_symbol
 from lightfee.venues.cid import generate_exchange_cid
 
 if TYPE_CHECKING:
@@ -16,6 +17,7 @@ BACKOFF_MS = 30_000
 MAX_ATTEMPTS = 3
 POSITION_TRUTH_MAX_AGE_MS = 10_000
 TERMINAL_MANUAL_REQUIRED = "manual_required"
+TERMINAL_OWNER_REASSOCIATED = "owner_reassociated"
 
 
 class UnpairedLivePositionRecoveryRuntime:
@@ -28,13 +30,22 @@ class UnpairedLivePositionRecoveryRuntime:
         records = self._records()
         unpaired_keys: set[tuple[str, str, str]] = set()
         open_order_keys: set[tuple[str, str]] = set()
+        owned_position_keys: set[tuple[str, str, str]] = set()
         for item in ledger.work_items:
             for artifact in item.artifacts:
                 if artifact.kind == "open_order":
                     open_order_keys.add(
                         (
                             str(artifact.venue or ""),
-                            str(artifact.symbol or ""),
+                            canonical_recovery_symbol(artifact.symbol, artifact.venue),
+                        )
+                    )
+                if artifact.kind == "position" and item.kind == "owned_open_position":
+                    owned_position_keys.add(
+                        (
+                            str(artifact.venue or ""),
+                            canonical_recovery_symbol(artifact.symbol, artifact.venue),
+                            str(artifact.side or "").lower(),
                         )
                     )
             if item.kind != "unpaired_live_position":
@@ -43,7 +54,7 @@ class UnpairedLivePositionRecoveryRuntime:
             if artifact is None:
                 continue
             venue = str(artifact.venue or "")
-            symbol = str(artifact.symbol or "")
+            symbol = canonical_recovery_symbol(artifact.symbol, artifact.venue)
             side = str(artifact.side or "").lower()
             quantity = float(artifact.quantity or 0.0)
             if not venue or not symbol or quantity <= EPSILON:
@@ -94,11 +105,21 @@ class UnpairedLivePositionRecoveryRuntime:
                 if not is_active_unpaired_live_position_recovery(record):
                     continue
                 venue = str(record.get("venue") or "")
-                symbol = str(record.get("symbol") or "")
+                symbol = canonical_recovery_symbol(
+                    record.get("symbol"),
+                    record.get("venue"),
+                )
                 side = str(record.get("side") or "").lower()
                 if (venue, symbol, side) in unpaired_keys:
                     continue
                 if (venue, symbol) in open_order_keys:
+                    continue
+                if (venue, symbol, side) in owned_position_keys:
+                    self._mark_owner_reassociated(
+                        record,
+                        now_ms,
+                        reason="ledger_position_has_runtime_owner",
+                    )
                     continue
                 self._mark_terminal_flat(
                     record,
@@ -355,6 +376,22 @@ class UnpairedLivePositionRecoveryRuntime:
             now_ms=now_ms,
         )
 
+    def _mark_owner_reassociated(
+        self,
+        record: dict[str, Any],
+        now_ms: int,
+        *,
+        reason: str,
+    ) -> None:
+        record["terminal_status"] = TERMINAL_OWNER_REASSOCIATED
+        record["last_error"] = ""
+        record["next_attempt_ms"] = int(now_ms)
+        self._append(
+            "recovery.unpaired_live_position_owner_reassociated",
+            {**record, "reason": reason},
+            now_ms=now_ms,
+        )
+
     def _mark_manual_required(
         self,
         record: dict[str, Any],
@@ -391,7 +428,11 @@ class UnpairedLivePositionRecoveryRuntime:
         for record in records:
             if (
                 str(record.get("venue") or "") == venue
-                and str(record.get("symbol") or "") == symbol
+                and canonical_recovery_symbol(
+                    record.get("symbol"),
+                    record.get("venue"),
+                )
+                == canonical_recovery_symbol(symbol, venue)
                 and str(record.get("side") or "") == side
             ):
                 return record
@@ -517,7 +558,10 @@ def _get(item: Any, key: str, default: Any = None) -> Any:
 def is_active_unpaired_live_position_recovery(record: Any) -> bool:
     if not isinstance(record, dict):
         return False
-    return str(record.get("terminal_status") or "").lower() != "flat"
+    return str(record.get("terminal_status") or "").lower() not in {
+        "flat",
+        TERMINAL_OWNER_REASSOCIATED,
+    }
 
 
 def active_unpaired_live_position_recovery_records(state: Any) -> list[dict[str, Any]]:

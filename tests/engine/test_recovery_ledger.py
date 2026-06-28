@@ -100,6 +100,49 @@ def test_pending_passive_close_owns_live_reduce_only_close_order():
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
+def test_okx_venue_symbol_live_leg_is_owned_by_canonical_open_position():
+    local = {
+        "open_positions": [
+            {
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "long_venue": "binance",
+                "short_venue": "okx",
+            }
+        ],
+        "pending_entries": [],
+        "pending_passive_closes": [],
+    }
+    owner_index = RecoveryOwnerIndex.from_state(local)
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local,
+        exchange_truth={
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": "binance",
+                    "symbol": "ACTUSDT",
+                    "side": "buy",
+                    "quantity": 5385.0,
+                },
+                {
+                    "venue": "okx",
+                    "symbol": "ACT-USDT-SWAP",
+                    "side": "sell",
+                    "quantity": 5385.0,
+                },
+            ],
+            "open_orders": [],
+        },
+        owner_index=owner_index,
+    )
+
+    assert [item.kind for item in ledger.work_items] == ["owned_open_position"]
+    assert all(item.blocking is False for item in ledger.work_items)
+    assert all(item.kind != "unpaired_live_position" for item in ledger.work_items)
+
+
 def test_passive_close_journal_owns_live_reduce_only_close_order_without_local_pending():
     local = {
         "open_positions": [
