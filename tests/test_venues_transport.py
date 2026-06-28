@@ -1292,6 +1292,43 @@ class TestHyperliquidLiveOrderNowSupported:
         assert adapter._transport._credential.wallet_mode == "api_wallet"
         assert adapter._transport._credential.account_address == ""
 
+    def test_registry_uses_hyperliquid_standard_wallet_mode_env(self, monkeypatch):
+        from lightfee.venues.registry import build_adapter
+
+        wallet_key = "0x" + "1" * 64
+        monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
+        monkeypatch.setenv("LIGHTFEE_HYPERLIQUID_WALLET_MODE", "api_wallet")
+        vc = VenueConfig(venue="hyperliquid")
+        vc.live.trade_credentials = TradeCredentials(
+            wallet_private_key_env="LF_TEST_HL_WALLET",
+            account_address_env=None,
+        )
+
+        adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
+
+        assert adapter._transport._credential.wallet_mode == "api_wallet"
+        assert adapter._transport._credential.account_address == ""
+
+    def test_registry_wallet_mode_env_overrides_hyperliquid_config_mode(self, monkeypatch):
+        from lightfee.venues.registry import build_adapter
+
+        wallet_key = "0x" + "1" * 64
+        account_address = "0x000000000000000000000000000000000000beef"
+        monkeypatch.setenv("LF_TEST_HL_WALLET", wallet_key)
+        monkeypatch.setenv("LF_TEST_HL_ACCOUNT", account_address)
+        monkeypatch.setenv("LF_TEST_HL_MODE", "agent_wallet")
+        vc = VenueConfig(venue="hyperliquid")
+        vc.live.trade_credentials = TradeCredentials(
+            wallet_private_key_env="LF_TEST_HL_WALLET",
+            account_address_env="LF_TEST_HL_ACCOUNT",
+            wallet_mode_env="LF_TEST_HL_MODE",
+            wallet_mode="account_wallet",
+        )
+
+        adapter = build_adapter(Venue.HYPERLIQUID, vc, mode="live")
+
+        assert adapter._transport._credential.wallet_mode == "api_wallet"
+        assert adapter._transport._credential.account_address == account_address
 
     @pytest.mark.asyncio
     async def test_hyperliquid_readonly_preflight_trusts_direct_wallet_account(self):

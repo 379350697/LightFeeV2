@@ -57,6 +57,15 @@ def _resolve_env(env_var: str) -> str:
     return val.strip("\r")
 
 
+def _resolve_wallet_mode(venue: Venue, creds: object) -> str:
+    configured = str(getattr(creds, "wallet_mode", "") or "account_wallet")
+    env_name = str(getattr(creds, "wallet_mode_env", "") or "")
+    if not env_name and venue == Venue.HYPERLIQUID:
+        env_name = "LIGHTFEE_HYPERLIQUID_WALLET_MODE"
+    env_value = _resolve_env(env_name)
+    return env_value or configured
+
+
 def build_adapter(venue: Venue, vc: VenueConfig, mode: str,
                   exchange_http_timeout_ms: int = 10000,
                   rate_limiter = None) -> VenueAdapter:
@@ -72,7 +81,10 @@ def build_adapter(venue: Venue, vc: VenueConfig, mode: str,
         api_passphrase=_resolve_env(creds.api_passphrase_env or ""),
         wallet_private_key=_resolve_env(creds.wallet_private_key_env or ""),
         account_address=_resolve_env(creds.account_address_env or ""),
-        wallet_mode=creds.wallet_mode,
+        wallet_mode=_resolve_wallet_mode(venue, creds),
+        allow_api_wallet_authorization_probe=bool(
+            getattr(creds, "allow_api_wallet_authorization_probe", False)
+        ),
     )
     return cls(mode="live", credential=credential,
                exchange_http_timeout_ms=exchange_http_timeout_ms,

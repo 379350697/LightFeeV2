@@ -88,6 +88,12 @@ evidence must map to the matrix before runtime code changes.
 - `metadata.hedge_accepted_order_truth_gap`,
   `pending_entry.accepted_order_truth_gap_registered`, or
   `pending_entry_order_truth_gap_count`.
+- `owned_live_conflict_cleanup_succeeded` or
+  `terminalized_after_single_leg_recovery` exists for an owner, but diagnose
+  still reports the old owner as a current `owned_pending_entry_live_conflict`.
+- Local state is flat/no-pending, exchange truth has a non-reduce-only open
+  maker order with no current owner, and V1 closure reports
+  `orphan_maker_order`.
 
 ## Current Effective Rule
 
@@ -185,6 +191,14 @@ proves one of: confirmed fill, no fill/no open order/no live hedge exposure, an
 open order still present, or truth unavailable. Abort/cleanup may remove the
 pending entry only after that current exchange truth proves the accepted hedge
 order did not fill, has no open order, and left no abnormal live exposure.
+
+Terminal cleanup/recovery events close their owner for current closure indexing.
+Once `pending_entry.owned_live_conflict_cleanup_succeeded` or
+`pending_entry.terminalized_after_single_leg_recovery` is emitted, historical
+positive-fill/live-conflict journal facts for that owner must not be replayed as
+current blocking exposure. If current exchange truth later shows a non-reduce
+open order without owner evidence, classify it as `orphan_maker_order`; do not
+silently relabel it as managed exposure.
 
 All readers should classify order truth through the shared business states:
 `confirmed_fill`, `accepted_uncertain`, `terminal_no_fill`, `rejected`,

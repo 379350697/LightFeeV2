@@ -13,6 +13,10 @@ decision path short.
 - Bybit opening balance family: `110007`, `ab not enough for new order`, `Available balance is insufficient`.
 - Aster max-notional family: `-5018`, `maximum notional value limit`, `max_notional_admission_blocked`.
 - Hyperliquid insufficient-margin family: `Insufficient margin to place order.`
+- Hyperliquid identity family:
+  `account_wallet_signer_mismatch`,
+  `api_wallet_authorization_not_verified_strict_readonly`, or runtime/diagnose
+  disagreement on `wallet_mode`.
 - Gate futures contract sizing family: `INSUFFICIENT_AVAILABLE` with
   `quantity_units=base_to_gate_contracts`, `contract_qty`, and
   `contract_multiplier`.
@@ -156,6 +160,16 @@ Deterministic hedge admission reject must:
   opening risk and should be blocked at candidate/selection once observed.
   They are not reduce-only close admission rejects.
 - Hyperliquid insufficient-margin rejects: no matching V1 exchange family found. Hyperliquid's official error response documents `Insufficient margin to place order.` under the perp margin family; V2 treats it as deterministic admission evidence with symbol cooldown, venue cooldown, shortlist/dispatch admission blocking, and pending hedge abort. Official doc: <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses>.
+- Hyperliquid account identity and API-wallet authorization are separate proof
+  classes. `/info` account reads must use the configured account address, while
+  `/exchange` is the signed trading endpoint. In `account_wallet` mode,
+  account/signer mismatch is fail-closed as
+  `account_wallet_signer_mismatch`. In `api_wallet` mode, do not treat the
+  signer as the account; under strict-readonly production policy, do not send a
+  signed noop and keep trading untrusted with
+  `api_wallet_authorization_not_verified_strict_readonly`. Runtime and
+  diagnose must load the same wallet mode source, including the standard
+  `LIGHTFEE_HYPERLIQUID_WALLET_MODE` environment variable.
 - Transport-level classification alone is insufficient unless runtime consumes it in the pending hedge branch.
 
 ## Attempts Ledger

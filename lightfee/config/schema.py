@@ -372,7 +372,9 @@ class TradeCredentials:
     api_passphrase_env: Optional[str] = None
     wallet_private_key_env: Optional[str] = None
     account_address_env: Optional[str] = None
+    wallet_mode_env: Optional[str] = None
     wallet_mode: str = "account_wallet"
+    allow_api_wallet_authorization_probe: bool = False
     permission_mode: str = "trade"
 
 
