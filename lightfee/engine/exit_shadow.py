@@ -145,7 +145,14 @@ class ExitShadowTracker:
 
         events: list[dict[str, Any]] = []
         for decision in decisions:
-            events.append(_strategy_decision_event(shadow_id, snapshot, decision))
+            events.append(
+                _strategy_decision_event(
+                    shadow_id,
+                    snapshot,
+                    decision,
+                    self.config,
+                )
+            )
         for path in PATHS:
             events.append(
                 _path_markout_event(
@@ -207,10 +214,12 @@ class ExitShadowTracker:
                     _strategy_summary_event(
                         shadow_id,
                         pending.snapshot,
+                        market,
                         decision,
                         horizon_ms=horizon_ms,
                         path_net_bps=path_net_bps,
                         path_adverse_bps=path_adverse_bps,
+                        config=self.config,
                     )
                 )
             pending.emitted_horizons_ms.add(horizon_ms)
@@ -463,10 +472,194 @@ def _position_fields(snapshot: ExitShadowSnapshot) -> dict[str, Any]:
     }
 
 
+def _market_snapshot(market: ExitShadowMarket, config: ExitShadowConfig) -> dict[str, Any]:
+    return {
+        "now_ms": int(market.now_ms or 0),
+        "long_quote": _quote_snapshot(market.long_quote, market.now_ms),
+        "short_quote": _quote_snapshot(market.short_quote, market.now_ms),
+        "long_l2": _book_snapshot(market.long_book, market.now_ms, config),
+        "short_l2": _book_snapshot(market.short_book, market.now_ms, config),
+        "cross_venue_premium_bps": _cross_venue_premium_bps(market),
+        "top_book_imbalance": (
+            _top_book_imbalance(market) if not _quote_stale_reason(market, config) else 0.0
+        ),
+        "multi_level_l2_imbalance": (
+            _multi_level_l2_imbalance(market, config.l2_depth_levels)
+            if not _l2_stale_reason(market, config)
+            else 0.0
+        ),
+    }
+
+
+def _quote_snapshot(quote: ExitShadowQuote | None, now_ms: int) -> dict[str, Any]:
+    if quote is None:
+        return {
+            "available": False,
+            "venue": "",
+            "symbol": "",
+            "bid": 0.0,
+            "ask": 0.0,
+            "mid": 0.0,
+            "spread_bps": 0.0,
+            "bid_size": 0.0,
+            "ask_size": 0.0,
+            "observed_at_ms": 0,
+            "age_ms": 0,
+            "source": "",
+        }
+    observed_at_ms = int(quote.observed_at_ms or 0)
+    return {
+        "available": True,
+        "venue": quote.venue,
+        "symbol": quote.symbol,
+        "bid": float(quote.bid or 0.0),
+        "ask": float(quote.ask or 0.0),
+        "mid": quote.mid,
+        "spread_bps": quote.spread_bps,
+        "bid_size": float(quote.bid_size or 0.0),
+        "ask_size": float(quote.ask_size or 0.0),
+        "observed_at_ms": observed_at_ms,
+        "age_ms": max(int(now_ms or 0) - observed_at_ms, 0) if observed_at_ms > 0 else 0,
+        "source": quote.source,
+    }
+
+
+def _book_snapshot(
+    book: LocalL2Book | None,
+    now_ms: int,
+    config: ExitShadowConfig,
+) -> dict[str, Any]:
+    if book is None:
+        return {
+            "available": False,
+            "ready": False,
+            "venue": "",
+            "symbol": "",
+            "status": "",
+            "source": "",
+            "observed_at_ms": 0,
+            "age_ms": 0,
+            "depth_levels": 0,
+            "bid_depth": 0.0,
+            "ask_depth": 0.0,
+            "top_bid": 0.0,
+            "top_ask": 0.0,
+            "top_bid_size": 0.0,
+            "top_ask_size": 0.0,
+        }
+    observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+    bids = list(getattr(book, "bids", []) or [])
+    asks = list(getattr(book, "asks", []) or [])
+    status = getattr(book, "status", "")
+    is_ready = getattr(book, "is_ready", None)
+    ready = False
+    if callable(is_ready):
+        try:
+            ready = bool(is_ready(config.max_l2_age_ms, int(now_ms or 0)))
+        except Exception:
+            ready = False
+    else:
+        ready = observed_at_ms > 0 and int(now_ms or 0) - observed_at_ms <= config.max_l2_age_ms
+    return {
+        "available": True,
+        "ready": ready,
+        "venue": str(getattr(book, "venue", "") or ""),
+        "symbol": str(getattr(book, "symbol", "") or ""),
+        "status": getattr(status, "value", str(status)),
+        "source": str(getattr(book, "source", "") or "local_l2"),
+        "observed_at_ms": observed_at_ms,
+        "age_ms": max(int(now_ms or 0) - observed_at_ms, 0) if observed_at_ms > 0 else 0,
+        "depth_levels": min(len(bids), len(asks), max(int(config.l2_depth_levels), 0)),
+        "bid_depth": _weighted_depth(book, "bids", config.l2_depth_levels),
+        "ask_depth": _weighted_depth(book, "asks", config.l2_depth_levels),
+        "top_bid": float(getattr(bids[0], "price", 0.0) or 0.0) if bids else 0.0,
+        "top_ask": float(getattr(asks[0], "price", 0.0) or 0.0) if asks else 0.0,
+        "top_bid_size": float(getattr(bids[0], "quantity", 0.0) or 0.0) if bids else 0.0,
+        "top_ask_size": float(getattr(asks[0], "quantity", 0.0) or 0.0) if asks else 0.0,
+    }
+
+
+def _market_data_quality(
+    market: ExitShadowMarket,
+    config: ExitShadowConfig,
+    *,
+    prefix: str = "",
+) -> dict[str, Any]:
+    data = {
+        f"{prefix}long_quote_status": _quote_quality(
+            market.long_quote,
+            market.now_ms,
+            config,
+        ),
+        f"{prefix}short_quote_status": _quote_quality(
+            market.short_quote,
+            market.now_ms,
+            config,
+        ),
+        f"{prefix}long_l2_status": _book_quality(
+            market.long_book,
+            market.now_ms,
+            config,
+        ),
+        f"{prefix}short_l2_status": _book_quality(
+            market.short_book,
+            market.now_ms,
+            config,
+        ),
+    }
+    return data
+
+
+def _combined_market_data_quality(
+    trigger_market: ExitShadowMarket,
+    future_market: ExitShadowMarket,
+    config: ExitShadowConfig,
+) -> dict[str, Any]:
+    quality = _market_data_quality(trigger_market, config)
+    quality.update(_market_data_quality(trigger_market, config, prefix="trigger_"))
+    quality.update(_market_data_quality(future_market, config, prefix="future_"))
+    return quality
+
+
+def _quote_quality(
+    quote: ExitShadowQuote | None,
+    now_ms: int,
+    config: ExitShadowConfig,
+) -> str:
+    if quote is None:
+        return "missing"
+    if quote.mid <= 0.0:
+        return "invalid"
+    observed_at_ms = int(quote.observed_at_ms or 0)
+    if observed_at_ms <= 0 or int(now_ms or 0) - observed_at_ms > config.max_quote_age_ms:
+        return "stale"
+    return "fresh"
+
+
+def _book_quality(
+    book: LocalL2Book | None,
+    now_ms: int,
+    config: ExitShadowConfig,
+) -> str:
+    if book is None:
+        return "missing"
+    is_ready = getattr(book, "is_ready", None)
+    if callable(is_ready):
+        try:
+            return "fresh" if bool(is_ready(config.max_l2_age_ms, int(now_ms or 0))) else "stale"
+        except Exception:
+            return "invalid"
+    observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+    if observed_at_ms <= 0 or int(now_ms or 0) - observed_at_ms > config.max_l2_age_ms:
+        return "stale"
+    return "fresh"
+
+
 def _strategy_decision_event(
     shadow_id: str,
     snapshot: ExitShadowSnapshot,
     decision: ExitShadowDecision,
+    config: ExitShadowConfig,
 ) -> dict[str, Any]:
     payload = {
         "shadow_id": shadow_id,
@@ -476,6 +669,8 @@ def _strategy_decision_event(
         "recommended_path": decision.recommended_path,
         "decision_reason": decision.reason,
         "features": dict(decision.features),
+        "trigger_market": _market_snapshot(snapshot.market, config),
+        "data_quality": _market_data_quality(snapshot.market, config),
         "ts_ms": snapshot.market.now_ms,
     }
     payload.update(_position_fields(snapshot))
@@ -503,6 +698,13 @@ def _path_markout_event(
         "max_adverse_bps": max_adverse_bps,
         "take_profit_hit_bps": max(take_profit_hits) if take_profit_hits else 0.0,
         "stop_loss_hit": max_adverse_bps >= config.adverse_stop_bps,
+        "trigger_market": _market_snapshot(snapshot.market, config),
+        "future_market": _market_snapshot(future_market, config),
+        "data_quality": _combined_market_data_quality(
+            snapshot.market,
+            future_market,
+            config,
+        ),
         "ts_ms": future_market.now_ms,
     }
     payload.update(_position_fields(snapshot))
@@ -512,11 +714,13 @@ def _path_markout_event(
 def _strategy_summary_event(
     shadow_id: str,
     snapshot: ExitShadowSnapshot,
+    future_market: ExitShadowMarket,
     decision: ExitShadowDecision,
     *,
     horizon_ms: int,
     path_net_bps: dict[str, float],
     path_adverse_bps: dict[str, float],
+    config: ExitShadowConfig,
 ) -> dict[str, Any]:
     recommended_net_bps = float(path_net_bps.get(decision.recommended_path, 0.0) or 0.0)
     baseline_net_bps = float(path_net_bps.get(PATH_SIMULTANEOUS, 0.0) or 0.0)
@@ -548,6 +752,13 @@ def _strategy_summary_event(
         ),
         "excluded": excluded,
         "exclude_reason": decision.reason if excluded else "",
+        "trigger_market": _market_snapshot(snapshot.market, config),
+        "future_market": _market_snapshot(future_market, config),
+        "data_quality": _combined_market_data_quality(
+            snapshot.market,
+            future_market,
+            config,
+        ),
         "ts_ms": snapshot.market.now_ms + int(horizon_ms),
     }
     payload.update(_position_fields(snapshot))

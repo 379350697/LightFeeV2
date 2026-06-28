@@ -1688,20 +1688,30 @@ class CloseRuntime:
             now_ms=now_ms,
         )
 
-    def _record_exit_shadow_trigger(self, position, reason: str, now_ms: int) -> None:
+    def _record_exit_shadow_trigger(self, position, reason: str, now_ms: int) -> str:
         config = self._exit_shadow_config()
         tracker = self._exit_shadow_tracker_for_config(config)
         if tracker is None:
-            return
+            return ""
         try:
             snapshot = ExitShadowSnapshot(
                 position=position,
                 reason=reason,
                 market=self._exit_shadow_market(position, now_ms),
             )
-            self._append_exit_shadow_events(tracker.on_close_trigger(snapshot))
+            events = tracker.on_close_trigger(snapshot)
+            shadow_id = ""
+            for event in events:
+                payload = event.get("payload", {})
+                if isinstance(payload, dict) and payload.get("shadow_id"):
+                    shadow_id = str(payload.get("shadow_id") or "")
+                    break
+            if shadow_id:
+                setattr(position, "exit_shadow_id", shadow_id)
+            self._append_exit_shadow_events(events)
+            return shadow_id
         except Exception:
-            return
+            return ""
 
     def _emit_due_exit_shadow_markouts(self, now_ms: int) -> None:
         config = self._exit_shadow_config()
@@ -1811,7 +1821,7 @@ class CloseRuntime:
                 continue
 
             reason_str = reason.value if hasattr(reason, 'value') else str(reason)
-            self._record_exit_shadow_trigger(position, reason_str, now_ms)
+            exit_shadow_id = self._record_exit_shadow_trigger(position, reason_str, now_ms)
 
             if normal_close_reason_uses_passive_maker_taker(reason_str):
                 # Route to passive close
@@ -1839,6 +1849,7 @@ class CloseRuntime:
                             "position_id": position.position_id,
                             "reason": reason_str,
                             "matched_quantity": position.matched_quantity,
+                            "exit_shadow_id": exit_shadow_id,
                         },
                     )
                     pending = await self.ctx.passive_close_executor.start_pending_passive_close(
@@ -1849,6 +1860,7 @@ class CloseRuntime:
                         short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
                         short_stage="exit_short",
                         long_stage="exit_long",
+                        exit_shadow_id=exit_shadow_id,
                     )
                     if pending is not None:
                         # Immediately drive one cycle
@@ -1864,6 +1876,7 @@ class CloseRuntime:
                             "position_id": position.position_id,
                             "reason": reason_str,
                             "matched_quantity": position.matched_quantity,
+                            "exit_shadow_id": exit_shadow_id,
                         },
                     )
                     await self.ctx.close_executor.execute_close(

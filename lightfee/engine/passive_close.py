@@ -97,6 +97,17 @@ from lightfee.engine.v1_lifecycle_closure import (
 )
 from lightfee.risk.modes import GlobalRiskMode
 
+
+def _exit_shadow_id_for_position(position: OpenPosition | None) -> str:
+    return str(getattr(position, "exit_shadow_id", "") or "")
+
+
+def _exit_shadow_id_for_pending(pending: PendingPassiveClose | None) -> str:
+    if pending is None:
+        return ""
+    return _exit_shadow_id_for_position(getattr(pending, "position_snapshot", None))
+
+
 # ---------------------------------------------------------------------------
 # V1 constants
 # ---------------------------------------------------------------------------
@@ -866,6 +877,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_final_truth_reconciled",
                 {
                     "position_id": pending.position_id,
+                    "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                     "symbol": position.symbol,
                     "hedge_venue": hedge_venue.value,
                     "hedge_leg": hedge_leg,
@@ -946,6 +958,7 @@ class PassiveCloseExecutor:
             "exit.passive_close_final_truth_reconciled",
             {
                 "position_id": pending.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "symbol": position.symbol,
                 "hedge_venue": hedge_venue.value,
                 "hedge_leg": hedge_leg,
@@ -973,6 +986,7 @@ class PassiveCloseExecutor:
                     quantity=fill.quantity,
                 ),
                 "position_id": pending.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "leg": hedge_leg,
                 "venue": hedge_venue.value,
                 "symbol": position.symbol,
@@ -1380,6 +1394,7 @@ class PassiveCloseExecutor:
         quantity: Optional[float] = None,
         short_stage: str = "exit_short",
         long_stage: str = "exit_long",
+        exit_shadow_id: str = "",
     ) -> Optional[PendingPassiveClose]:
         """V1 start_pending_passive_close (exit.rs line 1603).
 
@@ -1390,6 +1405,9 @@ class PassiveCloseExecutor:
         pid = position.position_id
         if pid in state.pending_passive_closes:
             return None
+
+        if exit_shadow_id:
+            setattr(position, "exit_shadow_id", str(exit_shadow_id))
 
         target = quantity or position.matched_quantity
         if target <= 0.0:
@@ -2723,6 +2741,7 @@ class PassiveCloseExecutor:
             "exit.passive_close_maker_submitted",
             {
                 "position_id": position.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_position(position),
                 "maker_venue": maker_venue.value,
                 "maker_leg": maker_leg_label,
                 "order_id": ack.order_id,
@@ -2954,6 +2973,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_maker_progress",
                 {
                     "position_id": pending.position_id,
+                    "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                     "cumulative_quantity": progress.cumulative_quantity,
                     "average_price": progress.average_price,
                     "delta_quantity": delta_qty,
@@ -3013,6 +3033,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_hedge_normalize_failed",
                 {
                     "position_id": position.position_id,
+                    "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                     "hedge_venue": hedge_venue.value,
                     "hedge_leg": hedge_leg_label,
                     "requested": delta,
@@ -3174,6 +3195,7 @@ class PassiveCloseExecutor:
                 "exit.passive_close_hedge_filled",
                 {
                     "position_id": position.position_id,
+                    "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                     "hedge_venue": hedge_venue.value,
                     "hedge_leg": hedge_leg_label,
                     "quantity": fill.quantity,
@@ -4780,6 +4802,7 @@ class PassiveCloseExecutor:
             "exit.passive_close_resolved",
             {
                 "position_id": pending.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "reason": pending.reason,
                 "long_closed_qty": long_closed,
                 "short_closed_qty": short_closed,
@@ -5371,6 +5394,7 @@ class PassiveCloseExecutor:
             "exit.pending_close_reconciliation_registered",
             {
                 "position_id": pending.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "symbol": position.symbol,
                 "source": source,
                 "long_leg_count": len(long_legs),
@@ -5458,6 +5482,7 @@ class PassiveCloseExecutor:
             "exit.accepted_order_truth_gap_registered",
             {
                 "position_id": pending.position_id,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "symbol": position.symbol,
                 "venue": venue.value,
                 "leg": leg_label,
@@ -5572,6 +5597,7 @@ class PassiveCloseExecutor:
                 ),
                 "resolved_at_ms": now_ms,
                 "exchange_truth": truth_payload,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 **closure_fields,
             },
         )

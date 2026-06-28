@@ -205,6 +205,7 @@ async def test_passive_close_readiness_selects_ready_leg_when_preferred_would_ta
             "funding_capture",
             long_price_hint=1.0,
             short_price_hint=1.0,
+            exit_shadow_id="shadow-pos-readiness-switch",
         )
         assert pending is not None
         pending.phase_state.active_maker_leg = ActiveMakerLeg.LONG
@@ -229,6 +230,7 @@ async def test_passive_close_readiness_selects_ready_leg_when_preferred_would_ta
         assert ready
         assert ready[-1]["maker_leg"] == "short"
         assert ready[-1]["switched_maker_leg"] is True
+        assert getattr(position, "exit_shadow_id", "") == "shadow-pos-readiness-switch"
     finally:
         journal.close()
 
@@ -976,6 +978,7 @@ class TestPassiveCloseFinalTruthGate:
                     quantity=10.0,
                 ),
                 "position_id": position.position_id,
+                "exit_shadow_id": "",
                 "leg": "short",
                 "venue": Venue.BYBIT.value,
                 "symbol": "HOMEUSDT",

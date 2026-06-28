@@ -136,3 +136,48 @@ def test_exit_shadow_tracker_emits_three_path_markouts_and_summary():
         "long_first_then_short",
     }
     assert [e["kind"] for e in due_events].count("exit_shadow.strategy_summary") == 5
+
+
+def test_exit_shadow_events_include_analysis_context_fields():
+    tracker = ExitShadowTracker(ExitShadowConfig(enabled=True, markout_horizons_ms=(1000,)))
+    snapshot = ExitShadowSnapshot(position=_position(), reason="funding_capture", market=_market())
+    start_events = tracker.on_close_trigger(snapshot)
+
+    decision_payload = next(
+        event["payload"]
+        for event in start_events
+        if event["kind"] == "exit_shadow.strategy_decision"
+    )
+    assert decision_payload["trigger_market"]["long_quote"]["bid"] == 100.0
+    assert decision_payload["trigger_market"]["long_quote"]["ask"] == 100.1
+    assert decision_payload["trigger_market"]["long_quote"]["age_ms"] == 100
+    assert decision_payload["trigger_market"]["short_quote"]["spread_bps"] > 0.0
+    assert decision_payload["trigger_market"]["long_l2"]["available"] is True
+    assert decision_payload["trigger_market"]["long_l2"]["depth_levels"] == 3
+    assert decision_payload["data_quality"]["long_quote_status"] == "fresh"
+    assert decision_payload["data_quality"]["short_l2_status"] == "fresh"
+
+    start_path_payload = next(
+        event["payload"]
+        for event in start_events
+        if event["kind"] == "exit_shadow.path_markout"
+    )
+    assert start_path_payload["trigger_market"]["now_ms"] == 10_100
+    assert start_path_payload["future_market"]["now_ms"] == 10_100
+    assert start_path_payload["data_quality"]["long_quote_status"] == "fresh"
+
+    future = ExitShadowMarket(
+        long_quote=ExitShadowQuote("binance", "BTCUSDT", 101.0, 101.1, 8.0, 5.0, 11_100),
+        short_quote=ExitShadowQuote("aster", "BTCUSDT", 101.2, 101.3, 7.0, 5.0, 11_100),
+        now_ms=11_100,
+    )
+    due_events = tracker.evaluate_markouts(future)
+    summary_payload = next(
+        event["payload"]
+        for event in due_events
+        if event["kind"] == "exit_shadow.strategy_summary"
+    )
+    assert summary_payload["trigger_market"]["now_ms"] == 10_100
+    assert summary_payload["future_market"]["long_quote"]["bid"] == 101.0
+    assert summary_payload["data_quality"]["long_l2_status"] == "fresh"
+    assert summary_payload["data_quality"]["future_long_l2_status"] == "missing"

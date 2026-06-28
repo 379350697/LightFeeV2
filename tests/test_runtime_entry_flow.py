@@ -3296,6 +3296,7 @@ class TestPlannerDispatchIntegration:
                     "short_price_hint": 0.0,
                     "short_stage": "exit_short",
                     "long_stage": "exit_long",
+                    "exit_shadow_id": "",
                 },
             )
         ]
@@ -3429,6 +3430,17 @@ class TestPlannerDispatchIntegration:
         kinds = [record["kind"] for record in records]
         assert kinds.count("exit_shadow.strategy_decision") == 5
         assert kinds.count("exit_shadow.path_markout") == 3
+        shadow_id = next(
+            record["payload"]["shadow_id"]
+            for record in records
+            if record["kind"] == "exit_shadow.strategy_decision"
+        )
+        routing_payload = next(
+            record["payload"]
+            for record in records
+            if record["kind"] == "runtime.normal_close_routing_passive"
+        )
+        assert routing_payload["exit_shadow_id"] == shadow_id
         assert passive.start_calls == [
             (
                 position.position_id,
@@ -3438,6 +3450,7 @@ class TestPlannerDispatchIntegration:
                     "short_price_hint": 0.0,
                     "short_stage": "exit_short",
                     "long_stage": "exit_long",
+                    "exit_shadow_id": shadow_id,
                 },
             )
         ]
