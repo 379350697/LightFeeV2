@@ -76,6 +76,7 @@
   "lightfee/engine/recovery_ledger.py": "1a364e562c2c4349a3cac781428d272d9c9e7317fac95e29c20b3a467a6d083c",
   "lightfee/engine/recovery_owner_index.py": "17246ffa2e2743a77174ded3a56e5ff785820baa5dba1d835b2f066748e41657",
   "lightfee/engine/recovery_startup_runtime.py": "ed719c1e7fda9d357e0bc03fa5298e7399c9839b18be1b4a849a60fe1a5f2820",
+  "lightfee/engine/recovery_symbol_identity.py": "5ce7cae2127547fa945a871aeb7533a76e6f41809f91ebf47c23d2b12a705887",
   "lightfee/engine/residual.py": "01116cf8ae7b405205cb88b47a7e6364b452a30ecec7562ca17ec8a44d822fbb",
   "lightfee/engine/residual_repair_runtime.py": "4cbea90dc964a54893a1dd47602a83c555646d88652e169a074c9e7815e39061",
   "lightfee/engine/risk_actions.py": "20d10cc6122aa7c485b04486c3a461471c45fa5ef66235a6275e99ad50de835d",
