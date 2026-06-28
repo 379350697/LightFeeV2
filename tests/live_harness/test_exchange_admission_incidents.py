@@ -103,6 +103,23 @@ class RejectingExecutor:
         )
 
 
+class StructuredRejectingExecutor:
+    def __init__(self, reject_reason: str, reject_evidence: dict):
+        self.reject_reason = reject_reason
+        self.reject_evidence = reject_evidence
+        self.calls = 0
+
+    async def execute(self, ctx):
+        self.calls += 1
+        result = EntryExecutionResult(
+            route=ExecutionRoute.REJECTED,
+            state=EntryState.FAILED,
+            reject_reason=self.reject_reason,
+        )
+        result.reject_evidence = dict(self.reject_evidence)
+        return result
+
+
 class RejectingBybitPrecheckAdapter(TrustedVenueAdapter):
     def __init__(self, reject_reason: str):
         self.reject_reason = reject_reason
@@ -359,6 +376,73 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         assert event_payload["official_doc_url"] == official_doc_url
         assert event_payload["evidence_gap"] is evidence_gap
 
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_aster_submit_reject_evidence_creates_symbol_admission_block():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        executor = StructuredRejectingExecutor(
+            "aster_v3 passive order rejected: aster_v3 POST /fapi/v3/order rejected status=400",
+            {
+                "venue": "aster",
+                "operation": "submit_passive_order",
+                "http_status": 400,
+                "raw_body": (
+                    '{"code":-5018,"msg":"Youve reached the maximum notional '
+                    'value limit for this symbol. You can still reduce or close '
+                    'your position to manage your risk."}'
+                ),
+                "exchange_code": "-5018",
+                "exchange_msg": (
+                    "Youve reached the maximum notional value limit for this symbol. "
+                    "You can still reduce or close your position to manage your risk."
+                ),
+                "request_context": {
+                    "symbol": "ESPORTSUSDT",
+                    "side": "buy",
+                    "quantity": 12.0,
+                    "price": 0.08,
+                    "post_only": True,
+                    "reduce_only": False,
+                    "client_order_id": "entry-aster-reject-m",
+                },
+                "evidence_completeness": "complete",
+            },
+        )
+        runtime.entry_executor = executor
+        candidate = _candidate("ESPORTSUSDT", "aster", "binance")
+
+        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.08)
+        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=0.08)
+
+        assert first is True
+        assert second is False
+        assert executor.calls == 1
+
+        state_payload = runtime.state.venue_entry_cooldowns["aster:ESPORTSUSDT"]
+        assert state_payload["reason"] == "max_notional_admission_blocked"
+        assert state_payload["source"] == "exchange_5018_fallback"
+        assert state_payload["exchange_code"] == "-5018"
+        assert state_payload["http_status"] == 400
+        assert state_payload["operation"] == "submit_passive_order"
+        assert state_payload["order_role"] == "entry_result"
+        assert state_payload["request_symbol"] == "ESPORTSUSDT"
+        assert "maximum notional value limit" in state_payload["raw_error"]
+        assert "aster:*" not in runtime.state.venue_entry_cooldowns
+
+        blocked_payload = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_blocked"
+            and record["payload"].get("venue") == "aster"
+            and record["payload"].get("symbol") == "ESPORTSUSDT"
+        ][-1]
+        assert blocked_payload["reason"] == "max_notional_admission_blocked"
+        assert blocked_payload["exchange_code"] == "-5018"
+        assert blocked_payload["block_scope"] == "symbol"
         runtime.journal.close()
 
 

@@ -92,6 +92,84 @@ def _aster_headroom_payload_from_error(
     return payload
 
 
+def _entry_reject_evidence_matches_venue(
+    venue: Venue, reject_evidence: dict[str, Any]
+) -> bool:
+    evidence_venue = str(reject_evidence.get("venue", "") or "").lower()
+    return not evidence_venue or evidence_venue == venue.value
+
+
+def _entry_reject_evidence_text(reject_evidence: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "exchange_code",
+        "exchange_msg",
+        "raw_body",
+        "transport_error_type",
+        "operation",
+    ):
+        value = reject_evidence.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    extra = reject_evidence.get("extra")
+    if isinstance(extra, dict):
+        for key in ("code", "retCode", "sCode", "msg", "retMsg", "label"):
+            value = extra.get(key)
+            if value not in (None, ""):
+                parts.append(f"extra.{key}={value}")
+    return " ".join(parts)
+
+
+def _entry_reject_raw_error(
+    reject_reason: str, reject_evidence: dict[str, Any]
+) -> str:
+    evidence_text = _entry_reject_evidence_text(reject_evidence)
+    if evidence_text:
+        reason = str(reject_reason or "")
+        return f"{reason} | exchange_error={evidence_text}" if reason else evidence_text
+    return str(reject_reason or "")
+
+
+def _entry_reject_evidence_payload(
+    reject_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key in (
+        "exchange_code",
+        "exchange_msg",
+        "http_status",
+        "operation",
+        "transport_error_type",
+        "evidence_completeness",
+    ):
+        value = reject_evidence.get(key)
+        if value not in (None, ""):
+            payload[key] = value
+    request_context = reject_evidence.get("request_context")
+    if isinstance(request_context, dict):
+        request_key_map = {
+            "symbol": "request_symbol",
+            "side": "request_side",
+            "quantity": "request_quantity",
+            "price": "request_price",
+            "post_only": "request_post_only",
+            "reduce_only": "request_reduce_only",
+            "client_order_id": "request_client_order_id",
+            "time_in_force": "request_time_in_force",
+        }
+        for source_key, payload_key in request_key_map.items():
+            value = request_context.get(source_key)
+            if value not in (None, ""):
+                payload[payload_key] = value
+    return payload
+
+
+def _entry_result_admission_source(venue: Venue, reason: str) -> str:
+    if venue == Venue.ASTER and reason == "max_notional_admission_blocked":
+        return "exchange_5018_fallback"
+    return "initial_entry"
+
+
 class EntryDispatchRuntime:
     def __init__(self, ctx: EntryDispatchRuntimeContext) -> None:
         self.ctx = ctx
@@ -165,9 +243,17 @@ class EntryDispatchRuntime:
     def _record_post_only_reject_cooldown(self, *args: Any, **kwargs: Any):
         return self.ctx._record_post_only_reject_cooldown(*args, **kwargs)
 
-    def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
+    def _record_entry_result_admission_blocks(
+        self,
+        candidate,
+        reject_reason: str,
+        now_ms: int,
+        reject_evidence: dict[str, Any] | None = None,
+    ) -> None:
         symbol = str(getattr(candidate, "symbol", "") or "")
         candidate_pair_id = self._candidate_pair_id(candidate)
+        reject_evidence = dict(reject_evidence or {})
+        evidence_text = _entry_reject_evidence_text(reject_evidence)
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),
@@ -176,23 +262,31 @@ class EntryDispatchRuntime:
                 venue = Venue.from_str(str(raw_venue))
             except ValueError:
                 continue
+            if reject_evidence and not _entry_reject_evidence_matches_venue(
+                venue, reject_evidence
+            ):
+                continue
             metadata = self._entry_admission_reject_metadata(venue, reject_reason)
+            if metadata is None and evidence_text:
+                metadata = self._entry_admission_reject_metadata(venue, evidence_text)
             if metadata:
                 reason = str(metadata["reason"])
+                raw_error = _entry_reject_raw_error(reject_reason, reject_evidence)
                 extra_payload = _aster_headroom_payload_from_error(
                     venue=venue,
                     reason=reason,
-                    error_text=reject_reason,
+                    error_text=raw_error,
                     order_role="entry_result",
                 )
+                extra_payload.update(_entry_reject_evidence_payload(reject_evidence))
                 self._record_symbol_admission_block(
                     venue=venue,
                     symbol=symbol,
                     reason=reason,
-                    raw_error=reject_reason,
+                    raw_error=raw_error,
                     now_ms=now_ms,
                     evidence=metadata,
-                    source="initial_entry",
+                    source=_entry_result_admission_source(venue, reason),
                     candidate_pair_id=candidate_pair_id,
                     extra_payload=extra_payload,
                 )
@@ -1730,6 +1824,7 @@ class EntryDispatchRuntime:
                     candidate,
                     str(result.reject_reason),
                     now_ms,
+                    reject_evidence=getattr(result, "reject_evidence", None),
                 )
             if result.pending_entry is not None:
                 if getattr(result.pending_entry, "outcome", "") == "rejected":

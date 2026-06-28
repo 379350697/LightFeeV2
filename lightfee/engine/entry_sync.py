@@ -61,6 +61,7 @@ class EntryExecutionResult:
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
     reject_reason: str = ""
+    reject_evidence: dict[str, Any] = field(default_factory=dict)
     journal_entries: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -197,6 +198,9 @@ class EntrySyncExecutor:
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
             result.reject_reason = maker_result.get("reason", "maker rejected")
+            exchange_error = maker_result.get("exchange_error")
+            if isinstance(exchange_error, dict):
+                result.reject_evidence = dict(exchange_error)
             self.journal.append(
                 "entry.aborted",
                 {

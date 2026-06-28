@@ -40,6 +40,7 @@ from lightfee.persistence.journal import Journal
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import PositionSnapshot
+from lightfee.venues.transport import TransportError, TransportErrorCategory
 
 
 # Inline test helpers (avoid cross-file import issues during pytest collection)
@@ -649,6 +650,62 @@ class TestPassiveMakerLifecycle:
         assert result.state == EntryState.MAKER_RESTING
         assert result.route == ExecutionRoute.PASSIVE_INCREMENTAL
         assert result.pending_entry.hedge_order_id == ""
+
+    @pytest.mark.asyncio
+    async def test_passive_maker_reject_result_carries_structured_exchange_evidence(self, tmp_path):
+        from lightfee.engine.entry import EntryContext, EntryType
+
+        maker = FakeVenueAdapter(Venue.ASTER)
+        hedge = FakeVenueAdapter(Venue.BINANCE)
+        transport_error = TransportError(
+            TransportErrorCategory.REQUEST_REJECTED,
+            "aster_v3 POST /fapi/v3/order rejected status=400",
+            status_code=400,
+            body=(
+                '{"code":-5018,"msg":"Youve reached the maximum notional value '
+                'limit for this symbol. You can still reduce or close your '
+                'position to manage your risk."}'
+            ),
+        )
+        maker.submit_passive_order_outcomes = [
+            OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster_v3 passive order rejected: aster_v3 POST /fapi/v3/order rejected status=400",
+                transport_error=transport_error,
+            )
+        ]
+
+        journal = Journal(tmp_path / "entry_passive_reject_evidence.jsonl")
+        journal.open()
+        executor = EntrySyncExecutor(
+            adapters={Venue.ASTER: maker, Venue.BINANCE: hedge},
+            journal=journal,
+        )
+
+        ctx = EntryContext(
+            entry_id="entry-aster-reject",
+            symbol="ESPORTSUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.BINANCE,
+            long_quantity=12.0,
+            short_quantity=12.0,
+            long_price_hint=0.08,
+            short_price_hint=0.08,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+            created_at_ms=1000,
+        )
+        result = await executor.execute(ctx)
+        journal.close()
+
+        assert result.route == ExecutionRoute.REJECTED
+        assert result.reject_evidence["venue"] == "aster"
+        assert result.reject_evidence["operation"] == "submit_passive_order"
+        assert result.reject_evidence["http_status"] == 400
+        assert result.reject_evidence["exchange_code"] == "-5018"
+        assert "maximum notional value limit" in result.reject_evidence["exchange_msg"]
+        assert result.reject_evidence["request_context"]["symbol"] == "ESPORTSUSDT"
+        assert result.reject_evidence["request_context"]["post_only"] is True
 
     @pytest.mark.asyncio
     async def test_taker_order_still_uses_place_order(self):
