@@ -6302,6 +6302,24 @@ def _build_business_progression_quality_summary(
                 venues.append(venue)
         return venues
 
+    archived_close_accounting_entries: set[str] = set()
+    backfilled_close_accounting_entries: set[str] = set()
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        close_entry_id = entry_id(payload)
+        if not close_entry_id:
+            continue
+        if kind == "reconciliation.pending_close_backfill_archived":
+            archived_close_accounting_entries.add(close_entry_id)
+        elif kind in {
+            "reconciliation.pending_close_backfill_completed",
+            "reconciliation.pending_close_statement_backfilled",
+        }:
+            backfilled_close_accounting_entries.add(close_entry_id)
+
     for rec in sorted(events, key=event_ts):
         ts_ms = event_ts(rec)
         active_cooldowns = {
@@ -6352,26 +6370,44 @@ def _build_business_progression_quality_summary(
                 samples = close_reconciliation_evidence_gap_summary["samples"]
                 if isinstance(samples, list) and len(samples) < 12:
                     terminal_flat_gap = action == "terminal_flat_accounting_gap"
-                    samples.append({
-                        "action": action,
-                        "audit_status": (
+                    reconciliation_owner_id = str(
+                        reconciliation_contract.get("owner_id") or ""
+                    )
+                    if (
+                        terminal_flat_gap
+                        and reconciliation_owner_id
+                        in backfilled_close_accounting_entries
+                    ):
+                        audit_status = "terminal_flat_backfilled"
+                        next_action = "none_backfill_recorded"
+                    elif (
+                        terminal_flat_gap
+                        and reconciliation_owner_id
+                        in archived_close_accounting_entries
+                    ):
+                        audit_status = "terminal_flat_archived"
+                        next_action = "none_archive_recorded"
+                    else:
+                        audit_status = (
                             "terminal_flat_backfill_required"
                             if terminal_flat_gap
                             else "blocking_reconciliation_required"
-                        ),
+                        )
+                        next_action = (
+                            "backfill_trade_statement_or_archive_gap"
+                            if terminal_flat_gap
+                            else "reconcile_missing_trade_statement_before_terminal"
+                        )
+                    samples.append({
+                        "action": action,
+                        "audit_status": audit_status,
                         "blocks_business_terminal": bool(
                             reconciliation_contract.get(
                                 "blocks_business_terminal"
                             )
                         ),
-                        "next_action": (
-                            "backfill_trade_statement_or_archive_gap"
-                            if terminal_flat_gap
-                            else "reconcile_missing_trade_statement_before_terminal"
-                        ),
-                        "owner_id": str(
-                            reconciliation_contract.get("owner_id") or ""
-                        ),
+                        "next_action": next_action,
+                        "owner_id": reconciliation_owner_id,
                         "reason": str(reconciliation_contract.get("reason") or ""),
                         "statement_probe_status": str(
                             reconciliation_contract.get("statement_probe_status")

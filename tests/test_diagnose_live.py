@@ -8790,6 +8790,85 @@ def test_business_progression_quality_marks_flat_accounting_gap_non_blocking():
     }
 
 
+def test_business_progression_quality_marks_archived_backfilled_accounting_gap_done():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.reconciled",
+            "payload": {
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "evidence_gap": True,
+                "evidence_gap_reason": "missing_long_close_trade_statement",
+                "statement_probe_status": "partial",
+                "trade_probe_status": {
+                    "long": "flat_by_position_truth",
+                    "short": "found",
+                },
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "reconciliation.pending_close_backfill_archived",
+            "payload": {
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "close_reconciliation_state": "terminal_flat_accounting_gap",
+                "missing_leg": "long",
+            },
+        },
+        {
+            "ts_ms": 4_000,
+            "kind": "reconciliation.pending_close_backfill_completed",
+            "payload": {
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "missing_leg": "long",
+                "venue": "binance",
+                "order_id": "3734866560",
+                "client_order_id": "lfexc794d080ed776a0d",
+                "quantity": 5385.0,
+                "average_price": 0.0087,
+            },
+        },
+    ]
+    production_acceptance_gate = {
+        "gate_passed": True,
+        "exchange_truth_flat": True,
+        "exchange_truth_no_open_orders": True,
+        "blocking_reasons": [],
+        "v1_lifecycle_summary": {"blocking_row_count": 0},
+    }
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate=production_acceptance_gate,
+    )
+
+    assert business["close_reconciliation_evidence_gap_count"] == 1
+    assert business["close_reconciliation_evidence_gap_summary"] == {
+        "count": 1,
+        "terminal_flat_accounting_gap_count": 1,
+        "unresolved_close_accounting_gap_count": 0,
+        "blocking_count": 0,
+        "samples": [
+            {
+                "action": "terminal_flat_accounting_gap",
+                "audit_status": "terminal_flat_backfilled",
+                "blocks_business_terminal": False,
+                "next_action": "none_backfill_recorded",
+                "owner_id": "live-recovered:ACTUSDT:binance->okx",
+                "reason": "missing_long_close_trade_statement",
+                "statement_probe_status": "partial",
+                "symbol": "ACTUSDT",
+                "truth_source": "exchange_flat_no_open_orders",
+            },
+        ],
+    }
+
+
 def test_diagnostic_noise_summary_separates_admission_and_current_blockers():
     import scripts.diagnose_live as dl
 
