@@ -2805,6 +2805,9 @@ class TestRuntimePreflight:
             async def fetch_all_positions(self):
                 return []
 
+            async def fetch_open_orders(self, symbol: str | None = None):
+                raise RuntimeError("open order truth unavailable")
+
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             bybit = FlatBulkPositionAdapter(Venue.BYBIT)
@@ -2821,6 +2824,44 @@ class TestRuntimePreflight:
             assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
             assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
             assert runtime.state.recovery_blocked_at_ms == 1234
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_flat_truth_clears_orphan_maker_order_block(self):
+        """Complete account position+order truth clears a stale orphan-order block."""
+
+        class AccountFlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.account_open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                assert symbol is None
+                self.account_open_order_calls += 1
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bitget = AccountFlatTruthAdapter(Venue.BITGET)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BITGET: bitget})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "orphan_maker_order"
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert bitget.account_open_order_calls == 1
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
             runtime.journal.close()
 
     @pytest.mark.asyncio

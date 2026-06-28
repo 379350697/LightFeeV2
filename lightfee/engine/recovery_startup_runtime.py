@@ -1351,6 +1351,7 @@ class RecoveryStartupRuntime:
             and self.ctx.state.recovery_blocked_reason
             in {
                 "live_position_mismatch_flatten_failed",
+                "orphan_maker_order",
                 "owned_pending_entry_live_conflict",
                 "unpaired_live_position",
             }
