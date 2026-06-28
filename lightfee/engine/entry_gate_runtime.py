@@ -39,6 +39,12 @@ _ENTRY_ADMISSION_EVIDENCE_FIELDS = (
     "account_margin_sufficient",
     "account_truth_submit_allowed",
     "order_role",
+    "account_state_readable",
+    "signer_matches_account",
+    "trading_authorization_trusted",
+    "policy_block",
+    "authorization_mode",
+    "authorization_error",
 )
 
 _ASTER_REMAINING_OPENABLE_DOC_URL = (
@@ -54,6 +60,20 @@ def _copy_entry_admission_evidence_fields(
     for field in _ENTRY_ADMISSION_EVIDENCE_FIELDS:
         if field in source:
             target[field] = source.get(field)
+
+
+def _trading_preflight_status_from_adapter(adapter: Any) -> dict[str, Any]:
+    transport = getattr(adapter, "_transport", adapter)
+    raw = (
+        getattr(transport, "trading_preflight_status", None)
+        or getattr(transport, "_trading_preflight_status", None)
+        or getattr(adapter, "trading_preflight_status", None)
+        or getattr(adapter, "_trading_preflight_status", None)
+        or {}
+    )
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {}
 
 
 def _first_sample_value(samples: list[dict[str, Any]], key: str) -> Any:
@@ -769,6 +789,59 @@ class EntryGateRuntime:
             route_payload.setdefault("pair_id", candidate_pair_id)
             _normalize_aster_max_notional_evidence(route_payload)
             return route_payload
+        for raw_venue in (
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        ):
+            try:
+                venue = Venue.from_str(str(raw_venue))
+            except ValueError:
+                continue
+            if venue != Venue.HYPERLIQUID:
+                continue
+            adapter = self.get_venue_adapter(venue)
+            if adapter is None:
+                continue
+            transport = getattr(adapter, "_transport", adapter)
+            if getattr(transport, "trading_capability_trusted", True) is not False:
+                continue
+            preflight_status = _trading_preflight_status_from_adapter(adapter)
+            reason = str(
+                preflight_status.get("reason")
+                or "trading_capability_untrusted"
+            )
+            clearinghouse_readable = preflight_status.get(
+                "clearinghouse_state_readable"
+            )
+            return {
+                "venue": venue.value,
+                "symbol": symbol,
+                "blocked_symbol": "*",
+                "reason": reason,
+                "block_scope": "venue",
+                "blocked_until_ms": 0,
+                "ttl_ms": 0,
+                "raw_error": str(preflight_status.get("error") or "")[:200],
+                "official_doc_url": "",
+                "evidence_gap": False,
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
+                "source": "trading_capability_preflight",
+                "policy_block": reason
+                == "api_wallet_authorization_not_verified_strict_readonly",
+                "account_state_readable": bool(clearinghouse_readable),
+                "signer_matches_account": bool(
+                    preflight_status.get("signer_matches_account")
+                    or preflight_status.get("wallet_matches_account")
+                ),
+                "trading_authorization_trusted": False,
+                "authorization_mode": str(
+                    preflight_status.get("authorization_mode") or ""
+                ),
+                "authorization_error": str(
+                    preflight_status.get("authorization_error") or ""
+                )[:200],
+            }
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),

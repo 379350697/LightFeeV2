@@ -513,6 +513,130 @@ def _flat_exchange_truth(runtime_dir, symbols, venues=None):
     }
 
 
+def test_run_diagnose_reports_hyperliquid_strict_readonly_authorization_summary(monkeypatch):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "hyperliquid_trading_disabled_reason": (
+                "api_wallet_authorization_not_verified_strict_readonly"
+            ),
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+        })
+        _write_jsonl(os.path.join(d, "live-events.jsonl"), [])
+
+        def exchange_truth(runtime_dir, symbols, venues=None):
+            return {
+                "available": True,
+                "available_venues": ["hyperliquid"],
+                "confidence": "high",
+                "positions": {"hyperliquid": {}},
+                "open_orders": {"hyperliquid": {}},
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "fetch_status": {"hyperliquid": {"status": "ok"}},
+                "credential_identity": {
+                    "hyperliquid": {
+                        "wallet_mode": "api_wallet",
+                        "account_address_present": True,
+                        "signer_address_present": True,
+                        "account_matches_signer": False,
+                        "signer_matches_account": False,
+                        "allow_api_wallet_authorization_probe": False,
+                        "account_address_masked": "0xe5E4...0C89",
+                        "signer_address_masked": "0x0670...bDcc",
+                    }
+                },
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            venues=["hyperliquid"],
+            now_ms=1782628000000,
+        )
+
+        summary = result["hyperliquid_trading_authorization"]
+        assert summary["wallet_mode"] == "api_wallet"
+        assert summary["account_state_readable"] is True
+        assert summary["signer_matches_account"] is False
+        assert summary["trading_authorization_trusted"] is False
+        assert summary["policy_block"] is True
+        assert summary["trading_disabled_reason"] == (
+            "api_wallet_authorization_not_verified_strict_readonly"
+        )
+        assert summary["next_action"] == "keep_hyperliquid_readonly_until_authorization_proven"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_hyperliquid_historical_trade_evidence_ignores_quote_and_preflight_events():
+    import scripts.diagnose_live as dl
+
+    no_success = dl._build_hyperliquid_historical_trade_evidence([
+        {
+            "ts_ms": 1782620789123,
+            "kind": "startup.trading_preflight",
+            "payload": {
+                "venue": "hyperliquid",
+                "reason": "api_wallet_authorization_not_verified_strict_readonly",
+            },
+        },
+        {
+            "ts_ms": 1782620790000,
+            "kind": "runtime.entry_quote_revalidate_resolved",
+            "payload": {"venue": "hyperliquid", "symbol": "IPUSDT"},
+        },
+        {
+            "ts_ms": 1782620791000,
+            "kind": "order.submitted",
+            "payload": {"venue": "binance", "symbol": "IPUSDT"},
+        },
+    ])
+
+    assert no_success["canonical_success_count"] == 0
+    assert no_success["has_successful_hyperliquid_order_evidence"] is False
+    assert no_success["conclusion"] == "no_successful_hyperliquid_order_evidence_in_window"
+    assert no_success["ignored_quote_or_preflight_count"] == 2
+
+    with_success = dl._build_hyperliquid_historical_trade_evidence([
+        {
+            "ts_ms": 1782620800000,
+            "kind": "order.submitted",
+            "payload": {
+                "venue": "hyperliquid",
+                "symbol": "BTCUSDT",
+                "account_address_masked": "0xe5E4...0C89",
+                "signer_address_masked": "0x0670...bDcc",
+            },
+        },
+        {
+            "ts_ms": 1782620801000,
+            "kind": "entry.opened",
+            "payload": {
+                "long_venue": "bybit",
+                "short_venue": "hyperliquid",
+                "symbol": "BTCUSDT",
+            },
+        },
+    ])
+
+    assert with_success["canonical_success_count"] == 2
+    assert with_success["has_successful_hyperliquid_order_evidence"] is True
+    assert with_success["samples"][0]["kind"] == "order.submitted"
+    assert with_success["samples"][1]["kind"] == "entry.opened"
+
+
 def _balanced_active_exchange_truth(runtime_dir, symbols, venues=None):
     venues = venues or []
     symbol = symbols[0] if symbols else "KATUSDT"

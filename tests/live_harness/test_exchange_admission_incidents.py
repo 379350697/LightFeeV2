@@ -38,6 +38,18 @@ class TrustedVenueAdapter:
         }
 
 
+class StrictReadonlyDisabledAdapter(TrustedVenueAdapter):
+    trading_capability_trusted = False
+    trading_preflight_status = {
+        "venue": "hyperliquid",
+        "authorization_mode": "api_wallet",
+        "reason": "api_wallet_authorization_not_verified_strict_readonly",
+        "clearinghouse_state_readable": True,
+        "signer_matches_account": False,
+        "trading_capability_trusted": False,
+    }
+
+
 def make_harness_config(tmp_path: str):
     config = make_test_config(tmp_path)
     config.strategy.pending_entry_pre_submit_hedgeable_fill_guard_enabled = False
@@ -1222,6 +1234,54 @@ def test_hyperliquid_venue_cooldown_prunes_new_entry_candidates_before_shortlist
         assert payload["allowed_count"] == 1
         assert payload["suppressed_count"] == 0
         assert payload["samples"][0]["candidate_pair_id"] == "wldusdt:bybit->hyperliquid"
+        runtime.journal.close()
+
+
+def test_hyperliquid_strict_readonly_prunes_new_entry_candidates_before_shortlist():
+    with tempfile.TemporaryDirectory() as td:
+        runtime = LiveRuntime(
+            make_harness_config(td),
+            venue_adapters={
+                Venue.BYBIT: TrustedVenueAdapter(),
+                Venue.BINANCE: TrustedVenueAdapter(),
+                Venue.HYPERLIQUID: StrictReadonlyDisabledAdapter(),
+            },
+        )
+        runtime.journal.open()
+
+        filtered = runtime._filter_candidates_by_entry_admission(
+            [
+                _candidate("WLDUSDT", "bybit", "hyperliquid"),
+                _candidate("BTCUSDT", "bybit", "binance"),
+            ],
+            now_ms=1778787002000,
+            stage="shortlist",
+        )
+
+        assert [candidate.symbol for candidate in filtered] == ["BTCUSDT"]
+        assert runtime._last_entry_admission_filter_blockers == {
+            "api_wallet_authorization_not_verified_strict_readonly": 1
+        }
+        sample = runtime._last_entry_admission_filter_samples[0]
+        assert sample["candidate_pair_id"] == "wldusdt:bybit->hyperliquid"
+        assert sample["venue"] == "hyperliquid"
+        assert sample["block_scope"] == "venue"
+        assert sample["source"] == "trading_capability_preflight"
+        assert sample["policy_block"] is True
+        assert sample["account_state_readable"] is True
+        assert sample["signer_matches_account"] is False
+        assert sample["trading_authorization_trusted"] is False
+
+        payload = [
+            record["payload"] for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_degraded"
+        ][-1]
+        assert payload["venue"] == "hyperliquid"
+        assert payload["reason"] == "api_wallet_authorization_not_verified_strict_readonly"
+        assert payload["source"] == "trading_capability_preflight"
+        assert payload["policy_block"] is True
+        assert payload["blocked_count"] == 1
+        assert payload["allowed_count"] == 1
         runtime.journal.close()
 
 

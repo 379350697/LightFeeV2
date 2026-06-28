@@ -733,6 +733,7 @@ def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
         "account_address_present": bool(resolved.get("account_address_present")),
         "signer_address_present": bool(resolved.get("signer_address_present")),
         "account_matches_signer": account_matches_signer,
+        "signer_matches_account": account_matches_signer,
         "account_address_masked": _mask_address(account_address),
         "account_address_hash": _address_hash(account_address),
         "signer_address_masked": _mask_address(signer_address),
@@ -745,6 +746,153 @@ def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
     if signer_error:
         identity["signer_address_error"] = signer_error
     return identity
+
+
+def _build_hyperliquid_trading_authorization_summary(
+    local_state: dict[str, Any],
+    exchange_truth: dict[str, Any],
+) -> dict[str, Any]:
+    credential_identity = exchange_truth.get("credential_identity", {})
+    if not isinstance(credential_identity, dict):
+        credential_identity = {}
+    identity = credential_identity.get(Venue.HYPERLIQUID.value, {})
+    if not isinstance(identity, dict):
+        identity = {}
+
+    fetch_status = exchange_truth.get("fetch_status", {})
+    if not isinstance(fetch_status, dict):
+        fetch_status = {}
+    hyper_fetch_status = fetch_status.get(Venue.HYPERLIQUID.value, {})
+    if not isinstance(hyper_fetch_status, dict):
+        hyper_fetch_status = {}
+    available_venues = {
+        str(venue).lower()
+        for venue in exchange_truth.get("available_venues", []) or []
+    }
+
+    disabled_reason = str(
+        local_state.get("hyperliquid_trading_disabled_reason") or ""
+    )
+    wallet_mode = str(identity.get("wallet_mode") or "")
+    signer_matches_account = bool(
+        identity.get("signer_matches_account")
+        or identity.get("account_matches_signer")
+        or identity.get("wallet_matches_account")
+    )
+    account_state_readable = (
+        Venue.HYPERLIQUID.value in available_venues
+        or str(hyper_fetch_status.get("status") or "").lower() == "ok"
+    )
+    policy_block = (
+        disabled_reason == "api_wallet_authorization_not_verified_strict_readonly"
+    )
+    authorization_probe_allowed = bool(
+        identity.get("allow_api_wallet_authorization_probe")
+    )
+    api_wallet_authorization_verified = bool(
+        identity.get("api_wallet_authorization_verified")
+    )
+    trading_authorization_trusted = (
+        not disabled_reason
+        and account_state_readable
+        and (
+            signer_matches_account
+            or (
+                wallet_mode == "api_wallet"
+                and api_wallet_authorization_verified
+            )
+        )
+    )
+    if policy_block:
+        next_action = "keep_hyperliquid_readonly_until_authorization_proven"
+    elif trading_authorization_trusted:
+        next_action = "hyperliquid_trading_authorization_trusted"
+    elif wallet_mode == "api_wallet":
+        next_action = "prove_api_wallet_authorization_or_keep_readonly"
+    else:
+        next_action = "resolve_hyperliquid_account_signer_identity"
+
+    return {
+        "wallet_mode": wallet_mode,
+        "account_state_readable": bool(account_state_readable),
+        "signer_matches_account": signer_matches_account,
+        "trading_authorization_trusted": bool(trading_authorization_trusted),
+        "policy_block": bool(policy_block),
+        "trading_disabled_reason": disabled_reason,
+        "next_action": next_action,
+        "allow_api_wallet_authorization_probe": authorization_probe_allowed,
+        "api_wallet_authorization_verified": api_wallet_authorization_verified,
+        "account_address_present": bool(identity.get("account_address_present")),
+        "signer_address_present": bool(identity.get("signer_address_present")),
+        "account_address_masked": str(identity.get("account_address_masked") or ""),
+        "account_address_hash": str(identity.get("account_address_hash") or ""),
+        "signer_address_masked": str(identity.get("signer_address_masked") or ""),
+        "signer_address_hash": str(identity.get("signer_address_hash") or ""),
+    }
+
+
+def _event_payload_mentions_hyperliquid(payload: dict[str, Any]) -> bool:
+    try:
+        text = json.dumps(payload, sort_keys=True, default=str).lower()
+    except TypeError:
+        text = str(payload).lower()
+    return "hyperliquid" in text
+
+
+def _is_hyperliquid_canonical_trade_event(
+    kind: str,
+    payload: dict[str, Any],
+) -> bool:
+    venue = str(payload.get("venue") or "").lower()
+    if kind.startswith("order."):
+        return venue == Venue.HYPERLIQUID.value
+    if kind in {"entry.opened", "runtime.position_opened"}:
+        return Venue.HYPERLIQUID.value in {
+            venue,
+            str(payload.get("long_venue") or "").lower(),
+            str(payload.get("short_venue") or "").lower(),
+        }
+    return False
+
+
+def _build_hyperliquid_historical_trade_evidence(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    samples: list[dict[str, Any]] = []
+    ignored_quote_or_preflight_count = 0
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if _is_hyperliquid_canonical_trade_event(kind, payload):
+            sample = {
+                "kind": kind,
+                "ts_ms": int(rec.get("ts_ms", 0) or 0),
+                "symbol": str(payload.get("symbol") or ""),
+                "venue": str(payload.get("venue") or ""),
+                "long_venue": str(payload.get("long_venue") or ""),
+                "short_venue": str(payload.get("short_venue") or ""),
+            }
+            for key in ("account_address_masked", "signer_address_masked"):
+                if payload.get(key):
+                    sample[key] = str(payload.get(key))
+            samples.append(sample)
+        elif _event_payload_mentions_hyperliquid(payload):
+            ignored_quote_or_preflight_count += 1
+
+    success_count = len(samples)
+    return {
+        "canonical_success_count": success_count,
+        "has_successful_hyperliquid_order_evidence": success_count > 0,
+        "conclusion": (
+            "successful_hyperliquid_order_evidence_present"
+            if success_count > 0
+            else "no_successful_hyperliquid_order_evidence_in_window"
+        ),
+        "ignored_quote_or_preflight_count": ignored_quote_or_preflight_count,
+        "samples": samples[:10],
+    }
 
 
 def _optional_float(value: Any) -> float | None:
@@ -8333,6 +8481,15 @@ def run_diagnose(
         pos_symbols if pos_symbols else [],
         venues if venues is not None else (pos_venues if pos_venues else None),
     )
+    hyperliquid_trading_authorization = (
+        _build_hyperliquid_trading_authorization_summary(
+            local_state,
+            exchange_truth,
+        )
+    )
+    hyperliquid_historical_trade_evidence = (
+        _build_hyperliquid_historical_trade_evidence(all_events)
+    )
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
     resolved_order_truth_gap_summary = _build_resolved_order_truth_gap_summary(
@@ -8531,6 +8688,10 @@ def run_diagnose(
         "risk_mode": str(state.get("risk_mode", "unknown")),
         "local_state": local_state,
         "exchange_truth": exchange_truth,
+        "hyperliquid_trading_authorization": hyperliquid_trading_authorization,
+        "hyperliquid_historical_trade_evidence": (
+            hyperliquid_historical_trade_evidence
+        ),
         "exchange_truth_env_files_loaded": exchange_truth_env_files_loaded,
         "state_consistency": state_consistency,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
