@@ -5756,9 +5756,11 @@ class VenueTransport(MarketDataClient):
         # Note: caller provides fallback order_id
         order_id = str(data.get("orderId", data.get("ordId", "")))
         client_id = str(data.get("clientOid", ""))
-        # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, filled_amount, size
+        # Bitget order detail separates original order size from executed size.
+        # `size`/`qty`/`baseSize`/`amount` are order amount fields and must not
+        # be used as fill quantity evidence.
         cum_qty = _safe_float(
-            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillQty", data.get("filled_amount", data.get("size", data.get("fillSz", "0")))))))
+            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillQty", data.get("filled_amount", data.get("fillSz", "0"))))))
         )
         avg_price = _safe_float(
             data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))
@@ -7430,18 +7432,29 @@ class VenueTransport(MarketDataClient):
                         return fee_sum
                 return 0.0
 
-            # V1: save status + original_quantity for post-merge state detection
+            # Save status + original_quantity for post-merge state detection.
+            # Bitget `size` is original amount; fill progress must come only
+            # from fill-specific fields such as `baseVolume`.
             # State is computed AFTER merge using merged.cumulative_quantity
-            # (bitget.rs:2560-2590)
             _btg_original_qty = _bf_f64(["size", "qty", "baseSize", "amount"])
             _btg_status_str = _bf(["state", "status", "orderStatus", "ordStatus"]).lower()
+            _btg_fill_qty_fields = [
+                "baseVolume", "filledQty", "fillQty", "filled_amount",
+            ]
+            _btg_detail_fill_qty = _bf_f64(_btg_fill_qty_fields)
+            _btg_fill_qty_missing = (
+                _btg_original_qty > 0.0
+                and _btg_detail_fill_qty <= 0.0
+                and not any(
+                    detail_data.get(k) is not None and str(detail_data.get(k)).strip()
+                    for k in _btg_fill_qty_fields
+                )
+            )
 
             detail_progress = CumulativeOrderProgress.from_position_snapshot(
                 order_id=_bf(["orderId", "ordId"]) or order_id,
                 client_order_id=_bf(["clientOid"]) or client_order_id,
-                cumulative_quantity=_bf_f64([
-                    "baseVolume", "filledQty", "fillQty", "filled_amount", "size",
-                ]),
+                cumulative_quantity=_btg_detail_fill_qty,
                 average_price=_bf_f64([
                     "priceAvg", "fillPriceAvg", "averagePrice", "avgPrice",
                 ]) or None,
@@ -7497,9 +7510,19 @@ class VenueTransport(MarketDataClient):
                 _btg_original_qty > 0.0
                 and merged_qty + 1e-9 >= _btg_original_qty
             )
-            if _btg_status_str in ("filled", "closed", "completed", "done", "success") \
-                    or is_filled:
+            terminal_status = _btg_status_str in (
+                "filled", "closed", "completed", "done", "success",
+            )
+            if is_filled:
                 state = PassiveOrderState.FILLED
+            elif terminal_status and merged_qty > 0.0:
+                state = (
+                    PassiveOrderState.PARTIALLY_FILLED
+                    if _btg_original_qty > 0.0
+                    else PassiveOrderState.FILLED
+                )
+            elif terminal_status:
+                state = PassiveOrderState.UNKNOWN
             elif _btg_status_str in (
                 "partial_filled", "partial_fill", "partially_filled",
                 "partial", "partial filled",
@@ -7543,6 +7566,14 @@ class VenueTransport(MarketDataClient):
             ),
             "merged_source": str(getattr(merged, "source", "") or ""),
             "state": state.value,
+            "bitget_fill_quantity_missing": bool(
+                detail_data is not None and _btg_fill_qty_missing
+            ),
+            "bitget_status_without_fill_quantity": bool(
+                detail_data is not None
+                and terminal_status
+                and merged.cumulative_quantity <= 0.0
+            ),
         }
 
         # 6. V1: detail None + private None + 0 fill → None

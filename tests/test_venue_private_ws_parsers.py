@@ -762,6 +762,137 @@ class TestBitgetPassiveProgressEndpoint:
         assert len(place_order_calls) == 0
 
     @pytest.mark.asyncio
+    async def test_bitget_live_order_size_is_original_qty_not_fill_qty(self, monkeypatch):
+        """Bitget order detail `size` is the order amount, not cumulative fill."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import Side, PassiveOrderState
+
+        spec = bitget_spec()
+
+        async def _fake_request(method, path, **kwargs):
+            if "/api/v3/trade/order-info" in path:
+                return {
+                    "code": "00000",
+                    "data": {
+                        "orderId": "o-live-size-1",
+                        "clientOid": "c-live-size-1",
+                        "size": "1",
+                        "priceAvg": "0",
+                        "fee": "0",
+                        "uTime": "1700000002100",
+                        "side": "buy",
+                        "status": "live",
+                    },
+                }
+            return {"code": "00000", "data": {}}
+
+        with patch.object(VenueTransport, '_validate_live_credentials', return_value=None):
+            transport = VenueTransport(spec, mode='mock')
+        monkeypatch.setattr(transport, '_request', _fake_request)
+        monkeypatch.setattr(transport, 'mode', 'mock')
+        monkeypatch.setattr(transport, 'private_order_progress', lambda **kw: None)
+
+        result = await transport.query_passive_order_progress(
+            "LABUSDT", "o-live-size-1", "c-live-size-1", side=Side.BUY,
+        )
+
+        assert result is not None
+        assert result.cumulative_quantity == pytest.approx(0.0)
+        assert result.state == PassiveOrderState.OPEN
+        assert result.evidence["detail_original_quantity"] == pytest.approx(1.0)
+        assert result.evidence["detail_cumulative_quantity"] == pytest.approx(0.0)
+        assert result.evidence["merged_cumulative_quantity"] == pytest.approx(0.0)
+        assert result.evidence["bitget_fill_quantity_missing"] is True
+
+    @pytest.mark.asyncio
+    async def test_bitget_filled_status_without_fill_qty_is_truth_gap_not_filled(self, monkeypatch):
+        """A filled status without a fill quantity is not enough to infer full fill."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import Side, PassiveOrderState
+
+        spec = bitget_spec()
+
+        async def _fake_request(method, path, **kwargs):
+            if "/api/v3/trade/order-info" in path:
+                return {
+                    "code": "00000",
+                    "data": {
+                        "orderId": "o-filled-size-only",
+                        "clientOid": "c-filled-size-only",
+                        "size": "1",
+                        "priceAvg": "15.39",
+                        "fee": "0",
+                        "uTime": "1700000002200",
+                        "side": "buy",
+                        "status": "filled",
+                    },
+                }
+            return {"code": "00000", "data": {}}
+
+        with patch.object(VenueTransport, '_validate_live_credentials', return_value=None):
+            transport = VenueTransport(spec, mode='mock')
+        monkeypatch.setattr(transport, '_request', _fake_request)
+        monkeypatch.setattr(transport, 'mode', 'mock')
+        monkeypatch.setattr(transport, 'private_order_progress', lambda **kw: None)
+
+        result = await transport.query_passive_order_progress(
+            "LABUSDT", "o-filled-size-only", "c-filled-size-only", side=Side.BUY,
+        )
+
+        assert result is not None
+        assert result.cumulative_quantity == pytest.approx(0.0)
+        assert result.state == PassiveOrderState.UNKNOWN
+        assert result.evidence["detail_original_quantity"] == pytest.approx(1.0)
+        assert result.evidence["bitget_fill_quantity_missing"] is True
+        assert result.evidence["bitget_status_without_fill_quantity"] is True
+
+    @pytest.mark.asyncio
+    async def test_bitget_terminal_status_with_partial_qty_is_not_full_fill(self, monkeypatch):
+        """Terminal status plus partial fill quantity must not imply full fill."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.core.domain import Side, PassiveOrderState
+
+        spec = bitget_spec()
+
+        async def _fake_request(method, path, **kwargs):
+            if "/api/v3/trade/order-info" in path:
+                return {
+                    "code": "00000",
+                    "data": {
+                        "orderId": "o-filled-partial",
+                        "clientOid": "c-filled-partial",
+                        "size": "1",
+                        "baseVolume": "0.5",
+                        "priceAvg": "15.39",
+                        "fee": "0",
+                        "uTime": "1700000002300",
+                        "side": "buy",
+                        "status": "filled",
+                    },
+                }
+            return {"code": "00000", "data": {}}
+
+        with patch.object(VenueTransport, '_validate_live_credentials', return_value=None):
+            transport = VenueTransport(spec, mode='mock')
+        monkeypatch.setattr(transport, '_request', _fake_request)
+        monkeypatch.setattr(transport, 'mode', 'mock')
+        monkeypatch.setattr(transport, 'private_order_progress', lambda **kw: None)
+
+        result = await transport.query_passive_order_progress(
+            "LABUSDT", "o-filled-partial", "c-filled-partial", side=Side.BUY,
+        )
+
+        assert result is not None
+        assert result.cumulative_quantity == pytest.approx(0.5)
+        assert result.state == PassiveOrderState.PARTIALLY_FILLED
+        assert result.evidence["detail_original_quantity"] == pytest.approx(1.0)
+        assert result.evidence["detail_cumulative_quantity"] == pytest.approx(0.5)
+        assert result.evidence["merged_cumulative_quantity"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
     async def test_classic_family_lock_uses_classic_order_detail_only(self, monkeypatch):
         """Resolved classic family uses /api/v2/mix/order/detail without UTA probing."""
         from lightfee.venues.transport import VenueTransport

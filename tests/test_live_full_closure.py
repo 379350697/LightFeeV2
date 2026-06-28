@@ -510,6 +510,40 @@ class TestLiveStartupPreflight:
             records = runtime.journal.read_all()
             assert any(r.get("kind") == "runtime.stale_fail_closed_cleared" for r in records)
 
+    def test_clean_v1_closure_releases_fail_closed_stale_recovery_block(self):
+        from lightfee.engine.recovery_decision_core import (
+            RecoveryDecision,
+            RecoveryDecisionKind,
+            RecoveryEvidenceClass,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(make_test_config(td))
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "live_position_mismatch_flatten_failed"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.v1_lifecycle_closure = {
+                "summary": {
+                    "entry_allowed": True,
+                    "recovery_block_reason": None,
+                }
+            }
+            runtime.recovery_decision = RecoveryDecision(
+                kind=RecoveryDecisionKind.RUNNING_CLEAN,
+                evidence_class=RecoveryEvidenceClass.COMPLETE_FLAT,
+                entry_allowed=True,
+                clear_previous_block=True,
+                clear_reason="core_running_clean_flat_no_open_orders",
+            )
+
+            runtime._clear_stale_recovery_block_when_v1_closure_allows_entry(1700000000000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+
     @pytest.mark.asyncio
     async def test_tick_populates_last_scan_with_fresh_snapshot(self):
         with tempfile.TemporaryDirectory() as td:

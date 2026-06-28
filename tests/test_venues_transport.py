@@ -7970,12 +7970,13 @@ class TestBybitParseOrderStatusRedLight:
 
 
 class TestBitgetParseOrderStatusRedLight:
-    """RED-LIGHT: _parse_order_status_bitget must follow V1 semantics.
+    """RED-LIGHT: _parse_order_status_bitget must preserve fill truth semantics.
 
     V1 reference: src/live/bitget.rs fetch_order_fill_reconciliation (lines 2912-2949)
-    V1 semantics:
+    Business semantics:
       - /api/v3/trade/order-info with orderId/clientOid
-      - quantity from baseVolume/filledQty/fillQty/size fallback
+      - quantity from fill-specific fields only
+      - Bitget `size` is original order amount, not cumulative fill
       - quantity <= 0 → None
       - multi-key avg price, fee, orderId/clientOid extraction
     """
@@ -8997,24 +8998,20 @@ class TestBitgetAdapterHttpRedLight:
 # ====================================================================
 
 class TestBitgetQuantityFallbackRedLight:
-    """RED-LIGHT: _parse_order_status_bitget quantity fallback must cover
-    every V1 field so no single-field response returns None.
+    """RED-LIGHT: _parse_order_status_bitget quantity fallback must only cover
+    fill quantity fields. Bitget `size` is original order amount.
 
-    V1 fields (bitget.rs:2516-2522): baseVolume, filledQty, fillQty, filled_amount, size
+    Fill fields: baseVolume, filledQty, fillQty, filled_amount
     V2 extra compatibility: cumExecQty, fillSz
-
-    Current V2 chain: cumExecQty → baseVolume → filledQty → fillSz → 0
-    Missing V1 fields: fillQty, filled_amount, size
     """
 
     @pytest.mark.parametrize("field", [
         "baseVolume",
         "filledQty",
-        "fillQty",       # RED: not in V2 chain
+        "fillQty",
         "fillSz",
         "cumExecQty",
-        "size",          # RED: not in V2 chain
-        "filled_amount", # RED: not in V2 chain (V1 field)
+        "filled_amount",
     ])
     def test_bitget_quantity_fallback_each_field_alone_returns_positive_qty(self, field):
         """Each quantity field alone must produce positive reconciliation."""
@@ -9040,6 +9037,28 @@ class TestBitgetQuantityFallbackRedLight:
         assert result.quantity == pytest.approx(0.5), (
             f"RED-LIGHT: field={field} quantity should be 0.5, got {result.quantity}"
         )
+
+    def test_bitget_size_alone_is_original_quantity_not_fill_quantity(self):
+        """`size` alone must not produce fill reconciliation."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        raw = {
+            "code": "00000", "msg": "success",
+            "data": {
+                "orderId": "oid-1", "clientOid": "cid-1",
+                "size": "0.5",
+                "priceAvg": "51000", "avgPrice": "51000",
+                "side": "buy", "uTime": "2000000",
+                "cTime": "2000000", "fee": "0.1",
+                "status": "filled",
+            },
+        }
+
+        result = transport._parse_order_status_bitget(raw, "BTCUSDT", 2000000)
+
+        assert result is None
 
 
 # ====================================================================# RED-LIGHT: Bybit execution side validation — fail-closed, V1 parity

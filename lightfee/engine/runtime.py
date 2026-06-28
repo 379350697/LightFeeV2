@@ -1174,8 +1174,6 @@ class LiveRuntime:
         )
         if has_pending_work:
             return
-        if getattr(self.state, "risk_mode", None) != GlobalRiskMode.RUNNING:
-            return
         stale_reason = getattr(self.state, "recovery_blocked_reason", None)
         if not stale_reason:
             return
@@ -1185,6 +1183,9 @@ class LiveRuntime:
         )
 
         core_decision = getattr(self, "recovery_decision", None)
+        recovery_fail_closed = (
+            getattr(self.state, "risk_mode", None) == GlobalRiskMode.FAIL_CLOSED
+        )
         if (
             stale_reason in CORE_CLEARABLE_BLOCK_REASONS
             and clear_risk_mode_for_recovery(self.state, core_decision)
@@ -1207,6 +1208,8 @@ class LiveRuntime:
                 },
             )
         else:
+            if recovery_fail_closed:
+                return
             self.state.recovery_blocked_reason = None
             self.state.recovery_blocked_at_ms = 0
         if getattr(self.state, "lifecycle", None) == EngineLifecycle.RISK_ONLY:
