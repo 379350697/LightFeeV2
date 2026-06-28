@@ -580,6 +580,99 @@ def test_run_diagnose_reports_hyperliquid_strict_readonly_authorization_summary(
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_keeps_hyperliquid_identity_with_other_active_positions(monkeypatch):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    captured: dict[str, object] = {}
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "hyperliquid_trading_disabled_reason": (
+                "api_wallet_authorization_not_verified_strict_readonly"
+            ),
+            "open_position_count": 1,
+            "open_positions": [{
+                "position_id": "live-recovered:ACTUSDT:binance->okx",
+                "symbol": "ACTUSDT",
+                "long_venue": "binance",
+                "short_venue": "okx",
+                "quantity": 5385.0,
+            }],
+            "pending_entries": [],
+            "pending_closes": [],
+        })
+        _write_jsonl(os.path.join(d, "live-events.jsonl"), [])
+
+        def exchange_truth(runtime_dir, symbols, venues=None):
+            captured["venues"] = venues
+            assert venues == ["binance", "okx", "hyperliquid"]
+            return {
+                "available": True,
+                "available_venues": ["binance", "okx", "hyperliquid"],
+                "confidence": "high",
+                "positions": {
+                    "binance": {
+                        "ACTUSDT": {
+                            "symbol": "ACTUSDT",
+                            "quantity": 5385.0,
+                            "side": "Side.BUY",
+                        }
+                    },
+                    "okx": {
+                        "ACTUSDT": {
+                            "symbol": "ACTUSDT",
+                            "quantity": 5385.0,
+                            "side": "Side.SELL",
+                        }
+                    },
+                    "hyperliquid": {},
+                },
+                "open_orders": {
+                    "binance": {"ACTUSDT": []},
+                    "okx": {"ACTUSDT": []},
+                    "hyperliquid": {},
+                },
+                "has_nonzero_position": True,
+                "has_open_order": False,
+                "fetch_status": {"hyperliquid": {"status": "ok"}},
+                "credential_identity": {
+                    "hyperliquid": {
+                        "wallet_mode": "api_wallet",
+                        "account_address_present": True,
+                        "signer_address_present": True,
+                        "account_matches_signer": False,
+                        "signer_matches_account": False,
+                        "allow_api_wallet_authorization_probe": False,
+                        "account_address_masked": "0xe5E4...0C89",
+                        "signer_address_masked": "0x0670...bDcc",
+                    }
+                },
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1782628000000,
+        )
+
+        assert captured["venues"] == ["binance", "okx", "hyperliquid"]
+        summary = result["hyperliquid_trading_authorization"]
+        assert summary["wallet_mode"] == "api_wallet"
+        assert summary["account_state_readable"] is True
+        assert summary["policy_block"] is True
+        assert summary["trading_authorization_trusted"] is False
+        assert summary["account_address_masked"] == "0xe5E4...0C89"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_hyperliquid_historical_trade_evidence_ignores_quote_and_preflight_events():
     import scripts.diagnose_live as dl
 

@@ -895,6 +895,23 @@ def _build_hyperliquid_historical_trade_evidence(
     }
 
 
+def _exchange_truth_venues_for_diagnose(
+    *,
+    explicit_venues: list[str] | None,
+    position_venues: list[str],
+    local_state: dict[str, Any],
+) -> list[str] | None:
+    if explicit_venues is not None:
+        return explicit_venues
+    selected = list(position_venues)
+    if (
+        local_state.get("hyperliquid_trading_disabled_reason")
+        and Venue.HYPERLIQUID.value not in selected
+    ):
+        selected.append(Venue.HYPERLIQUID.value)
+    return selected if selected else None
+
+
 def _optional_float(value: Any) -> float | None:
     try:
         parsed = float(value)
@@ -8479,7 +8496,11 @@ def run_diagnose(
     exchange_truth = _build_exchange_truth(
         runtime_dir,
         pos_symbols if pos_symbols else [],
-        venues if venues is not None else (pos_venues if pos_venues else None),
+        _exchange_truth_venues_for_diagnose(
+            explicit_venues=venues,
+            position_venues=pos_venues,
+            local_state=local_state,
+        ),
     )
     hyperliquid_trading_authorization = (
         _build_hyperliquid_trading_authorization_summary(
