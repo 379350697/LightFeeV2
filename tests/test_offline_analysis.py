@@ -17,7 +17,11 @@ from lightfee.offline.analysis.journal import (
 )
 from lightfee.offline.analysis.incident import build_incident_report
 from lightfee.offline.reports.daily import generate_daily_snapshot
-from lightfee.offline.reports.render import render_json, render_text
+from lightfee.offline.reports.render import (
+    render_daily_report_markdown,
+    render_json,
+    render_text,
+)
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.metrics import PersistenceMetrics
 from lightfee.persistence.projection_writer import (
@@ -256,6 +260,32 @@ class TestDailyReport:
             {"kind": "execution.entry_liquidity_blocked", "payload": {"position_id": "p2", "reason": "spread"}},
             {"kind": "runtime.local_l2_sequence_gap", "payload": {"continuity_reason": "ws"}},
             {"kind": "runtime.local_l2_sync_failed", "payload": {"failure_category": "timeout"}},
+            {
+                "kind": "exit_shadow.strategy_decision",
+                "payload": {
+                    "bot_id": "top_book_imbalance",
+                    "direction": "bullish",
+                    "confidence": 0.75,
+                },
+            },
+            {
+                "kind": "exit_shadow.path_markout",
+                "payload": {
+                    "bot_id": "top_book_imbalance",
+                    "path": "short_first_then_long",
+                    "horizon_ms": 1000,
+                },
+            },
+            {
+                "kind": "exit_shadow.strategy_summary",
+                "payload": {
+                    "bot_id": "top_book_imbalance",
+                    "direction_correct": True,
+                    "incremental_net_bps": 11.0,
+                    "max_adverse_bps": 2.0,
+                    "excluded": False,
+                },
+            },
         ]
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "test.jsonl"
@@ -301,6 +331,14 @@ class TestDailyReport:
         assert summary["local_l2_sequence_gap_count"] == 1
         assert summary["local_l2_sync_failed_count"] == 1
 
+        # Exit shadow
+        assert summary["exit_shadow_decision_count"] == 1
+        assert summary["exit_shadow_path_markout_count"] == 1
+        assert summary["exit_shadow_summary_count"] == 1
+        shadow = summary["exit_shadow_by_bot"]["top_book_imbalance"]
+        assert shadow["sample_count"] == 1
+        assert shadow["direction_accuracy"] == 1.0
+
     def test_report_renders_json_deterministically(self):
         """Rendered JSON output is stable and includes all report sections."""
         records = [
@@ -345,6 +383,27 @@ class TestReportRendering:
         result = render_text(data)
         assert "key" in result
         assert "value" in result
+
+    def test_render_daily_markdown_includes_exit_shadow(self):
+        report = {
+            "date": "2026-05-12",
+            "exit_shadow_decision_count": 1,
+            "exit_shadow_path_markout_count": 1,
+            "exit_shadow_by_bot": {
+                "top_book_imbalance": {
+                    "sample_count": 2,
+                    "direction_accuracy": 0.5,
+                    "win_rate": 0.5,
+                    "avg_incremental_net_bps": 4.25,
+                }
+            },
+        }
+
+        result = render_daily_report_markdown(report)
+
+        assert "Exit Shadow Decisions: 1" in result
+        assert "top_book_imbalance" in result
+        assert "Avg Incremental Net Bps: 4.2500" in result
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +879,53 @@ class TestStoreBackedAnalysis:
         assert store_report.local_l2_sync_failed_count == journal_report.local_l2_sync_failed_count
         assert store_report.execution_liquidity_blocked_count == journal_report.execution_liquidity_blocked_count
 
+    def test_analyze_from_store_includes_exit_shadow_summary(self):
+        records = [
+            _make_record(
+                1,
+                "exit_shadow.strategy_decision",
+                shadow_id="shadow-1",
+                bot_id="top_book_imbalance",
+                direction="bullish",
+                recommended_path="short_first_then_long",
+                confidence=0.8,
+            ),
+            _make_record(
+                2,
+                "exit_shadow.path_markout",
+                shadow_id="shadow-1",
+                path="short_first_then_long",
+                horizon_ms=1000,
+                net_bps=12.0,
+                max_adverse_bps=1.5,
+            ),
+            _make_record(
+                3,
+                "exit_shadow.strategy_summary",
+                shadow_id="shadow-1",
+                bot_id="top_book_imbalance",
+                direction="bullish",
+                recommended_path="short_first_then_long",
+                horizon_ms=1000,
+                direction_correct=True,
+                incremental_net_bps=12.0,
+                max_adverse_bps=1.5,
+                excluded=False,
+            ),
+        ]
+        _td, store, conn = self._setup_store_with_data(records)
+
+        report = analyze_from_store(conn)
+
+        assert report.exit_shadow_decision_count == 1
+        assert report.exit_shadow_path_markout_count == 1
+        assert report.exit_shadow_summary_count == 1
+        summary = report.exit_shadow_by_bot["top_book_imbalance"]
+        assert summary["sample_count"] == 1
+        assert summary["direction_accuracy"] == 1.0
+        assert summary["avg_incremental_net_bps"] == 12.0
+        assert summary["max_adverse_bps"] == 1.5
+
     def test_analyze_journal_or_store_prefers_store(self):
         records = [
             _make_record(1, "entry.opened", entry_fee_quote=5.0, symbol="BTCUSDT"),
@@ -968,6 +1074,29 @@ class TestDailyReportWithProjection:
             _make_record(7, "runtime.local_l2_sync_failed", failure_category="timeout"),
             _make_record(8, "runtime.fail_closed", reason="venue_error"),
             _make_record(9, "risk.warning_triggered", health_ratio=0.3),
+            _make_record(
+                10,
+                "exit_shadow.strategy_decision",
+                bot_id="top_book_imbalance",
+                direction="bullish",
+                confidence=0.75,
+            ),
+            _make_record(
+                11,
+                "exit_shadow.path_markout",
+                bot_id="top_book_imbalance",
+                path="short_first_then_long",
+                horizon_ms=1000,
+            ),
+            _make_record(
+                12,
+                "exit_shadow.strategy_summary",
+                bot_id="top_book_imbalance",
+                direction_correct=True,
+                incremental_net_bps=9.0,
+                max_adverse_bps=1.5,
+                excluded=False,
+            ),
         ]
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "test.jsonl"
@@ -994,6 +1123,12 @@ class TestDailyReportWithProjection:
             assert summary["local_l2_sync_failed_by_category"]["timeout"] == 1
             assert summary["fail_closed_reason_counts"]["venue_error"] == 1
             assert summary["risk_counts"]["risk.warning_triggered"] == 1
+            assert summary["exit_shadow_decision_count"] == 1
+            assert summary["exit_shadow_path_markout_count"] == 1
+            assert summary["exit_shadow_summary_count"] == 1
+            shadow = summary["exit_shadow_by_bot"]["top_book_imbalance"]
+            assert shadow["sample_count"] == 1
+            assert shadow["avg_incremental_net_bps"] == 9.0
 
 
 # ===========================================================================

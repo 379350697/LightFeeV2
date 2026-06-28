@@ -20,6 +20,13 @@ from lightfee.engine.business_contract import (
     close_reconciliation_exchange_truth_clean,
     close_reconciliation_evidence_fields,
 )
+from lightfee.engine.exit_shadow import (
+    ExitShadowConfig,
+    ExitShadowMarket,
+    ExitShadowQuote,
+    ExitShadowSnapshot,
+    ExitShadowTracker,
+)
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
@@ -37,6 +44,7 @@ class CloseRuntime:
         self._close_reconciliation_archive_emitted_keys: set[str] = set()
         self._close_reconciliation_exchange_truth: dict[str, Any] | None = None
         self._close_reconciliation_truth_refresh_next_ms = 0
+        self._exit_shadow_tracker: ExitShadowTracker | None = None
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
         flush = getattr(self.ctx, "_flush_adapter_order_diagnostics", None)
@@ -1571,6 +1579,144 @@ class CloseRuntime:
             elif self.ctx.state.pending_close_reconciliations:
                 set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
                 self.ctx.state.last_error = "pending_close_reconciliations_active"
+
+    def _exit_shadow_config(self) -> ExitShadowConfig:
+        strategy = self.ctx.config.strategy
+        horizons = tuple(
+            int(value)
+            for value in getattr(strategy, "exit_shadow_markout_horizons_ms", []) or []
+            if int(value) > 0
+        )
+        take_profit_bps = tuple(
+            float(value)
+            for value in getattr(strategy, "exit_shadow_take_profit_bps", []) or []
+            if float(value) > 0.0
+        )
+        return ExitShadowConfig(
+            enabled=bool(getattr(strategy, "exit_shadow_enabled", False)),
+            markout_horizons_ms=horizons or (1000, 2000, 5000),
+            take_profit_bps=take_profit_bps or (10.0, 20.0),
+            adverse_stop_bps=float(
+                getattr(strategy, "exit_shadow_adverse_stop_bps", 3.0) or 3.0
+            ),
+            max_quote_age_ms=int(
+                getattr(strategy, "exit_shadow_max_quote_age_ms", 1000) or 1000
+            ),
+            max_l2_age_ms=int(
+                getattr(strategy, "exit_shadow_max_l2_age_ms", 1000) or 1000
+            ),
+            cost_buffer_bps=float(
+                getattr(strategy, "exit_shadow_cost_buffer_bps", 3.0) or 3.0
+            ),
+        )
+
+    def _exit_shadow_tracker_for_config(
+        self,
+        config: ExitShadowConfig,
+    ) -> ExitShadowTracker | None:
+        if not config.enabled:
+            return None
+        if self._exit_shadow_tracker is None:
+            self._exit_shadow_tracker = ExitShadowTracker(config)
+        else:
+            self._exit_shadow_tracker.config = config
+        return self._exit_shadow_tracker
+
+    def _append_exit_shadow_events(self, events: list[dict[str, Any]]) -> None:
+        for event in events:
+            kind = str(event.get("kind", "") or "")
+            payload = event.get("payload", {})
+            if kind and isinstance(payload, dict):
+                self.ctx.journal.append(kind, payload)
+
+    def _exit_shadow_quote(self, venue, symbol: str, now_ms: int) -> ExitShadowQuote | None:
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        cache = getattr(self.ctx, "ws_bbo_cache", None)
+        if cache is not None and hasattr(cache, "get_quote"):
+            try:
+                quote = cache.get_quote(venue_value, symbol)
+            except Exception:
+                quote = None
+            if quote is not None:
+                return ExitShadowQuote(
+                    venue=str(getattr(quote, "venue", venue_value) or venue_value),
+                    symbol=str(getattr(quote, "symbol", symbol) or symbol),
+                    bid=float(getattr(quote, "bid", 0.0) or 0.0),
+                    ask=float(getattr(quote, "ask", 0.0) or 0.0),
+                    bid_size=float(getattr(quote, "bid_size", 0.0) or 0.0),
+                    ask_size=float(getattr(quote, "ask_size", 0.0) or 0.0),
+                    observed_at_ms=int(getattr(quote, "observed_at_ms", 0) or 0),
+                    source=str(getattr(quote, "source", "") or "ws_bbo_cache"),
+                )
+        book = self._exit_shadow_book(venue, symbol)
+        if book is None:
+            return None
+        best_bid = float(book.best_bid() or 0.0)
+        best_ask = float(book.best_ask() or 0.0)
+        if best_bid <= 0.0 or best_ask <= best_bid:
+            return None
+        bid_size = float(getattr(book.bids[0], "quantity", 0.0) or 0.0) if book.bids else 0.0
+        ask_size = float(getattr(book.asks[0], "quantity", 0.0) or 0.0) if book.asks else 0.0
+        return ExitShadowQuote(
+            venue=venue_value,
+            symbol=symbol,
+            bid=best_bid,
+            ask=best_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            observed_at_ms=int(getattr(book, "observed_at_ms", 0) or 0),
+            source=str(getattr(book, "source", "") or "local_l2"),
+        )
+
+    def _exit_shadow_book(self, venue, symbol: str):
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        local_l2_runtime = getattr(self.ctx, "local_l2_runtime", None)
+        get_book = getattr(local_l2_runtime, "get_book", None)
+        if not callable(get_book):
+            return None
+        try:
+            return get_book(venue_value, symbol)
+        except Exception:
+            return None
+
+    def _exit_shadow_market(self, position, now_ms: int) -> ExitShadowMarket:
+        return ExitShadowMarket(
+            long_quote=self._exit_shadow_quote(position.long_venue, position.symbol, now_ms),
+            short_quote=self._exit_shadow_quote(position.short_venue, position.symbol, now_ms),
+            long_book=self._exit_shadow_book(position.long_venue, position.symbol),
+            short_book=self._exit_shadow_book(position.short_venue, position.symbol),
+            now_ms=now_ms,
+        )
+
+    def _record_exit_shadow_trigger(self, position, reason: str, now_ms: int) -> None:
+        config = self._exit_shadow_config()
+        tracker = self._exit_shadow_tracker_for_config(config)
+        if tracker is None:
+            return
+        try:
+            snapshot = ExitShadowSnapshot(
+                position=position,
+                reason=reason,
+                market=self._exit_shadow_market(position, now_ms),
+            )
+            self._append_exit_shadow_events(tracker.on_close_trigger(snapshot))
+        except Exception:
+            return
+
+    def _emit_due_exit_shadow_markouts(self, now_ms: int) -> None:
+        config = self._exit_shadow_config()
+        tracker = self._exit_shadow_tracker_for_config(config)
+        if tracker is None:
+            return
+        try:
+            events: list[dict[str, Any]] = []
+            for shadow_id, snapshot in tracker.pending_items():
+                market = self._exit_shadow_market(snapshot.position, now_ms)
+                events.extend(tracker.evaluate_markouts_for_shadow(shadow_id, market))
+            self._append_exit_shadow_events(events)
+        except Exception:
+            return
+
     async def _maybe_process_normal_exits(self, now_ms: int) -> None:
         """Evaluate normal exit reasons for open positions and route to close path.
 
@@ -1589,6 +1735,8 @@ class CloseRuntime:
             update_position_funding_capture_state,
         )
         from lightfee.engine.exit import ExitReason
+
+        self._emit_due_exit_shadow_markouts(now_ms)
 
         if not self.ctx.state.open_positions:
             return
@@ -1663,6 +1811,7 @@ class CloseRuntime:
                 continue
 
             reason_str = reason.value if hasattr(reason, 'value') else str(reason)
+            self._record_exit_shadow_trigger(position, reason_str, now_ms)
 
             if normal_close_reason_uses_passive_maker_taker(reason_str):
                 # Route to passive close

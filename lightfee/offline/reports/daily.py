@@ -90,6 +90,10 @@ def generate_daily_snapshot(
             report.entry_liquidity_blocked_by_open_interest_evidence_status
         ),
         "fail_closed_reason_counts": dict(report.fail_closed_reason_counts),
+        "exit_shadow_decision_count": report.exit_shadow_decision_count,
+        "exit_shadow_path_markout_count": report.exit_shadow_path_markout_count,
+        "exit_shadow_summary_count": report.exit_shadow_summary_count,
+        "exit_shadow_by_bot": dict(report.exit_shadow_by_bot),
     }
 
 

@@ -126,6 +126,12 @@ PROJECTED_EXECUTION_KINDS: frozenset[str] = frozenset({
     "execution.passive_phase_switched",
 })
 
+PROJECTED_EXIT_SHADOW_KINDS: frozenset[str] = frozenset({
+    "exit_shadow.strategy_decision",
+    "exit_shadow.path_markout",
+    "exit_shadow.strategy_summary",
+})
+
 PROJECTED_LEDGER_BRIDGE_KINDS: frozenset[str] = frozenset({
     "entry.compensated",
     "execution.compensation_failed",
@@ -144,6 +150,7 @@ ALL_PROJECTED_KINDS: frozenset[str] = (
     | PROJECTED_RISK_KINDS
     | PROJECTED_L2_HEALTH_KINDS
     | PROJECTED_EXECUTION_KINDS
+    | PROJECTED_EXIT_SHADOW_KINDS
     | PROJECTED_LEDGER_BRIDGE_KINDS
 )
 
@@ -248,6 +255,7 @@ FACT_TABLE_MAP: dict[str, str] = {
     **{k: "risk_counter_facts" for k in PROJECTED_RISK_KINDS},
     **{k: "local_l2_health_facts" for k in PROJECTED_L2_HEALTH_KINDS},
     **{k: "diagnostic_facts" for k in PROJECTED_EXECUTION_KINDS},
+    **{k: "diagnostic_facts" for k in PROJECTED_EXIT_SHADOW_KINDS},
     **{k: "trade_ledger_events" for k in PROJECTED_LEDGER_BRIDGE_KINDS},
 }
 

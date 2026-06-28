@@ -77,6 +77,9 @@ _DIAGNOSTIC_KINDS = frozenset({
     "scan.no_entry_diagnostics",
     "scan.runtime_gate_blocked",
     "execution.entry_liquidity_blocked",
+    "exit_shadow.strategy_decision",
+    "exit_shadow.path_markout",
+    "exit_shadow.strategy_summary",
 })
 
 _FAIL_CLOSED_PREFIX = "runtime.fail_closed"

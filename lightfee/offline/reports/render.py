@@ -75,6 +75,21 @@ def render_daily_report_markdown(report: dict[str, Any]) -> str:
     lines.append(f"- Entry Liquidity Blocked: {report.get('execution_liquidity_blocked', 0)}")
     lines.append(f"- Local-L2 Sequence Gaps: {report.get('local_l2_sequence_gap_count', 0)}")
     lines.append(f"- Local-L2 Sync Failures: {report.get('local_l2_sync_failed_count', 0)}")
+    lines.append(f"- Exit Shadow Decisions: {report.get('exit_shadow_decision_count', 0)}")
+    lines.append(f"- Exit Shadow Path Markouts: {report.get('exit_shadow_path_markout_count', 0)}")
+
+    exit_shadow = report.get("exit_shadow_by_bot", {})
+    if exit_shadow:
+        lines.append("")
+        lines.append("## Exit Shadow")
+        for bot_id, stats in sorted(exit_shadow.items()):
+            lines.append(f"### {bot_id}")
+            lines.append(f"- Samples: {stats.get('sample_count', 0)}")
+            lines.append(f"- Direction Accuracy: {stats.get('direction_accuracy', 0):.4f}")
+            lines.append(f"- Win Rate: {stats.get('win_rate', 0):.4f}")
+            lines.append(
+                f"- Avg Incremental Net Bps: {stats.get('avg_incremental_net_bps', 0):.4f}"
+            )
 
     # Fail-closed
     fail_closed = report.get("fail_closed_reason_counts", {})

@@ -1342,6 +1342,9 @@ _EVENT_KIND_PHASES = {
     "runtime.close_price_evidence_rewarm_failed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_stale": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_missing": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit_shadow.strategy_decision": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "exit_shadow.path_markout": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "exit_shadow.strategy_summary": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.passive_close_readiness_ready": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.passive_close_readiness_blocked": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.passive_close_readiness_rewarm_attempted": (

@@ -960,6 +960,16 @@ class TestProjectionContractsFactTableMapping:
         for kind in PROJECTED_EXECUTION_KINDS:
             assert fact_table_for_kind(kind) == "diagnostic_facts"
 
+    def test_exit_shadow_kinds_map_to_diagnostic_facts(self):
+        for kind in (
+            "exit_shadow.strategy_decision",
+            "exit_shadow.path_markout",
+            "exit_shadow.strategy_summary",
+        ):
+            assert is_projected_kind(kind) is True
+            assert classify_kind(kind) == "projected"
+            assert fact_table_for_kind(kind) == "diagnostic_facts"
+
     def test_lifecycle_ledger_bridge_kinds_map_to_trade_ledger_events(self):
         assert "execution.compensation_failed" in PROJECTED_LEDGER_BRIDGE_KINDS
         assert "execution.compensation_failed" not in PROJECTED_EXECUTION_KINDS

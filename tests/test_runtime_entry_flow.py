@@ -38,6 +38,13 @@ from lightfee.engine.state import (
     PendingEntry,
     PendingPassiveClose,
 )
+from lightfee.engine.exit_shadow import (
+    ExitShadowConfig,
+    ExitShadowSnapshot,
+    evaluate_exit_shadow_strategies,
+)
+from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
 from lightfee.persistence.journal import Journal
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -3344,6 +3351,139 @@ class TestPlannerDispatchIntegration:
         await runtime._maybe_process_normal_exits(funding_ms + 120_000)
 
         assert passive.reasons == ["settlement_force_close"]
+
+    @pytest.mark.asyncio
+    async def test_normal_exit_shadow_records_strategy_decisions_without_extra_close_calls(
+        self, config, tmp_journal,
+    ):
+        config.strategy.post_funding_hold_secs = 0
+        config.strategy.settlement_remainder_close_delay_secs = 0
+        config.strategy.exit_shadow_enabled = True
+        config.strategy.exit_shadow_markout_horizons_ms = [1000]
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        cache = VenueBboCache()
+        cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=100.1,
+                bid_size=12.0,
+                ask_size=3.0,
+                observed_at_ms=1780167600000,
+            )
+        )
+        cache.update_quote(
+            TopBookQuote(
+                venue="aster",
+                symbol="BTCUSDT",
+                bid=100.2,
+                ask=100.3,
+                bid_size=10.0,
+                ask_size=4.0,
+                observed_at_ms=1780167600000,
+            )
+        )
+        runtime.ws_bbo_cache = cache
+
+        class CapturingPassiveClose:
+            def __init__(self):
+                self.start_calls = []
+                self.drive_calls = []
+
+            async def start_pending_passive_close(self, state, position, reason, **kwargs):
+                self.start_calls.append((position.position_id, reason, kwargs))
+                return object()
+
+            async def drive_pending_passive_close(
+                self, state, position_id, wait_until_terminal=False,
+            ):
+                self.drive_calls.append((position_id, wait_until_terminal))
+
+        passive = CapturingPassiveClose()
+        runtime.passive_close_executor = passive
+        funding_ms = 1780167600000
+        position = OpenPosition(
+            position_id="entry-shadow-close",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=100.0,
+            short_entry_price=101.0,
+            opened_at_ms=funding_ms - 30_000,
+            matched_quantity=0.01,
+            funding_timestamp_ms=funding_ms,
+            opportunity_type="aligned",
+            funding_captured=False,
+            current_net_quote=0.0,
+        )
+        runtime.state.open_positions[position.position_id] = position
+
+        await runtime._maybe_process_normal_exits(funding_ms)
+
+        records = runtime.journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert kinds.count("exit_shadow.strategy_decision") == 5
+        assert kinds.count("exit_shadow.path_markout") == 3
+        assert passive.start_calls == [
+            (
+                position.position_id,
+                "funding_capture",
+                {
+                    "long_price_hint": 0.0,
+                    "short_price_hint": 0.0,
+                    "short_stage": "exit_short",
+                    "long_stage": "exit_long",
+                },
+            )
+        ]
+        assert passive.drive_calls == [(position.position_id, False)]
+
+    def test_exit_shadow_local_l2_quote_preserves_stale_observed_at(self, config):
+        config.strategy.entry_readiness_provider = "local_l2"
+        runtime = LiveRuntime(config, venue_adapters={})
+        now_ms = 20_000
+        stale_observed_at_ms = 10_000
+        for venue in ("binance", "aster"):
+            book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+            book.bids = [PriceLevel(100.0, 12.0)]
+            book.asks = [PriceLevel(100.1, 3.0)]
+            book.status = L2BookStatus.HOT
+            book.observed_at_ms = stale_observed_at_ms
+
+        position = OpenPosition(
+            position_id="entry-shadow-stale-l2",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_entry_price=100.0,
+            short_entry_price=101.0,
+            opened_at_ms=1_000,
+            matched_quantity=0.01,
+        )
+
+        market = runtime.close_runtime._exit_shadow_market(position, now_ms)
+        snapshot = ExitShadowSnapshot(
+            position=position,
+            reason="funding_capture",
+            market=market,
+        )
+
+        decisions = evaluate_exit_shadow_strategies(
+            snapshot,
+            ExitShadowConfig(enabled=True, max_quote_age_ms=500, max_l2_age_ms=500),
+        )
+
+        assert market.long_quote is not None
+        assert market.long_quote.observed_at_ms == stale_observed_at_ms
+        assert {decision.direction for decision in decisions} == {"neutral"}
+        assert all("stale" in decision.reason for decision in decisions)
 
     @pytest.mark.asyncio
     async def test_pending_passive_close_overdue_arms_dual_taker_despite_future_retry(

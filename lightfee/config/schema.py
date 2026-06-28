@@ -176,6 +176,17 @@ class StrategyConfig:
     spread_liquidity_sublarge_penalty_bps: float = 10.0
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
+    exit_shadow_enabled: bool = False
+    exit_shadow_markout_horizons_ms: list[int] = field(
+        default_factory=lambda: [1000, 2000, 5000]
+    )
+    exit_shadow_take_profit_bps: list[float] = field(
+        default_factory=lambda: [10.0, 20.0]
+    )
+    exit_shadow_adverse_stop_bps: float = 3.0
+    exit_shadow_max_quote_age_ms: int = 1000
+    exit_shadow_max_l2_age_ms: int = 1000
+    exit_shadow_cost_buffer_bps: float = 3.0
     execution_buffer_bps: float = 2.0
     capital_buffer_bps: float = 1.0
     transfer_healthy_bias_bps: float = 0.25

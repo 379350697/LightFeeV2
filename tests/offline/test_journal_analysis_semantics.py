@@ -129,6 +129,87 @@ class TestQuickFlatObservability:
             "runtime.position_lifecycle_terminal": 1,
         }
 
+
+class TestExitShadowAnalysis:
+    def test_exit_shadow_events_aggregate_by_bot(self):
+        records = [
+            make_record(
+                "exit_shadow.strategy_decision",
+                {
+                    "shadow_id": "shadow-1",
+                    "bot_id": "top_book_imbalance",
+                    "direction": "bullish",
+                    "recommended_path": "short_first_then_long",
+                    "confidence": 0.8,
+                },
+            ),
+            make_record(
+                "exit_shadow.path_markout",
+                {
+                    "shadow_id": "shadow-1",
+                    "path": "simultaneous_close",
+                    "horizon_ms": 1000,
+                    "net_bps": 0.0,
+                    "max_adverse_bps": 0.0,
+                },
+            ),
+            make_record(
+                "exit_shadow.path_markout",
+                {
+                    "shadow_id": "shadow-1",
+                    "path": "short_first_then_long",
+                    "horizon_ms": 1000,
+                    "net_bps": 12.0,
+                    "max_adverse_bps": 1.5,
+                    "take_profit_hit_bps": 10.0,
+                },
+            ),
+            make_record(
+                "exit_shadow.strategy_summary",
+                {
+                    "shadow_id": "shadow-1",
+                    "bot_id": "top_book_imbalance",
+                    "direction": "bullish",
+                    "recommended_path": "short_first_then_long",
+                    "horizon_ms": 1000,
+                    "direction_correct": True,
+                    "recommended_net_bps": 12.0,
+                    "baseline_net_bps": 0.0,
+                    "incremental_net_bps": 12.0,
+                    "max_adverse_bps": 1.5,
+                    "excluded": False,
+                },
+            ),
+            make_record(
+                "exit_shadow.strategy_summary",
+                {
+                    "shadow_id": "shadow-2",
+                    "bot_id": "top_book_imbalance",
+                    "direction": "bullish",
+                    "recommended_path": "short_first_then_long",
+                    "horizon_ms": 1000,
+                    "excluded": True,
+                    "exclude_reason": "stale_quote",
+                },
+            ),
+        ]
+
+        report = analyze_journal_records(records)
+
+        assert report.exit_shadow_decision_count == 1
+        assert report.exit_shadow_path_markout_count == 2
+        summary = report.exit_shadow_by_bot["top_book_imbalance"]
+        assert summary["sample_count"] == 1
+        assert summary["excluded_count"] == 1
+        assert summary["direction_accuracy"] == 1.0
+        assert summary["win_rate"] == 1.0
+        assert summary["avg_incremental_net_bps"] == 12.0
+        assert summary["median_incremental_net_bps"] == 12.0
+        assert summary["max_adverse_bps"] == 1.5
+        assert summary["exclude_reasons"] == {"stale_quote": 1}
+
+
+class TestQuickFlatObservabilityAdditional:
     def test_quick_flat_close_count_deduplicates_double_exit_closed_projection(self):
         records = [
             {

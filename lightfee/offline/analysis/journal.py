@@ -8,8 +8,10 @@ Read paths:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
+from statistics import median
 
 
 @dataclass
@@ -89,6 +91,12 @@ class JournalAnalysisReport:
     quick_flat_duplicate_event_count: int = 0
     quick_flat_low_confidence_event_count: int = 0
     quick_flat_close_identity_confidence: str = "high"
+
+    # Exit shadow advisor diagnostics
+    exit_shadow_decision_count: int = 0
+    exit_shadow_path_markout_count: int = 0
+    exit_shadow_summary_count: int = 0
+    exit_shadow_by_bot: dict[str, dict] = field(default_factory=dict)
 
 
 _RECOVERY_KINDS = frozenset({
@@ -178,6 +186,83 @@ def _positive_payload_ts(payload: dict, key: str) -> int:
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
+
+
+def _exit_shadow_bot_summary(report: JournalAnalysisReport, bot_id: str) -> dict:
+    return report.exit_shadow_by_bot.setdefault(
+        bot_id,
+        {
+            "sample_count": 0,
+            "excluded_count": 0,
+            "direction_correct_count": 0,
+            "win_count": 0,
+            "incremental_net_bps_values": [],
+            "max_adverse_bps_values": [],
+            "exclude_reasons": {},
+            "direction_accuracy": 0.0,
+            "win_rate": 0.0,
+            "avg_incremental_net_bps": 0.0,
+            "median_incremental_net_bps": 0.0,
+            "max_adverse_bps": 0.0,
+        },
+    )
+
+
+def _bool_payload(payload: dict, key: str) -> bool:
+    value = payload.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
+
+
+def _float_payload(payload: dict, key: str) -> float:
+    try:
+        return float(payload.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_exit_shadow_summary(report: JournalAnalysisReport, payload: dict) -> None:
+    bot_id = str(payload.get("bot_id", "") or "unknown")
+    summary = _exit_shadow_bot_summary(report, bot_id)
+    excluded = _bool_payload(payload, "excluded")
+    if excluded:
+        summary["excluded_count"] += 1
+        reason = str(payload.get("exclude_reason", "") or "unspecified")
+        reasons = summary["exclude_reasons"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+        return
+
+    incremental_net_bps = _float_payload(payload, "incremental_net_bps")
+    max_adverse_bps = _float_payload(payload, "max_adverse_bps")
+    summary["sample_count"] += 1
+    if _bool_payload(payload, "direction_correct"):
+        summary["direction_correct_count"] += 1
+    if incremental_net_bps > 0.0:
+        summary["win_count"] += 1
+    summary["incremental_net_bps_values"].append(incremental_net_bps)
+    summary["max_adverse_bps_values"].append(max_adverse_bps)
+
+
+def _finalize_exit_shadow_summaries(report: JournalAnalysisReport) -> None:
+    for summary in report.exit_shadow_by_bot.values():
+        sample_count = int(summary.get("sample_count", 0) or 0)
+        incremental = list(summary.get("incremental_net_bps_values", []) or [])
+        adverse = list(summary.get("max_adverse_bps_values", []) or [])
+        if sample_count > 0:
+            summary["direction_accuracy"] = (
+                float(summary.get("direction_correct_count", 0) or 0) / sample_count
+            )
+            summary["win_rate"] = float(summary.get("win_count", 0) or 0) / sample_count
+        if incremental:
+            summary["avg_incremental_net_bps"] = sum(incremental) / len(incremental)
+            summary["median_incremental_net_bps"] = float(median(incremental))
+        if adverse:
+            summary["max_adverse_bps"] = max(adverse)
+        summary.pop("incremental_net_bps_values", None)
+        summary.pop("max_adverse_bps_values", None)
 
 
 def _entry_time_info(records: list[dict]) -> dict[str, dict]:
@@ -653,6 +738,16 @@ def analyze_journal_records(
                 report.paper_outcome_by_label.get(label, 0) + 1
             )
 
+        elif kind == "exit_shadow.strategy_decision":
+            report.exit_shadow_decision_count += 1
+
+        elif kind == "exit_shadow.path_markout":
+            report.exit_shadow_path_markout_count += 1
+
+        elif kind == "exit_shadow.strategy_summary":
+            report.exit_shadow_summary_count += 1
+            _record_exit_shadow_summary(report, payload)
+
     quick_flat_summary = summarize_quick_flat_events(records)
     report.quick_flat_count = int(quick_flat_summary["quick_flat_count"])
     report.quick_flat_duplicate_event_count = int(
@@ -664,6 +759,7 @@ def analyze_journal_records(
     report.quick_flat_close_identity_confidence = str(
         quick_flat_summary["close_identity_confidence"]
     )
+    _finalize_exit_shadow_summaries(report)
 
     return report
 
@@ -764,9 +860,9 @@ def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
                 report.local_l2_sync_failed_by_category.get(r["category"], 0) + 1
             )
 
-    # Diagnostic facts (scan, execution, fail-closed)
+    # Diagnostic facts (scan, execution, fail-closed, exit-shadow)
     for row in conn.execute(
-        "SELECT kind, reason, classification FROM diagnostic_facts ORDER BY seq"
+        "SELECT kind, reason, classification, payload_json FROM diagnostic_facts ORDER BY seq"
     ):
         r = dict(row)
         kind = r["kind"]
@@ -790,6 +886,17 @@ def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
             report.fail_closed_reason_counts[reason] = (
                 report.fail_closed_reason_counts.get(reason, 0) + 1
             )
+        elif kind == "exit_shadow.strategy_decision":
+            report.exit_shadow_decision_count += 1
+        elif kind == "exit_shadow.path_markout":
+            report.exit_shadow_path_markout_count += 1
+        elif kind == "exit_shadow.strategy_summary":
+            report.exit_shadow_summary_count += 1
+            try:
+                payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            _record_exit_shadow_summary(report, payload)
         elif kind in ("opportunity.paper_markout", "opportunity.paper_closed",
                       "opportunity.real_vs_paper_joined"):
             import json as _json
@@ -815,6 +922,8 @@ def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
         row = conn.execute(f"SELECT COUNT(*) as cnt FROM {table}").fetchone()
         total += row["cnt"] if row else 0
     report.total_records = total
+
+    _finalize_exit_shadow_summaries(report)
 
     return report
 
