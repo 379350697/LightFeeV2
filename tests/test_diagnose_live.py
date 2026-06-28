@@ -10095,6 +10095,89 @@ def test_run_diagnose_contains_bybit_auth_invalid_admission_when_truth_clean(mon
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_resolved_contained_entry_admission_uses_symbol_venue_truth_not_global_flat():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1700000001000,
+            "kind": "order.rejected",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": (
+                    "aster_v3 POST /fapi/v3/order rejected status=400 "
+                    '{"code":-5018,"msg":"Maximum notional value exceeded"}'
+                ),
+                "exchange_error": {
+                    "venue": "aster",
+                    "exchange_code": "-5018",
+                    "exchange_msg": "Maximum notional value exceeded",
+                },
+                "request_context": {
+                    "symbol": "ESPORTSUSDT",
+                    "reduce_only": False,
+                },
+            },
+        },
+        {
+            "ts_ms": 1700000001100,
+            "kind": "runtime.entry_admission_blocked",
+            "payload": {
+                "venue": "aster",
+                "symbol": "ESPORTSUSDT",
+                "reason": "max_notional_admission_blocked",
+                "source": "exchange_submit_reject_-5018",
+                "block_scope": "symbol",
+                "evidence_gap": False,
+            },
+        },
+    ]
+    exchange_truth = {
+        "available": True,
+        "truth_available": True,
+        "confidence": "high",
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {
+                "LABUSDT": {
+                    "symbol": "LABUSDT",
+                    "venue": "binance",
+                    "side": "buy",
+                    "quantity": 3.0,
+                }
+            },
+            "okx": {
+                "LABUSDT": {
+                    "symbol": "LABUSDT",
+                    "venue": "okx",
+                    "side": "sell",
+                    "quantity": 3.0,
+                }
+            },
+            "aster": {},
+        },
+        "open_orders": {},
+    }
+
+    summary = dl._build_resolved_contained_entry_admission_summary(
+        events,
+        exchange_truth,
+    )
+
+    assert summary["current_exchange_truth_clean"] is False
+    assert summary["resolved_count"] == 1
+    assert summary["unresolved_count"] == 0
+    assert summary["resolved_identities"] == [
+        {"symbol": "ESPORTSUSDT", "venue": "aster"}
+    ]
+    assert dl._order_error_resolved_by_contained_entry_admission(
+        events[0]["payload"],
+        summary,
+    )
+
+
 def test_run_diagnose_exposes_single_leg_recovery_and_cleanup_blocker_summary():
     import scripts.diagnose_live as dl
 

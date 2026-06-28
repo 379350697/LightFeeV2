@@ -72,6 +72,30 @@ def write_json_atomic(path: str, data: dict) -> None:
         raise
 
 
+def _effective_recovery_export_state(
+    state: EngineState,
+    v1_lifecycle_closure: dict[str, Any],
+) -> tuple[str, Any, int]:
+    lifecycle = state.lifecycle.value
+    recovery_blocked_reason = getattr(state, "recovery_blocked_reason", None)
+    recovery_blocked_at_ms = getattr(state, "recovery_blocked_at_ms", 0)
+    summary = dict(v1_lifecycle_closure.get("summary") or {})
+    closure_allows_entry = summary.get("entry_allowed") is True
+    closure_block_reason = summary.get("recovery_block_reason")
+    no_current_work = (
+        len(getattr(state, "pending_entries", []) or []) == 0
+        and len(getattr(state, "pending_closes", []) or []) == 0
+        and len(getattr(state, "pending_passive_closes", []) or []) == 0
+        and len(getattr(state, "pending_residual_repairs", []) or []) == 0
+    )
+    if closure_allows_entry and not closure_block_reason and no_current_work:
+        if state.risk_mode.value == "running":
+            lifecycle = "running"
+            recovery_blocked_reason = None
+            recovery_blocked_at_ms = 0
+    return lifecycle, recovery_blocked_reason, recovery_blocked_at_ms
+
+
 @dataclass
 class ExportState:
     """Tracks next-export deadlines for throttled periodic exporters."""
@@ -218,6 +242,11 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
     pending_close_reconciliation = _pending_close_reconciliation_summary(
         getattr(state, "pending_close_reconciliations", [])
     )
+    (
+        effective_lifecycle,
+        effective_recovery_blocked_reason,
+        effective_recovery_blocked_at_ms,
+    ) = _effective_recovery_export_state(state, v1_lifecycle_closure)
 
     data = {
         "schema": "lightfee.current_state.v1",
@@ -225,15 +254,15 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "expires_at_ms": now_ms + stale_after_ms,
         "stale": False,
         "mode": mode,
-        "lifecycle": state.lifecycle.value,
+        "lifecycle": effective_lifecycle,
         "risk_mode": state.risk_mode.value,
         "global_risk_mode": state.risk_mode.value,
         "global_risk_reason": getattr(state, "global_risk_reason", None),
         "hyperliquid_trading_disabled_reason": getattr(
             state, "hyperliquid_trading_disabled_reason", None
         ),
-        "recovery_blocked_reason": getattr(state, "recovery_blocked_reason", None),
-        "recovery_blocked_at_ms": getattr(state, "recovery_blocked_at_ms", 0),
+        "recovery_blocked_reason": effective_recovery_blocked_reason,
+        "recovery_blocked_at_ms": effective_recovery_blocked_at_ms,
         "run_id": state.run_id,
         "tick_count": state.tick_count,
         "last_tick_ms": state.last_tick_ms,

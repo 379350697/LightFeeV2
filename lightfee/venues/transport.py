@@ -81,6 +81,7 @@ class LiveCredential:
     wallet_private_key: str = ""
     account_address: str = ""
     wallet_mode: str = "account_wallet"
+    allow_api_wallet_authorization_probe: bool = False
 
 
 def _missing_hyperliquid_signing_dependencies() -> list[str]:
@@ -140,6 +141,50 @@ def _normalize_hyperliquid_credential(credential: LiveCredential) -> LiveCredent
             credential.wallet_private_key
         ),
     )
+
+
+def resolve_hyperliquid_credential_identity(
+    credential: LiveCredential | None,
+) -> dict[str, Any]:
+    wallet_mode = _normalize_hyperliquid_wallet_mode(
+        str(getattr(credential, "wallet_mode", "") or "account_wallet")
+    )
+    wallet_private_key = str(
+        getattr(credential, "wallet_private_key", "") or ""
+    ).strip()
+    signer_address = ""
+    signer_error = ""
+    if wallet_private_key:
+        try:
+            signer_address = _derive_hyperliquid_account_address(wallet_private_key)
+        except Exception as exc:
+            signer_error = str(exc)[:200]
+    account_address = str(
+        getattr(credential, "account_address", "") or ""
+    ).strip()
+    if wallet_mode == "account_wallet" and not account_address:
+        account_address = signer_address
+    matches = (
+        bool(account_address)
+        and bool(signer_address)
+        and account_address.lower() == signer_address.lower()
+    )
+    identity = {
+        "wallet_mode": wallet_mode,
+        "account_address": account_address,
+        "signer_address": signer_address,
+        "account_address_present": bool(account_address),
+        "signer_address_present": bool(signer_address),
+        "account_matches_signer": matches,
+        "wallet_matches_account": matches,
+        "signer_matches_account": matches,
+        "allow_api_wallet_authorization_probe": bool(
+            getattr(credential, "allow_api_wallet_authorization_probe", False)
+        ),
+    }
+    if signer_error:
+        identity["signer_address_error"] = signer_error
+    return identity
 
 
 def _floor_to_step(value: float, step: float) -> float:
@@ -1526,9 +1571,9 @@ class VenueTransport(MarketDataClient):
         """Run live trading preflight before allowing Hyperliquid orders.
 
         Account-wallet mode uses V1 direct-wallet semantics: the signing wallet
-        is the account. API-wallet mode proves agent authorization with
-        Hyperliquid's official no-op exchange action, which marks only the
-        nonce as used.
+        is the account. API-wallet mode reads the configured account only; by
+        default it stays strict read-only and does not send signed no-op exchange
+        actions unless an explicit test-only probe flag is set.
         """
         if self.mode != "live" or self._spec.venue_id != Venue.HYPERLIQUID:
             self._trading_capability_trusted = True
@@ -1569,25 +1614,25 @@ class VenueTransport(MarketDataClient):
             self._trading_preflight_status = payload
             return dict(payload)
 
-        try:
-            wallet_address = _derive_hyperliquid_account_address(cred.wallet_private_key)
-        except Exception as exc:
+        identity = resolve_hyperliquid_credential_identity(cred)
+        signer_error = str(identity.get("signer_address_error") or "")
+        if signer_error:
             payload["reason"] = "wallet_private_key_derivation_failed"
-            payload["error"] = str(exc)[:200]
+            payload["error"] = signer_error
             self._trading_capability_trusted = False
             self._trading_preflight_status = payload
             return dict(payload)
 
-        account_address = (cred.account_address or wallet_address or "").strip()
-        account_matches_wallet = (
-            bool(account_address)
-            and wallet_address.lower() == account_address.lower()
-        )
+        account_address = str(identity.get("account_address") or "")
+        signer_address = str(identity.get("signer_address") or "")
+        account_matches_wallet = bool(identity.get("account_matches_signer"))
         payload["wallet_matches_account"] = account_matches_wallet
         payload["signer_matches_account"] = account_matches_wallet
-        payload["account_address_present"] = bool(account_address)
+        payload["account_address_present"] = bool(
+            identity.get("account_address_present")
+        )
         payload["configured_account_address"] = account_address
-        payload["signer_address"] = wallet_address
+        payload["signer_address"] = signer_address
 
         if not account_address:
             payload["reason"] = "missing_account_address"
@@ -1623,6 +1668,16 @@ class VenueTransport(MarketDataClient):
             return dict(payload)
 
         if authorization_mode == "api_wallet":
+            if not cred.allow_api_wallet_authorization_probe:
+                payload["reason"] = (
+                    "api_wallet_authorization_not_verified_strict_readonly"
+                )
+                payload["authorization_error"] = (
+                    "signed_noop_disabled_by_strict_readonly_policy"
+                )
+                self._trading_capability_trusted = False
+                self._trading_preflight_status = payload
+                return dict(payload)
             try:
                 from lightfee.venues.hyperliquid_signing import (
                     build_hyperliquid_exchange_payload,

@@ -560,10 +560,17 @@ def _build_local_state(
     return {
         "lifecycle": str(state.get("lifecycle", "unknown")),
         "risk_mode": str(state.get("risk_mode", "unknown")),
+        "global_risk_mode": str(state.get("global_risk_mode", state.get("risk_mode", "unknown"))),
+        "global_risk_reason": state.get("global_risk_reason"),
+        "recovery_blocked_reason": state.get("recovery_blocked_reason"),
+        "hyperliquid_trading_disabled_reason": state.get(
+            "hyperliquid_trading_disabled_reason"
+        ),
         "open_position_count": int(state.get("open_position_count", 0) or 0),
         "pending_entry_count": int(state.get("pending_entry_count", 0) or 0),
         "pending_entries": state.get("pending_entries", []),
         "pending_close_count": int(state.get("pending_close_count", 0) or 0),
+        "open_positions": positions,
         "positions": positions,
         "last_tick_ms": int(state.get("last_tick_ms", 0) or 0),
         "runtime_progress": dict(state.get("runtime_progress") or {}),
@@ -572,6 +579,7 @@ def _build_local_state(
         ),
         "state_path": state.get("_state_path", ""),
         "state_path_source": state.get("_state_path_source", ""),
+        "v1_lifecycle_closure": dict(state.get("v1_lifecycle_closure") or {}),
     }
 
 
@@ -703,8 +711,7 @@ def _address_hash(value: str) -> str:
 def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
     try:
         from lightfee.venues.transport import (
-            _derive_hyperliquid_account_address,
-            _normalize_hyperliquid_wallet_mode,
+            resolve_hyperliquid_credential_identity,
         )
     except Exception:
         return {
@@ -716,33 +723,25 @@ def _hyperliquid_credential_identity(credential: Any) -> dict[str, Any]:
             "account_matches_signer": False,
         }
 
-    wallet_mode = _normalize_hyperliquid_wallet_mode(
-        str(getattr(credential, "wallet_mode", "") or "account_wallet")
-    )
-    account_address = str(getattr(credential, "account_address", "") or "").strip()
-    wallet_private_key = str(getattr(credential, "wallet_private_key", "") or "").strip()
-    signer_address = ""
-    signer_error = ""
-    if wallet_private_key:
-        try:
-            signer_address = _derive_hyperliquid_account_address(wallet_private_key)
-        except Exception as exc:
-            signer_error = str(exc)[:160]
-    account_matches_signer = (
-        bool(account_address)
-        and bool(signer_address)
-        and account_address.lower() == signer_address.lower()
-    )
+    resolved = resolve_hyperliquid_credential_identity(credential)
+    wallet_mode = str(resolved.get("wallet_mode") or "")
+    account_address = str(resolved.get("account_address") or "")
+    signer_address = str(resolved.get("signer_address") or "")
+    account_matches_signer = bool(resolved.get("account_matches_signer"))
     identity: dict[str, Any] = {
         "wallet_mode": wallet_mode,
-        "account_address_present": bool(account_address),
-        "signer_address_present": bool(signer_address),
+        "account_address_present": bool(resolved.get("account_address_present")),
+        "signer_address_present": bool(resolved.get("signer_address_present")),
         "account_matches_signer": account_matches_signer,
         "account_address_masked": _mask_address(account_address),
         "account_address_hash": _address_hash(account_address),
         "signer_address_masked": _mask_address(signer_address),
         "signer_address_hash": _address_hash(signer_address),
+        "allow_api_wallet_authorization_probe": bool(
+            resolved.get("allow_api_wallet_authorization_probe")
+        ),
     }
+    signer_error = str(resolved.get("signer_address_error") or "")
     if signer_error:
         identity["signer_address_error"] = signer_error
     return identity
@@ -2999,6 +2998,51 @@ def _contained_entry_admission_identity(payload: dict[str, Any]) -> tuple[str, s
     return symbol, venue
 
 
+def _exchange_truth_identity_clean(
+    exchange_truth: dict[str, Any],
+    key: tuple[str, str],
+) -> bool:
+    symbol, venue = key
+    if not symbol or not venue:
+        return False
+    if exchange_truth.get("available") is False:
+        return False
+    positions_by_venue = exchange_truth.get("positions") or {}
+    venue_positions = positions_by_venue.get(venue) or {}
+    if isinstance(venue_positions, dict):
+        pos = venue_positions.get(symbol) or venue_positions.get(symbol.upper())
+        if isinstance(pos, dict) and _safe_abs_quantity(pos.get("quantity")) > 1e-9:
+            return False
+    orders_by_venue = exchange_truth.get("open_orders") or {}
+    venue_orders = orders_by_venue.get(venue) or {}
+    order_items: list[Any]
+    if isinstance(venue_orders, dict):
+        maybe_symbol_orders = venue_orders.get(symbol) or venue_orders.get(symbol.upper())
+        if maybe_symbol_orders is None:
+            order_items = list(venue_orders.values())
+        elif isinstance(maybe_symbol_orders, dict):
+            if maybe_symbol_orders:
+                return False
+            order_items = []
+        elif isinstance(maybe_symbol_orders, (list, tuple)):
+            if maybe_symbol_orders:
+                return False
+            order_items = list(maybe_symbol_orders)
+        else:
+            order_items = [maybe_symbol_orders]
+    elif isinstance(venue_orders, (list, tuple)):
+        order_items = list(venue_orders)
+    else:
+        order_items = []
+    for order in order_items:
+        if not isinstance(order, dict):
+            continue
+        order_symbol = str(order.get("symbol") or "").upper()
+        if order_symbol == symbol.upper():
+            return False
+    return True
+
+
 def _build_resolved_contained_entry_admission_summary(
     events: list[dict[str, Any]],
     exchange_truth: dict[str, Any],
@@ -3086,7 +3130,11 @@ def _build_resolved_contained_entry_admission_summary(
                 }
             )
 
-    resolved_keys = reject_keys & block_keys if current_clean else set()
+    resolved_keys = {
+        key
+        for key in reject_keys & block_keys
+        if current_clean or _exchange_truth_identity_clean(exchange_truth, key)
+    }
     unresolved_keys = reject_keys - resolved_keys
     return {
         "count": len(reject_keys),
@@ -3109,6 +3157,8 @@ def _build_resolved_contained_entry_admission_summary(
             for sym, venue in sorted(block_keys)
         ],
         "current_exchange_truth_clean": current_clean,
+        "resolved_by_identity_exchange_truth_clean": not current_clean
+        and bool(resolved_keys),
         "samples": samples,
     }
 
@@ -3118,11 +3168,6 @@ def _order_error_resolved_by_contained_entry_admission(
     resolved_contained_admission_summary: dict[str, Any] | None,
 ) -> bool:
     if not resolved_contained_admission_summary:
-        return False
-    if (
-        resolved_contained_admission_summary.get("current_exchange_truth_clean")
-        is not True
-    ):
         return False
     if int(resolved_contained_admission_summary.get("resolved_count", 0) or 0) <= 0:
         return False
@@ -7176,6 +7221,17 @@ def _build_production_acceptance_gate(
         row for row in v1_lifecycle_closure.get("rows", []) or []
         if isinstance(row, dict)
     ]
+    v1_summary = dict(v1_lifecycle_closure.get("summary") or {})
+    effective_lifecycle = str(local_state.get("lifecycle", "") or "").lower()
+    if (
+        v1_summary.get("entry_allowed") is True
+        and not v1_summary.get("recovery_block_reason")
+        and str(local_state.get("risk_mode", "") or "").lower() == "running"
+        and pending_entry_count == 0
+        and pending_close_count == 0
+        and pending_residual_repair_count == 0
+    ):
+        effective_lifecycle = "running"
     closure_owned_pending_passive_close_count = sum(
         1
         for row in v1_rows
@@ -7313,7 +7369,7 @@ def _build_production_acceptance_gate(
         and exchange_truth.get("available")
         and not exchange_truth_flat
         and exchange_truth_no_open_orders
-        and str(local_state.get("lifecycle", "") or "").lower() == "running"
+        and effective_lifecycle == "running"
         and str(local_state.get("risk_mode", "") or "").lower() == "running"
         and state_consistent
     )

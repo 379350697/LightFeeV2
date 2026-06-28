@@ -52,6 +52,102 @@ def test_unavailable_truth_without_local_work_is_nonblocking_evidence_gap():
     assert payload["rows"][0]["evidence_class"] == "partial_evidence_gap"
 
 
+def test_terminalized_pending_entry_live_conflict_owner_fact_does_not_block_managed_open_position():
+    from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    local_state = {
+        "lifecycle": "risk_only",
+        "risk_mode": "running",
+        "recovery_blocked_reason": "owned_pending_entry_live_conflict",
+        "open_position_count": 1,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "positions": [
+            {
+                "position_id": "entry-current-LABUSDT",
+                "symbol": "LABUSDT",
+                "long_venue": "binance",
+                "short_venue": "okx",
+                "quantity": 3.0,
+                "matched_quantity": 3.0,
+            }
+        ],
+    }
+    events = [
+        {
+            "kind": "pending_entry.positive_fill_live_truth_conflict",
+            "payload": {
+                "entry_id": "entry-old-LABUSDT",
+                "symbol": "LABUSDT",
+                "live_short_quantity": 3.0,
+            },
+        },
+        {
+            "kind": "pending_entry.owned_live_conflict_cleanup_succeeded",
+            "payload": {
+                "entry_id": "entry-old-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
+            },
+        },
+        {
+            "kind": "pending_entry.terminalized_after_single_leg_recovery",
+            "payload": {
+                "entry_id": "entry-old-LABUSDT",
+                "symbol": "LABUSDT",
+                "reason": "owned_live_conflict_cleanup_succeeded",
+            },
+        },
+        {
+            "kind": "entry.opened",
+            "payload": {"position_id": "entry-current-LABUSDT", "symbol": "LABUSDT"},
+        },
+    ]
+
+    table = build_v1_lifecycle_closure_table(
+        local_state=local_state,
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {
+                "binance": {
+                    "LABUSDT": {
+                        "symbol": "LABUSDT",
+                        "venue": "binance",
+                        "side": "buy",
+                        "quantity": 3.0,
+                    }
+                },
+                "okx": {
+                    "LABUSDT": {
+                        "symbol": "LABUSDT",
+                        "venue": "okx",
+                        "side": "sell",
+                        "quantity": 3.0,
+                    }
+                },
+            },
+            "open_orders": {},
+        },
+        owner_index=RecoveryOwnerIndex.from_state_and_journal(local_state, events),
+        events=events,
+        generated_at_ms=1770000000000,
+    )
+
+    payload = table.to_dict()
+    assert payload["summary"]["entry_allowed"] is True
+    assert payload["summary"].get("recovery_block_reason") in (None, "")
+    assert not any(
+        row.get("terminality") == "owned_pending_entry_live_conflict"
+        for row in payload["rows"]
+    )
+
+
 def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
     from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 

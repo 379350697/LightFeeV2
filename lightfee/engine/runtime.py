@@ -1154,6 +1154,63 @@ class LiveRuntime:
                 else getattr(self, "recovery_decision", None)
             ),
         ).to_dict()
+        self._clear_stale_recovery_block_when_v1_closure_allows_entry(now_ms)
+
+    def _clear_stale_recovery_block_when_v1_closure_allows_entry(
+        self,
+        now_ms: int,
+    ) -> None:
+        closure = dict(getattr(self.state, "v1_lifecycle_closure", {}) or {})
+        summary = dict(closure.get("summary") or {})
+        if summary.get("entry_allowed") is not True:
+            return
+        if summary.get("recovery_block_reason"):
+            return
+        has_pending_work = (
+            bool(getattr(self.state, "pending_entries", []) or [])
+            or bool(getattr(self.state, "pending_closes", []) or [])
+            or bool(getattr(self.state, "pending_passive_closes", []) or [])
+            or bool(getattr(self.state, "pending_residual_repairs", []) or [])
+        )
+        if has_pending_work:
+            return
+        if getattr(self.state, "risk_mode", None) != GlobalRiskMode.RUNNING:
+            return
+        stale_reason = getattr(self.state, "recovery_blocked_reason", None)
+        if not stale_reason:
+            return
+        from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+        from lightfee.engine.recovery_decision_core import (
+            CORE_CLEARABLE_BLOCK_REASONS,
+        )
+
+        core_decision = getattr(self, "recovery_decision", None)
+        if (
+            stale_reason in CORE_CLEARABLE_BLOCK_REASONS
+            and clear_risk_mode_for_recovery(self.state, core_decision)
+        ):
+            self._try_journal(
+                "recovery.ledger_clear",
+                {
+                    "reason": getattr(core_decision, "clear_reason", ""),
+                    "decision": getattr(
+                        getattr(core_decision, "kind", None),
+                        "value",
+                        "",
+                    ),
+                    "ts_ms": now_ms,
+                    **closure_event_fields(
+                        closure,
+                        phase="RECOVERY_TRUTH",
+                        owner_id="core",
+                    ),
+                },
+            )
+        else:
+            self.state.recovery_blocked_reason = None
+            self.state.recovery_blocked_at_ms = 0
+        if getattr(self.state, "lifecycle", None) == EngineLifecycle.RISK_ONLY:
+            set_lifecycle(self.state, EngineLifecycle.RUNNING)
 
     def _current_v1_lifecycle_closure(
         self,

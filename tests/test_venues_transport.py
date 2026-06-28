@@ -1335,19 +1335,15 @@ class TestHyperliquidLiveOrderNowSupported:
             wallet_mode="api_wallet",
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
+        seen_paths: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            seen_paths.append(request.url.path)
             body = json.loads(request.content.decode())
             if request.url.path == "/info":
                 assert body["type"] == "clearinghouseState"
                 return httpx.Response(200, json={"assetPositions": [], "marginSummary": {}})
-            assert request.url.path == "/exchange"
-            assert body["action"] == {"type": "noop"}
-
-            return httpx.Response(
-                200,
-                json={"status": "err", "response": "User or API Wallet does not exist"},
-            )
+            raise AssertionError("strict-readonly api_wallet preflight must not call /exchange")
 
         transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
@@ -1362,7 +1358,9 @@ class TestHyperliquidLiveOrderNowSupported:
         assert result["api_wallet_authorization_verified"] is False
         assert result["clearinghouse_state_readable"] is True
         assert result["trading_capability_trusted"] is False
-        assert result["reason"] == "api_wallet_authorization_unverified"
+        assert result["reason"] == "api_wallet_authorization_not_verified_strict_readonly"
+        assert result["authorization_error"] == "signed_noop_disabled_by_strict_readonly_policy"
+        assert seen_paths == ["/info"]
 
     @pytest.mark.asyncio
     async def test_hyperliquid_account_wallet_preflight_fails_closed_on_signer_account_mismatch(self):
@@ -1407,6 +1405,7 @@ class TestHyperliquidLiveOrderNowSupported:
             wallet_private_key=wallet_key,
             account_address=account_address,
             wallet_mode="api_wallet",
+            allow_api_wallet_authorization_probe=True,
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
 
@@ -1449,6 +1448,7 @@ class TestHyperliquidLiveOrderNowSupported:
             wallet_private_key=wallet_key,
             account_address=account_address,
             wallet_mode="agent_wallet",
+            allow_api_wallet_authorization_probe=True,
         )
         transport = VenueTransport(spec=hyperliquid_spec(), mode="live", credential=cred)
 
@@ -1526,8 +1526,8 @@ class TestHyperliquidLiveOrderNowSupported:
             await transport.close()
 
         assert exc_info.value.class_ == SubmitFailureClass.REJECTED
-        assert "hyperliquid_trading_disabled:api_wallet_authorization_unverified" in str(exc_info.value)
-        assert exchange_calls == 1
+        assert "hyperliquid_trading_disabled:api_wallet_authorization_not_verified_strict_readonly" in str(exc_info.value)
+        assert exchange_calls == 0
 
     @pytest.mark.asyncio
     async def test_hyperliquid_place_order_rejects_without_trading_preflight(self):

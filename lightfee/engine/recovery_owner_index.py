@@ -37,15 +37,19 @@ class RecoveryOwnerIndex:
 
     @classmethod
     def active_journal_owner_events(cls, journal_events: Iterable[Any]) -> list[Any]:
+        events = list(journal_events or [])
+        terminalized_owners = _terminalized_journal_owner_keys(events)
         active_events: list[Any] = []
-        for event in journal_events:
+        for event in events:
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
                 continue
             order_id, client_order_id = _journal_order_identifiers(payload)
-            if not order_id and not client_order_id and not _journal_position_specs(
-                event, payload
-            ):
+            position_specs = _journal_position_specs(event, payload)
+            owner_id = _journal_owner_key(payload)
+            if owner_id in terminalized_owners:
+                position_specs = ()
+            if not order_id and not client_order_id and not position_specs:
                 continue
             active_events.append(event)
         return active_events
@@ -106,7 +110,10 @@ class RecoveryOwnerIndex:
             )
             self._index_pending_entry_position_keys(owner, pending)
 
-        for position in _collection(state, "open_positions"):
+        open_positions = _collection(state, "open_positions")
+        if not open_positions:
+            open_positions = _collection(state, "positions")
+        for position in open_positions:
             owner = RecoveryOwner(
                 owner_type="open_position",
                 owner_id=_text(
@@ -165,16 +172,20 @@ class RecoveryOwnerIndex:
                 self._residuals_by_key[(venue, symbol)] = owner
 
     def _add_journal_events(self, journal_events: Iterable[Any]) -> None:
-        for event in self.active_journal_owner_events(journal_events):
+        events = list(journal_events or [])
+        terminalized_owners = _terminalized_journal_owner_keys(events)
+        for event in self.active_journal_owner_events(events):
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
                 continue
             kind = _text(_get(event, "kind", ""))
             order_id, client_order_id = _journal_order_identifiers(payload)
             position_specs = _journal_position_specs(event, payload)
+            owner_id = _journal_owner_key(payload)
+            if owner_id in terminalized_owners:
+                position_specs = ()
             if not order_id and not client_order_id and not position_specs:
                 continue
-            owner_id = _journal_owner_key(payload)
             symbol = _text(payload.get("symbol")).upper()
             is_passive_close = kind.startswith("exit.passive_close")
             owner = RecoveryOwner(
@@ -379,6 +390,25 @@ def _journal_order_identifiers(payload: Mapping[str, Any]) -> tuple[str, str]:
         or payload.get("clientOrderId")
     )
     return order_id, client_order_id
+
+
+def _terminalized_journal_owner_keys(journal_events: Iterable[Any]) -> set[str]:
+    terminalized: set[str] = set()
+    terminal_kinds = {
+        "pending_entry.owned_live_conflict_cleanup_succeeded",
+        "pending_entry.terminalized_after_single_leg_recovery",
+    }
+    for event in journal_events:
+        kind = _text(_get(event, "kind", "")).lower()
+        if kind not in terminal_kinds:
+            continue
+        payload = _get(event, "payload", {})
+        if not isinstance(payload, Mapping):
+            continue
+        owner_id = _journal_owner_key(payload)
+        if owner_id:
+            terminalized.add(owner_id)
+    return terminalized
 
 
 def _journal_owner_key(payload: Mapping[str, Any]) -> str:
