@@ -3632,6 +3632,88 @@ class TestRealPathAbortCleanupDeadline:
         assert "pending_entry.maker_terminal_no_open_order" in kinds
 
     @pytest.mark.asyncio
+    async def test_try_abandon_stale_entry_allows_terminal_positive_fill_under_entry_target_when_flat(
+        self, tmp_path
+    ):
+        """SKYAI/P3: order terminality is scoped to the maker order, not the entry target.
+
+        A passive maker order can be FILLED for its exchange-rounded target
+        while the entry-level target remains slightly larger. If live position
+        and open-order truth are flat, this helper must not keep a stale pending
+        entry solely because maker_filled < pending.target_quantity.
+        """
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.ASTER)
+        maker.position = PositionSnapshot(
+            venue=Venue.ASTER,
+            symbol="SKYAIUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1_000_000,
+        )
+        maker.open_orders = []
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.ASTER,
+            symbol="SKYAIUSDT",
+            side=Side.BUY,
+            order_id="436274816",
+            client_order_id="02018-skyai-maker",
+            cumulative_quantity=171.0,
+            average_price=0.1396,
+            state=PassiveOrderState.FILLED,
+            observed_at_ms=1_000_100,
+        )
+        hedge = _FakeVenueAdapter(Venue.GATE)
+        hedge.position = PositionSnapshot(
+            venue=Venue.GATE,
+            symbol="SKYAIUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1_000_000,
+        )
+        runtime._venue_adapters[Venue.ASTER] = maker
+        runtime._venue_adapters[Venue.GATE] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-skyai-flat-terminal-maker",
+            symbol="SKYAIUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.GATE,
+            target_quantity=171.56337122024448,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000_000,
+            maker_leg="long",
+            maker_order_id="436274816",
+            maker_client_order_id="02018-skyai-maker",
+            maker_leg_filled=171.0,
+            hedge_leg_filled=160.0,
+            maker_fill_price=0.1396,
+            hedge_fill_price=0.1396,
+            uncertain_outcome=True,
+            passive_order=PendingPassiveOrder(
+                order_id="436274816",
+                client_order_id="02018-skyai-maker",
+                target_quantity=171.0,
+                last_progress_state=PassiveOrderState.FILLED,
+                fill_checkpoint_quantity=171.0,
+            ),
+        )
+
+        abandoned = await runtime._try_abandon_stale_entry(
+            pending, pending.pending_id
+        )
+
+        assert abandoned is True
+        assert maker._cancel_passive_order_calls == []
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.maker_terminal_no_open_order" in kinds
+        assert "reconciliation.entry_abandoned_flat" in kinds
+        assert "reconciliation.entry_abandon_retained_unresolved_maker" not in kinds
+
+    @pytest.mark.asyncio
     async def test_terminal_abandoned_flat_pending_entry_clears_recovery_core_block(
         self, tmp_path
     ):

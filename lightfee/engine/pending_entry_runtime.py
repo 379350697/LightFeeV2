@@ -1250,23 +1250,88 @@ class PendingEntryRuntime:
                 )
                 return True
             return False
-        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
-        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
-        if pending.maker_completed() and maker_filled >= target_quantity - 1e-9:
-            return False
 
         maker_venue = pending.maker_venue()
         adapter = self.ctx.get_venue_adapter(maker_venue)
         if adapter is None:
             return True
 
+        order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(
+            pending
+        )
+
+        async def terminal_only_when_open_order_absent(
+            reason: str,
+            *,
+            progress_state: str | None = None,
+            cumulative_quantity: float | None = None,
+        ) -> bool:
+            matches, open_order_error = await self.ctx._pending_entry_maker_open_order_matches(
+                pending,
+                adapter,
+                maker_venue,
+            )
+            if matches is not None:
+                if matches:
+                    payload = {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_order_id": order_id,
+                        "maker_client_order_id": client_order_id,
+                        "open_order_count": len(matches),
+                        "reason": f"{reason}_open_order_present",
+                    }
+                    if progress_state is not None:
+                        payload["progress_state"] = progress_state
+                    if cumulative_quantity is not None:
+                        payload["cumulative_quantity"] = cumulative_quantity
+                    self.ctx.journal.append(
+                        "pending_entry.maker_open_order_retained",
+                        payload,
+                    )
+                    return True
+                payload = {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "maker_venue": maker_venue.value,
+                    "maker_order_id": order_id,
+                    "maker_client_order_id": client_order_id,
+                    "reason": f"{reason}_open_order_absent",
+                }
+                if progress_state is not None:
+                    payload["progress_state"] = progress_state
+                if cumulative_quantity is not None:
+                    payload["cumulative_quantity"] = cumulative_quantity
+                self.ctx.journal.append(
+                    "pending_entry.maker_terminal_no_open_order",
+                    payload,
+                )
+                return False
+            payload = {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "maker_venue": maker_venue.value,
+                "reason": reason,
+                "open_order_error": open_order_error,
+            }
+            if progress_state is not None:
+                payload["progress_state"] = progress_state
+            if cumulative_quantity is not None:
+                payload["cumulative_quantity"] = cumulative_quantity
+            self.ctx.journal.append(
+                "pending_entry.maker_terminal_evidence_unavailable",
+                payload,
+            )
+            return True
+
+        if pending.maker_completed():
+            return await terminal_only_when_open_order_absent("maker_completed")
+
         try:
             maker_side = getattr(pending, 'maker_side', None)
             if callable(maker_side):
                 maker_side = maker_side()
-            order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(
-                pending
-            )
             progress = await adapter.query_passive_order_progress(
                 symbol=pending.symbol,
                 order_id=order_id,
@@ -1343,60 +1408,20 @@ class PendingEntryRuntime:
             )
             return True
 
-        if getattr(progress, "cumulative_quantity", 0.0) > 1e-9:
-            return True
         state = getattr(progress, "state", None)
         if state is not None and hasattr(state, "is_terminal"):
             state_value = str(getattr(state, "value", str(state or "")) or "").lower()
-            if state_value == "filled":
-                return True
+            cumulative_quantity = float(
+                getattr(progress, "cumulative_quantity", 0.0) or 0.0
+            )
             if state.is_terminal():
-                matches, open_order_error = await self.ctx._pending_entry_maker_open_order_matches(
-                    pending,
-                    adapter,
-                    maker_venue,
+                return await terminal_only_when_open_order_absent(
+                    "passive_order_terminal",
+                    progress_state=state_value,
+                    cumulative_quantity=cumulative_quantity,
                 )
-                if matches is not None:
-                    if matches:
-                        self.ctx.journal.append(
-                            "pending_entry.maker_open_order_retained",
-                            {
-                                "entry_id": entry_id,
-                                "symbol": pending.symbol,
-                                "maker_venue": maker_venue.value,
-                                "maker_order_id": order_id,
-                                "maker_client_order_id": client_order_id,
-                                "open_order_count": len(matches),
-                                "reason": "passive_order_terminal_no_fill_open_order_present",
-                                "progress_state": state_value,
-                            },
-                        )
-                        return True
-                    self.ctx.journal.append(
-                        "pending_entry.maker_terminal_no_open_order",
-                        {
-                            "entry_id": entry_id,
-                            "symbol": pending.symbol,
-                            "maker_venue": maker_venue.value,
-                            "maker_order_id": order_id,
-                            "maker_client_order_id": client_order_id,
-                            "reason": "passive_order_terminal_no_fill_open_order_absent",
-                            "progress_state": state_value,
-                        },
-                    )
-                    return False
-                self.ctx.journal.append(
-                    "pending_entry.maker_terminal_evidence_unavailable",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "maker_venue": maker_venue.value,
-                        "reason": "passive_order_terminal_no_fill",
-                        "progress_state": state_value,
-                        "open_order_error": open_order_error,
-                    },
-                )
-                return True
+            return True
+        if getattr(progress, "cumulative_quantity", 0.0) > 1e-9:
             return True
         return True
 
