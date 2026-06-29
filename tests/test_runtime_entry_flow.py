@@ -31,6 +31,7 @@ from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliati
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
+    ActiveMakerLeg,
     OpenPosition,
     PendingPassiveOrder,
     PassiveExecutionPhase,
@@ -3454,6 +3455,26 @@ class TestPlannerDispatchIntegration:
                 },
             )
         ]
+        assert passive.drive_calls == [(position.position_id, False)]
+
+        runtime.state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+
+        await runtime._maybe_process_normal_exits(funding_ms + 1)
+
+        retry_records = runtime.journal.read_all()
+        retry_kinds = [record["kind"] for record in retry_records]
+        assert retry_kinds.count("exit_shadow.strategy_decision") == 5
+        assert len(passive.start_calls) == 1
         assert passive.drive_calls == [(position.position_id, False)]
 
     def test_exit_shadow_local_l2_quote_preserves_stale_observed_at(self, config):

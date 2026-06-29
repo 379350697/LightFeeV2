@@ -4250,6 +4250,18 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "status_counts": {},
         "previous_status_counts": {},
     }
+    normal_close_trigger_position_ids: set[str] = set()
+    normal_close_shadow_ids: set[str] = set()
+    exit_shadow_recorded_position_ids: set[str] = set()
+    exit_shadow_recorded_shadow_ids: set[str] = set()
+    exit_shadow_strategy_decision_count = 0
+    passive_close_retry_kind_counts: dict[str, int] = {}
+    passive_close_retry_kinds = {
+        "exit.accepted_order_truth_gap_retry_blocked",
+        "exit.passive_close_dual_taker_drive",
+        "exit.passive_close_hedge_ack_live_truth_pending",
+        "exit.passive_close_hedge_ack_reconcile_in_progress",
+    }
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -4272,6 +4284,26 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             opened_entry_ids.add(entry_id)
         elif kind == "entry.passive_unfilled" and entry_id:
             passive_unfilled_entry_ids.add(entry_id)
+        elif kind in {
+            "runtime.normal_close_routing_passive",
+            "runtime.normal_close_routing_aggressive",
+        }:
+            if entry_id:
+                normal_close_trigger_position_ids.add(entry_id)
+            shadow_id = str(payload.get("exit_shadow_id") or "")
+            if shadow_id:
+                normal_close_shadow_ids.add(shadow_id)
+        elif kind == "exit_shadow.strategy_decision":
+            exit_shadow_strategy_decision_count += 1
+            if entry_id:
+                exit_shadow_recorded_position_ids.add(entry_id)
+            shadow_id = str(payload.get("shadow_id") or "")
+            if shadow_id:
+                exit_shadow_recorded_shadow_ids.add(shadow_id)
+        elif kind in passive_close_retry_kinds:
+            passive_close_retry_kind_counts[kind] = (
+                passive_close_retry_kind_counts.get(kind, 0) + 1
+            )
         elif kind in {
             "runtime.entry_quote_revalidate_failed",
             "runtime.entry_ws_bbo_top_candidate_rewarm_failed",
@@ -4397,6 +4429,24 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     entry_market_evidence_summary = _build_entry_market_evidence_summary(events)
     artifact_duration_summary = _build_artifact_duration_summary(events)
     phase_duration_summary = _build_phase_duration_summary(events)
+    shadow_expected_position_ids = set(normal_close_trigger_position_ids)
+    shadow_missing_position_ids = sorted(
+        shadow_expected_position_ids - exit_shadow_recorded_position_ids
+    )
+    close_trigger_recording_summary = {
+        "normal_close_trigger_count": len(normal_close_trigger_position_ids),
+        "normal_close_shadow_id_count": len(normal_close_shadow_ids),
+        "exit_shadow_expected_position_count": len(shadow_expected_position_ids),
+        "exit_shadow_strategy_decision_count": exit_shadow_strategy_decision_count,
+        "exit_shadow_recorded_position_count": len(exit_shadow_recorded_position_ids),
+        "exit_shadow_recorded_shadow_id_count": len(exit_shadow_recorded_shadow_ids),
+        "exit_shadow_missing_expected_count": len(shadow_missing_position_ids),
+        "exit_shadow_missing_position_ids": shadow_missing_position_ids,
+        "passive_close_retry_count": sum(passive_close_retry_kind_counts.values()),
+        "passive_close_retry_kind_counts": dict(
+            sorted(passive_close_retry_kind_counts.items())
+        ),
+    }
     return {
         "selected_count": len(selected_entry_ids),
         "dispatched_count": dispatched_count,
@@ -4435,6 +4485,7 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "quote_rewarm_after_rest_stale_summary": quote_rewarm_after_rest_stale_summary,
         "artifact_duration_summary": artifact_duration_summary,
         "phase_duration_summary": phase_duration_summary,
+        "close_trigger_recording_summary": close_trigger_recording_summary,
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 

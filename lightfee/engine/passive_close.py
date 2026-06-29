@@ -1266,26 +1266,18 @@ class PassiveCloseExecutor:
                 pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
             return {"handled": True, "status": result.status, "cleared": cleared}
 
-        self._journal.append(
-            "exit.accepted_order_truth_gap_retry_blocked",
-            {
-                "position_id": pending.position_id,
-                "symbol": position.symbol,
-                "venue": venue.value,
-                "leg": leg_label,
-                "accepted_order_id": order_id,
-                "accepted_client_order_id": client_order_id,
-                "resolution_status": result.status,
-                "decision": "retain_pending",
-                "source": source,
-                "order_truth_state": active_truth_gap.get("order_truth_state"),
-                "next_action": active_truth_gap.get("next_action"),
-                "open_order_count": payload.get("open_order_count"),
-                "live_quantity": payload.get("live_quantity"),
-            },
-        )
-        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
-        return {"handled": True, "status": result.status, "cleared": False}
+        return {
+            "handled": True,
+            "status": result.status,
+            "cleared": False,
+            "payload": payload,
+            "reconciliation": active_truth_gap,
+            "accepted_order_id": order_id,
+            "accepted_client_order_id": client_order_id,
+            "source": source,
+            "venue": venue,
+            "leg": leg_label,
+        }
 
     def _defer_final_hedge_truth_gap(
         self,
@@ -6308,6 +6300,101 @@ class PassiveCloseExecutor:
         pending.next_retry_at_ms = 0
         return False
 
+    def _existing_truth_gap_allows_live_one_sided_cleanup(
+        self,
+        existing_truth_gap: dict[str, Any],
+        *,
+        live_qty: float,
+    ) -> bool:
+        if str(existing_truth_gap.get("status") or "") != "truth_gap":
+            return False
+        payload = existing_truth_gap.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        if "open_order_count" not in payload:
+            return False
+        try:
+            open_order_count = int(payload.get("open_order_count") or 0)
+            truth_live_qty = abs(float(payload.get("live_quantity") or 0.0))
+        except (TypeError, ValueError):
+            return False
+        return open_order_count == 0 and truth_live_qty > 1e-9 and live_qty > 1e-9
+
+    def _record_existing_truth_gap_retry_blocked(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        existing_truth_gap: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> None:
+        payload = existing_truth_gap.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        venue = existing_truth_gap.get("venue")
+        leg = str(existing_truth_gap.get("leg") or "")
+        reconciliation = existing_truth_gap.get("reconciliation")
+        if not isinstance(reconciliation, dict):
+            reconciliation = {}
+        self._journal.append(
+            "exit.accepted_order_truth_gap_retry_blocked",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value if isinstance(venue, Venue) else str(venue or ""),
+                "leg": leg,
+                "accepted_order_id": existing_truth_gap.get("accepted_order_id"),
+                "accepted_client_order_id": existing_truth_gap.get("accepted_client_order_id"),
+                "resolution_status": existing_truth_gap.get("status"),
+                "decision": "retain_pending",
+                "source": existing_truth_gap.get("source"),
+                "order_truth_state": reconciliation.get("order_truth_state"),
+                "next_action": reconciliation.get("next_action"),
+                "open_order_count": payload.get("open_order_count"),
+                "live_quantity": payload.get("live_quantity"),
+            },
+        )
+        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+
+    def _resolve_existing_truth_gap_after_single_leg_cleanup(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        existing_truth_gap: dict[str, Any] | None,
+        *,
+        cleanup_order_client_id: str,
+        cleanup_quantity: float,
+        cleanup_venue: Venue,
+        cleanup_leg: str,
+    ) -> None:
+        if not existing_truth_gap:
+            return
+        reconciliation = existing_truth_gap.get("reconciliation")
+        if isinstance(reconciliation, dict):
+            state.remove_pending_close_reconciliation(reconciliation)
+        payload = existing_truth_gap.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        self._journal.append(
+            "exit.accepted_order_truth_gap_resolved",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": cleanup_venue.value,
+                "leg": cleanup_leg,
+                "accepted_order_id": existing_truth_gap.get("accepted_order_id"),
+                "accepted_client_order_id": existing_truth_gap.get("accepted_client_order_id"),
+                "resolution_status": "live_flat_after_single_leg_cleanup",
+                "decision": "clear_gap_after_cleanup",
+                "source": "passive_close_live_one_sided_cleanup",
+                "cleanup_client_order_id": cleanup_order_client_id,
+                "cleanup_quantity": cleanup_quantity,
+                "pre_cleanup_open_order_count": payload.get("open_order_count"),
+                "pre_cleanup_live_quantity": payload.get("live_quantity"),
+            },
+        )
+
     async def _flatten_live_one_sided_position(
         self,
         state: EngineState,
@@ -6343,8 +6430,52 @@ class PassiveCloseExecutor:
             source="passive_close_live_one_sided_existing_truth_gap",
             now_ms=now_ms,
         )
+        cleanup_handoff_truth_gap: dict[str, Any] | None = None
         if existing_truth_gap.get("handled"):
-            return bool(existing_truth_gap.get("cleared"))
+            if existing_truth_gap.get("cleared"):
+                return True
+            if str(existing_truth_gap.get("status") or "") in {"filled", "live_flat"}:
+                return False
+            if self._existing_truth_gap_allows_live_one_sided_cleanup(
+                existing_truth_gap,
+                live_qty=live_qty,
+            ):
+                cleanup_handoff_truth_gap = existing_truth_gap
+                payload = existing_truth_gap.get("payload")
+                if not isinstance(payload, dict):
+                    payload = {}
+                reconciliation = existing_truth_gap.get("reconciliation")
+                if isinstance(reconciliation, dict):
+                    reconciliation["order_truth_state"] = "cleanup_handoff"
+                    reconciliation["next_action"] = "submit_reduce_only_single_leg_cleanup"
+                    reconciliation["cleanup_handoff_ms"] = now_ms
+                self._journal.append(
+                    "exit.accepted_order_truth_gap_cleanup_handoff",
+                    {
+                        "position_id": pending.position_id,
+                        "symbol": position.symbol,
+                        "venue": venue.value,
+                        "leg": leg_label,
+                        "accepted_order_id": existing_truth_gap.get("accepted_order_id"),
+                        "accepted_client_order_id": existing_truth_gap.get(
+                            "accepted_client_order_id"
+                        ),
+                        "resolution_status": existing_truth_gap.get("status"),
+                        "open_order_count": payload.get("open_order_count"),
+                        "live_quantity": payload.get("live_quantity"),
+                        "cleanup_quantity": live_qty,
+                        "decision": "submit_reduce_only_live_one_sided_cleanup",
+                        "source": "passive_close_live_one_sided_existing_truth_gap",
+                    },
+                )
+            else:
+                self._record_existing_truth_gap_retry_blocked(
+                    pending,
+                    position,
+                    existing_truth_gap,
+                    now_ms=now_ms,
+                )
+                return False
 
         open_order_items, open_order_error = await self._fetch_venue_open_order_items(
             venue,
@@ -6680,6 +6811,16 @@ class PassiveCloseExecutor:
                 "flattened_quantity": normalized_qty,
             },
         ):
+            self._resolve_existing_truth_gap_after_single_leg_cleanup(
+                state,
+                pending,
+                position,
+                cleanup_handoff_truth_gap,
+                cleanup_order_client_id=client_order_id,
+                cleanup_quantity=normalized_qty,
+                cleanup_venue=venue,
+                cleanup_leg=leg_label,
+            )
             return True
 
         pending.next_retry_at_ms = self._now_ms() + 5_000
