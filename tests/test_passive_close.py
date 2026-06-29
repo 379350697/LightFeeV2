@@ -1960,6 +1960,220 @@ class TestAdvanceChunkRootInvariant:
 class TestTerminalMakerFillHedgeFail:
     """Test 2: terminal maker FILLED + hedge error → chunk NOT advanced."""
 
+    def test_terminal_maker_filled_checks_live_flat_before_hedge_delta(self):
+        """POWR shape: maker FILLED plus hedge leg already live-zero must not submit hedge."""
+        journal = _open_journal()
+
+        class LiveFlatMakerAdapter(VenueAdapter):
+            def __init__(self, venue: Venue, side: Side):
+                self._venue = venue
+                self._side = side
+                self.place_order_calls: list[OrderRequest] = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return PassiveOrderProgress(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    cumulative_quantity=469.0,
+                    average_price=0.05075,
+                    fee_quote=0.0,
+                    last_fill_time_ms=1782749106400,
+                    state=PassiveOrderState.FILLED,
+                    observed_at_ms=1782749106400,
+                )
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1782749107000,
+                )
+
+            async def fetch_open_orders(self, symbol):
+                return []
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                raise AssertionError("hedge order must not be submitted when live hedge leg is zero")
+
+        binance = LiveFlatMakerAdapter(Venue.BINANCE, Side.BUY)
+        bybit = LiveFlatMakerAdapter(Venue.BYBIT, Side.SELL)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.05075)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1782748326583-POWRUSDT",
+            symbol="POWRUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=469.0,
+            short_quantity=469.0,
+            matched_quantity=469.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=469.0,
+            chunk_quantities=[469.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="2165806894",
+                maker_client_order_id="lfexc549b448645569e2",
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is True
+        assert bybit.place_order_calls == []
+        assert state.pending_passive_closes == {}
+        assert state.open_positions == {}
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_post_maker_fill_live_flat_precheck" in kinds
+        assert "exit.passive_close_hedge_error" not in kinds
+        assert "exit.passive_close_unhedged_residual" not in kinds
+
+    def test_terminal_maker_filled_live_flat_with_open_order_retains_pending(self):
+        """Flat position truth is not terminal while open-order truth is dirty."""
+        journal = _open_journal()
+
+        class LiveFlatWithOpenOrderAdapter(VenueAdapter):
+            def __init__(self, venue: Venue, side: Side, *, open_orders=None):
+                self._venue = venue
+                self._side = side
+                self._open_orders = list(open_orders or [])
+                self.place_order_calls: list[OrderRequest] = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def query_passive_order_progress(self, symbol, order_id, client_order_id, side):
+                return PassiveOrderProgress(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=side,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    cumulative_quantity=469.0,
+                    average_price=0.05075,
+                    fee_quote=0.0,
+                    last_fill_time_ms=1782749106400,
+                    state=PassiveOrderState.FILLED,
+                    observed_at_ms=1782749106400,
+                )
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1782749107000,
+                )
+
+            async def fetch_open_orders(self, symbol):
+                return list(self._open_orders)
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                raise AssertionError("hedge order must not be submitted while live truth is flat")
+
+        binance = LiveFlatWithOpenOrderAdapter(Venue.BINANCE, Side.BUY)
+        bybit = LiveFlatWithOpenOrderAdapter(
+            Venue.BYBIT,
+            Side.SELL,
+            open_orders=[
+                {
+                    "symbol": "POWRUSDT",
+                    "side": "buy",
+                    "quantity": 469.0,
+                    "reduce_only": True,
+                    "order_id": "still-open",
+                }
+            ],
+        )
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.05075)
+
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-1782748326583-POWRUSDT",
+            symbol="POWRUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=469.0,
+            short_quantity=469.0,
+            matched_quantity=469.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=469.0,
+            chunk_quantities=[469.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="2165806894",
+                maker_client_order_id="lfexc549b448645569e2",
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=0.0),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        assert bybit.place_order_calls == []
+        assert position.position_id in state.pending_passive_closes
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_post_maker_fill_live_flat_precheck" in kinds
+        assert "exit.passive_close_recovery_probe_diagnostic" in kinds
+        assert "exit.passive_close_resolved" not in kinds
+
     def test_terminal_small_maker_fill_below_min_notional_compensates_flat(self):
         """V1 parity: terminal maker dust aborts and compensates in the same drive."""
         journal = _open_journal()
@@ -2026,7 +2240,7 @@ class TestTerminalMakerFillHedgeFail:
         okx = MakerAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
         bybit = SequencedPositionAdapter(
             Venue.BYBIT,
-            [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
+            [(2.0, Side.SELL), (2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
         )
         _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
@@ -2098,10 +2312,16 @@ class TestTerminalMakerFillHedgeFail:
         hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
             venue=Venue.BYBIT, symbol="UBUSDT", side=Side.BUY, quantity=1.0, price=0.01,
         ))
-        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
-            venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
-            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
-        ))
+        hedge_adapter.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+                quantity=1.0, entry_price=0.01, observed_at_ms=2000,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT, symbol="UBUSDT", side=Side.SELL,
+                quantity=0.0, entry_price=0.0, observed_at_ms=2001,
+            ),
+        ])
 
         executor = PassiveCloseExecutor(
             {Venue.BINANCE: maker_adapter, Venue.BYBIT: hedge_adapter}, journal,
@@ -2176,10 +2396,16 @@ class TestTerminalMakerFillHedgeFail:
         hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
             venue=Venue.OKX, symbol="SPACEUSDT", side=Side.BUY, quantity=39.0, price=0.006,
         ))
-        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
-            venue=Venue.OKX, symbol="SPACEUSDT", side=Side.SELL,
-            quantity=0.0, entry_price=0.0, observed_at_ms=2000,
-        ))
+        hedge_adapter.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.OKX, symbol="SPACEUSDT", side=Side.SELL,
+                quantity=39.0, entry_price=0.006, observed_at_ms=2000,
+            ),
+            PositionSnapshot(
+                venue=Venue.OKX, symbol="SPACEUSDT", side=Side.SELL,
+                quantity=0.0, entry_price=0.0, observed_at_ms=2001,
+            ),
+        ])
 
         try:
             executor = PassiveCloseExecutor(
@@ -4805,6 +5031,7 @@ class TestFallbackResidualReal:
                 super().__init__(Venue.BYBIT)
                 self.place_order_calls = 0
                 self.reconciliation_lookups = []
+                self.position_quantities = [534.0, 0.0]
 
             async def place_order(self, request):
                 self.place_order_calls += 1
@@ -4830,6 +5057,17 @@ class TestFallbackResidualReal:
                         "queried_endpoints": ["/v5/execution/list"],
                         "response_classification": "filled",
                     },
+                )
+
+            async def fetch_position(self, symbol):
+                quantity = self.position_quantities.pop(0) if self.position_quantities else 0.0
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=quantity,
+                    entry_price=0.04508 if quantity else 0.0,
+                    observed_at_ms=2000,
                 )
 
         binance = FilledMakerAdapter(Venue.BINANCE)
@@ -5280,14 +5518,24 @@ class TestFallbackResidualReal:
         hedge = _mock_adapter_with_tick(Venue.BYBIT)
         hedge.place_order = AsyncMock(side_effect=ack_error)
         hedge.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
-        hedge.fetch_position = AsyncMock(return_value=PositionSnapshot(
-            venue=Venue.BYBIT,
-            symbol="KATUSDT",
-            side=Side.SELL,
-            quantity=0.0,
-            entry_price=0.0,
-            observed_at_ms=3001,
-        ))
+        hedge.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="KATUSDT",
+                side=Side.SELL,
+                quantity=7000.0,
+                entry_price=0.00679,
+                observed_at_ms=3001,
+            ),
+            PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="KATUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=3002,
+            ),
+        ])
         hedge.fetch_open_orders = AsyncMock(return_value=[])
 
         executor = PassiveCloseExecutor({Venue.OKX: maker, Venue.BYBIT: hedge}, journal)

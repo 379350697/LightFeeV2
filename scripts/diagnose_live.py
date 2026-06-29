@@ -2371,9 +2371,7 @@ def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
 
 def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> bool:
     exchange_error = _exchange_error_dict(payload)
-    request_context = payload.get("request_context")
-    if not isinstance(request_context, dict):
-        request_context = {}
+    request_context = _payload_request_context(payload)
     exchange_code = str(
         payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
     )
@@ -2384,13 +2382,16 @@ def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> 
     venue = str(
         payload.get("venue") or exchange_error.get("venue") or request_context.get("venue") or ""
     ).lower()
+    raw_body = str(exchange_error.get("raw_body") or "").lower()
+    text = " ".join((exchange_msg, reason, raw_body))
     return (
         venue == "bybit"
         and exchange_code == "110017"
-        and request_context.get("reduce_only") is True
+        and _boolish(request_context.get("reduce_only"))
         and (
-            "orderqty will be truncated to zero" in exchange_msg
-            or "orderqty will be truncated to zero" in reason
+            "current position is zero" in text
+            or "cannot fix reduce-only order qty" in text
+            or "orderqty will be truncated to zero" in text
         )
     )
 
@@ -2778,6 +2779,7 @@ def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> boo
     )
     return (
         code == "-2022"
+        or _payload_is_bybit_terminal_zero_qty_reduce_only(payload)
         or gate_empty_position
         or "reduceonly order is rejected" in reason_text
         or "reduce only order is rejected" in reason_text
@@ -2965,6 +2967,8 @@ def _order_error_resolved_by_close_terminal_truth(
         _payload_is_reduce_only_terminal_flat_reject(payload)
         or _payload_is_zero_fill_terminal_flat(payload)
     ):
+        if _payload_is_bybit_terminal_zero_qty_reduce_only(payload):
+            return position_terminal_match
         return bool(order_terminal_match)
     return False
 

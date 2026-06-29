@@ -1764,14 +1764,27 @@ class PassiveCloseExecutor:
                         # is still behind, we submit a hedge for the remaining gap.
                         maker_fill_delta = pending.maker_fill.quantity - cycle_fill_before
                         unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
-                        if unhedged_gap > 1e-9:
+                        hedge_delta = unhedged_gap if unhedged_gap > 1e-9 else maker_fill_delta
+                        if hedge_delta > 1e-9:
+                            live_resolution, hedge_delta = await self._resolve_post_maker_fill_live_truth_before_hedge(
+                                state,
+                                pending,
+                                position,
+                                maker_leg_label=maker_leg_label,
+                                requested_hedge_delta=hedge_delta,
+                            )
+                            if live_resolution == PassiveCloseLiveTruthResolution.CLEARED:
+                                return True
+                            if live_resolution == PassiveCloseLiveTruthResolution.STOP_RETRY:
+                                return False
+                        if unhedged_gap > 1e-9 and hedge_delta > 1e-9:
                             result = await self._submit_hedge_for_delta(
-                                state, pending, position, unhedged_gap,
+                                state, pending, position, hedge_delta,
                                 maker_terminal=True,
                             )
-                        elif maker_fill_delta > 1e-9:
+                        elif maker_fill_delta > 1e-9 and hedge_delta > 1e-9:
                             result = await self._submit_hedge_for_delta(
-                                state, pending, position, maker_fill_delta,
+                                state, pending, position, hedge_delta,
                                 maker_terminal=True,
                             )
                         else:
@@ -6179,6 +6192,100 @@ class PassiveCloseExecutor:
             return PassiveCloseLiveTruthResolution.CLEARED
         pending.next_retry_at_ms = max(pending.next_retry_at_ms, self._now_ms() + 5_000)
         return PassiveCloseLiveTruthResolution.STOP_RETRY
+
+    async def _resolve_post_maker_fill_live_truth_before_hedge(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        maker_leg_label: str,
+        requested_hedge_delta: float,
+    ) -> tuple[PassiveCloseLiveTruthResolution, float]:
+        """Use live truth before submitting hedge catch-up after terminal maker fill."""
+        live_long, live_long_error = await self._fetch_live_position_snapshot(
+            position.long_venue,
+            position.symbol,
+        )
+        live_short, live_short_error = await self._fetch_live_position_snapshot(
+            position.short_venue,
+            position.symbol,
+        )
+        if live_long_error or live_short_error:
+            self._journal.append(
+                "exit.passive_close_post_maker_fill_live_precheck_untrusted",
+                {
+                    "position_id": pending.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "requested_hedge_delta": requested_hedge_delta,
+                    "long_error": live_long_error,
+                    "short_error": live_short_error,
+                    "decision": "continue_existing_hedge_delta",
+                },
+            )
+            return PassiveCloseLiveTruthResolution.CONTINUE_MAKER, requested_hedge_delta
+
+        live_long_qty = self._live_position_quantity(live_long)
+        live_short_qty = self._live_position_quantity(live_short)
+        if maker_leg_label == "long":
+            maker_qty = live_long_qty
+            hedge_qty = live_short_qty
+            hedge_leg_label = "short"
+        else:
+            maker_qty = live_short_qty
+            hedge_qty = live_long_qty
+            hedge_leg_label = "long"
+
+        decision = "continue_existing_hedge_delta"
+        if maker_qty <= 1e-9 and hedge_qty <= 1e-9:
+            decision = "clear_live_flat"
+        elif hedge_qty <= 1e-9:
+            decision = "retain_maker_leg_not_flat"
+        elif hedge_qty + 1e-9 < requested_hedge_delta:
+            decision = "clamp_hedge_delta_to_live_quantity"
+
+        self._journal.append(
+            "exit.passive_close_post_maker_fill_live_flat_precheck",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "maker_leg": maker_leg_label,
+                "hedge_leg": hedge_leg_label,
+                "requested_hedge_delta": requested_hedge_delta,
+                "live_long_size": live_long_qty,
+                "live_short_size": live_short_qty,
+                "decision": decision,
+            },
+        )
+
+        if maker_qty <= 1e-9 and hedge_qty <= 1e-9:
+            if await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_post_maker_fill_live_flat_precheck",
+                extra={
+                    "maker_leg": maker_leg_label,
+                    "hedge_leg": hedge_leg_label,
+                    "requested_hedge_delta": requested_hedge_delta,
+                },
+            ):
+                return PassiveCloseLiveTruthResolution.CLEARED, 0.0
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return PassiveCloseLiveTruthResolution.STOP_RETRY, 0.0
+
+        if hedge_qty <= 1e-9:
+            pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
+            return PassiveCloseLiveTruthResolution.STOP_RETRY, 0.0
+
+        if hedge_qty + 1e-9 < requested_hedge_delta:
+            return PassiveCloseLiveTruthResolution.CONTINUE_MAKER, hedge_qty
+        return PassiveCloseLiveTruthResolution.CONTINUE_MAKER, requested_hedge_delta
 
     def _pending_runtime_close_legs(
         self,

@@ -9457,6 +9457,70 @@ def test_resolved_close_order_error_summary_requires_order_identity_match_for_re
     assert summary["reduce_only_terminal_flat_count"] == 0
 
 
+def test_resolved_close_order_error_summary_accepts_bybit_zero_position_reject_with_position_terminal():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-1782748326583-POWRUSDT",
+                "symbol": "POWRUSDT",
+                "terminal_state": "flat",
+                "problem": False,
+            },
+        },
+        {
+            "ts_ms": 1_100,
+            "kind": "exit.passive_close_hedge_error",
+            "payload": {
+                "position_id": "entry-1782748326583-POWRUSDT",
+                "symbol": "POWRUSDT",
+                "venue": "bybit",
+                "exchange_code": "110017",
+                "reason": "current position is zero, cannot fix reduce-only order qty",
+                "request_context": {
+                    "symbol": "POWRUSDT",
+                    "side": "buy",
+                    "quantity": 469.0,
+                    "reduce_only": True,
+                    "client_order_id": "lfex25de598b3bf652c6",
+                },
+                "exchange_error": {
+                    "venue": "bybit",
+                    "operation": "place_order",
+                    "http_status": 400,
+                    "exchange_code": "110017",
+                    "exchange_msg": "current position is zero, cannot fix reduce-only order qty",
+                    "raw_body": '{"retCode":110017,"retMsg":"current position is zero, cannot fix reduce-only order qty"}',
+                    "request_context": {
+                        "symbol": "POWRUSDT",
+                        "side": "buy",
+                        "quantity": 469.0,
+                        "reduce_only": True,
+                        "client_order_id": "lfex25de598b3bf652c6",
+                    },
+                },
+            },
+        },
+    ]
+
+    summary = dl._build_resolved_close_order_error_summary(
+        events,
+        _flat_exchange_truth("/unused", ["POWRUSDT"], ["binance", "bybit"]),
+    )
+    blockers = dl._build_order_error_evidence(
+        events,
+        resolved_close_order_error_summary=summary,
+    )
+
+    assert summary["count"] == 1
+    assert summary["reduce_only_terminal_flat_count"] == 1
+    assert summary["position_ids"] == ["entry-1782748326583-POWRUSDT"]
+    assert blockers == []
+
+
 def test_diagnostic_noise_summary_keeps_unmatched_reduce_only_as_current_blocker():
     import scripts.diagnose_live as dl
 

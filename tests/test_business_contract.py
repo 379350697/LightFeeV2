@@ -1043,6 +1043,53 @@ def test_close_order_error_resolution_requires_order_identity_match_for_reduce_o
     }
 
 
+def test_close_order_error_resolution_accepts_bybit_zero_position_reject_with_position_terminal():
+    payload = {
+        "position_id": "entry-1782748326583-POWRUSDT",
+        "symbol": "POWRUSDT",
+        "venue": "bybit",
+        "exchange_code": "110017",
+        "reason": "current position is zero, cannot fix reduce-only order qty",
+        "request_context": {
+            "reduce_only": True,
+            "client_order_id": "lfex25de598b3bf652c6",
+            "symbol": "POWRUSDT",
+        },
+        "exchange_error": {
+            "venue": "bybit",
+            "exchange_code": "110017",
+            "exchange_msg": "current position is zero, cannot fix reduce-only order qty",
+            "request_context": {
+                "reduce_only": True,
+                "client_order_id": "lfex25de598b3bf652c6",
+            },
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="exit.passive_close_hedge_error",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=False,
+        has_order_identity=True,
+    )
+    dirty = close_order_error_resolution_contract(
+        kind="exit.passive_close_hedge_error",
+        payload=payload,
+        current_exchange_truth_clean=False,
+        position_terminal_match=True,
+        order_terminal_match=False,
+        has_order_identity=True,
+    )
+
+    assert result == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
+    assert dirty["resolved"] is False
+
+
 def test_close_order_error_resolution_treats_gate_empty_position_as_terminal_flat():
     payload = {
         "position_id": "entry-1",

@@ -59,7 +59,7 @@
       },
       "observed_reject": "bybit retCode=10001 The number of contracts exceeds minimum limit allowed",
       "expected_events": [
-        "exit.passive_close_hedge_dust_aborted",
+        "exit.passive_close_post_maker_fill_live_flat_precheck",
         "recovery.flat",
         "runtime.position_drift_corrected"
       ]

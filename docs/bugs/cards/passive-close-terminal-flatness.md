@@ -26,6 +26,7 @@ residuals, and live-flat cleanup.
 - Binance close `-5022 GTX_ORDER_REJECT` post-only maker reject
 - Binance close `-2022 ReduceOnly Order is rejected`
 - Bitget close `40786 Duplicate clientOid`
+- Bybit close `110017 current position is zero, cannot fix reduce-only order qty`
 - `exit.reconciled` with `evidence_gap_reason`,
   `statement_probe_status`, and `trade_probe_status`
 - `price_unavailable_for_min_notional`
@@ -137,8 +138,12 @@ close/order artifacts such as Binance close `-2022`, Binance close post-only
 flat/no-open-orders. Reduce-only and zero-fill artifacts also need a strong
 order/client identity match to terminal close evidence before diagnostics may
 downgrade them; a same-position terminal event without order identity is not
-enough. If that truth is unavailable, dirty, or identity cannot be matched, the
-artifact stays a current blocker. Quote stale and quote rewarm terminal stale are
+enough. The explicit exception is Bybit `110017 current position is zero` /
+`cannot fix reduce-only order qty`: this is a no-order terminal reject and may
+resolve by position terminal truth only when current exchange truth is
+flat/no-open-orders. If that truth is unavailable, dirty, or identity cannot be
+matched for all other reduce-only artifacts, the artifact stays a current
+blocker. Quote stale and quote rewarm terminal stale are
 `current_admission_blocker` records, not current exposure. Unsupported-symbol
 position/open-order probe records from venue catalog scope are
 `catalog_diagnostic`; they stay visible for audit but do not block the gate.
@@ -209,6 +214,7 @@ alone is not success evidence.
 | 2026-06-28 | ACT recovered funding close lifecycle | fixed in `904bb23`, deployed/cloud verified | CL-131 restores V1 close semantics for recovered live positions: startup recovery must hydrate funding timestamps and maker-leg hints from owner/pending journal or quote truth before creating a managed open position, and missing funding truth emits `recovery.recovered_position_funding_timestamp_missing` instead of a silent never-close state. Recovery ownership now canonicalizes OKX raw symbols such as `ACT-USDT-SWAP` to `ACTUSDT` across ledger, owner index, unpaired recovery, and V1 closure. Cloud ACT closed through normal passive/fallback close; final truth is running, exchange flat/no-open-orders, no pending close, and V1 `RUNNING_CLEAN`. |
 | 2026-06-29 | Aster accepted close ACK truth-gap identity closure | fixed in `617adb8`, deployed/cloud verified | CL-133 turns accepted 0-fill Aster close ACKs into `accepted_order_truth_gap` work rather than ordinary `zero_fill`; diagnose now treats `exit.accepted_order_truth_gap_resolved` as terminal only for `filled/live_flat` and requires matching order/client identity before downgrading Aster `-2022` reduce-only artifacts. Cloud verification showed running/flat/no-open-orders/no pending truth gaps and V1 `RUNNING_CLEAN`. |
 | 2026-06-29 | LABUSDT accepted truth-gap to single-leg cleanup handoff | local verified; deploy pending | CL-136 keeps exit-shadow accounting at one strategy sample group per normal close trigger and separates passive-close retry counts in diagnose. Existing accepted-order truth gaps no longer block live one-sided cleanup when follow-up truth proves open orders empty and live exposure still exists; runtime emits `exit.accepted_order_truth_gap_cleanup_handoff`, submits reduce-only IOC cleanup, then removes the old gap only after fresh live-flat/no-open-orders proof and emits `exit.accepted_order_truth_gap_resolved(live_flat_after_single_leg_cleanup)`. |
+| 2026-06-30 | POWRUSDT post-maker-fill live-zero hedge closure | local verified; deploy pending | CL-137 adds a terminal-maker-fill live-position/open-order precheck before hedge catch-up. Both legs already flat clears through live-flat proof instead of submitting a Bybit reduce-only order that would return `110017 current position is zero`; dirty open-order truth retains. Diagnose/business-contract close only this Bybit no-order zero-position reject by position terminal truth when current exchange truth is clean. |
 
 ## Recurrences
 
@@ -230,6 +236,7 @@ alone is not success evidence.
 | 2026-06-24 | Bitget `40786 Duplicate clientOid` close/recovery truth closure | `4ddbd07` | deployed/cloud verified; duplicate-client truth closure no longer leaves unresolved close residue when exchange truth is clean | [daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure](../daily/2026-06-24.md#cluster-cl-116---gate-contract-size-quantity-drift-and-bitget-duplicate-clientoid-truth-closure) |
 | 2026-06-29 | `LABUSDT` Aster accepted close ACK / Aster `-2022` reduce-only artifact family | `617adb8` | deployed/cloud verified; gate passed, exchange flat/no-open-orders, unresolved order-truth gap 0, order error evidence 0 | [daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure](../daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure) |
 | 2026-06-29 | `LABUSDT` Bitget live long / OKX flat accepted close truth-gap retry loop | working tree | local verified; exit-shadow expected count stays one normal close trigger, existing truth gap hands off to reduce-only IOC cleanup only with open-orders-empty + live one-sided proof | [daily/2026-06-29.md#cluster-cl-136---labusdt-exit-shadow-accounting-and-single-leg-cleanup-handoff](../daily/2026-06-29.md#cluster-cl-136---labusdt-exit-shadow-accounting-and-single-leg-cleanup-handoff) |
+| 2026-06-30 | `POWRUSDT` Binance maker filled / Bybit hedge leg already flat | working tree | local verified; terminal maker fill probes live flat before hedge catch-up, and Bybit `110017 current position is zero` is closed as historical terminal evidence only behind clean exchange truth plus position terminal proof | [daily/2026-06-30.md#cluster-cl-137---powrusdt-post-maker-fill-live-zero-hedge-closure](../daily/2026-06-30.md#cluster-cl-137---powrusdt-post-maker-fill-live-zero-hedge-closure) |
 
 ## Regression Harness
 

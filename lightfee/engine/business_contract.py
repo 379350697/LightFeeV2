@@ -879,6 +879,7 @@ def close_order_error_resolution_contract(
         else _payload_is_post_only_close_reject(payload)
     )
     reduce_only = _payload_is_reduce_only_terminal_flat_reject(payload)
+    terminal_zero_no_order = _payload_is_reduce_only_zero_position_reject(payload)
     zero_fill = (
         str(kind or "") == "order.uncertain"
         and "zero fill" in _payload_reason_text(payload)
@@ -889,7 +890,10 @@ def close_order_error_resolution_contract(
             "resolution_bucket": "post_only_boundary_reject",
         }
     if reduce_only or zero_fill:
-        resolved = bool(order_terminal_match)
+        resolved = bool(
+            order_terminal_match
+            or (terminal_zero_no_order and position_terminal_match)
+        )
         return {
             "resolved": resolved,
             "resolution_bucket": (
@@ -1263,6 +1267,38 @@ def diagnose_issue_counts(payload: dict[str, Any], kind: str) -> dict[str, int]:
     return {}
 
 
+def _payload_is_reduce_only_zero_position_reject(payload: dict[str, Any]) -> bool:
+    request_context = _payload_request_context(payload)
+    if not _boolish(request_context.get("reduce_only")):
+        return False
+    exchange_error = _exchange_error_dict(payload)
+    code = str(
+        payload.get("exchange_code")
+        or exchange_error.get("exchange_code")
+        or payload.get("code")
+        or exchange_error.get("code")
+        or ""
+    ).strip()
+    venue = str(
+        payload.get("venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).lower()
+    reason = _payload_reason_text(payload)
+    raw_body = str(exchange_error.get("raw_body") or "").lower()
+    text = " ".join((reason, raw_body))
+    bybit_zero_position = (
+        (venue == "bybit" or code == "110017")
+        and (
+            "current position is zero" in text
+            or "cannot fix reduce-only order qty" in text
+            or "orderqty will be truncated to zero" in text
+        )
+    )
+    return bybit_zero_position
+
+
 def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> bool:
     request_context = _payload_request_context(payload)
     if not _boolish(request_context.get("reduce_only")):
@@ -1296,6 +1332,7 @@ def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> boo
     )
     return (
         code == "-2022"
+        or _payload_is_reduce_only_zero_position_reject(payload)
         or gate_empty_position
         or "reduceonly order is rejected" in reason
         or "reduce only order is rejected" in reason
