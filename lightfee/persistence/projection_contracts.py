@@ -183,6 +183,7 @@ JOURNAL_ONLY_LIFECYCLE_KINDS: frozenset[str] = frozenset({
     "pending_entry.release_maker_terminal_no_open_order",
     "pending_entry.release_retained_maker_open_order",
     "pending_entry.terminalized_after_single_leg_recovery",
+    "entry.abort_maker_terminal_no_open_order",
     "pending_entry.viability_blocked",
     "runtime.entry_blocked_lifecycle",
     "runtime.entry_blocked_lifecycle_selection",

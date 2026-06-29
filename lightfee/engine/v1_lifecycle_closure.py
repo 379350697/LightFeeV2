@@ -1314,6 +1314,7 @@ _EVENT_KIND_PHASES = {
     "execution.passive_cycle_zero_fill": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "execution.passive_phase_switched": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "entry.abort_maker_cancel_requested": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "entry.abort_maker_terminal_no_open_order": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.cleanup_leg_exposure": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.cleanup_leg_exposure_truth_blocked": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value

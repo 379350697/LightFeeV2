@@ -626,6 +626,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "execution.entry_leverage_ready",
         "execution.entry_leverage_unavailable",
         "entry.abort_maker_cancel_requested",
+        "entry.abort_maker_terminal_no_open_order",
         "entry.cleanup_leg_exposure",
         "entry.aborted",
         "entry.opened",
@@ -835,6 +836,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("pending_entry.release_maker_cancel_requested") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("pending_entry.release_retained_maker_open_order") == "PENDING_ENTRY"
     assert map_lifecycle_event_kind("pending_entry.release_maker_terminal_no_open_order") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("entry.abort_maker_terminal_no_open_order") == "PENDING_ENTRY"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():
