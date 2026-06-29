@@ -7544,6 +7544,61 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
     }
 
 
+def test_entry_outcome_summary_separates_normal_close_shadow_from_passive_retries():
+    from scripts.diagnose_live import _build_entry_outcome_summary
+
+    events = [
+        {
+            "kind": "runtime.normal_close_routing_passive",
+            "payload": {
+                "position_id": "entry-lab",
+                "symbol": "LABUSDT",
+                "reason": "first_stage_capture",
+                "exit_shadow_id": "entry-lab:LABUSDT:first_stage_capture:1000",
+            },
+        },
+        *[
+            {
+                "kind": "exit_shadow.strategy_decision",
+                "payload": {
+                    "position_id": "entry-lab",
+                    "symbol": "LABUSDT",
+                    "shadow_id": "entry-lab:LABUSDT:first_stage_capture:1000",
+                    "strategy": f"shadow_{idx}",
+                },
+            }
+            for idx in range(5)
+        ],
+        {
+            "kind": "exit.passive_close_dual_taker_drive",
+            "payload": {"position_id": "entry-lab", "symbol": "LABUSDT"},
+        },
+        {
+            "kind": "exit.accepted_order_truth_gap_retry_blocked",
+            "payload": {"position_id": "entry-lab", "symbol": "LABUSDT"},
+        },
+        {
+            "kind": "exit.passive_close_hedge_ack_live_truth_pending",
+            "payload": {"position_id": "entry-lab", "symbol": "LABUSDT"},
+        },
+    ]
+
+    summary = _build_entry_outcome_summary(events)
+
+    close_recording = summary["close_trigger_recording_summary"]
+    assert close_recording["normal_close_trigger_count"] == 1
+    assert close_recording["exit_shadow_expected_position_count"] == 1
+    assert close_recording["exit_shadow_strategy_decision_count"] == 5
+    assert close_recording["exit_shadow_recorded_position_count"] == 1
+    assert close_recording["exit_shadow_missing_expected_count"] == 0
+    assert close_recording["passive_close_retry_count"] == 3
+    assert close_recording["passive_close_retry_kind_counts"] == {
+        "exit.accepted_order_truth_gap_retry_blocked": 1,
+        "exit.passive_close_dual_taker_drive": 1,
+        "exit.passive_close_hedge_ack_live_truth_pending": 1,
+    }
+
+
 def test_entry_outcome_summary_counts_public_oi_pre_http_filtered_symbols():
     from scripts.diagnose_live import _build_entry_outcome_summary
 

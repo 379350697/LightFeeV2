@@ -3282,7 +3282,7 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_truth_gap" in kinds
         assert "exit.passive_close_live_one_sided_flatten" not in kinds
 
-    def test_one_sided_flatten_resolves_existing_accepted_truth_gap_before_retry(self):
+    def test_one_sided_flatten_handoffs_existing_truth_gap_to_cleanup_when_no_open_orders(self):
         journal = _open_journal()
         state = EngineState()
         position = _make_position(
@@ -3326,14 +3326,19 @@ class TestFallbackResidualReal:
         })
 
         bybit = _mock_adapter_with_tick(Venue.BYBIT)
-        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
-            venue=Venue.BYBIT,
-            symbol="BEATUSDT",
-            side=Side.SELL,
-            quantity=20.0,
-            entry_price=1.0211,
-            observed_at_ms=2_000,
-        ))
+        bybit_live_quantities = iter([20.0, 0.0, 0.0])
+
+        async def fetch_bybit_position(symbol):
+            return PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.SELL,
+                quantity=next(bybit_live_quantities, 0.0),
+                entry_price=1.0211,
+                observed_at_ms=2_000,
+            )
+
+        bybit.fetch_position = AsyncMock(side_effect=fetch_bybit_position)
         bybit.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
         bybit.fetch_open_orders = AsyncMock(return_value=[])
         bybit.place_order = AsyncMock(return_value=_make_order_fill(
@@ -3343,7 +3348,17 @@ class TestFallbackResidualReal:
             quantity=20.0,
             price=1.0211,
         ))
-        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=1.0211,
+            observed_at_ms=2_000,
+        ))
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit, Venue.OKX: okx}, journal)
         executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
 
         result = asyncio.run(
@@ -3364,24 +3379,245 @@ class TestFallbackResidualReal:
             )
         )
 
-        assert result is False
+        assert result is True
         bybit.fetch_order_fill_reconciliation.assert_awaited_once_with(
             "BEATUSDT",
             "ack-close-order",
             "ack-close-cid",
         )
+        bybit.place_order.assert_awaited_once()
+        cleanup_request = bybit.place_order.await_args.args[0]
+        assert cleanup_request.side == Side.BUY
+        assert cleanup_request.quantity == 20.0
+        assert cleanup_request.reduce_only is True
+        assert cleanup_request.time_in_force == TimeInForce.IOC
+        assert all(
+            item.get("kind") != "accepted_order_truth_gap"
+            for item in state.pending_close_reconciliations
+        )
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.accepted_order_truth_gap_cleanup_handoff" in kinds
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
+        resolved = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert resolved
+        assert resolved[-1]["resolution_status"] == "live_flat_after_single_leg_cleanup"
+        assert resolved[-1]["decision"] == "clear_gap_after_cleanup"
+
+    def test_one_sided_flatten_retain_existing_truth_gap_when_open_order_present(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-existing-gap-open-order",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ack-open-order",
+            "client_order_id": "ack-open-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-open-order",
+                "client_order_id": "ack-open-cid",
+            }],
+            "requested_quantity": 20.0,
+            "order_truth_state": "ack_only_accepted",
+            "truth_required_by": "accepted_order_truth_gap",
+        })
+
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            entry_price=1.0211,
+            observed_at_ms=2_000,
+        ))
+        bybit.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        bybit.fetch_open_orders = AsyncMock(return_value=[{
+            "orderId": "ack-open-order",
+            "clientOrderId": "ack-open-cid",
+            "reduceOnly": True,
+        }])
+        bybit.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            price=1.0211,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is False
         bybit.place_order.assert_not_called()
         assert len(state.pending_close_reconciliations) == 1
-        assert state.pending_close_reconciliations[0]["order_truth_state"] == "truth_gap"
+        assert state.pending_close_reconciliations[0]["order_truth_state"] == "open_order_present"
         records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.accepted_order_truth_gap_cleanup_handoff" not in kinds
         blocked = [
             record["payload"]
             for record in records
             if record["kind"] == "exit.accepted_order_truth_gap_retry_blocked"
         ]
-        assert blocked
-        assert blocked[-1]["resolution_status"] == "truth_gap"
+        assert blocked[-1]["resolution_status"] == "open_order_present"
         assert blocked[-1]["decision"] == "retain_pending"
+
+    def test_one_sided_flatten_resolved_existing_truth_gap_does_not_emit_retry_blocked(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-existing-gap-filled",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ack-filled-order",
+            "client_order_id": "ack-filled-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-filled-order",
+                "client_order_id": "ack-filled-cid",
+            }],
+            "requested_quantity": 20.0,
+            "order_truth_state": "ack_only_accepted",
+            "truth_required_by": "accepted_order_truth_gap",
+        })
+
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="BEATUSDT",
+                side=Side.BUY,
+                quantity=20.0,
+                average_price=1.0211,
+                order_id="ack-filled-order",
+                client_order_id="ack-filled-cid",
+                filled_at_ms=2_000,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "queried_endpoints": ["/v5/execution/list"],
+                    "response_classification": "confirmed_fill",
+                },
+            )
+        )
+        bybit.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            price=1.0211,
+        ))
+        executor = PassiveCloseExecutor({Venue.BYBIT: bybit}, journal)
+        executor._clear_if_live_flat = AsyncMock(return_value=False)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is False
+        executor._clear_if_live_flat.assert_awaited_once()
+        bybit.place_order.assert_not_called()
+        assert all(
+            item.get("kind") != "accepted_order_truth_gap"
+            for item in state.pending_close_reconciliations
+        )
+        records = journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "exit.accepted_order_truth_gap_retry_blocked"
+        ] == []
+        resolved = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert resolved[-1]["resolution_status"] == "filled"
+        assert resolved[-1]["decision"] == "apply_fill"
 
     def test_one_sided_flatten_clears_existing_accepted_truth_gap_when_live_flat(self):
         journal = _open_journal()
