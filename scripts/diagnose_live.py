@@ -30,6 +30,7 @@ from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
 from lightfee.core.domain import Venue
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.exchange_truth import (
     normalize_exchange_truth_payload,
     request_venue_operation,
@@ -2245,7 +2246,18 @@ def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
         for nested in nested_payloads:
             value = nested.get(key)
             if value:
-                normalized = str(value).lower()
+                if key in {
+                    "accepted_order_id",
+                    "accepted_client_order_id",
+                    "order_id",
+                    "client_order_id",
+                }:
+                    normalized_value = normalize_order_identity(value)
+                    if not normalized_value:
+                        continue
+                else:
+                    normalized_value = str(value)
+                normalized = normalized_value.lower()
                 values.add(f"{key}:{normalized}")
                 if key in {"accepted_order_id", "order_id"}:
                     values.add(f"order_ref:{normalized}")
@@ -2271,9 +2283,13 @@ def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
 
 
 def _strong_order_identity_values(payload: dict[str, Any]) -> set[str]:
+    return _strong_truth_gap_identity_values(_truth_gap_identity_values(payload))
+
+
+def _strong_truth_gap_identity_values(values: set[str]) -> set[str]:
     return {
         value
-        for value in _truth_gap_identity_values(payload)
+        for value in values
         if not value.startswith(("symbol:", "venue_symbol:"))
     }
 
@@ -2287,6 +2303,16 @@ def _identity_values_with_bare_refs(values: set[str]) -> set[str]:
         if raw:
             normalized.add(raw)
     return normalized
+
+
+def _truth_gap_identity_sets_match(
+    registered_identities: set[str],
+    resolution_identities: set[str],
+) -> bool:
+    return bool(
+        _strong_truth_gap_identity_values(registered_identities)
+        & _strong_truth_gap_identity_values(resolution_identities)
+    )
 
 
 def _exchange_error_dict(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2436,14 +2462,19 @@ def _build_resolved_order_truth_gap_summary(
     if not (_exchange_truth_flat(exchange_truth) and _exchange_truth_no_open_orders(exchange_truth)):
         return {
             "count": 0,
+            "explicit_resolved_count": 0,
+            "legacy_inferred_count": 0,
             "resolved_identities": [],
+            "explicit_resolved_identities": [],
+            "legacy_inferred_identities": [],
             "unresolved_count": 0,
             "unresolved_identities": [],
             "current_exchange_truth_clean": False,
         }
 
     registered: list[set[str]] = []
-    resolved_identity_sets: list[set[str]] = []
+    explicit_resolved_identity_sets: list[set[str]] = []
+    legacy_inferred_identity_sets: list[set[str]] = []
     for rec in events:
         kind = str(rec.get("kind", "") or "")
         payload = rec.get("payload", {})
@@ -2463,29 +2494,58 @@ def _build_resolved_order_truth_gap_summary(
             (kind in _ORDER_TRUTH_GAP_RESOLUTION_KINDS or kind == "order.reconcile_result")
             and _truth_gap_resolution_complete(kind, payload)
         ):
-            resolved_identity_sets.append(identities)
+            if kind == "exit.accepted_order_truth_gap_resolved":
+                explicit_resolved_identity_sets.append(identities)
+            else:
+                legacy_inferred_identity_sets.append(identities)
 
     resolved: set[str] = set()
+    explicit_resolved: set[str] = set()
+    legacy_inferred: set[str] = set()
     unresolved: set[str] = set()
     matched_count = 0
+    explicit_matched_count = 0
+    legacy_matched_count = 0
     for registered_identities in registered:
         matched_resolution = next(
             (
-                identities for identities in resolved_identity_sets
-                if registered_identities & identities
+                identities for identities in explicit_resolved_identity_sets
+                if _truth_gap_identity_sets_match(registered_identities, identities)
             ),
             None,
         )
+        matched_kind = "explicit"
+        if matched_resolution is None:
+            matched_resolution = next(
+                (
+                    identities for identities in legacy_inferred_identity_sets
+                    if _truth_gap_identity_sets_match(registered_identities, identities)
+                ),
+                None,
+            )
+            matched_kind = "legacy"
         if matched_resolution is None:
             unresolved.update(registered_identities)
             continue
         matched_count += 1
         resolved.update(registered_identities)
         resolved.update(matched_resolution)
+        if matched_kind == "explicit":
+            explicit_matched_count += 1
+            explicit_resolved.update(registered_identities)
+            explicit_resolved.update(matched_resolution)
+        else:
+            legacy_matched_count += 1
+            legacy_inferred.update(registered_identities)
+            legacy_inferred.update(matched_resolution)
 
     return {
         "count": matched_count,
+        "explicit_resolved_count": explicit_matched_count,
+        "legacy_inferred_count": legacy_matched_count,
         "resolved_identities": sorted(resolved),
+        "explicit_resolved_identities": sorted(explicit_resolved),
+        "legacy_inferred_identities": sorted(legacy_inferred),
         "unresolved_count": len(unresolved),
         "unresolved_identities": sorted(unresolved),
         "current_exchange_truth_clean": True,

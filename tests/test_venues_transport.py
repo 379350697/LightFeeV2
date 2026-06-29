@@ -8109,6 +8109,53 @@ class TestBitgetParseOrderStatusRedLight:
 
         assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
 
+    @pytest.mark.asyncio
+    async def test_bitget_order_status_null_order_id_queries_by_client_oid_only(self):
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        seen_params: list[dict[str, str]] = []
+
+        async def handler(request):
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": {
+                        "orderId": "",
+                        "clientOid": "lfex364",
+                        "baseVolume": "0",
+                        "priceAvg": "0",
+                        "side": "sell",
+                        "status": "live",
+                    },
+                },
+            )
+
+        transport = VenueTransport(
+            bitget_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport._time_offset_ms = 0
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+
+        result = await transport.fetch_order_status(
+            "ESPORTSUSDT",
+            order_id="None",
+            client_order_id="lfex364",
+        )
+
+        assert result is None
+        assert seen_params
+        assert seen_params[-1]["clientOid"] == "lfex364"
+        assert "orderId" not in seen_params[-1]
+
 class TestVenueSpecificOrderReconciliationEvidence:
     """CL-001-G: venue query paths must expose endpoint-level evidence."""
 

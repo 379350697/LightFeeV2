@@ -37,6 +37,7 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.marketdata.private_ws import (
     CumulativeOrderProgress,
     PrivateOrderUpdate,
@@ -4914,6 +4915,9 @@ class VenueTransport(MarketDataClient):
         if self.mode != "live":
             return None
 
+        order_id = normalize_order_identity(order_id)
+        client_order_id = normalize_order_identity(client_order_id)
+
         try:
             if spec.venue_id == Venue.BYBIT:
                 return await self._fetch_order_status_bybit(
@@ -4931,6 +4935,14 @@ class VenueTransport(MarketDataClient):
                 )
 
             elif spec.venue_id == Venue.BITGET:
+                if not order_id and not client_order_id:
+                    self._record_order_reconcile_query(
+                        symbol=venue_sym,
+                        queried_endpoints=["fetch_order_status"],
+                        response_classification="missing_order_identifier",
+                        uncertain_subtype="execution_not_found",
+                    )
+                    return None
                 query_params: dict[str, Any] = {}
                 if order_id:
                     query_params["orderId"] = order_id

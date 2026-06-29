@@ -39,6 +39,7 @@ from lightfee.core.domain import (
     TimeInForce,
     Venue,
 )
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.bybit_duplicate_reconcile import (
     build_order_reconcile_result_payload,
     reconcile_bybit_duplicate_client_order,
@@ -699,12 +700,16 @@ class PassiveCloseExecutor:
             "flattened_venue": hedge_venue.value,
             "flattened_quantity": result.requested,
         }
-        if result.accepted_order_id:
-            extra["accepted_order_id"] = result.accepted_order_id
-            extra["accepted_order_ids"] = [result.accepted_order_id]
-        if result.accepted_client_order_id:
-            extra["accepted_client_order_id"] = result.accepted_client_order_id
-            extra["accepted_client_order_ids"] = [result.accepted_client_order_id]
+        accepted_order_id = normalize_order_identity(result.accepted_order_id)
+        accepted_client_order_id = normalize_order_identity(
+            result.accepted_client_order_id
+        )
+        if accepted_order_id:
+            extra["accepted_order_id"] = accepted_order_id
+            extra["accepted_order_ids"] = [accepted_order_id]
+        if accepted_client_order_id:
+            extra["accepted_client_order_id"] = accepted_client_order_id
+            extra["accepted_client_order_ids"] = [accepted_client_order_id]
         return extra
 
     def _active_hedge_truth_gap_reconciliation(
@@ -750,13 +755,13 @@ class PassiveCloseExecutor:
         payload = reconciliation.get("original_payload")
         if not isinstance(payload, dict):
             payload = {}
-        order_id = str(
+        order_id = normalize_order_identity(
             payload.get("accepted_order_id")
             or reconciliation.get("accepted_order_id")
             or reconciliation.get("order_id")
             or ""
         )
-        client_order_id = str(
+        client_order_id = normalize_order_identity(
             payload.get("accepted_client_order_id")
             or reconciliation.get("accepted_client_order_id")
             or reconciliation.get("client_order_id")
@@ -772,8 +777,10 @@ class PassiveCloseExecutor:
                 continue
             if str(record.get("venue") or "") != hedge_venue.value:
                 continue
-            order_id = order_id or str(record.get("order_id") or "")
-            client_order_id = client_order_id or str(record.get("client_order_id") or "")
+            order_id = order_id or normalize_order_identity(record.get("order_id"))
+            client_order_id = client_order_id or normalize_order_identity(
+                record.get("client_order_id")
+            )
         return order_id, client_order_id
 
     async def _refresh_passive_close_final_hedge_truth_before_terminal(
@@ -1332,6 +1339,18 @@ class PassiveCloseExecutor:
             source=f"{source}_live_flat",
             extra=extra,
         ):
+            self._resolve_active_hedge_truth_gap_after_live_flat(
+                state,
+                pending,
+                position,
+                result,
+                source=source,
+                exchange_truth=(
+                    dict(extra.get("exchange_truth"))
+                    if isinstance(extra.get("exchange_truth"), dict)
+                    else None
+                ),
+            )
             return True
 
         pending.next_retry_at_ms = self._now_ms() + 1_000
@@ -1351,6 +1370,57 @@ class PassiveCloseExecutor:
             },
         )
         return False
+
+    def _resolve_active_hedge_truth_gap_after_live_flat(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        result: HedgeDeltaResult,
+        *,
+        source: str,
+        exchange_truth: dict[str, Any] | None,
+    ) -> None:
+        if pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG:
+            hedge_venue = position.short_venue
+            hedge_leg = "short"
+        else:
+            hedge_venue = position.long_venue
+            hedge_leg = "long"
+        active_truth_gap = self._active_hedge_truth_gap_reconciliation(
+            state,
+            pending,
+            hedge_venue=hedge_venue,
+            hedge_leg=hedge_leg,
+        )
+        if active_truth_gap is None:
+            return
+        order_id, client_order_id = self._accepted_order_truth_gap_identity(
+            active_truth_gap,
+            hedge_venue=hedge_venue,
+            hedge_leg=hedge_leg,
+        )
+        order_id = order_id or normalize_order_identity(result.accepted_order_id)
+        client_order_id = client_order_id or normalize_order_identity(
+            result.accepted_client_order_id
+        )
+        state.remove_pending_close_reconciliation(active_truth_gap)
+        payload: dict[str, Any] = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "venue": hedge_venue.value,
+            "leg": hedge_leg,
+            "accepted_order_id": order_id,
+            "accepted_client_order_id": client_order_id,
+            "resolution_status": "live_flat",
+            "decision": "clear_gap",
+            "source": source,
+            "requested": float(result.requested or 0.0),
+            "residual": float(result.residual or 0.0),
+        }
+        if isinstance(exchange_truth, dict):
+            payload["exchange_truth"] = dict(exchange_truth)
+        self._journal.append("exit.accepted_order_truth_gap_resolved", payload)
 
     def _enter_passive_close_execution_fail_closed(
         self,
@@ -5007,6 +5077,15 @@ class PassiveCloseExecutor:
             )
             return False
 
+        exchange_truth = self._live_flat_exchange_truth(
+            position,
+            long_snap=long_snap,
+            short_snap=short_snap,
+            long_open_orders_evidence=long_open_orders_evidence,
+            short_open_orders_evidence=short_open_orders_evidence,
+        )
+        if extra is not None:
+            extra.setdefault("exchange_truth", dict(exchange_truth))
         self._clear_live_flat_state(
             state,
             pending,
@@ -5015,13 +5094,7 @@ class PassiveCloseExecutor:
             actual_long_size=actual_long_size,
             actual_short_size=actual_short_size,
             extra=extra,
-            exchange_truth=self._live_flat_exchange_truth(
-                position,
-                long_snap=long_snap,
-                short_snap=short_snap,
-                long_open_orders_evidence=long_open_orders_evidence,
-                short_open_orders_evidence=short_open_orders_evidence,
-            ),
+            exchange_truth=exchange_truth,
         )
         return True
 
@@ -5196,6 +5269,8 @@ class PassiveCloseExecutor:
     ) -> dict[str, Any]:
         return {
             "truth_available": True,
+            "positions_flat": True,
+            "open_orders_flat": True,
             "positions": [
                 self._position_truth_record(long_snap, position.long_venue, position.symbol),
                 self._position_truth_record(short_snap, position.short_venue, position.symbol),
@@ -5461,8 +5536,8 @@ class PassiveCloseExecutor:
     ) -> None:
         if self._runtime_mode != "live":
             return
-        accepted_order_id = str(payload.get("accepted_order_id") or "")
-        accepted_client_order_id = str(
+        accepted_order_id = normalize_order_identity(payload.get("accepted_order_id"))
+        accepted_client_order_id = normalize_order_identity(
             payload.get("accepted_client_order_id")
             or getattr(request, "client_order_id", "")
             or ""

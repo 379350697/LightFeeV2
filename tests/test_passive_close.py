@@ -5103,6 +5103,109 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_hedge_deadline_fail_closed" not in kinds
         assert "exit.compensated" not in kinds
 
+    def test_ack_only_terminal_hedge_live_flat_emits_explicit_truth_gap_resolution(self):
+        """Live-flat cleanup must close the accepted-order truth-gap lifecycle explicitly."""
+        journal = _open_journal()
+
+        maker = _mock_adapter_passive_ok(Venue.OKX)
+        maker.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="KATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        maker.fetch_open_orders = AsyncMock(return_value=[])
+        hedge = _mock_adapter_with_tick(Venue.BYBIT)
+        hedge.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="KATUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3001,
+        ))
+        hedge.fetch_open_orders = AsyncMock(return_value=[])
+
+        executor = PassiveCloseExecutor({Venue.OKX: maker, Venue.BYBIT: hedge}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-katusdt-ack-flat-explicit",
+            symbol="KATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=7000.0,
+            short_quantity=7000.0,
+            matched_quantity=7000.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=7000.0,
+            chunk_quantities=[7000.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(quantity=7000.0, average_price=0.00679),
+            hedge_fill=PendingPassiveLegFill(quantity=0.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ack-oid",
+            "client_order_id": "ack-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-oid",
+                "client_order_id": "ack-cid",
+            }],
+            "requested_quantity": 7000.0,
+            "order_truth_state": "ack_only_accepted",
+            "truth_required_by": "accepted_order_truth_gap",
+        })
+
+        result = asyncio.run(
+            executor._handle_hedge_truth_gap_result(
+                state,
+                pending,
+                position,
+                HedgeDeltaResult(
+                    requested=7000.0,
+                    filled=0.0,
+                    residual=7000.0,
+                    success=False,
+                    truth_gap=True,
+                    accepted_order_id="ack-oid",
+                    accepted_client_order_id="ack-cid",
+                ),
+                source="ack_pending_reconcile",
+            )
+        )
+
+        assert result is True
+        assert state.pending_close_reconciliations == []
+        resolved = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert resolved
+        assert resolved[-1]["position_id"] == position.position_id
+        assert resolved[-1]["accepted_order_id"] == "ack-oid"
+        assert resolved[-1]["accepted_client_order_id"] == "ack-cid"
+        assert resolved[-1]["resolution_status"] == "live_flat"
+        assert resolved[-1]["decision"] == "clear_gap"
+        assert resolved[-1]["exchange_truth"]["positions_flat"] is True
+        assert resolved[-1]["exchange_truth"]["open_orders_flat"] is True
+
     def test_aster_zero_fill_ack_registers_truth_gap_without_resubmit(self):
         """Aster accepted 0-fill close ACK is order-truth work, not a zero-fill retry."""
         journal = _open_journal()

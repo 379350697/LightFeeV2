@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.order_truth_ledger import (
     ORDER_TRUTH_LEDGER,
     OrderTruthFillStatus,
@@ -73,6 +74,8 @@ async def resolve_accepted_order_truth(
     baseline_quantity: float = 0.0,
     live_excess_mode: str = "absolute",
 ) -> AcceptedOrderTruthResolution:
+    accepted_order_id = normalize_order_identity(accepted_order_id)
+    accepted_client_order_id = normalize_order_identity(accepted_client_order_id)
     payload: dict[str, Any] = {
         "accepted_order_id": accepted_order_id,
         "accepted_client_order_id": accepted_client_order_id,

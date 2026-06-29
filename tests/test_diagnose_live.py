@@ -3939,6 +3939,79 @@ def test_acceptance_gate_resolved_order_truth_gap_is_green_when_fail_closed_but_
     assert gate["gate_passed"] is True
 
 
+def test_acceptance_gate_splits_explicit_and_legacy_order_truth_gap_resolution():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "entry-explicit",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "accepted_order_id": "oid-explicit",
+                    "accepted_client_order_id": "cid-explicit",
+                },
+            },
+            {
+                "kind": "exit.accepted_order_truth_gap_resolved",
+                "payload": {
+                    "position_id": "entry-explicit",
+                    "symbol": "LABUSDT",
+                    "venue": "aster",
+                    "accepted_order_id": "oid-explicit",
+                    "accepted_client_order_id": "cid-explicit",
+                    "resolution_status": "live_flat",
+                    "decision": "clear_gap",
+                },
+            },
+            {
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "entry-legacy",
+                    "symbol": "LABUSDT",
+                    "venue": "bybit",
+                    "accepted_order_id": "oid-legacy",
+                    "accepted_client_order_id": "cid-legacy",
+                },
+            },
+            {
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-legacy",
+                    "symbol": "LABUSDT",
+                    "terminal_state": "flat",
+                },
+            },
+        ],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    summary = gate["resolved_order_truth_gap_summary"]
+    assert summary["count"] == 2
+    assert summary["explicit_resolved_count"] == 1
+    assert summary["legacy_inferred_count"] == 1
+    assert summary["unresolved_count"] == 0
+    assert "accepted_order_id:oid-explicit" in summary["explicit_resolved_identities"]
+    assert "accepted_order_id:oid-legacy" in summary["legacy_inferred_identities"]
+
+
 def test_acceptance_gate_reports_pending_entry_order_truth_gap_from_current_state():
     from scripts.diagnose_live import _build_production_acceptance_gate
 
