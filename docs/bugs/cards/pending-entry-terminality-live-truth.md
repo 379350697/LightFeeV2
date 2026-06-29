@@ -94,6 +94,14 @@ evidence must map to the matrix before runtime code changes.
 - Local state is flat/no-pending, exchange truth has a non-reduce-only open
   maker order with no current owner, and V1 closure reports
   `orphan_maker_order`.
+- Pending entry has terminal maker progress/order truth but `maker_leg_filled`
+  is below the broader entry `target_quantity`, for example Aster maker
+  `filled=171` while entry target is `171.563...`; this is terminal maker proof
+  plus missing hedge/dust/cleanup work, not a reason to repeatedly cancel the
+  terminal maker order.
+- Aster maker cancel returns HTTP `400` / order not found / non-active after
+  positive fill. Treat it as a follow-up open-order/progress truth signal and
+  preserve status/body/code/msg evidence in the journal.
 
 ## Current Effective Rule
 
@@ -191,6 +199,16 @@ proves one of: confirmed fill, no fill/no open order/no live hedge exposure, an
 open order still present, or truth unavailable. Abort/cleanup may remove the
 pending entry only after that current exchange truth proves the accepted hedge
 order did not fill, has no open order, and left no abnormal live exposure.
+
+Terminal maker proof is order-scoped, not entry-target-scoped. If the passive
+maker order itself is `FILLED`, `CANCELED`, `REJECTED`, or `EXPIRED` and fresh
+open-order truth is absent, abort and single-leg release paths must not issue a
+blind cancel just because the passive maker order target is smaller than the
+overall pending-entry target. Positive-fill asymmetry must then flow through the
+shared missing-hedge, terminal hedge-dust, or reduce-only cleanup/retain
+decision. Cancel rejects from Aster/compatible venues are not terminal failure
+by themselves; they trigger follow-up progress/open-order proof and must keep
+the exchange body/code/msg as evidence.
 
 Terminal cleanup/recovery events close their owner for current closure indexing.
 Once `pending_entry.owned_live_conflict_cleanup_succeeded` or

@@ -4501,11 +4501,7 @@ async def test_positive_fill_owned_live_single_leg_retains_pending_when_maker_or
     assert finalized is False
     assert pending.pending_id in runtime.state.pending_entries
     assert pending.pending_id not in runtime.state.open_positions
-    assert bitget.cancel_calls == [{
-        "symbol": "ESPORTSUSDT",
-        "order_id": "1453886799619977220",
-        "client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
-    }]
+    assert bitget.cancel_calls == []
     events = tmp_journal.read_all()
     kinds = [event["kind"] for event in events]
     assert "pending_entry.terminalized_after_single_leg_recovery" not in kinds
@@ -4522,7 +4518,7 @@ async def test_positive_fill_owned_live_single_leg_retains_pending_when_maker_or
 
 
 @pytest.mark.asyncio
-async def test_positive_fill_owned_live_single_leg_cancels_maker_before_release_and_requires_absent_open_order_truth(
+async def test_positive_fill_owned_live_single_leg_requires_terminal_maker_truth_before_release(
     config, tmp_journal,
 ):
     _mark_live(config)
@@ -4601,11 +4597,7 @@ async def test_positive_fill_owned_live_single_leg_cancels_maker_before_release_
     assert finalized is True
     assert pending.pending_id not in runtime.state.pending_entries
     assert pending.pending_id not in runtime.state.open_positions
-    assert bitget.cancel_calls == [{
-        "symbol": "ESPORTSUSDT",
-        "order_id": "1453886799619977220",
-        "client_order_id": "3a113653919f22fadcf3e382ded6e41e0b0a",
-    }]
+    assert bitget.cancel_calls == []
     assert bitget.progress_calls == [{
         "symbol": "ESPORTSUSDT",
         "order_id": "1453886799619977220",
@@ -4614,7 +4606,7 @@ async def test_positive_fill_owned_live_single_leg_cancels_maker_before_release_
     }]
     events = tmp_journal.read_all()
     kinds = [event["kind"] for event in events]
-    assert "pending_entry.release_maker_cancel_requested" in kinds
+    assert "pending_entry.release_maker_cancel_requested" not in kinds
     assert "pending_entry.release_maker_terminal_no_open_order" in kinds
     assert "pending_entry.terminalized_after_single_leg_recovery" in kinds
 

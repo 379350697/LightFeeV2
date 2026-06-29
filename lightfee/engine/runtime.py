@@ -7785,6 +7785,73 @@ class LiveRuntime:
                     )
                     return True
 
+            if (
+                pending.has_any_fill()
+                and pending.missing_hedge_quantity() > 1e-9
+                and not pending.repair_state
+                and getattr(pending, "hedge_inflight", None) is None
+            ):
+                if await self._maybe_finalize_pending_entry_terminal_hedge_dust(
+                    pending,
+                    entry_id,
+                    now_ms,
+                    source=final_reason,
+                ):
+                    await self._complete_pending_entry_terminal_removal(
+                        entry_id,
+                        reason="terminal_budget_hedge_dust_finalize",
+                        symbol=pending.symbol,
+                        now_ms=now_ms,
+                    )
+                    self.journal.append(
+                        "recovery.pending_entry_finalized",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "reason": "terminal_budget_hedge_dust_finalize",
+                        },
+                    )
+                    return True
+
+                hedge_driven = await self._drive_missing_hedge_live(
+                    pending,
+                    entry_id,
+                    now_ms,
+                )
+                if entry_id not in self.state.pending_entries:
+                    return True
+                if hedge_driven:
+                    if (
+                        pending.missing_hedge_quantity() <= 1e-9
+                        and pending.maker_completed()
+                    ):
+                        if await self._finalize_pending_entry(pending, entry_id, now_ms):
+                            await self._complete_pending_entry_terminal_removal(
+                                entry_id,
+                                reason="terminal_budget_missing_hedge_filled",
+                                symbol=pending.symbol,
+                                now_ms=now_ms,
+                            )
+                            self.journal.append(
+                                "recovery.pending_entry_finalized",
+                                {
+                                    "entry_id": entry_id,
+                                    "symbol": pending.symbol,
+                                    "reason": "terminal_budget_missing_hedge_filled",
+                                },
+                            )
+                        else:
+                            self._apply_reconcile_backoff(pending, now_ms)
+                    else:
+                        self._apply_reconcile_backoff(pending, now_ms)
+                    return True
+                if (
+                    getattr(pending, "hedge_inflight", None) is not None
+                    or int(getattr(pending, "next_progress_poll_ms", 0) or 0) > now_ms
+                ):
+                    self._apply_reconcile_backoff(pending, now_ms)
+                    return True
+
             # P6: if there are actual fills (not repair-state), give
             # exactly one terminal truth checkpoint before abort. Hard ceiling
             # must not drift into a multi-minute pending retention loop.

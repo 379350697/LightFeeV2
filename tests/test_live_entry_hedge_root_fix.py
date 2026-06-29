@@ -35,6 +35,7 @@ from lightfee.engine.state import (
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.hyperliquid import HyperliquidAdapter
 from lightfee.venues.symbol_rules import SymbolRule
+from lightfee.venues.transport import TransportError, TransportErrorCategory
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2038,6 +2039,34 @@ class _CountingVenueAdapter(_FakeVenueAdapter):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         self.normalize_quantity_calls.append((symbol, quantity))
         return await super().normalize_quantity(symbol, quantity)
+
+
+class _CancelRejectThenTerminalVenueAdapter(_FakeVenueAdapter):
+    async def cancel_passive_order(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+    ) -> None:
+        self._cancel_passive_order_calls.append((symbol, order_id, client_order_id))
+        raise TransportError(
+            TransportErrorCategory.REQUEST_REJECTED,
+            "aster_v3 DELETE /fapi/v3/order rejected status=400",
+            status_code=400,
+            body='{"code":-2011,"msg":"Order does not exist"}',
+        )
+
+    async def query_passive_order_progress(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: str | None = None,
+        side = None,
+    ) -> PassiveOrderProgress | None:
+        self._query_passive_progress_calls.append((symbol, order_id, client_order_id))
+        if not self._cancel_passive_order_calls:
+            return None
+        return self.passive_progress
 
 
 def _make_test_config(tmp_path, **strategy_overrides):
@@ -5256,11 +5285,9 @@ class TestRealPathAbortCleanupDeadline:
         assert pending.pending_id in runtime.state.pending_entries
         assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
         assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
-        assert maker._cancel_passive_order_calls == [
-            ("USTCUSDT", "", "maker-client-only")
-        ]
+        assert maker._cancel_passive_order_calls == []
         assert pending.passive_order is not None
-        assert pending.passive_order.cancel_requested_at_ms > 0
+        assert pending.passive_order.cancel_requested_at_ms == 0
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "entry.abort_retained_maker_open_order" in kinds
 
@@ -5335,6 +5362,225 @@ class TestRealPathAbortCleanupDeadline:
         assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
         kinds = [event["kind"] for event in runtime.journal.read_all()]
         assert "entry.abort_maker_positive_fill_truth_retained" in kinds
+        assert "entry.aborted" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_abort_pending_entry_terminal_maker_under_full_target_does_not_cancel(self, tmp_path):
+        """SKYAI shape: passive maker terminal proof outranks entry target rounding."""
+        from lightfee.risk.modes import GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        maker = _FakeVenueAdapter(Venue.ASTER)
+        hedge = _FakeVenueAdapter(Venue.GATE)
+        maker.position = PositionSnapshot(
+            venue=Venue.ASTER,
+            symbol="SKYAIUSDT",
+            side=Side.BUY,
+            quantity=171.0,
+            entry_price=0.1396,
+            observed_at_ms=1_000_000,
+        )
+        hedge.position = PositionSnapshot(
+            venue=Venue.GATE,
+            symbol="SKYAIUSDT",
+            side=Side.SELL,
+            quantity=160.0,
+            entry_price=0.1396,
+            observed_at_ms=1_000_000,
+        )
+        runtime._venue_adapters[Venue.ASTER] = maker
+        runtime._venue_adapters[Venue.GATE] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-skyai-terminal-maker",
+            symbol="SKYAIUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.GATE,
+            target_quantity=171.56337122024448,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000_000,
+            maker_leg="long",
+            maker_order_id="436274816",
+            maker_client_order_id="02018-skyai-maker",
+            hedge_order_id="235876031733295306",
+            hedge_client_order_id="9d-skyai-hedge",
+            maker_leg_filled=171.0,
+            hedge_leg_filled=160.0,
+            maker_fill_price=0.1396,
+            hedge_fill_price=0.1396,
+            uncertain_outcome=True,
+            passive_order=PendingPassiveOrder(
+                order_id="436274816",
+                client_order_id="02018-skyai-maker",
+                target_quantity=171.0,
+                last_progress_state=PassiveOrderState.FILLED,
+                fill_checkpoint_quantity=171.0,
+                fill_checkpoint_notional_quote=23.8716,
+                fill_checkpoint_last_fill_at_ms=1_000_100,
+            ),
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=11.0,
+                    notional_quote=1.5356,
+                    fill_at_ms=1_000_100,
+                )
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        removed = await runtime._abort_pending_entry(
+            pending,
+            pending.pending_id,
+            "pending_entry_max_lifetime_exhausted",
+        )
+
+        assert removed is False
+        assert pending.pending_id in runtime.state.pending_entries
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert maker._cancel_passive_order_calls == []
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "entry.abort_maker_terminal_no_open_order" in kinds
+        assert "entry.abort_maker_cancel_failed" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_abort_pending_entry_cancel_400_followup_terminal_progress(self, tmp_path):
+        """Aster 400 cancel on an already terminal order is a truth-check signal."""
+        runtime = _make_open_runtime(tmp_path)
+        maker = _CancelRejectThenTerminalVenueAdapter(Venue.ASTER)
+        hedge = _FakeVenueAdapter(Venue.GATE)
+        maker.passive_progress = PassiveOrderProgress(
+            venue=Venue.ASTER,
+            symbol="SKYAIUSDT",
+            side=Side.BUY,
+            order_id="436274816",
+            client_order_id="02018-skyai-maker",
+            cumulative_quantity=171.0,
+            average_price=0.1396,
+            state=PassiveOrderState.FILLED,
+        )
+        runtime._venue_adapters[Venue.ASTER] = maker
+        runtime._venue_adapters[Venue.GATE] = hedge
+
+        pending = PendingEntry(
+            pending_id="entry-skyai-cancel-400-terminal",
+            symbol="SKYAIUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.GATE,
+            target_quantity=171.56337122024448,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000_000,
+            maker_leg="long",
+            maker_order_id="436274816",
+            maker_client_order_id="02018-skyai-maker",
+            maker_leg_filled=171.0,
+            hedge_leg_filled=160.0,
+            maker_fill_price=0.1396,
+            hedge_fill_price=0.1396,
+            passive_order=PendingPassiveOrder(
+                order_id="436274816",
+                client_order_id="02018-skyai-maker",
+                target_quantity=171.0,
+                last_progress_state=PassiveOrderState.OPEN,
+                fill_checkpoint_quantity=171.0,
+            ),
+        )
+
+        ok = await runtime._ensure_pending_entry_maker_not_open_before_abort(
+            pending,
+            pending.pending_id,
+            "pending_entry_max_lifetime_exhausted",
+        )
+
+        assert ok is True
+        assert maker._cancel_passive_order_calls == [
+            ("SKYAIUSDT", "436274816", "02018-skyai-maker")
+        ]
+        assert maker._query_passive_progress_calls == [
+            ("SKYAIUSDT", "436274816", "02018-skyai-maker"),
+            ("SKYAIUSDT", "436274816", "02018-skyai-maker"),
+        ]
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "entry.abort_maker_cancel_failed" in kinds
+        assert "entry.abort_maker_terminal_no_open_order" in kinds
+        cancel_failed = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"] == "entry.abort_maker_cancel_failed"
+        ][-1]
+        assert cancel_failed["error_status_code"] == 400
+        assert cancel_failed["error_body"] == '{"code":-2011,"msg":"Order does not exist"}'
+        assert cancel_failed["exchange_code"] == "-2011"
+        assert cancel_failed["exchange_msg"] == "Order does not exist"
+
+    @pytest.mark.asyncio
+    async def test_hard_ceiling_terminal_maker_drives_missing_hedge_before_abort(self, tmp_path):
+        """Positive-fill pending entry must close hedge delta before terminal abort."""
+        runtime = _make_open_runtime(
+            tmp_path,
+            pending_entry_hard_ceiling_ms=120_000,
+            passive_small_fill_buffer_notional_quote=0.0,
+        )
+        maker = _FakeVenueAdapter(Venue.ASTER)
+        hedge = _CountingVenueAdapter(Venue.GATE)
+        hedge.place_order_fill = OrderFill(
+            venue=Venue.GATE,
+            symbol="SKYAIUSDT",
+            side=Side.SELL,
+            quantity=11.0,
+            price=0.1396,
+            order_id="gate-hedge-11",
+        )
+        runtime._venue_adapters[Venue.ASTER] = maker
+        runtime._venue_adapters[Venue.GATE] = hedge
+
+        now_ms = 1_000_000
+        pending = PendingEntry(
+            pending_id="entry-skyai-hard-ceiling-hedge",
+            symbol="SKYAIUSDT",
+            long_venue=Venue.ASTER,
+            short_venue=Venue.GATE,
+            target_quantity=171.56337122024448,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=now_ms - 130_000,
+            maker_leg="long",
+            maker_order_id="436274816",
+            maker_client_order_id="02018-skyai-maker",
+            maker_leg_filled=171.0,
+            hedge_leg_filled=160.0,
+            maker_fill_price=0.1396,
+            hedge_fill_price=0.1396,
+            passive_order=PendingPassiveOrder(
+                order_id="436274816",
+                client_order_id="02018-skyai-maker",
+                target_quantity=171.0,
+                last_progress_state=PassiveOrderState.FILLED,
+                fill_checkpoint_quantity=171.0,
+            ),
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=11.0,
+                    notional_quote=1.5356,
+                    fill_at_ms=now_ms - 1_000,
+                )
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
+            pending,
+            pending.pending_id,
+            now_ms,
+        )
+
+        assert handled is True
+        assert hedge._place_order_calls
+        assert hedge._place_order_calls[0].quantity == pytest.approx(11.0)
+        assert pending.missing_hedge_quantity() == pytest.approx(0.0)
+        kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.hedge_submit_attempt" in kinds
         assert "entry.aborted" not in kinds
 
     @pytest.mark.asyncio

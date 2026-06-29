@@ -7,10 +7,12 @@ pending-entry removal authority, and recovery-core refresh timing stable.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
+from lightfee.engine.pending_entry_lifecycle import apply_pending_entry_passive_progress
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryLiveTruth,
     PendingEntryTerminalDecision,
@@ -797,6 +799,417 @@ class PendingEntryRuntime:
         ]
         return matches, "open_order_truth"
 
+    def _pending_entry_maker_terminal_base_evidence(
+        self,
+        pending,
+        entry_id: str,
+        *,
+        maker_venue: Venue,
+        order_id: str,
+        client_order_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        passive_order = getattr(pending, "passive_order", None)
+        passive_state = getattr(passive_order, "last_progress_state", None)
+        passive_state_value = getattr(passive_state, "value", str(passive_state or ""))
+        passive_checkpoint = (
+            float(getattr(passive_order, "fill_checkpoint_quantity", 0.0) or 0.0)
+            if passive_order is not None
+            else 0.0
+        )
+        return {
+            "entry_id": entry_id,
+            "symbol": pending.symbol,
+            "venue": maker_venue.value,
+            "maker_venue": maker_venue.value,
+            "maker_order_id": order_id,
+            "maker_client_order_id": client_order_id,
+            "maker_leg_filled": float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
+            "target_quantity": float(getattr(pending, "target_quantity", 0.0) or 0.0),
+            "progress_state": passive_state_value,
+            "cumulative_quantity": passive_checkpoint,
+            "passive_fill_checkpoint_quantity": passive_checkpoint,
+            "passive_fill_checkpoint_last_fill_at_ms": (
+                int(getattr(passive_order, "fill_checkpoint_last_fill_at_ms", 0) or 0)
+                if passive_order is not None
+                else 0
+            ),
+            "source": reason,
+            "reason": reason,
+        }
+
+    def _pending_entry_terminal_event_names(self, scope: str) -> dict[str, str]:
+        if scope == "release":
+            return {
+                "truth_unavailable": "pending_entry.release_maker_order_truth_unavailable",
+                "open_truth_unavailable": "pending_entry.release_maker_open_order_truth_unavailable",
+                "open_order": "pending_entry.release_retained_maker_open_order",
+                "cancel_requested": "pending_entry.release_maker_cancel_requested",
+                "cancel_failed": "pending_entry.release_maker_cancel_failed",
+                "positive_fill": "pending_entry.release_maker_positive_fill_truth_retained",
+                "terminal": "pending_entry.release_maker_terminal_no_open_order",
+            }
+        return {
+            "truth_unavailable": "entry.abort_maker_order_truth_unavailable",
+            "open_truth_unavailable": "entry.abort_maker_order_truth_unavailable",
+            "open_order": "entry.abort_retained_maker_open_order",
+            "cancel_requested": "entry.abort_maker_cancel_requested",
+            "cancel_failed": "entry.abort_maker_cancel_failed",
+            "positive_fill": "entry.abort_maker_positive_fill_truth_retained",
+            "terminal": "entry.abort_maker_terminal_no_open_order",
+        }
+
+    @staticmethod
+    def _pending_entry_exception_evidence(exc: Exception) -> dict[str, Any]:
+        body = str(getattr(exc, "body", "") or "")
+        payload: dict[str, Any] = {"error": str(exc) or exc.__class__.__name__}
+        status_code = int(getattr(exc, "status_code", 0) or 0)
+        if status_code:
+            payload["error_status_code"] = status_code
+        if body:
+            payload["error_body"] = body
+            try:
+                parsed = json.loads(body)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                if parsed.get("code") is not None:
+                    payload["exchange_code"] = str(parsed.get("code"))
+                if parsed.get("msg") is not None:
+                    payload["exchange_msg"] = str(parsed.get("msg"))
+        return payload
+
+    async def _ensure_pending_entry_maker_terminal_proof(
+        self,
+        pending: Any,
+        entry_id: str,
+        *,
+        reason: str,
+        now_ms: int,
+        scope: str,
+    ) -> tuple[bool, dict[str, Any]]:
+        maker_venue = pending.maker_venue()
+        adapter = self.ctx.get_venue_adapter(maker_venue)
+        order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(pending)
+        base_evidence = self._pending_entry_maker_terminal_base_evidence(
+            pending,
+            entry_id,
+            maker_venue=maker_venue,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            reason=reason,
+        )
+        events = self._pending_entry_terminal_event_names(scope)
+
+        def state_value(progress: Any) -> str:
+            state = getattr(progress, "state", None) if progress is not None else None
+            return getattr(state, "value", str(state or ""))
+
+        def is_terminal_progress(progress: Any) -> bool:
+            state = getattr(progress, "state", None) if progress is not None else None
+            return bool(state is not None and hasattr(state, "is_terminal") and state.is_terminal())
+
+        def terminal(extra: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+            payload = {
+                **base_evidence,
+                "result": "maker_terminal_before_pending_release"
+                if scope == "release"
+                else "maker_terminal_before_pending_abort",
+                "open_order_truth": "absent",
+                "has_live_open_order": False,
+                **extra,
+            }
+            self.ctx.journal.append(events["terminal"], payload)
+            return True, payload
+
+        def retain(event_key: str, extra: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+            payload = {
+                **base_evidence,
+                "result": "maker_order_not_terminal_before_pending_release"
+                if scope == "release"
+                else "maker_order_not_terminal_before_pending_abort",
+                **extra,
+            }
+            self.ctx.journal.append(events[event_key], payload)
+            return False, payload
+
+        if adapter is None:
+            return retain("truth_unavailable", {"error": "maker_adapter_unavailable"})
+
+        matches, open_order_error = await self.ctx._pending_entry_maker_open_order_matches(
+            pending,
+            adapter,
+            maker_venue,
+        )
+        if matches is None:
+            return retain(
+                "open_truth_unavailable",
+                {
+                    "error": open_order_error or "open_order_truth_unavailable",
+                    "has_live_open_order": False,
+                },
+            )
+        if matches:
+            return retain(
+                "open_order",
+                {
+                    "open_order_count": len(matches),
+                    "open_order_truth": "present",
+                    "has_live_open_order": True,
+                },
+            )
+
+        maker_completed = bool(getattr(pending, "maker_completed", lambda: False)())
+        if maker_completed:
+            return terminal({"reason": "maker_completed_and_open_order_absent"})
+
+        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
+        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
+
+        async def query_progress() -> tuple[Any, dict[str, Any]]:
+            try:
+                progress = await adapter.query_passive_order_progress(
+                    symbol=pending.symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id or None,
+                    side=pending.maker_side(),
+                )
+                return progress, {}
+            except Exception as exc:
+                return None, self._pending_entry_exception_evidence(exc)
+
+        progress, progress_error = await query_progress()
+        cumulative_quantity = (
+            float(getattr(progress, "cumulative_quantity", 0.0) or 0.0)
+            if progress is not None
+            else 0.0
+        )
+        if cumulative_quantity > maker_filled + 1e-9:
+            apply_pending_entry_passive_progress(pending, progress)
+            return retain(
+                "positive_fill",
+                {
+                    "open_order_truth": "absent",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(progress),
+                    "cumulative_quantity": cumulative_quantity,
+                    "local_maker_quantity": maker_filled,
+                    "target_quantity": target_quantity,
+                    "decision": "retain_pending_for_recovery_truth",
+                },
+            )
+        if is_terminal_progress(progress):
+            return terminal(
+                {
+                    "reason": "maker_progress_terminal_and_open_order_absent",
+                    "progress_state": state_value(progress),
+                    "cumulative_quantity": cumulative_quantity,
+                }
+            )
+
+        cancel_requested = self.ctx._pending_entry_maker_cancel_requested(pending)
+        if cancel_requested:
+            if scope == "abort" and not progress_error:
+                return terminal(
+                    {
+                        "reason": "maker_cancel_requested_and_open_order_absent",
+                        "progress_state": state_value(progress),
+                        "cumulative_quantity": cumulative_quantity,
+                    }
+                )
+            return retain(
+                "truth_unavailable",
+                {
+                    **(
+                        progress_error
+                        or {"error": "maker_cancel_requested_without_terminal_progress"}
+                    ),
+                    "open_order_truth": "absent",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(progress),
+                    "cumulative_quantity": cumulative_quantity,
+                },
+            )
+
+        try:
+            await adapter.cancel_passive_order(
+                symbol=pending.symbol,
+                order_id=order_id,
+                client_order_id=client_order_id or None,
+            )
+            self.ctx._mark_pending_entry_maker_cancel_requested(pending, now_ms)
+            self.ctx.journal.append(
+                events["cancel_requested"],
+                {
+                    **base_evidence,
+                    "reason": "cancel_before_pending_release"
+                    if scope == "release"
+                    else reason,
+                    "result": "maker_cancel_requested_before_pending_release"
+                    if scope == "release"
+                    else "maker_cancel_requested_before_pending_abort",
+                    "open_order_truth": "absent",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(progress),
+                    "cumulative_quantity": cumulative_quantity,
+                    **{
+                        f"pre_cancel_{key}": value
+                        for key, value in progress_error.items()
+                    },
+                },
+            )
+        except Exception as exc:
+            cancel_error = self._pending_entry_exception_evidence(exc)
+            self.ctx.journal.append(
+                events["cancel_failed"],
+                {
+                    **base_evidence,
+                    "result": "maker_cancel_failed_before_pending_release"
+                    if scope == "release"
+                    else "maker_cancel_failed_before_pending_abort",
+                    **cancel_error,
+                    "open_order_truth": "absent",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(progress),
+                    "cumulative_quantity": cumulative_quantity,
+                    **{
+                        f"pre_cancel_{key}": value
+                        for key, value in progress_error.items()
+                    },
+                },
+            )
+            follow_matches, follow_open_error = await self.ctx._pending_entry_maker_open_order_matches(
+                pending,
+                adapter,
+                maker_venue,
+            )
+            if follow_matches:
+                return retain(
+                    "open_order",
+                    {
+                        "open_order_count": len(follow_matches),
+                        "open_order_truth": "present",
+                        "has_live_open_order": True,
+                        "cancel_error": cancel_error,
+                    },
+                )
+            follow_progress, follow_progress_error = await query_progress()
+            follow_cumulative = (
+                float(getattr(follow_progress, "cumulative_quantity", 0.0) or 0.0)
+                if follow_progress is not None
+                else 0.0
+            )
+            if follow_cumulative > maker_filled + 1e-9:
+                apply_pending_entry_passive_progress(pending, follow_progress)
+                return retain(
+                    "positive_fill",
+                    {
+                        "open_order_truth": "absent" if follow_matches is not None else "unknown",
+                        "has_live_open_order": False,
+                        "progress_state": state_value(follow_progress),
+                        "cumulative_quantity": follow_cumulative,
+                        "local_maker_quantity": maker_filled,
+                        "target_quantity": target_quantity,
+                        "decision": "retain_pending_for_recovery_truth",
+                        **{f"cancel_{key}": value for key, value in cancel_error.items()},
+                    },
+                )
+            if follow_matches is not None and is_terminal_progress(follow_progress):
+                return terminal(
+                    {
+                        "reason": "maker_cancel_failed_but_followup_terminal",
+                        "progress_state": state_value(follow_progress),
+                        "cumulative_quantity": follow_cumulative,
+                        **{f"cancel_{key}": value for key, value in cancel_error.items()},
+                    }
+                )
+            fallback_error = (
+                follow_progress_error
+                or ({"error": follow_open_error} if follow_open_error else {})
+                or cancel_error
+                or {"error": "maker_cancel_failed_without_terminal_followup"}
+            )
+            return retain(
+                "truth_unavailable",
+                {
+                    **fallback_error,
+                    "open_order_truth": "absent" if follow_matches is not None else "unknown",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(follow_progress),
+                    "cumulative_quantity": follow_cumulative,
+                    **{f"cancel_{key}": value for key, value in cancel_error.items()},
+                },
+            )
+
+        follow_matches, follow_open_error = await self.ctx._pending_entry_maker_open_order_matches(
+            pending,
+            adapter,
+            maker_venue,
+        )
+        if follow_matches is None:
+            return retain(
+                "open_truth_unavailable",
+                {
+                    "error": follow_open_error or "open_order_truth_unavailable_after_cancel",
+                    "open_order_truth": "unknown",
+                    "has_live_open_order": False,
+                },
+            )
+        if follow_matches:
+            return retain(
+                "open_order",
+                {
+                    "open_order_count": len(follow_matches),
+                    "open_order_truth": "present",
+                    "has_live_open_order": True,
+                },
+            )
+        follow_progress, follow_progress_error = await query_progress()
+        follow_cumulative = (
+            float(getattr(follow_progress, "cumulative_quantity", 0.0) or 0.0)
+            if follow_progress is not None
+            else 0.0
+        )
+        if follow_cumulative > maker_filled + 1e-9:
+            apply_pending_entry_passive_progress(pending, follow_progress)
+            return retain(
+                "positive_fill",
+                {
+                    "open_order_truth": "absent",
+                    "has_live_open_order": False,
+                    "progress_state": state_value(follow_progress),
+                    "cumulative_quantity": follow_cumulative,
+                    "local_maker_quantity": maker_filled,
+                    "target_quantity": target_quantity,
+                    "decision": "retain_pending_for_recovery_truth",
+                },
+            )
+        if is_terminal_progress(follow_progress) or scope == "abort":
+            return terminal(
+                {
+                    "reason": "maker_cancel_terminal_and_open_order_absent",
+                    "progress_state": state_value(follow_progress),
+                    "cumulative_quantity": follow_cumulative,
+                    **{
+                        f"progress_{key}": value
+                        for key, value in follow_progress_error.items()
+                    },
+                }
+            )
+        return retain(
+            "truth_unavailable",
+            {
+                **(
+                    follow_progress_error
+                    or {"error": "maker_cancel_without_terminal_progress"}
+                ),
+                "open_order_truth": "absent",
+                "has_live_open_order": False,
+                "progress_state": state_value(follow_progress),
+                "cumulative_quantity": follow_cumulative,
+            },
+        )
+
     async def _ensure_pending_entry_maker_not_open_before_abort(
         self,
         pending,
@@ -805,116 +1218,14 @@ class PendingEntryRuntime:
     ) -> bool:
         if not self.ctx._pending_entry_has_maker_order_reference(pending):
             return True
-        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
-        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
-        if pending.maker_completed() and maker_filled >= target_quantity - 1e-9:
-            return True
-
-        maker_venue = pending.maker_venue()
-        adapter = self.ctx.get_venue_adapter(maker_venue)
-        order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(pending)
-        evidence = {
-            "entry_id": entry_id,
-            "symbol": pending.symbol,
-            "maker_venue": maker_venue.value,
-            "maker_order_id": order_id,
-            "maker_client_order_id": client_order_id,
-            "reason": reason,
-        }
-
-        if adapter is None:
-            self.ctx.journal.append(
-                "entry.abort_maker_order_truth_unavailable",
-                {**evidence, "error": "maker_adapter_unavailable"},
-            )
-            return False
-
-        if not self.ctx._pending_entry_maker_cancel_requested(pending):
-            try:
-                await adapter.cancel_passive_order(
-                    symbol=pending.symbol,
-                    order_id=order_id,
-                    client_order_id=client_order_id or None,
-                )
-                self.ctx._mark_pending_entry_maker_cancel_requested(
-                    pending,
-                    wall_clock_now_ms(),
-                )
-                self.ctx.journal.append(
-                    "entry.abort_maker_cancel_requested",
-                    evidence,
-                )
-            except Exception as exc:
-                self.ctx.journal.append(
-                    "entry.abort_maker_cancel_failed",
-                    {**evidence, "error": str(exc)},
-                )
-                return False
-
-        matches, open_order_error = await self.ctx._pending_entry_maker_open_order_matches(
+        ok, _payload = await self._ensure_pending_entry_maker_terminal_proof(
             pending,
-            adapter,
-            maker_venue,
+            entry_id,
+            reason=reason,
+            now_ms=wall_clock_now_ms(),
+            scope="abort",
         )
-        if matches:
-            self.ctx.journal.append(
-                "entry.abort_retained_maker_open_order",
-                {
-                    **evidence,
-                    "open_order_count": len(matches),
-                    "open_order_truth": "present",
-                },
-            )
-            return False
-
-        try:
-            progress = await adapter.query_passive_order_progress(
-                symbol=pending.symbol,
-                order_id=order_id,
-                client_order_id=client_order_id or None,
-                side=pending.maker_side(),
-            )
-        except Exception as exc:
-            if matches is not None:
-                return True
-            self.ctx.journal.append(
-                "entry.abort_maker_order_truth_unavailable",
-                {**evidence, "error": str(exc), "open_order_error": open_order_error},
-            )
-            return False
-
-        state = getattr(progress, "state", None) if progress is not None else None
-        cumulative_quantity = float(
-            getattr(progress, "cumulative_quantity", 0.0) or 0.0
-        ) if progress is not None else 0.0
-        if cumulative_quantity > maker_filled + 1e-9:
-            self.ctx.journal.append(
-                "entry.abort_maker_positive_fill_truth_retained",
-                {
-                    **evidence,
-                    "open_order_error": open_order_error,
-                    "progress_state": getattr(state, "value", str(state or "")),
-                    "cumulative_quantity": cumulative_quantity,
-                    "local_maker_quantity": maker_filled,
-                    "target_quantity": target_quantity,
-                    "decision": "retain_pending_for_recovery_truth",
-                },
-            )
-            return False
-        if matches is not None:
-            return True
-        if state is not None and hasattr(state, "is_terminal") and state.is_terminal():
-            return True
-        self.ctx.journal.append(
-            "entry.abort_maker_order_truth_unavailable",
-            {
-                **evidence,
-                "open_order_error": open_order_error,
-                "progress_state": getattr(state, "value", str(state or "")),
-                "cumulative_quantity": cumulative_quantity,
-            },
-        )
-        return False
+        return ok
 
     def _pending_entry_flat_clear_has_terminal_maker_evidence(self, pending, result) -> bool:
         if not self.ctx._pending_entry_has_maker_order_reference(pending):
@@ -2207,205 +2518,24 @@ class PendingEntryRuntime:
             )
             return False, evidence
 
-        maker_venue = pending.maker_venue()
-        adapter = self.ctx.get_venue_adapter(maker_venue)
-        order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(
-            pending
-        )
-        maker_filled = float(getattr(pending, "maker_leg_filled", 0.0) or 0.0)
-        target_quantity = float(getattr(pending, "target_quantity", 0.0) or 0.0)
-        passive_order = getattr(pending, "passive_order", None)
-        passive_progress_state = getattr(
-            getattr(passive_order, "last_progress_state", None),
-            "value",
-            str(getattr(passive_order, "last_progress_state", "") or ""),
-        )
-        base_evidence = {
-            "entry_id": entry_id,
-            "symbol": pending.symbol,
-            "venue": maker_venue.value,
-            "maker_venue": maker_venue.value,
-            "maker_order_id": order_id,
-            "maker_client_order_id": client_order_id,
-            "maker_leg_filled": maker_filled,
-            "target_quantity": target_quantity,
-            "progress_state": passive_progress_state,
-            "cumulative_quantity": float(
-                getattr(passive_order, "fill_checkpoint_quantity", 0.0) or 0.0
-            ) if passive_order is not None else 0.0,
-            "passive_fill_checkpoint_quantity": float(
-                getattr(passive_order, "fill_checkpoint_quantity", 0.0) or 0.0
-            ) if passive_order is not None else 0.0,
-            "passive_fill_checkpoint_last_fill_at_ms": int(
-                getattr(passive_order, "fill_checkpoint_last_fill_at_ms", 0) or 0
-            ) if passive_order is not None else 0,
-            "source": reason,
-        }
-
-        def retain(extra: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-            pending.uncertain_outcome = True
-            pending.reconcile_next_attempt_ms = max(
-                int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
-                now_ms + 10_000,
-            )
-            payload = {
-                **base_evidence,
-                "result": "maker_order_not_terminal_before_pending_release",
-                "reason": "maker_order_not_terminal_before_pending_release",
-                **extra,
-            }
-            return False, payload
-
-        if adapter is None:
-            ok, payload = retain({"error": "maker_adapter_unavailable"})
-            self.ctx.journal.append(
-                "pending_entry.release_maker_order_truth_unavailable",
-                payload,
-            )
-            return ok, payload
-
-        maker_completed = bool(
-            getattr(pending, "maker_completed", lambda: False)()
-        )
-        needs_cancel = (
-            not maker_completed
-            and maker_filled < target_quantity - 1e-9
-            and not self.ctx._pending_entry_maker_cancel_requested(pending)
-        )
-        if needs_cancel:
-            try:
-                await adapter.cancel_passive_order(
-                    symbol=pending.symbol,
-                    order_id=order_id,
-                    client_order_id=client_order_id or None,
-                )
-                self.ctx._mark_pending_entry_maker_cancel_requested(
-                    pending,
-                    now_ms,
-                )
-                self.ctx.journal.append(
-                    "pending_entry.release_maker_cancel_requested",
-                    {
-                        **base_evidence,
-                        "reason": "cancel_before_pending_release",
-                        "result": "maker_cancel_requested_before_pending_release",
-                    },
-                )
-            except Exception as exc:
-                ok, payload = retain({"error": str(exc) or exc.__class__.__name__})
-                self.ctx.journal.append(
-                    "pending_entry.release_maker_cancel_failed",
-                    payload,
-                )
-                return ok, payload
-
-        matches, open_order_error = await self.ctx._pending_entry_maker_open_order_matches(
+        ok, payload = await self._ensure_pending_entry_maker_terminal_proof(
             pending,
-            adapter,
-            maker_venue,
+            entry_id,
+            reason=reason,
+            now_ms=now_ms,
+            scope="release",
         )
-        if matches is None:
-            ok, payload = retain({
-                "error": open_order_error or "open_order_truth_unavailable",
-                "has_live_open_order": False,
-            })
-            self.ctx.journal.append(
-                "pending_entry.release_maker_open_order_truth_unavailable",
-                payload,
-            )
-            return ok, payload
-        if matches:
-            ok, payload = retain({
-                "open_order_count": len(matches),
-                "open_order_truth": "present",
-                "has_live_open_order": True,
-            })
-            self.ctx.journal.append(
-                "pending_entry.release_retained_maker_open_order",
-                payload,
-            )
-            return ok, payload
-
-        if maker_completed and not needs_cancel:
-            payload = {
-                **base_evidence,
-                "reason": "maker_completed_and_open_order_absent",
-                "result": "maker_terminal_before_pending_release",
-                "has_live_open_order": False,
-                "open_order_truth": "absent",
-            }
-            self.ctx.journal.append(
-                "pending_entry.release_maker_terminal_no_open_order",
-                payload,
-            )
+        if ok:
             return True, payload
 
-        try:
-            progress = await adapter.query_passive_order_progress(
-                symbol=pending.symbol,
-                order_id=order_id,
-                client_order_id=client_order_id or None,
-                side=pending.maker_side(),
-            )
-        except Exception as exc:
-            ok, payload = retain({
-                "error": str(exc) or exc.__class__.__name__,
-                "open_order_truth": "absent",
-                "has_live_open_order": False,
-            })
-            self.ctx.journal.append(
-                "pending_entry.release_maker_order_truth_unavailable",
-                payload,
-            )
-            return ok, payload
-
-        state = getattr(progress, "state", None) if progress is not None else None
-        cumulative_quantity = (
-            float(getattr(progress, "cumulative_quantity", 0.0) or 0.0)
-            if progress is not None
-            else 0.0
+        pending.uncertain_outcome = True
+        pending.reconcile_next_attempt_ms = max(
+            int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
+            now_ms + 10_000,
         )
-        state_value = getattr(state, "value", str(state or ""))
-        if cumulative_quantity > maker_filled + 1e-9:
-            ok, payload = retain({
-                "open_order_truth": "absent",
-                "has_live_open_order": False,
-                "progress_state": state_value,
-                "cumulative_quantity": cumulative_quantity,
-                "local_maker_quantity": maker_filled,
-            })
-            self.ctx.journal.append(
-                "pending_entry.release_maker_positive_fill_truth_retained",
-                payload,
-            )
-            return ok, payload
-        if state is not None and hasattr(state, "is_terminal") and state.is_terminal():
-            payload = {
-                **base_evidence,
-                "reason": "maker_cancel_terminal_and_open_order_absent",
-                "result": "maker_terminal_before_pending_release",
-                "open_order_truth": "absent",
-                "has_live_open_order": False,
-                "progress_state": state_value,
-                "cumulative_quantity": cumulative_quantity,
-            }
-            self.ctx.journal.append(
-                "pending_entry.release_maker_terminal_no_open_order",
-                payload,
-            )
-            return True, payload
-
-        ok, payload = retain({
-            "open_order_truth": "absent",
-            "has_live_open_order": False,
-            "progress_state": state_value,
-            "cumulative_quantity": cumulative_quantity,
-        })
-        self.ctx.journal.append(
-            "pending_entry.release_maker_order_truth_unavailable",
-            payload,
-        )
-        return ok, payload
+        if "reason" not in payload:
+            payload["reason"] = "maker_order_not_terminal_before_pending_release"
+        return False, payload
 
     async def _cleanup_owned_single_leg_live_truth_conflict(
         self,
