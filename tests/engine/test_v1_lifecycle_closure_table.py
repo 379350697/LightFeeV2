@@ -704,6 +704,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.position_drift_flatten_leg",
         "runtime.passive_close_recovery_result",
         "exit.accepted_order_truth_gap_registered",
+        "exit.accepted_order_truth_gap_resolved",
         "exit.pending_close_reconciliation_registered",
         "exit.reconciled",
         "runtime.position_drift_corrected",

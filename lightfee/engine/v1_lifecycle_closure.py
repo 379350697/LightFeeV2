@@ -1212,6 +1212,7 @@ _EVENT_KIND_PHASES = {
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
     ),
     "exit.accepted_order_truth_gap_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.accepted_order_truth_gap_resolved": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.pending_close_reconciliation_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.reconciliation_abandoned": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.retry_wait": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

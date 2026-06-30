@@ -1801,10 +1801,13 @@ def _active_owner_managed_scope(local_state: dict[str, Any]) -> dict[str, set[st
         )
         if position_id.startswith("live-recovered:"):
             continue
-        if "matched_quantity" in row:
-            qty = _safe_abs_quantity(row.get("matched_quantity"))
-        else:
-            qty = _safe_abs_quantity(row.get("quantity"))
+        matched_qty = (
+            _safe_abs_quantity(row.get("matched_quantity"))
+            if "matched_quantity" in row
+            else 0.0
+        )
+        quantity = _safe_abs_quantity(row.get("quantity"))
+        qty = matched_qty if matched_qty > 1e-9 else quantity
         if qty <= 1e-9:
             continue
         if position_id:
@@ -1934,6 +1937,42 @@ def _overhedge_corrections_scoped_to_active_owner(
         ):
             return False
     return saw_correction
+
+
+def _position_event_key(payload: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(
+            payload.get("position_id")
+            or payload.get("entry_id")
+            or payload.get("internal_entry_id")
+            or ""
+        ),
+        str(payload.get("symbol") or "").upper(),
+    )
+
+
+def _terminal_overhedge_corrections_closed(events: list[dict[str, Any]]) -> bool:
+    drift_keys: set[tuple[str, str]] = set()
+    terminal_keys: set[tuple[str, str]] = set()
+    flat_keys: set[tuple[str, str]] = set()
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        payload = _payload_dict(rec)
+        key = _position_event_key(payload)
+        if not key[0] and not key[1]:
+            continue
+        if kind == "runtime.position_drift_corrected":
+            drift_keys.add(key)
+        elif kind in {
+            "runtime.position_lifecycle_terminal",
+            "exit.passive_close_resolved",
+            "exit.passive_close_fallback_terminal_flat",
+            "exit.passive_close_recovery_probe_flat",
+        }:
+            terminal_keys.add(key)
+        elif kind == "recovery.flat":
+            flat_keys.add(key)
+    return bool(drift_keys) and drift_keys.issubset(terminal_keys & flat_keys)
 
 
 def _local_expected_legs(local_state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -7837,6 +7876,12 @@ def _build_production_acceptance_gate(
     )
     if active_overhedge_correction_resolved:
         fingerprints.append("active_owner_overhedge_corrected")
+    terminal_overhedge_corrections_closed = (
+        active_positions_with_capacity
+        and _terminal_overhedge_corrections_closed(events)
+    )
+    if terminal_overhedge_corrections_closed:
+        fingerprints.append("terminal_overhedge_corrections_closed")
 
     blocking_reasons: list[str] = []
     if open_position_count > max_concurrent_positions:
@@ -7857,6 +7902,7 @@ def _build_production_acceptance_gate(
         entry_overhedge_drift_corrected_count
         and not current_terminal_truth_clean
         and not active_overhedge_correction_resolved
+        and not terminal_overhedge_corrections_closed
     ):
         blocking_reasons.append("entry_overhedge_drift_corrected_present")
     if not exchange_truth.get("available"):

@@ -2418,6 +2418,158 @@ def test_acceptance_gate_accepts_owner_managed_overhedge_correction_scope():
     assert gate["gate_passed"] is True
 
 
+def test_acceptance_gate_accepts_owner_managed_scope_when_matched_quantity_zero_but_quantity_balanced():
+    from scripts import diagnose_live as dl
+
+    position_id = "entry-lab-current-owner"
+    events = [
+        {
+            "ts_ms": 1782780733492,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 3.0,
+            },
+        },
+        {
+            "ts_ms": 1782780734500,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+                "correction_scope": "pending_entry_owner_managed",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "long_venue": "aster",
+                "short_venue": "okx",
+                "quantity": 3.0,
+                "matched_quantity": 0.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "aster": {"LABUSDT": {"quantity": 3.0, "side": "buy"}},
+            "okx": {"LABUSDT": {"quantity": -3.0, "side": "sell"}},
+        },
+        "open_orders": {"aster": {"LABUSDT": []}, "okx": {"LABUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert "active_positions_with_capacity" in gate["fingerprints"]
+    assert "active_owner_overhedge_corrected" in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" not in gate["blocking_reasons"]
+    assert gate["gate_passed"] is True
+
+
+def test_acceptance_gate_ignores_terminal_flat_historical_drift_during_new_active_owner():
+    from scripts import diagnose_live as dl
+
+    stale_position_id = "entry-lab-terminal-owner"
+    current_position_id = "entry-lab-current-owner"
+    events = [
+        {
+            "ts_ms": 1782773599000,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LABUSDT",
+            },
+        },
+        {
+            "ts_ms": 1782773601000,
+            "kind": "runtime.position_drift_corrected",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LABUSDT",
+                "reason": "duplicated_hedge_progress_repaired",
+            },
+        },
+        {
+            "ts_ms": 1782773670000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LABUSDT",
+                "source": "passive_close_final_exchange_flat",
+            },
+        },
+        {
+            "ts_ms": 1782773670100,
+            "kind": "recovery.flat",
+            "payload": {
+                "position_id": stale_position_id,
+                "symbol": "LABUSDT",
+                "source": "passive_close_final_exchange_flat",
+            },
+        },
+        {
+            "ts_ms": 1782780733492,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": current_position_id,
+                "symbol": "LABUSDT",
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": current_position_id,
+                "symbol": "LABUSDT",
+                "long_venue": "aster",
+                "short_venue": "okx",
+                "quantity": 3.0,
+                "matched_quantity": 3.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "aster": {"LABUSDT": {"quantity": 3.0, "side": "buy"}},
+            "okx": {"LABUSDT": {"quantity": -3.0, "side": "sell"}},
+        },
+        "open_orders": {"aster": {"LABUSDT": []}, "okx": {"LABUSDT": []}},
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["entry_overhedge_drift_corrected_count"] == 1
+    assert "active_positions_with_capacity" in gate["fingerprints"]
+    assert "terminal_overhedge_corrections_closed" in gate["fingerprints"]
+    assert "entry_overhedge_drift_corrected_present" not in gate["blocking_reasons"]
+    assert gate["gate_passed"] is True
+
+
 def test_acceptance_gate_keeps_live_recovered_overhedge_as_blocker():
     from scripts import diagnose_live as dl
 
