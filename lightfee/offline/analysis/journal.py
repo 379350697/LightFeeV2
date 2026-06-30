@@ -81,10 +81,15 @@ class JournalAnalysisReport:
     fail_closed_reason_counts: dict[str, int] = field(default_factory=dict)
 
     # Paper outcome tracking (V1: paper_outcome event kinds)
+    paper_outcome_registered_count: int = 0
     paper_outcome_markout_count: int = 0
     paper_outcome_closed_count: int = 0
     paper_outcome_joined_count: int = 0
     paper_outcome_by_label: dict[str, int] = field(default_factory=dict)
+    paper_outcome_net_quote_total: float = 0.0
+    paper_outcome_fee_quote_total: float = 0.0
+    paper_outcome_slippage_quote_total: float = 0.0
+    paper_outcome_funding_quote_total: float = 0.0
 
     # Quick-flat observability
     quick_flat_count: int = 0
@@ -124,6 +129,7 @@ _LOCAL_L2_SEQUENCE_GAP = "runtime.local_l2_sequence_gap"
 _LOCAL_L2_SYNC_FAILED = "runtime.local_l2_sync_failed"
 
 _PAPER_OUTCOME_KINDS = frozenset({
+    "opportunity.paper_registered",
     "opportunity.paper_markout",
     "opportunity.paper_closed",
     "opportunity.real_vs_paper_joined",
@@ -222,6 +228,35 @@ def _float_payload(payload: dict, key: str) -> float:
         return float(payload.get(key, 0.0) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _record_paper_outcome(report: JournalAnalysisReport, kind: str, payload: dict) -> None:
+    if kind == "opportunity.paper_registered":
+        report.paper_outcome_registered_count += 1
+        return
+
+    label = payload.get("opportunity_label", "unknown")
+    report.paper_outcome_by_label[label] = (
+        report.paper_outcome_by_label.get(label, 0) + 1
+    )
+    if kind == "opportunity.paper_markout":
+        report.paper_outcome_markout_count += 1
+    elif kind == "opportunity.paper_closed":
+        report.paper_outcome_closed_count += 1
+    elif kind == "opportunity.real_vs_paper_joined":
+        report.paper_outcome_joined_count += 1
+
+    if kind in {"opportunity.paper_markout", "opportunity.paper_closed"}:
+        report.paper_outcome_net_quote_total += _float_payload(payload, "paper_net_quote")
+        report.paper_outcome_fee_quote_total += _float_payload(payload, "paper_fee_quote")
+        report.paper_outcome_slippage_quote_total += _float_payload(
+            payload,
+            "paper_slippage_quote",
+        )
+        report.paper_outcome_funding_quote_total += _float_payload(
+            payload,
+            "paper_funding_quote",
+        )
 
 
 def _record_exit_shadow_summary(report: JournalAnalysisReport, payload: dict) -> None:
@@ -717,26 +752,8 @@ def analyze_journal_records(
                 report.fail_closed_reason_counts.get(reason, 0) + 1
             )
 
-        elif kind == "opportunity.paper_markout":
-            report.paper_outcome_markout_count += 1
-            label = payload.get("opportunity_label", "unknown")
-            report.paper_outcome_by_label[label] = (
-                report.paper_outcome_by_label.get(label, 0) + 1
-            )
-
-        elif kind == "opportunity.paper_closed":
-            report.paper_outcome_closed_count += 1
-            label = payload.get("opportunity_label", "unknown")
-            report.paper_outcome_by_label[label] = (
-                report.paper_outcome_by_label.get(label, 0) + 1
-            )
-
-        elif kind == "opportunity.real_vs_paper_joined":
-            report.paper_outcome_joined_count += 1
-            label = payload.get("opportunity_label", "unknown")
-            report.paper_outcome_by_label[label] = (
-                report.paper_outcome_by_label.get(label, 0) + 1
-            )
+        elif kind in _PAPER_OUTCOME_KINDS:
+            _record_paper_outcome(report, kind, payload)
 
         elif kind == "exit_shadow.strategy_decision":
             report.exit_shadow_decision_count += 1
@@ -897,23 +914,13 @@ def analyze_from_store(conn: sqlite3.Connection) -> JournalAnalysisReport:
             except (TypeError, ValueError):
                 payload = {}
             _record_exit_shadow_summary(report, payload)
-        elif kind in ("opportunity.paper_markout", "opportunity.paper_closed",
-                      "opportunity.real_vs_paper_joined"):
+        elif kind in _PAPER_OUTCOME_KINDS:
             import json as _json
             try:
-                pl = _json.loads(row["payload_json"]) if row["payload_json"] else {}
+                pl = _json.loads(r["payload_json"]) if r["payload_json"] else {}
             except Exception:
                 pl = {}
-            label = pl.get("opportunity_label", "unknown")
-            report.paper_outcome_by_label[label] = (
-                report.paper_outcome_by_label.get(label, 0) + 1
-            )
-            if kind == "opportunity.paper_markout":
-                report.paper_outcome_markout_count += 1
-            elif kind == "opportunity.paper_closed":
-                report.paper_outcome_closed_count += 1
-            elif kind == "opportunity.real_vs_paper_joined":
-                report.paper_outcome_joined_count += 1
+            _record_paper_outcome(report, kind, pl)
 
     # Total records = sum of all projected facts (approximate but sufficient for reporting)
     total = 0

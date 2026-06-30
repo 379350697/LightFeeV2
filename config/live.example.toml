@@ -80,6 +80,12 @@ spread_liquidity_large_quote = 500.0
 spread_liquidity_small_penalty_bps = 60.0
 spread_liquidity_medium_penalty_bps = 30.0
 spread_liquidity_sublarge_penalty_bps = 10.0
+spread_paper_enabled = false
+spread_paper_finalist_limit = 10
+spread_paper_markout_secs = [60, 300, 900, 1800]
+spread_paper_terminal_secs = 1800
+spread_paper_slippage_buffer_bps = 0.0
+spread_paper_default_funding_interval_ms = 28800000
 risk_monitor_enabled = false
 execution_liquidity_enabled = true
 max_entry_slippage_bps = 25.0
@@ -90,6 +96,7 @@ entry_ws_bbo_per_venue_budget = 10
 
 [persistence]
 event_log_path = "runtime/events.jsonl"
+spread_paper_event_log_path = "runtime/spread-paper-events.jsonl"
 snapshot_path = "runtime/state.json"
 tuning_diagnostics_enabled = true
 tuning_diagnostics_max_records = 10000

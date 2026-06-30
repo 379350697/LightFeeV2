@@ -174,6 +174,14 @@ class StrategyConfig:
     spread_liquidity_small_penalty_bps: float = 60.0
     spread_liquidity_medium_penalty_bps: float = 30.0
     spread_liquidity_sublarge_penalty_bps: float = 10.0
+    spread_paper_enabled: bool = False
+    spread_paper_finalist_limit: int = 10
+    spread_paper_markout_secs: list[int] = field(
+        default_factory=lambda: [60, 300, 900, 1800]
+    )
+    spread_paper_terminal_secs: int = 1800
+    spread_paper_slippage_buffer_bps: float = 0.0
+    spread_paper_default_funding_interval_ms: int = 28_800_000
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     exit_shadow_enabled: bool = False
@@ -368,6 +376,7 @@ class StrategyConfig:
 @dataclass
 class PersistenceConfig:
     event_log_path: str = "runtime/events.jsonl"
+    spread_paper_event_log_path: str = "runtime/spread-paper-events.jsonl"
     snapshot_path: str = "runtime/state.json"
     tuning_diagnostics_enabled: bool = True
     tuning_diagnostics_max_records: int = 10000

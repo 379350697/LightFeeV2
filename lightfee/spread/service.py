@@ -10,7 +10,9 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
+from lightfee.persistence.journal import Journal
 from lightfee.spread.models import SpreadSnapshot
+from lightfee.spread.paper import SpreadPaperConfig, SpreadPaperTracker
 from lightfee.spread.publisher import publish_spread_snapshot
 from lightfee.spread.reversion import (
     SpreadReversionConfig,
@@ -43,6 +45,18 @@ class SpreadSidecarService:
         self.signal_config = SpreadReversionConfig.from_app_config(config)
         self.stats = SpreadStatsTracker()
         self._exchange_sources: dict[str, object] = {}
+        self._paper_journal: Journal | None = None
+        self._paper_tracker = SpreadPaperTracker(self._paper_config(config))
+        if self._paper_tracker.enabled:
+            persistence = config.persistence
+            self._paper_journal = Journal(
+                persistence.spread_paper_event_log_path,
+                max_bytes=persistence.event_log_compaction_max_bytes,
+                archive_count=persistence.event_log_archive_count,
+                retention_hours=persistence.event_log_retention_hours,
+            )
+            self._paper_journal.open()
+            self._paper_tracker.restore_from_records(self._paper_journal.read_all())
 
         if self.source_mode != "direct_market" or not self.direct_fetch_enabled:
             return
@@ -65,6 +79,9 @@ class SpreadSidecarService:
             )
 
     async def close(self) -> None:
+        if self._paper_journal is not None:
+            self._paper_journal.close()
+            self._paper_journal = None
         for source in self._exchange_sources.values():
             close = getattr(source, "close", None)
             if close is not None:
@@ -91,7 +108,33 @@ class SpreadSidecarService:
             candidates=candidates,
         )
         publish_spread_snapshot(snapshot, self.snapshot_path)
+        self._refresh_paper(candidates, quotes, observed_ms)
         return snapshot
+
+    def _refresh_paper(
+        self,
+        candidates: list,
+        quotes: dict[str, QuoteSnapshot],
+        observed_ms: int,
+    ) -> None:
+        if self._paper_journal is None or not self._paper_tracker.enabled:
+            return
+        for rank, candidate in enumerate(candidates):
+            if rank >= self._paper_tracker.config.finalist_limit:
+                break
+            registered_event = self._paper_tracker.register(candidate, quotes, finalist_rank=rank)
+            if registered_event is not None:
+                self._paper_journal.append(
+                    str(registered_event["kind"]),
+                    dict(registered_event["payload"]),
+                    ts_ms=observed_ms,
+                )
+        for event in self._paper_tracker.evaluate_due(observed_ms, quotes):
+            self._paper_journal.append(
+                str(event["kind"]),
+                dict(event["payload"]),
+                ts_ms=observed_ms,
+            )
 
     async def _fetch_quotes(
         self,
@@ -128,6 +171,31 @@ class SpreadSidecarService:
             if str(venue)
         }
         return quotes, degraded_venues, "sidecar_snapshot"
+
+    def _paper_config(self, config: AppConfig) -> SpreadPaperConfig:
+        strategy = config.strategy
+        slippage_bps = float(
+            getattr(strategy, "spread_paper_slippage_buffer_bps", 0.0) or 0.0
+        )
+        if slippage_bps <= 0.0:
+            slippage_bps = float(getattr(strategy, "spread_slippage_reserve_bps", 0.0) or 0.0)
+        return SpreadPaperConfig(
+            enabled=bool(getattr(strategy, "spread_paper_enabled", False)),
+            finalist_limit=int(getattr(strategy, "spread_paper_finalist_limit", 0) or 0),
+            markout_secs=list(getattr(strategy, "spread_paper_markout_secs", []) or []),
+            terminal_secs=int(getattr(strategy, "spread_paper_terminal_secs", 0) or 0),
+            taker_fee_bps_by_venue={
+                str(getattr(venue, "venue", "") or "").lower(): float(
+                    getattr(venue, "taker_fee_bps", 0.0) or 0.0
+                )
+                for venue in config.venues
+                if str(getattr(venue, "venue", "") or "").strip()
+            },
+            slippage_buffer_bps=slippage_bps,
+            default_funding_interval_ms=int(
+                getattr(strategy, "spread_paper_default_funding_interval_ms", 0) or 0
+            ),
+        )
 
     async def _fetch_quotes_direct(
         self,

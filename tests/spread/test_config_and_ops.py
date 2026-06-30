@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from lightfee.config.loader import load_config
-from lightfee.config.schema import RuntimeConfig, StrategyConfig
+from lightfee.config.schema import PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.ops.production_health import analyze_systemd_unit
 from scripts import check_process_singleton as singleton
 
@@ -23,6 +23,13 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_min_liquidity_capacity_ratio == 1.25
     assert strategy.spread_min_history_ms == 300_000
     assert strategy.spread_ranker_max_candidates == 10
+    assert strategy.spread_paper_enabled is False
+    assert strategy.spread_paper_finalist_limit == 10
+    assert strategy.spread_paper_markout_secs == [60, 300, 900, 1800]
+    assert strategy.spread_paper_terminal_secs == 1800
+    assert strategy.spread_paper_slippage_buffer_bps == 0.0
+    assert strategy.spread_paper_default_funding_interval_ms == 28_800_000
+    assert PersistenceConfig().spread_paper_event_log_path == "runtime/spread-paper-events.jsonl"
 
 
 def test_loads_spread_reversion_config_without_loader_changes(tmp_path) -> None:
@@ -46,6 +53,15 @@ spread_min_fair_price_confidence = 0.5
 spread_min_liquidity_capacity_ratio = 1.5
 spread_min_history_ms = 600000
 spread_ranker_max_candidates = 3
+spread_paper_enabled = true
+spread_paper_finalist_limit = 2
+spread_paper_markout_secs = [10, 20]
+spread_paper_terminal_secs = 20
+spread_paper_slippage_buffer_bps = 4.0
+spread_paper_default_funding_interval_ms = 14400000
+
+[persistence]
+spread_paper_event_log_path = "runtime/custom-spread-paper.jsonl"
 
 [[venues]]
 venue = "binance"
@@ -69,6 +85,13 @@ venue = "okx"
     assert config.strategy.spread_min_liquidity_capacity_ratio == 1.5
     assert config.strategy.spread_min_history_ms == 600_000
     assert config.strategy.spread_ranker_max_candidates == 3
+    assert config.strategy.spread_paper_enabled is True
+    assert config.strategy.spread_paper_finalist_limit == 2
+    assert config.strategy.spread_paper_markout_secs == [10, 20]
+    assert config.strategy.spread_paper_terminal_secs == 20
+    assert config.strategy.spread_paper_slippage_buffer_bps == 4.0
+    assert config.strategy.spread_paper_default_funding_interval_ms == 14_400_000
+    assert config.persistence.spread_paper_event_log_path == "runtime/custom-spread-paper.jsonl"
 
 
 def test_spread_sidecar_systemd_unit_is_validated_like_sidecar() -> None:

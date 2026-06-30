@@ -8,10 +8,6 @@ Replay must be idempotent and produce the same semantic summary.
 
 from __future__ import annotations
 
-import json
-import tempfile
-from pathlib import Path
-
 import pytest
 from lightfee.persistence.journal import Journal, replay_journal_records
 
@@ -275,12 +271,20 @@ class TestReplayWithJournalRoundtrip:
         journal = Journal(tmp_path / "paper_outcome_roundtrip.jsonl")
         journal.open()
         try:
+            journal.append("opportunity.paper_registered", {
+                "paper_id": "p1", "review_id": "rvw-1",
+                "symbol": "LABUSDT",
+                "paper_order_status": "open",
+            })
             journal.append("opportunity.paper_markout", {
                 "paper_id": "p1", "review_id": "rvw-1",
                 "symbol": "LABUSDT",
                 "horizon_kind": "markout_300s",
                 "opportunity_label": "good_trade_missed",
                 "paper_net_quote": 0.33,
+                "paper_fee_quote": 0.01,
+                "paper_slippage_quote": 0.02,
+                "paper_funding_quote": 0.03,
                 "evaluated_at_ms": 301000,
             })
             journal.append("opportunity.paper_closed", {
@@ -289,6 +293,9 @@ class TestReplayWithJournalRoundtrip:
                 "horizon_kind": "settlement",
                 "opportunity_label": "bad_trade_correctly_rejected",
                 "paper_net_quote": -0.10,
+                "paper_fee_quote": 0.01,
+                "paper_slippage_quote": 0.02,
+                "paper_funding_quote": -0.01,
                 "evaluated_at_ms": 3600100,
             })
             journal.append("opportunity.real_vs_paper_joined", {
@@ -310,9 +317,14 @@ class TestReplayWithJournalRoundtrip:
         # Verify analysis layer can process them
         from lightfee.offline.analysis.journal import analyze_journal_records
         report = analyze_journal_records(records)
+        assert report.paper_outcome_registered_count == 1
         assert report.paper_outcome_markout_count == 1
         assert report.paper_outcome_closed_count == 1
         assert report.paper_outcome_joined_count == 1
         assert report.paper_outcome_by_label["good_trade_missed"] == 1
         assert report.paper_outcome_by_label["bad_trade_correctly_rejected"] == 1
         assert report.paper_outcome_by_label["good_trade_executed"] == 1
+        assert report.paper_outcome_net_quote_total == pytest.approx(0.23)
+        assert report.paper_outcome_fee_quote_total == pytest.approx(0.02)
+        assert report.paper_outcome_slippage_quote_total == pytest.approx(0.04)
+        assert report.paper_outcome_funding_quote_total == pytest.approx(0.02)
