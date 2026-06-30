@@ -25,6 +25,7 @@ from lightfee.core.exchange_errors import (
     build_evidence_from_order_submit_error,
     build_fallback_evidence,
 )
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.bybit_duplicate_reconcile import (
     build_order_reconcile_result_payload,
@@ -611,6 +612,119 @@ class CloseExecutor:
             post_funding_hold_ms=overrides.get("post_funding_hold_ms", 30_000),
             close_chunk_max_notional_quote=overrides.get("close_chunk_max_notional_quote", 0.0),
             close_chunk_min_interval_ms=overrides.get("close_chunk_min_interval_ms", 1_000),
+        )
+
+    async def _close_open_order_proof(
+        self,
+        adapter: Any,
+        symbol: str,
+    ) -> dict[str, Any]:
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if not callable(fetch_open_orders):
+            return {
+                "available": False,
+                "open_orders_empty": None,
+                "open_order_count": None,
+                "reason": "fetch_open_orders_unavailable",
+            }
+        try:
+            try:
+                open_orders = await fetch_open_orders(symbol)
+            except TypeError:
+                open_orders = await fetch_open_orders()
+        except Exception as exc:
+            return {
+                "available": False,
+                "open_orders_empty": None,
+                "open_order_count": None,
+                "reason": "fetch_open_orders_failed",
+                "error": str(exc),
+            }
+        if open_orders is None:
+            open_orders = []
+        try:
+            open_order_count = len(open_orders)
+        except TypeError:
+            open_order_count = 0
+        return {
+            "available": True,
+            "open_orders_empty": open_order_count == 0,
+            "open_order_count": open_order_count,
+            "source": "fetch_open_orders",
+        }
+
+    def _emit_close_accepted_order_truth_gap_registered(
+        self,
+        *,
+        request: OrderRequest,
+        position_id: str,
+        leg: str,
+        source: str,
+        order_id: str,
+        client_order_id: str,
+        reason: str,
+    ) -> None:
+        accepted_order_id = normalize_order_identity(order_id)
+        accepted_client_order_id = normalize_order_identity(client_order_id)
+        self.journal.append(
+            "exit.accepted_order_truth_gap_registered",
+            {
+                "position_id": position_id,
+                "symbol": request.symbol,
+                "venue": request.venue.value,
+                "leg": leg,
+                "operation": "close_reduce_only",
+                "source": source,
+                "order_id": accepted_order_id,
+                "client_order_id": accepted_client_order_id,
+                "accepted_order_id": accepted_order_id,
+                "accepted_client_order_id": accepted_client_order_id,
+                "order_truth_state": "accepted_pending_truth",
+                "truth_required_by": "accepted_order_truth_gap",
+                "accepted_order_truth_gap": True,
+                "reason": reason,
+                "next_action": "prove_order_detail_live_position_and_open_orders",
+                "probe_paths": {
+                    "order_detail": True,
+                    "live_position": True,
+                    "open_orders": True,
+                },
+            },
+        )
+
+    def _emit_close_accepted_order_truth_gap_resolved_live_flat(
+        self,
+        *,
+        request: OrderRequest,
+        position_id: str,
+        leg: str,
+        source: str,
+        order_id: str,
+        client_order_id: str,
+        live_position_proof: dict[str, Any],
+        open_order_proof: dict[str, Any],
+        reason: str,
+    ) -> None:
+        accepted_order_id = normalize_order_identity(order_id)
+        accepted_client_order_id = normalize_order_identity(client_order_id)
+        self.journal.append(
+            "exit.accepted_order_truth_gap_resolved",
+            {
+                "position_id": position_id,
+                "symbol": request.symbol,
+                "venue": request.venue.value,
+                "leg": leg,
+                "order_id": accepted_order_id,
+                "client_order_id": accepted_client_order_id,
+                "accepted_order_id": accepted_order_id,
+                "accepted_client_order_id": accepted_client_order_id,
+                "resolution_status": "live_flat",
+                "decision": "clear_gap",
+                "source": source,
+                "reason": reason,
+                "live_position_proof": live_position_proof,
+                "open_order_proof": open_order_proof,
+            },
         )
 
     async def execute_close(
@@ -1382,6 +1496,99 @@ class CloseExecutor:
                         and duplicate_reconcile.clear_state
                     ):
                         if recon_qty <= 1e-12:
+                            gap_order_id = normalize_order_identity(
+                                duplicate_reconcile.order_id
+                            )
+                            gap_client_order_id = normalize_order_identity(
+                                duplicate_reconcile.client_order_id
+                                or request.client_order_id
+                            )
+                            self._emit_close_accepted_order_truth_gap_registered(
+                                request=request,
+                                position_id=position_id,
+                                leg=leg,
+                                source="duplicate_client_order_reconcile",
+                                order_id=gap_order_id,
+                                client_order_id=gap_client_order_id,
+                                reason="duplicate_client_order_ack_truth_gap",
+                            )
+                            live_position_proof = {
+                                "available": not bool(duplicate_reconcile.live_fetch_error),
+                                "quantity": float(duplicate_reconcile.live_qty or 0.0),
+                                "side": duplicate_reconcile.live_side,
+                                "source": "fetch_position",
+                                "error": duplicate_reconcile.live_fetch_error,
+                            }
+                            open_order_proof = await self._close_open_order_proof(
+                                adapter,
+                                request.symbol,
+                            )
+                            if (
+                                live_position_proof.get("available") is True
+                                and abs(float(duplicate_reconcile.live_qty or 0.0))
+                                <= 1e-9
+                                and open_order_proof.get("open_orders_empty") is True
+                            ):
+                                self._emit_close_accepted_order_truth_gap_resolved_live_flat(
+                                    request=request,
+                                    position_id=position_id,
+                                    leg=leg,
+                                    source="duplicate_client_order_reconcile",
+                                    order_id=gap_order_id,
+                                    client_order_id=gap_client_order_id,
+                                    live_position_proof=live_position_proof,
+                                    open_order_proof=open_order_proof,
+                                    reason="duplicate_client_order_live_flat",
+                                )
+                            else:
+                                if not live_position_proof.get("available"):
+                                    blocker_reason = (
+                                        "duplicate_client_order_live_position_truth_unavailable"
+                                    )
+                                elif abs(float(duplicate_reconcile.live_qty or 0.0)) > 1e-9:
+                                    blocker_reason = (
+                                        "duplicate_client_order_live_position_not_flat"
+                                    )
+                                elif open_order_proof.get("open_orders_empty") is False:
+                                    blocker_reason = "duplicate_client_order_open_order_present"
+                                else:
+                                    blocker_reason = (
+                                        "duplicate_client_order_open_order_truth_unavailable"
+                                    )
+                                self.journal.append(
+                                    "exit.accepted_order_truth_gap_retry_blocked",
+                                    {
+                                        "position_id": position_id,
+                                        "symbol": request.symbol,
+                                        "venue": request.venue.value,
+                                        "leg": leg,
+                                        "order_id": gap_order_id,
+                                        "client_order_id": gap_client_order_id,
+                                        "accepted_order_id": gap_order_id,
+                                        "accepted_client_order_id": gap_client_order_id,
+                                        "reason": blocker_reason,
+                                        "decision": "retain_truth_gap",
+                                        "live_position_proof": live_position_proof,
+                                        "open_order_proof": open_order_proof,
+                                    },
+                                )
+                                self.journal.append(
+                                    "exit.close_duplicate_client_order_pending_reconcile",
+                                    {
+                                        "position_id": position_id,
+                                        "leg": leg,
+                                        "client_order_id": request.client_order_id,
+                                        "reason": blocker_reason,
+                                        "classification": duplicate_reconcile.classification,
+                                        "decision": "retain_truth_gap",
+                                    },
+                                )
+                                return {
+                                    "outcome": "uncertain",
+                                    "fill": None,
+                                    "reason": blocker_reason,
+                                    "order_id": "",
+                                }
                             self.journal.append(
                                 "exit.close_duplicate_client_order_resolved_live_flat",
                                 {

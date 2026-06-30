@@ -6741,6 +6741,63 @@ def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkey
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_probes_recent_traded_scope_when_current_state_is_flat(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "hyperliquid_trading_disabled_reason": "strict_readonly_account_mismatch",
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1700000001000-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "long_venue": "aster",
+                    "short_venue": "bybit",
+                },
+            },
+            {
+                "ts_ms": 1700000002000,
+                "kind": "exit.passive_close_resolved",
+                "payload": {
+                    "position_id": "entry-1700000001000-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "long_venue": "aster",
+                    "short_venue": "bybit",
+                },
+            },
+        ])
+        seen = {}
+
+        def fake_exchange_truth(runtime_dir, symbols, venues=None):
+            seen["symbols"] = symbols
+            seen["venues"] = venues
+            return _flat_exchange_truth(runtime_dir, symbols, venues)
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", fake_exchange_truth)
+
+        run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
+
+        assert seen["symbols"] == ["LABUSDT"]
+        assert seen["venues"] == ["aster", "bybit", "hyperliquid"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_allows_explicit_exchange_truth_venues(monkeypatch):
     from scripts import diagnose_live as dl
 
@@ -8841,6 +8898,8 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
                 "maker_no_fill_count": 0,
                 "zero_fill_cycle_count": 0,
                 "fallback_after_zero_fill_count": 0,
+                "maker_viability_rejected_count": 0,
+                "early_fallback_after_viability_rejected_count": 0,
                 "samples": [],
             },
             "repeated_single_leg_guarded": {
@@ -9062,6 +9121,77 @@ def test_business_progression_quality_reports_close_cost_inefficiency_as_non_blo
     assert summary["samples"][0]["position_id"] == "entry-close-cost"
     assert summary["samples"][0]["status"] == "terminal_resolved"
     assert business["active_stuck_count"] == 0
+
+
+def test_business_progression_quality_counts_maker_viability_rejection_separately():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-close-viability",
+                "symbol": "POWRUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_maker_viability_rejected",
+            "payload": {
+                "position_id": "entry-close-viability",
+                "symbol": "POWRUSDT",
+                "venue": "binance",
+                "maker_venue": "binance",
+                "leg": "long",
+                "maker_leg": "long",
+                "reason": "missing_price_hint",
+                "decision": "arm_dual_taker",
+            },
+        },
+        {
+            "ts_ms": 2_100,
+            "kind": "execution.dual_taker_armed",
+            "payload": {
+                "position_id": "entry-close-viability",
+                "symbol": "POWRUSDT",
+                "reason": "maker_viability_rejected",
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-close-viability",
+                "symbol": "POWRUSDT",
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                },
+            },
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate={
+            "gate_passed": True,
+            "exchange_truth_flat": True,
+            "exchange_truth_no_open_orders": True,
+            "blocking_reasons": [],
+            "v1_lifecycle_summary": {"blocking_row_count": 0},
+        },
+    )
+
+    summary = business["close_cost_inefficiency_summary"]
+    assert summary["count"] == 1
+    assert summary["maker_viability_rejected_count"] == 1
+    assert summary["early_fallback_after_viability_rejected_count"] == 1
+    assert summary["zero_fill_cycle_count"] == 0
+    assert summary["samples"][0]["maker_viability_rejected_count"] == 1
+    assert summary["samples"][0]["next_action"] == "monitor_early_fallback_cost"
 
 
 def test_business_progression_quality_flags_actionable_passive_close_single_leg_wait():

@@ -174,6 +174,23 @@ def _parse_bitget_risk_from_rowlike(raw: dict, now_ms: int):
     return snapshot
 
 
+def _extract_bitget_open_order_rows(raw: Any) -> list[dict[str, Any]]:
+    data = raw.get("data", raw) if isinstance(raw, dict) else raw
+    if isinstance(data, list):
+        return [dict(row) for row in data if isinstance(row, dict)]
+    if not isinstance(data, dict):
+        return []
+
+    for key in ("entrustedList", "orderList", "orders", "list", "resultList"):
+        rows = data.get(key)
+        if isinstance(rows, list):
+            return [dict(row) for row in rows if isinstance(row, dict)]
+
+    if any(key in data for key in ("orderId", "clientOid", "symbol")):
+        return [dict(data)]
+    return []
+
+
 def _profile_from_contract_family(family: BitgetContractFamily) -> BitgetAccountProfile:
     if family == BitgetContractFamily.CLASSIC_MIX_V2:
         return BitgetAccountProfile.CLASSIC
@@ -477,6 +494,23 @@ class BitgetAdapter(VenueAdapter):
 
         now_ms = int(__import__("time").time() * 1000)
         return self._transport._parse_all_positions(raw, now_ms)
+
+    async def fetch_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if self._mode != "live":
+            return []
+
+        from lightfee.venues.transport import _require_bitget_success
+
+        family = await self.resolve_contract_family()
+        raw, _request = await request_venue_operation(
+            self._transport,
+            Venue.BITGET,
+            VenueOperation.OPEN_ORDERS,
+            symbol=symbol or "",
+            resolved_account_family=family,
+        )
+        _require_bitget_success(raw, "bitget open orders failed")
+        return _extract_bitget_open_order_rows(raw)
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._mode != "live":

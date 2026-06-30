@@ -674,6 +674,74 @@ class TestMakerProgressTruthGate:
         assert truth_gap[-1]["source"] == "poll_maker_progress"
         assert truth_gap[-1]["next_action"] == "retry_progress_poll"
 
+    def test_missing_maintain_price_evidence_rejects_maker_viability_without_zero_fill(self):
+        """Missing maintain price truth should not burn a normal zero-fill cycle."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(position_id="entry-powr-maker-viability")
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="resting-oid",
+                maker_client_order_id="resting-cid",
+                maker_resting_limit_price=50000.0,
+                zero_fill_cycles_in_phase=0,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(
+            return_value=PassiveOrderProgress(
+                venue=Venue.BINANCE,
+                symbol=position.symbol,
+                side=Side.SELL,
+                order_id="resting-oid",
+                client_order_id="resting-cid",
+                cumulative_quantity=0.0,
+                average_price=0.0,
+                state=PassiveOrderState.OPEN,
+                observed_at_ms=2_000,
+            )
+        )
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: None)
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(
+                state,
+                position.position_id,
+                wait_until_terminal=False,
+            )
+        )
+
+        assert result is False
+        assert pending.phase_state.zero_fill_cycles_in_phase == 0
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        events = journal.read_all()
+        kinds = [event["kind"] for event in events]
+        assert "exit.passive_close_maker_viability_rejected" in kinds
+        assert "execution.passive_cycle_zero_fill" not in kinds
+        rejected = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.passive_close_maker_viability_rejected"
+        ][-1]
+        assert rejected["reason"] == "missing_price_hint"
+        assert rejected["decision"] == "arm_dual_taker"
+
 
 class TestPassiveCloseRouteAbnormalCooldown:
     def test_abnormal_terminal_arms_route_only_admission_cooldown(self):
@@ -2486,6 +2554,7 @@ class TestTerminalMakerFillHedgeFail:
             config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position()
@@ -2545,6 +2614,7 @@ class TestTerminalMakerFillHedgeFail:
             config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position()
@@ -2612,6 +2682,7 @@ class TestTerminalMakerFillHedgeFail:
             config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position()
@@ -6403,8 +6474,8 @@ class TestFallbackResidualReal:
 class TestMaintainFailClosed:
     """Test 4: maintain/reprice fail-closed on missing L2/tick data."""
 
-    def test_maintain_no_tick_size_journals_and_sets_retry(self):
-        """tick_size <= 0 → journal, retry, no amend/cancel_replace call."""
+    def test_maintain_no_tick_size_rejects_maker_viability(self):
+        """tick_size <= 0 → journal and stop burning maker zero-fill cycles."""
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
         # Override tick size to return 0
@@ -6432,14 +6503,21 @@ class TestMaintainFailClosed:
             )
         )
 
-        assert pending.next_retry_at_ms > 0
+        assert pending.next_retry_at_ms == 0
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
 
         events = journal.read_all()
         no_tick = [e for e in events if e.get("kind") == "exit.passive_close_maintain_no_tick_size"]
         assert len(no_tick) == 1
+        rejected = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_viability_rejected"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0]["payload"]["reason"] == "missing_tick_size"
 
-    def test_maintain_no_price_hint_journals_and_sets_retry(self):
-        """price_hint <= 0 → journal, retry, no amend/cancel_replace."""
+    def test_maintain_no_price_hint_rejects_maker_viability(self):
+        """price_hint <= 0 → journal and stop burning maker zero-fill cycles."""
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
         executor._get_tick_size = lambda venue, symbol: 0.01
@@ -6467,11 +6545,18 @@ class TestMaintainFailClosed:
             )
         )
 
-        assert pending.next_retry_at_ms > 0
+        assert pending.next_retry_at_ms == 0
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
 
         events = journal.read_all()
         no_price = [e for e in events if e.get("kind") == "exit.passive_close_maintain_no_price_hint"]
         assert len(no_price) == 1
+        rejected = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_viability_rejected"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0]["payload"]["reason"] == "missing_price_hint"
 
     def test_maintain_no_resting_price_journals_and_sets_retry(self):
         """current_price is None → journal, retry."""
@@ -6565,6 +6650,50 @@ class TestMaintainFailClosed:
         assert success is False
         assert pending.phase_state.maker_order_id == ""
 
+    def test_submit_maker_rejects_viability_without_quote_proof(self):
+        """Valid mid/tick without quote proof must not submit post-only maker."""
+        journal = _open_journal()
+        adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        async def fixed_passive_tick_size(*args, **kwargs):
+            return 0.01
+
+        executor._get_passive_tick_size = fixed_passive_tick_size
+        executor.set_l2_quote_resolver(lambda venue, symbol: None)
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        success = asyncio.run(
+            executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 50000.0, 0.01,
+            )
+        )
+
+        assert success is False
+        adapter.submit_passive_order.assert_not_called()
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        events = journal.read_all()
+        rejected = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.passive_close_maker_viability_rejected"
+        ]
+        assert rejected
+        assert rejected[-1]["reason"] == "missing_quote"
+        assert rejected[-1]["source"] == "submit_maker_order"
+
     def test_submit_maker_uses_dynamic_bybit_tick_before_static_spec(self):
         """V1 parity: passive close uses symbol metadata tick before VenueSpec default."""
         from lightfee.venues.specs import get_spec
@@ -6631,6 +6760,7 @@ class TestMaintainFailClosed:
             ),
         )
         state.pending_passive_closes[position.position_id] = pending
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.007801, 0.007803))
 
         try:
             success = asyncio.run(
@@ -8060,6 +8190,7 @@ class TestNonTerminalPartialFillHedgeGapClosure:
             config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position()
@@ -8162,6 +8293,7 @@ class TestNonTerminalPartialFillHedgeGapClosure:
             config_overrides={"runtime_mode": "paper"},
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49999.99, 50000.01))
 
         state = EngineState()
         position = _make_position()

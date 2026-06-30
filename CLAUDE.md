@@ -6,6 +6,8 @@ This project is used by both Codex and Claude Code. Keep `AGENTS.md` and
 `CLAUDE.md` synchronized; `AGENTS.md` is the source of truth when the two files
 disagree.
 
+DO NOT send optional commentary
+
 ## V1 Reference
 
 `LightFee V1` means the original legacy LightFee production behavior, especially

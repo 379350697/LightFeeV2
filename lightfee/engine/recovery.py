@@ -718,6 +718,15 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     maker_client_order_id=str(ps_data.get("maker_client_order_id", "")),
                     maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
                     maker_resting_since_ms=int(ps_data.get("maker_resting_since_ms", 0)),
+                    maker_viability_rejected_this_cycle=bool(
+                        ps_data.get("maker_viability_rejected_this_cycle", False)
+                    ),
+                    maker_viability_rejection_reason=str(
+                        ps_data.get("maker_viability_rejection_reason", "")
+                    ),
+                    maker_viability_rejection_decision=str(
+                        ps_data.get("maker_viability_rejection_decision", "")
+                    ),
                 )
                 mf = pdata.get("maker_fill", {})
                 maker_fill = PendingPassiveLegFill(

@@ -2092,6 +2092,48 @@ class TestBitgetProfileDetection:
         assert adapter.account_profile is not None
 
     @pytest.mark.asyncio
+    async def test_bitget_adapter_fetch_open_orders_uses_private_truth_contract(self):
+        from lightfee.venues.bitget import BitgetAccountProfile, BitgetAdapter
+        from lightfee.venues.specs import BitgetContractFamily
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._contract_family_resolver.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+        calls: list[dict[str, object]] = []
+
+        async def mock_request(method, path, **kwargs):
+            calls.append({"method": method, "path": path, **kwargs})
+            return {
+                "code": "00000",
+                "data": {
+                    "entrustedList": [
+                        {"symbol": "BTCUSDT", "orderId": "oid-1", "clientOid": "cid-1"}
+                    ]
+                },
+            }
+
+        adapter._transport._request = mock_request
+
+        rows = await adapter.fetch_open_orders("BTCUSDT")
+
+        assert rows == [{"symbol": "BTCUSDT", "orderId": "oid-1", "clientOid": "cid-1"}]
+        assert calls == [
+            {
+                "method": "GET",
+                "path": "/api/v2/mix/order/orders-pending",
+                "params": {
+                    "productType": "USDT-FUTURES",
+                    "marginCoin": "USDT",
+                    "symbol": "BTCUSDT",
+                },
+                "private": True,
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_live_uta_probe_uses_official_category_param(self):
         from lightfee.venues.bitget import BitgetAccountProfile, BitgetAdapter
 

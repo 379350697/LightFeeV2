@@ -825,6 +825,9 @@ class PassivePhaseState:
     maker_client_order_id: str = ""
     maker_resting_limit_price: Optional[float] = None
     maker_resting_since_ms: int = 0
+    maker_viability_rejected_this_cycle: bool = False
+    maker_viability_rejection_reason: str = ""
+    maker_viability_rejection_decision: str = ""
 
 
 @dataclass
@@ -1400,6 +1403,15 @@ class EngineState:
                         "maker_client_order_id": ppc.phase_state.maker_client_order_id,
                         "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,
                         "maker_resting_since_ms": ppc.phase_state.maker_resting_since_ms,
+                        "maker_viability_rejected_this_cycle": (
+                            ppc.phase_state.maker_viability_rejected_this_cycle
+                        ),
+                        "maker_viability_rejection_reason": (
+                            ppc.phase_state.maker_viability_rejection_reason
+                        ),
+                        "maker_viability_rejection_decision": (
+                            ppc.phase_state.maker_viability_rejection_decision
+                        ),
                     },
                     "maker_fill": {
                         "quantity": ppc.maker_fill.quantity,

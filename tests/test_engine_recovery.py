@@ -430,6 +430,41 @@ class TestRecovery:
         assert state.local_l2_books_snapshot[0]["symbol"] == "ETHUSDT"
         assert len(state.local_l2_session_snapshot) == 1
 
+    def test_snapshot_restores_passive_close_maker_viability_rejection(self):
+        """Passive close cost-control evidence must survive restart recovery."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        snap = {
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "pending_passive_closes": {
+                "pos-1": {
+                    "position_id": "pos-1",
+                    "reason": "funding_capture",
+                    "target_quantity": 1.0,
+                    "chunk_quantities": [1.0],
+                    "active_chunk_index": 0,
+                    "phase_state": {
+                        "phase": "dual_taker",
+                        "preferred_maker_leg": "long",
+                        "active_maker_leg": "long",
+                        "maker_viability_rejected_this_cycle": True,
+                        "maker_viability_rejection_reason": "missing_quote",
+                        "maker_viability_rejection_decision": "arm_dual_taker",
+                    },
+                    "maker_fill": {},
+                    "hedge_fill": {},
+                },
+            },
+        }
+
+        state = _restore_state_from_snapshot_dict(snap)
+
+        phase = state.pending_passive_closes["pos-1"].phase_state
+        assert phase.maker_viability_rejected_this_cycle is True
+        assert phase.maker_viability_rejection_reason == "missing_quote"
+        assert phase.maker_viability_rejection_decision == "arm_dual_taker"
+
     def test_ambiguous_open_positions_are_core_evidence_gap_not_recovery_block(self):
         """Ambiguous replay truth is evidence quality, not an independent block."""
         with tempfile.TemporaryDirectory() as td:

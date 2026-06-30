@@ -1265,6 +1265,9 @@ class TestCloseChunkExecutor:
                 self.reconciliation_lookups.append((symbol, order_id, client_order_id))
                 return None
 
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
         short_adapter = DuplicateBybitAdapter()
         long_adapter = FakeVenueAdapter(Venue.ASTER, default_fill_price=0.2908)
         short_adapter.place_order_outcomes = [
@@ -1340,6 +1343,9 @@ class TestCloseChunkExecutor:
                     observed_at_ms=2200,
                 )
 
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
         adapter = DuplicateLiveFlatBybitAdapter()
         adapter.place_order_outcomes = [
             _make_rejected_error(
@@ -1384,6 +1390,100 @@ class TestCloseChunkExecutor:
         assert resolution_payload["client_order_id"] == client_order_id
         assert resolution_payload["reconciled_qty"] == 0.0
         assert resolution_payload["live_qty"] == 0.0
+        registered = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_registered"
+        ]
+        resolved = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert registered
+        assert registered[-1]["position_id"] == "p001"
+        assert registered[-1]["venue"] == "bybit"
+        assert registered[-1]["leg"] == "short"
+        assert registered[-1]["client_order_id"] == client_order_id
+        assert registered[-1]["truth_required_by"] == "accepted_order_truth_gap"
+        assert resolved
+        assert resolved[-1]["resolution_status"] == "live_flat"
+        assert resolved[-1]["decision"] == "clear_gap"
+        assert resolved[-1]["client_order_id"] == client_order_id
+        assert resolved[-1]["live_position_proof"]["quantity"] == 0.0
+        assert resolved[-1]["open_order_proof"]["open_order_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_live_flat_without_open_order_truth_retains_gap(self):
+        """Live-flat alone is insufficient; open-order truth must close the gap."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class DuplicateLiveFlatNoOpenOrderTruthAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BYBIT, default_fill_price=0.2911)
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return None
+
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+        adapter = DuplicateLiveFlatNoOpenOrderTruthAdapter()
+        adapter.place_order_outcomes = [
+            _make_rejected_error(
+                "bybit order failed: bybit retCode=110072 retMsg=OrderLinkedID is duplicate"
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        client_order_id = compact_client_order_id("p001", "exit_short")
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="MOVEUSDT",
+            side=Side.BUY,
+            quantity=1840.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "uncertain"
+        events = journal.read_all()
+        assert [
+            event for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_registered"
+        ]
+        blocked = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_retry_blocked"
+        ]
+        assert blocked
+        assert blocked[-1]["decision"] == "retain_truth_gap"
+        assert blocked[-1]["open_order_proof"]["reason"] == "fetch_open_orders_unavailable"
+        assert [
+            event for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ] == []
+        assert [
+            event for event in events
+            if event["kind"] == "exit.close_duplicate_client_order_resolved_live_flat"
+        ] == []
 
     @pytest.mark.asyncio
     async def test_bitget_duplicate_client_oid_close_reconciles_live_flat(self):
@@ -1409,6 +1509,9 @@ class TestCloseChunkExecutor:
                     entry_price=0.2911,
                     observed_at_ms=2200,
                 )
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
 
         adapter = DuplicateLiveFlatBitgetAdapter()
         adapter.place_order_outcomes = [

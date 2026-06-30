@@ -913,6 +913,131 @@ def _exchange_truth_venues_for_diagnose(
     return selected if selected else None
 
 
+_EXCHANGE_TRUTH_SCOPE_EVENT_KINDS = frozenset({
+    "entry.opened",
+    "entry.aborted",
+    "execution.dual_taker_armed",
+    "execution.passive_cycle_zero_fill",
+    "passive_maintenance.maker_progress",
+    "recovery.flat",
+    "reconciliation.entry_flat_unresolved_maker_retained",
+    "reconciliation.entry_flatten_residual_submitted",
+    "reconciliation.entry_flatten_residual_succeeded",
+    "runtime.entry_dispatched",
+    "runtime.normal_close_routing_passive",
+    "runtime.pending_entry_registered",
+    "runtime.position_drift_corrected",
+    "runtime.position_drift_detected",
+    "runtime.position_lifecycle_terminal",
+    "runtime.position_opened",
+})
+
+_EXCHANGE_TRUTH_SCOPE_EVENT_PREFIXES = (
+    "exit.",
+    "order.",
+    "pending_entry.",
+)
+
+
+def _event_kind_contributes_exchange_truth_scope(kind: str) -> bool:
+    return (
+        kind in _EXCHANGE_TRUTH_SCOPE_EVENT_KINDS
+        or kind.startswith(_EXCHANGE_TRUTH_SCOPE_EVENT_PREFIXES)
+    )
+
+
+def _canonical_event_symbol(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text or text in {"NONE", "NULL"}:
+        return ""
+    if text.endswith("-SWAP"):
+        text = text[:-5]
+    text = text.replace("-", "").replace("_", "").replace("/", "")
+    if text.endswith(("USDT", "USDC", "USD")) and any(ch.isalpha() for ch in text):
+        return text
+    return ""
+
+
+def _symbol_from_event_identity(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    normalized = text
+    for sep in ("->", ":", "-", "/", "_"):
+        normalized = normalized.replace(sep, " ")
+    for token in normalized.split():
+        symbol = _canonical_event_symbol(token)
+        if symbol:
+            return symbol
+    return ""
+
+
+def _append_unique_normalized(target: list[str], value: str) -> None:
+    if value and value not in target:
+        target.append(value)
+
+
+def _canonical_event_venue(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text or text in {"none", "null"}:
+        return ""
+    return text
+
+
+def _extend_exchange_truth_scope_from_payload(
+    payload: dict[str, Any],
+    symbols: list[str],
+    venues: list[str],
+) -> None:
+    for key in ("symbol", "canonical_symbol", "venue_symbol"):
+        _append_unique_normalized(symbols, _canonical_event_symbol(payload.get(key)))
+    for key in ("symbols", "canonical_symbols"):
+        values = payload.get(key)
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            for item in values:
+                _append_unique_normalized(symbols, _canonical_event_symbol(item))
+    for key in ("position_id", "entry_id", "pending_id", "owner_id", "recovery_key"):
+        _append_unique_normalized(symbols, _symbol_from_event_identity(payload.get(key)))
+
+    for key in (
+        "venue",
+        "long_venue",
+        "short_venue",
+        "maker_venue",
+        "hedge_venue",
+        "passive_venue",
+        "taker_venue",
+        "close_venue",
+    ):
+        _append_unique_normalized(venues, _canonical_event_venue(payload.get(key)))
+    payload_venues = payload.get("venues")
+    if isinstance(payload_venues, str):
+        payload_venues = [payload_venues]
+    if isinstance(payload_venues, dict):
+        payload_venues = list(payload_venues.values())
+    if isinstance(payload_venues, list):
+        for item in payload_venues:
+            _append_unique_normalized(venues, _canonical_event_venue(item))
+
+
+def _exchange_truth_scope_from_events(
+    events: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    symbols: list[str] = []
+    venues: list[str] = []
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if not _event_kind_contributes_exchange_truth_scope(kind):
+            continue
+        payload = rec.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        _extend_exchange_truth_scope_from_payload(payload, symbols, venues)
+    return symbols, venues
+
+
 def _optional_float(value: Any) -> float | None:
     try:
         parsed = float(value)
@@ -6407,8 +6532,11 @@ def _build_business_progression_quality_summary(
                 "maker_no_fill_count": 0,
                 "zero_fill_cycle_count": 0,
                 "fallback_after_zero_fill_count": 0,
+                "maker_viability_rejected_count": 0,
+                "early_fallback_after_viability_rejected_count": 0,
                 "venues": set(),
                 "maker_legs": set(),
+                "maker_viability_reasons": set(),
                 "terminal_resolved": False,
             },
         )
@@ -6746,14 +6874,27 @@ def _build_business_progression_quality_summary(
             entry = close_cost_entry(payload)
             if entry is not None:
                 entry["zero_fill_cycle_count"] += 1
+        elif kind == "exit.passive_close_maker_viability_rejected":
+            entry = close_cost_entry(payload)
+            if entry is not None:
+                entry["maker_viability_rejected_count"] += 1
+                reason = str(payload.get("reason") or "")
+                if reason:
+                    entry["maker_viability_reasons"].add(reason)
         elif kind in {
             "exit.passive_close_dual_taker_drive",
             "exit.passive_close_fallback_terminal_flat",
             "exit.passive_close_live_matched_close",
+            "execution.dual_taker_armed",
         }:
             entry = close_cost_entry(payload)
             if entry is not None and int(entry.get("zero_fill_cycle_count") or 0) > 0:
                 entry["fallback_after_zero_fill_count"] += 1
+            if (
+                entry is not None
+                and int(entry.get("maker_viability_rejected_count") or 0) > 0
+            ):
+                entry["early_fallback_after_viability_rejected_count"] += 1
         if kind in {
             "exit.passive_close_resolved",
             "exit.passive_close_fallback_terminal_flat",
@@ -6886,18 +7027,34 @@ def _build_business_progression_quality_summary(
     close_cost_maker_no_fill_count = 0
     close_cost_zero_fill_cycle_count = 0
     close_cost_fallback_after_zero_fill_count = 0
+    close_cost_maker_viability_rejected_count = 0
+    close_cost_early_fallback_after_viability_rejected_count = 0
     for entry in close_cost_entries.values():
         maker_no_fill_count = int(entry.get("maker_no_fill_count") or 0)
         zero_fill_cycle_count = int(entry.get("zero_fill_cycle_count") or 0)
         fallback_after_zero_fill_count = int(
             entry.get("fallback_after_zero_fill_count") or 0
         )
-        if maker_no_fill_count <= 0 and zero_fill_cycle_count <= 0:
+        maker_viability_rejected_count = int(
+            entry.get("maker_viability_rejected_count") or 0
+        )
+        early_fallback_after_viability_rejected_count = int(
+            entry.get("early_fallback_after_viability_rejected_count") or 0
+        )
+        if (
+            maker_no_fill_count <= 0
+            and zero_fill_cycle_count <= 0
+            and maker_viability_rejected_count <= 0
+        ):
             continue
         close_cost_count += 1
         close_cost_maker_no_fill_count += maker_no_fill_count
         close_cost_zero_fill_cycle_count += zero_fill_cycle_count
         close_cost_fallback_after_zero_fill_count += fallback_after_zero_fill_count
+        close_cost_maker_viability_rejected_count += maker_viability_rejected_count
+        close_cost_early_fallback_after_viability_rejected_count += (
+            early_fallback_after_viability_rejected_count
+        )
         terminal_resolved = bool(entry.get("terminal_resolved"))
         if not terminal_resolved and not gate_currently_green():
             close_cost_blocking_count += 1
@@ -6916,12 +7073,25 @@ def _build_business_progression_quality_summary(
                     "fallback_after_zero_fill_count": (
                         fallback_after_zero_fill_count
                     ),
+                    "maker_viability_rejected_count": (
+                        maker_viability_rejected_count
+                    ),
+                    "early_fallback_after_viability_rejected_count": (
+                        early_fallback_after_viability_rejected_count
+                    ),
+                    "maker_viability_reasons": sorted(
+                        entry.get("maker_viability_reasons") or []
+                    ),
                     "venues": sorted(entry.get("venues") or []),
                     "maker_legs": sorted(entry.get("maker_legs") or []),
                     "next_action": (
-                        "tighten_close_maker_viability_source_gate"
-                        if terminal_resolved
-                        else "verify_exchange_truth_before_classifying_noise"
+                        "monitor_early_fallback_cost"
+                        if maker_viability_rejected_count > 0
+                        else (
+                            "tighten_close_maker_viability_source_gate"
+                            if terminal_resolved
+                            else "verify_exchange_truth_before_classifying_noise"
+                        )
                     ),
                 }
             )
@@ -6931,6 +7101,10 @@ def _build_business_progression_quality_summary(
         "maker_no_fill_count": close_cost_maker_no_fill_count,
         "zero_fill_cycle_count": close_cost_zero_fill_cycle_count,
         "fallback_after_zero_fill_count": close_cost_fallback_after_zero_fill_count,
+        "maker_viability_rejected_count": close_cost_maker_viability_rejected_count,
+        "early_fallback_after_viability_rejected_count": (
+            close_cost_early_fallback_after_viability_rejected_count
+        ),
         "samples": close_cost_samples,
     }
     return {
@@ -8805,6 +8979,13 @@ def run_diagnose(
             venue = str(pos.get(venue_key, "") or "").lower()
             if venue and venue not in pos_venues:
                 pos_venues.append(venue)
+    event_symbols, event_venues = _exchange_truth_scope_from_events(all_events)
+    for sym in event_symbols:
+        if sym not in pos_symbols:
+            pos_symbols.append(sym)
+    for venue in event_venues:
+        if venue not in pos_venues:
+            pos_venues.append(venue)
     if symbol and symbol not in pos_symbols:
         pos_symbols.append(symbol)
 

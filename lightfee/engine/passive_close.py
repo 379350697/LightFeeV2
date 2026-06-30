@@ -783,6 +783,53 @@ class PassiveCloseExecutor:
             )
         return order_id, client_order_id
 
+    def _reject_passive_close_maker_viability(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        maker_venue: Venue,
+        maker_leg_label: str,
+        price_hint: float,
+        tick_size: float,
+        reason: str,
+        source: str,
+        decision: str = "arm_dual_taker",
+        price_evidence_source: str = "",
+    ) -> None:
+        phase = pending.phase_state
+        phase.maker_viability_rejected_this_cycle = True
+        phase.maker_viability_rejection_reason = reason
+        phase.maker_viability_rejection_decision = decision
+        previous_phase = phase.phase.value
+        if decision == "arm_dual_taker":
+            phase.phase = PassiveExecutionPhase.DUAL_TAKER
+            phase.zero_fill_cycles_in_phase = 0
+            phase.cycle_started_at_ms = self._now_ms()
+            pending.next_retry_at_ms = 0
+
+        self._journal.append(
+            "exit.passive_close_maker_viability_rejected",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": maker_venue.value,
+                "maker_venue": maker_venue.value,
+                "leg": maker_leg_label,
+                "maker_leg": maker_leg_label,
+                "phase": previous_phase,
+                "decision": decision,
+                "source": source,
+                "reason": reason,
+                "next_action": decision,
+                "price_hint": price_hint,
+                "tick_size": tick_size,
+                "price_evidence_source": price_evidence_source,
+                "order_id": phase.maker_order_id,
+                "client_order_id": phase.maker_client_order_id,
+            },
+        )
+
     async def _refresh_passive_close_final_hedge_truth_before_terminal(
         self,
         state: EngineState,
@@ -2245,6 +2292,20 @@ class PassiveCloseExecutor:
             if pending is None:
                 return True
 
+            if pending.phase_state.maker_viability_rejected_this_cycle:
+                self._journal.append(
+                    "execution.dual_taker_armed",
+                    {
+                        "position_id": position_id,
+                        "symbol": position.symbol,
+                        "execution_kind": "exit",
+                        "reason": "maker_viability_rejected",
+                        "maker_leg": pending.phase_state.active_maker_leg.value,
+                        "remaining_quantity": pending.remaining_chunk_quantity(),
+                    },
+                )
+                return False
+
             # Still zero fill — apply retry delay
             if pending.maker_fill.quantity <= cycle_fill_before + 1e-9:
                 pending.phase_state.zero_fill_cycles_in_phase += 1
@@ -2536,7 +2597,23 @@ class PassiveCloseExecutor:
             pending.next_retry_at_ms = self._now_ms() + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
             return False
 
-        quote = self._resolve_local_l2_quote(maker_venue, position.symbol)
+        quote, quote_source = self._resolve_local_l2_quote_with_source(
+            maker_venue,
+            position.symbol,
+        )
+        if quote is None:
+            self._reject_passive_close_maker_viability(
+                pending,
+                position,
+                maker_venue=maker_venue,
+                maker_leg_label=maker_leg_label,
+                price_hint=price_hint,
+                tick_size=tick_size,
+                reason="missing_quote",
+                source="submit_maker_order",
+                price_evidence_source=quote_source,
+            )
+            return False
         if self._post_only_price_would_take(maker_side, aligned_price, quote):
             self._rotate_post_only_maker_leg(
                 pending,
@@ -4108,6 +4185,29 @@ class PassiveCloseExecutor:
         now_ms = self._now_ms()
         pid = position.position_id
 
+        if price_hint <= 0.0:
+            self._journal.append(
+                "exit.passive_close_maintain_no_price_hint",
+                {
+                    "position_id": pid,
+                    "venue": maker_venue.value,
+                    "maker_leg": maker_leg_label,
+                    "reason": "cannot reprice — L2 mid unavailable",
+                },
+            )
+            self._reject_passive_close_maker_viability(
+                pending,
+                position,
+                maker_venue=maker_venue,
+                maker_leg_label=maker_leg_label,
+                price_hint=price_hint,
+                tick_size=0.0,
+                reason="missing_price_hint",
+                source="maintain_maker_order",
+                price_evidence_source="l2_mid_unavailable",
+            )
+            return
+
         tick_size = await self._get_passive_tick_size(
             maker_venue,
             position.symbol,
@@ -4124,21 +4224,37 @@ class PassiveCloseExecutor:
                     "reason": "cannot reprice — no tick size available",
                 },
             )
-            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+            self._reject_passive_close_maker_viability(
+                pending,
+                position,
+                maker_venue=maker_venue,
+                maker_leg_label=maker_leg_label,
+                price_hint=price_hint,
+                tick_size=tick_size,
+                reason="missing_tick_size",
+                source="maintain_maker_order",
+                price_evidence_source="tick_size_unavailable",
+            )
             return
 
-        if price_hint <= 0.0:
-            self._journal.append(
-                "exit.passive_close_maintain_no_price_hint",
-                {
-                    "position_id": pid,
-                    "venue": maker_venue.value,
-                    "maker_leg": maker_leg_label,
-                    "reason": "cannot reprice — L2 mid unavailable",
-                },
+        if self._l2_quote_resolver is not None:
+            quote, quote_source = self._resolve_local_l2_quote_with_source(
+                maker_venue,
+                position.symbol,
             )
-            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
-            return
+            if quote is None:
+                self._reject_passive_close_maker_viability(
+                    pending,
+                    position,
+                    maker_venue=maker_venue,
+                    maker_leg_label=maker_leg_label,
+                    price_hint=price_hint,
+                    tick_size=tick_size,
+                    reason="missing_quote",
+                    source="maintain_maker_order",
+                    price_evidence_source=quote_source,
+                )
+                return
 
         reference_mid = self._resolve_local_l2_mid(maker_venue, position.symbol)
         current_price = pending.phase_state.maker_resting_limit_price
