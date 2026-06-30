@@ -6618,6 +6618,41 @@ class PassiveCloseExecutor:
             },
         )
 
+    def _resolve_existing_truth_gap_after_pre_submit_live_flat(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        existing_truth_gap: dict[str, Any] | None,
+        *,
+        cleanup_venue: Venue,
+        cleanup_leg: str,
+    ) -> None:
+        if not existing_truth_gap:
+            return
+        reconciliation = existing_truth_gap.get("reconciliation")
+        if isinstance(reconciliation, dict):
+            state.remove_pending_close_reconciliation(reconciliation)
+        payload = existing_truth_gap.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        self._journal.append(
+            "exit.accepted_order_truth_gap_resolved",
+            {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "venue": cleanup_venue.value,
+                "leg": cleanup_leg,
+                "accepted_order_id": existing_truth_gap.get("accepted_order_id"),
+                "accepted_client_order_id": existing_truth_gap.get("accepted_client_order_id"),
+                "resolution_status": "live_flat",
+                "decision": "clear_gap_pre_submit_flat",
+                "source": "passive_close_live_one_sided_pre_submit_flat",
+                "pre_cleanup_open_order_count": payload.get("open_order_count"),
+                "pre_cleanup_live_quantity": payload.get("live_quantity"),
+            },
+        )
+
     async def _flatten_live_one_sided_position(
         self,
         state: EngineState,
@@ -6761,6 +6796,110 @@ class PassiveCloseExecutor:
             )
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
+
+        refreshed_snapshot, refreshed_error = await self._fetch_live_position_snapshot(
+            venue,
+            position.symbol,
+        )
+        if refreshed_error:
+            self._journal.append(
+                "exit.passive_close_live_one_sided_truth_gap",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "live_quantity": live_qty,
+                    "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
+                    "open_orders_flat": open_orders_flat,
+                    "open_orders_evidence": open_orders_evidence,
+                    "live_truth_error": refreshed_error,
+                    "decision": "retain_pending",
+                    "reason": "one_sided_flatten_pre_submit_live_truth_unavailable",
+                },
+            )
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        refreshed_qty = self._live_position_quantity(refreshed_snapshot)
+        refreshed_side = getattr(refreshed_snapshot, "side", None)
+        refreshed_close_side = (
+            refreshed_side.opposite()
+            if isinstance(refreshed_side, Side)
+            else close_side
+        )
+        if refreshed_qty <= 1e-9:
+            self._journal.append(
+                "exit.passive_close_live_one_sided_pre_submit_flat",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "previous_quantity": live_qty,
+                    "live_quantity": refreshed_qty,
+                    "previous_side": close_side.value,
+                    "live_side": (
+                        refreshed_side.value
+                        if isinstance(refreshed_side, Side)
+                        else str(refreshed_side)
+                    ),
+                    "open_orders_flat": open_orders_flat,
+                    "open_orders_evidence": open_orders_evidence,
+                    "decision": "skip_reduce_only_probe_terminal_flat",
+                    "source": "passive_close_live_one_sided_pre_submit",
+                },
+            )
+            cleared = await self._clear_if_live_flat(
+                state,
+                pending,
+                position,
+                source="passive_close_live_one_sided_pre_submit_flat",
+                extra={
+                    "flattened_venue": venue.value,
+                    "flattened_quantity": 0.0,
+                    "previous_quantity": live_qty,
+                    "skipped_reduce_only": True,
+                },
+            )
+            if cleared:
+                self._resolve_existing_truth_gap_after_pre_submit_live_flat(
+                    state,
+                    pending,
+                    position,
+                    cleanup_handoff_truth_gap,
+                    cleanup_venue=venue,
+                    cleanup_leg=leg_label,
+                )
+                return True
+            pending.next_retry_at_ms = self._now_ms() + 5_000
+            return False
+
+        if (
+            abs(refreshed_qty - live_qty) > 1e-9
+            or refreshed_close_side != close_side
+        ):
+            self._journal.append(
+                "exit.passive_close_live_one_sided_pre_submit_quantity_refreshed",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "previous_quantity": live_qty,
+                    "live_quantity": refreshed_qty,
+                    "previous_side": close_side.value,
+                    "side": refreshed_close_side.value,
+                    "open_orders_flat": open_orders_flat,
+                    "open_orders_evidence": open_orders_evidence,
+                    "decision": "refresh_reduce_only_quantity",
+                    "source": "passive_close_live_one_sided_pre_submit",
+                },
+            )
+            live_qty = refreshed_qty
+            live_snapshot = refreshed_snapshot
+            live_side = refreshed_side
+            close_side = refreshed_close_side
 
         try:
             normalized_qty = float(await adapter.normalize_quantity(position.symbol, live_qty))

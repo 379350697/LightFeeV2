@@ -1043,6 +1043,56 @@ def test_close_order_error_resolution_requires_order_identity_match_for_reduce_o
     }
 
 
+def test_close_order_error_resolution_accepts_aster_reduce_only_reject_with_position_terminal_no_order():
+    payload = {
+        "position_id": "entry-1782816837656-LABUSDT",
+        "symbol": "LABUSDT",
+        "venue": "aster",
+        "exchange_code": "-2022",
+        "exchange_msg": "ReduceOnly Order is rejected.",
+        "exchange_error": {
+            "venue": "aster",
+            "operation": "place_order",
+            "http_status": 400,
+            "raw_body": '{"code":-2022,"msg":"ReduceOnly Order is rejected."}',
+            "exchange_code": "-2022",
+            "exchange_msg": "ReduceOnly Order is rejected.",
+            "request_context": {
+                "symbol": "LABUSDT",
+                "side": "sell",
+                "time_in_force": "IOC",
+                "quantity": 3.0,
+                "price": 0.0,
+                "reduce_only": True,
+                "client_order_id": "lfxlfafdaee235c94d4e",
+            },
+        },
+        "request_context": {
+            "symbol": "LABUSDT",
+            "side": "sell",
+            "time_in_force": "IOC",
+            "quantity": 3.0,
+            "price": 0.0,
+            "reduce_only": True,
+            "client_order_id": "lfxlfafdaee235c94d4e",
+        },
+    }
+
+    result = close_order_error_resolution_contract(
+        kind="order.rejected",
+        payload=payload,
+        current_exchange_truth_clean=True,
+        position_terminal_match=True,
+        order_terminal_match=False,
+        has_order_identity=True,
+    )
+
+    assert result == {
+        "resolved": True,
+        "resolution_bucket": "reduce_only_terminal_flat",
+    }
+
+
 def test_close_order_error_resolution_accepts_bybit_zero_position_reject_with_position_terminal():
     payload = {
         "position_id": "entry-1782748326583-POWRUSDT",

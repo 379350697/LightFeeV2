@@ -44,6 +44,7 @@ from lightfee.engine.business_contract import (
     passive_close_final_truth_contract,
     passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
     quote_rewarm_handoff_contract,
+    _payload_is_aster_reduce_only_no_order_reject,
 )
 from lightfee.engine.lifecycle_sla import (
     LifecyclePhaseBudget,
@@ -3133,6 +3134,8 @@ def _order_error_resolved_by_close_terminal_truth(
     ):
         if _payload_is_bybit_terminal_zero_qty_reduce_only(payload):
             return position_terminal_match
+        if _payload_is_aster_reduce_only_no_order_reject(payload):
+            return position_terminal_match and bool(order_identities)
         return bool(order_terminal_match)
     return False
 

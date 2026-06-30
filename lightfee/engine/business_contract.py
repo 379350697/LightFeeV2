@@ -880,6 +880,14 @@ def close_order_error_resolution_contract(
     )
     reduce_only = _payload_is_reduce_only_terminal_flat_reject(payload)
     terminal_zero_no_order = _payload_is_reduce_only_zero_position_reject(payload)
+    rejected_reduce_only_no_order = (
+        str(kind or "") in {
+            "order.rejected",
+            "exit.passive_close_hedge_error",
+            "exit.passive_close_maker_submit_error",
+        }
+        and _payload_is_aster_reduce_only_no_order_reject(payload)
+    )
     zero_fill = (
         str(kind or "") == "order.uncertain"
         and "zero fill" in _payload_reason_text(payload)
@@ -893,6 +901,11 @@ def close_order_error_resolution_contract(
         resolved = bool(
             order_terminal_match
             or (terminal_zero_no_order and position_terminal_match)
+            or (
+                rejected_reduce_only_no_order
+                and position_terminal_match
+                and has_order_identity
+            )
         )
         return {
             "resolved": resolved,
@@ -1297,6 +1310,48 @@ def _payload_is_reduce_only_zero_position_reject(payload: dict[str, Any]) -> boo
         )
     )
     return bybit_zero_position
+
+
+def _payload_is_aster_reduce_only_no_order_reject(payload: dict[str, Any]) -> bool:
+    request_context = _payload_request_context(payload)
+    if not _boolish(request_context.get("reduce_only")):
+        return False
+    if _boolish(request_context.get("post_only")):
+        return False
+    exchange_error = _exchange_error_dict(payload)
+    venue = str(
+        payload.get("venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).lower()
+    if venue not in {"aster", "aster_v3"}:
+        return False
+    code = str(
+        payload.get("exchange_code")
+        or exchange_error.get("exchange_code")
+        or payload.get("code")
+        or exchange_error.get("code")
+        or ""
+    ).strip()
+    reason = " ".join(
+        str(part or "")
+        for part in (
+            _payload_reason_text(payload),
+            payload.get("exchange_msg"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
+    ).lower()
+    if code != "-2022" and "-2022" not in reason:
+        return False
+    if "pending order" in reason:
+        return False
+    return (
+        "reduceonly order is rejected" in reason
+        or "reduce only order is rejected" in reason
+        or "reduce-only order is rejected" in reason
+    )
 
 
 def _payload_is_reduce_only_terminal_flat_reject(payload: dict[str, Any]) -> bool:

@@ -3127,7 +3127,7 @@ class TestFallbackResidualReal:
         okx = SequencedPositionAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
         bybit = SequencedPositionAdapter(
             Venue.BYBIT,
-            [(2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
+            [(2.0, Side.SELL), (2.0, Side.SELL), (2.0, Side.SELL), (0.0, Side.SELL)],
         )
         _attach_bybit_min_notional_transport(bybit)
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
@@ -3234,7 +3234,10 @@ class TestFallbackResidualReal:
                 )
 
         okx = LiveAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
-        bybit = LiveAdapter(Venue.BYBIT, [(20.0, Side.SELL), (0.0, Side.SELL)])
+        bybit = LiveAdapter(
+            Venue.BYBIT,
+            [(20.0, Side.SELL), (20.0, Side.SELL), (0.0, Side.SELL)],
+        )
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
         executor = PassiveCloseExecutor(
             adapters, journal, config_overrides={"runtime_mode": "paper"},
@@ -3344,7 +3347,12 @@ class TestFallbackResidualReal:
         okx = ForceCloseAdapter(Venue.OKX, [(0.0, Side.BUY), (0.0, Side.BUY)])
         bybit = ForceCloseAdapter(
             Venue.BYBIT,
-            [(20.0, Side.SELL), (20.0, Side.SELL), (0.0, Side.SELL)],
+            [
+                (20.0, Side.SELL),
+                (20.0, Side.SELL),
+                (20.0, Side.SELL),
+                (0.0, Side.SELL),
+            ],
             first_order_raises=True,
         )
         adapters = {Venue.OKX: okx, Venue.BYBIT: bybit}
@@ -3579,6 +3587,188 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_truth_gap" in kinds
         assert "exit.passive_close_live_one_sided_flatten" not in kinds
 
+    def test_one_sided_flatten_rechecks_live_truth_before_reduce_only_when_flat(self):
+        """Skip the cleanup IOC if the last live truth already proves this leg flat."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-jit-flat",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_000,
+        ))
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        bybit.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_001,
+        ))
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            price=1.0211,
+        ))
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2_000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is True
+        bybit.place_order.assert_not_called()
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.passive_close_live_one_sided_pre_submit_flat" in kinds
+        assert "exit.passive_close_live_one_sided_flatten" not in kinds
+
+    def test_one_sided_flatten_clamps_reduce_only_to_latest_live_quantity(self):
+        """Use the latest live quantity when it shrinks before cleanup submit."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-one-sided-jit-clamp",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        okx = _mock_adapter_with_tick(Venue.OKX)
+        okx.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BEATUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_000,
+        ))
+        okx.fetch_open_orders = AsyncMock(return_value=[])
+        bybit = _mock_adapter_with_tick(Venue.BYBIT)
+        live_quantities = iter([7.0, 0.0, 0.0, 0.0])
+
+        async def fetch_bybit_position(symbol):
+            quantity = next(live_quantities, 0.0)
+            return PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.SELL,
+                quantity=quantity,
+                entry_price=1.0211 if quantity else 0.0,
+                observed_at_ms=2_001,
+            )
+
+        bybit.fetch_position = AsyncMock(side_effect=fetch_bybit_position)
+        bybit.fetch_open_orders = AsyncMock(return_value=[])
+        bybit.place_order = AsyncMock(side_effect=lambda request: _make_order_fill(
+            venue=Venue.BYBIT,
+            symbol=request.symbol,
+            side=request.side,
+            quantity=request.quantity,
+            price=request.price or 1.0211,
+        ))
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+
+        result = asyncio.run(
+            executor._flatten_live_one_sided_position(
+                state,
+                pending,
+                position,
+                venue=Venue.BYBIT,
+                live_snapshot=PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="BEATUSDT",
+                    side=Side.SELL,
+                    quantity=20.0,
+                    entry_price=1.0211,
+                    observed_at_ms=2_000,
+                ),
+                leg_label="short",
+            )
+        )
+
+        assert result is True
+        bybit.place_order.assert_awaited_once()
+        request = bybit.place_order.await_args.args[0]
+        assert request.side == Side.BUY
+        assert request.quantity == 7.0
+        assert request.reduce_only is True
+        assert request.time_in_force == TimeInForce.IOC
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        refreshed = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_live_one_sided_pre_submit_quantity_refreshed"
+        ]
+        assert refreshed
+        assert refreshed[-1]["previous_quantity"] == 20.0
+        assert refreshed[-1]["live_quantity"] == 7.0
+
     def test_one_sided_flatten_handoffs_existing_truth_gap_to_cleanup_when_no_open_orders(self):
         journal = _open_journal()
         state = EngineState()
@@ -3623,7 +3813,7 @@ class TestFallbackResidualReal:
         })
 
         bybit = _mock_adapter_with_tick(Venue.BYBIT)
-        bybit_live_quantities = iter([20.0, 0.0, 0.0])
+        bybit_live_quantities = iter([20.0, 20.0, 0.0, 0.0])
 
         async def fetch_bybit_position(symbol):
             return PositionSnapshot(
@@ -4360,7 +4550,12 @@ class TestFallbackResidualReal:
         )
         bybit = FinalTruthAdapter(
             Venue.BYBIT,
-            [(425.0, Side.SELL), (425.0, Side.SELL), (0.0, Side.SELL)],
+            [
+                (425.0, Side.SELL),
+                (425.0, Side.SELL),
+                (425.0, Side.SELL),
+                (0.0, Side.SELL),
+            ],
         )
 
         executor = PassiveCloseExecutor(
@@ -4997,7 +5192,7 @@ class TestFallbackResidualReal:
         bybit = SequencedFlatAdapter(Venue.BYBIT, [0.0, 0.0])
         aster = SequencedFlatAdapter(
             Venue.ASTER,
-            [1874.0, 0.0],
+            [1874.0, 1874.0, 0.0],
             OrderSubmitError(
                 SubmitFailureClass.REJECTED,
                 'HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}',
@@ -6304,7 +6499,7 @@ class TestFallbackResidualReal:
 
         aster = TerminalFlatAdapter(
             Venue.ASTER,
-            [533.0, 0.0, 0.0],
+            [533.0, 533.0, 0.0, 0.0],
             OrderSubmitError(
                 SubmitFailureClass.REJECTED,
                 'HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}',
@@ -8531,7 +8726,11 @@ class TestPassiveCloseMakerLegLiveTruthPrecheck:
                     filled_at_ms=1780560000001,
                 )
 
-        long_adapter = SettlingLiveTruthAdapter(Venue.OKX, Side.SELL, [23.3, 23.3])
+        long_adapter = SettlingLiveTruthAdapter(
+            Venue.OKX,
+            Side.SELL,
+            [23.3, 23.3, 23.3, 23.3],
+        )
         short_adapter = SettlingLiveTruthAdapter(Venue.BYBIT, Side.BUY, [0.0, 0.0])
         executor = PassiveCloseExecutor(
             {Venue.OKX: long_adapter, Venue.BYBIT: short_adapter},

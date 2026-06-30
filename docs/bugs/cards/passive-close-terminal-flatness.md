@@ -215,6 +215,8 @@ alone is not success evidence.
 | 2026-06-29 | Aster accepted close ACK truth-gap identity closure | fixed in `617adb8`, deployed/cloud verified | CL-133 turns accepted 0-fill Aster close ACKs into `accepted_order_truth_gap` work rather than ordinary `zero_fill`; diagnose now treats `exit.accepted_order_truth_gap_resolved` as terminal only for `filled/live_flat` and requires matching order/client identity before downgrading Aster `-2022` reduce-only artifacts. Cloud verification showed running/flat/no-open-orders/no pending truth gaps and V1 `RUNNING_CLEAN`. |
 | 2026-06-29 | LABUSDT accepted truth-gap to single-leg cleanup handoff | local verified; deploy pending | CL-136 keeps exit-shadow accounting at one strategy sample group per normal close trigger and separates passive-close retry counts in diagnose. Existing accepted-order truth gaps no longer block live one-sided cleanup when follow-up truth proves open orders empty and live exposure still exists; runtime emits `exit.accepted_order_truth_gap_cleanup_handoff`, submits reduce-only IOC cleanup, then removes the old gap only after fresh live-flat/no-open-orders proof and emits `exit.accepted_order_truth_gap_resolved(live_flat_after_single_leg_cleanup)`. |
 | 2026-06-30 | POWRUSDT post-maker-fill live-zero hedge closure | local verified; deploy pending | CL-137 adds a terminal-maker-fill live-position/open-order precheck before hedge catch-up. Both legs already flat clears through live-flat proof instead of submitting a Bybit reduce-only order that would return `110017 current position is zero`; dirty open-order truth retains. Diagnose/business-contract close only this Bybit no-order zero-position reject by position terminal truth when current exchange truth is clean. |
+| 2026-06-30 | LABUSDT Aster direct reduce-only no-order reject diagnosis | local verified; deploy pending | CL-141 keeps CL-110 identity tightening for generic Binance/Aster `-2022`, but adds the narrower Aster V3 direct reject shape: reduce-only, non-post-only request, request client/order identity, same-position terminal flat, and current flat/no-open-orders truth. That no-order close artifact can resolve by position terminal truth because no accepted order exists to match; missing identity or dirty truth remains a current blocker. |
+| 2026-06-30 | one-sided cleanup pre-submit live truth refresh | local verified; deploy pending | CL-142 reduces avoidable Aster/Bybit already-flat reduce-only artifacts at the source: one-sided passive-close cleanup refreshes live position after open-order proof and before IOC construction. If latest truth is flat it skips IOC only through full live-flat/open-order terminal proof; if quantity/side changed it rebuilds the request from latest truth; unavailable truth retains fail-closed. |
 
 ## Recurrences
 
@@ -295,3 +297,13 @@ alone is not success evidence.
     chunks must preserve fill accounting and fall back to terminal taker close.
 19. If Binance close returns `-2022`, inspect existing reduce-only close orders
     and position truth before deciding retry, adopt, or terminal-flat.
+20. If Aster close returns `-2022 ReduceOnly Order is rejected`, distinguish
+    accepted-order truth gaps from direct HTTP rejects. Direct rejects create no
+    accepted order to match later; only downgrade them after request identity,
+    same-position terminal flat, and current flat/no-open-orders truth are all
+    present.
+21. For repeated Aster/Bybit already-flat reduce-only artifacts, inspect whether
+    `exit.passive_close_live_one_sided_pre_submit_flat` or
+    `exit.passive_close_live_one_sided_pre_submit_quantity_refreshed` preceded
+    the cleanup submit. Missing pre-submit refresh is a runtime-quality issue;
+    present refresh plus clean terminal proof is a resolved close artifact.
