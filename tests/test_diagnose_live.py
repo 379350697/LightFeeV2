@@ -7557,7 +7557,10 @@ def test_run_diagnose_reports_zero_fill_lifecycle_guard_entry_outcome(monkeypatc
                     "entry_id": "entry-zero-lifecycle",
                     "symbol": "HOMEUSDT",
                     "reason": "candidate_not_tradeable_after_zero_fill_reprice",
-                    "blocked_reasons": ["lifecycle_risk_only"],
+                    "blocked_reasons": [
+                        "lifecycle_risk_only",
+                        "recovery_ledger_blocked",
+                    ],
                     "phase": "high_slippage_maker",
                 },
             },
@@ -7604,10 +7607,23 @@ def test_run_diagnose_reports_zero_fill_lifecycle_guard_entry_outcome(monkeypatc
         assert outcome["zero_fill_lifecycle_guard_count"] == 1
         assert outcome["zero_fill_lifecycle_guard_blocker_counts"] == {
             "lifecycle_risk_only": 1,
+            "recovery_ledger_blocked": 1,
         }
         assert outcome["zero_fill_lifecycle_guard_entry_ids"] == [
             "entry-zero-lifecycle"
         ]
+        viability = outcome["entry_execution_viability_summary"]
+        assert viability["blocked_count"] == 1
+        assert viability["zero_fill_reprice_blocked_count"] == 1
+        assert viability["blocker_counts"] == {
+            "lifecycle_risk_only": 1,
+            "recovery_ledger_blocked": 1,
+        }
+        assert viability["samples"][0]["decision"] == "terminalize_without_repost"
+        unfilled_quality = outcome["passive_unfilled_quality_summary"]
+        assert unfilled_quality["passive_unfilled_count"] == 1
+        assert unfilled_quality["avoidable_reprice_not_tradeable_count"] == 1
+        assert unfilled_quality["legitimate_passive_no_fill_count"] == 0
         assert outcome["reason_counts"][
             "candidate_not_tradeable_after_zero_fill_reprice"
         ] == 1
@@ -7760,6 +7776,60 @@ def test_entry_outcome_summary_separates_quote_lease_and_oi_liquidity_reasons():
             "next_structural_recheck_ms": None,
             "raw_candidate_block_count": 5,
             "structural_suppressed_count": 0,
+            "top_blocked_owner_ids": [
+                {
+                    "owner_id": "aster:HOMEUSDT",
+                    "count": 2,
+                    "actions": {
+                        "block_oi_unavailable": 1,
+                        "block_stale_quote": 1,
+                    },
+                    "evidence_classes": {
+                        "oi": 1,
+                        "quote": 1,
+                    },
+                    "reasons": {
+                        "oi_evidence_unavailable": 1,
+                        "rest_resolved_but_stale": 1,
+                    },
+                },
+                {
+                    "owner_id": "aster:BSBUSDT",
+                    "count": 1,
+                    "actions": {"block_oi_unavailable": 1},
+                    "evidence_classes": {"oi": 1},
+                    "reasons": {"timeout_waiting_for_oi": 1},
+                },
+                {
+                    "owner_id": "binance:BSBUSDT",
+                    "count": 1,
+                    "actions": {"block_oi_unavailable": 1},
+                    "evidence_classes": {"oi": 1},
+                    "reasons": {"oi_evidence_unavailable": 1},
+                },
+                {
+                    "owner_id": "binance:HOMEUSDT",
+                    "count": 1,
+                    "actions": {"block_stale_quote": 1},
+                    "evidence_classes": {"quote": 1},
+                    "reasons": {"rest_throttled": 1},
+                },
+            ],
+        },
+        "market_data_readiness_summary": {
+            "blocks_production_gate": False,
+            "current_scope": "entry_candidate_admission",
+            "readiness_buckets": {
+                "quote_stale": 2,
+                "oi_below_floor": 0,
+                "oi_unavailable": 3,
+                "oi_structural_suppressed": 0,
+                "prewarm_pending": 0,
+            },
+            "readiness_blocked_count": 5,
+            "raw_candidate_block_count": 5,
+            "dedupe_scope": "symbol_venue_ttl",
+            "next_action": "targeted_refresh_or_data_source_backfill",
             "top_blocked_owner_ids": [
                 {
                     "owner_id": "aster:HOMEUSDT",
@@ -8993,6 +9063,9 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
                 "blocking_count": 0,
                 "maker_no_fill_count": 0,
                 "zero_fill_cycle_count": 0,
+                "normal_maker_poll_zero_fill_count": 0,
+                "resolved_after_zero_fill_count": 0,
+                "unproductive_zero_fill_count": 0,
                 "fallback_after_zero_fill_count": 0,
                 "maker_viability_rejected_count": 0,
                 "early_fallback_after_viability_rejected_count": 0,
@@ -9219,6 +9292,64 @@ def test_business_progression_quality_reports_close_cost_inefficiency_as_non_blo
     assert business["active_stuck_count"] == 0
 
 
+def test_business_progression_quality_classifies_resolved_zero_fill_poll_as_normal():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "exit.passive_close_created",
+            "payload": {
+                "position_id": "entry-close-normal-zero-fill",
+                "symbol": "LABUSDT",
+                "reason": "funding_capture",
+            },
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "execution.passive_cycle_zero_fill",
+            "payload": {
+                "position_id": "entry-close-normal-zero-fill",
+                "symbol": "LABUSDT",
+                "zero_fill_cycles": 1,
+                "max_zero_fill_cycles": 3,
+            },
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "exit.passive_close_resolved",
+            "payload": {
+                "position_id": "entry-close-normal-zero-fill",
+                "symbol": "LABUSDT",
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                },
+            },
+        },
+    ]
+
+    business = dl._build_business_progression_quality_summary(
+        events,
+        production_acceptance_gate={
+            "gate_passed": True,
+            "exchange_truth_flat": True,
+            "exchange_truth_no_open_orders": True,
+            "blocking_reasons": [],
+            "v1_lifecycle_summary": {"blocking_row_count": 0},
+        },
+    )
+
+    summary = business["close_cost_inefficiency_summary"]
+    assert summary["count"] == 1
+    assert summary["normal_maker_poll_zero_fill_count"] == 1
+    assert summary["resolved_after_zero_fill_count"] == 1
+    assert summary["unproductive_zero_fill_count"] == 0
+    assert summary["samples"][0]["classification"] == "normal_maker_poll_zero_fill"
+    assert summary["samples"][0]["next_action"] == "none_terminal_resolved"
+
+
 def test_business_progression_quality_counts_maker_viability_rejection_separately():
     import scripts.diagnose_live as dl
 
@@ -9288,6 +9419,54 @@ def test_business_progression_quality_counts_maker_viability_rejection_separatel
     assert summary["zero_fill_cycle_count"] == 0
     assert summary["samples"][0]["maker_viability_rejected_count"] == 1
     assert summary["samples"][0]["next_action"] == "monitor_early_fallback_cost"
+
+
+def test_conclusion_keeps_resolved_historical_order_artifacts_from_degrading_gate_pass():
+    import scripts.diagnose_live as dl
+
+    conclusion = dl._build_conclusion(
+        health={"ok": True, "critical_count": 0, "fingerprints": []},
+        state_consistency={
+            "state_mismatch": False,
+            "local_open_exchange_flat": False,
+        },
+        evidence_completeness={
+            "overall": "complete",
+            "confidence": "high",
+            "missing_evidence": [],
+        },
+        order_errors=[
+            {
+                "kind": "order.rejected",
+                "count": 1,
+                "exchange_code": "-2022",
+                "resolved": True,
+                "status": "historical_resolved",
+                "resolution_status": "terminal_flat",
+                "visibility": "historical_terminal_artifact",
+                "current_blocker": False,
+            },
+        ],
+        l2_evidence={"missing_l2_or_tick_count": 0, "stale_rebuild_count": 0},
+        snapshot_evidence={"stale_or_degraded_count": 0},
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+        },
+        production_acceptance_gate={
+            "gate_passed": True,
+            "blocking_reasons": [],
+            "exchange_truth_flat": True,
+            "exchange_truth_no_open_orders": True,
+        },
+    )
+
+    assert conclusion["status"] == "healthy"
+    assert conclusion["risk"] == "low"
+    assert "historical resolved order error groups" in conclusion["summary"]
+    assert "review order_error_evidence for root cause" not in conclusion["next_actions"]
 
 
 def test_business_progression_quality_flags_actionable_passive_close_single_leg_wait():

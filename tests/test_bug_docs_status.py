@@ -43,6 +43,25 @@ def test_bug_index_archive_preserves_historical_latest_narrative():
     assert "Latest stale risk-state alignment and order-error closure" in archive
 
 
+def test_recent_deployed_clusters_do_not_remain_deploy_pending():
+    bug_index = BUG_INDEX.read_text()
+    daily = (ROOT / "docs/bugs/daily/2026-06-30.md").read_text()
+
+    for cluster in ("CL-140", "CL-141", "CL-142"):
+        index_row = next(
+            line for line in bug_index.splitlines() if f"| {cluster} |" in line
+        )
+        assert "deployed/cloud verified" in index_row
+        assert "deploy pending" not in index_row
+
+    for cluster in ("CL-140", "CL-141", "CL-142"):
+        section_start = daily.index(f"## Cluster {cluster}")
+        section_end = daily.find("\n## Cluster ", section_start + 1)
+        section = daily[section_start:] if section_end < 0 else daily[section_start:section_end]
+        assert "Status: deployed/cloud verified" in section
+        assert "Status: local verified; deploy pending" not in section
+
+
 def test_bug_ledger_checker_json_reports_clean_governance():
     result = subprocess.run(
         [sys.executable, str(CHECK_SCRIPT), "--json"],

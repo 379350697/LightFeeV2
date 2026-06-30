@@ -21,7 +21,12 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import OpenPosition, PendingEntry, PendingPassiveOrder
+from lightfee.engine.state import (
+    OpenPosition,
+    PendingEntry,
+    PendingEntryPassivePhaseState,
+    PendingPassiveOrder,
+)
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -3576,6 +3581,97 @@ async def test_live_terminal_zero_fill_with_clear_truth_allows_passive_unfilled(
     assert decisions[-1]["allows_pending_removal"] is True
     assert "entry.passive_unfilled" in kinds
     assert "pending_entry.pending_entry_finalized" in kinds
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_reprice_lifecycle_block_emits_dispatch_viability_block(
+    config,
+    tmp_journal,
+):
+    _mark_live(config)
+    adapter = _TerminalNoFillClearOpenOrdersFlatPositionAdapter(venue=Venue.BYBIT)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+    )
+    runtime.journal = tmp_journal
+    passive_order = PendingPassiveOrder(
+        order_id="jto-maker-order",
+        client_order_id="jto-maker-client",
+        accepted_at_ms=1780584320000,
+        timeout_at_ms=1780584322000,
+        limit_price=1.23,
+        target_quantity=31.0,
+        last_progress_state=PassiveOrderState.CANCELED,
+    )
+    pending = _pending_entry(
+        pending_id="entry-1780584320000-JTOUSDT",
+        symbol="JTOUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.HYPERLIQUID,
+        target_quantity=31.0,
+        first_funding_timestamp_ms=1780587925000,
+        funding_timestamp_ms=1780587925000,
+        maker_order_id="jto-maker-order",
+        maker_client_order_id="jto-maker-client",
+        maker_leg="long",
+        maker_leg_filled=0.0,
+        hedge_leg_filled=0.0,
+        outcome="maker_resting",
+        passive_order=passive_order,
+        phase_state=PendingEntryPassivePhaseState(
+            execution_kind="entry",
+            preferred_maker_leg="long",
+            active_maker_leg="long",
+            phase="high_slippage_maker",
+            cycle_attempt=1,
+            phase_started_at_ms=1780584320000,
+            cycle_started_at_ms=1780584320000,
+            zero_fill_cycles_in_phase=1,
+        ),
+        frozen_candidate={
+            "symbol": "JTOUSDT",
+            "long_venue": "bybit",
+            "short_venue": "hyperliquid",
+            "blocked": True,
+            "blocked_reasons": [
+                "lifecycle_risk_only",
+                "recovery_ledger_blocked",
+            ],
+            "entry_notional_quote": 50.0,
+        },
+    )
+    pending.metadata = {
+        "passive_zero_fill_retry_pending": True,
+        "passive_zero_fill_retry_at_ms": 1780584324000,
+    }
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    handled = await runtime._handle_pending_passive_zero_fill_completion(
+        pending,
+        pending.pending_id,
+        passive_order,
+        adapter,
+        now_ms=1780584325000,
+    )
+
+    assert handled is True
+    assert pending.pending_id not in runtime.state.pending_entries
+    events = tmp_journal.read_all()
+    blocked = [
+        event["payload"]
+        for event in events
+        if event["kind"] == "entry.dispatch_viability_blocked"
+    ]
+    assert len(blocked) == 1
+    assert blocked[0]["entry_id"] == pending.pending_id
+    assert blocked[0]["source"] == "zero_fill_reprice"
+    assert blocked[0]["decision"] == "terminalize_without_repost"
+    assert "lifecycle_risk_only" in blocked[0]["blocked_reasons"]
+    assert "recovery_ledger_blocked" in blocked[0]["blocked_reasons"]
+    kinds = [event["kind"] for event in events]
+    assert "execution.passive_entry_reposted" not in kinds
+    assert "entry.passive_unfilled" in kinds
 
 
 @pytest.mark.asyncio

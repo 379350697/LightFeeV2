@@ -110,6 +110,13 @@ promotion time. Those events must carry `evidence_role=prewarm_only` and
 evidence, not current entry blockers; only `entry_execution` evidence from the
 V1 primary+shadow scope can increment current unresolved entry blockers.
 
+Deploy diagnostics must keep readiness separate from execution failure. Quote
+stale, confirmed OI below floor, OI unavailable, structural OI suppression, and
+prewarm-pending samples belong in `market_data_readiness_summary` with their
+refresh/backoff action. They must not be hidden, but they also must not be
+reported as abnormal positions, open-order failures, or a reason to loosen
+quote TTL, OI floor, liquidity floor, or post-only execution quality.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |
@@ -135,6 +142,7 @@ V1 primary+shadow scope can increment current unresolved entry blockers.
 | 2026-06-24 | Entry quote/OI prewarm horizon after Gate/Bitget candidate recovery | `653b21a` deployed/cloud verified | CL-115 adds a bounded `entry_quote_prewarm_extra_candidate_count=24` near-promotion horizon. Extra candidates only warm quote/OI caches and emit `prewarm_only` evidence; final entry filtering and dispatch remain V1 primary+shadow. Diagnose now separates `prewarm_extra` counters, avoids double-counting paired quote-revalidate/rewarm events, and does not count prewarm-only failures as unresolved blockers. Active venue admission cooldowns, including Aster `max_notional_admission_blocked`, prune before prewarm. Cloud since-deploy diagnose passed with no entry evidence blockers, no quote rewarm timeout, and exchange truth flat/no-open-orders. |
 | 2026-06-27 | Public OI pre-HTTP symbol filter and spread snapshot sharing | code fix `d2d89af` deployed/cloud verified | CL-123 filters Binance/Aster-compatible OI symbols before OI HTTP when bulk premiumIndex/bookTicker does not confirm tradeability or candidate mark truth is missing/rejected. Spread-sidecar defaults to consuming the main sidecar snapshot and only direct-fetches public data through an explicit fallback config that marks `source_mode=direct_market_fallback`. |
 | 2026-06-27 | Private truth pre-HTTP symbol filter and spread source-state classification | code fix `a839074` deployed/cloud verified | CL-124 adds shared `venue_symbol_eligibility(...)` for Aster private position/open-order probes, reports `symbol_not_listed_before_private_truth_http` before V3 private HTTP, keeps account-level unfiltered truth untouched, and splits spread stale source evidence into current degraded vs `transient_stale_recovered`. Cloud diagnose passed with flat/no-open-orders, `private_truth_pre_http_filtered_count=0`, and recovered spread stale source not counted as current degraded. No quote/OI threshold, entry sizing, order, close, or recovery behavior is changed. |
+| 2026-07-01 | Deploy readiness bucket for quote/OI candidate noise | local verified; deploy pending | CL-143 adds `market_data_readiness_summary` for quote stale, OI below floor, OI unavailable, structural OI suppression, and prewarm pending samples. The fix explains candidate-readiness volume without lowering OI/quote/liquidity gates and without misclassifying readiness as order-path failure. |
 
 ## Regression Harness
 

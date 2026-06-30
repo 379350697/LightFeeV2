@@ -102,6 +102,13 @@ evidence must map to the matrix before runtime code changes.
 - Aster maker cancel returns HTTP `400` / order not found / non-active after
   positive fill. Treat it as a follow-up open-order/progress truth signal and
   preserve status/body/code/msg evidence in the journal.
+- `entry.dispatch_viability_blocked` appears before maker submit, price
+  resolution, or zero-fill reprice when quote/OI/post-only/lifecycle/recovery
+  evidence says the candidate is not currently tradeable.
+- `candidate_not_tradeable_after_zero_fill_reprice` with
+  `lifecycle_risk_only` or `recovery_ledger_blocked` is a dispatch viability
+  block, not permission to repost maker and not a fake passive-unfilled
+  terminal state.
 
 ## Current Effective Rule
 
@@ -209,6 +216,15 @@ shared missing-hedge, terminal hedge-dust, or reduce-only cleanup/retain
 decision. Cancel rejects from Aster/compatible venues are not terminal failure
 by themselves; they trigger follow-up progress/open-order proof and must keep
 the exchange body/code/msg as evidence.
+
+Entry execution viability is the shared pre-maker and reprice boundary. A
+candidate that fails fresh quote/OI, post-only, symbol eligibility, lifecycle,
+or recovery-ledger checks must emit `entry.dispatch_viability_blocked` and avoid
+new maker/repost work. This does not relax terminality: an already submitted
+pending entry can be removed as passive-unfilled only after maker terminal
+no-fill, realtime open-order absence, and live-position flat proof. Positive
+fill, live exposure, matching open orders, or unavailable truth still retain or
+route to cleanup/recovery.
 
 Terminal cleanup/recovery events close their owner for current closure indexing.
 Once `pending_entry.owned_live_conflict_cleanup_succeeded` or
@@ -339,6 +355,7 @@ without owner ids.
 | 2026-06-28 | Recovered owner symbol identity and funding-close metadata | `904bb23` deployed/cloud verified | CL-131 makes recovered live-position ownership use the same canonical venue symbol identity across recovery ledger, owner index, unpaired recovery, and V1 closure. OKX raw `ACT-USDT-SWAP` now matches strategy symbol `ACTUSDT` instead of replaying the owned short leg as `unpaired_live_position`. Startup recovery also refuses to create a managed `live-recovered:*` open position without funding-close metadata, emitting `recovery.recovered_position_funding_timestamp_missing` when journal/quote truth cannot provide it. Cloud ACT closed and final production truth is running/flat/no-open-orders. See [daily/2026-06-28.md#cluster-cl-131---act-funding-close-lifecycle-recovery-metadata-and-symbol-identity](../daily/2026-06-28.md#cluster-cl-131---act-funding-close-lifecycle-recovery-metadata-and-symbol-identity). |
 | 2026-06-29 | SKYAI pending-entry maker terminal under entry target | `b6004dd` deployed/cloud verified | CL-134 closes the pending-entry hedge-asymmetry family and its P3 tail. Maker terminality is scoped to the maker order, not the entry-level target quantity: a terminal passive maker `FILLED` for the exchange-rounded maker target plus realtime open-order absence is terminal even if `maker_leg_filled < pending.target_quantity`. Abort/release paths share maker terminal proof; cancel 400 is followed by progress/open-order truth; hard-ceiling positive-fill entries drive missing hedge before abort; and `_pending_entry_has_unresolved_maker_order()` now uses the same terminal/open-order truth contract for flat-abandon and force-terminal guards. Matching open orders or unavailable open-order truth still retain fail-safe. Final cloud proof at `b6004dd` was running, flat/no-open-orders, no pending entry, no order-truth gaps, no live conflicts, and no unmapped lifecycle rows. See [daily/2026-06-29.md#cluster-cl-134---skyai-pending-entry-hedge-asymmetry-and-maker-terminal-proof](../daily/2026-06-29.md#cluster-cl-134---skyai-pending-entry-hedge-asymmetry-and-maker-terminal-proof). |
 | 2026-06-30 | Active open diagnostic scope and terminal drift closure | local verified; deploy pending | CL-138 tightens the CL-112 diagnose scope without loosening fail-closed recovery. Managed active owners may fall back from zero/missing `matched_quantity` to positive `quantity` only when owner id, symbol, venues, and balanced exchange truth exist; `live-recovered:*`, stale owner ids, and open-order truth gaps still block. Historical `runtime.position_drift_corrected` stops blocking a later active owner only when the same historical owner also has `runtime.position_lifecycle_terminal` and `recovery.flat`. The same closure maps `exit.accepted_order_truth_gap_resolved` to V1 `PASSIVE_CLOSE` so explicit passive-close truth-gap resolution is not reported as unmapped. See [daily/2026-06-30.md#cluster-cl-138---active-open-diagnostic-scope-and-passive-close-truth-gap-lifecycle-mapping](../daily/2026-06-30.md#cluster-cl-138---active-open-diagnostic-scope-and-passive-close-truth-gap-lifecycle-mapping). |
+| 2026-07-01 | Deploy diagnostics entry viability closure | local verified; deploy pending | CL-143 adds the shared `entry.dispatch_viability_blocked` vocabulary before dispatch/maker submit/reprice, separates late lifecycle/recovery reprice blocks from true passive-unfilled terminality, and keeps `_finalize_pending_entry()` as the V1 terminal proof boundary. Diagnose now exposes `entry_execution_viability_summary` and `passive_unfilled_quality_summary` so selected/dispatched/opened gaps do not get misread as abnormal positions or hidden order failures. See [daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure](../daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure). |
 | 2026-06-27 | Live mismatch flatten latch complete-truth release | `c827b82` deployed/cloud verified | CL-128 makes `live_position_mismatch_flatten_failed` complete-truth-only clearable through the V1 recovery core and routes the same latch through runtime account-truth refresh when clean-live-position probes see no live positions. Evidence-gap/unavailable truth still preserves fail-closed. Cloud final proof was running/flat/no-open-orders with `recovery_blocked_reason=null`. See [daily/2026-06-27.md#cluster-cl-128---complete-truth-clear-for-live-mismatch-flatten-latch](../daily/2026-06-27.md#cluster-cl-128---complete-truth-clear-for-live-mismatch-flatten-latch). |
 | 2026-06-27 | Pending-entry ACK-only hedge order truth gap | `887c34d` deployed/cloud verified | CL-129 makes pending-entry hedge ACK-only accepted orders owner-scoped truth work instead of plain `hedge_inflight`: accepted ids are persisted in `metadata.hedge_accepted_order_truth_gap`, duplicate hedge submit is blocked while truth is unresolved, fill/live-flat/open-order/unavailable states resolve through the shared accepted-order truth helper, and abort cleanup is gated on current exchange truth. Cloud final proof was running/flat/no-open-orders with no pending entry, no open order, and `pending_entry_order_truth_gap_count=0`. See [daily/2026-06-27.md#cluster-cl-129---pending-entry-ack-only-hedge-order-truth-gap](../daily/2026-06-27.md#cluster-cl-129---pending-entry-ack-only-hedge-order-truth-gap). |
 

@@ -6802,6 +6802,21 @@ class LiveRuntime:
                 strategy=strategy,
             )
             if not decision.allowed:
+                viability_payload = {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": decision.reason,
+                    "blocked_reasons": [decision.reason] if decision.reason else [],
+                    "source": "pending_entry_viability_before_zero_fill_cycle",
+                    "decision": "terminalize_by_v1_truth",
+                    "ts_ms": now_ms,
+                }
+                for key, value in decision.evidence.items():
+                    viability_payload.setdefault(key, value)
+                self.journal.append(
+                    "entry.dispatch_viability_blocked",
+                    viability_payload,
+                )
                 self.journal.append(
                     "pending_entry.viability_blocked",
                     {
@@ -6862,13 +6877,32 @@ class LiveRuntime:
         )
         phase_budget = pending_entry_phase_zero_fill_budget(self.config.strategy)
         if action.reason == "candidate_not_tradeable_after_zero_fill_reprice":
+            blocked_reasons = [
+                str(reason)
+                for reason in action.evidence.get("blocked_reasons", []) or []
+                if str(reason)
+            ]
+            self.journal.append(
+                "entry.dispatch_viability_blocked",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": action.reason,
+                    "blocked_reasons": blocked_reasons,
+                    "source": "zero_fill_reprice",
+                    "phase": previous_phase,
+                    "phase_zero_fill_budget": phase_budget,
+                    "decision": "terminalize_without_repost",
+                    "ts_ms": now_ms,
+                },
+            )
             self.journal.append(
                 "execution.direction_drift_blocked",
                 {
                     "entry_id": entry_id,
                     "symbol": pending.symbol,
                     "reason": action.reason,
-                    "blocked_reasons": action.evidence.get("blocked_reasons", []),
+                    "blocked_reasons": blocked_reasons,
                     "phase": previous_phase,
                     "phase_zero_fill_budget": phase_budget,
                 },

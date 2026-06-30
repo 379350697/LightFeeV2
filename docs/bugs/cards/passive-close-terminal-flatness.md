@@ -23,6 +23,9 @@ residuals, and live-flat cleanup.
 - `close_reconciliation_evidence_gap_count`
 - `execution.dual_taker_armed` with `execution_kind=exit`
 - `exit.passive_close_post_only_maker_rotated`
+- `close_cost_inefficiency_summary.normal_maker_poll_zero_fill_count`
+- `close_cost_inefficiency_summary.resolved_after_zero_fill_count`
+- `close_cost_inefficiency_summary.unproductive_zero_fill_count`
 - Binance close `-5022 GTX_ORDER_REJECT` post-only maker reject
 - Binance close `-2022 ReduceOnly Order is rejected`
 - Bitget close `40786 Duplicate clientOid`
@@ -160,6 +163,13 @@ the passive-close owner. If the position is already flat, terminal-flat handling
 still requires exchange position truth and no-open-order truth; the error code
 alone is not success evidence.
 
+Passive-close zero-fill diagnostics must distinguish normal maker polling from
+unproductive cost. A maker close that polls zero fill and later resolves
+terminally is normal/resolved maker waiting. Only no-price, stale quote,
+unmaintainable maker, maker viability rejected, or final fallback-after-zero
+paths count as unproductive zero-fill cost evidence. This diagnostic split must
+not change live-flat, open-order, reduce-only cleanup, or fail-closed rules.
+
 ## V1 / Exchange Semantics
 
 - V1 lets live exchange truth dominate stale recovered local close state.
@@ -215,8 +225,9 @@ alone is not success evidence.
 | 2026-06-29 | Aster accepted close ACK truth-gap identity closure | fixed in `617adb8`, deployed/cloud verified | CL-133 turns accepted 0-fill Aster close ACKs into `accepted_order_truth_gap` work rather than ordinary `zero_fill`; diagnose now treats `exit.accepted_order_truth_gap_resolved` as terminal only for `filled/live_flat` and requires matching order/client identity before downgrading Aster `-2022` reduce-only artifacts. Cloud verification showed running/flat/no-open-orders/no pending truth gaps and V1 `RUNNING_CLEAN`. |
 | 2026-06-29 | LABUSDT accepted truth-gap to single-leg cleanup handoff | local verified; deploy pending | CL-136 keeps exit-shadow accounting at one strategy sample group per normal close trigger and separates passive-close retry counts in diagnose. Existing accepted-order truth gaps no longer block live one-sided cleanup when follow-up truth proves open orders empty and live exposure still exists; runtime emits `exit.accepted_order_truth_gap_cleanup_handoff`, submits reduce-only IOC cleanup, then removes the old gap only after fresh live-flat/no-open-orders proof and emits `exit.accepted_order_truth_gap_resolved(live_flat_after_single_leg_cleanup)`. |
 | 2026-06-30 | POWRUSDT post-maker-fill live-zero hedge closure | local verified; deploy pending | CL-137 adds a terminal-maker-fill live-position/open-order precheck before hedge catch-up. Both legs already flat clears through live-flat proof instead of submitting a Bybit reduce-only order that would return `110017 current position is zero`; dirty open-order truth retains. Diagnose/business-contract close only this Bybit no-order zero-position reject by position terminal truth when current exchange truth is clean. |
-| 2026-06-30 | LABUSDT Aster direct reduce-only no-order reject diagnosis | local verified; deploy pending | CL-141 keeps CL-110 identity tightening for generic Binance/Aster `-2022`, but adds the narrower Aster V3 direct reject shape: reduce-only, non-post-only request, request client/order identity, same-position terminal flat, and current flat/no-open-orders truth. That no-order close artifact can resolve by position terminal truth because no accepted order exists to match; missing identity or dirty truth remains a current blocker. |
-| 2026-06-30 | one-sided cleanup pre-submit live truth refresh | local verified; deploy pending | CL-142 reduces avoidable Aster/Bybit already-flat reduce-only artifacts at the source: one-sided passive-close cleanup refreshes live position after open-order proof and before IOC construction. If latest truth is flat it skips IOC only through full live-flat/open-order terminal proof; if quantity/side changed it rebuilds the request from latest truth; unavailable truth retains fail-closed. |
+| 2026-06-30 | LABUSDT Aster direct reduce-only no-order reject diagnosis | `ca2ede1` deployed/cloud verified | CL-141 keeps CL-110 identity tightening for generic Binance/Aster `-2022`, but adds the narrower Aster V3 direct reject shape: reduce-only, non-post-only request, request client/order identity, same-position terminal flat, and current flat/no-open-orders truth. That no-order close artifact can resolve by position terminal truth because no accepted order exists to match; missing identity or dirty truth remains a current blocker. |
+| 2026-06-30 | one-sided cleanup pre-submit live truth refresh | `ca2ede1` deployed/cloud verified | CL-142 reduces avoidable Aster/Bybit already-flat reduce-only artifacts at the source: one-sided passive-close cleanup refreshes live position after open-order proof and before IOC construction. If latest truth is flat it skips IOC only through full live-flat/open-order terminal proof; if quantity/side changed it rebuilds the request from latest truth; unavailable truth retains fail-closed. |
+| 2026-07-01 | close zero-fill diagnostic semantic split | local verified; deploy pending | CL-143 splits passive-close maker zero-fill into normal maker polling, resolved-after-zero-fill, unproductive zero-fill, and maker-viability rejected buckets. Later terminally resolved maker waiting no longer appears as close-cost inefficiency, while no-price/unmaintainable/fallback shapes remain visible. The split is diagnostic only and preserves terminal flat/open-order proof. |
 
 ## Recurrences
 
@@ -239,6 +250,7 @@ alone is not success evidence.
 | 2026-06-29 | `LABUSDT` Aster accepted close ACK / Aster `-2022` reduce-only artifact family | `617adb8` | deployed/cloud verified; gate passed, exchange flat/no-open-orders, unresolved order-truth gap 0, order error evidence 0 | [daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure](../daily/2026-06-29.md#cluster-cl-133---aster-accepted-close-ack-truth-gap-and-reduce-only-identity-closure) |
 | 2026-06-29 | `LABUSDT` Bitget live long / OKX flat accepted close truth-gap retry loop | working tree | local verified; exit-shadow expected count stays one normal close trigger, existing truth gap hands off to reduce-only IOC cleanup only with open-orders-empty + live one-sided proof | [daily/2026-06-29.md#cluster-cl-136---labusdt-exit-shadow-accounting-and-single-leg-cleanup-handoff](../daily/2026-06-29.md#cluster-cl-136---labusdt-exit-shadow-accounting-and-single-leg-cleanup-handoff) |
 | 2026-06-30 | `POWRUSDT` Binance maker filled / Bybit hedge leg already flat | working tree | local verified; terminal maker fill probes live flat before hedge catch-up, and Bybit `110017 current position is zero` is closed as historical terminal evidence only behind clean exchange truth plus position terminal proof | [daily/2026-06-30.md#cluster-cl-137---powrusdt-post-maker-fill-live-zero-hedge-closure](../daily/2026-06-30.md#cluster-cl-137---powrusdt-post-maker-fill-live-zero-hedge-closure) |
+| 2026-07-01 | deployment diagnostics close zero-fill summary | working tree | local verified; normal maker-poll zero-fill and resolved-after-zero-fill are separated from unproductive zero-fill/fallback cost evidence | [daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure](../daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure) |
 
 ## Regression Harness
 

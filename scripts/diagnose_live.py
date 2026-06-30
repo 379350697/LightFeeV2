@@ -4393,9 +4393,13 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     opened_entry_ids: set[str] = set()
     passive_unfilled_entry_ids: set[str] = set()
     zero_fill_lifecycle_guard_entry_ids: set[str] = set()
+    entry_execution_viability_blocked_ids: set[str] = set()
+    entry_execution_viability_zero_fill_reprice_ids: set[str] = set()
     reason_counts: dict[str, int] = {}
     zero_fill_lifecycle_guard_blocker_counts: dict[str, int] = {}
     zero_fill_lifecycle_guard_samples: list[dict[str, Any]] = []
+    entry_execution_viability_blocker_counts: dict[str, int] = {}
+    entry_execution_viability_samples: list[dict[str, Any]] = []
     quote_lease_failure_counts: dict[str, int] = {}
     quote_lease_failure_family_counts: dict[str, int] = {}
     oi_liquidity_evidence_counts: dict[str, int] = {}
@@ -4433,6 +4437,53 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "exit.passive_close_hedge_ack_live_truth_pending",
         "exit.passive_close_hedge_ack_reconcile_in_progress",
     }
+
+    def payload_blocked_reasons(payload: dict[str, Any]) -> list[str]:
+        raw = payload.get("blocked_reasons", []) or []
+        if not isinstance(raw, list):
+            raw = [raw]
+        return [str(reason) for reason in raw if str(reason)]
+
+    def viability_owner_id(payload: dict[str, Any]) -> str:
+        return str(
+            payload.get("entry_id")
+            or payload.get("position_id")
+            or payload.get("internal_entry_id")
+            or payload.get("candidate_pair_id")
+            or payload.get("pair_id")
+            or ""
+        )
+
+    def record_entry_execution_viability(
+        payload: dict[str, Any],
+        *,
+        reason: str,
+        blocked_reasons: list[str],
+        source: str,
+        decision: str,
+    ) -> None:
+        owner_id = viability_owner_id(payload)
+        if not owner_id:
+            return
+        entry_execution_viability_blocked_ids.add(owner_id)
+        if reason == "candidate_not_tradeable_after_zero_fill_reprice":
+            entry_execution_viability_zero_fill_reprice_ids.add(owner_id)
+        if source == "zero_fill_reprice":
+            entry_execution_viability_zero_fill_reprice_ids.add(owner_id)
+        for blocker in blocked_reasons:
+            entry_execution_viability_blocker_counts[blocker] = (
+                entry_execution_viability_blocker_counts.get(blocker, 0) + 1
+            )
+        if len(entry_execution_viability_samples) < 24:
+            entry_execution_viability_samples.append({
+                "entry_id": owner_id,
+                "symbol": str(payload.get("symbol", "") or ""),
+                "reason": reason,
+                "blocked_reasons": blocked_reasons,
+                "source": source,
+                "decision": decision,
+                "phase": str(payload.get("phase", "") or ""),
+            })
 
     for rec in events:
         kind = str(rec.get("kind", "") or "")
@@ -4474,6 +4525,16 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         elif kind in passive_close_retry_kinds:
             passive_close_retry_kind_counts[kind] = (
                 passive_close_retry_kind_counts.get(kind, 0) + 1
+            )
+        elif kind == "entry.dispatch_viability_blocked":
+            reason = str(payload.get("reason", "") or "")
+            blocked_reasons = payload_blocked_reasons(payload)
+            record_entry_execution_viability(
+                payload,
+                reason=reason,
+                blocked_reasons=blocked_reasons,
+                source=str(payload.get("source") or "entry_dispatch"),
+                decision=str(payload.get("decision") or "skip_dispatch"),
             )
         elif kind in {
             "runtime.entry_quote_revalidate_failed",
@@ -4568,17 +4629,23 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
             reason = str(payload.get("reason", "") or "")
             if reason:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            blocked_reasons = [
-                str(reason)
-                for reason in payload.get("blocked_reasons", []) or []
-                if str(reason)
-            ]
+            blocked_reasons = payload_blocked_reasons(payload)
             if (
                 entry_id
                 and reason == "candidate_not_tradeable_after_zero_fill_reprice"
-                and "lifecycle_risk_only" in blocked_reasons
+                and (
+                    "lifecycle_risk_only" in blocked_reasons
+                    or "recovery_ledger_blocked" in blocked_reasons
+                )
             ):
                 zero_fill_lifecycle_guard_entry_ids.add(entry_id)
+                record_entry_execution_viability(
+                    payload,
+                    reason=reason,
+                    blocked_reasons=blocked_reasons,
+                    source="zero_fill_reprice",
+                    decision="terminalize_without_repost",
+                )
                 for blocker in blocked_reasons:
                     zero_fill_lifecycle_guard_blocker_counts[blocker] = (
                         zero_fill_lifecycle_guard_blocker_counts.get(blocker, 0) + 1
@@ -4600,6 +4667,9 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
     entry_market_evidence_summary = _build_entry_market_evidence_summary(events)
     artifact_duration_summary = _build_artifact_duration_summary(events)
     phase_duration_summary = _build_phase_duration_summary(events)
+    passive_unfilled_avoidable_reprice_ids = (
+        passive_unfilled_entry_ids & entry_execution_viability_zero_fill_reprice_ids
+    )
     shadow_expected_position_ids = set(normal_close_trigger_position_ids)
     shadow_missing_position_ids = sorted(
         shadow_expected_position_ids - exit_shadow_recorded_position_ids
@@ -4624,6 +4694,42 @@ def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]
         "opened_count": opened_count,
         "selected_not_opened_count": max(dispatched_count - opened_count, 0),
         "passive_unfilled_count": len(passive_unfilled_entry_ids),
+        "passive_unfilled_quality_summary": {
+            "passive_unfilled_count": len(passive_unfilled_entry_ids),
+            "avoidable_reprice_not_tradeable_count": len(
+                passive_unfilled_avoidable_reprice_ids
+            ),
+            "avoidable_reprice_not_tradeable_entry_ids": sorted(
+                passive_unfilled_avoidable_reprice_ids
+            ),
+            "legitimate_passive_no_fill_count": max(
+                len(passive_unfilled_entry_ids)
+                - len(passive_unfilled_avoidable_reprice_ids),
+                0,
+            ),
+            "scope": "entry_passive_terminality",
+            "next_action": (
+                "move_lifecycle_recovery_gate_before_maker_repost"
+                if passive_unfilled_avoidable_reprice_ids
+                else "no_passive_unfilled_quality_action_required"
+            ),
+        },
+        "entry_execution_viability_summary": {
+            "blocked_count": len(entry_execution_viability_blocked_ids),
+            "zero_fill_reprice_blocked_count": len(
+                entry_execution_viability_zero_fill_reprice_ids
+            ),
+            "blocker_counts": dict(
+                sorted(entry_execution_viability_blocker_counts.items())
+            ),
+            "entry_ids": sorted(entry_execution_viability_blocked_ids),
+            "zero_fill_reprice_entry_ids": sorted(
+                entry_execution_viability_zero_fill_reprice_ids
+            ),
+            "samples": entry_execution_viability_samples,
+            "blocks_production_gate": False,
+            "scope": "entry_execution_viability",
+        },
         "zero_fill_lifecycle_guard_count": len(zero_fill_lifecycle_guard_entry_ids),
         "zero_fill_lifecycle_guard_blocker_counts": dict(
             sorted(zero_fill_lifecycle_guard_blocker_counts.items())
@@ -4904,6 +5010,19 @@ def _build_entry_market_evidence_summary(
         next_action = "confirmed_oi_below_floor_no_data_backfill"
     else:
         next_action = "no_entry_market_evidence_action_required"
+    prewarm_pending_count = max(
+        prewarm_extra_targeted_count
+        - prewarm_extra_resolved_count
+        - prewarm_extra_failed_count,
+        0,
+    )
+    readiness_buckets = {
+        "quote_stale": quote_blocked_candidate_count,
+        "oi_below_floor": oi_below_floor_count,
+        "oi_unavailable": oi_unavailable_count,
+        "oi_structural_suppressed": oi_structural_suppressed_count,
+        "prewarm_pending": prewarm_pending_count,
+    }
 
     return {
         "action_counts": dict(sorted(action_counts.items())),
@@ -4918,6 +5037,16 @@ def _build_entry_market_evidence_summary(
             "raw_candidate_block_count": blocked_candidate_count,
             "structural_suppressed_count": oi_structural_suppressed_count,
             "next_structural_recheck_ms": oi_structural_next_recheck_ms or None,
+            "top_blocked_owner_ids": top_blocked_owner_ids,
+        },
+        "market_data_readiness_summary": {
+            "blocks_production_gate": False,
+            "current_scope": "entry_candidate_admission",
+            "readiness_buckets": readiness_buckets,
+            "readiness_blocked_count": sum(readiness_buckets.values()),
+            "raw_candidate_block_count": blocked_candidate_count,
+            "dedupe_scope": "symbol_venue_ttl",
+            "next_action": next_action,
             "top_blocked_owner_ids": top_blocked_owner_ids,
         },
         "diagnostic_recovered_overbudget_count": (
@@ -7032,6 +7161,9 @@ def _build_business_progression_quality_summary(
     close_cost_fallback_after_zero_fill_count = 0
     close_cost_maker_viability_rejected_count = 0
     close_cost_early_fallback_after_viability_rejected_count = 0
+    close_cost_normal_maker_poll_zero_fill_count = 0
+    close_cost_resolved_after_zero_fill_count = 0
+    close_cost_unproductive_zero_fill_count = 0
     for entry in close_cost_entries.values():
         maker_no_fill_count = int(entry.get("maker_no_fill_count") or 0)
         zero_fill_cycle_count = int(entry.get("zero_fill_cycle_count") or 0)
@@ -7061,6 +7193,30 @@ def _build_business_progression_quality_summary(
         terminal_resolved = bool(entry.get("terminal_resolved"))
         if not terminal_resolved and not gate_currently_green():
             close_cost_blocking_count += 1
+        if maker_viability_rejected_count > 0:
+            classification = "maker_viability_rejected"
+        elif (
+            zero_fill_cycle_count > 0
+            and terminal_resolved
+            and maker_no_fill_count <= 0
+            and fallback_after_zero_fill_count <= 0
+        ):
+            classification = "normal_maker_poll_zero_fill"
+            close_cost_normal_maker_poll_zero_fill_count += zero_fill_cycle_count
+            close_cost_resolved_after_zero_fill_count += 1
+        elif zero_fill_cycle_count > 0:
+            classification = (
+                "resolved_unproductive_zero_fill"
+                if terminal_resolved
+                else "unresolved_unproductive_zero_fill"
+            )
+            close_cost_unproductive_zero_fill_count += zero_fill_cycle_count
+            if terminal_resolved:
+                close_cost_resolved_after_zero_fill_count += 1
+        elif maker_no_fill_count > 0:
+            classification = "maker_terminal_no_fill"
+        else:
+            classification = "close_cost_trace"
         if len(close_cost_samples) < 12:
             close_cost_samples.append(
                 {
@@ -7082,6 +7238,7 @@ def _build_business_progression_quality_summary(
                     "early_fallback_after_viability_rejected_count": (
                         early_fallback_after_viability_rejected_count
                     ),
+                    "classification": classification,
                     "maker_viability_reasons": sorted(
                         entry.get("maker_viability_reasons") or []
                     ),
@@ -7091,9 +7248,13 @@ def _build_business_progression_quality_summary(
                         "monitor_early_fallback_cost"
                         if maker_viability_rejected_count > 0
                         else (
-                            "tighten_close_maker_viability_source_gate"
-                            if terminal_resolved
-                            else "verify_exchange_truth_before_classifying_noise"
+                            "none_terminal_resolved"
+                            if classification == "normal_maker_poll_zero_fill"
+                            else (
+                                "tighten_close_maker_viability_source_gate"
+                                if terminal_resolved
+                                else "verify_exchange_truth_before_classifying_noise"
+                            )
                         )
                     ),
                 }
@@ -7103,6 +7264,11 @@ def _build_business_progression_quality_summary(
         "blocking_count": close_cost_blocking_count,
         "maker_no_fill_count": close_cost_maker_no_fill_count,
         "zero_fill_cycle_count": close_cost_zero_fill_cycle_count,
+        "normal_maker_poll_zero_fill_count": (
+            close_cost_normal_maker_poll_zero_fill_count
+        ),
+        "resolved_after_zero_fill_count": close_cost_resolved_after_zero_fill_count,
+        "unproductive_zero_fill_count": close_cost_unproductive_zero_fill_count,
         "fallback_after_zero_fill_count": close_cost_fallback_after_zero_fill_count,
         "maker_viability_rejected_count": close_cost_maker_viability_rejected_count,
         "early_fallback_after_viability_rejected_count": (
@@ -8693,6 +8859,38 @@ def _build_evidence_completeness(
 # conclusion
 # ---------------------------------------------------------------------------
 
+def _order_error_is_current_blocker(error: dict[str, Any]) -> bool:
+    if error.get("current_blocker") is False:
+        return False
+    visibility = str(error.get("visibility") or "")
+    if visibility in {
+        "historical_terminal_artifact",
+        "historical_resolved_artifact",
+        "legacy_terminal_inferred",
+    }:
+        return False
+    status = str(error.get("status") or "")
+    if status in {
+        "resolved",
+        "terminal_resolved",
+        "historical_resolved",
+        "historical_terminal_artifact",
+    }:
+        return False
+    resolution_status = str(error.get("resolution_status") or "")
+    if error.get("resolved") is True and resolution_status in {
+        "terminal_flat",
+        "live_flat",
+        "position_terminal_flat",
+        "resolved_by_terminal_truth",
+        "reduce_only_terminal_flat",
+    }:
+        return False
+    if error.get("blocking") is False:
+        return False
+    return True
+
+
 def _build_conclusion(
     health: dict[str, Any],
     state_consistency: dict[str, Any],
@@ -8712,11 +8910,25 @@ def _build_conclusion(
         if production_acceptance_gate is not None
         else []
     )
+    gate_passed = (
+        production_acceptance_gate is not None
+        and production_acceptance_gate.get("gate_passed") is True
+    )
+    current_order_errors = [
+        error
+        for error in order_errors
+        if _order_error_is_current_blocker(error) or not gate_passed
+    ]
+    resolved_order_error_count = len(order_errors) - len(current_order_errors)
 
     if gate_failed:
         status = "unhealthy"
         risk = "high"
-    elif health["ok"] and not state_consistency["state_mismatch"] and not order_errors:
+    elif (
+        health["ok"]
+        and not state_consistency["state_mismatch"]
+        and not current_order_errors
+    ):
         status = "healthy"
         risk = "low"
     elif health["critical_count"] > 0:
@@ -8728,9 +8940,11 @@ def _build_conclusion(
     elif state_consistency["state_mismatch"]:
         status = "degraded"
         risk = "high"
-    elif order_errors:
+    elif current_order_errors:
         status = "degraded"
-        has_rejected = any(e.get("kind") == "order.rejected" for e in order_errors)
+        has_rejected = any(
+            e.get("kind") == "order.rejected" for e in current_order_errors
+        )
         risk = "medium" if has_rejected else "low"
     else:
         status = "degraded"
@@ -8747,11 +8961,17 @@ def _build_conclusion(
         summary_parts.append("exchange truth unavailable — cannot verify consistency")
     if l2_evidence["missing_l2_or_tick_count"] > 0:
         summary_parts.append("L2/tick gaps: {}".format(l2_evidence["missing_l2_or_tick_count"]))
-    if order_errors:
-        total_errs = sum(e.get("count", 0) for e in order_errors)
+    if current_order_errors:
+        total_errs = sum(e.get("count", 0) for e in current_order_errors)
         summary_parts.append("{} order error groups ({} total)".format(
-            len(order_errors), total_errs,
+            len(current_order_errors), total_errs,
         ))
+    if resolved_order_error_count > 0:
+        summary_parts.append(
+            "{} historical resolved order error groups".format(
+                resolved_order_error_count
+            )
+        )
     if evidence_completeness["overall"] != "complete":
         summary_parts.append("evidence: {}".format(evidence_completeness["overall"]))
     if gate_failed:
@@ -8811,8 +9031,8 @@ def _build_conclusion(
             next_actions.append("exchange truth not available — check network/credentials")
     if evidence_completeness["overall"] in ("partial", "missing"):
         next_actions.append("collect full exchange error bodies (raw_body, exchange_code)")
-    if order_errors:
-        top = _build_top_exchange_errors(order_errors)
+    if current_order_errors:
+        top = _build_top_exchange_errors(current_order_errors)
         for t in top[:3]:
             if t["http_status"] > 0 and not t["raw_body_present"]:
                 next_actions.append(

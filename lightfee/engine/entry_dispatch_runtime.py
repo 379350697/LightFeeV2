@@ -1035,9 +1035,35 @@ class EntryDispatchRuntime:
                 "runtime.entry_admission_blocked",
                 payload,
             )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=str(payload.get("reason") or "entry_admission_blocked"),
+                blocked_reasons=[
+                    str(payload.get("reason") or "entry_admission_blocked")
+                ],
+                source="initial_entry_admission",
+                decision="skip_dispatch",
+                extra={"candidate_pair_id": pair_id, "pair_id": pair_id},
+            )
             return True
 
         if not self._candidate_is_tradeable_for_selection(candidate):
+            blocked_reasons = [
+                str(reason)
+                for reason in getattr(candidate, "blocked_reasons", []) or []
+                if str(reason)
+            ]
+            if "candidate_not_tradeable_for_selection" not in blocked_reasons:
+                blocked_reasons.append("candidate_not_tradeable_for_selection")
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="candidate_not_tradeable_for_selection",
+                blocked_reasons=blocked_reasons,
+                source="initial_selection_tradeability",
+                decision="skip_dispatch",
+            )
             self.ctx.journal.append(
                 "runtime.entry_blocked_trading_capability",
                 {
@@ -1058,6 +1084,15 @@ class EntryDispatchRuntime:
             source="dispatch",
         )
         if not decision.allowed:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=decision.reason,
+                blocked_reasons=[decision.reason] if decision.reason else [],
+                source="dispatch_lifecycle",
+                decision="skip_dispatch",
+                extra=dict(getattr(decision, "evidence", {}) or {}),
+            )
             self.ctx.journal.append(
                 "runtime.entry_blocked_lifecycle",
                 {
@@ -1085,6 +1120,15 @@ class EntryDispatchRuntime:
         for gate_name, gate_fn, gate_args in gates:
             allowed, reason = gate_fn(candidate, *gate_args)
             if not allowed:
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason=reason or gate_name,
+                    blocked_reasons=[reason or gate_name],
+                    source="dispatch_runtime_gate",
+                    decision="skip_dispatch",
+                    extra={"gate": gate_name},
+                )
                 self.ctx.journal.append(
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
@@ -1106,6 +1150,43 @@ class EntryDispatchRuntime:
                 )
                 return True
         return False
+
+    def _emit_entry_dispatch_viability_blocked(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        reason: str,
+        blocked_reasons: list[str],
+        source: str,
+        decision: str,
+        extra: dict | None = None,
+    ) -> None:
+        entry_id = str(
+            getattr(candidate, "entry_id", "")
+            or getattr(candidate, "internal_entry_id", "")
+            or getattr(candidate, "pending_owner_id", "")
+            or getattr(candidate, "position_id", "")
+            or ""
+        )
+        pair_id = self._candidate_pair_id(candidate)
+        payload = {
+            "entry_id": entry_id,
+            "symbol": getattr(candidate, "symbol", ""),
+            "long_venue": getattr(candidate, "long_venue", ""),
+            "short_venue": getattr(candidate, "short_venue", ""),
+            "candidate_pair_id": pair_id,
+            "pair_id": pair_id,
+            "reason": reason,
+            "blocked_reasons": [item for item in blocked_reasons if item],
+            "source": source,
+            "decision": decision,
+            "ts_ms": now_ms,
+        }
+        if extra:
+            for key, value in extra.items():
+                payload.setdefault(key, value)
+        self.ctx.journal.append("entry.dispatch_viability_blocked", payload)
 
     def _entry_price_resolution(
         self,
@@ -1135,6 +1216,15 @@ class EntryDispatchRuntime:
                 "ts_ms": now_ms,
             }
             self.ctx.journal.append("runtime.entry_blocked_quote_lease", payload)
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=quote_lease_reason,
+                blocked_reasons=[quote_lease_reason],
+                source="price_quote_lease",
+                decision="skip_dispatch",
+                extra=quote_lease_evidence,
+            )
             self.ctx.journal.append(
                 "review.candidate_rejected",
                 {
@@ -1163,6 +1253,23 @@ class EntryDispatchRuntime:
 
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
+            blocked_reasons = []
+            if price_hint <= 0:
+                blocked_reasons.append("no_valid_quote")
+            if candidate.entry_notional_quote <= 0:
+                blocked_reasons.append("no_entry_notional")
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="no_valid_quote",
+                blocked_reasons=blocked_reasons,
+                source="price_gate",
+                decision="skip_dispatch",
+                extra={
+                    "price_hint": price_hint,
+                    "notional": candidate.entry_notional_quote,
+                },
+            )
             self.ctx.journal.append(
                 "runtime.entry_skipped_no_quote",
                 {
