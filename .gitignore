@@ -9,6 +9,9 @@ runtime/
 !.env.example
 scripts/deploy.sh
 .deploy_manifest.json
+.deploy_version
+.venv/
+config/live.toml
 docs/superpowers/
 scripts/benchmark_quote_providers.py
 tests/test_benchmark_quote_providers.py
