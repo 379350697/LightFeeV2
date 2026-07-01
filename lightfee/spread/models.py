@@ -56,6 +56,7 @@ class SpreadReversionCandidate:
     liquidity_evidence_status: str = ""
     screening_reasons: list[str] = field(default_factory=list)
     history_age_ms: int = 0
+    opportunity_label: str = "spread_reversion"
 
 
 @dataclass(frozen=True)

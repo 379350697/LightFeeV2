@@ -35,6 +35,8 @@ class SpreadTradingController:
             return SpreadDecision(False, "spread_candidate_wrong_bucket")
         if candidate.signal_status != "entry_ready":
             return SpreadDecision(False, "spread_candidate_not_entry_ready")
+        if str(getattr(candidate, "opportunity_label", "") or "") == "single_venue_dislocation":
+            return SpreadDecision(False, "spread_single_venue_dislocation_paper_only")
         max_age = int(getattr(self.strategy, "spread_signal_ttl_ms", 1000) or 0)
         if max_age > 0 and now_ms - int(candidate.signal_ts_ms or 0) > max_age:
             return SpreadDecision(False, "spread_signal_stale")

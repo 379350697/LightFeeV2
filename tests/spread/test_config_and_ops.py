@@ -23,6 +23,8 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_min_liquidity_capacity_ratio == 1.25
     assert strategy.spread_min_history_ms == 300_000
     assert strategy.spread_ranker_max_candidates == 10
+    assert strategy.spread_single_venue_dislocation_enabled is False
+    assert strategy.spread_single_venue_dislocation_min_anchor_venues == 3
     assert strategy.spread_paper_enabled is False
     assert strategy.spread_paper_finalist_limit == 10
     assert strategy.spread_paper_markout_secs == [60, 300, 900, 1800]
@@ -53,6 +55,8 @@ spread_min_fair_price_confidence = 0.5
 spread_min_liquidity_capacity_ratio = 1.5
 spread_min_history_ms = 600000
 spread_ranker_max_candidates = 3
+spread_single_venue_dislocation_enabled = true
+spread_single_venue_dislocation_min_anchor_venues = 4
 spread_paper_enabled = true
 spread_paper_finalist_limit = 2
 spread_paper_markout_secs = [10, 20]
@@ -85,6 +89,8 @@ venue = "okx"
     assert config.strategy.spread_min_liquidity_capacity_ratio == 1.5
     assert config.strategy.spread_min_history_ms == 600_000
     assert config.strategy.spread_ranker_max_candidates == 3
+    assert config.strategy.spread_single_venue_dislocation_enabled is True
+    assert config.strategy.spread_single_venue_dislocation_min_anchor_venues == 4
     assert config.strategy.spread_paper_enabled is True
     assert config.strategy.spread_paper_finalist_limit == 2
     assert config.strategy.spread_paper_markout_secs == [10, 20]

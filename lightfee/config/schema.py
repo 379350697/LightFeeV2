@@ -161,6 +161,8 @@ class StrategyConfig:
     spread_fair_price_max_venue_premium_bps: float = 150.0
     spread_fair_price_min_venues: int = 3
     spread_min_fair_price_confidence: float = 1.0
+    spread_single_venue_dislocation_enabled: bool = False
+    spread_single_venue_dislocation_min_anchor_venues: int = 3
     spread_min_liquidity_capacity_ratio: float = 1.25
     spread_min_history_ms: int = 300000
     spread_mean_reversion_min_std_bps: float = 0.05

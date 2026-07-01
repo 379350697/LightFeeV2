@@ -38,6 +38,8 @@ class SpreadReversionConfig:
     fair_price_max_venue_premium_bps: float = 150.0
     fair_price_min_venues: int = 3
     min_fair_price_confidence: float = 1.0
+    single_venue_dislocation_enabled: bool = False
+    single_venue_dislocation_min_anchor_venues: int = 3
     min_liquidity_capacity_ratio: float = 1.25
     min_history_ms: int = 300_000
     mean_reversion_min_std_bps: float = 0.05
@@ -109,6 +111,21 @@ class SpreadReversionConfig:
                     cls.min_fair_price_confidence,
                 )
                 or 0.0
+            ),
+            single_venue_dislocation_enabled=bool(
+                getattr(
+                    strategy,
+                    "spread_single_venue_dislocation_enabled",
+                    cls.single_venue_dislocation_enabled,
+                )
+            ),
+            single_venue_dislocation_min_anchor_venues=int(
+                getattr(
+                    strategy,
+                    "spread_single_venue_dislocation_min_anchor_venues",
+                    cls.single_venue_dislocation_min_anchor_venues,
+                )
+                or 0
             ),
             min_liquidity_capacity_ratio=float(
                 getattr(
@@ -371,10 +388,20 @@ def _candidate_for_pair(
 
     long_fair = fair_price.get(str(long_q.venue).lower())
     short_fair = fair_price.get(str(short_q.venue).lower())
-    if (long_fair is not None and not long_fair.eligible) or (
-        short_fair is not None and not short_fair.eligible
-    ):
-        return None
+    opportunity_label = "spread_reversion"
+    screening_reasons: list[str] = []
+    long_outlier = long_fair is not None and not long_fair.eligible
+    short_outlier = short_fair is not None and not short_fair.eligible
+    if long_outlier or short_outlier:
+        if not _single_venue_dislocation_allowed(
+            long_outlier=long_outlier,
+            short_outlier=short_outlier,
+            fair_price=fair_price,
+            config=config,
+        ):
+            return None
+        opportunity_label = "single_venue_dislocation"
+        screening_reasons.append("fair_outlier_override")
 
     if not liquidity_gate.quote_fresh(
         long_q,
@@ -517,8 +544,9 @@ def _candidate_for_pair(
         rank_reason=rank_reason,
         degradation_state=DegradationState.HEALTHY.value,
         liquidity_evidence_status=liquidity_evidence_status,
-        screening_reasons=[],
+        screening_reasons=screening_reasons,
         history_age_ms=stats.history_age_ms,
+        opportunity_label=opportunity_label,
     )
 
 
@@ -530,6 +558,22 @@ def _fee_map(venues: list[VenueConfig]) -> dict[str, float]:
             continue
         result[name] = float(getattr(venue, "taker_fee_bps", 0.0) or 0.0)
     return result
+
+
+def _single_venue_dislocation_allowed(
+    *,
+    long_outlier: bool,
+    short_outlier: bool,
+    fair_price: dict[str, FairPriceAssessment],
+    config: SpreadReversionConfig,
+) -> bool:
+    if not config.single_venue_dislocation_enabled:
+        return False
+    if long_outlier == short_outlier:
+        return False
+    anchor_count = sum(1 for assessment in fair_price.values() if assessment.eligible)
+    required = max(int(config.single_venue_dislocation_min_anchor_venues or 0), 1)
+    return anchor_count >= required
 
 
 def _fee_bps(config: SpreadReversionConfig, venue: str) -> float:

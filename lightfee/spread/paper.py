@@ -41,6 +41,7 @@ class SpreadPaperPosition:
     symbol: str
     long_venue: str
     short_venue: str
+    candidate_opportunity_label: str
     finalist_rank: int
     registered_at_ms: int
     entry_notional_quote: float
@@ -193,6 +194,9 @@ class SpreadPaperTracker:
             symbol=candidate.symbol,
             long_venue=candidate.long_venue,
             short_venue=candidate.short_venue,
+            candidate_opportunity_label=str(
+                getattr(candidate, "opportunity_label", "") or "spread_reversion"
+            ),
             finalist_rank=finalist_rank,
             registered_at_ms=int(candidate.signal_ts_ms or 0),
             entry_notional_quote=entry_notional,
@@ -299,6 +303,7 @@ class SpreadPaperTracker:
             "evaluated_at_ms": now_ms,
             "selected_real_trade": False,
             "not_selected_reason": "spread_shadow_paper",
+            "candidate_opportunity_label": position.candidate_opportunity_label,
             "paper_entry_notional_quote": position.entry_notional_quote,
             "market_snapshot": {
                 "long_mid": long_mid,
@@ -436,6 +441,7 @@ def _registration_event(position: SpreadPaperPosition) -> dict:
             "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}",
             "long_venue": position.long_venue,
             "short_venue": position.short_venue,
+            "candidate_opportunity_label": position.candidate_opportunity_label,
             "finalist_rank": position.finalist_rank,
             "registered_at_ms": position.registered_at_ms,
             "selected_real_trade": False,
@@ -478,6 +484,9 @@ def _position_from_registration_payload(payload: dict) -> SpreadPaperPosition | 
         symbol=symbol,
         long_venue=long_venue,
         short_venue=short_venue,
+        candidate_opportunity_label=str(
+            payload.get("candidate_opportunity_label", "") or "spread_reversion"
+        ),
         finalist_rank=int(payload.get("finalist_rank", 0) or 0),
         registered_at_ms=int(payload.get("registered_at_ms", 0) or 0),
         entry_notional_quote=float(payload.get("paper_entry_notional_quote", 0.0) or 0.0),

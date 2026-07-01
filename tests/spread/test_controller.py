@@ -70,6 +70,23 @@ def test_spread_controller_allows_only_small_live_canary_when_enabled() -> None:
     assert decision.intent.entry_notional_quote == 20.0
 
 
+def test_spread_controller_blocks_single_venue_dislocation_from_live_entry() -> None:
+    cfg = StrategyConfig(spread_reversion_enabled=True)
+    controller = SpreadTradingController(cfg)
+
+    decision = controller.evaluate_entry(
+        _candidate(
+            opportunity_label="single_venue_dislocation",
+            screening_reasons=["fair_outlier_override"],
+        ),
+        state=SpreadTradingState(),
+        now_ms=1_000,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "spread_single_venue_dislocation_paper_only"
+
+
 def test_spread_controller_blocks_concurrent_spread_positions() -> None:
     cfg = StrategyConfig(
         spread_reversion_enabled=True,

@@ -117,6 +117,7 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
                 "liquidity_evidence_status": c.liquidity_evidence_status,
                 "screening_reasons": list(c.screening_reasons),
                 "history_age_ms": c.history_age_ms,
+                "opportunity_label": c.opportunity_label,
             }
             for c in snapshot.candidates
         ],
