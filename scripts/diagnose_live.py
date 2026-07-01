@@ -2379,6 +2379,11 @@ _ORDER_TRUTH_GAP_RESOLUTION_KINDS = frozenset({
     "runtime.position_lifecycle_terminal",
     "recovery.flat",
 })
+_EXIT_ACCEPTED_ORDER_TRUTH_GAP_COMPLETE_STATUSES = frozenset({
+    "filled",
+    "live_flat",
+    "live_flat_after_single_leg_cleanup",
+})
 
 
 def _truth_gap_identity_values(payload: dict[str, Any]) -> set[str]:
@@ -2574,10 +2579,10 @@ def _payload_is_terminal_zero_qty_truth_probe_retained(
 
 def _truth_gap_resolution_complete(kind: str, payload: dict[str, Any]) -> bool:
     if kind == "exit.accepted_order_truth_gap_resolved":
-        return str(payload.get("resolution_status") or "").lower() in {
-            "filled",
-            "live_flat",
-        }
+        return (
+            str(payload.get("resolution_status") or "").lower()
+            in _EXIT_ACCEPTED_ORDER_TRUTH_GAP_COMPLETE_STATUSES
+        )
     if kind in {
         "exit.passive_close_hedge_confirmed_after_ack",
         "exit.passive_close_hedge_reconciled_after_error",
@@ -3003,10 +3008,10 @@ def _build_resolved_close_order_error_summary(
                 "flat",
             }
         elif kind == "exit.accepted_order_truth_gap_resolved":
-            terminal = str(payload.get("resolution_status") or "").lower() in {
-                "filled",
-                "live_flat",
-            }
+            terminal = (
+                str(payload.get("resolution_status") or "").lower()
+                in _EXIT_ACCEPTED_ORDER_TRUTH_GAP_COMPLETE_STATUSES
+            )
         elif kind in {"order.filled", "exit.close_chunk_submitted", "exit.closed"}:
             terminal = True
         if terminal:
@@ -8119,6 +8124,14 @@ def _build_production_acceptance_gate(
         exception_conclusions["resolved_order_truth_gap"] = (
             "closed_by_current_exchange_truth"
         )
+    legacy_order_truth_gap_count = int(
+        resolved_order_truth_gap_summary.get("legacy_inferred_count", 0) or 0
+    )
+    if legacy_order_truth_gap_count:
+        fingerprints.append("close_truth_gap_legacy_inferred")
+        exception_conclusions["close_truth_gap_legacy_inferred"] = (
+            "nonblocking_explicit_lifecycle_missing"
+        )
     if unresolved_order_truth_gap_count:
         exception_conclusions["unresolved_order_truth_gap"] = (
             "order_truth_gap_unresolved"
@@ -8881,6 +8894,7 @@ def _order_error_is_current_blocker(error: dict[str, Any]) -> bool:
     if error.get("resolved") is True and resolution_status in {
         "terminal_flat",
         "live_flat",
+        "live_flat_after_single_leg_cleanup",
         "position_terminal_flat",
         "resolved_by_terminal_truth",
         "reduce_only_terminal_flat",

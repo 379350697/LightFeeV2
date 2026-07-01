@@ -4232,6 +4232,28 @@ def test_acceptance_gate_splits_explicit_and_legacy_order_truth_gap_resolution()
                     "terminal_state": "flat",
                 },
             },
+            {
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": "entry-cleanup",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "accepted_order_id": "oid-cleanup",
+                    "accepted_client_order_id": "cid-cleanup",
+                },
+            },
+            {
+                "kind": "exit.accepted_order_truth_gap_resolved",
+                "payload": {
+                    "position_id": "entry-cleanup",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "accepted_order_id": "oid-cleanup",
+                    "accepted_client_order_id": "cid-cleanup",
+                    "resolution_status": "live_flat_after_single_leg_cleanup",
+                    "decision": "clear_gap_after_cleanup",
+                },
+            },
         ],
         local_state={
             "lifecycle": "running",
@@ -4252,12 +4274,18 @@ def test_acceptance_gate_splits_explicit_and_legacy_order_truth_gap_resolution()
     )
 
     summary = gate["resolved_order_truth_gap_summary"]
-    assert summary["count"] == 2
-    assert summary["explicit_resolved_count"] == 1
+    assert summary["count"] == 3
+    assert summary["explicit_resolved_count"] == 2
     assert summary["legacy_inferred_count"] == 1
     assert summary["unresolved_count"] == 0
     assert "accepted_order_id:oid-explicit" in summary["explicit_resolved_identities"]
+    assert "accepted_order_id:oid-cleanup" in summary["explicit_resolved_identities"]
     assert "accepted_order_id:oid-legacy" in summary["legacy_inferred_identities"]
+    assert "close_truth_gap_legacy_inferred" in gate["fingerprints"]
+    assert gate["exception_conclusions"]["close_truth_gap_legacy_inferred"] == (
+        "nonblocking_explicit_lifecycle_missing"
+    )
+    assert gate["gate_passed"] is True
 
 
 def test_acceptance_gate_reports_pending_entry_order_truth_gap_from_current_state():

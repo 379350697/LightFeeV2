@@ -727,6 +727,223 @@ class CloseExecutor:
             },
         )
 
+    def _emit_close_accepted_order_truth_gap_resolved_filled(
+        self,
+        *,
+        request: OrderRequest,
+        position_id: str,
+        leg: str,
+        source: str,
+        order_id: str,
+        client_order_id: str,
+        filled_quantity: float,
+        filled_price: float,
+        reason: str,
+    ) -> None:
+        accepted_order_id = normalize_order_identity(order_id)
+        accepted_client_order_id = normalize_order_identity(client_order_id)
+        self.journal.append(
+            "exit.accepted_order_truth_gap_resolved",
+            {
+                "position_id": position_id,
+                "symbol": request.symbol,
+                "venue": request.venue.value,
+                "leg": leg,
+                "order_id": accepted_order_id,
+                "client_order_id": accepted_client_order_id,
+                "accepted_order_id": accepted_order_id,
+                "accepted_client_order_id": accepted_client_order_id,
+                "resolution_status": "filled",
+                "decision": "apply_fill",
+                "source": source,
+                "reason": reason,
+                "filled_quantity": float(filled_quantity or 0.0),
+                "filled_price": float(filled_price or 0.0),
+            },
+        )
+
+    async def _resolve_ack_only_close_truth_gap(
+        self,
+        *,
+        request: OrderRequest,
+        position_id: str,
+        leg: str,
+        order_id: str,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        adapter = self.adapters.get(request.venue)
+        accepted_order_id = normalize_order_identity(order_id)
+        accepted_client_order_id = normalize_order_identity(
+            client_order_id or request.client_order_id
+        )
+        self._emit_close_accepted_order_truth_gap_registered(
+            request=request,
+            position_id=position_id,
+            leg=leg,
+            source="ack_only_order_reconcile",
+            order_id=accepted_order_id,
+            client_order_id=accepted_client_order_id,
+            reason="ack_only_order_fill_not_confirmed",
+        )
+
+        if adapter is None:
+            blocker_reason = "ack_only_order_adapter_missing"
+            live_position_proof = {"available": False, "reason": "adapter_missing"}
+            open_order_proof = {"available": False, "reason": "adapter_missing"}
+        else:
+            fetch_reconciliation = getattr(
+                adapter, "fetch_order_fill_reconciliation", None
+            )
+            if callable(fetch_reconciliation) and (
+                accepted_order_id or accepted_client_order_id
+            ):
+                try:
+                    fill_probe = await fetch_reconciliation(
+                        request.symbol,
+                        accepted_order_id,
+                        accepted_client_order_id,
+                    )
+                except Exception:
+                    fill_probe = None
+                if fill_probe is not None:
+                    filled_qty = abs(float(getattr(fill_probe, "quantity", 0.0) or 0.0))
+                    if filled_qty > 1e-12:
+                        fill = OrderFill(
+                            venue=request.venue,
+                            symbol=request.symbol,
+                            side=request.side,
+                            quantity=filled_qty,
+                            price=float(
+                                getattr(fill_probe, "average_price", 0.0)
+                                or request.price
+                                or 0.0
+                            ),
+                            order_id=normalize_order_identity(
+                                getattr(fill_probe, "order_id", "")
+                            )
+                            or accepted_order_id,
+                            client_order_id=normalize_order_identity(
+                                getattr(fill_probe, "client_order_id", "")
+                            )
+                            or accepted_client_order_id,
+                            fee_quote=float(getattr(fill_probe, "fee_quote", 0.0) or 0.0),
+                            filled_at_ms=int(
+                                getattr(fill_probe, "filled_at_ms", 0) or 0
+                            ),
+                        )
+                        self.journal.append(
+                            "order.filled",
+                            {
+                                "position_id": position_id,
+                                "leg": leg,
+                                "venue": request.venue.value,
+                                "symbol": request.symbol,
+                                "side": request.side.value,
+                                "order_id": fill.order_id,
+                                "client_order_id": fill.client_order_id,
+                                "quantity": fill.quantity,
+                                "price": fill.price,
+                                "fee_quote": fill.fee_quote,
+                                "filled_at_ms": fill.filled_at_ms,
+                                "reason": "ack_only_order_reconciled",
+                            },
+                        )
+                        self._emit_close_accepted_order_truth_gap_resolved_filled(
+                            request=request,
+                            position_id=position_id,
+                            leg=leg,
+                            source="ack_only_order_reconcile",
+                            order_id=fill.order_id,
+                            client_order_id=fill.client_order_id,
+                            filled_quantity=fill.quantity,
+                            filled_price=fill.price,
+                            reason="ack_only_order_detail_filled",
+                        )
+                        return {
+                            "outcome": "filled",
+                            "fill": fill,
+                            "order_id": fill.order_id,
+                            "reason": "ack_only_order_reconciled",
+                        }
+
+            try:
+                current_pos = await adapter.fetch_position(request.symbol)
+                live_qty = abs(float(getattr(current_pos, "quantity", 0.0) or 0.0))
+                live_position_proof = {
+                    "available": True,
+                    "quantity": live_qty,
+                    "side": (
+                        getattr(getattr(current_pos, "side", None), "value", None)
+                        or str(getattr(current_pos, "side", "") or "")
+                    ),
+                    "source": "fetch_position",
+                }
+            except Exception as exc:
+                live_qty = math.inf
+                live_position_proof = {
+                    "available": False,
+                    "reason": "fetch_position_failed",
+                    "error": str(exc),
+                }
+            open_order_proof = await self._close_open_order_proof(
+                adapter,
+                request.symbol,
+            )
+            if (
+                live_position_proof.get("available") is True
+                and live_qty <= 1e-9
+                and open_order_proof.get("open_orders_empty") is True
+            ):
+                self._emit_close_accepted_order_truth_gap_resolved_live_flat(
+                    request=request,
+                    position_id=position_id,
+                    leg=leg,
+                    source="ack_only_order_reconcile",
+                    order_id=accepted_order_id,
+                    client_order_id=accepted_client_order_id,
+                    live_position_proof=live_position_proof,
+                    open_order_proof=open_order_proof,
+                    reason="ack_only_order_live_flat",
+                )
+                return {
+                    "outcome": "terminal_flat",
+                    "fill": None,
+                    "order_id": accepted_order_id,
+                    "reason": "ack_only_order_live_flat",
+                }
+            if not live_position_proof.get("available"):
+                blocker_reason = "ack_only_order_live_position_truth_unavailable"
+            elif live_qty > 1e-9:
+                blocker_reason = "ack_only_order_live_position_not_flat"
+            elif open_order_proof.get("open_orders_empty") is False:
+                blocker_reason = "ack_only_order_open_order_present"
+            else:
+                blocker_reason = "ack_only_order_open_order_truth_unavailable"
+
+        self.journal.append(
+            "exit.accepted_order_truth_gap_retry_blocked",
+            {
+                "position_id": position_id,
+                "symbol": request.symbol,
+                "venue": request.venue.value,
+                "leg": leg,
+                "order_id": accepted_order_id,
+                "client_order_id": accepted_client_order_id,
+                "accepted_order_id": accepted_order_id,
+                "accepted_client_order_id": accepted_client_order_id,
+                "reason": blocker_reason,
+                "decision": "retain_truth_gap",
+                "live_position_proof": live_position_proof,
+                "open_order_proof": open_order_proof,
+            },
+        )
+        return {
+            "outcome": "uncertain",
+            "fill": None,
+            "reason": blocker_reason,
+            "order_id": accepted_order_id,
+        }
+
     async def execute_close(
         self,
         position: OpenPosition,
@@ -1373,19 +1590,58 @@ class CloseExecutor:
                 )
                 return {"outcome": "rejected", "fill": None, "reason": str(e), "order_id": ""}
             else:
+                accepted_order_id = normalize_order_identity(
+                    getattr(e, "accepted_order_id", "")
+                    or evidence.extra.get("accepted_order_id")
+                )
+                accepted_client_order_id = normalize_order_identity(
+                    getattr(e, "accepted_client_order_id", "")
+                    or evidence.extra.get("accepted_client_order_id")
+                    or request.client_order_id
+                )
+                ack_only = bool(getattr(e, "order_ack_only", False)) or bool(
+                    evidence.extra.get("order_ack_only")
+                )
+                payload = {
+                    "position_id": position_id,
+                    "symbol": request.symbol,
+                    "venue": request.venue.value,
+                    "leg": leg,
+                    "operation": "close_reduce_only",
+                    "reason": str(e),
+                    "client_order_id": request.client_order_id,
+                    "exchange_error": evidence.to_dict(),
+                    "request_context": req_ctx.to_dict(),
+                    "evidence_completeness": evidence.evidence_completeness,
+                }
+                if ack_only or accepted_order_id or accepted_client_order_id:
+                    payload.update(
+                        {
+                            "accepted_order_truth_gap": True,
+                            "truth_required_by": "accepted_order_truth_gap",
+                            "accepted_order_id": accepted_order_id,
+                            "accepted_client_order_id": accepted_client_order_id,
+                            "order_id": accepted_order_id,
+                            "next_action": (
+                                "prove_order_detail_live_position_and_open_orders"
+                            ),
+                        }
+                    )
                 self.journal.append(
                     "order.uncertain",
-                    {
-                        "position_id": position_id,
-                        "leg": leg,
-                        "reason": str(e),
-                        "client_order_id": request.client_order_id,
-                        "exchange_error": evidence.to_dict(),
-                        "request_context": req_ctx.to_dict(),
-                        "evidence_completeness": evidence.evidence_completeness,
-                    },
+                    payload,
                 )
-                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+                return {
+                    "outcome": "uncertain",
+                    "fill": None,
+                    "order_id": accepted_order_id,
+                    "accepted_order_id": accepted_order_id,
+                    "accepted_client_order_id": accepted_client_order_id,
+                    "accepted_order_truth_gap": bool(
+                        ack_only or accepted_order_id or accepted_client_order_id
+                    ),
+                    "reason": str(e),
+                }
 
         except Exception as e:
             req_ctx = RequestContext.from_order_request(request)
@@ -1802,6 +2058,19 @@ class CloseExecutor:
                 return result
 
             # Uncertain — retry with backoff if attempts remain
+            if result.get("accepted_order_truth_gap") is True:
+                return await self._resolve_ack_only_close_truth_gap(
+                    request=request,
+                    position_id=position_id,
+                    leg=leg,
+                    order_id=str(result.get("accepted_order_id") or ""),
+                    client_order_id=str(
+                        result.get("accepted_client_order_id")
+                        or request.client_order_id
+                        or ""
+                    ),
+                )
+
             if attempt < self.config.max_close_retries:
                 backoff_ms = min(retry_base_ms * (2 ** (attempt - 1)), retry_max_ms)
                 self.journal.append(

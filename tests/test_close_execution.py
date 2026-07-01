@@ -1486,6 +1486,216 @@ class TestCloseChunkExecutor:
         ] == []
 
     @pytest.mark.asyncio
+    async def test_ack_only_close_live_flat_emits_explicit_truth_gap_resolution(self):
+        """ACK-only close responses must close through explicit truth-gap lifecycle."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class AckOnlyLiveFlatAdapter(FakeVenueAdapter):
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
+        adapter = AckOnlyLiveFlatAdapter(Venue.BYBIT, default_fill_price=0.2911)
+        err = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-close-1) but fill not confirmed",
+        )
+        err.order_ack_only = True
+        err.accepted_order_id = "ack-close-1"
+        err.accepted_client_order_id = compact_client_order_id("p001", "exit_short")
+        err.fill_confirmation_missing_fields = ["executedQty", "cumQty", "fillSz"]
+        adapter.place_order_outcomes = [err]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="TAIKOUSDT",
+            side=Side.BUY,
+            quantity=193.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=err.accepted_client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "terminal_flat"
+        assert result["reason"] == "ack_only_order_live_flat"
+        events = journal.read_all()
+        registered = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_registered"
+        ]
+        resolved = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert registered[-1]["accepted_order_id"] == "ack-close-1"
+        assert registered[-1]["accepted_client_order_id"] == err.accepted_client_order_id
+        assert registered[-1]["symbol"] == "TAIKOUSDT"
+        assert registered[-1]["venue"] == "bybit"
+        assert resolved[-1]["resolution_status"] == "live_flat"
+        assert resolved[-1]["decision"] == "clear_gap"
+        assert resolved[-1]["source"] == "ack_only_order_reconcile"
+        assert resolved[-1]["live_position_proof"]["quantity"] == 0.0
+        assert resolved[-1]["open_order_proof"]["open_order_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_ack_only_close_open_order_present_retains_truth_gap(self):
+        """ACK-only close cannot resolve while the accepted order remains open."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class AckOnlyOpenOrderAdapter(FakeVenueAdapter):
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+            async def fetch_open_orders(self, symbol: str):
+                return [{"orderId": "ack-close-1", "symbol": symbol}]
+
+        adapter = AckOnlyOpenOrderAdapter(Venue.BYBIT, default_fill_price=0.2911)
+        err = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-close-1) but fill not confirmed",
+        )
+        err.order_ack_only = True
+        err.accepted_order_id = "ack-close-1"
+        err.accepted_client_order_id = compact_client_order_id("p001", "exit_short")
+        adapter.place_order_outcomes = [err]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="TAIKOUSDT",
+            side=Side.BUY,
+            quantity=193.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=err.accepted_client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "uncertain"
+        events = journal.read_all()
+        assert [
+            event for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_registered"
+        ]
+        blocked = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_retry_blocked"
+        ]
+        assert blocked[-1]["reason"] == "ack_only_order_open_order_present"
+        assert blocked[-1]["decision"] == "retain_truth_gap"
+        assert [
+            event for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ] == []
+
+    @pytest.mark.asyncio
+    async def test_ack_only_close_order_detail_fill_emits_explicit_truth_gap_resolution(self):
+        """Order-detail truth wins before live-flat inference for ACK-only closes."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class AckOnlyFilledAdapter(FakeVenueAdapter):
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=193.0,
+                    average_price=0.2912,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.03,
+                    filled_at_ms=2300,
+                )
+
+            async def fetch_position(self, symbol: str):
+                raise AssertionError("live-flat proof must not run after fill truth")
+
+        adapter = AckOnlyFilledAdapter(Venue.BYBIT, default_fill_price=0.2911)
+        err = OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "order accepted (id=ack-close-2) but fill not confirmed",
+        )
+        err.order_ack_only = True
+        err.accepted_order_id = "ack-close-2"
+        err.accepted_client_order_id = compact_client_order_id("p001", "exit_short")
+        adapter.place_order_outcomes = [err]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="TAIKOUSDT",
+            side=Side.BUY,
+            quantity=193.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=err.accepted_client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "filled"
+        assert result["fill"].quantity == pytest.approx(193.0)
+        events = journal.read_all()
+        resolved = [
+            event["payload"] for event in events
+            if event["kind"] == "exit.accepted_order_truth_gap_resolved"
+        ]
+        assert resolved[-1]["resolution_status"] == "filled"
+        assert resolved[-1]["decision"] == "apply_fill"
+        assert resolved[-1]["filled_quantity"] == pytest.approx(193.0)
+        assert resolved[-1]["accepted_order_id"] == "ack-close-2"
+
+    @pytest.mark.asyncio
     async def test_bitget_duplicate_client_oid_close_reconciles_live_flat(self):
         """Bitget 40786 duplicate clientOid is an idempotency conflict, not a hard reject."""
         from lightfee.engine.close_executor import CloseExecutor
