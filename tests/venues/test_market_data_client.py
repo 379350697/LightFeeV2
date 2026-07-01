@@ -1180,6 +1180,65 @@ class TestProductionSidecarParserRegressions:
         assert ticker.funding_rate_bps == pytest.approx(4.0)
 
     @pytest.mark.asyncio
+    async def test_gate_ticker_uses_highest_lowest_size_fields(self):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [
+                        {
+                            "contract": "ALL_USDT",
+                            "highest_bid": "0.4295",
+                            "highest_size": "1",
+                            "lowest_ask": "0.4297",
+                            "lowest_size": "2",
+                            "mark_price": "0.4334",
+                            "index_price": "0.4363",
+                            "funding_rate": "-0.000269",
+                            "volume_24h_quote": "17013",
+                            "total_size": "45948",
+                            "quanto_multiplier": "1",
+                        },
+                        {
+                            "contract": "LAB_USDT",
+                            "highest_bid": "11.78813",
+                            "highest_size": "0.1",
+                            "lowest_ask": "11.78926",
+                            "lowest_size": "0.2",
+                            "mark_price": "11.81042",
+                            "index_price": "12.222091",
+                            "funding_rate": "-0.003463",
+                            "volume_24h_quote": "41570427",
+                            "total_size": "6166",
+                            "quanto_multiplier": "100",
+                        },
+                    ]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return [
+                        {
+                            "name": "ALL_USDT",
+                            "funding_rate": "-0.000269",
+                            "funding_next_apply": 4100007200,
+                        },
+                        {
+                            "name": "LAB_USDT",
+                            "funding_rate": "-0.003463",
+                            "funding_next_apply": 4100007200,
+                        },
+                    ]
+                raise AssertionError(f"unexpected path: {path}")
+
+        result = await FakeGateClient(gate_spec())._fetch_gate_style(
+            ["ALLUSDT", "LABUSDT"]
+        )
+
+        all_ticker = result["gate:ALLUSDT"]
+        lab_ticker = result["gate:LABUSDT"]
+        assert all_ticker.bid_size == pytest.approx(1.0)
+        assert all_ticker.ask_size == pytest.approx(2.0)
+        assert lab_ticker.bid_size == pytest.approx(10.0)
+        assert lab_ticker.ask_size == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
     async def test_gate_contracts_funding_bulk_cache_reuses_fresh_metadata(self):
         class FakeGateClient(MarketDataClient):
             def __init__(self, spec):

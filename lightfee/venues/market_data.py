@@ -1520,13 +1520,20 @@ class MarketDataClient:
             )
             if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
                 funding_timestamp_ms = 0
+            bid_size_contracts = _safe_float(
+                item.get("highest_size", item.get("bid_size", 0))
+            )
+            ask_size_contracts = _safe_float(
+                item.get("lowest_size", item.get("ask_size", 0))
+            )
+            size_multiplier = quanto if quanto > 0 else 1.0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
                 bid=_safe_float(item.get("highest_bid", 0)),
                 ask=_safe_float(item.get("lowest_ask", 0)),
-                bid_size=_safe_float(item.get("bid_size", 0)),
-                ask_size=_safe_float(item.get("ask_size", 0)),
+                bid_size=bid_size_contracts * size_multiplier,
+                ask_size=ask_size_contracts * size_multiplier,
                 mark_price=mark,
                 index_price=_safe_float(item.get("index_price", 0)),
                 funding_rate_bps=_safe_float(
