@@ -28,6 +28,14 @@ semantic contract before changing the V2 implementation.
 - For bugs involving live exchange state, exchange truth outranks local recovered
   state.
 
+## Context Hygiene
+
+- Default searches must exclude `.gitnexus/**` and large audit artifacts such as
+  `runtime/audits/**` unless the user explicitly asks to inspect them.
+- Diagnostic commands must emit field-focused output instead of full dumps. Use
+  filters such as `jq`, targeted SQL columns, bounded `rg`, and explicit
+  `max_output_tokens` limits for large JSON, JSONL, logs, or session files.
+
 ## GitNexus
 
 The actual GitNexus repo name for this project is `LightFeeV2`.

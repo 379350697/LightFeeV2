@@ -1560,6 +1560,47 @@ class TestCloseChunkExecutor:
         assert resolved[-1]["open_order_proof"]["open_order_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_plain_uncertain_close_does_not_promote_request_cid_to_ack_gap(self):
+        """Plain close timeouts keep V1 pending-close semantics."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        adapter = FakeVenueAdapter(Venue.BYBIT, default_fill_price=0.2911)
+        adapter.place_order_outcomes = [
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "order timeout")
+        ]
+
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BYBIT: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        request = OrderRequest(
+            venue=Venue.BYBIT,
+            symbol="TAIKOUSDT",
+            side=Side.BUY,
+            quantity=193.0,
+            price=0.0,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=compact_client_order_id("p001", "exit_short"),
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "uncertain"
+        assert result.get("accepted_order_truth_gap") is not True
+        assert adapter.fetch_position_call_count == 0
+        assert [
+            event for event in journal.read_all()
+            if event["kind"] == "exit.accepted_order_truth_gap_registered"
+        ] == []
+
+    @pytest.mark.asyncio
     async def test_ack_only_close_open_order_present_retains_truth_gap(self):
         """ACK-only close cannot resolve while the accepted order remains open."""
         from lightfee.engine.close_executor import CloseExecutor

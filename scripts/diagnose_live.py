@@ -8,6 +8,7 @@ same conclusion.
 
 Usage:
   python scripts/diagnose_live.py --json                     # full diagnose
+  python scripts/diagnose_live.py --compact-json             # field-focused diagnose
   python scripts/diagnose_live.py --json --symbol BTCUSDT     # filter
   python scripts/diagnose_live.py --json --runtime-dir ./tests/fixtures
 """
@@ -67,6 +68,7 @@ from lightfee.offline.analysis.journal import (
     summarize_quick_flat_events,
 )
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+from lightfee.ops.diagnostics.reporting import render_budgeted_json
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.symbol_eligibility import (
     PRIVATE_TRUTH_UNSUPPORTED_REASON,
@@ -9948,6 +9950,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LightFeeV2 read-only production diagnostics")
     parser.add_argument("--json", action="store_true", default=True,
                        help="Output JSON (default)")
+    parser.add_argument("--profile", choices=["full", "operator", "agent", "gate"],
+                       default="full",
+                       help="Output profile: full, operator, agent, or gate")
+    parser.add_argument("--compact-json", action="store_true", default=False,
+                       help="Compatibility alias for --profile agent")
+    parser.add_argument("--artifact-dir", type=str, default="",
+                       help="Optional directory for full artifacts when profile output exceeds budget")
     parser.add_argument("--symbol", type=str, default="",
                        help="Filter by symbol")
     parser.add_argument("--venues", type=str, default="",
@@ -9997,7 +10006,17 @@ def main() -> None:
         exclude_liquidity=args.exclude_liquidity,
     )
 
-    if args.json:
+    profile = "agent" if args.compact_json else args.profile
+    if profile != "full":
+        sys.stdout.write(
+            render_budgeted_json(
+                result,
+                profile=profile,
+                artifact_dir=args.artifact_dir or None,
+                artifact_name=f"diagnose-{profile}.json",
+            )
+        )
+    elif args.json:
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:

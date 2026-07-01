@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 
 import pytest
@@ -48,6 +49,168 @@ def _write_json(path, data):
 
 def _make_tmpdir():
     return tempfile.mkdtemp(prefix="diagnose_test_")
+
+
+def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
+    import scripts.diagnose_live as diagnose_live
+
+    def fake_run_diagnose(**kwargs):
+        return {
+            "schema_version": 2,
+            "generated_at_ms": 123456,
+            "scope": {
+                "symbol": "*",
+                "venues": [],
+                "since_deploy": kwargs["since_deploy"],
+                "max_events": kwargs["max_events"],
+                "event_files": ["/runtime/live-events.jsonl"],
+                "events_parsed": 42,
+                "state_path": "/runtime/live-state-current.json",
+                "state_path_source": "explicit",
+            },
+            "window": {
+                "mode": "since_deploy",
+                "since_ms": 1000,
+                "until_ms": 123456,
+                "confidence": "high",
+            },
+            "conclusion": {
+                "status": "healthy",
+                "risk": "low",
+                "summary": "no issues detected",
+                "next_actions": [],
+            },
+            "health": {
+                "ok": True,
+                "critical_count": 0,
+                "warning_count": 0,
+                "fingerprints": [],
+            },
+            "local_state": {
+                "lifecycle": "RUNNING",
+                "risk_mode": "running",
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "positions": [{"symbol": "SHOULD_NOT_LEAK"}],
+            },
+            "exchange_truth": {
+                "available": True,
+                "confidence": "high",
+                "available_venues": ["binance"],
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "state_verdict": "consistent",
+                "errors": [],
+            },
+            "state_consistency": {
+                "state_mismatch": False,
+                "local_open_exchange_flat": False,
+                "details": [],
+            },
+            "production_acceptance_gate": {
+                "gate_passed": True,
+                "fingerprints": [],
+                "next_actions": [],
+            },
+            "diagnostic_noise_summary": {
+                "current_blocker_count": 0,
+                "visibility_counts": {},
+            },
+            "top_exchange_errors": [],
+            "order_error_evidence": [{"error": "SHOULD_NOT_LEAK"}],
+        }
+
+    monkeypatch.setattr(diagnose_live, "run_diagnose", fake_run_diagnose)
+    monkeypatch.setattr(sys, "argv", ["diagnose_live.py", "--compact-json", "--since-deploy"])
+
+    diagnose_live.main()
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["conclusion"]["status"] == "healthy"
+    assert output["scope"] == {
+        "symbol": "*",
+        "venues": [],
+        "since_deploy": True,
+        "max_events": 50_000,
+        "events_parsed": 42,
+        "event_file_count": 1,
+        "state_path_source": "explicit",
+    }
+    assert output["local_state"] == {
+        "lifecycle": "RUNNING",
+        "risk_mode": "running",
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+    }
+    assert "positions" not in output["local_state"]
+    assert "order_error_evidence" not in output
+
+
+def test_main_profile_gate_outputs_minimal_gate_report(monkeypatch, capsys):
+    import scripts.diagnose_live as diagnose_live
+
+    def fake_run_diagnose(**kwargs):
+        return {
+            "conclusion": {
+                "status": "healthy",
+                "risk": "low",
+                "summary": "no issues detected",
+                "next_actions": [],
+            },
+            "local_state": {
+                "lifecycle": "RUNNING",
+                "risk_mode": "running",
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "positions": [{"symbol": "SHOULD_NOT_LEAK"}],
+            },
+            "exchange_truth": {
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "state_verdict": "consistent",
+            },
+            "production_acceptance_gate": {
+                "gate_passed": True,
+                "fingerprints": [],
+                "next_actions": [],
+            },
+            "order_error_evidence": [{"error": "SHOULD_NOT_LEAK"}],
+        }
+
+    monkeypatch.setattr(diagnose_live, "run_diagnose", fake_run_diagnose)
+    monkeypatch.setattr(sys, "argv", ["diagnose_live.py", "--profile", "gate"])
+
+    diagnose_live.main()
+
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "profile": "gate",
+        "status": "healthy",
+        "risk": "low",
+        "gate_passed": True,
+        "summary": "no issues detected",
+        "next_actions": [],
+        "local_state": {
+            "lifecycle": "RUNNING",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+        },
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "state_verdict": "consistent",
+        },
+        "fingerprints": [],
+    }
 
 
 def test_run_diagnose_reports_spread_sidecar_snapshot_source():

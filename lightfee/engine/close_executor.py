@@ -1594,13 +1594,19 @@ class CloseExecutor:
                     getattr(e, "accepted_order_id", "")
                     or evidence.extra.get("accepted_order_id")
                 )
-                accepted_client_order_id = normalize_order_identity(
+                explicit_accepted_client_order_id = normalize_order_identity(
                     getattr(e, "accepted_client_order_id", "")
                     or evidence.extra.get("accepted_client_order_id")
-                    or request.client_order_id
                 )
                 ack_only = bool(getattr(e, "order_ack_only", False)) or bool(
                     evidence.extra.get("order_ack_only")
+                )
+                accepted_client_order_id = (
+                    explicit_accepted_client_order_id
+                    or (normalize_order_identity(request.client_order_id) if ack_only else "")
+                )
+                accepted_order_truth_gap = bool(
+                    ack_only or accepted_order_id or explicit_accepted_client_order_id
                 )
                 payload = {
                     "position_id": position_id,
@@ -1614,7 +1620,7 @@ class CloseExecutor:
                     "request_context": req_ctx.to_dict(),
                     "evidence_completeness": evidence.evidence_completeness,
                 }
-                if ack_only or accepted_order_id or accepted_client_order_id:
+                if accepted_order_truth_gap:
                     payload.update(
                         {
                             "accepted_order_truth_gap": True,
@@ -1637,9 +1643,7 @@ class CloseExecutor:
                     "order_id": accepted_order_id,
                     "accepted_order_id": accepted_order_id,
                     "accepted_client_order_id": accepted_client_order_id,
-                    "accepted_order_truth_gap": bool(
-                        ack_only or accepted_order_id or accepted_client_order_id
-                    ),
+                    "accepted_order_truth_gap": accepted_order_truth_gap,
                     "reason": str(e),
                 }
 
