@@ -319,6 +319,82 @@ def test_spread_reversion_allows_enabled_single_venue_dislocation_for_paper() ->
     assert candidate.net_edge_bps > 5.0
 
 
+def test_single_venue_dislocation_does_not_wait_for_rolling_zscore() -> None:
+    tracker = SpreadStatsTracker()
+    cfg = SpreadReversionConfig(
+        min_samples=120,
+        min_history_ms=300_000,
+        min_fair_price_confidence=1.0,
+        min_liquidity_capacity_ratio=1.0,
+        entry_z=2.0,
+        min_net_edge_bps=5.0,
+        signal_ttl_ms=20_000,
+        quote_skew_ms=2_000,
+        live_notional_quote=20.0,
+        max_gross_quote=50.0,
+        slippage_reserve_bps=0.0,
+        adverse_selection_buffer_bps=0.0,
+        fair_price_max_venue_premium_bps=150.0,
+        fair_price_min_venues=3,
+        single_venue_dislocation_enabled=True,
+        single_venue_dislocation_min_anchor_venues=3,
+    )
+    now_ms = 65_000
+    quotes = {
+        "gate:LABUSDT": _quote(
+            "gate",
+            symbol="LABUSDT",
+            bid=11.98,
+            ask=12.00,
+            observed_at_ms=now_ms - 100,
+            bid_size=20.0,
+            ask_size=20.0,
+        ),
+        "okx:LABUSDT": _quote(
+            "okx",
+            symbol="LABUSDT",
+            bid=11.99,
+            ask=12.01,
+            observed_at_ms=now_ms - 150,
+            bid_size=20.0,
+            ask_size=20.0,
+        ),
+        "binance:LABUSDT": _quote(
+            "binance",
+            symbol="LABUSDT",
+            bid=12.02,
+            ask=12.04,
+            observed_at_ms=now_ms - 120,
+            bid_size=20.0,
+            ask_size=20.0,
+        ),
+        "bybit:LABUSDT": _quote(
+            "bybit",
+            symbol="LABUSDT",
+            bid=12.38,
+            ask=12.39,
+            observed_at_ms=now_ms - 1_000,
+            bid_size=20.0,
+            ask_size=20.0,
+        ),
+    }
+
+    candidates = build_spread_reversion_candidates(
+        quotes,
+        ["LABUSDT"],
+        tracker=tracker,
+        config=cfg,
+        now_ms=now_ms,
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.opportunity_label == "single_venue_dislocation"
+    assert candidate.signal_status == "entry_ready"
+    assert candidate.sample_count == 1
+    assert candidate.z_score == 0.0
+
+
 def test_spread_reversion_blocks_missing_top_book_size() -> None:
     tracker = SpreadStatsTracker()
     cfg = SpreadReversionConfig(

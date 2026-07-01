@@ -421,23 +421,25 @@ def _candidate_for_pair(
         spread_mid_bps,
         observed_at_ms=now_ms,
     )
-    if stats.sample_count < max(config.min_samples, 1):
-        return None
-    if config.min_history_ms > 0 and stats.history_age_ms < config.min_history_ms:
-        return None
+    is_single_venue_dislocation = opportunity_label == "single_venue_dislocation"
+    if not is_single_venue_dislocation:
+        if stats.sample_count < max(config.min_samples, 1):
+            return None
+        if config.min_history_ms > 0 and stats.history_age_ms < config.min_history_ms:
+            return None
     z_score = zscore_model.z_score(
         spread_mid_bps=spread_mid_bps,
         mean_bps=stats.mean_bps,
         std_bps=stats.std_bps,
     )
-    if z_score < config.entry_z:
+    if not is_single_venue_dislocation and z_score < config.entry_z:
         return None
     quality = quality_model.assess(
         z_score=z_score,
         sample_count=stats.sample_count,
         rolling_std_bps=stats.std_bps,
     )
-    if not quality.entry_allowed and config.entry_z > 0.0:
+    if not is_single_venue_dislocation and not quality.entry_allowed and config.entry_z > 0.0:
         return None
 
     executable_spread_bps = 0.0
