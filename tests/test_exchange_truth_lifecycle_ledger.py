@@ -1014,6 +1014,316 @@ def test_entry_opened_infers_unlabeled_hedge_open_identity_from_submitted_maker(
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
 
 
+def test_entry_opened_infers_hedge_when_submitted_maker_uses_noncanonical_leg():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-1779479522323-ALTUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "quantity": 19,
+                "matched_quantity": 19,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "maker_order_id": "4492933796",
+                "maker_client_order_id": "maker-open-client",
+                "hedge_order_id": "d7df6fe1-1057-448f-9c79-16a91eb4087b",
+                "hedge_client_order_id": "hedge-open-client",
+            },
+        ),
+        _event(
+            1_020,
+            "order.passive_submitted",
+            {
+                "entry_id": position_id,
+                "symbol": "ALTUSDT",
+                "venue": "binance",
+                "leg": "maker",
+                "order_id": "4492933796",
+                "client_order_id": "maker-open-client",
+                "quantity": 19,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long-binance",
+                "quantity": 19,
+                "price": 0.041,
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "close-short-bybit",
+                "quantity": 19,
+                "price": 0.0408,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+
+    class FakeAdapter:
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol: str,
+            order_id: str,
+            client_order_id: str = "",
+        ) -> OrderFillReconciliation:
+            if order_id == "4492933796":
+                return OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=19,
+                    average_price=0.0407,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    filled_at_ms=1_100,
+                    metadata={"tradeSide": "open"},
+                )
+            if order_id == "d7df6fe1-1057-448f-9c79-16a91eb4087b":
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=19,
+                    average_price=0.0409,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    filled_at_ms=1_120,
+                    metadata={"tradeSide": "open"},
+                )
+            raise AssertionError(order_id)
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events(
+            report,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["attempted"] == 2
+    assert {
+        (event["payload"]["leg"], event["payload"]["venue"], event["payload"]["order_id"])
+        for event in fill_events
+    } == {
+        ("long", "binance", "4492933796"),
+        ("short", "bybit", "d7df6fe1-1057-448f-9c79-16a91eb4087b"),
+    }
+
+
+def test_rebuild_lifecycle_truth_treats_binance_order_not_exist_as_not_found():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-binance-not-found"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "quantity": 19,
+                "matched_quantity": 19,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 19,
+                "price": 0.0407,
+            },
+        ),
+        _event(
+            1_120,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "open",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 19,
+                "price": 0.0409,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.pending_close_reconciliation_registered",
+            {
+                "position_id": position_id,
+                "statement_probe_candidates": [
+                    {
+                        "leg": "long",
+                        "venue": "binance",
+                        "order_id": "missing-binance-order",
+                    }
+                ],
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+
+    class FakeAdapter:
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol: str,
+            order_id: str,
+            client_order_id: str = "",
+        ) -> None:
+            raise RuntimeError('HTTP 400: {"code":-2013,"msg":"Order does not exist."}')
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events(
+            report,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert fill_events == []
+    assert summary["attempted"] == 1
+    assert summary["not_found"] == 1
+    assert summary["errors"] == []
+
+
+def test_rebuild_lifecycle_truth_queries_exchange_until_no_new_fill_events():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-iterative-query"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "quantity": 19,
+                "matched_quantity": 19,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long-binance",
+                "quantity": 19,
+                "price": 0.041,
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "close-short-bybit",
+                "quantity": 19,
+                "price": 0.0408,
+            },
+        ),
+    ]
+    first_fill = _event(
+        1_100,
+        "order.filled",
+        {
+            "position_id": position_id,
+            "symbol": "ALTUSDT",
+            "phase": "open",
+            "leg": "long",
+            "venue": "binance",
+            "order_id": "open-long-binance",
+            "quantity": 19,
+            "price": 0.0407,
+        },
+    )
+    second_fill = _event(
+        1_120,
+        "order.filled",
+        {
+            "position_id": position_id,
+            "symbol": "ALTUSDT",
+            "phase": "open",
+            "leg": "short",
+            "venue": "bybit",
+            "order_id": "open-short-bybit",
+            "quantity": 19,
+            "price": 0.0409,
+        },
+    )
+    calls = 0
+
+    async def fake_query(report: dict) -> tuple[list[dict], dict]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return [first_fill], {"enabled": True, "attempted": 1, "filled": 1, "errors": []}
+        if calls == 2:
+            return [second_fill], {"enabled": True, "attempted": 1, "filled": 1, "errors": []}
+        return [], {"enabled": True, "attempted": 0, "filled": 0, "errors": []}
+
+    report, fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events_until_stable(
+            events,
+            position_ids={position_id},
+            query_func=fake_query,
+            max_passes=3,
+        )
+    )
+
+    assert calls == 3
+    assert fill_events == [first_fill, second_fill]
+    assert summary["pass_count"] == 3
+    assert summary["synthetic_fill_event_count"] == 2
+    assert report["positions"][position_id]["classification"] == (
+        LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    )
+
+
 def test_hedge_duplicate_close_identity_infers_opposite_leg_and_venue():
     from scripts import rebuild_lifecycle_truth
 

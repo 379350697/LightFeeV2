@@ -727,7 +727,7 @@ def _enrich_identity_from_entry(identity: JsonDict, entry: JsonDict) -> None:
     phase = _identity_phase_from_identity(identity)
     if phase not in {"open", "close"}:
         return
-    leg = str(identity.get("leg") or "").lower()
+    leg = _canonical_identity_leg(identity)
     venue = str(identity.get("venue") or "").lower()
     long_venue = _entry_venue_for_leg(entry, "long")
     short_venue = _entry_venue_for_leg(entry, "short")
@@ -742,6 +742,13 @@ def _enrich_identity_from_entry(identity: JsonDict, entry: JsonDict) -> None:
         inferred_venue = _entry_venue_for_leg(entry, leg)
         if inferred_venue:
             identity["venue"] = inferred_venue
+
+
+def _canonical_identity_leg(identity: JsonDict) -> str:
+    leg = str(identity.get("leg") or "").lower()
+    if leg in {"long", "short"}:
+        return leg
+    return ""
 
 
 def _enrich_identity_from_matching_identity(identities: list[JsonDict]) -> None:

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -421,6 +421,12 @@ async def query_exchange_fill_events(
                 else:
                     summary["unwindowed_query_count"] += 1
             except Exception as exc:  # pragma: no cover - defensive for live adapters.
+                if _is_exchange_order_not_found_exception(candidate, exc):
+                    summary["not_found"] += 1
+                    summary["not_found_from_error_count"] = (
+                        int(summary.get("not_found_from_error_count") or 0) + 1
+                    )
+                    continue
                 summary["errors"].append(
                     {
                         "position_id": candidate["position_id"],
@@ -439,6 +445,102 @@ async def query_exchange_fill_events(
     finally:
         restore_runtime(previous_runtime)
     return fill_events, summary
+
+
+def _is_exchange_order_not_found_exception(candidate: dict[str, Any], exc: Exception) -> bool:
+    venue = str(candidate.get("venue") or "").lower()
+    if venue != "binance":
+        return False
+    text = str(exc).lower()
+    return "-2013" in text or "order does not exist" in text
+
+
+async def query_exchange_fill_events_until_stable(
+    events: list[dict[str, Any]],
+    *,
+    position_ids: Iterable[str] | None,
+    max_passes: int = 3,
+    query_func: Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
+    | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Rebuild lifecycle truth and keep probing newly exposed order identities."""
+
+    query = query_func or query_exchange_fill_events
+    scoped_position_ids = set(position_ids or [])
+    report = build_exchange_truth_lifecycle(events, position_ids=scoped_position_ids)
+    queried_fill_events: list[dict[str, Any]] = []
+    pass_summaries: list[dict[str, Any]] = []
+    seen = {_fill_event_identity_key(event) for event in events if _fill_event_identity_key(event)}
+
+    for pass_index in range(1, max(1, max_passes) + 1):
+        fill_events, summary = await query(report)
+        summary = dict(summary)
+        summary["pass_index"] = pass_index
+        pass_summaries.append(summary)
+        new_fill_events: list[dict[str, Any]] = []
+        for event in fill_events:
+            key = _fill_event_identity_key(event)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            new_fill_events.append(event)
+        if not new_fill_events:
+            break
+        queried_fill_events.extend(new_fill_events)
+        report = build_exchange_truth_lifecycle(
+            events + queried_fill_events,
+            position_ids=scoped_position_ids,
+        )
+
+    exchange_query_summary = _merge_exchange_query_summaries(
+        pass_summaries,
+        synthetic_fill_event_count=len(queried_fill_events),
+    )
+    return report, queried_fill_events, exchange_query_summary
+
+
+def _fill_event_identity_key(event: dict[str, Any]) -> tuple[str, str, str, str, str, str, str] | None:
+    if str(event.get("kind") or "") != "order.filled":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    return (
+        str(payload.get("position_id") or payload.get("entry_id") or ""),
+        str(payload.get("phase") or ""),
+        str(payload.get("leg") or ""),
+        str(payload.get("venue") or payload.get("exchange") or "").lower(),
+        str(payload.get("order_id") or payload.get("orderId") or ""),
+        str(payload.get("client_order_id") or payload.get("clientOrderId") or ""),
+        str(payload.get("filled_at_ms") or event.get("ts_ms") or ""),
+    )
+
+
+def _merge_exchange_query_summaries(
+    pass_summaries: list[dict[str, Any]],
+    *,
+    synthetic_fill_event_count: int,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "enabled": True,
+        "pass_count": len(pass_summaries),
+        "synthetic_fill_event_count": synthetic_fill_event_count,
+        "pass_summaries": pass_summaries,
+        "errors": [],
+    }
+    for summary in pass_summaries:
+        for key, value in summary.items():
+            if key in {"enabled", "errors", "pass_index"}:
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                merged[key] = int(merged.get(key) or 0) + value
+        errors = summary.get("errors")
+        if isinstance(errors, list):
+            merged["errors"].extend(errors)
+    return merged
 
 
 def correction_event(position_id: str, truth: dict[str, Any]) -> dict[str, Any]:
@@ -616,14 +718,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.query_exchange:
         exchange_truth_env_files_loaded = _load_exchange_truth_environment()
-        fill_events, exchange_query_summary = asyncio.run(query_exchange_fill_events(report))
-        if fill_events:
-            queried_fill_events = fill_events
-            report = build_exchange_truth_lifecycle(
-                events + fill_events,
+        report, queried_fill_events, exchange_query_summary = asyncio.run(
+            query_exchange_fill_events_until_stable(
+                events,
                 position_ids=set(position_ids or []),
             )
-        exchange_query_summary["synthetic_fill_event_count"] = len(queried_fill_events)
+        )
         report["exchange_query"] = exchange_query_summary
     else:
         report["exchange_query"] = {"enabled": False}
