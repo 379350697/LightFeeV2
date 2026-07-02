@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -602,6 +603,62 @@ def test_rebuild_lifecycle_truth_queries_close_identity_into_fill_event():
     truth = rebuilt["positions"][position_id]
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
     assert truth["close_coverage"]["short"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_loads_exchange_env_before_query(monkeypatch, tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-env-load"
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps(
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "quantity": 1,
+                    "long_venue": "bitget",
+                    "short_venue": "bybit",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+    monkeypatch.delenv("LIGHTFEE_BYBIT_API_KEY", raising=False)
+    observed: list[str] = []
+
+    def fake_load_env() -> list[str]:
+        os.environ["LIGHTFEE_BYBIT_API_KEY"] = "loaded-from-systemd-env"
+        return ["/etc/lightfee/lightfee.env"]
+
+    async def fake_query(report: dict) -> tuple[list[dict], dict]:
+        observed.append(os.environ.get("LIGHTFEE_BYBIT_API_KEY", ""))
+        return [], {"enabled": True, "candidate_count": 0}
+
+    monkeypatch.setattr(
+        rebuild_lifecycle_truth,
+        "_load_exchange_truth_environment",
+        fake_load_env,
+    )
+    monkeypatch.setattr(rebuild_lifecycle_truth, "query_exchange_fill_events", fake_query)
+
+    rc = rebuild_lifecycle_truth.main(
+        [
+            "--events",
+            str(events_path),
+            "--positions-file",
+            str(positions_path),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    assert observed == ["loaded-from-systemd-env"]
 
 
 def test_rebuild_lifecycle_truth_skips_query_for_already_complete_identity():

@@ -273,6 +273,15 @@ def _load_exchange_query_helpers() -> tuple[
     )
 
 
+def _load_exchange_truth_environment(unit_dir: str = "/etc/systemd/system") -> list[str]:
+    try:
+        from scripts.diagnose_live import _load_systemd_environment_files  # noqa: PLC0415
+
+        return _load_systemd_environment_files(unit_dir)
+    except Exception:
+        return []
+
+
 async def query_exchange_fill_events(
     report: dict[str, Any],
     *,
@@ -538,11 +547,13 @@ def main(argv: list[str] | None = None) -> int:
     position_ids = read_position_ids(args.positions_file)
     events = read_jsonl_events(event_files)
     queried_fill_events: list[dict[str, Any]] = []
+    exchange_truth_env_files_loaded: list[str] = []
     report = build_exchange_truth_lifecycle(
         events,
         position_ids=set(position_ids or []),
     )
     if args.query_exchange:
+        exchange_truth_env_files_loaded = _load_exchange_truth_environment()
         fill_events, exchange_query_summary = asyncio.run(query_exchange_fill_events(report))
         if fill_events:
             queried_fill_events = fill_events
@@ -562,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
         "dry_run": not args.apply,
         "query_exchange": bool(args.query_exchange),
     }
+    report["exchange_truth_env_files_loaded"] = exchange_truth_env_files_loaded
     report["apply_blockers"] = apply_report_blockers(
         report,
         position_ids=position_ids,
