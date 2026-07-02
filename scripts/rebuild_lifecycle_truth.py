@@ -24,6 +24,7 @@ DEFAULT_RUNTIME_DIR = Path("runtime")
 CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
 HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 ACCOUNT_HISTORY_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
+ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS = 30 * 60 * 1000
 QTY_TOLERANCE = 0.999
 
 
@@ -535,10 +536,10 @@ def _account_history_fill_matches_target(
         return False
     side = str(_json_value(getattr(fill, "side", None)) or "").lower()
     expected_side = str(target.get("expected_side") or "").lower()
-    if expected_side and side and side != expected_side:
-        return False
     metadata = getattr(fill, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
+    if not _account_history_side_matches_target(side, expected_side, metadata, target):
+        return False
     if not _account_history_trade_side_matches(metadata, str(target.get("phase") or "")):
         return False
     if not _account_history_position_side_matches(metadata, str(target.get("leg") or "")):
@@ -546,6 +547,28 @@ def _account_history_fill_matches_target(
     if require_identity_match and _target_has_identity(target):
         return _account_history_fill_identity_matches(fill, target)
     return True
+
+
+def _account_history_side_matches_target(
+    side: str,
+    expected_side: str,
+    metadata: dict[str, Any],
+    target: dict[str, Any],
+) -> bool:
+    if not expected_side or not side or side == expected_side:
+        return True
+    venue = str(target.get("venue") or "").lower()
+    phase = str(target.get("phase") or "").lower()
+    if venue == "bitget" and phase == "close":
+        trade_side = str(
+            metadata.get("tradeSide")
+            or metadata.get("trade_side")
+            or metadata.get("trade_side_raw")
+            or ""
+        ).lower()
+        if "close" in trade_side or trade_side.startswith("reduce_"):
+            return True
+    return False
 
 
 def _target_has_identity(target: dict[str, Any]) -> bool:
@@ -593,6 +616,17 @@ def _account_history_fill_sort_key(fill: Any, anchor_ts_ms: int) -> tuple[int, i
     if anchor_ts_ms > 0 and filled_at_ms > 0:
         return abs(filled_at_ms - anchor_ts_ms), filled_at_ms
     return 0, filled_at_ms
+
+
+def _account_history_fill_within_identity_fallback_window(
+    fill: Any,
+    target: dict[str, Any],
+) -> bool:
+    anchor_ts_ms = int(target.get("anchor_ts_ms") or 0)
+    filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
+    if anchor_ts_ms <= 0 or filled_at_ms <= 0:
+        return False
+    return abs(filled_at_ms - anchor_ts_ms) <= ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS
 
 
 def _account_history_event_key(event: dict[str, Any]) -> tuple[str, str, str, str, str, str, str] | None:
@@ -645,6 +679,44 @@ def _account_history_exchange_event_key(event: dict[str, Any]) -> tuple[str, ...
         side,
         str(payload.get("quantity") or ""),
         str(payload.get("average_price") or payload.get("price") or ""),
+        str(payload.get("filled_at_ms") or event.get("ts_ms") or ""),
+    )
+
+
+def _account_history_has_trade_identity(event: dict[str, Any]) -> bool:
+    if str(event.get("kind") or "") != "order.filled":
+        return False
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return bool(
+        payload.get("trade_id")
+        or payload.get("tradeId")
+        or payload.get("exec_id")
+        or payload.get("execId")
+    )
+
+
+def _account_history_aggregate_fill_fingerprint(event: dict[str, Any]) -> tuple[str, ...] | None:
+    if str(event.get("kind") or "") != "order.filled":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    order_id = str(payload.get("order_id") or payload.get("orderId") or "")
+    client_order_id = str(payload.get("client_order_id") or payload.get("clientOrderId") or "")
+    if not order_id and not client_order_id:
+        return None
+    return (
+        str(payload.get("position_id") or payload.get("entry_id") or ""),
+        str(payload.get("phase") or ""),
+        str(payload.get("leg") or ""),
+        str(payload.get("venue") or payload.get("exchange") or "").lower(),
+        str(payload.get("symbol") or "").upper(),
+        order_id,
+        client_order_id,
+        str(_to_float(payload.get("quantity"))),
+        str(_to_float(payload.get("average_price") or payload.get("price"))),
         str(payload.get("filled_at_ms") or event.get("ts_ms") or ""),
     )
 
@@ -881,6 +953,8 @@ async def query_exchange_account_history_fill_events(
         "account_history_unavailable": 0,
         "identity_fallback_targets": 0,
         "identity_fallback_filled": 0,
+        "identity_fallback_time_filtered": 0,
+        "existing_aggregate_trade_skipped": 0,
         "errors": [],
     }
     fill_events: list[dict[str, Any]] = []
@@ -898,6 +972,15 @@ async def query_exchange_account_history_fill_events(
         for event in seed_events
         if _account_history_exchange_event_key(event)
     }
+    existing_aggregate_fingerprints: dict[tuple[str, ...], int] = {}
+    for event in seed_events:
+        if _account_history_has_trade_identity(event):
+            continue
+        fingerprint = _account_history_aggregate_fill_fingerprint(event)
+        if fingerprint:
+            existing_aggregate_fingerprints[fingerprint] = (
+                int(existing_aggregate_fingerprints.get(fingerprint) or 0) + 1
+            )
     previous_runtime = install_runtime()
     try:
         for target in targets:
@@ -964,7 +1047,7 @@ async def query_exchange_account_history_fill_events(
             ]
             match_mode = "identity" if identity_required else "no_identity"
             if identity_required and not matched:
-                matched = [
+                fallback_candidates = [
                     fill
                     for fill in history_fills
                     if _account_history_fill_matches_target(
@@ -973,6 +1056,15 @@ async def query_exchange_account_history_fill_events(
                         require_identity_match=False,
                     )
                 ]
+                matched = [
+                    fill
+                    for fill in fallback_candidates
+                    if _account_history_fill_within_identity_fallback_window(fill, target)
+                ]
+                summary["identity_fallback_time_filtered"] += max(
+                    0,
+                    len(fallback_candidates) - len(matched),
+                )
                 match_mode = "fallback"
                 if matched:
                     summary["identity_fallback_targets"] += 1
@@ -991,6 +1083,15 @@ async def query_exchange_account_history_fill_events(
                     fill,
                     identity_match_mode=match_mode,
                 )
+                aggregate_fingerprint = _account_history_aggregate_fill_fingerprint(event)
+                if aggregate_fingerprint:
+                    aggregate_count = int(
+                        existing_aggregate_fingerprints.get(aggregate_fingerprint) or 0
+                    )
+                    if aggregate_count > 0:
+                        existing_aggregate_fingerprints[aggregate_fingerprint] = aggregate_count - 1
+                        summary["existing_aggregate_trade_skipped"] += 1
+                        continue
                 key = _account_history_event_key(event)
                 exchange_key = _account_history_exchange_event_key(event)
                 if exchange_key and exchange_key in seen_exchange:
@@ -1060,7 +1161,11 @@ async def query_exchange_fill_events_until_stable(
     report = build_exchange_truth_lifecycle(events, position_ids=scoped_position_ids)
     queried_fill_events: list[dict[str, Any]] = []
     pass_summaries: list[dict[str, Any]] = []
-    seen = {_fill_event_identity_key(event) for event in events if _fill_event_identity_key(event)}
+    seen: set[tuple[str, str, str, str, str, str, str]] = set()
+    for event in events:
+        key = _fill_event_identity_key(event)
+        if key:
+            seen.add(key)
     windows = position_event_windows(events, position_ids=scoped_position_ids)
 
     for pass_index in range(1, max(1, max_passes) + 1):
@@ -1098,12 +1203,17 @@ async def query_exchange_fill_events_until_stable(
             {"enabled": False, "reason": "skipped_for_injected_order_query"},
         )
     new_account_history_events: list[dict[str, Any]] = []
+    account_history_seen: set[tuple[str, str, str, str, str, str, str]] = set()
+    for event in events + queried_fill_events:
+        key = _account_history_event_key(event)
+        if key:
+            account_history_seen.add(key)
     for event in account_history_events:
-        key = _fill_event_identity_key(event)
-        if key and key in seen:
+        key = _account_history_event_key(event) or _fill_event_identity_key(event)
+        if key and key in account_history_seen:
             continue
         if key:
-            seen.add(key)
+            account_history_seen.add(key)
         new_account_history_events.append(event)
     if new_account_history_events:
         queried_fill_events.extend(new_account_history_events)

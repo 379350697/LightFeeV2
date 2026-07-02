@@ -1832,6 +1832,394 @@ def test_rebuild_lifecycle_truth_account_history_falls_back_when_statement_omits
     assert truth["close_coverage"]["long"]["covered"] is True
 
 
+def test_rebuild_lifecycle_truth_account_history_bitget_close_short_uses_trade_side():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-bitget-short-TAIKOUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "quantity": 295,
+                "matched_quantity": 295,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "bybit",
+                "order_id": "open-long",
+                "quantity": 295,
+                "price": 0.081,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "open-short",
+                "quantity": 295,
+                "price": 0.082,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "bybit",
+                "order_id": "close-long",
+                "quantity": 295,
+                "price": 0.083,
+            },
+        ),
+        _event(
+            2_050,
+            "runtime.position_drift_flatten_leg",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "venue": "bitget",
+                "leg": "short",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            assert symbol == "TAIKOUSDT"
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=295,
+                    average_price=0.0817,
+                    order_id="1456049108408758276",
+                    fee_quote=0.01,
+                    filled_at_ms=2_060,
+                    metadata={
+                        "tradeSide": "close",
+                        "trade_id": "1456049108604944384",
+                    },
+                )
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 1
+    assert fill_events[0]["payload"]["leg"] == "short"
+    assert fill_events[0]["payload"]["side"] == "sell"
+
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["short"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_account_history_keeps_same_order_time_trade_ids():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-binance-multifill-EPICUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "quantity": 50.9,
+                "matched_quantity": 50.9,
+                "long_venue": "binance",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "binance",
+                "order_id": "open-long",
+                "quantity": 50.9,
+                "price": 0.47,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "open-short",
+                "quantity": 50.9,
+                "price": 0.472,
+            },
+        ),
+        _event(
+            2_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "close-short",
+                "quantity": 50.9,
+                "price": 0.471,
+            },
+        ),
+    ]
+
+    async def fake_account_history_query(report: dict, windows: dict):
+        return (
+            [
+                _event(
+                    2_200,
+                    "order.filled",
+                    {
+                        "position_id": position_id,
+                        "symbol": "EPICUSDT",
+                        "phase": "close",
+                        "leg": "long",
+                        "venue": "binance",
+                        "order_id": "1094652589",
+                        "client_order_id": "",
+                        "side": "sell",
+                        "tradeSide": "close",
+                        "quantity": quantity,
+                        "average_price": 0.4714,
+                        "fee_quote": 0.01,
+                        "filled_at_ms": 2_200,
+                        "source": "rebuild_lifecycle_truth_exchange_account_history_close",
+                        "trade_id": trade_id,
+                        "exec_id": "",
+                    },
+                )
+                for quantity, trade_id in (
+                    (10.9, "112559178"),
+                    (11.8, "112559179"),
+                    (28.2, "112559180"),
+                )
+            ],
+            {"enabled": True, "attempted": 1, "filled": 3, "errors": []},
+        )
+
+    report, queried_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events_until_stable(
+            events,
+            position_ids=[position_id],
+            query_func=lambda report: asyncio.sleep(
+                0,
+                result=(
+                    [],
+                    {"enabled": True, "attempted": 0, "filled": 0, "errors": []},
+                ),
+            ),
+            account_history_query_func=fake_account_history_query,
+        )
+    )
+
+    assert len(queried_events) == 3
+    assert summary["synthetic_fill_event_count"] == 3
+    truth = report["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "50.9"
+
+
+def test_rebuild_lifecycle_truth_account_history_consumes_existing_aggregate_once():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-existing-aggregate-EPICUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "quantity": 3,
+                "matched_quantity": 3,
+                "long_venue": "binance",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "binance",
+                "order_id": "open-long",
+                "quantity": 3,
+                "price": 0.47,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "open-short",
+                "quantity": 3,
+                "price": 0.472,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "binance",
+                "order_id": "close-long-binance",
+                "client_order_id": "",
+                "side": "sell",
+                "quantity": 1,
+                "price": 0.4714,
+                "average_price": 0.4714,
+                "filled_at_ms": 2_000,
+            },
+        ),
+        _event(
+            2_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "close-short",
+                "quantity": 3,
+                "price": 0.471,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=1,
+                    average_price=0.4714,
+                    order_id="close-long-binance",
+                    fee_quote=0.01,
+                    filled_at_ms=2_000,
+                    metadata={"tradeSide": "close", "trade_id": "112559178"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=1,
+                    average_price=0.4714,
+                    order_id="close-long-binance",
+                    fee_quote=0.01,
+                    filled_at_ms=2_000,
+                    metadata={"tradeSide": "close", "trade_id": "112559179"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=1,
+                    average_price=0.4714,
+                    order_id="close-long-binance",
+                    fee_quote=0.01,
+                    filled_at_ms=2_000,
+                    metadata={"tradeSide": "close", "trade_id": "112559180"},
+                ),
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            existing_events=events,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 2
+    assert [event["payload"]["trade_id"] for event in fill_events] == [
+        "112559179",
+        "112559180",
+    ]
+
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "3"
+
+
 def test_rebuild_lifecycle_truth_account_history_window_caps_future_end(monkeypatch):
     from scripts import rebuild_lifecycle_truth
 
