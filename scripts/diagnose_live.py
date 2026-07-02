@@ -8084,7 +8084,21 @@ def _build_production_acceptance_gate(
                 and str(item.get("archive_reason") or "")
                 == "terminal_flat_accounting_gap"
             )
+            and not (
+                isinstance(item, dict)
+                and item.get("accounting_only_backfill") is True
+                and item.get("blocking_trading") is False
+            )
         )
+    pending_close_reconciliation_accounting_only_count = sum(
+        1
+        for item in pending_close_reconciliation_items
+        if (
+            isinstance(item, dict)
+            and item.get("accounting_only_backfill") is True
+            and item.get("blocking_trading") is False
+        )
+    )
     if "pending_close_reconciliation_terminal_flat_count" in local_state:
         pending_close_reconciliation_terminal_flat_count = int(
             local_state.get("pending_close_reconciliation_terminal_flat_count")
@@ -8096,9 +8110,19 @@ def _build_production_acceptance_gate(
             for item in pending_close_reconciliation_items
             if (
                 isinstance(item, dict)
-                and item.get("archived") is True
-                and str(item.get("archive_reason") or "")
-                == "terminal_flat_accounting_gap"
+                and (
+                    (
+                        item.get("archived") is True
+                        and str(item.get("archive_reason") or "")
+                        == "terminal_flat_accounting_gap"
+                    )
+                    or (
+                        item.get("accounting_only_backfill") is True
+                        and item.get("blocking_trading") is False
+                        and str(item.get("close_reconciliation_state") or "")
+                        == "terminal_flat_accounting_gap"
+                    )
+                )
             )
         )
     pending_close_reconciliation_symbols = list(
@@ -8511,6 +8535,9 @@ def _build_production_acceptance_gate(
         ),
         "pending_close_reconciliation_terminal_flat_count": (
             pending_close_reconciliation_terminal_flat_count
+        ),
+        "pending_close_reconciliation_accounting_only_count": (
+            pending_close_reconciliation_accounting_only_count
         ),
         "pending_close_reconciliation_symbols": (
             pending_close_reconciliation_symbols

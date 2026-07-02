@@ -462,6 +462,129 @@ def _make_order_fill(
     )
 
 
+def test_final_close_reconciliation_merges_existing_truth_gap_candidates():
+    journal = _open_journal()
+    try:
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-lab",
+            symbol="LABUSDT",
+            long_venue=Venue.BITGET,
+            short_venue=Venue.OKX,
+            matched_quantity=5.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=5.0,
+            chunk_quantities=[5.0],
+            phase_state=PassivePhaseState(active_maker_leg=ActiveMakerLeg.SHORT),
+        )
+        state.pending_close_reconciliations = [
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "kind": "accepted_order_truth_gap",
+                "leg": "long",
+                "long_legs": [
+                    {
+                        "venue": Venue.BITGET.value,
+                        "order_id": "bitget-late-fill",
+                        "client_order_id": "bitget-late-cid",
+                        "quantity": 0.0,
+                        "statement_probe_candidate": True,
+                    }
+                ],
+                "short_legs": [],
+            }
+        ]
+        pending.short_legs.append(
+            PersistedCloseExecutionLeg(
+                client_order_id="okx-cid",
+                fill=_make_order_fill(
+                    venue=Venue.OKX,
+                    symbol=position.symbol,
+                    side=Side.BUY,
+                    quantity=5.0,
+                    price=8.991,
+                    order_id="okx-filled",
+                    fee_quote=0.008991,
+                ),
+            )
+        )
+
+        executor = PassiveCloseExecutor({}, journal)
+        executor._register_close_reconciliation_after_live_flat(
+            state,
+            pending,
+            position,
+            source="pending_passive_close_flat_probe",
+            payload={
+                "exchange_truth": {
+                    "truth_available": True,
+                    "positions_flat": True,
+                    "open_orders_flat": True,
+                }
+            },
+            extra=None,
+        )
+
+        final_records = [
+            rec for rec in state.pending_close_reconciliations
+            if rec.get("kind") == "final"
+        ]
+        assert final_records
+        assert final_records[-1]["accounting_only_backfill"] is True
+        assert final_records[-1]["truth_gap_candidate_count"] == 1
+        assert any(
+            leg.get("order_id") == "bitget-late-fill"
+            and leg.get("statement_probe_candidate") is True
+            for leg in final_records[-1]["long_legs"]
+        )
+    finally:
+        journal.close()
+
+
+def test_pending_passive_close_snapshot_keeps_close_order_identity_history():
+    state = EngineState()
+    position = _make_position(position_id="entry-in", symbol="INUSDT")
+    state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+        position_id=position.position_id,
+        reason="funding_capture",
+        position_snapshot=position,
+        target_quantity=360.0,
+        chunk_quantities=[360.0],
+        close_order_identity_history=[
+            {
+                "venue": Venue.BYBIT.value,
+                "leg": "short",
+                "order_id": "ba8d6524-3bac-4fa3-a3d8-91ff799bff6f",
+                "client_order_id": "bybit-cid",
+                "source": "maker_submitted",
+                "quantity_hint": 360.0,
+                "submitted_at_ms": 1782867904425,
+            }
+        ],
+    )
+
+    snap = state.to_dict()
+
+    assert snap["pending_passive_closes"][position.position_id][
+        "close_order_identity_history"
+    ] == [
+        {
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "ba8d6524-3bac-4fa3-a3d8-91ff799bff6f",
+            "client_order_id": "bybit-cid",
+            "source": "maker_submitted",
+            "quantity_hint": 360.0,
+            "submitted_at_ms": 1782867904425,
+        }
+    ]
+
+
 def _make_passive_ack(
     venue=Venue.BINANCE, symbol="BTCUSDT", side=Side.SELL,
     order_id="pa001", client_order_id="", price=50000.0, quantity=0.01,

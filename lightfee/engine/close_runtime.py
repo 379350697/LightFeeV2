@@ -314,6 +314,85 @@ class CloseRuntime:
             if order_id or client_order_id:
                 return True
         return False
+
+    @staticmethod
+    def _close_reconciliation_leg_quantity_hint(leg: Any) -> float:
+        if not isinstance(leg, dict):
+            return 0.0
+        raw = leg.get("quantity_hint", leg.get("quantity", 0.0))
+        try:
+            qty = float(raw or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return qty if math.isfinite(qty) else 0.0
+
+    @classmethod
+    def _close_reconciliation_leg_statement_probe_candidate(cls, leg: Any) -> bool:
+        if not isinstance(leg, dict):
+            return False
+        if bool(
+            leg.get("statement_probe_candidate")
+            or leg.get("truth_gap_candidate")
+            or leg.get("accepted_order_truth_gap")
+            or leg.get("accounting_only_backfill")
+        ):
+            return True
+        order_id, client_order_id = cls._close_reconciliation_leg_identity(leg)
+        return bool(order_id or client_order_id) and (
+            cls._close_reconciliation_leg_quantity_hint(leg) <= 1e-12
+        )
+
+    @classmethod
+    def _statement_probe_candidates_from_reconciliation(
+        cls,
+        reconciliation: dict[str, Any],
+        *,
+        missing_leg: str = "",
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        allowed_legs = {"long", "short"}
+        if missing_leg in allowed_legs:
+            allowed_legs = {missing_leg}
+        for leg_name, key in (("long", "long_legs"), ("short", "short_legs")):
+            if leg_name not in allowed_legs:
+                continue
+            legs = reconciliation.get(key)
+            if not isinstance(legs, list):
+                continue
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+                if not cls._close_reconciliation_leg_statement_probe_candidate(leg):
+                    continue
+                order_id, client_order_id = cls._close_reconciliation_leg_identity(leg)
+                if not order_id and not client_order_id:
+                    continue
+                candidates.append(
+                    {
+                        "leg": leg_name,
+                        "venue": str(leg.get("venue") or ""),
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "source": str(leg.get("source") or ""),
+                        "quantity_hint": cls._close_reconciliation_leg_quantity_hint(
+                            leg
+                        ),
+                        "submitted_at_ms": int(leg.get("submitted_at_ms") or 0),
+                    }
+                )
+        return candidates
+
+    @classmethod
+    def _has_statement_probe_candidates(cls, reconciliation: dict[str, Any]) -> bool:
+        return bool(cls._statement_probe_candidates_from_reconciliation(reconciliation))
+
+    @staticmethod
+    def _append_journal(ctx: Any, event: str, payload: dict[str, Any]) -> None:
+        journal = getattr(ctx, "journal", None)
+        append = getattr(journal, "append", None)
+        if callable(append):
+            append(event, payload)
+
     @staticmethod
     def _close_reconciliation_fill_qty(fill: Any) -> float:
         qty = getattr(fill, "quantity", 0.0) if fill is not None else 0.0
@@ -336,10 +415,14 @@ class CloseRuntime:
             return None
 
         fills: list[Any] = []
+        unresolved_statement_candidates: list[dict[str, str]] = []
         for leg in legs:
             order_id, client_order_id = self._close_reconciliation_leg_identity(leg)
             if not order_id and not client_order_id:
                 return None
+            statement_candidate = (
+                self._close_reconciliation_leg_statement_probe_candidate(leg)
+            )
             if callable(fetch_probe):
                 probe = await fetch_probe(symbol, order_id, client_order_id)
                 self._flush_adapter_order_diagnostics(adapter)
@@ -350,20 +433,56 @@ class CloseRuntime:
                     OrderFillProbeStatus.UNAVAILABLE,
                     OrderFillProbeStatus.ERROR,
                 }:
+                    if statement_candidate:
+                        unresolved_statement_candidates.append(
+                            {
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                            }
+                        )
+                        continue
                     return None
                 if status != OrderFillProbeStatus.CONFIRMED_FILL:
+                    if statement_candidate:
+                        unresolved_statement_candidates.append(
+                            {
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                            }
+                        )
+                        continue
                     return None
                 fill = getattr(probe, "reconciliation", None)
             else:
                 fill = await fetch_reconciliation(symbol, order_id, client_order_id)
                 self._flush_adapter_order_diagnostics(adapter)
                 if fill is None:
+                    if statement_candidate:
+                        unresolved_statement_candidates.append(
+                            {
+                                "order_id": order_id,
+                                "client_order_id": client_order_id,
+                            }
+                        )
+                        continue
                     return None
                 if self._close_reconciliation_fill_qty(fill) <= 1e-12:
                     continue
             if fill is None:
+                if statement_candidate:
+                    unresolved_statement_candidates.append(
+                        {
+                            "order_id": order_id,
+                            "client_order_id": client_order_id,
+                        }
+                    )
+                    continue
                 return None
             fills.append(fill)
+        if fills:
+            return fills
+        if unresolved_statement_candidates:
+            return None
         return fills
     @staticmethod
     def _close_reconciliation_live_size(position: Any) -> float:
@@ -617,6 +736,74 @@ class CloseRuntime:
             return "short"
         return ""
 
+    def _retain_terminal_flat_accounting_backfill(
+        self,
+        reconciliation: dict[str, Any],
+        *,
+        now_ms: int,
+        exchange_truth: dict[str, Any],
+        state: str,
+        symbol: str,
+        missing_leg: str,
+        evidence_gap_reason: str,
+        truth_hash: str,
+        source: str,
+        emit_event: bool = True,
+    ) -> None:
+        candidates = self._statement_probe_candidates_from_reconciliation(
+            reconciliation,
+            missing_leg=missing_leg,
+        )
+        if not candidates:
+            candidates = self._statement_probe_candidates_from_reconciliation(
+                reconciliation
+            )
+
+        reconciliation["pending_backfill"] = True
+        reconciliation["accounting_only_backfill"] = True
+        reconciliation["blocking_trading"] = False
+        reconciliation["close_reconciliation_state"] = state
+        reconciliation["archive_reconciliation"] = False
+        reconciliation["business_contract_action"] = state
+        reconciliation["exchange_truth"] = dict(exchange_truth)
+        reconciliation["last_partial_reconciled_at_ms"] = now_ms
+        reconciliation["unresolved_statement_probe_candidates"] = candidates
+        if missing_leg:
+            reconciliation["missing_leg"] = missing_leg
+        if evidence_gap_reason:
+            reconciliation["last_evidence_gap_reason"] = evidence_gap_reason
+        if truth_hash:
+            reconciliation["exchange_truth_hash"] = truth_hash
+        original_payload = reconciliation.get("original_payload")
+        if not isinstance(original_payload, dict):
+            original_payload = {}
+        original_payload["exchange_truth"] = dict(exchange_truth)
+        reconciliation["original_payload"] = original_payload
+
+        if emit_event:
+            self._append_journal(
+                self.ctx,
+                "reconciliation.pending_close_backfill_retained",
+                {
+                    "position_id": reconciliation.get("position_id", ""),
+                    "symbol": symbol,
+                    "candidate_owner_id": reconciliation.get(
+                        "candidate_owner_id",
+                        reconciliation.get("position_id", ""),
+                    ),
+                    "missing_leg": missing_leg,
+                    "evidence_gap_reason": evidence_gap_reason,
+                    "next_attempt_ms": reconciliation.get("next_attempt_ms", 0),
+                    "source": source,
+                    "close_reconciliation_state": state,
+                    "archive_reconciliation": False,
+                    "accounting_only_backfill": True,
+                    "blocking_trading": False,
+                    "exchange_truth_hash": truth_hash,
+                    "unresolved_statement_probe_candidates": candidates,
+                },
+            )
+
     def _archive_terminal_flat_pending_close_reconciliation(
         self,
         reconciliation: dict[str, Any],
@@ -652,6 +839,27 @@ class CloseRuntime:
         )
         missing_leg = self._missing_leg_from_reconciliation(reconciliation)
         truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
+        candidates = self._statement_probe_candidates_from_reconciliation(
+            reconciliation,
+            missing_leg=missing_leg,
+        )
+        if candidates:
+            self._retain_terminal_flat_accounting_backfill(
+                reconciliation,
+                now_ms=now_ms,
+                exchange_truth=exchange_truth,
+                state=state,
+                symbol=symbol,
+                missing_leg=missing_leg,
+                evidence_gap_reason=evidence_gap_reason,
+                truth_hash=truth_hash,
+                source=str(
+                    reconciliation.get("source")
+                    or "pending_close_reconciliation"
+                ),
+                emit_event=reconciliation.get("accounting_only_backfill") is not True,
+            )
+            return False
         payload = {
             "position_id": reconciliation.get("position_id", ""),
             "symbol": symbol,
@@ -1257,6 +1465,13 @@ class CloseRuntime:
                     archive_reconciliation = bool(
                         contract.get("archive_reconciliation") is True
                     )
+                    if archive_reconciliation and self._has_statement_probe_candidates(
+                        reconciliation
+                    ):
+                        archive_reconciliation = False
+                        payload["accounting_only_backfill"] = True
+                        payload["blocking_trading"] = False
+                        payload["archive_reconciliation"] = False
                     if archive_reconciliation and truth_hash:
                         archive_key = self._close_reconciliation_archive_key(
                             payload,
@@ -1338,6 +1553,15 @@ class CloseRuntime:
                         if archive_key:
                             reconciliation["archive_key"] = archive_key
                     else:
+                        if self._has_statement_probe_candidates(reconciliation):
+                            reconciliation["accounting_only_backfill"] = True
+                            reconciliation["blocking_trading"] = False
+                            reconciliation[
+                                "unresolved_statement_probe_candidates"
+                            ] = self._statement_probe_candidates_from_reconciliation(
+                                reconciliation,
+                                missing_leg=str(payload.get("missing_leg") or ""),
+                            )
                         self._call_apply_pending_close_reconciliation_backoff(
                             reconciliation,
                             now_ms,
@@ -1375,6 +1599,19 @@ class CloseRuntime:
                                     contract.get("state") or ""
                                 ),
                                 "archive_reconciliation": archive_reconciliation,
+                                "accounting_only_backfill": bool(
+                                    reconciliation.get("accounting_only_backfill")
+                                ),
+                                "blocking_trading": bool(
+                                    reconciliation.get("blocking_trading", True)
+                                ),
+                                "unresolved_statement_probe_candidates": list(
+                                    reconciliation.get(
+                                        "unresolved_statement_probe_candidates",
+                                        [],
+                                    )
+                                    or []
+                                ),
                                 "exchange_truth_hash": truth_hash,
                             },
                         )
@@ -1444,6 +1681,10 @@ class CloseRuntime:
                     archive_reconciliation = bool(
                         contract.get("archive_reconciliation") is True
                     )
+                    if archive_reconciliation and self._has_statement_probe_candidates(
+                        reconciliation
+                    ):
+                        archive_reconciliation = False
                     if archive_reconciliation:
                         archive_key = self._close_reconciliation_archive_key(
                             payload,
@@ -1521,6 +1762,32 @@ class CloseRuntime:
                                 self._close_reconciliation_archive_emitted_keys.add(
                                     archive_key
                                 )
+                        changed = True
+                        continue
+                    if self._has_statement_probe_candidates(reconciliation):
+                        self._retain_terminal_flat_accounting_backfill(
+                            reconciliation,
+                            now_ms=now_ms,
+                            exchange_truth=exchange_truth,
+                            state=str(contract.get("state") or ""),
+                            symbol=symbol,
+                            missing_leg=str(payload.get("missing_leg") or ""),
+                            evidence_gap_reason=str(
+                                payload.get("evidence_gap_reason") or ""
+                            ),
+                            truth_hash=truth_hash,
+                            source=str(
+                                payload.get(
+                                    "source",
+                                    "pending_close_reconciliation",
+                                )
+                            ),
+                        )
+                        self._call_apply_pending_close_reconciliation_backoff(
+                            reconciliation,
+                            now_ms,
+                        )
+                        retained.append(reconciliation)
                         changed = True
                         continue
                 self.ctx.journal.append(

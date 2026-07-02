@@ -1229,6 +1229,19 @@ class EntryGateRuntime:
                 return False, "pending_close_reconciliation_invalid"
             if (pc_long_s == long_v and pc_short_s == short_v) or \
                (pc_long_s == short_v and pc_short_s == long_v):
+                if (
+                    rec.get("accounting_only_backfill") is True
+                    and rec.get("blocking_trading") is False
+                    and close_reconciliation_exchange_truth_clean(
+                        rec,
+                        current_exchange_truth=getattr(
+                            self.ctx,
+                            "_last_recovery_exchange_truth",
+                            None,
+                        ),
+                    )
+                ):
+                    continue
                 contract = classify_close_reconciliation_state(
                     rec,
                     current_exchange_truth_clean=(

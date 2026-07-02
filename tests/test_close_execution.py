@@ -41,9 +41,10 @@ from lightfee.engine.close_executor import (
     build_exit_pnl_attribution,
 )
 from lightfee.engine.close_runtime import CloseRuntime
+from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.residual import ResidualOrigin
-from lightfee.engine.state import OpenPosition
+from lightfee.engine.state import EngineState, OpenPosition
 from lightfee.persistence.journal import Journal
 
 
@@ -186,6 +187,52 @@ def test_exit_reconciled_payload_does_not_dedupe_unidentified_close_fills():
     )
 
     assert payload["long_closed_qty"] == pytest.approx(10.0)
+    assert payload["duplicate_close_leg_suppressed_count"] == 0
+
+
+def test_exit_reconciled_payload_does_not_cross_dedupe_opposite_legs():
+    runtime = CloseRuntime(ctx=None)
+    reconciliation = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "position_snapshot": {
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+        },
+    }
+    long_fill = OrderFill(
+        venue=Venue.BINANCE,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        price=1.1,
+        order_id="same-exchange-id",
+        client_order_id="same-client-id",
+        fee_quote=0.01,
+        filled_at_ms=1781531700000,
+    )
+    short_fill = OrderFill(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.BUY,
+        quantity=10.0,
+        price=1.0,
+        order_id="same-exchange-id",
+        client_order_id="same-client-id",
+        fee_quote=0.02,
+        filled_at_ms=1781531700100,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation,
+        [long_fill],
+        [short_fill],
+        now_ms=1781531700200,
+    )
+
+    assert payload["venue_statement_reconciled"] is True
+    assert payload["long_closed_qty"] == pytest.approx(10.0)
+    assert payload["short_closed_qty"] == pytest.approx(10.0)
     assert payload["duplicate_close_leg_suppressed_count"] == 0
 
 
@@ -510,6 +557,165 @@ async def test_venue_adapter_probe_contract_distinguishes_no_fill_and_errors():
     assert no_fill.reconciliation is not None
     assert error.status == OrderFillProbeStatus.ERROR
     assert "statement endpoint timeout" in error.error
+
+
+@pytest.mark.asyncio
+async def test_statement_probe_candidates_tolerate_missing_candidate_then_fill():
+    class _Adapter:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol,
+            order_id="",
+            client_order_id=None,
+        ):
+            self.calls.append((symbol, order_id, client_order_id or ""))
+            if order_id == "missing-old-truth-gap":
+                return None
+            return OrderFillReconciliation(
+                venue=Venue.BITGET,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=5.0,
+                average_price=8.933,
+                order_id=order_id,
+                client_order_id=client_order_id or "",
+                fee_quote=0.026799,
+                filled_at_ms=1782984006210,
+            )
+
+    class _Ctx:
+        pass
+
+    adapter = _Adapter()
+    ctx = _Ctx()
+    ctx.venue_adapters = {Venue.BITGET: adapter}
+    runtime = CloseRuntime(ctx=ctx)
+
+    fills = await runtime._fetch_close_leg_reconciliations(
+        symbol="LABUSDT",
+        venue=Venue.BITGET,
+        legs=[
+            {
+                "venue": Venue.BITGET.value,
+                "order_id": "missing-old-truth-gap",
+                "client_order_id": "old-cid",
+                "statement_probe_candidate": True,
+            },
+            {
+                "venue": Venue.BITGET.value,
+                "order_id": "filled-late-truth-gap",
+                "client_order_id": "filled-cid",
+                "statement_probe_candidate": True,
+            },
+        ],
+    )
+
+    assert adapter.calls == [
+        ("LABUSDT", "missing-old-truth-gap", "old-cid"),
+        ("LABUSDT", "filled-late-truth-gap", "filled-cid"),
+    ]
+    assert fills is not None
+    assert [fill.order_id for fill in fills] == ["filled-late-truth-gap"]
+
+
+def test_terminal_flat_accounting_gap_is_retained_as_accounting_only_backfill():
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx._last_recovery_exchange_truth = None
+    ctx.journal = None
+    runtime = CloseRuntime(ctx=ctx)
+    reconciliation = {
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "kind": "final",
+        "source": "pending_passive_close_flat_probe",
+        "position_snapshot": {
+            "symbol": "LABUSDT",
+            "long_venue": Venue.BITGET.value,
+            "short_venue": Venue.OKX.value,
+        },
+        "long_legs": [
+            {
+                "venue": Venue.BITGET.value,
+                "order_id": "bitget-late-fill",
+                "client_order_id": "bitget-late-cid",
+                "statement_probe_candidate": True,
+            }
+        ],
+        "short_legs": [
+            {
+                "venue": Venue.OKX.value,
+                "order_id": "okx-filled",
+                "client_order_id": "okx-cid",
+                "quantity": 5.0,
+                "average_price": 8.991,
+            }
+        ],
+        "pending_backfill": True,
+        "missing_leg": "long",
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+        "exchange_truth": {
+            "truth_available": True,
+            "positions_flat": True,
+            "open_orders_flat": True,
+            "positions": [],
+            "open_orders": [],
+        },
+    }
+
+    archived = runtime._archive_terminal_flat_pending_close_reconciliation(
+        reconciliation,
+        now_ms=1782984078892,
+    )
+
+    assert archived is False
+    assert reconciliation["accounting_only_backfill"] is True
+    assert reconciliation["blocking_trading"] is False
+    assert reconciliation["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+
+
+def test_accounting_only_backfill_does_not_block_entry_gate():
+    class _Candidate:
+        symbol = "LABUSDT"
+        long_venue = Venue.BITGET.value
+        short_venue = Venue.OKX.value
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.state = EngineState()
+    ctx._last_recovery_exchange_truth = None
+    ctx.state.pending_close_reconciliations = [
+        {
+            "position_id": "entry-lab",
+            "symbol": "LABUSDT",
+            "accounting_only_backfill": True,
+            "blocking_trading": False,
+            "pending_backfill": True,
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "position_snapshot": {
+                "long_venue": Venue.BITGET.value,
+                "short_venue": Venue.OKX.value,
+            },
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+            },
+        }
+    ]
+    gate = EntryGateRuntime(ctx)
+
+    allowed, reason = gate._gate_pending_close_reconciliation(_Candidate())
+
+    assert allowed is True
+    assert reason == ""
 
 
 # ---------------------------------------------------------------------------

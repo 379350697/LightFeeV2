@@ -1454,6 +1454,52 @@ def test_acceptance_gate_allows_terminal_flat_pending_close_reconciliation_audit
     assert gate["blocking_reasons"] == []
 
 
+def test_acceptance_gate_separates_accounting_only_backfill_from_position_risk():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "entry-lab",
+                    "symbol": "LABUSDT",
+                    "pending_backfill": True,
+                    "accounting_only_backfill": True,
+                    "blocking_trading": False,
+                    "close_reconciliation_state": "terminal_flat_accounting_gap",
+                    "exchange_truth": {
+                        "truth_available": True,
+                        "positions_flat": True,
+                        "open_orders_flat": True,
+                    },
+                }
+            ],
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["gate_passed"] is True
+    assert gate["pending_close_reconciliation_blocking_count"] == 0
+    assert gate["pending_close_reconciliation_terminal_flat_count"] == 1
+    assert gate["pending_close_reconciliation_accounting_only_count"] == 1
+    assert gate["blocking_reasons"] == []
+
+
 def test_state_consistency_exposes_runtime_progress_diagnostics():
     from scripts.diagnose_live import _build_state_consistency
 

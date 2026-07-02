@@ -908,6 +908,7 @@ class PendingPassiveClose:
     hedge_fill: PendingPassiveLegFill = field(default_factory=PendingPassiveLegFill)
     long_legs: list[PersistedCloseExecutionLeg] = field(default_factory=list)
     short_legs: list[PersistedCloseExecutionLeg] = field(default_factory=list)
+    close_order_identity_history: list[dict[str, Any]] = field(default_factory=list)
     passive_manager_runtimes: dict[str, PassiveOrderManagerRuntime] = field(default_factory=dict)
     small_fill_min_notional_attempts: int = 0
     last_small_fill_missing_quantity: float = 0.0
@@ -1429,6 +1430,11 @@ class EngineState:
                         "order_id": ppc.hedge_fill.order_id,
                         "client_order_id": ppc.hedge_fill.client_order_id,
                     },
+                    "close_order_identity_history": [
+                        dict(item)
+                        for item in ppc.close_order_identity_history
+                        if isinstance(item, dict)
+                    ],
                     "next_retry_at_ms": ppc.next_retry_at_ms,
                     "multi_phase_started_at_ms": ppc.multi_phase_started_at_ms,
                     "created_cycle": ppc.created_cycle,

@@ -2888,6 +2888,16 @@ class PassiveCloseExecutor:
         pending.phase_state.maker_client_order_id = ack.client_order_id
         pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
+        self._record_close_order_identity_history(
+            pending,
+            venue=maker_venue,
+            leg=maker_leg_label,
+            order_id=ack.order_id,
+            client_order_id=ack.client_order_id,
+            source="maker_submitted",
+            quantity_hint=chunk_quantity,
+            submitted_at_ms=ack.accepted_at_ms,
+        )
 
         self._journal.append(
             "exit.passive_close_maker_submitted",
@@ -5423,8 +5433,12 @@ class PassiveCloseExecutor:
         quantity: float = 0.0,
         average_price: float = 0.0,
         fee_quote: float = 0.0,
+        source: str = "",
+        quantity_hint: float = 0.0,
+        submitted_at_ms: int = 0,
+        statement_probe_candidate: bool = False,
     ) -> dict[str, Any]:
-        return {
+        record = {
             "venue": venue.value,
             "order_id": str(order_id or ""),
             "client_order_id": str(client_order_id or ""),
@@ -5432,6 +5446,62 @@ class PassiveCloseExecutor:
             "average_price": float(average_price or 0.0),
             "fee_quote": float(fee_quote or 0.0),
         }
+        if source:
+            record["source"] = str(source)
+        if quantity_hint:
+            record["quantity_hint"] = float(quantity_hint or 0.0)
+        if submitted_at_ms:
+            record["submitted_at_ms"] = int(submitted_at_ms or 0)
+        if statement_probe_candidate:
+            record["statement_probe_candidate"] = True
+        return record
+
+    @staticmethod
+    def _record_close_order_identity_history(
+        pending: PendingPassiveClose,
+        *,
+        venue: Venue,
+        leg: str,
+        order_id: str = "",
+        client_order_id: str = "",
+        source: str = "",
+        quantity_hint: float = 0.0,
+        submitted_at_ms: int = 0,
+    ) -> None:
+        order_id = normalize_order_identity(order_id)
+        client_order_id = normalize_order_identity(client_order_id)
+        if not order_id and not client_order_id:
+            return
+        record = {
+            "venue": venue.value,
+            "leg": str(leg or ""),
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "source": str(source or ""),
+            "quantity_hint": float(quantity_hint or 0.0),
+            "submitted_at_ms": int(submitted_at_ms or 0),
+            "statement_probe_candidate": True,
+        }
+        key = (
+            record["venue"],
+            record["leg"],
+            record["order_id"],
+            record["client_order_id"],
+            record["source"],
+        )
+        for existing in pending.close_order_identity_history:
+            if not isinstance(existing, dict):
+                continue
+            existing_key = (
+                str(existing.get("venue") or ""),
+                str(existing.get("leg") or ""),
+                str(existing.get("order_id") or ""),
+                str(existing.get("client_order_id") or ""),
+                str(existing.get("source") or ""),
+            )
+            if existing_key == key:
+                return
+        pending.close_order_identity_history.append(record)
 
     def _pending_close_reconciliation_records(
         self,
@@ -5514,6 +5584,36 @@ class PassiveCloseExecutor:
             add_fill_state(short_records, pending.maker_fill, position.short_venue)
             add_fill_state(long_records, pending.hedge_fill, position.long_venue)
 
+        for history in pending.close_order_identity_history:
+            if not isinstance(history, dict):
+                continue
+            try:
+                venue = Venue.from_str(str(history.get("venue") or ""))
+            except ValueError:
+                continue
+            leg = str(history.get("leg") or "")
+            target = (
+                long_records
+                if leg == "long" or venue == position.long_venue
+                else short_records
+                if leg == "short" or venue == position.short_venue
+                else None
+            )
+            if target is None:
+                continue
+            add_record(
+                target,
+                self._close_reconciliation_record(
+                    venue=venue,
+                    order_id=str(history.get("order_id") or ""),
+                    client_order_id=str(history.get("client_order_id") or ""),
+                    source=str(history.get("source") or "close_order_identity_history"),
+                    quantity_hint=float(history.get("quantity_hint") or 0.0),
+                    submitted_at_ms=int(history.get("submitted_at_ms") or 0),
+                    statement_probe_candidate=True,
+                ),
+            )
+
         if extra:
             flattened_venue = str(extra.get("flattened_venue") or "")
             flattened_quantity = float(extra.get("flattened_quantity") or 0.0)
@@ -5578,6 +5678,49 @@ class PassiveCloseExecutor:
             position,
             extra=extra,
         )
+
+        truth_gap_candidate_count = 0
+        seen_keys = {
+            (
+                str(record.get("venue") or ""),
+                str(record.get("order_id") or ""),
+                str(record.get("client_order_id") or ""),
+            )
+            for record in [*long_legs, *short_legs]
+            if isinstance(record, dict)
+        }
+        for existing in state.pending_close_reconciliations:
+            if not isinstance(existing, dict):
+                continue
+            if existing.get("position_id") != pending.position_id:
+                continue
+            if str(existing.get("kind") or "") != "accepted_order_truth_gap":
+                continue
+            for leg_name, key, target in (
+                ("long", "long_legs", long_legs),
+                ("short", "short_legs", short_legs),
+            ):
+                for record in existing.get(key, []):
+                    if not isinstance(record, dict):
+                        continue
+                    order_id = str(record.get("order_id") or "")
+                    client_order_id = str(record.get("client_order_id") or "")
+                    venue = str(record.get("venue") or "")
+                    if not order_id and not client_order_id:
+                        continue
+                    dedupe_key = (venue, order_id, client_order_id)
+                    if dedupe_key in seen_keys:
+                        continue
+                    merged = dict(record)
+                    merged["statement_probe_candidate"] = True
+                    merged["truth_gap_candidate"] = True
+                    merged.setdefault("source", "accepted_order_truth_gap")
+                    merged.setdefault("quantity_hint", existing.get("requested_quantity", 0.0))
+                    merged.setdefault("leg", leg_name)
+                    target.append(merged)
+                    seen_keys.add(dedupe_key)
+                    truth_gap_candidate_count += 1
+
         if not long_legs and not short_legs:
             return
 
@@ -5623,7 +5766,30 @@ class PassiveCloseExecutor:
             "short_legs": short_legs,
             "attempt_count": 0,
             "next_attempt_ms": closed_at_ms,
+            "truth_gap_candidate_count": truth_gap_candidate_count,
         }
+        statement_probe_candidates = [
+            {
+                "leg": leg_name,
+                "venue": str(record.get("venue") or ""),
+                "order_id": str(record.get("order_id") or ""),
+                "client_order_id": str(record.get("client_order_id") or ""),
+                "source": str(record.get("source") or ""),
+                "quantity_hint": float(record.get("quantity_hint") or 0.0),
+                "submitted_at_ms": int(record.get("submitted_at_ms") or 0),
+            }
+            for leg_name, records in (("long", long_legs), ("short", short_legs))
+            for record in records
+            if isinstance(record, dict)
+            and bool(
+                record.get("statement_probe_candidate")
+                or record.get("truth_gap_candidate")
+            )
+        ]
+        if statement_probe_candidates:
+            reconciliation["accounting_only_backfill"] = True
+            reconciliation["blocking_trading"] = False
+            reconciliation["statement_probe_candidates"] = statement_probe_candidates
         exchange_truth = payload.get("exchange_truth")
         if isinstance(exchange_truth, dict):
             reconciliation["exchange_truth"] = dict(exchange_truth)
@@ -5638,6 +5804,11 @@ class PassiveCloseExecutor:
                 "long_leg_count": len(long_legs),
                 "short_leg_count": len(short_legs),
                 "order_ids": order_key,
+                "accounting_only_backfill": bool(
+                    reconciliation.get("accounting_only_backfill")
+                ),
+                "statement_probe_candidates": statement_probe_candidates,
+                "truth_gap_candidate_count": truth_gap_candidate_count,
             },
         )
 
@@ -5671,6 +5842,20 @@ class PassiveCloseExecutor:
             order_id=accepted_order_id,
             client_order_id=accepted_client_order_id,
             quantity=0.0,
+            source=source,
+            quantity_hint=float(quantity or 0.0),
+            statement_probe_candidate=True,
+        )
+        record["truth_gap_candidate"] = True
+        self._record_close_order_identity_history(
+            pending,
+            venue=venue,
+            leg=leg_label,
+            order_id=accepted_order_id,
+            client_order_id=accepted_client_order_id,
+            source=source,
+            quantity_hint=float(quantity or 0.0),
+            submitted_at_ms=self._now_ms(),
         )
         long_legs: list[dict[str, Any]] = []
         short_legs: list[dict[str, Any]] = []

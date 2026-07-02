@@ -101,6 +101,7 @@ def test_bug_ledger_checker_json_reports_pending_clusters_without_status_drift()
     pending_clusters = {row["cluster"] for row in payload["pending_rows"]}
     stale_clusters = {row["cluster"] for row in payload["stale_pending_rows"]}
 
-    assert "CL-139" in pending_clusters
+    assert "CL-146" in pending_clusters
+    assert "CL-139" not in pending_clusters
     assert "CL-110" in stale_clusters
     assert payload["status_drift_rows"] == []

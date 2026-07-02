@@ -758,6 +758,11 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     phase_state=phase_state,
                     maker_fill=maker_fill,
                     hedge_fill=hedge_fill,
+                    close_order_identity_history=[
+                        dict(item)
+                        for item in pdata.get("close_order_identity_history", [])
+                        if isinstance(item, dict)
+                    ],
                     next_retry_at_ms=int(pdata.get("next_retry_at_ms", 0)),
                     multi_phase_started_at_ms=int(pdata.get("multi_phase_started_at_ms", 0)),
                     created_cycle=int(pdata.get("created_cycle", 0)),
