@@ -1779,6 +1779,16 @@ def test_rebuild_lifecycle_truth_account_history_falls_back_when_statement_omits
                 "quantity_hint": 2,
             },
         ),
+        _event(
+            3_700_000,
+            "exit.passive_close_recovery_probe_diagnostic",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "venue": "bitget",
+                "leg": "long",
+            },
+        ),
     ]
     report = build_exchange_truth_lifecycle(events)
     windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
@@ -1830,6 +1840,421 @@ def test_rebuild_lifecycle_truth_account_history_falls_back_when_statement_omits
     truth = rebuilt["positions"][position_id]
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
     assert truth["close_coverage"]["long"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_account_history_accepts_okx_net_position_side():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-okx-net-UBUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "UBUSDT",
+                "quantity": 100,
+                "matched_quantity": 100,
+                "long_venue": "binance",
+                "short_venue": "okx",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "UBUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "binance",
+                "order_id": "open-long",
+                "quantity": 100,
+                "price": 0.1595,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "UBUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "okx",
+                "order_id": "open-short",
+                "quantity": 100,
+                "price": 0.1602,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "UBUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "binance",
+                "order_id": "close-long",
+                "quantity": 100,
+                "price": 0.1601,
+            },
+        ),
+        _event(
+            2_050,
+            "runtime.position_drift_flatten_leg",
+            {
+                "position_id": position_id,
+                "symbol": "UBUSDT",
+                "venue": "okx",
+                "leg": "short",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=100,
+                    average_price=0.1606,
+                    order_id="okx-close-short",
+                    fee_quote=0.01,
+                    filled_at_ms=2_060,
+                    metadata={"positionSide": "net", "trade_id": "okx-trade-1"},
+                )
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 1
+    assert fill_events[0]["payload"]["venue"] == "okx"
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["short"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_account_history_continues_after_existing_partial_identity():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-partial-BEATUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "quantity": 24,
+                "matched_quantity": 24,
+                "long_venue": "aster",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "aster",
+                "order_id": "open-long",
+                "quantity": 24,
+                "price": 0.9618,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bybit",
+                "order_id": "open-short",
+                "quantity": 24,
+                "price": 0.9592,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "aster",
+                "order_id": "close-long",
+                "quantity": 24,
+                "price": 0.9601,
+            },
+        ),
+        _event(
+            2_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bybit",
+                "order_id": "partial-short-close",
+                "client_order_id": "partial-short-client",
+                "quantity": 15,
+                "average_price": 0.9623,
+                "filled_at_ms": 2_100,
+                "exec_id": "partial-exec",
+            },
+        ),
+        _event(
+            10_000,
+            "exit.passive_close_recovery_probe_flat",
+            {
+                "position_id": position_id,
+                "symbol": "BEATUSDT",
+                "venue": "bybit",
+                "leg": "short",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=15,
+                    average_price=0.9623,
+                    order_id="partial-short-close",
+                    client_order_id="partial-short-client",
+                    fee_quote=0.01,
+                    filled_at_ms=2_100,
+                    metadata={"exec_id": "partial-exec"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=3,
+                    average_price=0.9981,
+                    order_id="late-short-close",
+                    fee_quote=0.01,
+                    filled_at_ms=10_000,
+                    metadata={"exec_id": "late-exec-a"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=6,
+                    average_price=0.9979,
+                    order_id="late-short-close",
+                    fee_quote=0.01,
+                    filled_at_ms=10_000,
+                    metadata={"exec_id": "late-exec-b"},
+                ),
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            existing_events=events,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 2
+    assert summary["identity_fallback_filled"] == 2
+    assert [event["payload"]["exec_id"] for event in fill_events] == [
+        "late-exec-a",
+        "late-exec-b",
+    ]
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["short"]["filled_qty"] == "24"
+
+
+def test_rebuild_lifecycle_truth_account_history_respects_next_symbol_entry_boundary():
+    from scripts import rebuild_lifecycle_truth
+
+    first_id = "entry-account-history-boundary-a-TAIKOUSDT"
+    second_id = "entry-account-history-boundary-b-TAIKOUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": first_id,
+                "symbol": "TAIKOUSDT",
+                "quantity": 2,
+                "matched_quantity": 2,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "bybit",
+                "order_id": "first-open-long",
+                "quantity": 2,
+                "price": 0.081,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "first-open-short",
+                "quantity": 2,
+                "price": 0.082,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "first-close-short",
+                "quantity": 2,
+                "price": 0.0805,
+            },
+        ),
+        _event(
+            100_000,
+            "exit.passive_close_recovery_probe_flat",
+            {
+                "position_id": first_id,
+                "symbol": "TAIKOUSDT",
+                "venue": "bybit",
+                "leg": "long",
+            },
+        ),
+        _event(
+            5_000,
+            "entry.opened",
+            {
+                "position_id": second_id,
+                "symbol": "TAIKOUSDT",
+                "quantity": 2,
+                "matched_quantity": 2,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events, position_ids={first_id})
+    windows = rebuild_lifecycle_truth.position_event_windows(events)
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=2,
+                    average_price=0.083,
+                    order_id="wrong-next-position-close",
+                    fee_quote=0.01,
+                    filled_at_ms=6_000,
+                    metadata={"exec_id": "wrong-exec"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=2,
+                    average_price=0.0828,
+                    order_id="first-position-close",
+                    fee_quote=0.01,
+                    filled_at_ms=2_500,
+                    metadata={"exec_id": "first-exec"},
+                ),
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 1
+    assert summary["lifecycle_time_filtered"] >= 1
+    assert fill_events[0]["payload"]["order_id"] == "first-position-close"
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events, position_ids={first_id})
+    truth = rebuilt["positions"][first_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["order_ids"] == ["first-position-close"]
 
 
 def test_rebuild_lifecycle_truth_account_history_bitget_close_short_uses_trade_side():

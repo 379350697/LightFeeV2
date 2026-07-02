@@ -98,9 +98,9 @@ def position_event_windows(
     events: list[dict[str, Any]],
     *,
     position_ids: Iterable[str] | None = None,
-) -> dict[str, dict[str, int]]:
+) -> dict[str, dict[str, Any]]:
     selected_ids = {str(item) for item in position_ids or [] if str(item)}
-    windows: dict[str, dict[str, int]] = {}
+    windows: dict[str, dict[str, Any]] = {}
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -111,6 +111,9 @@ def position_event_windows(
         if ts_ms <= 0:
             continue
         kind = str(event.get("kind") or "")
+        payload = event.get("payload")
+        row_payload = payload if isinstance(payload, dict) else event
+        symbol = str(row_payload.get("symbol") or "").upper()
         row = windows.setdefault(
             position_id,
             {
@@ -118,10 +121,13 @@ def position_event_windows(
                 "last_ts_ms": ts_ms,
                 "entry_ts_ms": 0,
                 "close_ts_ms": 0,
+                "symbol": "",
             },
         )
         row["first_ts_ms"] = min(int(row.get("first_ts_ms") or ts_ms), ts_ms)
         row["last_ts_ms"] = max(int(row.get("last_ts_ms") or ts_ms), ts_ms)
+        if symbol and not row.get("symbol"):
+            row["symbol"] = symbol
         if kind in {"entry.opened", "runtime.position_opened"}:
             existing = int(row.get("entry_ts_ms") or 0)
             row["entry_ts_ms"] = ts_ms if existing <= 0 else min(existing, ts_ms)
@@ -393,7 +399,7 @@ def _fill_event_from_account_reconciliation(
 def _iter_account_history_targets(
     report: dict[str, Any],
     *,
-    position_windows: dict[str, dict[str, int]] | None = None,
+    position_windows: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     positions = report.get("positions")
@@ -432,6 +438,13 @@ def _iter_account_history_targets(
                 anchor = _account_history_anchor_ts(window, phase)
                 start_time_ms, end_time_ms = _account_history_query_window(anchor)
                 identities = _target_order_identities(truth, phase=phase, leg=leg, venue=venue)
+                lifecycle_start_ms, lifecycle_end_ms = _account_history_lifecycle_bounds(
+                    position_id=str(position_id),
+                    symbol=symbol,
+                    phase=phase,
+                    window=window,
+                    all_windows=windows,
+                )
                 targets.append(
                     {
                         "position_id": str(position_id),
@@ -448,6 +461,9 @@ def _iter_account_history_targets(
                         "end_time_ms": end_time_ms,
                         "identity_order_ids": identities["order_ids"],
                         "identity_client_order_ids": identities["client_order_ids"],
+                        "identity_anchor_ts_ms": identities["submitted_at_ms"],
+                        "lifecycle_start_ts_ms": lifecycle_start_ms,
+                        "lifecycle_end_ts_ms": lifecycle_end_ms,
                     }
                 )
     return targets
@@ -471,18 +487,73 @@ def _account_history_query_window(anchor_ts_ms: int) -> tuple[int | None, int | 
     return start_time_ms, end_time_ms
 
 
+def _account_history_lifecycle_bounds(
+    *,
+    position_id: str,
+    symbol: str,
+    phase: str,
+    window: dict[str, Any],
+    all_windows: dict[str, dict[str, Any]],
+) -> tuple[int, int]:
+    entry_ts_ms = int(window.get("entry_ts_ms") or window.get("first_ts_ms") or 0)
+    start_ts_ms = int(window.get("first_ts_ms") or entry_ts_ms or 0)
+    if phase == "close" and entry_ts_ms > 0:
+        start_ts_ms = entry_ts_ms
+    if start_ts_ms > 0:
+        start_ts_ms = max(0, start_ts_ms - ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS)
+    next_entry_ts_ms = _next_symbol_entry_ts_ms(
+        position_id=position_id,
+        symbol=symbol,
+        entry_ts_ms=entry_ts_ms,
+        all_windows=all_windows,
+    )
+    if next_entry_ts_ms > 0:
+        return start_ts_ms, max(0, next_entry_ts_ms - 1)
+    end_ts_ms = int(window.get("last_ts_ms") or window.get("close_ts_ms") or 0)
+    if end_ts_ms > 0:
+        end_ts_ms += ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS
+    return start_ts_ms, end_ts_ms
+
+
+def _next_symbol_entry_ts_ms(
+    *,
+    position_id: str,
+    symbol: str,
+    entry_ts_ms: int,
+    all_windows: dict[str, dict[str, Any]],
+) -> int:
+    if entry_ts_ms <= 0 or not symbol:
+        return 0
+    candidates: list[int] = []
+    for other_position_id, other_window in all_windows.items():
+        if str(other_position_id) == position_id:
+            continue
+        other_symbol = str(other_window.get("symbol") or "").upper()
+        if other_symbol != symbol:
+            continue
+        other_entry_ts_ms = int(other_window.get("entry_ts_ms") or 0)
+        if other_entry_ts_ms > entry_ts_ms:
+            candidates.append(other_entry_ts_ms)
+    return min(candidates) if candidates else 0
+
+
 def _target_order_identities(
     truth: dict[str, Any],
     *,
     phase: str,
     leg: str,
     venue: str,
-) -> dict[str, set[str]]:
+) -> dict[str, set[str] | list[int]]:
     order_ids: set[str] = set()
     client_order_ids: set[str] = set()
+    submitted_at_ms: set[int] = set()
     identities = truth.get("order_identity_history")
     if not isinstance(identities, list):
-        return {"order_ids": order_ids, "client_order_ids": client_order_ids}
+        return {
+            "order_ids": order_ids,
+            "client_order_ids": client_order_ids,
+            "submitted_at_ms": [],
+        }
     for identity in identities:
         if not isinstance(identity, dict):
             continue
@@ -498,7 +569,14 @@ def _target_order_identities(
             order_ids.add(order_id)
         if client_order_id:
             client_order_ids.add(client_order_id)
-    return {"order_ids": order_ids, "client_order_ids": client_order_ids}
+        submitted_at = int(identity.get("submitted_at_ms") or 0)
+        if submitted_at > 0:
+            submitted_at_ms.add(submitted_at)
+    return {
+        "order_ids": order_ids,
+        "client_order_ids": client_order_ids,
+        "submitted_at_ms": sorted(submitted_at_ms),
+    }
 
 
 def _expected_side_for_target(phase: str, leg: str) -> str:
@@ -606,7 +684,7 @@ def _account_history_trade_side_matches(metadata: dict[str, Any], phase: str) ->
 
 def _account_history_position_side_matches(metadata: dict[str, Any], leg: str) -> bool:
     position_side = str(metadata.get("positionSide") or metadata.get("position_side") or "").lower()
-    if not position_side or position_side == "both":
+    if not position_side or position_side in {"both", "net"}:
         return True
     return position_side == leg.lower()
 
@@ -622,11 +700,39 @@ def _account_history_fill_within_identity_fallback_window(
     fill: Any,
     target: dict[str, Any],
 ) -> bool:
-    anchor_ts_ms = int(target.get("anchor_ts_ms") or 0)
+    anchor_values = list(target.get("identity_anchor_ts_ms") or [])
+    anchor_values.append(target.get("anchor_ts_ms"))
+    anchors: list[int] = []
+    for value in anchor_values:
+        try:
+            anchor_ts_ms = int(value or 0)
+        except (TypeError, ValueError):
+            anchor_ts_ms = 0
+        if anchor_ts_ms > 0:
+            anchors.append(anchor_ts_ms)
     filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
-    if anchor_ts_ms <= 0 or filled_at_ms <= 0:
+    if not anchors or filled_at_ms <= 0:
         return False
-    return abs(filled_at_ms - anchor_ts_ms) <= ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS
+    return any(
+        abs(filled_at_ms - anchor_ts_ms) <= ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS
+        for anchor_ts_ms in anchors
+    )
+
+
+def _account_history_fill_within_lifecycle_window(
+    fill: Any,
+    target: dict[str, Any],
+) -> bool:
+    filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
+    if filled_at_ms <= 0:
+        return True
+    start_ts_ms = int(target.get("lifecycle_start_ts_ms") or 0)
+    end_ts_ms = int(target.get("lifecycle_end_ts_ms") or 0)
+    if start_ts_ms > 0 and filled_at_ms < start_ts_ms:
+        return False
+    if end_ts_ms > 0 and filled_at_ms > end_ts_ms:
+        return False
+    return True
 
 
 def _account_history_event_key(event: dict[str, Any]) -> tuple[str, str, str, str, str, str, str] | None:
@@ -954,6 +1060,7 @@ async def query_exchange_account_history_fill_events(
         "identity_fallback_targets": 0,
         "identity_fallback_filled": 0,
         "identity_fallback_time_filtered": 0,
+        "lifecycle_time_filtered": 0,
         "existing_aggregate_trade_skipped": 0,
         "errors": [],
     }
@@ -1036,7 +1143,7 @@ async def query_exchange_account_history_fill_events(
                 )
                 continue
             identity_required = _target_has_identity(target)
-            matched = [
+            exact_matched = [
                 fill
                 for fill in history_fills
                 if _account_history_fill_matches_target(
@@ -1045,8 +1152,20 @@ async def query_exchange_account_history_fill_events(
                     require_identity_match=identity_required,
                 )
             ]
-            match_mode = "identity" if identity_required else "no_identity"
-            if identity_required and not matched:
+            lifecycle_exact_matched = [
+                fill
+                for fill in exact_matched
+                if _account_history_fill_within_lifecycle_window(fill, target)
+            ]
+            summary["lifecycle_time_filtered"] += max(
+                0,
+                len(exact_matched) - len(lifecycle_exact_matched),
+            )
+            matched_rows: list[tuple[Any, str]] = [
+                (fill, "identity" if identity_required else "no_identity")
+                for fill in lifecycle_exact_matched
+            ]
+            if identity_required:
                 fallback_candidates = [
                     fill
                     for fill in history_fills
@@ -1056,28 +1175,38 @@ async def query_exchange_account_history_fill_events(
                         require_identity_match=False,
                     )
                 ]
-                matched = [
+                lifecycle_candidates = [
                     fill
                     for fill in fallback_candidates
+                    if _account_history_fill_within_lifecycle_window(fill, target)
+                ]
+                summary["lifecycle_time_filtered"] += max(
+                    0,
+                    len(fallback_candidates) - len(lifecycle_candidates),
+                )
+                fallback_matched = [
+                    fill
+                    for fill in lifecycle_candidates
                     if _account_history_fill_within_identity_fallback_window(fill, target)
                 ]
                 summary["identity_fallback_time_filtered"] += max(
                     0,
-                    len(fallback_candidates) - len(matched),
+                    len(lifecycle_candidates) - len(fallback_matched),
                 )
-                match_mode = "fallback"
-                if matched:
+                if fallback_matched:
                     summary["identity_fallback_targets"] += 1
-            matched.sort(
-                key=lambda fill: _account_history_fill_sort_key(
-                    fill,
+                matched_rows.extend((fill, "fallback") for fill in fallback_matched)
+            matched_rows.sort(
+                key=lambda row: _account_history_fill_sort_key(
+                    row[0],
                     int(target.get("anchor_ts_ms") or 0),
                 )
             )
             accumulated = 0.0
             emitted_for_target = 0
+            emitted_fallback_for_target = 0
             needed_qty = float(target.get("missing_quantity") or 0.0)
-            for fill in matched:
+            for fill, match_mode in matched_rows:
                 event = _fill_event_from_account_reconciliation(
                     target,
                     fill,
@@ -1104,13 +1233,14 @@ async def query_exchange_account_history_fill_events(
                     seen.add(key)
                 fill_events.append(event)
                 emitted_for_target += 1
+                if match_mode == "fallback":
+                    emitted_fallback_for_target += 1
                 accumulated += _to_float(getattr(fill, "quantity", 0.0))
                 if needed_qty > 0.0 and accumulated >= needed_qty * QTY_TOLERANCE:
                     break
             if emitted_for_target:
                 summary["filled"] += emitted_for_target
-                if match_mode == "fallback":
-                    summary["identity_fallback_filled"] += emitted_for_target
+                summary["identity_fallback_filled"] += emitted_fallback_for_target
             else:
                 summary["not_found"] += 1
     finally:
@@ -1145,11 +1275,12 @@ async def query_exchange_fill_events_until_stable(
     events: list[dict[str, Any]],
     *,
     position_ids: Iterable[str] | None,
+    context_events: list[dict[str, Any]] | None = None,
     max_passes: int = 3,
     query_func: Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
     | None = None,
     account_history_query_func: Callable[
-        [dict[str, Any], dict[str, dict[str, int]]],
+        [dict[str, Any], dict[str, dict[str, Any]]],
         Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]],
     ]
     | None = None,
@@ -1166,7 +1297,8 @@ async def query_exchange_fill_events_until_stable(
         key = _fill_event_identity_key(event)
         if key:
             seen.add(key)
-    windows = position_event_windows(events, position_ids=scoped_position_ids)
+    context = context_events if context_events is not None else events
+    windows = position_event_windows(context)
 
     for pass_index in range(1, max(1, max_passes) + 1):
         fill_events, summary = await query(report)
@@ -1451,6 +1583,9 @@ def main(argv: list[str] | None = None) -> int:
     position_ids = read_position_ids(args.positions_file)
     event_position_filter = set(position_ids or []) if position_ids is not None else None
     events = read_jsonl_events(event_files, position_ids=event_position_filter)
+    context_events = events
+    if event_position_filter:
+        context_events = read_jsonl_events(event_files)
     queried_fill_events: list[dict[str, Any]] = []
     exchange_truth_env_files_loaded: list[str] = []
     report = build_exchange_truth_lifecycle(
@@ -1463,6 +1598,7 @@ def main(argv: list[str] | None = None) -> int:
             query_exchange_fill_events_until_stable(
                 events,
                 position_ids=set(position_ids or []),
+                context_events=context_events,
             )
         )
         report["exchange_query"] = exchange_query_summary
