@@ -127,6 +127,9 @@ def build_exchange_truth_lifecycle(
         else:
             _collect_identity_from_payload(facts, payload, kind=kind)
 
+    for facts in positions.values():
+        _enrich_order_identity_history(facts)
+
     report_positions = {
         position_id: _finalize_position(facts)
         for position_id, facts in sorted(positions.items())
@@ -589,6 +592,7 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
                     or payload.get("quantity")
                     or payload.get("matched_quantity")
                 ),
+                "source_prefix": prefix,
                 "source": payload.get("source") or kind,
             }
         )
@@ -650,6 +654,7 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
             "client_order_id": client_order_id,
             "source_kind": kind,
             "source": str(row.get("source") or ""),
+            "source_prefix": str(row.get("source_prefix") or ""),
             "quantity_hint": _decimal_str(
                 _decimal(row.get("quantity_hint") or row.get("quantity") or row.get("qty"))
             ),
@@ -667,6 +672,208 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
             continue
         seen.add(key)
         facts.order_identities.append(identity)
+
+
+def _enrich_order_identity_history(facts: _PositionFacts) -> None:
+    if not facts.order_identities:
+        return
+    entry = facts.entry or {}
+    for identity in facts.order_identities:
+        _enrich_identity_from_entry(identity, entry)
+    _enrich_identity_from_matching_identity(facts.order_identities)
+    _infer_unlabeled_open_hedge_identity(facts.order_identities, entry)
+    _infer_unlabeled_close_hedge_identity(facts.order_identities, entry)
+    for identity in facts.order_identities:
+        _enrich_identity_from_entry(identity, entry)
+    facts.order_identities = _dedupe_order_identities(facts.order_identities)
+
+
+def _enrich_identity_from_entry(identity: JsonDict, entry: JsonDict) -> None:
+    phase = _identity_phase_from_identity(identity)
+    if phase not in {"open", "close"}:
+        return
+    leg = str(identity.get("leg") or "").lower()
+    venue = str(identity.get("venue") or "").lower()
+    long_venue = _entry_venue_for_leg(entry, "long")
+    short_venue = _entry_venue_for_leg(entry, "short")
+    if not leg:
+        if venue and venue == long_venue:
+            identity["leg"] = "long"
+            leg = "long"
+        elif venue and venue == short_venue:
+            identity["leg"] = "short"
+            leg = "short"
+    if not venue and leg in {"long", "short"}:
+        inferred_venue = _entry_venue_for_leg(entry, leg)
+        if inferred_venue:
+            identity["venue"] = inferred_venue
+
+
+def _enrich_identity_from_matching_identity(identities: list[JsonDict]) -> None:
+    known: dict[tuple[str, str, str], set[tuple[str, str]]] = {}
+    for identity in identities:
+        phase = _identity_phase_from_identity(identity)
+        leg = str(identity.get("leg") or "").lower()
+        venue = str(identity.get("venue") or "").lower()
+        if phase not in {"open", "close"} or leg not in {"long", "short"} or not venue:
+            continue
+        for ref in _identity_refs(identity, phase):
+            known.setdefault(ref, set()).add((leg, venue))
+
+    for identity in identities:
+        phase = _identity_phase_from_identity(identity)
+        if phase not in {"open", "close"}:
+            continue
+        leg = str(identity.get("leg") or "").lower()
+        venue = str(identity.get("venue") or "").lower()
+        if leg in {"long", "short"} and venue:
+            continue
+        matches: set[tuple[str, str]] = set()
+        for ref in _identity_refs(identity, phase):
+            matches.update(known.get(ref, set()))
+        if len(matches) != 1:
+            continue
+        inferred_leg, inferred_venue = next(iter(matches))
+        if leg not in {"long", "short"}:
+            identity["leg"] = inferred_leg
+        if not venue:
+            identity["venue"] = inferred_venue
+
+
+def _infer_unlabeled_open_hedge_identity(identities: list[JsonDict], entry: JsonDict) -> None:
+    unresolved = [
+        identity
+        for identity in identities
+        if _identity_phase_from_identity(identity) == "open"
+        and _has_order_identity_ref(identity)
+        and _identity_needs_leg_or_venue(identity)
+        and str(identity.get("source_kind") or "") == "entry.opened"
+    ]
+    if not unresolved:
+        return
+    known_legs = _known_legs_for_phase(identities, "open")
+    if len(known_legs) != 1:
+        return
+    inferred_leg = _opposite_leg(next(iter(known_legs)))
+    inferred_venue = _entry_venue_for_leg(entry, inferred_leg)
+    if not inferred_venue:
+        return
+    prefixed_hedge = [
+        identity for identity in unresolved
+        if str(identity.get("source_prefix") or "").lower() == "hedge"
+    ]
+    targets = prefixed_hedge or (unresolved if len(unresolved) == 1 else [])
+    for identity in targets:
+        _assign_identity_leg_venue(identity, inferred_leg, inferred_venue)
+
+
+def _infer_unlabeled_close_hedge_identity(identities: list[JsonDict], entry: JsonDict) -> None:
+    unresolved = [
+        identity
+        for identity in identities
+        if _identity_phase_from_identity(identity) == "close"
+        and _has_order_identity_ref(identity)
+        and _identity_needs_leg_or_venue(identity)
+        and _identity_source_mentions(identity, "hedge")
+    ]
+    if not unresolved:
+        return
+    known_legs = _known_legs_for_phase(identities, "close")
+    if len(known_legs) != 1:
+        return
+    inferred_leg = _opposite_leg(next(iter(known_legs)))
+    inferred_venue = _entry_venue_for_leg(entry, inferred_leg)
+    if not inferred_venue:
+        return
+    for identity in unresolved:
+        _assign_identity_leg_venue(identity, inferred_leg, inferred_venue)
+
+
+def _assign_identity_leg_venue(identity: JsonDict, leg: str, venue: str) -> None:
+    if str(identity.get("leg") or "").lower() not in {"long", "short"}:
+        identity["leg"] = leg
+    if not str(identity.get("venue") or ""):
+        identity["venue"] = venue
+
+
+def _known_legs_for_phase(identities: list[JsonDict], phase: str) -> set[str]:
+    return {
+        str(identity.get("leg") or "").lower()
+        for identity in identities
+        if _identity_phase_from_identity(identity) == phase
+        and str(identity.get("leg") or "").lower() in {"long", "short"}
+        and str(identity.get("venue") or "")
+    }
+
+
+def _identity_needs_leg_or_venue(identity: JsonDict) -> bool:
+    leg = str(identity.get("leg") or "").lower()
+    venue = str(identity.get("venue") or "")
+    return leg not in {"long", "short"} or not venue
+
+
+def _has_order_identity_ref(identity: JsonDict) -> bool:
+    return bool(identity.get("order_id") or identity.get("client_order_id"))
+
+
+def _identity_refs(identity: JsonDict, phase: str) -> list[tuple[str, str, str]]:
+    refs: list[tuple[str, str, str]] = []
+    order_id = str(identity.get("order_id") or "")
+    client_order_id = str(identity.get("client_order_id") or "")
+    if order_id:
+        refs.append((phase, "order_id", order_id))
+    if client_order_id:
+        refs.append((phase, "client_order_id", client_order_id))
+    return refs
+
+
+def _identity_source_mentions(identity: JsonDict, token: str) -> bool:
+    text = " ".join(
+        str(identity.get(key) or "")
+        for key in ("source_kind", "source", "source_prefix")
+    ).lower()
+    return token in text
+
+
+def _identity_phase_from_identity(identity: JsonDict) -> str:
+    phase = str(identity.get("phase") or "").lower()
+    if phase in {"open", "close"}:
+        return phase
+    return _identity_phase_from_kind(str(identity.get("source_kind") or ""), identity)
+
+
+def _entry_venue_for_leg(entry: JsonDict, leg: str) -> str:
+    if leg == "long":
+        return str(entry.get("long_venue") or entry.get("long_exchange") or "").lower()
+    if leg == "short":
+        return str(entry.get("short_venue") or entry.get("short_exchange") or "").lower()
+    return ""
+
+
+def _opposite_leg(leg: str) -> str:
+    if leg == "long":
+        return "short"
+    if leg == "short":
+        return "long"
+    return ""
+
+
+def _dedupe_order_identities(identities: list[JsonDict]) -> list[JsonDict]:
+    out: list[JsonDict] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for identity in identities:
+        key = (
+            str(identity.get("phase") or ""),
+            str(identity.get("leg") or ""),
+            str(identity.get("venue") or ""),
+            str(identity.get("order_id") or ""),
+            str(identity.get("client_order_id") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(identity)
+    return out
 
 
 def _identity_phase_from_kind(kind: str, payload: JsonDict) -> str:

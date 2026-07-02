@@ -893,6 +893,252 @@ def test_rebuild_lifecycle_truth_queries_open_submit_identities():
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
 
 
+def test_entry_opened_infers_unlabeled_hedge_open_identity_from_submitted_maker():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-1779479522323-ALTUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "quantity": 19,
+                "matched_quantity": 19,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "maker_order_id": "4492933796",
+                "maker_client_order_id": "maker-open-client",
+                "hedge_order_id": "d7df6fe1-1057-448f-9c79-16a91eb4087b",
+                "hedge_client_order_id": "hedge-open-client",
+            },
+        ),
+        _event(
+            1_020,
+            "order.passive_submitted",
+            {
+                "entry_id": position_id,
+                "symbol": "ALTUSDT",
+                "venue": "binance",
+                "order_id": "4492933796",
+                "client_order_id": "maker-open-client",
+                "quantity": 19,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long-binance",
+                "quantity": 19,
+                "price": 0.041,
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "ALTUSDT",
+                "phase": "close",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "close-short-bybit",
+                "quantity": 19,
+                "price": 0.0408,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+
+    class FakeAdapter:
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol: str,
+            order_id: str,
+            client_order_id: str = "",
+        ) -> OrderFillReconciliation:
+            if order_id == "4492933796":
+                return OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=19,
+                    average_price=0.0407,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    filled_at_ms=1_100,
+                    metadata={"tradeSide": "open"},
+                )
+            if order_id == "d7df6fe1-1057-448f-9c79-16a91eb4087b":
+                return OrderFillReconciliation(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=19,
+                    average_price=0.0409,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    filled_at_ms=1_120,
+                    metadata={"tradeSide": "open"},
+                )
+            raise AssertionError(order_id)
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events(
+            report,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["attempted"] == 2
+    assert {
+        (event["payload"]["leg"], event["payload"]["venue"], event["payload"]["order_id"])
+        for event in fill_events
+    } == {
+        ("long", "binance", "4492933796"),
+        ("short", "bybit", "d7df6fe1-1057-448f-9c79-16a91eb4087b"),
+    }
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+
+
+def test_hedge_duplicate_close_identity_infers_opposite_leg_and_venue():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-1779551578130-LYNUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "quantity": 100,
+                "matched_quantity": 100,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long-binance",
+                "quantity": 100,
+                "price": 0.10,
+            },
+        ),
+        _event(
+            1_120,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "phase": "open",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "open-short-bybit",
+                "quantity": 100,
+                "price": 0.101,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.passive_close_maker_submitted",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "maker_venue": "binance",
+                "maker_leg": "long",
+                "order_id": "close-long-binance",
+                "quantity": 100,
+            },
+        ),
+        _event(
+            2_020,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long-binance",
+                "quantity": 100,
+                "price": 0.102,
+            },
+        ),
+        _event(
+            2_050,
+            "exit.passive_close_hedge_duplicate_client_order_reconciled",
+            {
+                "position_id": position_id,
+                "symbol": "LYNUSDT",
+                "order_id": "95dbe960-6b01-4259-958b-02ef11bb6dbc",
+                "client_order_id": "lfexfff-hedge-close",
+                "quantity": 100,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+
+    class FakeAdapter:
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol: str,
+            order_id: str,
+            client_order_id: str = "",
+        ) -> OrderFillReconciliation:
+            assert order_id == "95dbe960-6b01-4259-958b-02ef11bb6dbc"
+            return OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.BUY,
+                quantity=100,
+                average_price=0.099,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                filled_at_ms=2_100,
+                metadata={"tradeSide": "close"},
+            )
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events(
+            report,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["attempted"] == 1
+    assert fill_events[0]["payload"]["phase"] == "close"
+    assert fill_events[0]["payload"]["leg"] == "short"
+    assert fill_events[0]["payload"]["venue"] == "bybit"
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+
+
 def test_rebuild_lifecycle_truth_loads_exchange_env_before_query(monkeypatch, tmp_path: Path):
     from scripts import rebuild_lifecycle_truth
 
