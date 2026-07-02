@@ -1926,7 +1926,7 @@ def test_rebuild_lifecycle_truth_account_history_accepts_okx_net_position_side()
             return [
                 OrderFillReconciliation(
                     venue=Venue.OKX,
-                    symbol=symbol,
+                    symbol="UB-USDT-SWAP",
                     side=Side.BUY,
                     quantity=100,
                     average_price=0.1606,
@@ -2255,6 +2255,135 @@ def test_rebuild_lifecycle_truth_account_history_respects_next_symbol_entry_boun
     truth = rebuilt["positions"][first_id]
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
     assert truth["close_coverage"]["long"]["order_ids"] == ["first-position-close"]
+
+
+def test_rebuild_lifecycle_truth_account_history_allows_next_entry_settlement_grace():
+    from scripts import rebuild_lifecycle_truth
+
+    first_id = "entry-account-history-boundary-grace-a-BSBUSDT"
+    second_id = "entry-account-history-boundary-grace-b-BSBUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": first_id,
+                "symbol": "BSBUSDT",
+                "quantity": 30,
+                "matched_quantity": 30,
+                "long_venue": "aster",
+                "short_venue": "okx",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "BSBUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "aster",
+                "order_id": "first-open-long",
+                "quantity": 30,
+                "price": 0.8277,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "BSBUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "okx",
+                "order_id": "first-open-short",
+                "quantity": 30,
+                "price": 0.8278,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": first_id,
+                "symbol": "BSBUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "aster",
+                "order_id": "first-close-long",
+                "quantity": 30,
+                "price": 0.8263,
+            },
+        ),
+        _event(
+            5_000,
+            "entry.opened",
+            {
+                "position_id": second_id,
+                "symbol": "BSBUSDT",
+                "quantity": 30,
+                "matched_quantity": 30,
+                "long_venue": "aster",
+                "short_venue": "okx",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events, position_ids={first_id})
+    windows = rebuild_lifecycle_truth.position_event_windows(events)
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol="BSB-USDT-SWAP",
+                    side=Side.BUY,
+                    quantity=30,
+                    average_price=0.8018,
+                    order_id="previous-close-inside-grace",
+                    fee_quote=0.01,
+                    filled_at_ms=5_050,
+                    metadata={"positionSide": "net", "trade_id": "inside-grace"},
+                ),
+                OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol="BSB-USDT-SWAP",
+                    side=Side.BUY,
+                    quantity=30,
+                    average_price=0.4563,
+                    order_id="next-position-fill-outside-grace",
+                    fee_quote=0.01,
+                    filled_at_ms=6_000,
+                    metadata={"positionSide": "net", "trade_id": "outside-grace"},
+                ),
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 1
+    assert summary["lifecycle_time_filtered"] >= 1
+    assert fill_events[0]["payload"]["order_id"] == "previous-close-inside-grace"
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events, position_ids={first_id})
+    truth = rebuilt["positions"][first_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
 
 
 def test_rebuild_lifecycle_truth_streams_context_windows_for_filtered_positions(tmp_path: Path):

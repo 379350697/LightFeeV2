@@ -25,6 +25,7 @@ CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
 HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 ACCOUNT_HISTORY_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS = 30 * 60 * 1000
+ACCOUNT_HISTORY_NEXT_ENTRY_BOUNDARY_GRACE_MS = 250
 QTY_TOLERANCE = 0.999
 
 
@@ -546,7 +547,10 @@ def _account_history_lifecycle_bounds(
         all_windows=all_windows,
     )
     if next_entry_ts_ms > 0:
-        return start_ts_ms, max(0, next_entry_ts_ms - 1)
+        return start_ts_ms, max(
+            0,
+            next_entry_ts_ms + ACCOUNT_HISTORY_NEXT_ENTRY_BOUNDARY_GRACE_MS,
+        )
     end_ts_ms = int(window.get("last_ts_ms") or window.get("close_ts_ms") or 0)
     if end_ts_ms > 0:
         end_ts_ms += ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS
@@ -647,8 +651,9 @@ def _account_history_fill_matches_target(
     fill_venue = str(_json_value(getattr(fill, "venue", None)) or "").lower()
     if fill_venue and fill_venue != str(target.get("venue") or "").lower():
         return False
-    fill_symbol = str(getattr(fill, "symbol", "") or "").upper()
-    if fill_symbol and fill_symbol != str(target.get("symbol") or "").upper():
+    fill_symbol = _canonical_account_history_symbol(str(getattr(fill, "symbol", "") or ""))
+    target_symbol = _canonical_account_history_symbol(str(target.get("symbol") or ""))
+    if fill_symbol and target_symbol and fill_symbol != target_symbol:
         return False
     side = str(_json_value(getattr(fill, "side", None)) or "").lower()
     expected_side = str(target.get("expected_side") or "").lower()
@@ -663,6 +668,22 @@ def _account_history_fill_matches_target(
     if require_identity_match and _target_has_identity(target):
         return _account_history_fill_identity_matches(fill, target)
     return True
+
+
+def _canonical_account_history_symbol(raw: str) -> str:
+    symbol = (
+        str(raw or "")
+        .upper()
+        .replace("-", "")
+        .replace("_", "")
+        .replace("/", "")
+        .replace(" ", "")
+    )
+    for suffix in ("PERPETUAL", "SWAP", "PERP", "UMCBL", "DMCBL", "CMCBL"):
+        if symbol.endswith(suffix):
+            symbol = symbol[: -len(suffix)]
+            break
+    return symbol
 
 
 def _account_history_side_matches_target(
