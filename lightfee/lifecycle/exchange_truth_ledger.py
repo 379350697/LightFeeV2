@@ -98,7 +98,7 @@ def build_exchange_truth_lifecycle(
         facts = positions.setdefault(position_id, _PositionFacts(position_id=position_id))
         facts.event_kinds[kind] += 1
         if kind in {"entry.opened", "runtime.position_opened"}:
-            facts.entry = payload
+            facts.entry = _merge_entry_payload(facts.entry, payload, kind=kind)
             facts.entry_ts_ms = _event_ts_ms(event) or _first_int(
                 payload.get("opened_at_ms"),
                 payload.get("entered_at_ms"),
@@ -220,6 +220,23 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
             "gaps": source_gaps,
         },
     }
+
+
+def _merge_entry_payload(existing: JsonDict | None, incoming: JsonDict, *, kind: str) -> JsonDict:
+    if existing is None:
+        return dict(incoming)
+    merged = dict(existing)
+    prefer_incoming = kind == "entry.opened"
+    for key, value in incoming.items():
+        if _missing_entry_value(value):
+            continue
+        if prefer_incoming or _missing_entry_value(merged.get(key)):
+            merged[key] = value
+    return merged
+
+
+def _missing_entry_value(value: Any) -> bool:
+    return value is None or value == ""
 
 
 def _collect_exit_reconciled_fills(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> None:

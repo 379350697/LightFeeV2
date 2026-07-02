@@ -47,6 +47,98 @@ def test_zero_quantity_entry_opened_is_phantom_not_normal_lifecycle():
     assert truth["close_coverage"]["short"]["covered"] is False
 
 
+def test_sparse_runtime_position_opened_does_not_overwrite_entry_opened_truth():
+    position_id = "entry-1779382428040-PROVEUSDT"
+    truth = _truth(
+        [
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                    "quantity": 74,
+                    "matched_quantity": 74,
+                    "long_venue": "aster",
+                    "short_venue": "bybit",
+                    "long_entry_price": 0.3209,
+                    "short_entry_price": 0.3211,
+                },
+            ),
+            _event(
+                1_100,
+                "runtime.position_opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                },
+            ),
+            _event(
+                1_200,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                    "phase": "open",
+                    "venue": "aster",
+                    "leg": "long",
+                    "order_id": "open-long",
+                    "quantity": 74,
+                    "price": 0.3209,
+                },
+            ),
+            _event(
+                1_300,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                    "phase": "open",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "order_id": "open-short",
+                    "quantity": 74,
+                    "price": 0.3211,
+                },
+            ),
+            _event(
+                2_000,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                    "phase": "close",
+                    "venue": "aster",
+                    "leg": "long",
+                    "order_id": "close-long",
+                    "quantity": 74,
+                    "price": 0.3210,
+                },
+            ),
+            _event(
+                2_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "PROVEUSDT",
+                    "phase": "close",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "order_id": "close-short",
+                    "quantity": 74,
+                    "price": 0.3208,
+                },
+            ),
+        ],
+        position_id,
+    )
+
+    assert truth["target_quantity"] == "74"
+    assert truth["long_venue"] == "aster"
+    assert truth["short_venue"] == "bybit"
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+
+
 def test_lifecycle_completion_uses_target_coverage_not_zero_leg_only():
     position_id = "entry-1779789403921-BEATUSDT"
     truth = _truth(
