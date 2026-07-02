@@ -1707,6 +1707,144 @@ def test_rebuild_lifecycle_truth_uses_account_history_when_close_identity_is_mis
     assert truth["close_coverage"]["short"]["covered"] is True
 
 
+def test_rebuild_lifecycle_truth_account_history_falls_back_when_statement_omits_local_identity():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-fallback-LABUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 2,
+                "matched_quantity": 2,
+                "long_venue": "bitget",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "bitget",
+                "order_id": "open-long",
+                "quantity": 2,
+                "price": 10.0,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bybit",
+                "order_id": "open-short",
+                "quantity": 2,
+                "price": 10.1,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bybit",
+                "order_id": "close-short",
+                "quantity": 2,
+                "price": 10.2,
+            },
+        ),
+        _event(
+            2_050,
+            "exit.accepted_order_truth_gap_registered",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "bitget",
+                "client_order_id": "local-close-client-id",
+                "quantity_hint": 2,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            assert symbol == "LABUSDT"
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=2,
+                    average_price=10.15,
+                    order_id="exchange-history-order-id",
+                    client_order_id="",
+                    fee_quote=0.01,
+                    filled_at_ms=2_060,
+                    metadata={
+                        "tradeSide": "close",
+                        "trade_id": "bitget-fallback-trade",
+                    },
+                )
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["filled"] == 1
+    assert summary["identity_fallback_filled"] == 1
+    assert fill_events[0]["payload"]["identity_match_mode"] == "fallback"
+
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_account_history_window_caps_future_end(monkeypatch):
+    from scripts import rebuild_lifecycle_truth
+
+    now_ms = 20_000
+    monkeypatch.setattr(rebuild_lifecycle_truth.time, "time", lambda: now_ms / 1000)
+
+    start_time_ms, end_time_ms = rebuild_lifecycle_truth._account_history_query_window(18_000)
+
+    assert end_time_ms == now_ms
+    assert start_time_ms < end_time_ms
+    assert end_time_ms - start_time_ms <= rebuild_lifecycle_truth.ACCOUNT_HISTORY_QUERY_WINDOW_MS
+
+
 def test_rebuild_lifecycle_truth_account_history_fill_is_not_double_assigned():
     from scripts import rebuild_lifecycle_truth
 
@@ -2065,6 +2203,36 @@ def test_apply_validation_rejects_incomplete_or_query_error():
 
     assert "exchange_query_errors_present" in blockers
     assert "exchange_lifecycle_incomplete:entry-gap" in blockers
+
+
+def test_apply_validation_rejects_account_history_query_error():
+    from scripts import rebuild_lifecycle_truth
+
+    report = {
+        "summary": {
+            "position_count": 0,
+            LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value: 0,
+            LifecycleClassification.PHANTOM_ZERO_QTY_OPENED.value: 0,
+            LifecycleClassification.EXCHANGE_LIFECYCLE_INCOMPLETE.value: 0,
+            LifecycleClassification.EVIDENCE_INCOMPLETE.value: 0,
+        },
+        "positions": {},
+        "exchange_query": {
+            "errors": [],
+            "account_history": {
+                "enabled": True,
+                "errors": [{"position_id": "entry-gap", "error": "Invalid time interval"}],
+                "account_history_unavailable": 0,
+            },
+        },
+    }
+
+    blockers = rebuild_lifecycle_truth.apply_report_blockers(
+        report,
+        position_ids=["entry-gap"],
+    )
+
+    assert "exchange_query_account_history_errors_present" in blockers
 
 
 def test_lifecycle_truth_rebuilt_correction_event_is_replayable():

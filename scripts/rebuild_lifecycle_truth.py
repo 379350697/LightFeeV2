@@ -345,6 +345,8 @@ def _fill_event_from_reconciliation(
 def _fill_event_from_account_reconciliation(
     target: dict[str, Any],
     fill: Any,
+    *,
+    identity_match_mode: str = "identity",
 ) -> dict[str, Any]:
     metadata = getattr(fill, "metadata", None)
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -360,7 +362,7 @@ def _fill_event_from_account_reconciliation(
         or metadata.get("trade_side_raw")
         or phase
     )
-    return {
+    event = {
         "ts_ms": ts_ms,
         "kind": "order.filled",
         "payload": {
@@ -382,6 +384,9 @@ def _fill_event_from_account_reconciliation(
             "exec_id": str(metadata.get("exec_id") or metadata.get("execId") or ""),
         },
     }
+    if identity_match_mode == "fallback":
+        event["payload"]["identity_match_mode"] = identity_match_mode
+    return event
 
 
 def _iter_account_history_targets(
@@ -457,7 +462,12 @@ def _account_history_query_window(anchor_ts_ms: int) -> tuple[int | None, int | 
     if anchor_ts_ms <= 0:
         return None, None
     half_window_ms = ACCOUNT_HISTORY_QUERY_WINDOW_MS // 2
-    return max(0, anchor_ts_ms - half_window_ms), anchor_ts_ms + half_window_ms
+    now_ms = int(time.time() * 1000)
+    start_time_ms = max(0, anchor_ts_ms - half_window_ms)
+    end_time_ms = min(anchor_ts_ms + half_window_ms, now_ms)
+    if end_time_ms <= start_time_ms:
+        start_time_ms = max(0, end_time_ms - ACCOUNT_HISTORY_QUERY_WINDOW_MS)
+    return start_time_ms, end_time_ms
 
 
 def _target_order_identities(
@@ -509,7 +519,12 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
-def _account_history_fill_matches_target(fill: Any, target: dict[str, Any]) -> bool:
+def _account_history_fill_matches_target(
+    fill: Any,
+    target: dict[str, Any],
+    *,
+    require_identity_match: bool = False,
+) -> bool:
     if fill is None or _to_float(getattr(fill, "quantity", 0.0)) <= 0.0:
         return False
     fill_venue = str(_json_value(getattr(fill, "venue", None)) or "").lower()
@@ -528,6 +543,16 @@ def _account_history_fill_matches_target(fill: Any, target: dict[str, Any]) -> b
         return False
     if not _account_history_position_side_matches(metadata, str(target.get("leg") or "")):
         return False
+    if require_identity_match and _target_has_identity(target):
+        return _account_history_fill_identity_matches(fill, target)
+    return True
+
+
+def _target_has_identity(target: dict[str, Any]) -> bool:
+    return bool(target.get("identity_order_ids") or target.get("identity_client_order_ids"))
+
+
+def _account_history_fill_identity_matches(fill: Any, target: dict[str, Any]) -> bool:
     order_ids: set[str] = target.get("identity_order_ids") or set()
     client_order_ids: set[str] = target.get("identity_client_order_ids") or set()
     if order_ids or client_order_ids:
@@ -820,6 +845,7 @@ async def query_exchange_account_history_fill_events(
     report: dict[str, Any],
     *,
     position_windows: dict[str, dict[str, int]] | None = None,
+    existing_events: list[dict[str, Any]] | None = None,
     credential_loader: Callable[[str], Any] | None = None,
     adapter_factory: Callable[..., Any] | None = None,
     rate_limiter_factory: Callable[[], Any] | None = None,
@@ -853,16 +879,23 @@ async def query_exchange_account_history_fill_events(
         "credential_missing": 0,
         "adapter_unavailable": 0,
         "account_history_unavailable": 0,
+        "identity_fallback_targets": 0,
+        "identity_fallback_filled": 0,
         "errors": [],
     }
     fill_events: list[dict[str, Any]] = []
     adapter_cache: dict[str, Any] = {}
     fill_cache: dict[tuple[str, str, int | None, int | None], list[Any]] = {}
     missing_credentials: set[str] = set()
-    seen = {_account_history_event_key(event) for event in fill_events}
+    seed_events = list(existing_events or [])
+    seen = {
+        _account_history_event_key(event)
+        for event in seed_events
+        if _account_history_event_key(event)
+    }
     seen_exchange = {
         _account_history_exchange_event_key(event)
-        for event in fill_events
+        for event in seed_events
         if _account_history_exchange_event_key(event)
     }
     previous_runtime = install_runtime()
@@ -919,11 +952,30 @@ async def query_exchange_account_history_fill_events(
                     }
                 )
                 continue
+            identity_required = _target_has_identity(target)
             matched = [
                 fill
                 for fill in history_fills
-                if _account_history_fill_matches_target(fill, target)
+                if _account_history_fill_matches_target(
+                    fill,
+                    target,
+                    require_identity_match=identity_required,
+                )
             ]
+            match_mode = "identity" if identity_required else "no_identity"
+            if identity_required and not matched:
+                matched = [
+                    fill
+                    for fill in history_fills
+                    if _account_history_fill_matches_target(
+                        fill,
+                        target,
+                        require_identity_match=False,
+                    )
+                ]
+                match_mode = "fallback"
+                if matched:
+                    summary["identity_fallback_targets"] += 1
             matched.sort(
                 key=lambda fill: _account_history_fill_sort_key(
                     fill,
@@ -934,7 +986,11 @@ async def query_exchange_account_history_fill_events(
             emitted_for_target = 0
             needed_qty = float(target.get("missing_quantity") or 0.0)
             for fill in matched:
-                event = _fill_event_from_account_reconciliation(target, fill)
+                event = _fill_event_from_account_reconciliation(
+                    target,
+                    fill,
+                    identity_match_mode=match_mode,
+                )
                 key = _account_history_event_key(event)
                 exchange_key = _account_history_exchange_event_key(event)
                 if exchange_key and exchange_key in seen_exchange:
@@ -952,6 +1008,8 @@ async def query_exchange_account_history_fill_events(
                     break
             if emitted_for_target:
                 summary["filled"] += emitted_for_target
+                if match_mode == "fallback":
+                    summary["identity_fallback_filled"] += emitted_for_target
             else:
                 summary["not_found"] += 1
     finally:
@@ -1032,6 +1090,7 @@ async def query_exchange_fill_events_until_stable(
         account_history_events, account_history_summary = await query_exchange_account_history_fill_events(
             report,
             position_windows=windows,
+            existing_events=events + queried_fill_events,
         )
     else:
         account_history_events, account_history_summary = (
@@ -1189,15 +1248,25 @@ def apply_report_blockers(
 
     exchange_query = report.get("exchange_query")
     if isinstance(exchange_query, dict) and exchange_query.get("enabled", True):
-        if exchange_query.get("errors"):
-            blockers.append("exchange_query_errors_present")
-        for key in ("credential_missing", "adapter_unavailable", "reconciliation_unavailable"):
-            try:
-                value = int(exchange_query.get(key) or 0)
-            except (TypeError, ValueError):
-                value = 0
-            if value > 0:
-                blockers.append(f"exchange_query_{key}:{value}")
+        exchange_checks = [("exchange_query", exchange_query)]
+        account_history = exchange_query.get("account_history")
+        if isinstance(account_history, dict) and account_history.get("enabled", True):
+            exchange_checks.append(("exchange_query_account_history", account_history))
+        for prefix, query_row in exchange_checks:
+            if query_row.get("errors"):
+                blockers.append(f"{prefix}_errors_present")
+            for key in (
+                "credential_missing",
+                "adapter_unavailable",
+                "reconciliation_unavailable",
+                "account_history_unavailable",
+            ):
+                try:
+                    value = int(query_row.get(key) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    blockers.append(f"{prefix}_{key}:{value}")
 
     positions = report.get("positions")
     if isinstance(positions, dict):
