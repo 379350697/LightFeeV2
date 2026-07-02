@@ -102,7 +102,7 @@ def test_generate_deploy_script_computes_deploy_version_at_runtime(tmp_path, mon
         ssh_port=2222,
     )
 
-    assert 'DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse --short HEAD)"' in script
+    assert 'DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse HEAD)"' in script
     assert 'echo "$DEPLOY_VERSION" > "$REMOTE_PATH/.deploy_version"' in script
     assert 'echo "$DEPLOY_VERSION" | ssh $SSH_OPTS root@38.60.253.248 "cat > /opt/lightfee-v2/.deploy_version"' in script
     assert 'echo "abc123" > "$REMOTE_PATH/.deploy_version"' not in script
@@ -119,12 +119,12 @@ def test_generate_deploy_script_reports_post_deploy_metadata(tmp_path, monkeypat
     )
 
     assert 'echo "=== Verifying deploy metadata ==="' in script
-    assert 'REMOTE_GIT_HEAD="$(git -C "$REMOTE_PATH" rev-parse --short HEAD)"' in script
+    assert 'REMOTE_GIT_HEAD="$(git -C "$REMOTE_PATH" rev-parse HEAD)"' in script
     assert 'REMOTE_DEPLOY_VERSION="$(cat "$REMOTE_PATH/.deploy_version")"' in script
     assert 'deploy_metadata git_head=%s deploy_version=%s expected=%s\\n' in script
     assert 'deploy metadata mismatch' in script
     assert (
-        "git_head=\\$(git -C /opt/lightfee-v2 rev-parse --short HEAD) "
+        "git_head=\\$(git -C /opt/lightfee-v2 rev-parse HEAD) "
         "deploy_version=\\$(cat /opt/lightfee-v2/.deploy_version)"
     ) in script
 

@@ -217,7 +217,7 @@ def check_deploy_version_matches(remote_host: str, remote_path: str, ssh_port: i
     """Verify .deploy_version on remote matches local HEAD."""
     root = repo_root()
     local_head = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
+        ["git", "rev-parse", "HEAD"],
         capture_output=True, text=True, cwd=root,
     ).stdout.strip()
 
@@ -264,7 +264,7 @@ REMOTE_PATH="{remote_path}"
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 DEFAULT_LOCAL="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOCAL="${{LIGHTFEE_DEPLOY_LOCAL:-$DEFAULT_LOCAL}}"
-DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse --short HEAD)"
+DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse HEAD)"
 REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
@@ -278,7 +278,7 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   echo "$DEPLOY_VERSION" > "$REMOTE_PATH/.deploy_version"
 
   echo "=== Verifying deploy metadata ==="
-  REMOTE_GIT_HEAD="$(git -C "$REMOTE_PATH" rev-parse --short HEAD)"
+  REMOTE_GIT_HEAD="$(git -C "$REMOTE_PATH" rev-parse HEAD)"
   REMOTE_DEPLOY_VERSION="$(cat "$REMOTE_PATH/.deploy_version")"
   printf 'deploy_metadata git_head=%s deploy_version=%s expected=%s\n' "$REMOTE_GIT_HEAD" "$REMOTE_DEPLOY_VERSION" "$DEPLOY_VERSION"
   if [[ "$REMOTE_GIT_HEAD" != "$DEPLOY_VERSION" || "$REMOTE_DEPLOY_VERSION" != "$DEPLOY_VERSION" ]]; then
@@ -316,7 +316,7 @@ echo "=== Writing .deploy_version ==="
 echo "$DEPLOY_VERSION" | ssh $SSH_OPTS {remote_host} "cat > {remote_path}/.deploy_version"
 
 echo "=== Verifying deploy metadata ==="
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && git_head=\\$(git -C {remote_path} rev-parse --short HEAD) deploy_version=\\$(cat {remote_path}/.deploy_version) expected=$DEPLOY_VERSION; printf 'deploy_metadata git_head=%s deploy_version=%s expected=%s\\n' \"\\$git_head\" \"\\$deploy_version\" \"\\$expected\"; if [ \"\\$git_head\" != \"\\$expected\" ] || [ \"\\$deploy_version\" != \"\\$expected\" ]; then echo 'deploy metadata mismatch' >&2; exit 1; fi"
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && git_head=\\$(git -C {remote_path} rev-parse HEAD) deploy_version=\\$(cat {remote_path}/.deploy_version) expected=$DEPLOY_VERSION; printf 'deploy_metadata git_head=%s deploy_version=%s expected=%s\\n' \"\\$git_head\" \"\\$deploy_version\" \"\\$expected\"; if [ \"\\$git_head\" != \"\\$expected\" ] || [ \"\\$deploy_version\" != \"\\$expected\" ]; then echo 'deploy metadata mismatch' >&2; exit 1; fi"
 
 echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
