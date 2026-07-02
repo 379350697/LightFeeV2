@@ -104,6 +104,8 @@ def build_exchange_truth_lifecycle(
                 payload.get("entered_at_ms"),
             )
             _collect_identity_from_payload(facts, payload, kind=kind)
+            if kind == "entry.opened":
+                _collect_entry_opened_fills(facts, payload, _event_ts_ms(event))
         elif kind == "exit.reconciled":
             facts.exit_reconciled.append({"ts_ms": _event_ts_ms(event), "payload": payload})
             _collect_identity_from_payload(facts, payload, kind=kind)
@@ -237,6 +239,118 @@ def _merge_entry_payload(existing: JsonDict | None, incoming: JsonDict, *, kind:
 
 def _missing_entry_value(value: Any) -> bool:
     return value is None or value == ""
+
+
+def _collect_entry_opened_fills(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> None:
+    if not _entry_opened_has_exact_fill_evidence(payload):
+        return
+    for leg in ("long", "short"):
+        qty = _decimal(
+            payload.get(f"{leg}_quantity")
+            or payload.get("matched_quantity")
+            or payload.get("quantity")
+        )
+        venue = str(payload.get(f"{leg}_venue") or payload.get(f"{leg}_exchange") or "")
+        price = _decimal(payload.get(f"{leg}_entry_price"))
+        if qty <= 0 or price <= 0 or not venue:
+            continue
+        order_id, client_order_id = _entry_opened_leg_identity(payload, leg)
+        facts.fills.append(
+            _FillFact(
+                phase="open",
+                leg=leg,
+                venue=venue,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                qty=qty,
+                price=price,
+                fee_quote=_decimal(payload.get(f"{leg}_entry_fee_quote")),
+                filled_at_ms=_entry_opened_leg_filled_at_ms(payload, leg, ts_ms),
+                source="entry.opened",
+                confidence="exchange_fill_exact",
+            )
+        )
+
+
+def _entry_opened_has_exact_fill_evidence(payload: JsonDict) -> bool:
+    entry_quality = _quality_is_exchange_exact(payload.get("entry_timestamp_quality"))
+    maker_quality = _quality_is_exchange_exact(payload.get("maker_fill_timestamp_quality"))
+    hedge_quality = _quality_is_exchange_exact(payload.get("hedge_fill_timestamp_quality"))
+    return bool(entry_quality or (maker_quality and hedge_quality))
+
+
+def _quality_is_exchange_exact(value: Any) -> bool:
+    text = str(value or "").lower()
+    return bool(text and "exchange" in text and "exact" in text)
+
+
+def _entry_opened_leg_identity(payload: JsonDict, leg: str) -> tuple[str, str]:
+    order_id = _first_str(
+        payload.get(f"{leg}_order_id"),
+        payload.get(f"{leg}_entry_order_id"),
+    )
+    client_order_id = _first_str(
+        payload.get(f"{leg}_client_order_id"),
+        payload.get(f"{leg}_entry_client_order_id"),
+    )
+    if order_id or client_order_id:
+        return order_id, client_order_id
+    for prefix in ("maker", "hedge"):
+        if _prefixed_leg(payload, prefix) != leg:
+            continue
+        return (
+            _first_str(payload.get(f"{prefix}_order_id")),
+            _first_str(
+                payload.get(f"{prefix}_client_order_id"),
+                payload.get(f"{prefix}_clientOrderId"),
+                payload.get(f"{prefix}_clientOid"),
+            ),
+        )
+    return "", ""
+
+
+def _entry_opened_leg_filled_at_ms(payload: JsonDict, leg: str, ts_ms: int) -> int:
+    for prefix in ("maker", "hedge"):
+        if _prefixed_leg(payload, prefix) == leg:
+            value = _first_int(
+                payload.get(f"{prefix}_filled_at_ms"),
+                payload.get(f"{prefix}_fill_time_ms"),
+            )
+            if value > 0:
+                return value
+    return _first_int(payload.get("entered_at_ms"), payload.get("opened_at_ms"), ts_ms)
+
+
+def _prefixed_leg(payload: JsonDict, prefix: str) -> str:
+    raw = _first_str(
+        payload.get(f"{prefix}_leg"),
+        payload.get("entry_maker_leg") if prefix == "maker" else "",
+    ).lower()
+    if raw in {"long", "short"}:
+        return raw
+    side = str(payload.get(f"{prefix}_side") or "").lower()
+    if side in {"buy", "bid"}:
+        return "long"
+    if side in {"sell", "ask"}:
+        return "short"
+    venue = str(
+        payload.get(f"{prefix}_venue")
+        or payload.get(f"{prefix}_exchange")
+        or ""
+    ).lower()
+    long_venue = str(payload.get("long_venue") or payload.get("long_exchange") or "").lower()
+    short_venue = str(payload.get("short_venue") or payload.get("short_exchange") or "").lower()
+    if venue and venue == long_venue:
+        return "long"
+    if venue and venue == short_venue:
+        return "short"
+    if prefix == "hedge":
+        maker_leg = _prefixed_leg(payload, "maker")
+        if maker_leg == "long":
+            return "short"
+        if maker_leg == "short":
+            return "long"
+    return ""
 
 
 def _collect_exit_reconciled_fills(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> None:
@@ -436,6 +550,48 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
     items = payload.get("statement_probe_candidates")
     if isinstance(items, list):
         rows.extend(item for item in items if isinstance(item, dict))
+    for prefix in ("maker", "hedge"):
+        prefixed_order_id = _first_str(payload.get(f"{prefix}_order_id"))
+        prefixed_client_order_id = _first_str(
+            payload.get(f"{prefix}_client_order_id"),
+            payload.get(f"{prefix}_clientOrderId"),
+            payload.get(f"{prefix}_clientOid"),
+        )
+        if (
+            prefix == "maker"
+            and not prefixed_order_id
+            and not prefixed_client_order_id
+            and (payload.get("maker_venue") or payload.get("maker_leg"))
+        ):
+            prefixed_order_id = _first_str(payload.get("order_id"), payload.get("orderId"))
+            prefixed_client_order_id = _first_str(
+                payload.get("client_order_id"),
+                payload.get("clientOrderId"),
+                payload.get("clientOid"),
+                payload.get("orderLinkId"),
+            )
+        if not prefixed_order_id and not prefixed_client_order_id:
+            continue
+        rows.append(
+            {
+                "phase": _identity_phase_from_kind(kind, payload),
+                "leg": _prefixed_leg({**(facts.entry or {}), **payload}, prefix),
+                "venue": (
+                    payload.get(f"{prefix}_venue")
+                    or payload.get(f"{prefix}_exchange")
+                ),
+                "order_id": prefixed_order_id,
+                "client_order_id": prefixed_client_order_id,
+                "quantity_hint": (
+                    payload.get(f"{prefix}_quantity")
+                    or payload.get(f"{prefix}_fill_quantity")
+                    or payload.get(f"{prefix}_leg_filled")
+                    or payload.get("quantity")
+                    or payload.get("matched_quantity")
+                ),
+                "source": payload.get("source") or kind,
+            }
+        )
     for leg in ("long", "short"):
         leg_order_id = _first_str(
             payload.get(f"{leg}_order_id"),
@@ -518,6 +674,8 @@ def _identity_phase_from_kind(kind: str, payload: JsonDict) -> str:
     if explicit in {"open", "close"}:
         return explicit
     if kind in {"entry.opened", "runtime.position_opened"}:
+        return "open"
+    if kind in {"order.submitted", "order.passive_submitted"}:
         return "open"
     if kind.startswith("exit.") or kind.startswith("accounting."):
         return "close"
@@ -759,7 +917,14 @@ def _source_coverage_gaps(
 def _dedupe_fills(fills: list[_FillFact]) -> list[_FillFact]:
     out: list[_FillFact] = []
     seen: set[tuple[str, ...]] = set()
+    detailed_open_legs = {
+        (fill.phase, fill.leg)
+        for fill in fills
+        if fill.phase == "open" and fill.source != "entry.opened" and fill.qty > 0
+    }
     for fill in fills:
+        if fill.source == "entry.opened" and (fill.phase, fill.leg) in detailed_open_legs:
+            continue
         key = _fill_dedupe_key(fill)
         if key in seen:
             continue

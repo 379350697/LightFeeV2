@@ -80,6 +80,9 @@ def _identity_phase(identity: dict[str, Any]) -> str:
     explicit = str(identity.get("phase") or "").lower()
     if explicit in {"open", "close"}:
         return explicit
+    source_kind = str(identity.get("source_kind") or "").lower()
+    if source_kind in {"order.submitted", "order.passive_submitted"}:
+        return "open"
     text = " ".join(
         str(identity.get(key) or "")
         for key in ("source_kind", "source")
