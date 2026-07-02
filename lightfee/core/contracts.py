@@ -162,6 +162,8 @@ class VenueAdapter(ABC):
         *,
         order_id: str = "",
         client_order_id: str = "",
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional[OrderFillReconciliation]:
         """Task 11: Query order status by exchange ID or client ID.
 
@@ -171,7 +173,11 @@ class VenueAdapter(ABC):
         transport = getattr(self, "_transport", None)
         if transport is not None and hasattr(transport, "fetch_order_status"):
             return await transport.fetch_order_status(
-                symbol, order_id=order_id, client_order_id=client_order_id,
+                symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
             )
         return None
 

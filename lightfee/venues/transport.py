@@ -4933,12 +4933,22 @@ class VenueTransport(MarketDataClient):
 
             elif spec.venue_id == Venue.BINANCE:
                 return await self._fetch_order_status_binance(
-                    venue_sym, order_id, client_order_id, now_ms,
+                    venue_sym,
+                    order_id,
+                    client_order_id,
+                    now_ms,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
                 )
 
             elif spec.venue_id == Venue.OKX:
                 return await self._fetch_order_status_okx(
-                    venue_sym, order_id, client_order_id, now_ms,
+                    venue_sym,
+                    order_id,
+                    client_order_id,
+                    now_ms,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
                 )
 
             elif spec.venue_id == Venue.BITGET:
@@ -5003,6 +5013,9 @@ class VenueTransport(MarketDataClient):
         order_id: str,
         client_order_id: str,
         now_ms: int,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         if not order_id and not client_order_id:
             self._record_order_reconcile_query(
@@ -5045,6 +5058,18 @@ class VenueTransport(MarketDataClient):
         if code is not None and str(code).lstrip("-").isdigit() and int(code) < 0:
             msg = str(raw.get("msg", ""))
             subtype = "open_order_not_found" if str(code) in ("-2011", "-2013") else "execution_not_found"
+            if str(code) in ("-2011", "-2013"):
+                historical_result = await self._fetch_binance_historical_order_fill(
+                    venue_sym=venue_sym,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    now_ms=now_ms,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
+                    endpoints=["/fapi/v1/order"],
+                )
+                if historical_result is not None:
+                    return historical_result
             self._record_order_reconcile_query(
                 symbol=venue_sym,
                 order_id=order_id,
@@ -5072,6 +5097,229 @@ class VenueTransport(MarketDataClient):
             next_action="clear_uncertain_state" if result is not None else "check_live_position",
         )
         return result
+
+    async def _fetch_binance_historical_order_fill(
+        self,
+        *,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+        endpoints: list[str],
+    ) -> Optional["OrderFillReconciliation"]:
+        queried_endpoints = list(endpoints)
+        order_id_text = str(order_id or "").strip()
+        client_order_id_text = str(client_order_id or "").strip()
+        matched_order: dict[str, Any] = {}
+        window_params = self._binance_order_query_window_params(
+            start_time_ms,
+            end_time_ms,
+        )
+
+        if window_params:
+            all_orders_params: dict[str, Any] = {
+                "symbol": venue_sym,
+                "limit": 1000,
+                **window_params,
+            }
+            queried_endpoints.append("/fapi/v1/allOrders")
+            orders_raw = await self._request(
+                "GET",
+                "/fapi/v1/allOrders",
+                params=all_orders_params,
+                private=True,
+            )
+            matched_order = self._select_binance_historical_order(
+                orders_raw,
+                order_id=order_id_text,
+                client_order_id=client_order_id_text,
+            )
+
+        resolved_order_id = str(matched_order.get("orderId") or order_id_text or "").strip()
+        resolved_client_id = str(
+            matched_order.get("clientOrderId") or client_order_id_text or ""
+        ).strip()
+
+        if resolved_order_id.isdigit():
+            trade_params: dict[str, Any] = {
+                "symbol": venue_sym,
+                "orderId": resolved_order_id,
+                "limit": 1000,
+                **window_params,
+            }
+            queried_endpoints.append("/fapi/v1/userTrades")
+            trades_raw = await self._request(
+                "GET",
+                "/fapi/v1/userTrades",
+                params=trade_params,
+                private=True,
+            )
+            trades_result = self._parse_binance_user_trades_reconciliation(
+                trades_raw,
+                venue_sym=venue_sym,
+                order_id=resolved_order_id,
+                client_order_id=resolved_client_id,
+                order_row=matched_order,
+                now_ms=now_ms,
+                queried_endpoints=queried_endpoints,
+            )
+            if trades_result is not None:
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=trades_result.order_id,
+                    client_order_id=trades_result.client_order_id or client_order_id,
+                    queried_endpoints=queried_endpoints,
+                    response_classification="filled",
+                    next_action="clear_uncertain_state",
+                )
+                return trades_result
+
+        if matched_order:
+            order_result = self._parse_order_status_binance(
+                matched_order,
+                venue_sym,
+                now_ms,
+            )
+            if order_result is not None:
+                metadata = dict(order_result.metadata or {})
+                metadata["queried_endpoints"] = list(queried_endpoints)
+                metadata["evidence_source"] = "binance_all_orders"
+                order_result = replace(order_result, metadata=metadata)
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=order_result.order_id,
+                    client_order_id=order_result.client_order_id or client_order_id,
+                    queried_endpoints=queried_endpoints,
+                    response_classification="filled",
+                    next_action="clear_uncertain_state",
+                )
+                return order_result
+
+        if len(queried_endpoints) > len(endpoints):
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=queried_endpoints,
+                response_classification="open_order_not_found;closed_order_not_found",
+                uncertain_subtype="closed_order_not_found",
+                next_action="check_live_position",
+            )
+        return None
+
+    @staticmethod
+    def _binance_order_query_window_params(
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> dict[str, int]:
+        params: dict[str, int] = {}
+        if start_time_ms is not None and int(start_time_ms or 0) > 0:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None and int(end_time_ms or 0) > 0:
+            params["endTime"] = int(end_time_ms)
+        return params
+
+    @staticmethod
+    def _select_binance_historical_order(
+        raw: Any,
+        *,
+        order_id: str,
+        client_order_id: str,
+    ) -> dict[str, Any]:
+        rows = raw if isinstance(raw, list) else []
+        candidates = [row for row in rows if isinstance(row, dict)]
+        if order_id:
+            for row in candidates:
+                if str(row.get("orderId") or "") == order_id:
+                    return row
+        if client_order_id:
+            for row in candidates:
+                if str(row.get("clientOrderId") or "") == client_order_id:
+                    return row
+        return {}
+
+    def _parse_binance_user_trades_reconciliation(
+        self,
+        raw: Any,
+        *,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        order_row: dict[str, Any],
+        now_ms: int,
+        queried_endpoints: list[str],
+    ) -> Optional["OrderFillReconciliation"]:
+        rows = raw if isinstance(raw, list) else []
+        total_qty = 0.0
+        weighted_notional = 0.0
+        total_fee = 0.0
+        latest_fill_ms = 0
+        resolved_side: Side | None = self._binance_side_from_raw(order_row.get("side"))
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_order_id = str(row.get("orderId") or "")
+            if order_id and row_order_id and row_order_id != order_id:
+                continue
+            qty = _safe_float(row.get("qty", row.get("quantity", "0")))
+            price = _safe_float(row.get("price", "0"))
+            if qty <= 0.0 or price <= 0.0:
+                continue
+            row_side = self._binance_side_from_trade(row)
+            if resolved_side is None:
+                resolved_side = row_side
+            elif row_side is not None and resolved_side != row_side:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "binance userTrades has mixed sides for one order",
+                )
+            total_qty += qty
+            weighted_notional += qty * price
+            commission_asset = str(row.get("commissionAsset") or "").upper()
+            if commission_asset in {"USDT", "USDC", "BUSD", ""}:
+                total_fee += abs(_safe_float(row.get("commission", "0")))
+            latest_fill_ms = max(latest_fill_ms, int(row.get("time", now_ms) or now_ms))
+
+        if total_qty <= 0.0 or resolved_side is None:
+            return None
+        return OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol=venue_sym,
+            side=resolved_side,
+            quantity=total_qty,
+            average_price=weighted_notional / total_qty,
+            order_id=order_id,
+            client_order_id=client_order_id or None,
+            fee_quote=total_fee if total_fee > 0.0 else None,
+            filled_at_ms=latest_fill_ms if latest_fill_ms > 0 else now_ms,
+            metadata={
+                "evidence_source": "binance_user_trades",
+                "queried_endpoints": list(queried_endpoints),
+                "raw_exchange_status": str(order_row.get("status", "")),
+                "response_classification": "filled",
+            },
+        )
+
+    @staticmethod
+    def _binance_side_from_raw(value: Any) -> Side | None:
+        side_raw = str(value or "").upper()
+        if side_raw == "BUY":
+            return Side.BUY
+        if side_raw == "SELL":
+            return Side.SELL
+        return None
+
+    @classmethod
+    def _binance_side_from_trade(cls, row: dict[str, Any]) -> Side | None:
+        side = cls._binance_side_from_raw(row.get("side"))
+        if side is not None:
+            return side
+        buyer = row.get("buyer")
+        if isinstance(buyer, bool):
+            return Side.BUY if buyer else Side.SELL
+        return None
 
     @staticmethod
     def _classify_binance_zero_fill(raw: dict[str, Any]) -> str:
@@ -5131,6 +5379,9 @@ class VenueTransport(MarketDataClient):
         order_id: str,
         client_order_id: str,
         now_ms: int,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         if not order_id and not client_order_id:
             self._record_order_reconcile_query(
@@ -5164,6 +5415,8 @@ class VenueTransport(MarketDataClient):
                 fallback_client_order_id=client_order_id_text,
                 now_ms=now_ms,
                 endpoints=endpoints,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
             )
             if open_result is not None:
                 self._record_order_reconcile_query(
@@ -5180,6 +5433,9 @@ class VenueTransport(MarketDataClient):
 
         history_params = dict(params)
         history_params["instType"] = "SWAP"
+        history_params.update(
+            self._okx_order_query_window_params(start_time_ms, end_time_ms)
+        )
         endpoints.append("/api/v5/trade/orders-history")
         history_raw = await self._request(
             "GET", "/api/v5/trade/orders-history", params=history_params, private=True,
@@ -5193,6 +5449,8 @@ class VenueTransport(MarketDataClient):
                 fallback_client_order_id=client_order_id_text,
                 now_ms=now_ms,
                 endpoints=endpoints,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
             )
             if history_result is None:
                 return None
@@ -5220,6 +5478,18 @@ class VenueTransport(MarketDataClient):
         return None
 
     @staticmethod
+    def _okx_order_query_window_params(
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> dict[str, int]:
+        params: dict[str, int] = {}
+        if start_time_ms is not None and int(start_time_ms or 0) > 0:
+            params["begin"] = int(start_time_ms)
+        if end_time_ms is not None and int(end_time_ms or 0) > 0:
+            params["end"] = int(end_time_ms)
+        return params
+
+    @staticmethod
     def _okx_order_status_row(raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
             return {}
@@ -5241,6 +5511,8 @@ class VenueTransport(MarketDataClient):
         fallback_client_order_id: str,
         now_ms: int,
         endpoints: list[str],
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         resolved_order_id = str(order_row.get("ordId") or fallback_order_id or "").strip()
         resolved_client_id = str(
@@ -5270,11 +5542,48 @@ class VenueTransport(MarketDataClient):
             private=True,
         )
         if not self._okx_trade_fills_has_quantity(fills_raw):
+            window_params = self._okx_order_query_window_params(
+                start_time_ms,
+                end_time_ms,
+            )
+            if window_params:
+                history_fill_endpoints = fill_endpoints + ["/api/v5/trade/fills-history"]
+                history_fills_raw = await self._request(
+                    "GET",
+                    "/api/v5/trade/fills-history",
+                    params={
+                        "instType": "SWAP",
+                        "instId": venue_sym,
+                        "ordId": resolved_order_id,
+                        **window_params,
+                    },
+                    private=True,
+                )
+                if self._okx_trade_fills_has_quantity(history_fills_raw):
+                    contract_size = await self._okx_contract_size_for_venue_symbol(
+                        venue_sym
+                    )
+                    result = self._parse_okx_trade_fills(
+                        history_fills_raw,
+                        venue_sym=venue_sym,
+                        order_id=resolved_order_id,
+                        client_order_id=resolved_client_id,
+                        now_ms=now_ms,
+                        contract_size=contract_size,
+                        raw_exchange_status=str(order_row.get("state", "")),
+                        queried_endpoints=history_fill_endpoints,
+                    )
+                    if result is not None:
+                        return result
             self._record_order_reconcile_query(
                 symbol=venue_sym,
                 order_id=resolved_order_id,
                 client_order_id=resolved_client_id,
-                queried_endpoints=fill_endpoints,
+                queried_endpoints=(
+                    fill_endpoints + ["/api/v5/trade/fills-history"]
+                    if window_params
+                    else fill_endpoints
+                ),
                 response_classification="detail_found;fills_empty",
                 uncertain_subtype="execution_not_found",
                 next_action="check_live_position",

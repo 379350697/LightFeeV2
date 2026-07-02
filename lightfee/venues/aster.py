@@ -13,6 +13,7 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
     PassiveOrderProgress,
@@ -444,15 +445,43 @@ class AsterAdapter(VenueAdapter):
         symbol: str,
         order_id: str = "",
         client_order_id: Optional[str] = None,
-    ) -> OrderFill | None:
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> OrderFillReconciliation | None:
         if self._private is not None:
             return await self._private.fetch_order_status(
-                symbol, order_id, client_order_id,
+                symbol,
+                order_id,
+                client_order_id,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
             )
         if self._mode == "live":
             raise self._private_unavailable()
         return await self._transport.fetch_order_status(
-            symbol, order_id, client_order_id,
+            symbol,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> OrderFillReconciliation | None:
+        return await self.fetch_order_status(
+            symbol,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
         )
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:

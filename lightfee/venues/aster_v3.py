@@ -16,6 +16,7 @@ import httpx
 
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
     PassiveOrderProgress,
@@ -725,14 +726,10 @@ class AsterV3Client:
         symbol: str,
         order_id: str = "",
         client_order_id: Optional[str] = None,
-    ) -> Optional[OrderFill]:
-        request = OrderRequest(
-            venue=Venue.ASTER,
-            symbol=symbol,
-            side=Side.BUY,
-            quantity=0.0,
-            client_order_id=client_order_id,
-        )
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> Optional[OrderFillReconciliation]:
         progress = await self.query_passive_order_progress(
             symbol,
             order_id,
@@ -740,15 +737,27 @@ class AsterV3Client:
         )
         if progress is None or progress.cumulative_quantity <= 0:
             return None
-        return OrderFill(
+        metadata = {
+            "raw_exchange_status": progress.state.value,
+            "queried_endpoints": [ASTER_V3_ORDER_PATH],
+            "response_classification": "filled",
+            "evidence_source": "aster_v3_order_status",
+        }
+        if start_time_ms is not None:
+            metadata["query_start_time_ms"] = int(start_time_ms)
+        if end_time_ms is not None:
+            metadata["query_end_time_ms"] = int(end_time_ms)
+        return OrderFillReconciliation(
             venue=Venue.ASTER,
             symbol=symbol,
             side=progress.side,
             quantity=progress.cumulative_quantity,
-            price=progress.average_price,
+            average_price=progress.average_price,
             order_id=progress.order_id,
-            client_order_id=progress.client_order_id or request.client_order_id,
+            client_order_id=progress.client_order_id or client_order_id,
+            fee_quote=progress.fee_quote,
             filled_at_ms=progress.last_fill_time_ms or progress.observed_at_ms,
+            metadata=metadata,
         )
 
     async def close(self) -> None:

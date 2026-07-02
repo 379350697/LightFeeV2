@@ -604,6 +604,100 @@ class TestBinanceAsterPostSigning:
         assert snapshot.maintenance_margin_quote > 0.0
 
     @pytest.mark.asyncio
+    async def test_aster_adapter_fetch_order_fill_reconciliation_delegates_private_v3_with_window(self):
+        from lightfee.core.domain import OrderFillReconciliation
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+        adapter._private.fetch_order_status = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.ASTER,
+                symbol="LABUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=0.05,
+                order_id="aster-order-1",
+                client_order_id="aster-cid-1",
+                filled_at_ms=start_time_ms + 10,
+                metadata={"queried_endpoints": ["/fapi/v3/order"]},
+            )
+        )
+
+        try:
+            result = await adapter.fetch_order_fill_reconciliation(
+                "LABUSDT",
+                order_id="aster-order-1",
+                client_order_id="aster-cid-1",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert result is not None
+        assert result.average_price == pytest.approx(0.05)
+        adapter._private.fetch_order_status.assert_awaited_once_with(
+            "LABUSDT",
+            "aster-order-1",
+            "aster-cid-1",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_fetch_order_status_returns_reconciliation_with_metadata(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/order"
+            params = dict(request.url.params)
+            assert params["orderId"] == "aster-order-2"
+            return httpx.Response(
+                200,
+                json={
+                    "symbol": "LABUSDT",
+                    "orderId": "aster-order-2",
+                    "clientOrderId": "aster-cid-2",
+                    "side": "SELL",
+                    "executedQty": "12",
+                    "avgPrice": "0.051",
+                    "updateTime": str(start_time_ms + 100),
+                    "status": "FILLED",
+                },
+            )
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            result = await client.fetch_order_status(
+                "LABUSDT",
+                order_id="aster-order-2",
+                client_order_id="aster-cid-2",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await client.close()
+
+        assert result is not None
+        assert result.venue == Venue.ASTER
+        assert result.side == Side.SELL
+        assert result.quantity == pytest.approx(12.0)
+        assert result.average_price == pytest.approx(0.051)
+        assert result.metadata["queried_endpoints"] == ["/fapi/v3/order"]
+        assert result.metadata["response_classification"] == "filled"
+
+    @pytest.mark.asyncio
     async def test_aster_v3_unfiltered_open_orders_consumes_official_weight_40(self):
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
@@ -8335,6 +8429,98 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert query_payload["next_action"] == "check_live_position"
 
     @pytest.mark.anyio
+    async def test_binance_historical_reconciliation_uses_windowed_all_orders_and_user_trades(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+        seen: list[tuple[str, dict[str, str]]] = []
+
+        async def mock_handler(request):
+            query = dict(request.url.params)
+            seen.append((request.url.path, query))
+            if request.url.path == "/fapi/v1/order":
+                return httpx.Response(200, json={
+                    "code": -2013,
+                    "msg": "Order does not exist.",
+                })
+            if request.url.path == "/fapi/v1/allOrders":
+                return httpx.Response(200, json=[
+                    {
+                        "symbol": "LABUSDT",
+                        "orderId": 987654,
+                        "clientOrderId": "bn-old-cid",
+                        "side": "SELL",
+                        "executedQty": "12",
+                        "avgPrice": "0.052",
+                        "cumQuote": "0.624",
+                        "updateTime": str(start_time_ms + 100),
+                        "status": "FILLED",
+                    }
+                ])
+            if request.url.path == "/fapi/v1/userTrades":
+                return httpx.Response(200, json=[
+                    {
+                        "symbol": "LABUSDT",
+                        "orderId": 987654,
+                        "qty": "5",
+                        "price": "0.051",
+                        "commission": "0.001",
+                        "commissionAsset": "USDT",
+                        "time": str(start_time_ms + 90),
+                        "buyer": False,
+                    },
+                    {
+                        "symbol": "LABUSDT",
+                        "orderId": 987654,
+                        "qty": "7",
+                        "price": "0.053",
+                        "commission": "0.002",
+                        "commissionAsset": "USDT",
+                        "time": str(start_time_ms + 110),
+                        "buyer": False,
+                    },
+                ])
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "LABUSDT",
+            order_id="",
+            client_order_id="bn-old-cid",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.order_id == "987654"
+        assert result.client_order_id == "bn-old-cid"
+        assert result.side == Side.SELL
+        assert result.quantity == pytest.approx(12.0)
+        assert result.average_price == pytest.approx(((5 * 0.051) + (7 * 0.053)) / 12)
+        assert result.fee_quote == pytest.approx(0.003)
+        by_path = {path: query for path, query in seen}
+        assert by_path["/fapi/v1/allOrders"]["startTime"] == str(start_time_ms)
+        assert by_path["/fapi/v1/allOrders"]["endTime"] == str(end_time_ms)
+        assert by_path["/fapi/v1/userTrades"]["orderId"] == "987654"
+        assert by_path["/fapi/v1/userTrades"]["startTime"] == str(start_time_ms)
+        assert by_path["/fapi/v1/userTrades"]["endTime"] == str(end_time_ms)
+        assert result.metadata["queried_endpoints"] == [
+            "/fapi/v1/order",
+            "/fapi/v1/allOrders",
+            "/fapi/v1/userTrades",
+        ]
+
+    @pytest.mark.anyio
     async def test_okx_order_not_found_queries_open_and_history(self):
         from lightfee.venues.okx import OkxAdapter
 
@@ -8512,6 +8698,95 @@ class TestVenueSpecificOrderReconciliationEvidence:
         ]
         assert query_payload["response_classification"] == "detail_found;fills_empty"
         assert query_payload["uncertain_subtype"] == "execution_not_found"
+
+    @pytest.mark.anyio
+    async def test_okx_historical_reconciliation_uses_windowed_orders_and_fills_history(self):
+        from lightfee.venues.okx import OkxAdapter
+
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+        seen: list[tuple[str, dict[str, str]]] = []
+
+        async def mock_handler(request):
+            query = dict(request.url.params)
+            seen.append((request.url.path, query))
+            if request.url.path == "/api/v5/trade/order":
+                return httpx.Response(200, json={
+                    "code": "51603",
+                    "msg": "Order does not exist",
+                    "data": [],
+                })
+            if request.url.path == "/api/v5/trade/orders-history":
+                return httpx.Response(200, json={
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "UB-USDT-SWAP",
+                            "ordId": "okx-old-order",
+                            "clOrdId": "okx-old-cid",
+                            "side": "buy",
+                            "accFillSz": "30",
+                            "avgPx": "0.02",
+                            "state": "filled",
+                        }
+                    ],
+                })
+            if request.url.path == "/api/v5/trade/fills":
+                return httpx.Response(200, json={"code": "0", "data": []})
+            if request.url.path == "/api/v5/trade/fills-history":
+                return httpx.Response(200, json={
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "UB-USDT-SWAP",
+                            "ordId": "okx-old-order",
+                            "clOrdId": "okx-old-cid",
+                            "side": "buy",
+                            "fillSz": "30",
+                            "fillPx": "0.02",
+                            "fee": "-0.004",
+                            "ts": str(start_time_ms + 100),
+                        }
+                    ],
+                })
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+        adapter._transport._okx_contract_size_for_venue_symbol = AsyncMock(return_value=1.0)
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "UBUSDT",
+            order_id="",
+            client_order_id="okx-old-cid",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.order_id == "okx-old-order"
+        assert result.client_order_id == "okx-old-cid"
+        assert result.quantity == pytest.approx(30.0)
+        assert result.fee_quote == pytest.approx(0.004)
+        by_path = {path: query for path, query in seen}
+        assert by_path["/api/v5/trade/orders-history"]["begin"] == str(start_time_ms)
+        assert by_path["/api/v5/trade/orders-history"]["end"] == str(end_time_ms)
+        assert by_path["/api/v5/trade/fills-history"]["ordId"] == "okx-old-order"
+        assert by_path["/api/v5/trade/fills-history"]["begin"] == str(start_time_ms)
+        assert by_path["/api/v5/trade/fills-history"]["end"] == str(end_time_ms)
+        assert result.metadata["queried_endpoints"] == [
+            "/api/v5/trade/order",
+            "/api/v5/trade/orders-history",
+            "/api/v5/trade/fills",
+            "/api/v5/trade/fills-history",
+        ]
 
     def test_okx_order_status_scales_acc_fill_contracts_to_base_quantity(self):
         from lightfee.venues.transport import VenueTransport
@@ -9021,6 +9296,61 @@ class TestBitgetAdapterHttpRedLight:
         assert result.fee_quote is not None and result.fee_quote == pytest.approx(0.1), (
             f"RED-LIGHT: fee should be 0.1 (sum of feeDetail fees), got {result.fee_quote}"
         )
+
+    @pytest.mark.anyio
+    async def test_bitget_reconciliation_accepts_historical_window_kwargs(self):
+        import httpx
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.transport import LiveCredential
+        from lightfee.core.domain import Side
+
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            seen_params.append(dict(request.url.params))
+            if "/api/v3/position/current-position" in str(request.url):
+                return httpx.Response(200, json={"code": "00000", "data": []})
+            if "/api/v3/trade/order-info" in str(request.url):
+                return httpx.Response(200, json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": {
+                        "orderId": "bitget-old-order",
+                        "clientOid": "bitget-old-cid",
+                        "symbol": "LABUSDT",
+                        "orderStatus": "filled",
+                        "side": "buy",
+                        "cumExecQty": "15",
+                        "avgPrice": "0.05",
+                        "feeDetail": [{"fee": "0.01", "feeCoin": "USDT"}],
+                        "cTime": "1783000000100",
+                        "uTime": "1783000000100",
+                    },
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "LABUSDT",
+            order_id="bitget-old-order",
+            client_order_id="bitget-old-cid",
+            start_time_ms=1_783_000_000_000,
+            end_time_ms=1_783_360_000_000,
+        )
+        await adapter._transport.close()
+
+        assert result is not None
+        assert result.side == Side.BUY
+        assert result.quantity == pytest.approx(15.0)
+        assert result.average_price == pytest.approx(0.05)
+        assert seen_params[-1]["orderId"] == "bitget-old-order"
 
     @pytest.mark.anyio
     async def test_bitget_uta_fetch_position_uses_official_category_param(self):
