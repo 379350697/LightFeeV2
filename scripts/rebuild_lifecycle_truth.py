@@ -102,37 +102,75 @@ def position_event_windows(
     selected_ids = {str(item) for item in position_ids or [] if str(item)}
     windows: dict[str, dict[str, Any]] = {}
     for event in events:
-        if not isinstance(event, dict):
+        _add_position_event_window(windows, event, selected_ids=selected_ids)
+    return _finalize_position_event_windows(windows)
+
+
+def read_position_event_windows(
+    paths: Iterable[Path],
+    *,
+    position_ids: Iterable[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    selected_ids = {str(item) for item in position_ids or [] if str(item)}
+    windows: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        if not path.exists():
             continue
-        position_id = _event_position_id(event)
-        if not position_id or (selected_ids and position_id not in selected_ids):
-            continue
-        ts_ms = _event_ts_ms(event)
-        if ts_ms <= 0:
-            continue
-        kind = str(event.get("kind") or "")
-        payload = event.get("payload")
-        row_payload = payload if isinstance(payload, dict) else event
-        symbol = str(row_payload.get("symbol") or "").upper()
-        row = windows.setdefault(
-            position_id,
-            {
-                "first_ts_ms": ts_ms,
-                "last_ts_ms": ts_ms,
-                "entry_ts_ms": 0,
-                "close_ts_ms": 0,
-                "symbol": "",
-            },
-        )
-        row["first_ts_ms"] = min(int(row.get("first_ts_ms") or ts_ms), ts_ms)
-        row["last_ts_ms"] = max(int(row.get("last_ts_ms") or ts_ms), ts_ms)
-        if symbol and not row.get("symbol"):
-            row["symbol"] = symbol
-        if kind in {"entry.opened", "runtime.position_opened"}:
-            existing = int(row.get("entry_ts_ms") or 0)
-            row["entry_ts_ms"] = ts_ms if existing <= 0 else min(existing, ts_ms)
-        if _kind_is_close_or_flatten(kind):
-            row["close_ts_ms"] = max(int(row.get("close_ts_ms") or 0), ts_ms)
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                _add_position_event_window(windows, event, selected_ids=selected_ids)
+    return _finalize_position_event_windows(windows)
+
+
+def _add_position_event_window(
+    windows: dict[str, dict[str, Any]],
+    event: Any,
+    *,
+    selected_ids: set[str],
+) -> None:
+    if not isinstance(event, dict):
+        return
+    position_id = _event_position_id(event)
+    if not position_id or (selected_ids and position_id not in selected_ids):
+        return
+    ts_ms = _event_ts_ms(event)
+    if ts_ms <= 0:
+        return
+    kind = str(event.get("kind") or "")
+    payload = event.get("payload")
+    row_payload = payload if isinstance(payload, dict) else event
+    symbol = str(row_payload.get("symbol") or "").upper()
+    row = windows.setdefault(
+        position_id,
+        {
+            "first_ts_ms": ts_ms,
+            "last_ts_ms": ts_ms,
+            "entry_ts_ms": 0,
+            "close_ts_ms": 0,
+            "symbol": "",
+        },
+    )
+    row["first_ts_ms"] = min(int(row.get("first_ts_ms") or ts_ms), ts_ms)
+    row["last_ts_ms"] = max(int(row.get("last_ts_ms") or ts_ms), ts_ms)
+    if symbol and not row.get("symbol"):
+        row["symbol"] = symbol
+    if kind in {"entry.opened", "runtime.position_opened"}:
+        existing = int(row.get("entry_ts_ms") or 0)
+        row["entry_ts_ms"] = ts_ms if existing <= 0 else min(existing, ts_ms)
+    if _kind_is_close_or_flatten(kind):
+        row["close_ts_ms"] = max(int(row.get("close_ts_ms") or 0), ts_ms)
+
+
+def _finalize_position_event_windows(
+    windows: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
     for row in windows.values():
         if int(row.get("entry_ts_ms") or 0) <= 0:
             row["entry_ts_ms"] = int(row.get("first_ts_ms") or 0)
@@ -1276,6 +1314,7 @@ async def query_exchange_fill_events_until_stable(
     *,
     position_ids: Iterable[str] | None,
     context_events: list[dict[str, Any]] | None = None,
+    position_windows: dict[str, dict[str, Any]] | None = None,
     max_passes: int = 3,
     query_func: Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
     | None = None,
@@ -1297,8 +1336,11 @@ async def query_exchange_fill_events_until_stable(
         key = _fill_event_identity_key(event)
         if key:
             seen.add(key)
-    context = context_events if context_events is not None else events
-    windows = position_event_windows(context)
+    if position_windows is not None:
+        windows = _finalize_position_event_windows(dict(position_windows))
+    else:
+        context = context_events if context_events is not None else events
+        windows = position_event_windows(context)
 
     for pass_index in range(1, max(1, max_passes) + 1):
         fill_events, summary = await query(report)
@@ -1583,9 +1625,9 @@ def main(argv: list[str] | None = None) -> int:
     position_ids = read_position_ids(args.positions_file)
     event_position_filter = set(position_ids or []) if position_ids is not None else None
     events = read_jsonl_events(event_files, position_ids=event_position_filter)
-    context_events = events
+    context_windows: dict[str, dict[str, Any]] | None = None
     if event_position_filter:
-        context_events = read_jsonl_events(event_files)
+        context_windows = read_position_event_windows(event_files)
     queried_fill_events: list[dict[str, Any]] = []
     exchange_truth_env_files_loaded: list[str] = []
     report = build_exchange_truth_lifecycle(
@@ -1598,7 +1640,7 @@ def main(argv: list[str] | None = None) -> int:
             query_exchange_fill_events_until_stable(
                 events,
                 position_ids=set(position_ids or []),
-                context_events=context_events,
+                position_windows=context_windows,
             )
         )
         report["exchange_query"] = exchange_query_summary
