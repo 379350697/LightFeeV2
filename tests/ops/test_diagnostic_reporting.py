@@ -19,6 +19,9 @@ def _sample_diagnose_result() -> dict:
             "max_events": 50_000,
             "event_files": ["/runtime/live-events.jsonl"],
             "events_parsed": 42,
+            "event_scan_truncated": False,
+            "events_dropped_by_cap": 0,
+            "since_deploy_time_filtered": True,
             "state_path": "/runtime/live-state-current.json",
             "state_path_source": "explicit",
         },
@@ -55,6 +58,9 @@ def _sample_diagnose_result() -> dict:
             "has_nonzero_position": False,
             "has_open_order": False,
             "state_verdict": "consistent",
+            "required_venues": ["binance"],
+            "missing_required_venues": [],
+            "missing_evidence": [],
             "errors": [],
         },
         "state_consistency": {
@@ -64,6 +70,8 @@ def _sample_diagnose_result() -> dict:
         },
         "production_acceptance_gate": {
             "gate_passed": True,
+            "blocking_reasons": [],
+            "exchange_truth_missing_required_venues": [],
             "fingerprints": [],
             "next_actions": [],
         },
@@ -87,6 +95,9 @@ def test_agent_profile_keeps_context_safe_fields_only():
         "max_events": 50_000,
         "events_parsed": 42,
         "event_file_count": 1,
+        "event_scan_truncated": False,
+        "events_dropped_by_cap": 0,
+        "since_deploy_time_filtered": True,
         "state_path_source": "explicit",
     }
     assert report["local_state"] == {

@@ -76,3 +76,31 @@ def test_bug_ledger_checker_json_reports_clean_governance():
     assert payload["daily_files"] >= 39
     assert payload["daily_clusters"] >= 140
     assert payload["recent_rows"] >= 10
+    assert "pending_rows" in payload
+    assert "stale_pending_rows" in payload
+    assert "status_drift_rows" in payload
+
+
+def test_bug_ledger_checker_json_reports_pending_clusters_without_status_drift():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK_SCRIPT),
+            "--json",
+            "--as-of-date",
+            "2026-07-02",
+            "--stale-pending-days",
+            "7",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+
+    pending_clusters = {row["cluster"] for row in payload["pending_rows"]}
+    stale_clusters = {row["cluster"] for row in payload["stale_pending_rows"]}
+
+    assert "CL-139" in pending_clusters
+    assert "CL-110" in stale_clusters
+    assert payload["status_drift_rows"] == []

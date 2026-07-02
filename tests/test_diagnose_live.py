@@ -65,6 +65,9 @@ def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
                 "max_events": kwargs["max_events"],
                 "event_files": ["/runtime/live-events.jsonl"],
                 "events_parsed": 42,
+                "event_scan_truncated": False,
+                "events_dropped_by_cap": 0,
+                "since_deploy_time_filtered": True,
                 "state_path": "/runtime/live-state-current.json",
                 "state_path_source": "explicit",
             },
@@ -101,6 +104,9 @@ def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
                 "has_nonzero_position": False,
                 "has_open_order": False,
                 "state_verdict": "consistent",
+                "required_venues": ["binance"],
+                "missing_required_venues": [],
+                "missing_evidence": [],
                 "errors": [],
             },
             "state_consistency": {
@@ -110,6 +116,8 @@ def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
             },
             "production_acceptance_gate": {
                 "gate_passed": True,
+                "blocking_reasons": [],
+                "exchange_truth_missing_required_venues": [],
                 "fingerprints": [],
                 "next_actions": [],
             },
@@ -135,6 +143,9 @@ def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
         "max_events": 50_000,
         "events_parsed": 42,
         "event_file_count": 1,
+        "event_scan_truncated": False,
+        "events_dropped_by_cap": 0,
+        "since_deploy_time_filtered": True,
         "state_path_source": "explicit",
     }
     assert output["local_state"] == {
@@ -202,15 +213,18 @@ def test_main_profile_gate_outputs_minimal_gate_report(monkeypatch, capsys):
             "pending_entry_count": 0,
             "pending_close_count": 0,
         },
-        "exchange_truth": {
-            "available": True,
-            "confidence": "high",
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "state_verdict": "consistent",
-        },
-        "fingerprints": [],
-    }
+            "exchange_truth": {
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "state_verdict": "consistent",
+                "required_venues": [],
+                "missing_required_venues": [],
+            },
+            "blocking_reasons": [],
+            "fingerprints": [],
+        }
 
 
 def test_run_diagnose_reports_spread_sidecar_snapshot_source():
@@ -13187,6 +13201,161 @@ def test_tail_read_captures_latest_events_not_cut_by_max_records():
         assert "exit.passive_close_maker_submit_error" in ec
     finally:
         import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_since_deploy_preserves_early_materialized_trade_scope_before_noise(monkeypatch):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    captured = {}
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "hyperliquid_trading_disabled_reason": (
+                "api_wallet_authorization_not_verified_strict_readonly"
+            ),
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000400000,
+        })
+        events = [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1700000001000-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "long_venue": "bitget",
+                    "short_venue": "okx",
+                },
+            },
+            {
+                "ts_ms": 1700000002000,
+                "kind": "order.rejected",
+                "payload": {
+                    "symbol": "GUAUSDT",
+                    "venue": "aster",
+                    "reason": "max_notional_admission_blocked",
+                },
+            },
+        ]
+        for i in range(200):
+            events.append({
+                "ts_ms": 1700000100000 + i,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {"reason": "quote_revalidate_noise", "seq": i},
+            })
+        _write_jsonl(os.path.join(d, "events.jsonl"), events)
+
+        monkeypatch.setattr(dl, "_build_deploy_status", lambda runtime_dir: {
+            "commit_time": "2023-11-14T22:13:20+00:00",
+            "git_head": "test",
+            "deploy_version": "test",
+            "version_mismatch": False,
+        })
+
+        def exchange_truth(runtime_dir, symbols, venues=None):
+            captured["symbols"] = list(symbols)
+            captured["venues"] = list(venues or [])
+            return _flat_exchange_truth(runtime_dir, symbols, venues or [])
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000400000,
+            since_deploy=True,
+            max_events=50,
+        )
+
+        assert "LABUSDT" in captured["symbols"]
+        assert "GUAUSDT" in captured["symbols"]
+        assert {"bitget", "okx", "aster", "hyperliquid"}.issubset(
+            set(captured["venues"])
+        )
+        assert result["scope"]["event_scan_truncated"] is True
+        assert result["scope"]["events_dropped_by_cap"] > 0
+        assert result["scope"]["since_deploy_time_filtered"] is True
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_since_deploy_required_venues_missing_blocks_gate(monkeypatch):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000200000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": "entry-1700000001000-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bitget",
+                },
+            },
+            {
+                "ts_ms": 1700000002000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1700000001000-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_deploy_status", lambda runtime_dir: {
+            "commit_time": "2023-11-14T22:13:20+00:00",
+            "git_head": "test",
+            "deploy_version": "test",
+            "version_mismatch": False,
+        })
+
+        def exchange_truth(runtime_dir, symbols, venues=None):
+            truth = _flat_exchange_truth(runtime_dir, symbols, ["binance"])
+            truth["available_venues"] = ["binance"]
+            truth["fetch_status"] = {"binance": {"status": "ok"}}
+            return truth
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000200000,
+            since_deploy=True,
+        )
+
+        exchange_truth = result["exchange_truth"]
+        assert exchange_truth["required_venues"] == ["binance", "bitget"]
+        assert exchange_truth["missing_required_venues"] == ["bitget"]
+        assert "exchange_truth_required_venue_missing_bitget" in (
+            exchange_truth["missing_evidence"]
+        )
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert "exchange_truth_required_venues_missing" in gate["blocking_reasons"]
+    finally:
         shutil.rmtree(d, ignore_errors=True)
 
 

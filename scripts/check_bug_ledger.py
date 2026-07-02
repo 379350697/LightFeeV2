@@ -8,6 +8,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
 
@@ -53,6 +54,17 @@ def parse_args() -> argparse.Namespace:
         "--json",
         action="store_true",
         help="Emit machine-readable JSON.",
+    )
+    parser.add_argument(
+        "--as-of-date",
+        default=date.today().isoformat(),
+        help="Date used for pending-age checks, YYYY-MM-DD. Default: today.",
+    )
+    parser.add_argument(
+        "--stale-pending-days",
+        type=int,
+        default=7,
+        help="Pending rows older than this many days are reported as stale.",
     )
     return parser.parse_args()
 
@@ -122,6 +134,62 @@ def validate_recent_rows(rows: list[RecentRow], recent_since: str) -> list[str]:
     return violations
 
 
+def _row_payload(row: RecentRow) -> dict[str, str]:
+    return {
+        "date": row.date,
+        "cluster": row.cluster,
+        "status": row.status,
+        "start_here": row.start_here,
+    }
+
+
+def _is_pending_status(status: str) -> bool:
+    status_lower = status.lower()
+    return (
+        "deploy pending" in status_lower
+        or status_lower.startswith("local ")
+        or "local verified" in status_lower
+        or "local green" in status_lower
+        or "local semantic hardening" in status_lower
+    )
+
+
+def _has_production_status(status: str) -> bool:
+    status_lower = status.lower()
+    return "deployed" in status_lower or "cloud verified" in status_lower
+
+
+def pending_status_rows(
+    rows: list[RecentRow],
+    *,
+    as_of_date: str,
+    stale_pending_days: int,
+) -> dict[str, list[dict[str, str]]]:
+    pending = [row for row in rows if _is_pending_status(row.status)]
+    status_drift = [
+        row for row in pending
+        if _has_production_status(row.status)
+    ]
+    try:
+        as_of = date.fromisoformat(as_of_date)
+    except ValueError:
+        as_of = date.today()
+    cutoff = as_of - timedelta(days=max(stale_pending_days, 0))
+    stale = []
+    for row in pending:
+        try:
+            row_date = date.fromisoformat(row.date)
+        except ValueError:
+            continue
+        if row_date < cutoff:
+            stale.append(row)
+    return {
+        "pending_rows": [_row_payload(row) for row in pending],
+        "stale_pending_rows": [_row_payload(row) for row in stale],
+        "status_drift_rows": [_row_payload(row) for row in status_drift],
+    }
+
+
 def count_daily_clusters(root: Path) -> tuple[int, int]:
     daily_files = sorted((root / "docs/bugs/daily").glob("*.md"))
     cluster_count = 0
@@ -130,7 +198,14 @@ def count_daily_clusters(root: Path) -> tuple[int, int]:
     return len(daily_files), cluster_count
 
 
-def validate(root: Path, recent_since: str, max_index_lines: int) -> dict[str, object]:
+def validate(
+    root: Path,
+    recent_since: str,
+    max_index_lines: int,
+    *,
+    as_of_date: str | None = None,
+    stale_pending_days: int = 7,
+) -> dict[str, object]:
     index_path = root / "docs/bugs/BUG_INDEX.md"
     archive_path = root / ARCHIVE_RELATIVE_PATH
     violations: list[str] = []
@@ -148,6 +223,11 @@ def validate(root: Path, recent_since: str, max_index_lines: int) -> dict[str, o
     rows, row_parse_violations = find_recent_rows(index_text)
     violations.extend(row_parse_violations)
     violations.extend(validate_recent_rows(rows, recent_since))
+    pending_report = pending_status_rows(
+        rows,
+        as_of_date=as_of_date or date.today().isoformat(),
+        stale_pending_days=stale_pending_days,
+    )
 
     if not archive_path.exists():
         violations.append(f"missing {ARCHIVE_RELATIVE_PATH}")
@@ -167,12 +247,19 @@ def validate(root: Path, recent_since: str, max_index_lines: int) -> dict[str, o
         "archive": ARCHIVE_RELATIVE_PATH,
         "recent_since": recent_since,
         "max_index_lines": max_index_lines,
+        **pending_report,
     }
 
 
 def main() -> int:
     args = parse_args()
-    payload = validate(Path(args.root), args.recent_since, args.max_index_lines)
+    payload = validate(
+        Path(args.root),
+        args.recent_since,
+        args.max_index_lines,
+        as_of_date=args.as_of_date,
+        stale_pending_days=args.stale_pending_days,
+    )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:

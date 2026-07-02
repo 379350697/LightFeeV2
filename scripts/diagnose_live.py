@@ -201,6 +201,66 @@ def _read_jsonl_tail(
     return records
 
 
+def _read_jsonl_since(path: str | Path, since_ms: int = 0) -> list[dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with open(p) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                ts = int(rec.get("ts_ms", 0) or 0)
+                if since_ms and ts < since_ms:
+                    continue
+                records.append(rec)
+            except json.JSONDecodeError:
+                pass
+    return records
+
+
+def _limit_since_deploy_events(
+    events: list[dict[str, Any]],
+    max_records: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if max_records <= 0 or len(events) <= max_records:
+        return events, {
+            "event_scan_truncated": False,
+            "events_dropped_by_cap": 0,
+            "events_before_cap": len(events),
+        }
+
+    materialized: list[dict[str, Any]] = []
+    latest: list[dict[str, Any]] = []
+    materialized_ids: set[int] = set()
+    for rec in events:
+        kind = str(rec.get("kind") or "")
+        if _event_kind_contributes_exchange_truth_scope(kind):
+            materialized.append(rec)
+            materialized_ids.add(id(rec))
+
+    remaining_slots = max(max_records - len(materialized), 0)
+    if remaining_slots:
+        for rec in events[-max_records:]:
+            if id(rec) not in materialized_ids:
+                latest.append(rec)
+        latest = latest[-remaining_slots:]
+
+    selected = sorted(
+        materialized + latest,
+        key=lambda rec: int(rec.get("ts_ms", 0) or 0),
+    )
+    return selected, {
+        "event_scan_truncated": True,
+        "events_dropped_by_cap": max(len(events) - len(selected), 0),
+        "events_before_cap": len(events),
+        "materialized_events_preserved": len(materialized),
+    }
+
+
 def _find_event_files(runtime_dir: str) -> list[Path]:
     base = Path(runtime_dir)
     if not base.exists():
@@ -351,8 +411,6 @@ def _runtime_started_at(events: list[dict[str, Any]]) -> int:
             if isinstance(payload, dict) and str(payload.get("to", "")) == "running":
                 if earliest == 0 or ts < earliest:
                     earliest = ts
-        if earliest == 0 or (ts > 0 and ts < earliest):
-            earliest = ts
     return earliest
 
 
@@ -1039,6 +1097,34 @@ def _exchange_truth_scope_from_events(
             continue
         _extend_exchange_truth_scope_from_payload(payload, symbols, venues)
     return symbols, venues
+
+
+def _annotate_exchange_truth_required_venues(
+    exchange_truth: dict[str, Any],
+    required_venues: list[str],
+) -> dict[str, Any]:
+    required = [venue for venue in required_venues if venue]
+    available = {
+        str(venue or "").strip().lower()
+        for venue in exchange_truth.get("available_venues", []) or []
+    }
+    missing_required = [
+        venue for venue in required
+        if venue not in available
+    ]
+    annotated = dict(exchange_truth)
+    annotated["required_venues"] = required
+    annotated["missing_required_venues"] = missing_required
+    if missing_required:
+        missing_evidence = list(annotated.get("missing_evidence") or [])
+        for venue in missing_required:
+            key = f"exchange_truth_required_venue_missing_{venue}"
+            if key not in missing_evidence:
+                missing_evidence.append(key)
+        annotated["missing_evidence"] = missing_evidence
+        if str(annotated.get("confidence", "")).lower() == "high":
+            annotated["confidence"] = "medium"
+    return normalize_exchange_truth_payload(annotated)
 
 
 def _optional_float(value: Any) -> float | None:
@@ -8020,6 +8106,12 @@ def _build_production_acceptance_gate(
     )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
+    exchange_truth_required_venues = list(
+        exchange_truth.get("required_venues") or []
+    )
+    exchange_truth_missing_required_venues = list(
+        exchange_truth.get("missing_required_venues") or []
+    )
     pending_live_conflicts = _build_pending_entry_live_conflict_summary(
         local_state,
         exchange_truth,
@@ -8266,6 +8358,8 @@ def _build_production_acceptance_gate(
     if not exchange_truth.get("available"):
         blocking_reasons.append("exchange_truth_unavailable")
     else:
+        if exchange_truth_missing_required_venues:
+            blocking_reasons.append("exchange_truth_required_venues_missing")
         if not exchange_truth_flat and not active_positions_with_capacity:
             blocking_reasons.append("exchange_truth_nonzero_position")
         if not exchange_truth_no_open_orders:
@@ -8438,6 +8532,10 @@ def _build_production_acceptance_gate(
         "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        "exchange_truth_required_venues": exchange_truth_required_venues,
+        "exchange_truth_missing_required_venues": (
+            exchange_truth_missing_required_venues
+        ),
         "pending_entry_live_conflicts": pending_live_conflicts,
         "recovery_decision": recovery_decision,
         "v1_lifecycle_closure": v1_lifecycle_closure,
@@ -9183,27 +9281,56 @@ def run_diagnose(
     else:
         event_files = _find_event_files(runtime_dir)
 
-    all_events: list[dict[str, Any]] = []
+    initial_events: list[dict[str, Any]] = []
     for ef in event_files:
-        all_events.extend(_read_jsonl_tail(ef, max_events))
-        if len(all_events) >= max_events:
+        initial_events.extend(_read_jsonl_tail(ef, max_events))
+        if len(initial_events) >= max_events:
             break
-    recent_events = list(all_events)
 
     window = _compute_window(
-        since_deploy, generated_at_ms, deploy_status, service_status, all_events,
+        since_deploy, generated_at_ms, deploy_status, service_status, initial_events,
     )
 
-    since_ms = window.get("since_ms", 0)
-    if since_ms > 0:
-        all_events = [e for e in all_events if int(e.get("ts_ms", 0) or 0) >= since_ms]
-
-    if symbol or venues:
-        all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
-        recent_events = [
-            e for e in recent_events
-            if _event_matches_scope(e, symbol, venues)
-        ]
+    event_scan_meta: dict[str, Any] = {
+        "event_scan_truncated": False,
+        "events_dropped_by_cap": 0,
+        "events_before_cap": len(initial_events),
+        "since_deploy_time_filtered": False,
+    }
+    since_ms = int(window.get("since_ms", 0) or 0)
+    if since_deploy and since_ms > 0:
+        window_events: list[dict[str, Any]] = []
+        for ef in event_files:
+            window_events.extend(_read_jsonl_since(ef, since_ms))
+        if symbol or venues:
+            window_events = [
+                e for e in window_events
+                if _event_matches_scope(e, symbol, venues)
+            ]
+        all_events, limit_meta = _limit_since_deploy_events(
+            window_events,
+            max_events,
+        )
+        event_scan_meta.update(limit_meta)
+        event_scan_meta["since_deploy_time_filtered"] = True
+        recent_events = list(initial_events)
+        if symbol or venues:
+            recent_events = [
+                e for e in recent_events
+                if _event_matches_scope(e, symbol, venues)
+            ]
+    else:
+        all_events = list(initial_events)
+        recent_events = list(all_events)
+        if symbol or venues:
+            all_events = [
+                e for e in all_events
+                if _event_matches_scope(e, symbol, venues)
+            ]
+            recent_events = [
+                e for e in recent_events
+                if _event_matches_scope(e, symbol, venues)
+            ]
 
     health = _build_health(state, service_status)
     local_state = _build_local_state(state, all_events)
@@ -9228,14 +9355,20 @@ def run_diagnose(
     if symbol and symbol not in pos_symbols:
         pos_symbols.append(symbol)
 
+    exchange_truth_venues = _exchange_truth_venues_for_diagnose(
+        explicit_venues=venues,
+        position_venues=pos_venues,
+        local_state=local_state,
+    )
+    required_truth_venues = list(venues) if venues is not None else list(event_venues)
     exchange_truth = _build_exchange_truth(
         runtime_dir,
         pos_symbols if pos_symbols else [],
-        _exchange_truth_venues_for_diagnose(
-            explicit_venues=venues,
-            position_venues=pos_venues,
-            local_state=local_state,
-        ),
+        exchange_truth_venues,
+    )
+    exchange_truth = _annotate_exchange_truth_required_venues(
+        exchange_truth,
+        required_truth_venues,
     )
     hyperliquid_trading_authorization = (
         _build_hyperliquid_trading_authorization_summary(
@@ -9433,6 +9566,15 @@ def run_diagnose(
             "max_events": max_events,
             "event_files": [str(ef) for ef in event_files],
             "events_parsed": len(all_events),
+            "event_scan_truncated": bool(
+                event_scan_meta.get("event_scan_truncated")
+            ),
+            "events_dropped_by_cap": int(
+                event_scan_meta.get("events_dropped_by_cap", 0) or 0
+            ),
+            "since_deploy_time_filtered": bool(
+                event_scan_meta.get("since_deploy_time_filtered")
+            ),
             "state_path": str(resolved_state_path),
             "state_path_source": state_source,
         },

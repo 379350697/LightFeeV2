@@ -43,6 +43,12 @@ def _compact_scope(scope: dict[str, Any]) -> dict[str, Any]:
         "max_events": _as_int(scope, "max_events"),
         "events_parsed": _as_int(scope, "events_parsed"),
         "event_file_count": len(scope.get("event_files", []) or []),
+        "event_scan_truncated": _as_bool(scope, "event_scan_truncated"),
+        "events_dropped_by_cap": _as_int(scope, "events_dropped_by_cap"),
+        "since_deploy_time_filtered": _as_bool(
+            scope,
+            "since_deploy_time_filtered",
+        ),
         "state_path_source": scope.get("state_path_source", ""),
     }
 
@@ -65,6 +71,15 @@ def _compact_exchange_truth(exchange_truth: dict[str, Any]) -> dict[str, Any]:
         "has_nonzero_position": _as_bool(exchange_truth, "has_nonzero_position"),
         "has_open_order": _as_bool(exchange_truth, "has_open_order"),
         "state_verdict": exchange_truth.get("state_verdict", "unknown"),
+        "required_venues": exchange_truth.get("required_venues", []),
+        "missing_required_venues": exchange_truth.get(
+            "missing_required_venues",
+            [],
+        ),
+        "missing_evidence": _limit_list(
+            exchange_truth.get("missing_evidence", []),
+            10,
+        ),
         "errors": _limit_list(exchange_truth.get("errors", []), 5),
     }
 
@@ -101,6 +116,11 @@ def _compact_state_consistency(state_consistency: dict[str, Any]) -> dict[str, A
 def _compact_gate(gate: dict[str, Any]) -> dict[str, Any]:
     return {
         "gate_passed": _as_bool(gate, "gate_passed"),
+        "blocking_reasons": _limit_list(gate.get("blocking_reasons", []), 10),
+        "exchange_truth_missing_required_venues": gate.get(
+            "exchange_truth_missing_required_venues",
+            [],
+        ),
         "fingerprints": _limit_list(gate.get("fingerprints", []), 10),
         "next_actions": _limit_list(gate.get("next_actions", []), 10),
     }
@@ -162,7 +182,13 @@ def _gate_diagnose_report(result: dict[str, Any]) -> dict[str, Any]:
             ),
             "has_open_order": _as_bool(exchange_truth, "has_open_order"),
             "state_verdict": exchange_truth.get("state_verdict", "unknown"),
+            "required_venues": exchange_truth.get("required_venues", []),
+            "missing_required_venues": exchange_truth.get(
+                "missing_required_venues",
+                [],
+            ),
         },
+        "blocking_reasons": _limit_list(gate.get("blocking_reasons", []), 10),
         "fingerprints": _limit_list(gate.get("fingerprints", []), 10),
     }
 
