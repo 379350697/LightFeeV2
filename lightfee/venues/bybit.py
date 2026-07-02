@@ -105,6 +105,9 @@ class BybitAdapter(VenueAdapter):
         symbol: str,
         order_id: str,
         client_order_id: Optional[str] = None,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         """V1: Bybit fetch_order_fill_reconciliation via /v5/order/realtime.
 
@@ -115,7 +118,11 @@ class BybitAdapter(VenueAdapter):
         from lightfee.core.domain import OrderFillReconciliation
 
         status = await self._transport.fetch_order_status(
-            symbol, order_id=order_id, client_order_id=client_order_id or "",
+            symbol,
+            order_id=order_id,
+            client_order_id=client_order_id or "",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
         )
         if status is not None:
             return status

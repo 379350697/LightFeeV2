@@ -8876,6 +8876,75 @@ class TestBybitAdapterHttpRedLight:
         assert result.side == Side.BUY
         assert result.quantity == pytest.approx(400.0)
 
+    @pytest.mark.anyio
+    async def test_bybit_historical_reconciliation_passes_time_window_to_history_and_executions(self):
+        import httpx
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import LiveCredential
+
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+        history_params: dict[str, str] = {}
+        execution_params: dict[str, str] = {}
+
+        async def mock_handler(request):
+            nonlocal history_params, execution_params
+            if request.url.path == "/v5/order/realtime":
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": []},
+                })
+            if request.url.path == "/v5/order/history":
+                history_params = dict(request.url.params)
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "orderId": "oid-window",
+                        "orderLinkId": "cid-window",
+                    }]},
+                })
+            if request.url.path == "/v5/execution/list":
+                execution_params = dict(request.url.params)
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "execQty": "24",
+                        "execPrice": "0.101",
+                        "execFee": "0.01",
+                        "execTime": str(start_time_ms + 10),
+                        "side": "Sell",
+                        "symbol": "OLDUSDT",
+                    }]},
+                })
+            return httpx.Response(404, json={"error": "not found"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "OLDUSDT",
+            order_id="",
+            client_order_id="cid-window",
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+        await adapter._transport.close()
+
+        assert result is not None
+        assert history_params["startTime"] == str(start_time_ms)
+        assert history_params["endTime"] == str(end_time_ms)
+        assert execution_params["startTime"] == str(start_time_ms)
+        assert execution_params["endTime"] == str(end_time_ms)
+
 
 # ====================================================================# RED-LIGHT: Bitget official UTA field regression
 # ====================================================================

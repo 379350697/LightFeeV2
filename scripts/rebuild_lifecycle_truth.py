@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from lightfee.lifecycle.exchange_truth_ledger import build_exchange_truth_lifecy
 
 DEFAULT_RUNTIME_DIR = Path("runtime")
 CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
+HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 
 
 def read_jsonl_events(paths: list[Path]) -> list[dict[str, Any]]:
@@ -166,6 +168,7 @@ def _iter_order_query_candidates(report: dict[str, Any]) -> tuple[list[dict[str,
                     "client_order_id": client_order_id,
                     "source_kind": str(identity.get("source_kind") or ""),
                     "source": str(identity.get("source") or ""),
+                    "submitted_at_ms": int(identity.get("submitted_at_ms") or 0),
                 }
             )
     return candidates, stats
@@ -285,6 +288,54 @@ def _load_exchange_truth_environment(unit_dir: str = "/etc/systemd/system") -> l
         return []
 
 
+def _candidate_query_window(candidate: dict[str, Any]) -> tuple[int | None, int | None]:
+    submitted_at_ms = int(candidate.get("submitted_at_ms") or 0)
+    if submitted_at_ms <= 0:
+        return None, None
+    half_window_ms = HISTORICAL_ORDER_QUERY_WINDOW_MS // 2
+    return max(0, submitted_at_ms - half_window_ms), submitted_at_ms + half_window_ms
+
+
+def _supports_time_window_kwargs(fetch: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(fetch)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "start_time_ms" in signature.parameters or "end_time_ms" in signature.parameters
+
+
+async def _fetch_order_fill_reconciliation_with_window(
+    fetch: Callable[..., Any],
+    candidate: dict[str, Any],
+) -> tuple[Any, str]:
+    start_time_ms, end_time_ms = _candidate_query_window(candidate)
+    if start_time_ms is not None and end_time_ms is not None:
+        if _supports_time_window_kwargs(fetch):
+            fill = await fetch(
+                candidate["symbol"],
+                candidate["order_id"],
+                candidate["client_order_id"],
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+            return fill, "windowed"
+        fill = await fetch(
+            candidate["symbol"],
+            candidate["order_id"],
+            candidate["client_order_id"],
+        )
+        return fill, "window_unsupported"
+    fill = await fetch(
+        candidate["symbol"],
+        candidate["order_id"],
+        candidate["client_order_id"],
+    )
+    return fill, "unwindowed"
+
+
 async def query_exchange_fill_events(
     report: dict[str, Any],
     *,
@@ -321,6 +372,9 @@ async def query_exchange_fill_events(
         "credential_missing": 0,
         "adapter_unavailable": 0,
         "reconciliation_unavailable": 0,
+        "windowed_query_count": 0,
+        "windowed_query_unsupported_count": 0,
+        "unwindowed_query_count": 0,
         **candidate_stats,
         "errors": [],
     }
@@ -356,11 +410,16 @@ async def query_exchange_fill_events(
                 summary["reconciliation_unavailable"] += 1
                 continue
             try:
-                fill = await fetch(
-                    candidate["symbol"],
-                    candidate["order_id"],
-                    candidate["client_order_id"],
+                fill, window_state = await _fetch_order_fill_reconciliation_with_window(
+                    fetch,
+                    candidate,
                 )
+                if window_state == "windowed":
+                    summary["windowed_query_count"] += 1
+                elif window_state == "window_unsupported":
+                    summary["windowed_query_unsupported_count"] += 1
+                else:
+                    summary["unwindowed_query_count"] += 1
             except Exception as exc:  # pragma: no cover - defensive for live adapters.
                 summary["errors"].append(
                     {

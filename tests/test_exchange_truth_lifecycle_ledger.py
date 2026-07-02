@@ -1139,6 +1139,84 @@ def test_hedge_duplicate_close_identity_infers_opposite_leg_and_venue():
     assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
 
 
+def test_rebuild_lifecycle_truth_queries_historical_identity_with_time_window():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-1783000000000-OLDUSDT"
+    submitted_at_ms = 1_783_000_000_000
+    events = [
+        _event(
+            submitted_at_ms,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "OLDUSDT",
+                "quantity": 12,
+                "matched_quantity": 12,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "maker_venue": "bybit",
+                "maker_leg": "short",
+                "maker_order_id": "bybit-old-open",
+                "maker_client_order_id": "cid-old-open",
+                "maker_quantity": 12,
+                "submitted_at_ms": submitted_at_ms,
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    identity = report["positions"][position_id]["order_identity_history"][0]
+    assert identity["submitted_at_ms"] == submitted_at_ms
+
+    seen_windows: list[tuple[int | None, int | None]] = []
+
+    class FakeAdapter:
+        async def fetch_order_fill_reconciliation(
+            self,
+            symbol: str,
+            order_id: str,
+            client_order_id: str = "",
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> OrderFillReconciliation:
+            assert symbol == "OLDUSDT"
+            assert order_id == "bybit-old-open"
+            assert client_order_id == "cid-old-open"
+            seen_windows.append((start_time_ms, end_time_ms))
+            assert start_time_ms is not None
+            assert end_time_ms is not None
+            assert start_time_ms < submitted_at_ms < end_time_ms
+            return OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol=symbol,
+                side=Side.SELL,
+                quantity=12,
+                average_price=0.25,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                fee_quote=0.01,
+                filled_at_ms=submitted_at_ms + 100,
+                metadata={"tradeSide": "open"},
+            )
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_fill_events(
+            report,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert seen_windows
+    assert summary["windowed_query_count"] == 1
+    assert summary["filled"] == 1
+    assert fill_events[0]["payload"]["phase"] == "open"
+
+
 def test_rebuild_lifecycle_truth_loads_exchange_env_before_query(monkeypatch, tmp_path: Path):
     from scripts import rebuild_lifecycle_truth
 

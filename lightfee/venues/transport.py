@@ -4894,6 +4894,8 @@ class VenueTransport(MarketDataClient):
         *,
         order_id: str = "",
         client_order_id: str = "",
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         """Query order status by exchange order ID or client order ID.
 
@@ -4921,7 +4923,12 @@ class VenueTransport(MarketDataClient):
         try:
             if spec.venue_id == Venue.BYBIT:
                 return await self._fetch_order_status_bybit(
-                    venue_sym, order_id, client_order_id, now_ms,
+                    venue_sym,
+                    order_id,
+                    client_order_id,
+                    now_ms,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
                 )
 
             elif spec.venue_id == Venue.BINANCE:
@@ -5467,6 +5474,9 @@ class VenueTransport(MarketDataClient):
         order_id: str,
         client_order_id: str,
         now_ms: int,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
         """Bybit V1 two-step reconciliation: resolve orderId → execution/list → aggregate.
 
@@ -5475,6 +5485,10 @@ class VenueTransport(MarketDataClient):
         resolved_order_id = order_id
         resolved_client_id = ""
         queried_endpoints: list[str] = []
+        query_window_params = self._bybit_order_query_window_params(
+            start_time_ms,
+            end_time_ms,
+        )
 
         # Step 1: resolve orderId from client_order_id if needed.
         # V1 duplicate orderLinkId reconciliation must search open/realtime
@@ -5498,6 +5512,7 @@ class VenueTransport(MarketDataClient):
                             "category": "linear",
                             "symbol": venue_sym,
                             "orderLinkId": client_order_id,
+                            **query_window_params,
                         },
                         "bybit order history",
                     ),
@@ -5551,6 +5566,7 @@ class VenueTransport(MarketDataClient):
             "category": "linear",
             "symbol": venue_sym,
             "orderId": resolved_order_id,
+            **query_window_params,
         }
         queried_endpoints.append("/v5/execution/list")
         exec_raw = await self._request(
@@ -5588,6 +5604,18 @@ class VenueTransport(MarketDataClient):
             next_action="check_live_position",
         )
         return None
+
+    @staticmethod
+    def _bybit_order_query_window_params(
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> dict[str, int]:
+        params: dict[str, int] = {}
+        if start_time_ms is not None and int(start_time_ms or 0) > 0:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None and int(end_time_ms or 0) > 0:
+            params["endTime"] = int(end_time_ms)
+        return params
 
     def _require_bybit_reconciliation_success(
         self, raw: dict[str, Any], context: str,

@@ -90,6 +90,7 @@ def build_exchange_truth_lifecycle(
     selected_ids = {str(item) for item in position_ids or [] if str(item)}
     positions: dict[str, _PositionFacts] = {}
     for event in sorted(events, key=_event_ts_ms):
+        ts_ms = _event_ts_ms(event)
         kind = str(event.get("kind") or "")
         payload = _payload(event)
         position_id = _position_id(payload)
@@ -99,33 +100,33 @@ def build_exchange_truth_lifecycle(
         facts.event_kinds[kind] += 1
         if kind in {"entry.opened", "runtime.position_opened"}:
             facts.entry = _merge_entry_payload(facts.entry, payload, kind=kind)
-            facts.entry_ts_ms = _event_ts_ms(event) or _first_int(
+            facts.entry_ts_ms = ts_ms or _first_int(
                 payload.get("opened_at_ms"),
                 payload.get("entered_at_ms"),
             )
-            _collect_identity_from_payload(facts, payload, kind=kind)
+            _collect_identity_from_payload(facts, payload, kind=kind, ts_ms=ts_ms)
             if kind == "entry.opened":
-                _collect_entry_opened_fills(facts, payload, _event_ts_ms(event))
+                _collect_entry_opened_fills(facts, payload, ts_ms)
         elif kind == "exit.reconciled":
-            facts.exit_reconciled.append({"ts_ms": _event_ts_ms(event), "payload": payload})
-            _collect_identity_from_payload(facts, payload, kind=kind)
-            _collect_exit_reconciled_fills(facts, payload, _event_ts_ms(event))
+            facts.exit_reconciled.append({"ts_ms": ts_ms, "payload": payload})
+            _collect_identity_from_payload(facts, payload, kind=kind, ts_ms=ts_ms)
+            _collect_exit_reconciled_fills(facts, payload, ts_ms)
         elif kind == "exit.closed":
-            facts.exit_closed.append({"ts_ms": _event_ts_ms(event), "payload": payload})
-            _collect_identity_from_payload(facts, payload, kind=kind)
+            facts.exit_closed.append({"ts_ms": ts_ms, "payload": payload})
+            _collect_identity_from_payload(facts, payload, kind=kind, ts_ms=ts_ms)
         elif kind == "order.filled":
-            fill = _fill_fact_from_order_filled(facts, payload, _event_ts_ms(event))
+            fill = _fill_fact_from_order_filled(facts, payload, ts_ms)
             if fill is not None:
                 facts.fills.append(fill)
-            _collect_identity_from_payload(facts, payload, kind=kind)
+            _collect_identity_from_payload(facts, payload, kind=kind, ts_ms=ts_ms)
         elif kind == "accounting.close_statement_backfill_corrected":
-            _collect_backfill_correction_fills(facts, payload, _event_ts_ms(event))
+            _collect_backfill_correction_fills(facts, payload, ts_ms)
         elif kind == "accounting.lifecycle_truth_rebuilt":
-            _collect_lifecycle_truth_rebuilt_fills(facts, payload, _event_ts_ms(event))
+            _collect_lifecycle_truth_rebuilt_fills(facts, payload, ts_ms)
         elif "funding" in kind:
-            facts.funding_facts.append({"ts_ms": _event_ts_ms(event), "kind": kind, "payload": payload})
+            facts.funding_facts.append({"ts_ms": ts_ms, "kind": kind, "payload": payload})
         else:
-            _collect_identity_from_payload(facts, payload, kind=kind)
+            _collect_identity_from_payload(facts, payload, kind=kind, ts_ms=ts_ms)
 
     for facts in positions.values():
         _enrich_order_identity_history(facts)
@@ -374,7 +375,7 @@ def _collect_exit_reconciled_fills(facts: _PositionFacts, payload: JsonDict, ts_
                 if fill is not None:
                     facts.fills.append(fill)
                     emitted_from_leg_rows.add(leg)
-                    _collect_identity_from_payload(facts, row, kind="exit.reconciled")
+                    _collect_identity_from_payload(facts, row, kind="exit.reconciled", ts_ms=ts_ms)
     for leg in ("long", "short"):
         if leg in emitted_from_leg_rows:
             continue
@@ -398,7 +399,7 @@ def _collect_exit_reconciled_fills(facts: _PositionFacts, payload: JsonDict, ts_
             source="exit.reconciled",
         )
         facts.fills.append(fill)
-        _collect_identity_from_payload(facts, fill.to_dict(), kind="exit.reconciled")
+        _collect_identity_from_payload(facts, fill.to_dict(), kind="exit.reconciled", ts_ms=ts_ms)
 
 
 def _collect_backfill_correction_fills(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> None:
@@ -416,7 +417,12 @@ def _collect_backfill_correction_fills(facts: _PositionFacts, payload: JsonDict,
             )
             if fill is not None:
                 facts.fills.append(fill)
-                _collect_identity_from_payload(facts, row, kind="accounting.close_statement_backfill_corrected")
+                _collect_identity_from_payload(
+                    facts,
+                    row,
+                    kind="accounting.close_statement_backfill_corrected",
+                    ts_ms=ts_ms,
+                )
 
 
 def _collect_lifecycle_truth_rebuilt_fills(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> None:
@@ -450,7 +456,12 @@ def _collect_lifecycle_truth_rebuilt_fills(facts: _PositionFacts, payload: JsonD
             )
             if fill is not None:
                 facts.fills.append(fill)
-                _collect_identity_from_payload(facts, row, kind="accounting.lifecycle_truth_rebuilt")
+                _collect_identity_from_payload(
+                    facts,
+                    row,
+                    kind="accounting.lifecycle_truth_rebuilt",
+                    ts_ms=ts_ms,
+                )
 
 
 def _fill_fact_from_order_filled(facts: _PositionFacts, payload: JsonDict, ts_ms: int) -> _FillFact | None:
@@ -537,7 +548,13 @@ def _fill_fact_from_leg_row(
     )
 
 
-def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind: str) -> None:
+def _collect_identity_from_payload(
+    facts: _PositionFacts,
+    payload: Any,
+    *,
+    kind: str,
+    ts_ms: int = 0,
+) -> None:
     if not isinstance(payload, dict):
         return
     rows: list[JsonDict] = []
@@ -592,6 +609,7 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
                     or payload.get("quantity")
                     or payload.get("matched_quantity")
                 ),
+                "submitted_at_ms": _identity_submitted_at_ms(payload, ts_ms, prefix=prefix),
                 "source_prefix": prefix,
                 "source": payload.get("source") or kind,
             }
@@ -621,10 +639,12 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
                         or payload.get("matched_quantity")
                         or payload.get("quantity")
                     ),
+                    "submitted_at_ms": _identity_submitted_at_ms(payload, ts_ms),
                     "source": payload.get("source") or kind,
                 }
             )
     rows.append(payload)
+    existing_by_key: dict[tuple[str, str, str, str, str], JsonDict] = {}
     seen = {
         (
             str(row.get("phase") or ""),
@@ -635,6 +655,16 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
         )
         for row in facts.order_identities
     }
+    for row in facts.order_identities:
+        existing_by_key[
+            (
+                str(row.get("phase") or ""),
+                str(row.get("leg") or ""),
+                str(row.get("venue") or row.get("exchange") or ""),
+                str(row.get("order_id") or row.get("orderId") or ""),
+                str(row.get("client_order_id") or row.get("clientOrderId") or row.get("clientOid") or ""),
+            )
+        ] = row
     for row in rows:
         order_id = str(row.get("order_id") or row.get("orderId") or "")
         client_order_id = str(
@@ -658,6 +688,7 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
             "quantity_hint": _decimal_str(
                 _decimal(row.get("quantity_hint") or row.get("quantity") or row.get("qty"))
             ),
+            "submitted_at_ms": _identity_submitted_at_ms(row, ts_ms),
             "accepted_only": bool(row.get("accepted_only") or row.get("truth_gap_candidate")),
             "statement_probe_candidate": bool(row.get("statement_probe_candidate")),
         }
@@ -669,8 +700,12 @@ def _collect_identity_from_payload(facts: _PositionFacts, payload: Any, *, kind:
             identity["client_order_id"],
         )
         if key in seen:
+            existing = existing_by_key.get(key)
+            if existing is not None:
+                _merge_identity_submitted_at_ms(existing, identity)
             continue
         seen.add(key)
+        existing_by_key[key] = identity
         facts.order_identities.append(identity)
 
 
@@ -860,7 +895,7 @@ def _opposite_leg(leg: str) -> str:
 
 def _dedupe_order_identities(identities: list[JsonDict]) -> list[JsonDict]:
     out: list[JsonDict] = []
-    seen: set[tuple[str, str, str, str, str]] = set()
+    seen: dict[tuple[str, str, str, str, str], JsonDict] = {}
     for identity in identities:
         key = (
             str(identity.get("phase") or ""),
@@ -870,10 +905,55 @@ def _dedupe_order_identities(identities: list[JsonDict]) -> list[JsonDict]:
             str(identity.get("client_order_id") or ""),
         )
         if key in seen:
+            _merge_identity_submitted_at_ms(seen[key], identity)
             continue
-        seen.add(key)
+        seen[key] = identity
         out.append(identity)
     return out
+
+
+def _identity_submitted_at_ms(row: JsonDict, ts_ms: int = 0, *, prefix: str = "") -> int:
+    values: list[Any] = []
+    if prefix:
+        values.extend(
+            [
+                row.get(f"{prefix}_submitted_at_ms"),
+                row.get(f"{prefix}_accepted_at_ms"),
+                row.get(f"{prefix}_created_at_ms"),
+                row.get(f"{prefix}_filled_at_ms"),
+                row.get(f"{prefix}_fill_time_ms"),
+            ]
+        )
+    values.extend(
+        [
+            row.get("submitted_at_ms"),
+            row.get("accepted_at_ms"),
+            row.get("created_at_ms"),
+            row.get("created_time_ms"),
+            row.get("createdTime"),
+            row.get("cTime"),
+            row.get("submitted_time_ms"),
+            row.get("filled_at_ms"),
+            row.get("fill_time_ms"),
+            row.get("fillTime"),
+            row.get("opened_at_ms"),
+            row.get("entered_at_ms"),
+            row.get("updated_at_ms"),
+            row.get("updatedTime"),
+            row.get("uTime"),
+            ts_ms,
+        ]
+    )
+    return _first_int(*values)
+
+
+def _merge_identity_submitted_at_ms(existing: JsonDict, incoming: JsonDict) -> None:
+    existing_ts = _first_int(existing.get("submitted_at_ms"))
+    incoming_ts = _first_int(incoming.get("submitted_at_ms"))
+    if incoming_ts <= 0:
+        return
+    if existing_ts <= 0 or incoming_ts < existing_ts:
+        existing["submitted_at_ms"] = incoming_ts
 
 
 def _identity_phase_from_kind(kind: str, payload: JsonDict) -> str:

@@ -91,6 +91,9 @@ class VenueAdapter(ABC):
         symbol: str,
         order_id: str,
         client_order_id: Optional[str] = None,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
     ) -> Optional[OrderFillReconciliation]:
         return None
 
