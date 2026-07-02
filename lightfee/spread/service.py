@@ -195,6 +195,15 @@ class SpreadSidecarService:
             default_funding_interval_ms=int(
                 getattr(strategy, "spread_paper_default_funding_interval_ms", 0) or 0
             ),
+            excluded_symbols=list(
+                getattr(strategy, "spread_paper_excluded_symbols", []) or []
+            ),
+            allowed_opportunity_labels=list(
+                getattr(strategy, "spread_paper_allowed_opportunity_labels", []) or []
+            ),
+            episode_cooldown_ms=int(
+                getattr(strategy, "spread_paper_episode_cooldown_ms", 0) or 0
+            ),
         )
 
     async def _fetch_quotes_direct(

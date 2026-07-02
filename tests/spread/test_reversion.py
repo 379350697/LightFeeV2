@@ -46,6 +46,8 @@ def test_spread_reversion_candidates_do_not_require_funding_timestamps() -> None
         signal_ttl_ms=1_000,
         quote_skew_ms=250,
         live_notional_quote=20.0,
+        slippage_reserve_bps=0.0,
+        adverse_selection_buffer_bps=0.0,
     )
 
     now_ms = 10_000
@@ -156,6 +158,8 @@ def test_net_edge_deducts_fees_slippage_and_funding_carry() -> None:
         min_liquidity_capacity_ratio=1.0,
         entry_z=0.0,
         min_net_edge_bps=0.0,
+        min_executable_spread_bps=0.0,
+        max_executable_spread_bps=0.0,
         taker_fee_bps_by_venue={"cheap": 1.0, "rich": 1.5},
         slippage_reserve_bps=2.0,
         adverse_selection_buffer_bps=1.0,
@@ -197,8 +201,92 @@ def test_net_edge_deducts_fees_slippage_and_funding_carry() -> None:
     assert candidates
     candidate = candidates[0]
     assert candidate.executable_spread_bps > candidate.net_edge_bps
-    assert candidate.fee_bps == pytest.approx(2.5)
-    assert candidate.slippage_reserve_bps == pytest.approx(2.0)
+    assert candidate.fee_bps == pytest.approx(5.0)
+    assert candidate.slippage_reserve_bps == pytest.approx(8.0)
+    assert candidate.net_edge_bps == pytest.approx(
+        candidate.executable_spread_bps
+        - candidate.fee_bps
+        - candidate.slippage_reserve_bps
+        - candidate.adverse_selection_buffer_bps
+        - candidate.funding_carry_bps
+    )
+
+
+def test_spread_reversion_respects_executable_spread_window() -> None:
+    tracker = SpreadStatsTracker()
+    cfg = SpreadReversionConfig(
+        min_samples=1,
+        min_history_ms=0,
+        min_fair_price_confidence=0.0,
+        min_liquidity_capacity_ratio=1.0,
+        entry_z=0.0,
+        min_net_edge_bps=-1_000.0,
+        min_executable_spread_bps=50.0,
+        max_executable_spread_bps=300.0,
+        slippage_reserve_bps=0.0,
+        adverse_selection_buffer_bps=0.0,
+    )
+    now_ms = 55_000
+
+    low = build_spread_reversion_candidates(
+        {
+            "cheap:BTCUSDT": _quote("cheap", bid=99.9, ask=100.0, observed_at_ms=now_ms),
+            "rich:BTCUSDT": _quote("rich", bid=100.3, ask=100.4, observed_at_ms=now_ms),
+        },
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=cfg,
+        now_ms=now_ms,
+    )
+    middle = build_spread_reversion_candidates(
+        {
+            "cheap:ETHUSDT": _quote(
+                "cheap",
+                symbol="ETHUSDT",
+                bid=99.9,
+                ask=100.0,
+                observed_at_ms=now_ms,
+            ),
+            "rich:ETHUSDT": _quote(
+                "rich",
+                symbol="ETHUSDT",
+                bid=100.8,
+                ask=100.9,
+                observed_at_ms=now_ms,
+            ),
+        },
+        ["ETHUSDT"],
+        tracker=tracker,
+        config=cfg,
+        now_ms=now_ms,
+    )
+    high = build_spread_reversion_candidates(
+        {
+            "cheap:SOLUSDT": _quote(
+                "cheap",
+                symbol="SOLUSDT",
+                bid=99.9,
+                ask=100.0,
+                observed_at_ms=now_ms,
+            ),
+            "rich:SOLUSDT": _quote(
+                "rich",
+                symbol="SOLUSDT",
+                bid=104.0,
+                ask=104.1,
+                observed_at_ms=now_ms,
+            ),
+        },
+        ["SOLUSDT"],
+        tracker=tracker,
+        config=cfg,
+        now_ms=now_ms,
+    )
+
+    assert low == []
+    assert len(middle) == 1
+    assert middle[0].executable_spread_bps >= 50.0
+    assert high == []
 
 
 def test_spread_reversion_blocks_low_fair_price_confidence() -> None:

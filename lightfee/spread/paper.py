@@ -18,12 +18,26 @@ class SpreadPaperConfig:
     taker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     slippage_buffer_bps: float = 0.0
     default_funding_interval_ms: int = 28_800_000
+    excluded_symbols: list[str] = field(default_factory=lambda: ["BBUSDT", "QNTUSDT"])
+    allowed_opportunity_labels: list[str] = field(
+        default_factory=lambda: ["spread_reversion"]
+    )
+    episode_cooldown_ms: int = 1_800_000
 
 
 @dataclass(frozen=True)
 class SpreadPaperLeg:
     venue: str
     side: str
+    entry_bid: float
+    entry_ask: float
+    entry_bid_size: float
+    entry_ask_size: float
+    entry_observed_at_ms: int
+    mark_price: float
+    index_price: float
+    volume_24h_quote: float
+    open_interest: float
     entry_raw_price: float
     entry_price: float
     qty: float
@@ -47,6 +61,8 @@ class SpreadPaperPosition:
     entry_notional_quote: float
     long_leg: SpreadPaperLeg
     short_leg: SpreadPaperLeg
+    candidate_snapshot: dict
+    entry_market_snapshot: dict
     due_horizons: list[dict]
 
 
@@ -56,6 +72,7 @@ class SpreadPaperTracker:
         self._positions: dict[str, SpreadPaperPosition] = {}
         self._emitted_horizons: dict[str, set[str]] = {}
         self._known_paper_ids: set[str] = set()
+        self._episode_started_at_ms: dict[tuple[str, str, str, str], int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -78,6 +95,16 @@ class SpreadPaperTracker:
             return None
         if str(candidate.signal_status) != "entry_ready":
             return None
+        opportunity_label = str(
+            getattr(candidate, "opportunity_label", "") or "spread_reversion"
+        )
+        if str(candidate.symbol).upper() in _excluded_symbols(self.config):
+            return None
+        allowed_labels = _allowed_labels(self.config)
+        if allowed_labels and opportunity_label not in allowed_labels:
+            return None
+        if self._episode_in_cooldown(candidate, opportunity_label):
+            return None
         paper_id = _paper_id(candidate)
         if paper_id in self._known_paper_ids:
             return None
@@ -97,6 +124,7 @@ class SpreadPaperTracker:
         self._positions[paper_id] = position
         self._emitted_horizons[paper_id] = set()
         self._known_paper_ids.add(paper_id)
+        self._record_episode(position)
         return _registration_event(position)
 
     def restore_from_records(self, records: list[dict]) -> None:
@@ -104,6 +132,7 @@ class SpreadPaperTracker:
         self._positions.clear()
         self._emitted_horizons.clear()
         self._known_paper_ids.clear()
+        self._episode_started_at_ms.clear()
         for record in records:
             kind = str(record.get("kind", "") or "")
             payload = record.get("payload", {})
@@ -119,7 +148,9 @@ class SpreadPaperTracker:
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
                 self._emitted_horizons.setdefault(paper_id, set())
+                self._record_episode(position)
             elif kind in {"opportunity.paper_markout", "opportunity.paper_closed"}:
+                self._record_episode_from_payload(payload)
                 self._known_paper_ids.add(paper_id)
                 horizon_kind = str(payload.get("horizon_kind", "") or "")
                 if horizon_kind:
@@ -159,6 +190,55 @@ class SpreadPaperTracker:
             self._positions.pop(paper_id, None)
             self._emitted_horizons.pop(paper_id, None)
         return events
+
+    def _episode_in_cooldown(
+        self,
+        candidate: SpreadReversionCandidate,
+        opportunity_label: str,
+    ) -> bool:
+        cooldown_ms = max(int(self.config.episode_cooldown_ms or 0), 0)
+        if cooldown_ms <= 0:
+            return False
+        signal_ts_ms = int(candidate.signal_ts_ms or 0)
+        if signal_ts_ms <= 0:
+            return False
+        key = _episode_key(
+            candidate.symbol,
+            candidate.long_venue,
+            candidate.short_venue,
+            opportunity_label,
+        )
+        last_started_at_ms = int(self._episode_started_at_ms.get(key, 0) or 0)
+        return last_started_at_ms > 0 and signal_ts_ms - last_started_at_ms < cooldown_ms
+
+    def _record_episode(self, position: SpreadPaperPosition) -> None:
+        key = _episode_key(
+            position.symbol,
+            position.long_venue,
+            position.short_venue,
+            position.candidate_opportunity_label,
+        )
+        started_at_ms = int(position.registered_at_ms or 0)
+        if started_at_ms <= 0:
+            return
+        self._episode_started_at_ms[key] = max(
+            int(self._episode_started_at_ms.get(key, 0) or 0),
+            started_at_ms,
+        )
+
+    def _record_episode_from_payload(self, payload: dict) -> None:
+        symbol = str(payload.get("symbol", "") or "")
+        long_venue = str(payload.get("long_venue", "") or "")
+        short_venue = str(payload.get("short_venue", "") or "")
+        label = str(payload.get("candidate_opportunity_label", "") or "spread_reversion")
+        started_at_ms = int(payload.get("registered_at_ms", 0) or 0)
+        if not symbol or not long_venue or not short_venue or started_at_ms <= 0:
+            return
+        key = _episode_key(symbol, long_venue, short_venue, label)
+        self._episode_started_at_ms[key] = max(
+            int(self._episode_started_at_ms.get(key, 0) or 0),
+            started_at_ms,
+        )
 
     def _build_position(
         self,
@@ -202,6 +282,8 @@ class SpreadPaperTracker:
             entry_notional_quote=entry_notional,
             long_leg=long_leg,
             short_leg=short_leg,
+            candidate_snapshot=_candidate_snapshot(candidate),
+            entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
             due_horizons=self._due_horizons(int(candidate.signal_ts_ms or 0)),
         )
 
@@ -226,6 +308,15 @@ class SpreadPaperTracker:
         return SpreadPaperLeg(
             venue=str(venue).lower(),
             side=side,
+            entry_bid=float(getattr(quote, "bid", 0.0) or 0.0),
+            entry_ask=float(getattr(quote, "ask", 0.0) or 0.0),
+            entry_bid_size=float(getattr(quote, "bid_size", 0.0) or 0.0),
+            entry_ask_size=float(getattr(quote, "ask_size", 0.0) or 0.0),
+            entry_observed_at_ms=int(getattr(quote, "observed_at_ms", 0) or 0),
+            mark_price=float(getattr(quote, "mark_price", 0.0) or 0.0),
+            index_price=float(getattr(quote, "index_price", 0.0) or 0.0),
+            volume_24h_quote=float(getattr(quote, "volume_24h_quote", 0.0) or 0.0),
+            open_interest=float(getattr(quote, "open_interest", 0.0) or 0.0),
             entry_raw_price=raw_price,
             entry_price=entry_price,
             qty=qty,
@@ -305,6 +396,12 @@ class SpreadPaperTracker:
             "not_selected_reason": "spread_shadow_paper",
             "candidate_opportunity_label": position.candidate_opportunity_label,
             "paper_entry_notional_quote": position.entry_notional_quote,
+            "candidate_snapshot": dict(position.candidate_snapshot),
+            "entry_market_snapshot": dict(position.entry_market_snapshot),
+            "exit_market_snapshot": _market_snapshot_payload(long_quote, short_quote),
+            "funding_advantage_bps": (
+                position.short_leg.funding_rate_bps - position.long_leg.funding_rate_bps
+            ),
             "market_snapshot": {
                 "long_mid": long_mid,
                 "short_mid": short_mid,
@@ -377,7 +474,9 @@ class SpreadPaperTracker:
         long_exit_notional = position.long_leg.qty * long_exit_raw
         short_exit_notional = position.short_leg.qty * short_exit_raw
         long_exit_fee = long_exit_notional * _fee_bps(self.config, position.long_venue) / 10_000.0
-        short_exit_fee = short_exit_notional * _fee_bps(self.config, position.short_venue) / 10_000.0
+        short_exit_fee = (
+            short_exit_notional * _fee_bps(self.config, position.short_venue) / 10_000.0
+        )
         entry_fee_quote = _entry_fee_quote(position)
         exit_fee_quote = long_exit_fee + short_exit_fee
         entry_slippage_quote = _entry_slippage_quote(position)
@@ -426,6 +525,97 @@ class SpreadPaperTracker:
         }
 
 
+def _excluded_symbols(config: SpreadPaperConfig) -> set[str]:
+    return {
+        str(symbol).upper()
+        for symbol in (config.excluded_symbols or [])
+        if str(symbol).strip()
+    }
+
+
+def _allowed_labels(config: SpreadPaperConfig) -> set[str]:
+    return {
+        str(label)
+        for label in (config.allowed_opportunity_labels or [])
+        if str(label).strip()
+    }
+
+
+def _episode_key(
+    symbol: str,
+    long_venue: str,
+    short_venue: str,
+    opportunity_label: str,
+) -> tuple[str, str, str, str]:
+    return (
+        str(symbol).upper(),
+        str(long_venue).lower(),
+        str(short_venue).lower(),
+        str(opportunity_label or "spread_reversion"),
+    )
+
+
+def _candidate_snapshot(candidate: SpreadReversionCandidate) -> dict:
+    return {
+        "executable_spread_bps": float(
+            getattr(candidate, "executable_spread_bps", 0.0) or 0.0
+        ),
+        "spread_mid_bps": float(getattr(candidate, "spread_mid_bps", 0.0) or 0.0),
+        "z_score": float(getattr(candidate, "z_score", 0.0) or 0.0),
+        "net_edge_bps": float(getattr(candidate, "net_edge_bps", 0.0) or 0.0),
+        "fair_price": float(getattr(candidate, "fair_price", 0.0) or 0.0),
+        "venue_premium_bps": float(getattr(candidate, "venue_premium_bps", 0.0) or 0.0),
+        "capacity_quote": float(getattr(candidate, "capacity_quote", 0.0) or 0.0),
+        "liquidity_evidence_status": str(
+            getattr(candidate, "liquidity_evidence_status", "") or ""
+        ),
+        "fee_bps": float(getattr(candidate, "fee_bps", 0.0) or 0.0),
+        "slippage_reserve_bps": float(
+            getattr(candidate, "slippage_reserve_bps", 0.0) or 0.0
+        ),
+        "funding_carry_bps": float(
+            getattr(candidate, "funding_carry_bps", 0.0) or 0.0
+        ),
+        "funding_carry_cost_bps": float(
+            getattr(candidate, "funding_carry_cost_bps", 0.0) or 0.0
+        ),
+    }
+
+
+def _market_snapshot_payload(
+    long_quote: QuoteSnapshot | None,
+    short_quote: QuoteSnapshot | None,
+) -> dict:
+    return {
+        "long_quote": _quote_payload(long_quote),
+        "short_quote": _quote_payload(short_quote),
+    }
+
+
+def _quote_payload(quote: QuoteSnapshot | None) -> dict | None:
+    if quote is None:
+        return None
+    return {
+        "venue": str(getattr(quote, "venue", "") or "").lower(),
+        "symbol": str(getattr(quote, "symbol", "") or "").upper(),
+        "bid": float(getattr(quote, "bid", 0.0) or 0.0),
+        "ask": float(getattr(quote, "ask", 0.0) or 0.0),
+        "bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
+        "ask_size": float(getattr(quote, "ask_size", 0.0) or 0.0),
+        "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
+        "funding_rate_bps": float(getattr(quote, "funding_rate_bps", 0.0) or 0.0),
+        "funding_timestamp_ms": int(getattr(quote, "funding_timestamp_ms", 0) or 0),
+        "mark_price": float(getattr(quote, "mark_price", 0.0) or 0.0),
+        "index_price": float(getattr(quote, "index_price", 0.0) or 0.0),
+        "volume_24h_quote": float(getattr(quote, "volume_24h_quote", 0.0) or 0.0),
+        "open_interest": float(getattr(quote, "open_interest", 0.0) or 0.0),
+    }
+
+
+def _dict_payload(payload: object) -> dict:
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
 def _paper_id(candidate: SpreadReversionCandidate) -> str:
     return f"spread:{candidate.candidate_id}:{int(candidate.signal_ts_ms or 0)}"
 
@@ -448,6 +638,11 @@ def _registration_event(position: SpreadPaperPosition) -> dict:
             "not_selected_reason": "spread_shadow_paper",
             "paper_order_status": "open",
             "paper_entry_notional_quote": position.entry_notional_quote,
+            "candidate_snapshot": dict(position.candidate_snapshot),
+            "entry_market_snapshot": dict(position.entry_market_snapshot),
+            "funding_advantage_bps": (
+                position.short_leg.funding_rate_bps - position.long_leg.funding_rate_bps
+            ),
             "paper_entry_fee_quote": _entry_fee_quote(position),
             "paper_entry_slippage_quote": _entry_slippage_quote(position),
             "paper_fee_quote": _entry_fee_quote(position),
@@ -492,6 +687,8 @@ def _position_from_registration_payload(payload: dict) -> SpreadPaperPosition | 
         entry_notional_quote=float(payload.get("paper_entry_notional_quote", 0.0) or 0.0),
         long_leg=long_leg,
         short_leg=short_leg,
+        candidate_snapshot=_dict_payload(payload.get("candidate_snapshot", {})),
+        entry_market_snapshot=_dict_payload(payload.get("entry_market_snapshot", {})),
         due_horizons=due_horizons,
     )
 
@@ -506,6 +703,15 @@ def _leg_from_payload(payload: object) -> SpreadPaperLeg | None:
     return SpreadPaperLeg(
         venue=venue,
         side=side,
+        entry_bid=float(payload.get("entry_bid", 0.0) or 0.0),
+        entry_ask=float(payload.get("entry_ask", 0.0) or 0.0),
+        entry_bid_size=float(payload.get("entry_bid_size", 0.0) or 0.0),
+        entry_ask_size=float(payload.get("entry_ask_size", 0.0) or 0.0),
+        entry_observed_at_ms=int(payload.get("entry_observed_at_ms", 0) or 0),
+        mark_price=float(payload.get("mark_price", 0.0) or 0.0),
+        index_price=float(payload.get("index_price", 0.0) or 0.0),
+        volume_24h_quote=float(payload.get("volume_24h_quote", 0.0) or 0.0),
+        open_interest=float(payload.get("open_interest", 0.0) or 0.0),
         entry_raw_price=float(payload.get("entry_raw_price", 0.0) or 0.0),
         entry_price=float(payload.get("entry_price", 0.0) or 0.0),
         qty=float(payload.get("qty", 0.0) or 0.0),
@@ -602,6 +808,15 @@ def _leg_payload(
     return {
         "venue": leg.venue,
         "side": leg.side,
+        "entry_bid": leg.entry_bid,
+        "entry_ask": leg.entry_ask,
+        "entry_bid_size": leg.entry_bid_size,
+        "entry_ask_size": leg.entry_ask_size,
+        "entry_observed_at_ms": leg.entry_observed_at_ms,
+        "mark_price": leg.mark_price,
+        "index_price": leg.index_price,
+        "volume_24h_quote": leg.volume_24h_quote,
+        "open_interest": leg.open_interest,
         "entry_raw_price": leg.entry_raw_price,
         "entry_price": leg.entry_price,
         "exit_raw_price": exit_raw_price,

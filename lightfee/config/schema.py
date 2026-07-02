@@ -165,6 +165,8 @@ class StrategyConfig:
     spread_single_venue_dislocation_min_anchor_venues: int = 3
     spread_min_liquidity_capacity_ratio: float = 1.25
     spread_min_history_ms: int = 300000
+    spread_min_executable_spread_bps: float = 50.0
+    spread_max_executable_spread_bps: float = 300.0
     spread_mean_reversion_min_std_bps: float = 0.05
     spread_mean_reversion_max_half_life_ms: int = 1800000
     spread_ranker_max_candidates: int = 10
@@ -178,6 +180,13 @@ class StrategyConfig:
     spread_liquidity_sublarge_penalty_bps: float = 10.0
     spread_paper_enabled: bool = False
     spread_paper_finalist_limit: int = 10
+    spread_paper_excluded_symbols: list[str] = field(
+        default_factory=lambda: ["BBUSDT", "QNTUSDT"]
+    )
+    spread_paper_allowed_opportunity_labels: list[str] = field(
+        default_factory=lambda: ["spread_reversion"]
+    )
+    spread_paper_episode_cooldown_ms: int = 1_800_000
     spread_paper_markout_secs: list[int] = field(
         default_factory=lambda: [60, 300, 900, 1800]
     )

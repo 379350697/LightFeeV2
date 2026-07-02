@@ -42,6 +42,8 @@ class SpreadReversionConfig:
     single_venue_dislocation_min_anchor_venues: int = 3
     min_liquidity_capacity_ratio: float = 1.25
     min_history_ms: int = 300_000
+    min_executable_spread_bps: float = 0.0
+    max_executable_spread_bps: float = 0.0
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
     ranker_max_candidates: int = 10
@@ -137,6 +139,22 @@ class SpreadReversionConfig:
             ),
             min_history_ms=int(
                 getattr(strategy, "spread_min_history_ms", cls.min_history_ms) or 0
+            ),
+            min_executable_spread_bps=float(
+                getattr(
+                    strategy,
+                    "spread_min_executable_spread_bps",
+                    cls.min_executable_spread_bps,
+                )
+                or 0.0
+            ),
+            max_executable_spread_bps=float(
+                getattr(
+                    strategy,
+                    "spread_max_executable_spread_bps",
+                    cls.max_executable_spread_bps,
+                )
+                or 0.0
             ),
             mean_reversion_min_std_bps=float(
                 getattr(
@@ -445,7 +463,15 @@ def _candidate_for_pair(
     executable_spread_bps = 0.0
     if short_q.bid > 0.0 and long_q.ask > 0.0:
         executable_spread_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10_000.0
-    fee_bps = _fee_bps(config, long_q.venue) + _fee_bps(config, short_q.venue)
+    if not is_single_venue_dislocation:
+        min_executable = max(float(config.min_executable_spread_bps or 0.0), 0.0)
+        max_executable = max(float(config.max_executable_spread_bps or 0.0), 0.0)
+        if min_executable > 0.0 and executable_spread_bps < min_executable:
+            return None
+        if max_executable > 0.0 and executable_spread_bps >= max_executable:
+            return None
+    fee_bps = (_fee_bps(config, long_q.venue) + _fee_bps(config, short_q.venue)) * 2.0
+    slippage_reserve_bps = max(float(config.slippage_reserve_bps or 0.0), 0.0) * 4.0
     funding = funding_model.assess(
         long_funding_rate_bps=float(getattr(long_q, "funding_rate_bps", 0.0) or 0.0),
         short_funding_rate_bps=float(getattr(short_q, "funding_rate_bps", 0.0) or 0.0),
@@ -453,7 +479,7 @@ def _candidate_for_pair(
     cost = cost_model.assess(
         executable_spread_bps=executable_spread_bps,
         fee_bps=fee_bps,
-        slippage_reserve_bps=config.slippage_reserve_bps,
+        slippage_reserve_bps=slippage_reserve_bps,
         adverse_selection_buffer_bps=config.adverse_selection_buffer_bps,
         funding_carry_bps=funding.carry_cost_bps,
     )
@@ -528,7 +554,7 @@ def _candidate_for_pair(
         capacity_quote=capacity_quote,
         signal_status="entry_ready",
         fee_bps=fee_bps,
-        slippage_reserve_bps=config.slippage_reserve_bps,
+        slippage_reserve_bps=slippage_reserve_bps,
         adverse_selection_buffer_bps=config.adverse_selection_buffer_bps,
         funding_carry_cost_bps=funding.carry_cost_bps,
         quote_skew_ms=quote_skew,
