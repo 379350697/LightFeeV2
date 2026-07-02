@@ -49,6 +49,7 @@ ASTER_V3_DOC_URL = (
 )
 
 ASTER_V3_ORDER_PATH = "/fapi/v3/order"
+ASTER_V3_USER_TRADES_PATH = "/fapi/v3/userTrades"
 ASTER_V3_OPEN_ORDERS_PATH = "/fapi/v3/openOrders"
 ASTER_V3_POSITION_PATH = "/fapi/v3/positionRisk"
 ASTER_V3_ACCOUNT_PATH = "/fapi/v3/accountWithJoinMargin"
@@ -759,6 +760,72 @@ class AsterV3Client:
             filled_at_ms=progress.last_fill_time_ms or progress.observed_at_ms,
             metadata=metadata,
         )
+
+    async def fetch_account_fill_reconciliations(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[OrderFillReconciliation]:
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "limit": 1000,
+        }
+        if start_time_ms is not None and int(start_time_ms or 0) > 0:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None and int(end_time_ms or 0) > 0:
+            params["endTime"] = int(end_time_ms)
+        raw = await self._request("GET", ASTER_V3_USER_TRADES_PATH, params=params)
+        _require_aster_v3_success(raw, "aster v3 user trades history failed")
+        fills: list[OrderFillReconciliation] = []
+        for row in _extract_rows(raw):
+            qty = _safe_float(row.get("qty", row.get("quantity", "0")), default=0.0)
+            price = _safe_float(row.get("price", "0"), default=0.0)
+            if qty <= 0.0 or price <= 0.0:
+                continue
+            side_raw = str(row.get("side", "")).upper()
+            if side_raw == "BUY":
+                side = Side.BUY
+            elif side_raw == "SELL":
+                side = Side.SELL
+            else:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"aster v3 userTrades row has invalid/missing side {side_raw!r}",
+                )
+            commission_asset = str(row.get("commissionAsset") or "").upper()
+            fee_quote = None
+            if commission_asset in {"USDT", "USDC", "BUSD", ""}:
+                fee_quote = abs(
+                    _safe_float(row.get("commission", "0"), default=0.0)
+                ) or None
+            trade_id = str(row.get("id", row.get("tradeId", "")) or "")
+            fills.append(
+                OrderFillReconciliation(
+                    venue=Venue.ASTER,
+                    symbol=str(row.get("symbol") or symbol),
+                    side=side,
+                    quantity=qty,
+                    average_price=price,
+                    order_id=str(row.get("orderId", "")),
+                    client_order_id=str(row.get("clientOrderId", "")) or None,
+                    fee_quote=fee_quote,
+                    filled_at_ms=int(row.get("time", row.get("updateTime", 0)) or 0),
+                    metadata={
+                        "evidence_source": "aster_v3_user_trades_history",
+                        "queried_endpoints": [ASTER_V3_USER_TRADES_PATH],
+                        "trade_id": trade_id,
+                        "positionSide": str(row.get("positionSide", "")),
+                        "buyer": row.get("buyer"),
+                        "maker": row.get("maker"),
+                        "realizedPnl": str(row.get("realizedPnl", "")),
+                        "raw_side": side_raw,
+                        "response_classification": "filled",
+                    },
+                )
+            )
+        return fills
 
     async def close(self) -> None:
         if self._owns_client:

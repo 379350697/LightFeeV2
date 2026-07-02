@@ -5007,6 +5007,433 @@ class VenueTransport(MarketDataClient):
 
         return None
 
+    async def fetch_account_fill_reconciliations(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list["OrderFillReconciliation"]:
+        """Query account trade history as individual fill truth rows.
+
+        This is intentionally order-id agnostic: lifecycle backfill uses it
+        when legacy project records lost the close/open order identity but the
+        exchange account statement still has the fills.
+        """
+        if self.mode != "live":
+            return []
+
+        venue_sym = self._venue_symbol(symbol)
+        spec = self._spec
+        now_ms = int(time.time() * 1000)
+        if spec.venue_id == Venue.BINANCE:
+            return await self._fetch_binance_account_fill_history(
+                venue_sym,
+                now_ms,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        if spec.venue_id == Venue.BYBIT:
+            return await self._fetch_bybit_account_fill_history(
+                venue_sym,
+                now_ms,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        if spec.venue_id == Venue.OKX:
+            return await self._fetch_okx_account_fill_history(
+                venue_sym,
+                now_ms,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        if spec.venue_id == Venue.BITGET:
+            return await self._fetch_bitget_account_fill_history(
+                venue_sym,
+                now_ms,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        return []
+
+    async def _fetch_binance_account_fill_history(
+        self,
+        venue_sym: str,
+        now_ms: int,
+        *,
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> list["OrderFillReconciliation"]:
+        params: dict[str, Any] = {
+            "symbol": venue_sym,
+            "limit": 1000,
+            **self._binance_order_query_window_params(start_time_ms, end_time_ms),
+        }
+        raw = await self._request(
+            "GET", "/fapi/v1/userTrades", params=params, private=True,
+        )
+        rows = raw if isinstance(raw, list) else []
+        fills: list[OrderFillReconciliation] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fill = self._parse_binance_account_history_trade(
+                row,
+                venue_sym=venue_sym,
+                now_ms=now_ms,
+            )
+            if fill is not None:
+                fills.append(fill)
+        return fills
+
+    def _parse_binance_account_history_trade(
+        self,
+        row: dict[str, Any],
+        *,
+        venue_sym: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        qty = _safe_float(row.get("qty", row.get("quantity", "0")))
+        price = _safe_float(row.get("price", "0"))
+        if qty <= 0.0 or price <= 0.0:
+            return None
+        side = self._binance_side_from_trade(row)
+        if side is None:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "binance account userTrades row has invalid/missing side",
+            )
+        commission_asset = str(row.get("commissionAsset") or "").upper()
+        fee_quote = None
+        if commission_asset in {"USDT", "USDC", "BUSD", ""}:
+            fee_quote = abs(_safe_float(row.get("commission", "0"))) or None
+        trade_id = str(row.get("id", row.get("tradeId", "")) or "")
+        return OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol=str(row.get("symbol") or venue_sym),
+            side=side,
+            quantity=qty,
+            average_price=price,
+            order_id=str(row.get("orderId", "")),
+            client_order_id=str(row.get("clientOrderId", "")) or None,
+            fee_quote=fee_quote,
+            filled_at_ms=int(row.get("time", now_ms) or now_ms),
+            metadata={
+                "evidence_source": "binance_user_trades_history",
+                "queried_endpoints": ["/fapi/v1/userTrades"],
+                "trade_id": trade_id,
+                "positionSide": str(row.get("positionSide", "")),
+                "buyer": row.get("buyer"),
+                "maker": row.get("maker"),
+                "realizedPnl": str(row.get("realizedPnl", "")),
+                "raw_side": str(row.get("side", "")),
+                "response_classification": "filled",
+            },
+        )
+
+    async def _fetch_bybit_account_fill_history(
+        self,
+        venue_sym: str,
+        now_ms: int,
+        *,
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> list["OrderFillReconciliation"]:
+        fills: list[OrderFillReconciliation] = []
+        cursor = ""
+        for _ in range(5):
+            params: dict[str, Any] = {
+                "category": "linear",
+                "symbol": venue_sym,
+                "limit": 100,
+                **self._bybit_order_query_window_params(start_time_ms, end_time_ms),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._request(
+                "GET", "/v5/execution/list", params=params, private=True,
+            )
+            self._require_bybit_reconciliation_success(
+                raw, "bybit execution account history",
+            )
+            result = raw.get("result", {}) if isinstance(raw, dict) else {}
+            rows = result.get("list", []) if isinstance(result, dict) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                fill = self._parse_bybit_account_history_execution(
+                    row,
+                    venue_sym=venue_sym,
+                    now_ms=now_ms,
+                )
+                if fill is not None:
+                    fills.append(fill)
+            next_cursor = str(result.get("nextPageCursor", "") or "") if isinstance(result, dict) else ""
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return fills
+
+    def _parse_bybit_account_history_execution(
+        self,
+        row: dict[str, Any],
+        *,
+        venue_sym: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        qty = _safe_float(row.get("execQty", "0"))
+        price = _safe_float(row.get("execPrice", "0"))
+        if qty <= 0.0 or price <= 0.0:
+            return None
+        side_raw = str(row.get("side", "")).strip()
+        if side_raw == "Buy":
+            side = Side.BUY
+        elif side_raw == "Sell":
+            side = Side.SELL
+        else:
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"bybit execution history has invalid side value {side_raw!r}",
+            )
+        return OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol=str(row.get("symbol") or venue_sym),
+            side=side,
+            quantity=qty,
+            average_price=price,
+            order_id=str(row.get("orderId", "")),
+            client_order_id=str(row.get("orderLinkId", "")) or None,
+            fee_quote=abs(_safe_float(row.get("execFee", "0"))) or None,
+            filled_at_ms=int(row.get("execTime", now_ms) or now_ms),
+            metadata={
+                "evidence_source": "bybit_execution_history",
+                "queried_endpoints": ["/v5/execution/list"],
+                "exec_id": str(row.get("execId", "")),
+                "exec_type": str(row.get("execType", "")),
+                "positionSide": str(row.get("positionSide", "")),
+                "positionIdx": str(row.get("positionIdx", "")),
+                "raw_side": side_raw,
+                "response_classification": "filled",
+            },
+        )
+
+    async def _fetch_okx_account_fill_history(
+        self,
+        venue_sym: str,
+        now_ms: int,
+        *,
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> list["OrderFillReconciliation"]:
+        params: dict[str, Any] = {
+            "instType": "SWAP",
+            "instId": venue_sym,
+            "limit": 100,
+            **self._okx_order_query_window_params(start_time_ms, end_time_ms),
+        }
+        raw = await self._request(
+            "GET",
+            "/api/v5/trade/fills-history",
+            params=params,
+            private=True,
+        )
+        contract_size = await self._okx_contract_size_for_venue_symbol(venue_sym)
+        return self._parse_okx_account_history_fills(
+            raw,
+            venue_sym=venue_sym,
+            now_ms=now_ms,
+            contract_size=contract_size,
+        )
+
+    def _parse_okx_account_history_fills(
+        self,
+        raw: dict[str, Any],
+        *,
+        venue_sym: str,
+        now_ms: int,
+        contract_size: float,
+    ) -> list["OrderFillReconciliation"]:
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            return []
+        rows = raw.get("data", [])
+        if not isinstance(rows, list):
+            rows = [rows]
+        fills: list[OrderFillReconciliation] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            contract_qty = _safe_float(row.get("fillSz", row.get("sz", "0")))
+            price = _safe_float(row.get("fillPx", row.get("px", "0")))
+            if contract_qty <= 0.0 or price <= 0.0:
+                continue
+            side_raw = str(row.get("side", "")).lower()
+            if side_raw == "buy":
+                side = Side.BUY
+            elif side_raw == "sell":
+                side = Side.SELL
+            else:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"okx fills-history row has invalid/missing side value {side_raw!r}",
+                )
+            fills.append(
+                OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol=venue_sym,
+                    side=side,
+                    quantity=self._okx_contracts_to_base_quantity(
+                        contract_qty,
+                        contract_size,
+                    ),
+                    average_price=price,
+                    order_id=str(row.get("ordId", "")),
+                    client_order_id=str(row.get("clOrdId", "")) or None,
+                    fee_quote=abs(_safe_float(row.get("fee", "0"))) or None,
+                    filled_at_ms=int(row.get("ts", row.get("fillTime", now_ms)) or now_ms),
+                    metadata={
+                        "evidence_source": "okx_trade_fills_history",
+                        "queried_endpoints": ["/api/v5/trade/fills-history"],
+                        "trade_id": str(row.get("tradeId", "")),
+                        "bill_id": str(row.get("billId", "")),
+                        "positionSide": str(row.get("posSide", "")),
+                        "raw_side": side_raw,
+                        "quantity_units": "contracts_to_base",
+                        "contract_qty": contract_qty,
+                        "ct_val": float(contract_size or 0.0),
+                        "response_classification": "filled",
+                    },
+                )
+            )
+        return fills
+
+    async def _fetch_bitget_account_fill_history(
+        self,
+        venue_sym: str,
+        now_ms: int,
+        *,
+        start_time_ms: int | None,
+        end_time_ms: int | None,
+    ) -> list["OrderFillReconciliation"]:
+        family = await _resolve_bitget_contract_family_for_truth(self)
+        if family != BitgetContractFamily.CLASSIC_MIX_V2:
+            return []
+        params: dict[str, Any] = {
+            "productType": "USDT-FUTURES",
+            "symbol": venue_sym,
+            "limit": 100,
+        }
+        if start_time_ms is not None and int(start_time_ms or 0) > 0:
+            params["startTime"] = int(start_time_ms)
+        if end_time_ms is not None and int(end_time_ms or 0) > 0:
+            params["endTime"] = int(end_time_ms)
+        raw = await self._request(
+            "GET",
+            "/api/v2/mix/order/fills",
+            params=params,
+            private=True,
+        )
+        return self._parse_bitget_account_history_fills(
+            raw,
+            venue_sym=venue_sym,
+            now_ms=now_ms,
+            resolved_account_family=family,
+        )
+
+    def _parse_bitget_account_history_fills(
+        self,
+        raw: dict[str, Any],
+        *,
+        venue_sym: str,
+        now_ms: int,
+        resolved_account_family: object,
+    ) -> list["OrderFillReconciliation"]:
+        _require_bitget_success(raw, "bitget account fills history failed")
+        data = raw.get("data", raw) if isinstance(raw, dict) else {}
+        rows: list[Any] = []
+        if isinstance(data, dict):
+            fill_list = data.get("fillList")
+            rows = fill_list if isinstance(fill_list, list) else [data]
+        elif isinstance(data, list):
+            rows = data
+        fills: list[OrderFillReconciliation] = []
+        family = (
+            getattr(resolved_account_family, "value", None)
+            or resolved_account_family
+            or ""
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            qty = _safe_float(
+                row.get(
+                    "baseVolume",
+                    row.get("baseSize", row.get("size", row.get("fillQty", "0"))),
+                )
+            )
+            price = _safe_float(row.get("price", row.get("fillPrice", "0")))
+            if qty <= 0.0 or price <= 0.0:
+                continue
+            side_str = str(row.get("side", "")).lower()
+            if side_str == "buy":
+                side = Side.BUY
+            elif side_str == "sell":
+                side = Side.SELL
+            else:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"bitget fills-history row has invalid/missing side value {side_str!r}",
+                )
+            fills.append(
+                OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=str(row.get("symbol") or venue_sym),
+                    side=side,
+                    quantity=qty,
+                    average_price=price,
+                    order_id=str(row.get("orderId", row.get("ordId", ""))),
+                    client_order_id=str(row.get("clientOid", "")) or None,
+                    fee_quote=self._bitget_fee_quote_from_row(row),
+                    filled_at_ms=int(row.get("cTime", row.get("uTime", now_ms)) or now_ms),
+                    metadata={
+                        "evidence_source": "bitget_order_fills_history",
+                        "queried_endpoints": ["/api/v2/mix/order/fills"],
+                        "resolved_account_family": str(family),
+                        "trade_id": str(row.get("tradeId", "")),
+                        "tradeSide": str(row.get("tradeSide", "")),
+                        "trade_side": str(row.get("tradeSide", "")),
+                        "profit": str(row.get("profit", "")),
+                        "raw_side": side_str,
+                        "response_classification": "filled",
+                    },
+                )
+            )
+        return fills
+
+    @staticmethod
+    def _bitget_fee_quote_from_row(row: dict[str, Any]) -> float | None:
+        for key in ("fee", "totalFee", "filledFee"):
+            if row.get(key) is not None:
+                value = abs(_safe_float(row.get(key)))
+                if value > 0.0:
+                    return value
+        detail = row.get("feeDetail")
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except json.JSONDecodeError:
+                detail = None
+        total = 0.0
+        if isinstance(detail, list):
+            for item in detail:
+                if isinstance(item, dict):
+                    total += abs(_safe_float(item.get("fee", item.get("totalFee", "0"))))
+        elif isinstance(detail, dict):
+            for key in ("totalFee", "fee"):
+                if detail.get(key) is not None:
+                    total += abs(_safe_float(detail.get(key)))
+                    break
+        return total if total > 0.0 else None
+
     async def _fetch_order_status_binance(
         self,
         venue_sym: str,

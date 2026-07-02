@@ -7,6 +7,7 @@ from typing import Any, Optional
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
     Venue,
@@ -127,6 +128,19 @@ class BybitAdapter(VenueAdapter):
         if status is not None:
             return status
         return None
+
+    async def fetch_account_fill_reconciliations(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[OrderFillReconciliation]:
+        return await self._transport.fetch_account_fill_reconciliations(
+            symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
 
     async def shutdown(self) -> None:
         await self._transport.close()

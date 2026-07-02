@@ -698,6 +698,68 @@ class TestBinanceAsterPostSigning:
         assert result.metadata["response_classification"] == "filled"
 
     @pytest.mark.asyncio
+    async def test_aster_v3_account_history_user_trades_returns_fill_truth(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        start_time_ms = 1_783_000_000_000
+        end_time_ms = 1_783_360_000_000
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/userTrades"
+            params = dict(request.url.params)
+            assert params["symbol"] == "LABUSDT"
+            assert int(params["startTime"]) == start_time_ms
+            assert int(params["endTime"]) == end_time_ms
+            assert int(params["limit"]) == 1000
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 8842,
+                        "orderId": 998877,
+                        "symbol": "LABUSDT",
+                        "side": "SELL",
+                        "positionSide": "SHORT",
+                        "qty": "17",
+                        "price": "0.051",
+                        "commission": "-0.0065",
+                        "commissionAsset": "USDT",
+                        "realizedPnl": "0.42",
+                        "time": str(start_time_ms + 1234),
+                        "buyer": False,
+                        "maker": True,
+                    }
+                ],
+            )
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+        try:
+            rows = await client.fetch_account_fill_reconciliations(
+                "LABUSDT",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await client.close()
+
+        assert len(rows) == 1
+        result = rows[0]
+        assert result.venue == Venue.ASTER
+        assert result.side == Side.SELL
+        assert result.quantity == pytest.approx(17.0)
+        assert result.average_price == pytest.approx(0.051)
+        assert result.order_id == "998877"
+        assert result.fee_quote == pytest.approx(0.0065)
+        assert result.filled_at_ms == start_time_ms + 1234
+        assert result.metadata["evidence_source"] == "aster_v3_user_trades_history"
+        assert result.metadata["trade_id"] == "8842"
+        assert result.metadata["positionSide"] == "SHORT"
+        assert result.metadata["realizedPnl"] == "0.42"
+
+    @pytest.mark.asyncio
     async def test_aster_v3_unfiltered_open_orders_consumes_official_weight_40(self):
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
@@ -8292,8 +8354,280 @@ class TestBitgetParseOrderStatusRedLight:
         assert seen_params[-1]["clientOid"] == "lfex364"
         assert "orderId" not in seen_params[-1]
 
+    @pytest.mark.asyncio
+    async def test_bitget_account_history_fills_use_trade_side_and_fee_detail(self):
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        start_time_ms = 1_782_870_000_000
+        end_time_ms = 1_782_880_000_000
+        seen_params: list[dict[str, str]] = []
+
+        async def handler(request):
+            assert request.url.path == "/api/v2/mix/order/fills"
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "code": "00000",
+                    "msg": "success",
+                    "data": {
+                        "fillList": [
+                            {
+                                "tradeId": "1456505976935575553",
+                                "orderId": "1456505976935575553",
+                                "clientOid": "lf-close-short-1",
+                                "symbol": "TAIKOUSDT",
+                                "side": "buy",
+                                "tradeSide": "close",
+                                "baseVolume": "24",
+                                "price": "0.0812",
+                                "feeDetail": [
+                                    {"feeCoin": "USDT", "fee": "-0.004"},
+                                    {"feeCoin": "USDT", "fee": "-0.003"},
+                                ],
+                                "profit": "0.18",
+                                "cTime": str(start_time_ms + 3456),
+                            }
+                        ]
+                    },
+                },
+            )
+
+        transport = VenueTransport(
+            bitget_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport._time_offset_ms = 0
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+
+        try:
+            rows = await transport.fetch_account_fill_reconciliations(
+                "TAIKOUSDT",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await transport.close()
+
+        assert seen_params
+        assert seen_params[-1]["symbol"] == "TAIKOUSDT"
+        assert seen_params[-1]["productType"] == "USDT-FUTURES"
+        assert int(seen_params[-1]["startTime"]) == start_time_ms
+        assert int(seen_params[-1]["endTime"]) == end_time_ms
+        assert rows[0].venue == Venue.BITGET
+        assert rows[0].side == Side.BUY
+        assert rows[0].quantity == pytest.approx(24.0)
+        assert rows[0].average_price == pytest.approx(0.0812)
+        assert rows[0].fee_quote == pytest.approx(0.007)
+        assert rows[0].metadata["tradeSide"] == "close"
+        assert rows[0].metadata["trade_id"] == "1456505976935575553"
+        assert rows[0].metadata["evidence_source"] == "bitget_order_fills_history"
+
+
 class TestVenueSpecificOrderReconciliationEvidence:
     """CL-001-G: venue query paths must expose endpoint-level evidence."""
+
+    @pytest.mark.asyncio
+    async def test_binance_account_history_user_trades_returns_individual_fill_truth(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        start_time_ms = 1_779_380_000_000
+        end_time_ms = 1_779_390_000_000
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            assert request.url.path == "/fapi/v1/userTrades"
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 31001,
+                        "orderId": 778899,
+                        "symbol": "IRYSUSDT",
+                        "side": "BUY",
+                        "qty": "7",
+                        "price": "0.033",
+                        "commission": "-0.002",
+                        "commissionAsset": "USDT",
+                        "realizedPnl": "0.09",
+                        "positionSide": "LONG",
+                        "buyer": True,
+                        "maker": False,
+                        "time": start_time_ms + 100,
+                    }
+                ],
+            )
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        try:
+            rows = await adapter.fetch_account_fill_reconciliations(
+                "IRYSUSDT",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert seen_params
+        assert seen_params[-1]["symbol"] == "IRYSUSDT"
+        assert int(seen_params[-1]["startTime"]) == start_time_ms
+        assert int(seen_params[-1]["endTime"]) == end_time_ms
+        assert rows[0].venue == Venue.BINANCE
+        assert rows[0].side == Side.BUY
+        assert rows[0].quantity == pytest.approx(7.0)
+        assert rows[0].fee_quote == pytest.approx(0.002)
+        assert rows[0].metadata["evidence_source"] == "binance_user_trades_history"
+        assert rows[0].metadata["trade_id"] == "31001"
+        assert rows[0].metadata["positionSide"] == "LONG"
+
+    @pytest.mark.asyncio
+    async def test_bybit_account_history_execution_list_returns_individual_fill_truth(self):
+        from lightfee.venues.bybit import BybitAdapter
+
+        start_time_ms = 1_779_780_000_000
+        end_time_ms = 1_779_790_000_000
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            assert request.url.path == "/v5/execution/list"
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {
+                        "list": [
+                            {
+                                "execId": "bybit-exec-1",
+                                "orderId": "bybit-order-1",
+                                "orderLinkId": "lf-bybit-cid",
+                                "symbol": "BEATUSDT",
+                                "side": "Buy",
+                                "execQty": "9",
+                                "execPrice": "0.014",
+                                "execFee": "-0.001",
+                                "execTime": str(start_time_ms + 200),
+                                "execType": "Trade",
+                            }
+                        ],
+                        "nextPageCursor": "",
+                    },
+                },
+            )
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        try:
+            rows = await adapter.fetch_account_fill_reconciliations(
+                "BEATUSDT",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert seen_params
+        assert seen_params[-1]["category"] == "linear"
+        assert seen_params[-1]["symbol"] == "BEATUSDT"
+        assert int(seen_params[-1]["startTime"]) == start_time_ms
+        assert int(seen_params[-1]["endTime"]) == end_time_ms
+        assert rows[0].venue == Venue.BYBIT
+        assert rows[0].side == Side.BUY
+        assert rows[0].quantity == pytest.approx(9.0)
+        assert rows[0].order_id == "bybit-order-1"
+        assert rows[0].client_order_id == "lf-bybit-cid"
+        assert rows[0].metadata["evidence_source"] == "bybit_execution_history"
+        assert rows[0].metadata["exec_id"] == "bybit-exec-1"
+
+    @pytest.mark.asyncio
+    async def test_okx_account_history_fills_history_converts_contracts_to_base(self):
+        from lightfee.venues.okx import OkxAdapter
+
+        start_time_ms = 1_779_540_000_000
+        end_time_ms = 1_779_550_000_000
+        seen_params: list[dict[str, str]] = []
+
+        async def mock_handler(request):
+            assert request.url.path == "/api/v5/trade/fills-history"
+            seen_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "code": "0",
+                    "msg": "",
+                    "data": [
+                        {
+                            "tradeId": "okx-trade-1",
+                            "ordId": "okx-order-1",
+                            "clOrdId": "okx-cid-1",
+                            "instId": "GMT-USDT-SWAP",
+                            "side": "sell",
+                            "fillSz": "30",
+                            "fillPx": "0.021",
+                            "fee": "-0.004",
+                            "ts": str(start_time_ms + 300),
+                            "posSide": "short",
+                        }
+                    ],
+                },
+            )
+
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+        adapter._transport._okx_swap_instruments_loaded = True
+        adapter._transport.set_symbol_metadata(
+            {"GMT-USDT-SWAP": {"ctVal": "0.1", "ctType": "linear"}}
+        )
+
+        try:
+            rows = await adapter.fetch_account_fill_reconciliations(
+                "GMTUSDT",
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert seen_params
+        assert seen_params[-1]["instType"] == "SWAP"
+        assert seen_params[-1]["instId"] == "GMT-USDT-SWAP"
+        assert int(seen_params[-1]["begin"]) == start_time_ms
+        assert int(seen_params[-1]["end"]) == end_time_ms
+        assert rows[0].venue == Venue.OKX
+        assert rows[0].side == Side.SELL
+        assert rows[0].quantity == pytest.approx(3.0)
+        assert rows[0].fee_quote == pytest.approx(0.004)
+        assert rows[0].metadata["evidence_source"] == "okx_trade_fills_history"
+        assert rows[0].metadata["trade_id"] == "okx-trade-1"
+        assert rows[0].metadata["positionSide"] == "short"
 
     @pytest.mark.anyio
     async def test_binance_timeout_accepted_later_queries_order_endpoint(self):

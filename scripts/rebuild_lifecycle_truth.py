@@ -23,6 +23,8 @@ from lightfee.lifecycle.exchange_truth_ledger import build_exchange_truth_lifecy
 DEFAULT_RUNTIME_DIR = Path("runtime")
 CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
 HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
+ACCOUNT_HISTORY_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
+QTY_TOLERANCE = 0.999
 
 
 def _event_position_id(event: dict[str, Any]) -> str:
@@ -89,6 +91,78 @@ def read_position_ids(path: Path | None) -> list[str] | None:
                     out.append(str(value))
             return out
     raise SystemExit(f"unsupported positions file shape: {path}")
+
+
+def position_event_windows(
+    events: list[dict[str, Any]],
+    *,
+    position_ids: Iterable[str] | None = None,
+) -> dict[str, dict[str, int]]:
+    selected_ids = {str(item) for item in position_ids or [] if str(item)}
+    windows: dict[str, dict[str, int]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        position_id = _event_position_id(event)
+        if not position_id or (selected_ids and position_id not in selected_ids):
+            continue
+        ts_ms = _event_ts_ms(event)
+        if ts_ms <= 0:
+            continue
+        kind = str(event.get("kind") or "")
+        row = windows.setdefault(
+            position_id,
+            {
+                "first_ts_ms": ts_ms,
+                "last_ts_ms": ts_ms,
+                "entry_ts_ms": 0,
+                "close_ts_ms": 0,
+            },
+        )
+        row["first_ts_ms"] = min(int(row.get("first_ts_ms") or ts_ms), ts_ms)
+        row["last_ts_ms"] = max(int(row.get("last_ts_ms") or ts_ms), ts_ms)
+        if kind in {"entry.opened", "runtime.position_opened"}:
+            existing = int(row.get("entry_ts_ms") or 0)
+            row["entry_ts_ms"] = ts_ms if existing <= 0 else min(existing, ts_ms)
+        if _kind_is_close_or_flatten(kind):
+            row["close_ts_ms"] = max(int(row.get("close_ts_ms") or 0), ts_ms)
+    for row in windows.values():
+        if int(row.get("entry_ts_ms") or 0) <= 0:
+            row["entry_ts_ms"] = int(row.get("first_ts_ms") or 0)
+        if int(row.get("close_ts_ms") or 0) <= 0:
+            row["close_ts_ms"] = int(row.get("last_ts_ms") or 0)
+    return windows
+
+
+def _event_ts_ms(event: dict[str, Any]) -> int:
+    payload = event.get("payload")
+    row = payload if isinstance(payload, dict) else event
+    for value in (
+        event.get("ts_ms"),
+        row.get("ts_ms"),
+        row.get("timestamp_ms"),
+        row.get("opened_at_ms"),
+        row.get("entered_at_ms"),
+        row.get("submitted_at_ms"),
+        row.get("filled_at_ms"),
+    ):
+        try:
+            ts_ms = int(value or 0)
+        except (TypeError, ValueError):
+            ts_ms = 0
+        if ts_ms > 0:
+            return ts_ms
+    return 0
+
+
+def _kind_is_close_or_flatten(kind: str) -> bool:
+    text = str(kind or "").lower()
+    return bool(
+        text.startswith("exit.")
+        or "close" in text
+        or "flatten" in text
+        or "reconciled" in text
+    )
 
 
 def _identity_phase(identity: dict[str, Any]) -> str:
@@ -266,6 +340,288 @@ def _fill_event_from_reconciliation(
             "source": f"rebuild_lifecycle_truth_exchange_query_{phase}",
         },
     }
+
+
+def _fill_event_from_account_reconciliation(
+    target: dict[str, Any],
+    fill: Any,
+) -> dict[str, Any]:
+    metadata = getattr(fill, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    venue = str(_json_value(getattr(fill, "venue", None)) or target["venue"]).lower()
+    side = str(_json_value(getattr(fill, "side", None)) or "").lower()
+    order_id = str(getattr(fill, "order_id", "") or "")
+    client_order_id = str(getattr(fill, "client_order_id", "") or "")
+    ts_ms = int(getattr(fill, "filled_at_ms", 0) or target.get("anchor_ts_ms") or time.time() * 1000)
+    phase = str(target.get("phase") or "close")
+    trade_side = str(
+        metadata.get("tradeSide")
+        or metadata.get("trade_side")
+        or metadata.get("trade_side_raw")
+        or phase
+    )
+    return {
+        "ts_ms": ts_ms,
+        "kind": "order.filled",
+        "payload": {
+            "position_id": target["position_id"],
+            "symbol": str(getattr(fill, "symbol", "") or target["symbol"]).upper(),
+            "phase": phase,
+            "leg": target.get("leg") or "",
+            "venue": venue,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "side": side,
+            "tradeSide": trade_side,
+            "quantity": getattr(fill, "quantity", 0.0) or 0.0,
+            "average_price": getattr(fill, "average_price", 0.0) or 0.0,
+            "fee_quote": getattr(fill, "fee_quote", 0.0) or 0.0,
+            "filled_at_ms": ts_ms,
+            "source": f"rebuild_lifecycle_truth_exchange_account_history_{phase}",
+            "trade_id": str(metadata.get("trade_id") or metadata.get("tradeId") or ""),
+            "exec_id": str(metadata.get("exec_id") or metadata.get("execId") or ""),
+        },
+    }
+
+
+def _iter_account_history_targets(
+    report: dict[str, Any],
+    *,
+    position_windows: dict[str, dict[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    positions = report.get("positions")
+    if not isinstance(positions, dict):
+        return targets
+    windows = position_windows or {}
+    for position_id, truth in sorted(positions.items()):
+        if not isinstance(truth, dict):
+            continue
+        if str(truth.get("classification") or "") == "phantom_zero_qty_opened":
+            continue
+        symbol = str(truth.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        target_quantity = _to_float(truth.get("target_quantity"))
+        if target_quantity <= 0.0:
+            continue
+        window = windows.get(str(position_id), {})
+        for phase, coverage_key in (("open", "open_coverage"), ("close", "close_coverage")):
+            coverage = truth.get(coverage_key)
+            if not isinstance(coverage, dict):
+                continue
+            for leg in ("long", "short"):
+                row = coverage.get(leg)
+                if not isinstance(row, dict):
+                    continue
+                if row.get("covered") is True:
+                    continue
+                filled_qty = _to_float(row.get("filled_qty"))
+                missing_qty = max(0.0, target_quantity - filled_qty)
+                if missing_qty <= 0.0:
+                    continue
+                venue = str(truth.get(f"{leg}_venue") or "").lower()
+                if not venue:
+                    continue
+                anchor = _account_history_anchor_ts(window, phase)
+                start_time_ms, end_time_ms = _account_history_query_window(anchor)
+                identities = _target_order_identities(truth, phase=phase, leg=leg, venue=venue)
+                targets.append(
+                    {
+                        "position_id": str(position_id),
+                        "symbol": symbol,
+                        "phase": phase,
+                        "leg": leg,
+                        "venue": venue,
+                        "target_quantity": target_quantity,
+                        "filled_quantity": filled_qty,
+                        "missing_quantity": missing_qty,
+                        "expected_side": _expected_side_for_target(phase, leg),
+                        "anchor_ts_ms": anchor,
+                        "start_time_ms": start_time_ms,
+                        "end_time_ms": end_time_ms,
+                        "identity_order_ids": identities["order_ids"],
+                        "identity_client_order_ids": identities["client_order_ids"],
+                    }
+                )
+    return targets
+
+
+def _account_history_anchor_ts(window: dict[str, int], phase: str) -> int:
+    if phase == "open":
+        return int(window.get("entry_ts_ms") or window.get("first_ts_ms") or 0)
+    return int(window.get("close_ts_ms") or window.get("last_ts_ms") or window.get("entry_ts_ms") or 0)
+
+
+def _account_history_query_window(anchor_ts_ms: int) -> tuple[int | None, int | None]:
+    if anchor_ts_ms <= 0:
+        return None, None
+    half_window_ms = ACCOUNT_HISTORY_QUERY_WINDOW_MS // 2
+    return max(0, anchor_ts_ms - half_window_ms), anchor_ts_ms + half_window_ms
+
+
+def _target_order_identities(
+    truth: dict[str, Any],
+    *,
+    phase: str,
+    leg: str,
+    venue: str,
+) -> dict[str, set[str]]:
+    order_ids: set[str] = set()
+    client_order_ids: set[str] = set()
+    identities = truth.get("order_identity_history")
+    if not isinstance(identities, list):
+        return {"order_ids": order_ids, "client_order_ids": client_order_ids}
+    for identity in identities:
+        if not isinstance(identity, dict):
+            continue
+        if _identity_phase(identity) != phase:
+            continue
+        if _candidate_leg(truth, identity) != leg:
+            continue
+        if _candidate_venue(truth, identity) != venue:
+            continue
+        order_id = str(identity.get("order_id") or "")
+        client_order_id = str(identity.get("client_order_id") or "")
+        if order_id:
+            order_ids.add(order_id)
+        if client_order_id:
+            client_order_ids.add(client_order_id)
+    return {"order_ids": order_ids, "client_order_ids": client_order_ids}
+
+
+def _expected_side_for_target(phase: str, leg: str) -> str:
+    if phase == "open" and leg == "long":
+        return "buy"
+    if phase == "open" and leg == "short":
+        return "sell"
+    if phase == "close" and leg == "long":
+        return "sell"
+    if phase == "close" and leg == "short":
+        return "buy"
+    return ""
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _account_history_fill_matches_target(fill: Any, target: dict[str, Any]) -> bool:
+    if fill is None or _to_float(getattr(fill, "quantity", 0.0)) <= 0.0:
+        return False
+    fill_venue = str(_json_value(getattr(fill, "venue", None)) or "").lower()
+    if fill_venue and fill_venue != str(target.get("venue") or "").lower():
+        return False
+    fill_symbol = str(getattr(fill, "symbol", "") or "").upper()
+    if fill_symbol and fill_symbol != str(target.get("symbol") or "").upper():
+        return False
+    side = str(_json_value(getattr(fill, "side", None)) or "").lower()
+    expected_side = str(target.get("expected_side") or "").lower()
+    if expected_side and side and side != expected_side:
+        return False
+    metadata = getattr(fill, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if not _account_history_trade_side_matches(metadata, str(target.get("phase") or "")):
+        return False
+    if not _account_history_position_side_matches(metadata, str(target.get("leg") or "")):
+        return False
+    order_ids: set[str] = target.get("identity_order_ids") or set()
+    client_order_ids: set[str] = target.get("identity_client_order_ids") or set()
+    if order_ids or client_order_ids:
+        fill_order_id = str(getattr(fill, "order_id", "") or "")
+        fill_client_id = str(getattr(fill, "client_order_id", "") or "")
+        return bool(
+            (fill_order_id and fill_order_id in order_ids)
+            or (fill_client_id and fill_client_id in client_order_ids)
+        )
+    return True
+
+
+def _account_history_trade_side_matches(metadata: dict[str, Any], phase: str) -> bool:
+    trade_side = str(
+        metadata.get("tradeSide")
+        or metadata.get("trade_side")
+        or metadata.get("trade_side_raw")
+        or ""
+    ).lower()
+    if not trade_side:
+        return True
+    if phase == "close":
+        return "close" in trade_side or trade_side.startswith("reduce_")
+    if phase == "open":
+        return trade_side == "open" or trade_side.endswith("_single") or "open" in trade_side
+    return True
+
+
+def _account_history_position_side_matches(metadata: dict[str, Any], leg: str) -> bool:
+    position_side = str(metadata.get("positionSide") or metadata.get("position_side") or "").lower()
+    if not position_side or position_side == "both":
+        return True
+    return position_side == leg.lower()
+
+
+def _account_history_fill_sort_key(fill: Any, anchor_ts_ms: int) -> tuple[int, int]:
+    filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
+    if anchor_ts_ms > 0 and filled_at_ms > 0:
+        return abs(filled_at_ms - anchor_ts_ms), filled_at_ms
+    return 0, filled_at_ms
+
+
+def _account_history_event_key(event: dict[str, Any]) -> tuple[str, str, str, str, str, str, str] | None:
+    key = _fill_event_identity_key(event)
+    if key is None:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return key
+    trade_id = str(payload.get("trade_id") or "")
+    exec_id = str(payload.get("exec_id") or "")
+    if trade_id:
+        return key[:4] + ("trade_id", trade_id, "")
+    if exec_id:
+        return key[:4] + ("exec_id", exec_id, "")
+    return key
+
+
+def _account_history_exchange_event_key(event: dict[str, Any]) -> tuple[str, ...] | None:
+    if str(event.get("kind") or "") != "order.filled":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    venue = str(payload.get("venue") or payload.get("exchange") or "").lower()
+    symbol = str(payload.get("symbol") or "").upper()
+    trade_id = str(payload.get("trade_id") or "")
+    exec_id = str(payload.get("exec_id") or "")
+    order_id = str(payload.get("order_id") or payload.get("orderId") or "")
+    client_order_id = str(payload.get("client_order_id") or payload.get("clientOrderId") or "")
+    side = str(payload.get("side") or "").lower()
+    if trade_id:
+        return (venue, symbol, "trade_id", trade_id)
+    if exec_id:
+        return (venue, symbol, "exec_id", exec_id)
+    if order_id or client_order_id:
+        return (
+            venue,
+            symbol,
+            "order",
+            order_id,
+            client_order_id,
+            side,
+            str(payload.get("filled_at_ms") or event.get("ts_ms") or ""),
+        )
+    return (
+        venue,
+        symbol,
+        "fill",
+        side,
+        str(payload.get("quantity") or ""),
+        str(payload.get("average_price") or payload.get("price") or ""),
+        str(payload.get("filled_at_ms") or event.get("ts_ms") or ""),
+    )
 
 
 def _load_exchange_query_helpers() -> tuple[
@@ -460,6 +816,164 @@ async def query_exchange_fill_events(
     return fill_events, summary
 
 
+async def query_exchange_account_history_fill_events(
+    report: dict[str, Any],
+    *,
+    position_windows: dict[str, dict[str, int]] | None = None,
+    credential_loader: Callable[[str], Any] | None = None,
+    adapter_factory: Callable[..., Any] | None = None,
+    rate_limiter_factory: Callable[[], Any] | None = None,
+    install_runtime: Callable[[], Any] | None = None,
+    restore_runtime: Callable[[Any], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Probe exchange account fill history for missing lifecycle legs."""
+
+    if (
+        credential_loader is None
+        or adapter_factory is None
+        or rate_limiter_factory is None
+        or install_runtime is None
+        or restore_runtime is None
+    ):
+        (
+            credential_loader,
+            adapter_factory,
+            rate_limiter_factory,
+            install_runtime,
+            restore_runtime,
+        ) = _load_exchange_query_helpers()
+
+    targets = _iter_account_history_targets(report, position_windows=position_windows)
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "target_count": len(targets),
+        "attempted": 0,
+        "filled": 0,
+        "not_found": 0,
+        "credential_missing": 0,
+        "adapter_unavailable": 0,
+        "account_history_unavailable": 0,
+        "errors": [],
+    }
+    fill_events: list[dict[str, Any]] = []
+    adapter_cache: dict[str, Any] = {}
+    fill_cache: dict[tuple[str, str, int | None, int | None], list[Any]] = {}
+    missing_credentials: set[str] = set()
+    seen = {_account_history_event_key(event) for event in fill_events}
+    seen_exchange = {
+        _account_history_exchange_event_key(event)
+        for event in fill_events
+        if _account_history_exchange_event_key(event)
+    }
+    previous_runtime = install_runtime()
+    try:
+        for target in targets:
+            summary["attempted"] += 1
+            venue = target["venue"]
+            if venue in missing_credentials:
+                summary["credential_missing"] += 1
+                continue
+            adapter = adapter_cache.get(venue)
+            if adapter is None:
+                credential = credential_loader(venue)
+                if credential is None:
+                    missing_credentials.add(venue)
+                    summary["credential_missing"] += 1
+                    continue
+                adapter = adapter_factory(
+                    venue,
+                    credential,
+                    rate_limiter=rate_limiter_factory(),
+                )
+                if adapter is None:
+                    summary["adapter_unavailable"] += 1
+                    continue
+                adapter_cache[venue] = adapter
+            fetch = _account_history_fetcher(adapter)
+            if not callable(fetch):
+                summary["account_history_unavailable"] += 1
+                continue
+            cache_key = (
+                venue,
+                target["symbol"],
+                target.get("start_time_ms"),
+                target.get("end_time_ms"),
+            )
+            try:
+                if cache_key not in fill_cache:
+                    fill_cache[cache_key] = await fetch(
+                        target["symbol"],
+                        start_time_ms=target.get("start_time_ms"),
+                        end_time_ms=target.get("end_time_ms"),
+                    )
+                history_fills = fill_cache[cache_key]
+            except Exception as exc:  # pragma: no cover - defensive for live adapters.
+                summary["errors"].append(
+                    {
+                        "position_id": target["position_id"],
+                        "venue": venue,
+                        "symbol": target["symbol"],
+                        "phase": target["phase"],
+                        "leg": target["leg"],
+                        "error": str(exc),
+                    }
+                )
+                continue
+            matched = [
+                fill
+                for fill in history_fills
+                if _account_history_fill_matches_target(fill, target)
+            ]
+            matched.sort(
+                key=lambda fill: _account_history_fill_sort_key(
+                    fill,
+                    int(target.get("anchor_ts_ms") or 0),
+                )
+            )
+            accumulated = 0.0
+            emitted_for_target = 0
+            needed_qty = float(target.get("missing_quantity") or 0.0)
+            for fill in matched:
+                event = _fill_event_from_account_reconciliation(target, fill)
+                key = _account_history_event_key(event)
+                exchange_key = _account_history_exchange_event_key(event)
+                if exchange_key and exchange_key in seen_exchange:
+                    continue
+                if key and key in seen:
+                    continue
+                if exchange_key:
+                    seen_exchange.add(exchange_key)
+                if key:
+                    seen.add(key)
+                fill_events.append(event)
+                emitted_for_target += 1
+                accumulated += _to_float(getattr(fill, "quantity", 0.0))
+                if needed_qty > 0.0 and accumulated >= needed_qty * QTY_TOLERANCE:
+                    break
+            if emitted_for_target:
+                summary["filled"] += emitted_for_target
+            else:
+                summary["not_found"] += 1
+    finally:
+        restore_runtime(previous_runtime)
+    return fill_events, summary
+
+
+def _account_history_fetcher(adapter: Any) -> Callable[..., Awaitable[list[Any]]] | None:
+    fetch = getattr(adapter, "fetch_account_fill_reconciliations", None)
+    if callable(fetch):
+        return fetch
+    transport = getattr(adapter, "_transport", None)
+    fetch = getattr(transport, "fetch_account_fill_reconciliations", None)
+    if callable(fetch):
+        return fetch
+    private = getattr(adapter, "_private", None)
+    fetch = getattr(private, "fetch_account_fill_reconciliations", None)
+    if callable(fetch):
+        return fetch
+    return None
+
+
 def _is_exchange_order_not_found_exception(candidate: dict[str, Any], exc: Exception) -> bool:
     venue = str(candidate.get("venue") or "").lower()
     if venue != "binance":
@@ -475,6 +989,11 @@ async def query_exchange_fill_events_until_stable(
     max_passes: int = 3,
     query_func: Callable[[dict[str, Any]], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
     | None = None,
+    account_history_query_func: Callable[
+        [dict[str, Any], dict[str, dict[str, int]]],
+        Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]],
+    ]
+    | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     """Rebuild lifecycle truth and keep probing newly exposed order identities."""
 
@@ -484,6 +1003,7 @@ async def query_exchange_fill_events_until_stable(
     queried_fill_events: list[dict[str, Any]] = []
     pass_summaries: list[dict[str, Any]] = []
     seen = {_fill_event_identity_key(event) for event in events if _fill_event_identity_key(event)}
+    windows = position_event_windows(events, position_ids=scoped_position_ids)
 
     for pass_index in range(1, max(1, max_passes) + 1):
         fill_events, summary = await query(report)
@@ -506,10 +1026,38 @@ async def query_exchange_fill_events_until_stable(
             position_ids=scoped_position_ids,
         )
 
+    if account_history_query_func is not None:
+        account_history_events, account_history_summary = await account_history_query_func(report, windows)
+    elif query_func is None:
+        account_history_events, account_history_summary = await query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+        )
+    else:
+        account_history_events, account_history_summary = (
+            [],
+            {"enabled": False, "reason": "skipped_for_injected_order_query"},
+        )
+    new_account_history_events: list[dict[str, Any]] = []
+    for event in account_history_events:
+        key = _fill_event_identity_key(event)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        new_account_history_events.append(event)
+    if new_account_history_events:
+        queried_fill_events.extend(new_account_history_events)
+        report = build_exchange_truth_lifecycle(
+            events + queried_fill_events,
+            position_ids=scoped_position_ids,
+        )
+
     exchange_query_summary = _merge_exchange_query_summaries(
         pass_summaries,
         synthetic_fill_event_count=len(queried_fill_events),
     )
+    exchange_query_summary["account_history"] = account_history_summary
     return report, queried_fill_events, exchange_query_summary
 
 
@@ -792,6 +1340,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_json:
         write_json(args.output_json, report)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+    expected_args_present = any(
+        value is not None
+        for value in (
+            args.expected_complete,
+            args.expected_phantom_zero,
+            args.expected_exchange_bad,
+        )
+    )
+    if not args.apply and expected_args_present and report["apply_blockers"]:
+        return 2
     return 0
 
 

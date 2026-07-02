@@ -484,6 +484,27 @@ class AsterAdapter(VenueAdapter):
             end_time_ms=end_time_ms,
         )
 
+    async def fetch_account_fill_reconciliations(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[OrderFillReconciliation]:
+        if self._private is not None:
+            return await self._private.fetch_account_fill_reconciliations(
+                symbol,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        if self._mode == "live":
+            raise self._private_unavailable()
+        return await self._transport.fetch_account_fill_reconciliations(
+            symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 

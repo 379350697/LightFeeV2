@@ -1560,6 +1560,322 @@ def test_rebuild_lifecycle_truth_queries_historical_identity_with_time_window():
     assert fill_events[0]["payload"]["phase"] == "open"
 
 
+def test_rebuild_lifecycle_truth_uses_account_history_when_close_identity_is_missing():
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-account-history-TAIKOUSDT"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "quantity": 2,
+                "matched_quantity": 2,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "long",
+                "venue": "bybit",
+                "order_id": "open-long",
+                "quantity": 2,
+                "price": 0.081,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "open",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "open-short",
+                "quantity": 2,
+                "price": 0.082,
+            },
+        ),
+        _event(
+            2_000,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "close",
+                "leg": "long",
+                "venue": "bybit",
+                "order_id": "close-long",
+                "quantity": 2,
+                "price": 0.083,
+            },
+        ),
+        _event(
+            2_100,
+            "runtime.position_drift_flatten_leg",
+            {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "venue": "bitget",
+                "leg": "short",
+            },
+        ),
+    ]
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=[position_id])
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            assert symbol == "TAIKOUSDT"
+            assert start_time_ms is not None and start_time_ms < 2_100
+            assert end_time_ms is not None and end_time_ms > 2_100
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=2,
+                    average_price=0.0805,
+                    order_id="close-short-from-history",
+                    fee_quote=0.01,
+                    filled_at_ms=2_105,
+                    metadata={
+                        "tradeSide": "close",
+                        "trade_id": "bitget-trade-1",
+                    },
+                )
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["target_count"] == 1
+    assert summary["attempted"] == 1
+    assert summary["filled"] == 1
+    assert fill_events == [
+        {
+            "ts_ms": 2_105,
+            "kind": "order.filled",
+            "payload": {
+                "position_id": position_id,
+                "symbol": "TAIKOUSDT",
+                "phase": "close",
+                "leg": "short",
+                "venue": "bitget",
+                "order_id": "close-short-from-history",
+                "client_order_id": "",
+                "side": "buy",
+                "tradeSide": "close",
+                "quantity": 2,
+                "average_price": 0.0805,
+                "fee_quote": 0.01,
+                "filled_at_ms": 2_105,
+                "source": "rebuild_lifecycle_truth_exchange_account_history_close",
+                "trade_id": "bitget-trade-1",
+                "exec_id": "",
+            },
+        }
+    ]
+
+    rebuilt = build_exchange_truth_lifecycle(events + fill_events)
+    truth = rebuilt["positions"][position_id]
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["short"]["covered"] is True
+
+
+def test_rebuild_lifecycle_truth_account_history_fill_is_not_double_assigned():
+    from scripts import rebuild_lifecycle_truth
+
+    position_ids = [
+        "entry-account-history-dup-a-TAIKOUSDT",
+        "entry-account-history-dup-b-TAIKOUSDT",
+    ]
+    events: list[dict] = []
+    for index, position_id in enumerate(position_ids):
+        offset = index * 100
+        events.extend(
+            [
+                _event(
+                    1_000 + offset,
+                    "entry.opened",
+                    {
+                        "position_id": position_id,
+                        "symbol": "TAIKOUSDT",
+                        "quantity": 2,
+                        "matched_quantity": 2,
+                        "long_venue": "bybit",
+                        "short_venue": "bitget",
+                    },
+                ),
+                _event(
+                    1_010 + offset,
+                    "order.filled",
+                    {
+                        "position_id": position_id,
+                        "symbol": "TAIKOUSDT",
+                        "phase": "open",
+                        "leg": "long",
+                        "venue": "bybit",
+                        "order_id": f"{position_id}-open-long",
+                        "quantity": 2,
+                        "price": 0.081,
+                    },
+                ),
+                _event(
+                    1_020 + offset,
+                    "order.filled",
+                    {
+                        "position_id": position_id,
+                        "symbol": "TAIKOUSDT",
+                        "phase": "open",
+                        "leg": "short",
+                        "venue": "bitget",
+                        "order_id": f"{position_id}-open-short",
+                        "quantity": 2,
+                        "price": 0.082,
+                    },
+                ),
+                _event(
+                    2_000 + offset,
+                    "order.filled",
+                    {
+                        "position_id": position_id,
+                        "symbol": "TAIKOUSDT",
+                        "phase": "close",
+                        "leg": "long",
+                        "venue": "bybit",
+                        "order_id": f"{position_id}-close-long",
+                        "quantity": 2,
+                        "price": 0.083,
+                    },
+                ),
+                _event(
+                    2_100 + offset,
+                    "runtime.position_drift_flatten_leg",
+                    {
+                        "position_id": position_id,
+                        "symbol": "TAIKOUSDT",
+                        "venue": "bitget",
+                        "leg": "short",
+                    },
+                ),
+            ]
+        )
+
+    report = build_exchange_truth_lifecycle(events)
+    windows = rebuild_lifecycle_truth.position_event_windows(events, position_ids=position_ids)
+
+    class FakeAdapter:
+        async def fetch_account_fill_reconciliations(
+            self,
+            symbol: str,
+            *,
+            start_time_ms: int | None = None,
+            end_time_ms: int | None = None,
+        ) -> list[OrderFillReconciliation]:
+            return [
+                OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=2,
+                    average_price=0.0805,
+                    order_id="same-exchange-order",
+                    fee_quote=0.01,
+                    filled_at_ms=2_105,
+                    metadata={
+                        "tradeSide": "close",
+                        "trade_id": "same-bitget-trade",
+                    },
+                )
+            ]
+
+    fill_events, summary = asyncio.run(
+        rebuild_lifecycle_truth.query_exchange_account_history_fill_events(
+            report,
+            position_windows=windows,
+            credential_loader=lambda venue: object(),
+            adapter_factory=lambda venue, credential, rate_limiter=None: FakeAdapter(),
+            rate_limiter_factory=lambda: None,
+            install_runtime=lambda: None,
+            restore_runtime=lambda previous: None,
+        )
+    )
+
+    assert summary["target_count"] == 2
+    assert len(fill_events) == 1
+    assert summary["filled"] == 1
+
+
+def test_rebuild_lifecycle_truth_dry_run_returns_nonzero_when_expected_counts_mismatch(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-mismatch"
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps(
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "matched_quantity": 0,
+                    "long_venue": "bitget",
+                    "short_venue": "bybit",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+
+    rc = rebuild_lifecycle_truth.main(
+        [
+            "--events",
+            str(events_path),
+            "--positions-file",
+            str(positions_path),
+            "--dry-run",
+            "--no-query-exchange",
+            "--expected-complete",
+            "1",
+            "--expected-phantom-zero",
+            "0",
+            "--expected-exchange-bad",
+            "0",
+        ]
+    )
+
+    assert rc == 2
+
+
 def test_rebuild_lifecycle_truth_loads_exchange_env_before_query(monkeypatch, tmp_path: Path):
     from scripts import rebuild_lifecycle_truth
 

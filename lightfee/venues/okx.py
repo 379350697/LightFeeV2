@@ -96,5 +96,18 @@ class OkxAdapter(VenueAdapter):
             end_time_ms=end_time_ms,
         )
 
+    async def fetch_account_fill_reconciliations(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[OrderFillReconciliation]:
+        return await self._transport.fetch_account_fill_reconciliations(
+            symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+
     async def shutdown(self) -> None:
         await self._transport.close()
