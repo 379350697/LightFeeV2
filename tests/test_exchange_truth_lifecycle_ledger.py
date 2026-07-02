@@ -534,6 +534,39 @@ def test_rebuild_lifecycle_truth_cli_dry_run(tmp_path: Path):
     )
 
 
+def test_rebuild_lifecycle_truth_reads_only_selected_position_events(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    keep_id = "entry-keep-LABUSDT"
+    drop_id = "entry-drop-LABUSDT"
+    events_path = tmp_path / "live-events.jsonl"
+    rows = [
+        _event(1_000, "entry.opened", {"position_id": keep_id, "symbol": "LABUSDT"}),
+        _event(1_001, "entry.opened", {"position_id": drop_id, "symbol": "LABUSDT"}),
+        _event(1_002, "runtime.position_opened", {"entry_id": keep_id, "symbol": "LABUSDT"}),
+        {"kind": "runtime.heartbeat", "payload": {"ok": True}, "ts_ms": 1_003},
+    ]
+    events_path.write_text(
+        "\n".join([*(json.dumps(row) for row in rows), "{not-json"]),
+        encoding="utf-8",
+    )
+
+    events = rebuild_lifecycle_truth.read_jsonl_events(
+        [events_path],
+        position_ids={keep_id},
+    )
+
+    assert [event["kind"] for event in events] == [
+        "entry.opened",
+        "runtime.position_opened",
+    ]
+    assert all(
+        (event.get("payload") or {}).get("position_id", (event.get("payload") or {}).get("entry_id"))
+        == keep_id
+        for event in events
+    )
+
+
 def test_rebuild_lifecycle_truth_queries_close_identity_into_fill_event():
     from scripts import rebuild_lifecycle_truth
 

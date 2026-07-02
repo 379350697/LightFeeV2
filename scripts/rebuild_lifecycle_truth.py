@@ -25,7 +25,18 @@ CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
 HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 
 
-def read_jsonl_events(paths: list[Path]) -> list[dict[str, Any]]:
+def _event_position_id(event: dict[str, Any]) -> str:
+    payload = event.get("payload")
+    row = payload if isinstance(payload, dict) else event
+    return str(row.get("position_id") or row.get("entry_id") or "").strip()
+
+
+def read_jsonl_events(
+    paths: list[Path],
+    *,
+    position_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    selected_ids = {str(item) for item in position_ids or set() if str(item)}
     events: list[dict[str, Any]] = []
     for path in paths:
         if not path.exists():
@@ -40,6 +51,8 @@ def read_jsonl_events(paths: list[Path]) -> list[dict[str, Any]]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict):
+                    if selected_ids and _event_position_id(event) not in selected_ids:
+                        continue
                     events.append(event)
     return events
 
@@ -709,7 +722,8 @@ def main(argv: list[str] | None = None) -> int:
     if not event_files:
         event_files = discover_event_files(args.runtime_dir, args.history)
     position_ids = read_position_ids(args.positions_file)
-    events = read_jsonl_events(event_files)
+    event_position_filter = set(position_ids or []) if position_ids is not None else None
+    events = read_jsonl_events(event_files, position_ids=event_position_filter)
     queried_fill_events: list[dict[str, Any]] = []
     exchange_truth_env_files_loaded: list[str] = []
     report = build_exchange_truth_lifecycle(
