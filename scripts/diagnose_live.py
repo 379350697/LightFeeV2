@@ -2923,7 +2923,10 @@ def _lifecycle_truth_terminal_flat_evidence_gap(
 ) -> bool:
     if not isinstance(truth, dict):
         return False
-    if str(truth.get("classification") or "") != "evidence_incomplete":
+    if str(truth.get("classification") or "") not in {
+        "evidence_incomplete",
+        "exchange_lifecycle_incomplete",
+    }:
         return False
     terminal_flat_truth = truth.get("terminal_flat_truth")
     if not isinstance(terminal_flat_truth, dict):

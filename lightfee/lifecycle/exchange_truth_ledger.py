@@ -1052,6 +1052,8 @@ def _project_record_status(
     if facts.exit_closed:
         if open_complete and close_complete:
             return "legacy_exit_closed_project_record_gap"
+        if terminal_flat_truth:
+            return "terminal_flat_exchange_truth_accounting_gap"
         return "legacy_exit_closed_missing_exchange_fill_evidence"
     if terminal_flat_truth:
         return "terminal_flat_exchange_truth_accounting_gap"

@@ -4808,6 +4808,124 @@ def test_acceptance_gate_moves_terminal_flat_legacy_truth_gap_to_ledger_evidence
     assert gate["gate_passed"] is True
 
 
+def test_acceptance_gate_moves_incomplete_exit_closed_truth_gap_to_terminal_flat_ledger_gap():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    position_id = "entry-incomplete-exit-closed-terminal-flat-gap"
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "ts_ms": 1_000,
+                "kind": "entry.opened",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "quantity": 3,
+                    "matched_quantity": 3,
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "long_entry_price": "6.10",
+                    "short_entry_price": "6.11",
+                    "entry_timestamp_quality": "exchange_exact",
+                    "long_order_id": "open-long",
+                    "short_order_id": "open-short",
+                },
+            },
+            {
+                "ts_ms": 601_000,
+                "kind": "exit.accepted_order_truth_gap_registered",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "accepted_order_id": "close-short",
+                    "accepted_client_order_id": "cid-close-short",
+                },
+            },
+            {
+                "ts_ms": 601_100,
+                "kind": "exit.accepted_order_truth_gap_retry_blocked",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "accepted_order_id": "close-short",
+                    "accepted_client_order_id": "cid-close-short",
+                    "reason": "ack_only_order_open_order_truth_unavailable",
+                    "decision": "retain_truth_gap",
+                },
+            },
+            {
+                "ts_ms": 601_200,
+                "kind": "exit.closed",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "reason": "funding_capture",
+                    "long_closed_qty": 3,
+                    "short_closed_qty": 0,
+                    "long_uncertain": False,
+                    "short_uncertain": True,
+                    "short_client_order_id": "cid-close-short",
+                    "net_quote": "-18.58",
+                },
+            },
+            {
+                "ts_ms": 601_300,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "terminal_state": "flat",
+                    "terminal_reason": "fallback_live_balanced_matched_close_flat_probe",
+                    "source": "fallback_live_balanced_matched_close_flat_probe",
+                    "exchange_truth": {
+                        "truth_available": True,
+                        "positions_flat": True,
+                        "open_orders_flat": True,
+                        "positions": [],
+                        "open_orders": [],
+                    },
+                },
+            },
+        ],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    summary = gate["resolved_order_truth_gap_summary"]
+    assert summary["legacy_inferred_count"] == 0
+    assert summary["ledger_closed_legacy_inferred_count"] == 0
+    assert summary["ledger_terminal_flat_legacy_inferred_count"] == 1
+    assert summary["ledger_terminal_flat_legacy_inferred_positions"] == [position_id]
+    assert summary["ledger_terminal_flat_legacy_project_statuses"] == {
+        position_id: "terminal_flat_exchange_truth_accounting_gap"
+    }
+    assert "close_truth_gap_legacy_inferred" not in gate["fingerprints"]
+    assert gate["exception_conclusions"]["ledger_terminal_flat_legacy_truth_gap"] == (
+        "terminal_flat_exchange_truth_ledger_evidence_gap"
+    )
+    assert gate["gate_passed"] is True
+
+
 def test_acceptance_gate_reports_pending_entry_order_truth_gap_from_current_state():
     from scripts.diagnose_live import _build_production_acceptance_gate
 
