@@ -8411,6 +8411,11 @@ def _build_production_acceptance_gate(
         and exchange_recovery_clean
         and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
     )
+    residual_lifecycle_complete = (
+        residual_count > 0
+        and pending_residual_repair_count == 0
+        and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
+    )
     if (
         (entry_opened_count or position_opened_count)
         and current_core_clean
@@ -8435,6 +8440,7 @@ def _build_production_acceptance_gate(
     residual_lifecycle_closed = (
         residual_count == 0
         or residual_lifecycle_closed_by_recovery
+        or residual_lifecycle_complete
     )
     trade_lifecycle_closed = (
         not (entry_opened_count or position_opened_count)
@@ -8491,6 +8497,10 @@ def _build_production_acceptance_gate(
     if active_residual_lifecycle_closed:
         residual_lifecycle_closed = True
         fingerprints.append("active_owner_residual_resolved")
+    if residual_lifecycle_complete:
+        exception_conclusions["residual_lifecycle_complete"] = (
+            "closed_by_residual_lifecycle_terminality"
+        )
     active_overhedge_correction_resolved = (
         active_positions_with_capacity
         and _overhedge_corrections_scoped_to_active_owner(
@@ -8707,6 +8717,7 @@ def _build_production_acceptance_gate(
         "unclosed_trade_lifecycle_count": recovery_lifecycle["unclosed_trade_lifecycle_count"],
         "closed_residual_lifecycle_count": recovery_lifecycle["closed_residual_lifecycle_count"],
         "unclosed_residual_lifecycle_count": recovery_lifecycle["unclosed_residual_lifecycle_count"],
+        "residual_lifecycle_complete": residual_lifecycle_complete,
         "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,

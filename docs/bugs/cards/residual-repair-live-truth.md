@@ -49,10 +49,13 @@ resubmit.
 
 Completed residual repair scoped to a current owner-managed active position is
 not a current production blocker when local owner evidence, balanced exchange
-truth, and trusted empty open-order truth agree. `live-recovered:*` rows, zero
-matched quantity, unresolved residual work, missing truth, open-order fetch
-errors, stale owner ids, nonempty open orders, or unbalanced live legs remain
-blocking.
+truth, and trusted empty open-order truth agree. Completed historical residual
+lifecycle is also not a current production blocker when there are no pending
+residual repairs and `unclosed_residual_lifecycle_count=0`; active positions
+are validated by their own exchange-truth/open-order checks instead of forcing
+the whole account flat. `live-recovered:*` rows, zero matched quantity,
+unresolved residual work, missing truth, open-order fetch errors, stale owner
+ids, nonempty open orders, or unbalanced live legs remain blocking.
 
 ## V1 / Exchange Semantics
 
@@ -75,6 +78,7 @@ blocking.
 | 2026-06-08 | ACK-only reduce-only repair closure | fixed, deployed, cloud verified | ACK-only residual repair now resolves accepted order ids through fill/order/open-order/live-position truth in the same recovery loop; confirmed fill or trusted live-flat/open-order-empty completes without duplicate submit, while open order/truth gaps retain the task and reconcile first next tick. `4b02ec2` deployed with singleton PASS, production verifier `ok=true`, and high-confidence flat/no-open-orders diagnose evidence. |
 | 2026-06-24 | Active owner-managed residual gate scope | `d7bb4ad` deployed/cloud verified | CL-112 keeps residual repair lifecycle blocking until completion, but stops completed owner-scoped residual repair from requiring whole-account flatness only when the position remains normally owner-managed, owner ids match when present, and trusted open-order truth is empty. `live-recovered:*`, zero matched quantity, stale owner ids, or open-order fetch errors remain blockers. Cloud acceptance reached `gate_passed=true`, `residual_count=0`, and flat/no-open-orders exchange truth. See [daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state](../daily/2026-06-24.md#cluster-cl-112---active-owner-managed-gate-scope-and-order-truth-business-state). |
 | 2026-06-24 | Zero-fill accepted repair shares order-truth contract | `b9f35e3` deployed/cloud verified | CL-111 prevents accepted repair order ids with zero fill from emitting `execution.residual_repair_completed(filled_quantity=0)`. They remain `execution.residual_repair_inflight` / accepted-order truth gaps until order/fill/live-position truth confirms fill, terminal no-fill plus live flat, or a fail-closed blocker. Cloud acceptance proved zero pending residual repair, flat/no-open-orders exchange truth, and no unresolved order-truth gap. See [daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix](../daily/2026-06-24.md#cluster-cl-111---order-truth-and-pending-entry-semantic-root-fix). |
+| 2026-07-03 | Completed historical residuals with active positions | local verified; deploy pending | CL-149 stops full-history explicit venue diagnose from treating already completed old residual events as current blockers when there are current owner-managed active positions. The gate now exposes `residual_lifecycle_complete=true` and blocks only when local pending residual work or unclosed residual lifecycle keys remain. See [daily/2026-07-03.md#cluster-cl-149---completed-historical-residuals-with-active-positions](../daily/2026-07-03.md#cluster-cl-149---completed-historical-residuals-with-active-positions). |
 
 ## Recurrences
 

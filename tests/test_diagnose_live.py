@@ -2575,6 +2575,89 @@ def test_acceptance_gate_accepts_completed_residual_for_owner_managed_active_pos
     assert gate["gate_passed"] is True
 
 
+def test_acceptance_gate_accepts_historical_completed_residual_with_active_positions():
+    from scripts import diagnose_live as dl
+
+    active_position_id = "entry-bir-active"
+    old_position_id = "entry-zkp-closed-residual"
+    events = [
+        {
+            "ts_ms": 1783094015818,
+            "kind": "entry.opened",
+            "payload": {
+                "position_id": active_position_id,
+                "symbol": "BIRBUSDT",
+                "quantity": 322.0,
+                "long_quantity": 322.0,
+                "short_quantity": 322.0,
+            },
+        },
+        {
+            "ts_ms": 1783094123000,
+            "kind": "execution.residual_repair_queued",
+            "payload": {
+                "position_id": old_position_id,
+                "symbol": "ZKPUSDT",
+                "reason": "incremental_entry_open_partially_matched",
+                "residual_quantity": 7.0,
+            },
+        },
+        {
+            "ts_ms": 1783094143000,
+            "kind": "execution.residual_repair_completed",
+            "payload": {
+                "position_id": old_position_id,
+                "symbol": "ZKPUSDT",
+                "result": "already_flat",
+                "filled_quantity": 0.0,
+            },
+        },
+    ]
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "max_concurrent_positions": 8,
+        "open_positions": [
+            {
+                "position_id": active_position_id,
+                "symbol": "BIRBUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 322.0,
+                "matched_quantity": 322.0,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "has_nonzero_position": True,
+        "has_open_order": False,
+        "positions": {
+            "binance": {"BIRBUSDT": {"quantity": 322.0}},
+            "bybit": {"BIRBUSDT": {"quantity": -322.0}},
+        },
+        "open_orders": {
+            "binance": {"BIRBUSDT": []},
+            "bybit": {"BIRBUSDT": []},
+        },
+    }
+
+    gate = dl._build_production_acceptance_gate(events, local_state, exchange_truth)
+
+    assert gate["residual_count"] >= 1
+    assert gate["unclosed_residual_lifecycle_count"] == 0
+    assert gate["residual_lifecycle_complete"] is True
+    assert "residual_events_present" not in gate["blocking_reasons"]
+    assert gate["exception_conclusions"]["residual_lifecycle_complete"] == (
+        "closed_by_residual_lifecycle_terminality"
+    )
+    assert gate["gate_passed"] is True
+
+
 def test_acceptance_gate_accepts_owner_managed_overhedge_correction_scope():
     from scripts import diagnose_live as dl
 
