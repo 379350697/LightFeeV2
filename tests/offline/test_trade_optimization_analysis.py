@@ -816,6 +816,18 @@ def test_cli_history_all_prefilters_without_bulk_jsonl_loader(tmp_path: Path, mo
         )
         for idx in range(500)
     )
+    noise_events.extend(
+        _event(
+            4_000_000 + idx,
+            "opportunity.paper_markout",
+            {
+                "entry_id": f"entry-noise-{idx}-LABUSDT",
+                "symbol": "LABUSDT",
+                "net_pnl_quote": "0.01",
+            },
+        )
+        for idx in range(500)
+    )
     events_path.write_text(
         "\n".join(json.dumps(event) for event in sample_events),
         encoding="utf-8",
@@ -864,4 +876,5 @@ def test_cli_history_all_prefilters_without_bulk_jsonl_loader(tmp_path: Path, mo
     assert event_filter["market_event_count"] < len(noise_events)
     assert event_filter["counterfactual_event_count"] == 0
     assert event_filter["raw_market_window_count"] > event_filter["market_window_count"]
+    assert payload["summary"]["event_kind_counts"].get("opportunity.paper_markout", 0) == 0
     assert "entry-stream-LAB" in csv_path.read_text(encoding="utf-8")

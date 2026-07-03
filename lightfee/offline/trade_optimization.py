@@ -1317,9 +1317,20 @@ def _is_trade_position_event(kind: str, payload: JsonDict) -> bool:
 
 def _first_pass_line_tokens(*, include_counterfactual: bool) -> tuple[str, ...]:
     tokens = [
-        '"position_id"',
-        '"entry_id"',
+        '"entry.opened"',
+        '"runtime.position_opened"',
+        '"exit.reconciled"',
+        '"exit.closed"',
+        '"order.filled"',
+        '"accounting.close_statement_backfill_corrected"',
         '"accounting.lifecycle_truth_rebuilt"',
+        '"funding',
+        '"exit_shadow.',
+        '"exit.passive_close',
+        '"runtime.normal_close',
+        '"runtime.entry_post_only',
+        '"order.rejected"',
+        '"order.uncertain"',
     ]
     if include_counterfactual:
         tokens.append('"execution.entry_selected"')
