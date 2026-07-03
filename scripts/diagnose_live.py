@@ -62,6 +62,7 @@ from lightfee.engine.venue_private_health import (
     private_health_status_for_admission_reason,
 )
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+from lightfee.lifecycle.exchange_truth_ledger import build_exchange_truth_lifecycle
 from lightfee.offline.analysis.journal import (
     _entry_time_info,
     _select_quick_flat_entry_time,
@@ -2723,15 +2724,20 @@ def _build_resolved_order_truth_gap_summary(
             "count": 0,
             "explicit_resolved_count": 0,
             "legacy_inferred_count": 0,
+            "ledger_closed_legacy_inferred_count": 0,
             "resolved_identities": [],
             "explicit_resolved_identities": [],
             "legacy_inferred_identities": [],
+            "ledger_closed_legacy_inferred_identities": [],
+            "legacy_inferred_positions": [],
+            "ledger_closed_legacy_inferred_positions": [],
+            "ledger_closed_legacy_project_statuses": {},
             "unresolved_count": 0,
             "unresolved_identities": [],
             "current_exchange_truth_clean": False,
         }
 
-    registered: list[set[str]] = []
+    registered: list[tuple[str, set[str]]] = []
     explicit_resolved_identity_sets: list[set[str]] = []
     legacy_inferred_identity_sets: list[set[str]] = []
     for rec in events:
@@ -2745,10 +2751,11 @@ def _build_resolved_order_truth_gap_summary(
         identities = _truth_gap_identity_values(payload)
         if not identities:
             continue
+        position_id = _position_event_key(payload)[0]
         if kind in _ORDER_TRUTH_GAP_REGISTERED_KINDS or (
             kind == "order.uncertain" and _payload_is_ack_only_order_truth_gap(payload)
         ):
-            registered.append(identities)
+            registered.append((position_id, identities))
         elif (
             (kind in _ORDER_TRUTH_GAP_RESOLUTION_KINDS or kind == "order.reconcile_result")
             and _truth_gap_resolution_complete(kind, payload)
@@ -2761,11 +2768,22 @@ def _build_resolved_order_truth_gap_summary(
     resolved: set[str] = set()
     explicit_resolved: set[str] = set()
     legacy_inferred: set[str] = set()
+    ledger_closed_legacy: set[str] = set()
     unresolved: set[str] = set()
+    legacy_positions: set[str] = set()
+    ledger_closed_legacy_positions: set[str] = set()
+    ledger_closed_legacy_project_statuses: dict[str, str] = {}
     matched_count = 0
     explicit_matched_count = 0
     legacy_matched_count = 0
-    for registered_identities in registered:
+    legacy_candidate_position_ids = {
+        position_id for position_id, _identities in registered if position_id
+    }
+    ledger_positions = _exchange_truth_lifecycle_positions(
+        events,
+        legacy_candidate_position_ids,
+    )
+    for position_id, registered_identities in registered:
         matched_resolution = next(
             (
                 identities for identities in explicit_resolved_identity_sets
@@ -2794,21 +2812,80 @@ def _build_resolved_order_truth_gap_summary(
             explicit_resolved.update(registered_identities)
             explicit_resolved.update(matched_resolution)
         else:
-            legacy_matched_count += 1
-            legacy_inferred.update(registered_identities)
-            legacy_inferred.update(matched_resolution)
+            ledger_truth = ledger_positions.get(position_id) if position_id else None
+            if _lifecycle_truth_exchange_complete(ledger_truth):
+                ledger_closed_legacy.update(registered_identities)
+                ledger_closed_legacy.update(matched_resolution)
+                ledger_closed_legacy_positions.add(position_id)
+                project_status = str(
+                    ledger_truth.get("project_record_status") or ""
+                )
+                if project_status:
+                    ledger_closed_legacy_project_statuses[position_id] = (
+                        project_status
+                    )
+            else:
+                legacy_matched_count += 1
+                legacy_inferred.update(registered_identities)
+                legacy_inferred.update(matched_resolution)
+                if position_id:
+                    legacy_positions.add(position_id)
 
     return {
         "count": matched_count,
         "explicit_resolved_count": explicit_matched_count,
         "legacy_inferred_count": legacy_matched_count,
+        "ledger_closed_legacy_inferred_count": len(ledger_closed_legacy_positions),
         "resolved_identities": sorted(resolved),
         "explicit_resolved_identities": sorted(explicit_resolved),
         "legacy_inferred_identities": sorted(legacy_inferred),
+        "ledger_closed_legacy_inferred_identities": sorted(ledger_closed_legacy),
+        "legacy_inferred_positions": sorted(legacy_positions),
+        "ledger_closed_legacy_inferred_positions": sorted(
+            ledger_closed_legacy_positions
+        ),
+        "ledger_closed_legacy_project_statuses": dict(
+            sorted(ledger_closed_legacy_project_statuses.items())
+        ),
         "unresolved_count": len(unresolved),
         "unresolved_identities": sorted(unresolved),
         "current_exchange_truth_clean": True,
     }
+
+
+def _exchange_truth_lifecycle_positions(
+    events: list[dict[str, Any]],
+    position_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    if not position_ids:
+        return {}
+    try:
+        report = build_exchange_truth_lifecycle(events, position_ids=position_ids)
+    except Exception:
+        return {}
+    positions = report.get("positions")
+    if not isinstance(positions, dict):
+        return {}
+    return {
+        str(position_id): row
+        for position_id, row in positions.items()
+        if isinstance(row, dict)
+    }
+
+
+def _lifecycle_truth_exchange_complete(truth: dict[str, Any] | None) -> bool:
+    if not isinstance(truth, dict):
+        return False
+    if str(truth.get("classification") or "") != "exchange_lifecycle_complete":
+        return False
+    close_coverage = truth.get("close_coverage")
+    if not isinstance(close_coverage, dict):
+        return False
+    return all(
+        isinstance(close_coverage.get(leg), dict)
+        and close_coverage[leg].get("covered") is True
+        for leg in ("long", "short")
+    )
 
 
 def _order_error_resolved_by_truth_gap(
@@ -8249,6 +8326,17 @@ def _build_production_acceptance_gate(
         fingerprints.append("close_truth_gap_legacy_inferred")
         exception_conclusions["close_truth_gap_legacy_inferred"] = (
             "nonblocking_explicit_lifecycle_missing"
+        )
+    ledger_closed_legacy_order_truth_gap_count = int(
+        resolved_order_truth_gap_summary.get(
+            "ledger_closed_legacy_inferred_count",
+            0,
+        )
+        or 0
+    )
+    if ledger_closed_legacy_order_truth_gap_count:
+        exception_conclusions["ledger_closed_legacy_truth_gap"] = (
+            "closed_by_exchange_truth_ledger"
         )
     if unresolved_order_truth_gap_count:
         exception_conclusions["unresolved_order_truth_gap"] = (

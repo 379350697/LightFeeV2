@@ -433,6 +433,75 @@ def test_legacy_exit_closed_without_exchange_fill_is_not_complete():
     assert truth["pnl"]["net_pnl_quote"] == "0"
 
 
+def test_legacy_order_filled_close_infers_phase_from_leg_and_side():
+    position_id = "entry-legacy-leg-side-close"
+    truth = _truth(
+        [
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "quantity": 5,
+                    "matched_quantity": 5,
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "entry_timestamp_quality": "exchange_fill_exact",
+                    "long_entry_price": "7.603",
+                    "short_entry_price": "7.61",
+                    "long_order_id": "open-long",
+                    "short_order_id": "open-short",
+                },
+            ),
+            _event(
+                2_000,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "venue": "binance",
+                    "leg": "long",
+                    "side": "sell",
+                    "order_id": "close-long",
+                    "quantity": 5,
+                    "price": "7.34",
+                },
+            ),
+            _event(
+                2_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LAB-USDT-SWAP",
+                    "venue": "okx",
+                    "leg": "short",
+                    "side": "buy",
+                    "order_id": "close-short",
+                    "quantity": 5,
+                    "price": "7.34",
+                },
+            ),
+            _event(
+                2_200,
+                "exit.closed",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "long_closed_qty": 5,
+                    "short_closed_qty": 5,
+                },
+            ),
+        ],
+        position_id,
+    )
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["project_record_status"] == "legacy_exit_closed_project_record_gap"
+    assert truth["close_coverage"]["long"]["covered"] is True
+    assert truth["close_coverage"]["short"]["covered"] is True
+
+
 def test_rebuild_lifecycle_truth_cli_dry_run(tmp_path: Path):
     position_id = "entry-1782874583508-TAIKOUSDT"
     events_path = tmp_path / "live-events.jsonl"

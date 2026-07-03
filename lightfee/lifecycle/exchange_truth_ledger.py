@@ -1265,14 +1265,23 @@ def _fill_phase(payload: JsonDict) -> str:
         return explicit
     source = str(payload.get("source") or "").lower()
     trade_side = str(payload.get("tradeSide") or payload.get("trade_side") or "").lower()
+    leg = str(payload.get("leg") or "").lower()
+    side = str(payload.get("side") or "").lower()
     if (
         "close" in source
         or "backfill" in source
         or "exchange_trade_history" in source
         or trade_side == "close"
+        or (leg == "long" and side in {"sell", "ask"})
+        or (leg == "short" and side in {"buy", "bid"})
     ):
         return "close"
-    if "open" in source or trade_side == "open":
+    if (
+        "open" in source
+        or trade_side == "open"
+        or (leg == "long" and side in {"buy", "bid"})
+        or (leg == "short" and side in {"sell", "ask"})
+    ):
         return "open"
     return ""
 
