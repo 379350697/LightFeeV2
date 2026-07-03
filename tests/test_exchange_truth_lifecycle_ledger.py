@@ -433,6 +433,67 @@ def test_legacy_exit_closed_without_exchange_fill_is_not_complete():
     assert truth["pnl"]["net_pnl_quote"] == "0"
 
 
+def test_terminal_flat_exchange_truth_gap_is_not_complete_but_is_classified():
+    position_id = "entry-terminal-flat-gap"
+    truth = _truth(
+        [
+            _event(
+                1_000,
+                "exit.accepted_order_truth_gap_registered",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "accepted_order_id": "close-short",
+                    "accepted_client_order_id": "cid-close-short",
+                },
+            ),
+            _event(
+                1_200,
+                "runtime.position_lifecycle_terminal",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "long_venue": "aster",
+                    "short_venue": "bybit",
+                    "terminal_state": "flat",
+                    "terminal_reason": "fallback_live_balanced_matched_close_flat_probe",
+                    "source": "fallback_live_balanced_matched_close_flat_probe",
+                    "exchange_truth": {
+                        "truth_available": True,
+                        "positions_flat": True,
+                        "open_orders_flat": True,
+                        "positions": [
+                            {
+                                "venue": "aster",
+                                "symbol": "LABUSDT",
+                                "side": "buy",
+                                "quantity": 0.0,
+                            },
+                            {
+                                "venue": "bybit",
+                                "symbol": "LABUSDT",
+                                "side": "buy",
+                                "quantity": 0.0,
+                            },
+                        ],
+                        "open_orders": [],
+                    },
+                },
+            ),
+        ],
+        position_id,
+    )
+
+    assert truth["classification"] == LifecycleClassification.EVIDENCE_INCOMPLETE.value
+    assert truth["project_record_status"] == "terminal_flat_exchange_truth_accounting_gap"
+    assert truth["terminal_flat_truth"]["available"] is True
+    assert truth["terminal_flat_truth"]["positions_flat"] is True
+    assert truth["terminal_flat_truth"]["open_orders_flat"] is True
+    assert truth["pnl"]["net_pnl_quote"] == "0"
+
+
 def test_legacy_order_filled_close_infers_phase_from_leg_and_side():
     position_id = "entry-legacy-leg-side-close"
     truth = _truth(

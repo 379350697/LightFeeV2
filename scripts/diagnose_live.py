@@ -2725,13 +2725,17 @@ def _build_resolved_order_truth_gap_summary(
             "explicit_resolved_count": 0,
             "legacy_inferred_count": 0,
             "ledger_closed_legacy_inferred_count": 0,
+            "ledger_terminal_flat_legacy_inferred_count": 0,
             "resolved_identities": [],
             "explicit_resolved_identities": [],
             "legacy_inferred_identities": [],
             "ledger_closed_legacy_inferred_identities": [],
+            "ledger_terminal_flat_legacy_inferred_identities": [],
             "legacy_inferred_positions": [],
             "ledger_closed_legacy_inferred_positions": [],
+            "ledger_terminal_flat_legacy_inferred_positions": [],
             "ledger_closed_legacy_project_statuses": {},
+            "ledger_terminal_flat_legacy_project_statuses": {},
             "unresolved_count": 0,
             "unresolved_identities": [],
             "current_exchange_truth_clean": False,
@@ -2769,10 +2773,13 @@ def _build_resolved_order_truth_gap_summary(
     explicit_resolved: set[str] = set()
     legacy_inferred: set[str] = set()
     ledger_closed_legacy: set[str] = set()
+    ledger_terminal_flat_legacy: set[str] = set()
     unresolved: set[str] = set()
     legacy_positions: set[str] = set()
     ledger_closed_legacy_positions: set[str] = set()
+    ledger_terminal_flat_legacy_positions: set[str] = set()
     ledger_closed_legacy_project_statuses: dict[str, str] = {}
+    ledger_terminal_flat_legacy_project_statuses: dict[str, str] = {}
     matched_count = 0
     explicit_matched_count = 0
     legacy_matched_count = 0
@@ -2824,6 +2831,17 @@ def _build_resolved_order_truth_gap_summary(
                     ledger_closed_legacy_project_statuses[position_id] = (
                         project_status
                     )
+            elif _lifecycle_truth_terminal_flat_evidence_gap(ledger_truth):
+                ledger_terminal_flat_legacy.update(registered_identities)
+                ledger_terminal_flat_legacy.update(matched_resolution)
+                ledger_terminal_flat_legacy_positions.add(position_id)
+                project_status = str(
+                    ledger_truth.get("project_record_status") or ""
+                )
+                if project_status:
+                    ledger_terminal_flat_legacy_project_statuses[position_id] = (
+                        project_status
+                    )
             else:
                 legacy_matched_count += 1
                 legacy_inferred.update(registered_identities)
@@ -2836,16 +2854,28 @@ def _build_resolved_order_truth_gap_summary(
         "explicit_resolved_count": explicit_matched_count,
         "legacy_inferred_count": legacy_matched_count,
         "ledger_closed_legacy_inferred_count": len(ledger_closed_legacy_positions),
+        "ledger_terminal_flat_legacy_inferred_count": len(
+            ledger_terminal_flat_legacy_positions
+        ),
         "resolved_identities": sorted(resolved),
         "explicit_resolved_identities": sorted(explicit_resolved),
         "legacy_inferred_identities": sorted(legacy_inferred),
         "ledger_closed_legacy_inferred_identities": sorted(ledger_closed_legacy),
+        "ledger_terminal_flat_legacy_inferred_identities": sorted(
+            ledger_terminal_flat_legacy
+        ),
         "legacy_inferred_positions": sorted(legacy_positions),
         "ledger_closed_legacy_inferred_positions": sorted(
             ledger_closed_legacy_positions
         ),
+        "ledger_terminal_flat_legacy_inferred_positions": sorted(
+            ledger_terminal_flat_legacy_positions
+        ),
         "ledger_closed_legacy_project_statuses": dict(
             sorted(ledger_closed_legacy_project_statuses.items())
+        ),
+        "ledger_terminal_flat_legacy_project_statuses": dict(
+            sorted(ledger_terminal_flat_legacy_project_statuses.items())
         ),
         "unresolved_count": len(unresolved),
         "unresolved_identities": sorted(unresolved),
@@ -2885,6 +2915,28 @@ def _lifecycle_truth_exchange_complete(truth: dict[str, Any] | None) -> bool:
         isinstance(close_coverage.get(leg), dict)
         and close_coverage[leg].get("covered") is True
         for leg in ("long", "short")
+    )
+
+
+def _lifecycle_truth_terminal_flat_evidence_gap(
+    truth: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(truth, dict):
+        return False
+    if str(truth.get("classification") or "") != "evidence_incomplete":
+        return False
+    terminal_flat_truth = truth.get("terminal_flat_truth")
+    if not isinstance(terminal_flat_truth, dict):
+        return False
+    if terminal_flat_truth.get("available") is not True:
+        return False
+    if terminal_flat_truth.get("positions_flat") is not True:
+        return False
+    if terminal_flat_truth.get("open_orders_flat") is not True:
+        return False
+    return (
+        str(truth.get("project_record_status") or "")
+        == "terminal_flat_exchange_truth_accounting_gap"
     )
 
 
@@ -8337,6 +8389,17 @@ def _build_production_acceptance_gate(
     if ledger_closed_legacy_order_truth_gap_count:
         exception_conclusions["ledger_closed_legacy_truth_gap"] = (
             "closed_by_exchange_truth_ledger"
+        )
+    ledger_terminal_flat_legacy_order_truth_gap_count = int(
+        resolved_order_truth_gap_summary.get(
+            "ledger_terminal_flat_legacy_inferred_count",
+            0,
+        )
+        or 0
+    )
+    if ledger_terminal_flat_legacy_order_truth_gap_count:
+        exception_conclusions["ledger_terminal_flat_legacy_truth_gap"] = (
+            "terminal_flat_exchange_truth_ledger_evidence_gap"
         )
     if unresolved_order_truth_gap_count:
         exception_conclusions["unresolved_order_truth_gap"] = (

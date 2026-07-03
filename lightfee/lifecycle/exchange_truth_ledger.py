@@ -78,6 +78,7 @@ class _PositionFacts:
     fills: list[_FillFact] = field(default_factory=list)
     order_identities: list[JsonDict] = field(default_factory=list)
     funding_facts: list[JsonDict] = field(default_factory=list)
+    terminal_flat_truth: list[JsonDict] = field(default_factory=list)
 
 
 def build_exchange_truth_lifecycle(
@@ -98,6 +99,9 @@ def build_exchange_truth_lifecycle(
             continue
         facts = positions.setdefault(position_id, _PositionFacts(position_id=position_id))
         facts.event_kinds[kind] += 1
+        terminal_flat_truth = _terminal_flat_truth_from_payload(kind, payload, ts_ms)
+        if terminal_flat_truth is not None:
+            facts.terminal_flat_truth.append(terminal_flat_truth)
         if kind in {"entry.opened", "runtime.position_opened"}:
             facts.entry = _merge_entry_payload(facts.entry, payload, kind=kind)
             facts.entry_ts_ms = ts_ms or _first_int(
@@ -176,7 +180,14 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
     open_short_covered = bool(open_coverage["short"]["covered"])
     close_long_covered = bool(close_coverage["long"]["covered"])
     close_short_covered = bool(close_coverage["short"]["covered"])
-    project_status = _project_record_status(facts, open_coverage, close_coverage, explicit_zero_entry)
+    terminal_flat_truth = _latest_terminal_flat_truth(facts)
+    project_status = _project_record_status(
+        facts,
+        open_coverage,
+        close_coverage,
+        explicit_zero_entry,
+        terminal_flat_truth,
+    )
 
     if explicit_zero_entry and not any(fill.qty > 0 for fill in fills):
         classification = LifecycleClassification.PHANTOM_ZERO_QTY_OPENED.value
@@ -220,6 +231,7 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
         "close_coverage": close_coverage,
         "order_identity_history": facts.order_identities,
         "funding_facts": facts.funding_facts,
+        "terminal_flat_truth": terminal_flat_truth,
         "pnl": pnl,
         "source_coverage": {
             "event_kind_counts": dict(sorted(facts.event_kinds.items())),
@@ -1026,6 +1038,7 @@ def _project_record_status(
     open_coverage: dict[str, JsonDict],
     close_coverage: dict[str, JsonDict],
     explicit_zero_entry: bool,
+    terminal_flat_truth: JsonDict | None = None,
 ) -> str:
     if explicit_zero_entry and not facts.fills:
         return "phantom_zero_qty_project_opened_no_real_trade"
@@ -1040,7 +1053,58 @@ def _project_record_status(
         if open_complete and close_complete:
             return "legacy_exit_closed_project_record_gap"
         return "legacy_exit_closed_missing_exchange_fill_evidence"
+    if terminal_flat_truth:
+        return "terminal_flat_exchange_truth_accounting_gap"
     return "missing_exit_reconciliation"
+
+
+def _terminal_flat_truth_from_payload(
+    kind: str,
+    payload: JsonDict,
+    ts_ms: int,
+) -> JsonDict | None:
+    terminal_state = str(payload.get("terminal_state") or "").lower()
+    terminal_reason = str(payload.get("terminal_reason") or payload.get("reason") or "")
+    source = str(payload.get("source") or kind)
+    exchange_truth = payload.get("exchange_truth")
+    if not isinstance(exchange_truth, dict):
+        exchange_truth = {}
+    truth_available = bool(exchange_truth.get("truth_available") is True)
+    positions_flat = bool(exchange_truth.get("positions_flat") is True)
+    open_orders_flat = bool(exchange_truth.get("open_orders_flat") is True)
+    terminal_flat = (
+        terminal_state == "flat"
+        or kind in {
+            "exit.passive_close_fallback_terminal_flat",
+            "exit.passive_close_recovery_probe_flat",
+            "recovery.flat",
+        }
+    )
+    if not terminal_flat:
+        return None
+    if exchange_truth and not (truth_available and positions_flat and open_orders_flat):
+        return None
+    if not exchange_truth and kind == "runtime.position_lifecycle_terminal":
+        return None
+    return {
+        "available": True,
+        "kind": kind,
+        "ts_ms": ts_ms,
+        "source": source,
+        "terminal_state": terminal_state or "flat",
+        "terminal_reason": terminal_reason,
+        "truth_available": truth_available,
+        "positions_flat": positions_flat,
+        "open_orders_flat": open_orders_flat,
+        "long_venue": str(payload.get("long_venue") or payload.get("long_exchange") or ""),
+        "short_venue": str(payload.get("short_venue") or payload.get("short_exchange") or ""),
+    }
+
+
+def _latest_terminal_flat_truth(facts: _PositionFacts) -> JsonDict | None:
+    if not facts.terminal_flat_truth:
+        return None
+    return max(facts.terminal_flat_truth, key=lambda row: _first_int(row.get("ts_ms")))
 
 
 def _pnl_from_truth(

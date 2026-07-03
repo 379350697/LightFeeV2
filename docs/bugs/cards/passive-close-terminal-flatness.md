@@ -138,9 +138,15 @@ ask the unified exchange-truth lifecycle ledger before keeping
 both close legs cover the target quantity, the legacy gap is a closed
 project-record gap and belongs in `ledger_closed_legacy_inferred_*`. If the
 ledger lacks complete exchange fill evidence, keep the legacy-inferred
-fingerprint visible. Legacy `order.filled` events do not always carry
-`phase/source/tradeSide`; venue-normalized `leg+side` is enough to infer close
-phase (`long+sell`, `short+buy`) or open phase (`long+buy`, `short+sell`).
+fingerprint visible unless the ledger has terminal live-flat exchange truth. If
+the current event window only retains terminal exchange truth with
+positions-flat and open-orders-flat, classify it as
+`terminal_flat_exchange_truth_accounting_gap`, report it under
+`ledger_terminal_flat_legacy_inferred_*`, and keep it out of complete-PnL
+samples until exchange fill statements are present. Legacy `order.filled`
+events do not always carry `phase/source/tradeSide`; venue-normalized
+`leg+side` is enough to infer close phase (`long+sell`, `short+buy`) or open
+phase (`long+buy`, `short+sell`).
 
 For new recurrences, start from `lightfee/engine/business_contract.py` before
 adding another passive-close or diagnose-local terminality predicate.
@@ -265,6 +271,7 @@ not change live-flat, open-order, reduce-only cleanup, or fail-closed rules.
 | 2026-07-01 | deployment diagnostics close zero-fill summary | `a9269db` | deployed/cloud verified; normal maker-poll zero-fill and resolved-after-zero-fill are separated from unproductive zero-fill/fallback cost evidence | [daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure](../daily/2026-07-01.md#cluster-cl-143---deploy-diagnostics-entry-viability-and-historical-artifact-closure) |
 | 2026-07-01 | ACK-only close truth-gap explicit lifecycle follow-up | working tree | local verified; ACK-only close registers truth-gap work and resolves explicitly by fill proof or live-flat/open-orders-empty proof | [daily/2026-07-01.md#cluster-cl-144---ack-only-close-truth-gap-explicit-lifecycle-follow-up](../daily/2026-07-01.md#cluster-cl-144---ack-only-close-truth-gap-explicit-lifecycle-follow-up) |
 | 2026-07-03 | legacy close gap consumed by exchange-truth ledger | working tree | local verified; legacy `order.filled leg/side` close events feed the ledger, ledger-complete legacy truth gaps move to `ledger_closed_legacy_inferred_*`, while missing exchange-fill evidence still keeps `close_truth_gap_legacy_inferred` | [daily/2026-07-03.md#cluster-cl-147---diagnose-consumes-exchange-truth-ledger-for-legacy-close-gaps](../daily/2026-07-03.md#cluster-cl-147---diagnose-consumes-exchange-truth-ledger-for-legacy-close-gaps) |
+| 2026-07-03 | terminal-flat-only legacy close evidence gap | working tree | local verified; terminal exchange truth with flat positions/open-orders moves to `ledger_terminal_flat_legacy_inferred_*` without pretending to be complete accounting/PnL truth | [daily/2026-07-03.md#cluster-cl-148---terminal-flat-legacy-close-gap-into-exchange-truth-ledger](../daily/2026-07-03.md#cluster-cl-148---terminal-flat-legacy-close-gap-into-exchange-truth-ledger) |
 
 ## Regression Harness
 
