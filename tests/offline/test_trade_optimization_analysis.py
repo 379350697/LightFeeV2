@@ -861,4 +861,5 @@ def test_cli_history_all_prefilters_without_bulk_jsonl_loader(tmp_path: Path, mo
     assert event_filter["selected_event_count"] < event_filter["raw_event_count"]
     assert event_filter["market_event_count"] < len(noise_events)
     assert event_filter["counterfactual_event_count"] == 0
+    assert event_filter["raw_market_window_count"] > event_filter["market_window_count"]
     assert "entry-stream-LAB" in csv_path.read_text(encoding="utf-8")

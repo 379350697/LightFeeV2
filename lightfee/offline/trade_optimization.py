@@ -85,12 +85,15 @@ def read_trade_optimization_events(
             counterfactual_events.append(event)
             counterfactual_event_count += 1
 
+    raw_market_window_count = sum(len(windows) for windows in market_windows.values())
+    merged_market_windows = _merge_market_windows(market_windows)
+
     market_events: list[JsonDict] = []
     for event in iter_jsonl_events(paths):
         kind = str(event.get("kind") or "")
         if kind not in MARKET_SNAPSHOT_KINDS:
             continue
-        if _market_event_in_windows(event, market_windows):
+        if _market_event_in_windows(event, merged_market_windows):
             market_events.append(event)
 
     selected = sorted(
@@ -105,8 +108,9 @@ def read_trade_optimization_events(
         "market_event_count": len(market_events),
         "counterfactual_event_count": counterfactual_event_count,
         "position_count": len(position_ids),
-        "market_window_count": sum(len(windows) for windows in market_windows.values()),
-        "market_window_symbol_count": len(market_windows),
+        "raw_market_window_count": raw_market_window_count,
+        "market_window_count": sum(len(windows) for windows in merged_market_windows.values()),
+        "market_window_symbol_count": len(merged_market_windows),
     }
     return selected, event_filter
 
@@ -1310,6 +1314,32 @@ def _market_event_in_windows(
             if not required_venues or not venues or required_venues.intersection(venues):
                 return True
     return False
+
+
+def _merge_market_windows(
+    windows_by_symbol: dict[str, list[tuple[int, int, set[str]]]],
+) -> dict[str, list[tuple[int, int, set[str]]]]:
+    merged_by_symbol: dict[str, list[tuple[int, int, set[str]]]] = {}
+    for symbol, windows in windows_by_symbol.items():
+        if not windows:
+            continue
+        merged_rows: list[list[Any]] = []
+        for start_ms, end_ms, venues in sorted(windows, key=lambda row: (row[0], row[1])):
+            venue_set = set(venues)
+            if not merged_rows or start_ms > int(merged_rows[-1][1]):
+                merged_rows.append([int(start_ms), int(end_ms), venue_set])
+                continue
+            merged_rows[-1][1] = max(int(merged_rows[-1][1]), int(end_ms))
+            current_venues = merged_rows[-1][2]
+            if not current_venues or not venue_set:
+                merged_rows[-1][2] = set()
+            else:
+                current_venues.update(venue_set)
+        merged_by_symbol[symbol] = [
+            (int(start_ms), int(end_ms), set(venues))
+            for start_ms, end_ms, venues in merged_rows
+        ]
+    return merged_by_symbol
 
 
 def _event_symbols(payload: JsonDict) -> set[str]:
