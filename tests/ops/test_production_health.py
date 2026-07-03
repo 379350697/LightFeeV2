@@ -1166,6 +1166,18 @@ def test_deploy_systemd_templates_pass_contract():
     assert analyze_systemd_unit("lightfee-live.service", live).ok
 
 
+def test_trade_optimization_report_timer_is_six_hour_readonly_job():
+    service = Path("deploy/systemd/lightfee-trade-optimization-report.service").read_text()
+    timer = Path("deploy/systemd/lightfee-trade-optimization-report.timer").read_text()
+
+    assert "Type=oneshot" in service
+    assert "ExecStart=/opt/lightfee-v2/scripts/run_trade_optimization_report.sh" in service
+    assert "lightfee.apps.live" not in service
+    assert "OnUnitActiveSec=6h" in timer
+    assert "Persistent=true" in timer
+    assert "Unit=lightfee-trade-optimization-report.service" in timer
+
+
 def test_spread_sidecar_systemd_template_uses_module_entrypoint():
     text = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     assert ".venv/bin/python3 -m lightfee.apps.spread_sidecar" in text

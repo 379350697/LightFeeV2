@@ -37,9 +37,12 @@ CRITICAL_FILES = [
     "lightfee/engine/lifecycle.py",
     "lightfee/ops/production_health.py",
     "scripts/verify_production_services.py",
+    "scripts/run_trade_optimization_report.sh",
     "deploy/systemd/lightfee-live.service",
     "deploy/systemd/lightfee-sidecar.service",
     "deploy/systemd/lightfee-spread-sidecar.service",
+    "deploy/systemd/lightfee-trade-optimization-report.service",
+    "deploy/systemd/lightfee-trade-optimization-report.timer",
     "deploy/network/NetworkManager-lightfee-dns.conf",
 ]
 
@@ -269,6 +272,15 @@ REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 
+install_systemd_units() {{
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-sidecar.service" /etc/systemd/system/lightfee-sidecar.service
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-sidecar.service" /etc/systemd/system/lightfee-spread-sidecar.service
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-live.service" /etc/systemd/system/lightfee-live.service
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.service" /etc/systemd/system/lightfee-trade-optimization-report.service
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.timer" /etc/systemd/system/lightfee-trade-optimization-report.timer
+  chmod 0755 "$REMOTE_PATH/scripts/run_trade_optimization_report.sh"
+}}
+
 echo "=== Generating deploy manifest ==="
 python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
 
@@ -290,8 +302,11 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   cd "$REMOTE_PATH"
   env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"
 
+  echo "=== Installing systemd units ==="
+  install_systemd_units
+
   echo "=== Restarting production services ==="
-  systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
+  systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
 
   echo "=== Verifying production health ==="
   env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict
@@ -321,8 +336,11 @@ ssh $SSH_OPTS {remote_host} "cd {remote_path} && git_head=\\$(git -C {remote_pat
 echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
+echo "=== Installing systemd units ==="
+ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-sidecar.service /etc/systemd/system/lightfee-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-sidecar.service /etc/systemd/system/lightfee-spread-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-live.service /etc/systemd/system/lightfee-live.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.service /etc/systemd/system/lightfee-trade-optimization-report.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.timer /etc/systemd/system/lightfee-trade-optimization-report.timer && chmod 0755 {remote_path}/scripts/run_trade_optimization_report.sh"
+
 echo "=== Restarting production services ==="
-ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
+ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
 
 echo "=== Verifying production health ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"

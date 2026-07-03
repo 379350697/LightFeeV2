@@ -1,0 +1,13 @@
+[Unit]
+Description=Run LightFee V2 trade optimization offline report every 6 hours
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+AccuracySec=5min
+RandomizedDelaySec=5min
+Persistent=true
+Unit=lightfee-trade-optimization-report.service
+
+[Install]
+WantedBy=timers.target
