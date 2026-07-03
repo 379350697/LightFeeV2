@@ -858,6 +858,8 @@ def test_cli_history_all_prefilters_without_bulk_jsonl_loader(tmp_path: Path, mo
     event_filter = payload["inputs"]["event_filter"]
     assert payload["summary"]["normal_sample_count"] == 1
     assert event_filter["raw_event_count"] == len(sample_events) + len(noise_events)
+    assert event_filter["first_pass_parsed_event_count"] < event_filter["raw_event_count"]
+    assert event_filter["market_pass_parsed_event_count"] < event_filter["raw_event_count"]
     assert event_filter["selected_event_count"] < event_filter["raw_event_count"]
     assert event_filter["market_event_count"] < len(noise_events)
     assert event_filter["counterfactual_event_count"] == 0

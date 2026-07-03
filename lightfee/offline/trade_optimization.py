@@ -25,6 +25,15 @@ DEFAULT_MARKET_MATCH_WINDOW_MS = 300_000
 
 
 def iter_jsonl_events(paths: list[Path]) -> Iterator[JsonDict]:
+    yield from _iter_jsonl_events_with_line_filter(paths)
+
+
+def _iter_jsonl_events_with_line_filter(
+    paths: list[Path],
+    *,
+    line_filter: Any | None = None,
+    stats: JsonDict | None = None,
+) -> Iterator[JsonDict]:
     for path in paths:
         if not path.exists():
             continue
@@ -33,11 +42,21 @@ def iter_jsonl_events(paths: list[Path]) -> Iterator[JsonDict]:
                 line = line.strip()
                 if not line:
                     continue
+                if stats is not None:
+                    stats["raw_line_count"] = int(stats.get("raw_line_count") or 0) + 1
+                if line_filter is not None and not line_filter(line):
+                    if stats is not None:
+                        stats["line_filtered_count"] = int(stats.get("line_filtered_count") or 0) + 1
+                    continue
                 try:
                     record = json.loads(line)
                 except Exception:
+                    if stats is not None:
+                        stats["json_error_count"] = int(stats.get("json_error_count") or 0) + 1
                     continue
                 if isinstance(record, dict):
+                    if stats is not None:
+                        stats["parsed_event_count"] = int(stats.get("parsed_event_count") or 0) + 1
                     yield record
 
 
@@ -62,12 +81,18 @@ def read_trade_optimization_events(
     counterfactual_events: list[JsonDict] = []
     market_windows: dict[str, list[tuple[int, int, set[str]]]] = defaultdict(list)
     position_ids: set[str] = set()
-    raw_event_count = 0
     position_event_count = 0
     counterfactual_event_count = 0
+    first_pass_stats: JsonDict = {}
+    first_pass_filter = _line_contains_any(
+        _first_pass_line_tokens(include_counterfactual=include_counterfactual)
+    )
 
-    for event in iter_jsonl_events(paths):
-        raw_event_count += 1
+    for event in _iter_jsonl_events_with_line_filter(
+        paths,
+        line_filter=first_pass_filter,
+        stats=first_pass_stats,
+    ):
         kind = str(event.get("kind") or "")
         payload = _payload(event)
         if _is_trade_position_event(kind, payload):
@@ -89,12 +114,21 @@ def read_trade_optimization_events(
     merged_market_windows = _merge_market_windows(market_windows)
 
     market_events: list[JsonDict] = []
-    for event in iter_jsonl_events(paths):
-        kind = str(event.get("kind") or "")
-        if kind not in MARKET_SNAPSHOT_KINDS:
-            continue
-        if _market_event_in_windows(event, merged_market_windows):
-            market_events.append(event)
+    market_pass_stats: JsonDict = {}
+    if merged_market_windows:
+        market_pass_filter = _line_contains_market_snapshot_for_symbols(
+            set(merged_market_windows)
+        )
+        for event in _iter_jsonl_events_with_line_filter(
+            paths,
+            line_filter=market_pass_filter,
+            stats=market_pass_stats,
+        ):
+            kind = str(event.get("kind") or "")
+            if kind not in MARKET_SNAPSHOT_KINDS:
+                continue
+            if _market_event_in_windows(event, merged_market_windows):
+                market_events.append(event)
 
     selected = sorted(
         selected_events + market_events + counterfactual_events,
@@ -102,8 +136,14 @@ def read_trade_optimization_events(
     )
     event_filter = {
         "enabled": True,
-        "raw_event_count": raw_event_count,
+        "raw_event_count": int(first_pass_stats.get("raw_line_count") or 0),
         "selected_event_count": len(selected),
+        "first_pass_parsed_event_count": int(first_pass_stats.get("parsed_event_count") or 0),
+        "first_pass_line_filtered_count": int(first_pass_stats.get("line_filtered_count") or 0),
+        "first_pass_json_error_count": int(first_pass_stats.get("json_error_count") or 0),
+        "market_pass_parsed_event_count": int(market_pass_stats.get("parsed_event_count") or 0),
+        "market_pass_line_filtered_count": int(market_pass_stats.get("line_filtered_count") or 0),
+        "market_pass_json_error_count": int(market_pass_stats.get("json_error_count") or 0),
         "position_event_count": position_event_count,
         "market_event_count": len(market_events),
         "counterfactual_event_count": counterfactual_event_count,
@@ -1273,6 +1313,37 @@ def _is_trade_position_event(kind: str, payload: JsonDict) -> bool:
     if kind == "accounting.lifecycle_truth_rebuilt" and isinstance(payload.get("truth"), dict):
         return True
     return False
+
+
+def _first_pass_line_tokens(*, include_counterfactual: bool) -> tuple[str, ...]:
+    tokens = [
+        '"position_id"',
+        '"entry_id"',
+        '"accounting.lifecycle_truth_rebuilt"',
+    ]
+    if include_counterfactual:
+        tokens.append('"execution.entry_selected"')
+    return tuple(tokens)
+
+
+def _line_contains_any(tokens: tuple[str, ...]) -> Any:
+    def _matches(line: str) -> bool:
+        return any(token in line for token in tokens)
+
+    return _matches
+
+
+def _line_contains_market_snapshot_for_symbols(symbols: set[str]) -> Any:
+    symbol_tokens = tuple(sorted(symbols))
+    kind_tokens = tuple(f'"{kind}"' for kind in sorted(MARKET_SNAPSHOT_KINDS))
+
+    def _matches(line: str) -> bool:
+        return (
+            any(kind in line for kind in kind_tokens)
+            and any(symbol in line for symbol in symbol_tokens)
+        )
+
+    return _matches
 
 
 def _add_market_windows_from_event(
