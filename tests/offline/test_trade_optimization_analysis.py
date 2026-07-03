@@ -770,3 +770,95 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
     assert payload["summary"]["normal_sample_count"] == 1
     assert "entry-cli-LAB" in csv_path.read_text(encoding="utf-8")
     assert "Trade Optimization Sample Report" in report_path.read_text(encoding="utf-8")
+
+
+def test_cli_history_all_prefilters_without_bulk_jsonl_loader(tmp_path: Path, monkeypatch):
+    import scripts.analyze_trade_optimization_samples as cli
+
+    runtime_dir = tmp_path / "runtime"
+    archive_dir = runtime_dir / "archive"
+    archive_dir.mkdir(parents=True)
+    events_path = runtime_dir / "live-events.jsonl"
+    archive_path = archive_dir / "live-events-archive.jsonl"
+
+    sample_events = _complete_exchange_sample_events(
+        position_id="entry-stream-LAB",
+        symbol="LABUSDT",
+        long_venue="bitget",
+        short_venue="okx",
+        ts_base=1_000_000,
+        quantity="2",
+        include_market=True,
+    )
+    noise_events = [
+        _event(
+            2_000_000 + idx,
+            "runtime.snapshot_freshness_decision",
+            {
+                "symbol": f"NOISE{idx}USDT",
+                "venue": "okx",
+                "bid_price": "1",
+                "ask_price": "1.01",
+            },
+        )
+        for idx in range(500)
+    ]
+    noise_events.extend(
+        _event(
+            3_000_000 + idx,
+            "review.candidate_shortlisted",
+            {
+                "symbol": f"NOISE{idx}USDT",
+                "long_venue": "bitget",
+                "short_venue": "okx",
+                "selected_edge_bps": "10",
+            },
+        )
+        for idx in range(500)
+    )
+    events_path.write_text(
+        "\n".join(json.dumps(event) for event in sample_events),
+        encoding="utf-8",
+    )
+    archive_path.write_text(
+        "\n".join(json.dumps(event) for event in noise_events),
+        encoding="utf-8",
+    )
+
+    def _fail_bulk_loader(_paths: list[Path]) -> list[dict]:
+        raise AssertionError("CLI must not bulk-load full history JSONL")
+
+    monkeypatch.setattr(cli, "read_jsonl_events", _fail_bulk_loader, raising=False)
+
+    json_path = tmp_path / "latest.json"
+    csv_path = tmp_path / "samples.csv"
+    report_path = tmp_path / "report.md"
+
+    assert (
+        cli.main(
+            [
+                "--runtime-dir",
+                str(runtime_dir),
+                "--history",
+                "all",
+                "--normal-only",
+                "--include-counterfactual",
+                "--json",
+                str(json_path),
+                "--csv",
+                str(csv_path),
+                "--report-md",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    event_filter = payload["inputs"]["event_filter"]
+    assert payload["summary"]["normal_sample_count"] == 1
+    assert event_filter["raw_event_count"] == len(sample_events) + len(noise_events)
+    assert event_filter["selected_event_count"] < event_filter["raw_event_count"]
+    assert event_filter["market_event_count"] < len(noise_events)
+    assert event_filter["counterfactual_event_count"] == 0
+    assert "entry-stream-LAB" in csv_path.read_text(encoding="utf-8")

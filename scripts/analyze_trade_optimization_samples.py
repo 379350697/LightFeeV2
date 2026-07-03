@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from lightfee.offline.trade_optimization import (  # noqa: E402
     build_trade_optimization_analysis,
-    read_jsonl_events,
+    read_trade_optimization_events,
     render_markdown_report,
     sample_rows_for_csv,
 )
@@ -114,7 +114,11 @@ def main(argv: list[str] | None = None) -> int:
     event_files = list(args.events)
     if not event_files:
         event_files = discover_event_files(args.runtime_dir, args.history)
-    events = read_jsonl_events(event_files)
+    events, event_filter = read_trade_optimization_events(
+        event_files,
+        include_counterfactual=bool(args.include_counterfactual),
+        market_match_window_ms=int(args.market_match_window_ms),
+    )
     report = build_trade_optimization_analysis(
         events,
         normal_only=bool(args.normal_only),
@@ -125,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_dir": str(args.runtime_dir),
         "history": args.history,
         "event_files": [str(path) for path in event_files],
+        "event_filter": event_filter,
     }
 
     if args.json_path:

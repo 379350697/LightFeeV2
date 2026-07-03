@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from lightfee.lifecycle.exchange_truth_ledger import (
     LifecycleClassification,
@@ -20,12 +20,11 @@ MARKET_SNAPSHOT_KINDS = {
     "runtime.snapshot_freshness_decision",
     "runtime.entry_quote_evidence_resolved_by_ws_bbo",
 }
-COUNTERFACTUAL_KINDS = {"execution.entry_selected", "review.candidate_shortlisted"}
+COUNTERFACTUAL_KINDS = {"execution.entry_selected"}
 DEFAULT_MARKET_MATCH_WINDOW_MS = 300_000
 
 
-def read_jsonl_events(paths: list[Path]) -> list[JsonDict]:
-    events: list[JsonDict] = []
+def iter_jsonl_events(paths: list[Path]) -> Iterator[JsonDict]:
     for path in paths:
         if not path.exists():
             continue
@@ -39,8 +38,77 @@ def read_jsonl_events(paths: list[Path]) -> list[JsonDict]:
                 except Exception:
                     continue
                 if isinstance(record, dict):
-                    events.append(record)
-    return events
+                    yield record
+
+
+def read_jsonl_events(paths: list[Path]) -> list[JsonDict]:
+    return list(iter_jsonl_events(paths))
+
+
+def read_trade_optimization_events(
+    paths: list[Path],
+    *,
+    include_counterfactual: bool = False,
+    market_match_window_ms: int = DEFAULT_MARKET_MATCH_WINDOW_MS,
+) -> tuple[list[JsonDict], JsonDict]:
+    """Read only the event subset needed for historical trade optimization.
+
+    Full production history can contain very large quote/snapshot noise. The
+    optimizer only needs position-scoped lifecycle/accounting evidence plus
+    market snapshots near the observed lifecycle timestamps.
+    """
+
+    selected_events: list[JsonDict] = []
+    counterfactual_events: list[JsonDict] = []
+    market_windows: dict[str, list[tuple[int, int, set[str]]]] = defaultdict(list)
+    position_ids: set[str] = set()
+    raw_event_count = 0
+    position_event_count = 0
+    counterfactual_event_count = 0
+
+    for event in iter_jsonl_events(paths):
+        raw_event_count += 1
+        kind = str(event.get("kind") or "")
+        payload = _payload(event)
+        if _is_trade_position_event(kind, payload):
+            selected_events.append(event)
+            position_event_count += 1
+            position_id = _position_id(payload)
+            if position_id:
+                position_ids.add(position_id)
+            _add_market_windows_from_event(
+                market_windows,
+                event,
+                market_match_window_ms=market_match_window_ms,
+            )
+        elif include_counterfactual and kind in COUNTERFACTUAL_KINDS:
+            counterfactual_events.append(event)
+            counterfactual_event_count += 1
+
+    market_events: list[JsonDict] = []
+    for event in iter_jsonl_events(paths):
+        kind = str(event.get("kind") or "")
+        if kind not in MARKET_SNAPSHOT_KINDS:
+            continue
+        if _market_event_in_windows(event, market_windows):
+            market_events.append(event)
+
+    selected = sorted(
+        selected_events + market_events + counterfactual_events,
+        key=_event_ts_ms,
+    )
+    event_filter = {
+        "enabled": True,
+        "raw_event_count": raw_event_count,
+        "selected_event_count": len(selected),
+        "position_event_count": position_event_count,
+        "market_event_count": len(market_events),
+        "counterfactual_event_count": counterfactual_event_count,
+        "position_count": len(position_ids),
+        "market_window_count": sum(len(windows) for windows in market_windows.values()),
+        "market_window_symbol_count": len(market_windows),
+    }
+    return selected, event_filter
 
 
 def build_trade_optimization_analysis(
@@ -1193,6 +1261,125 @@ def _is_execution_event_kind(kind: str) -> bool:
         or kind.startswith("runtime.entry_post_only")
         or kind in {"order.rejected", "order.uncertain"}
     )
+
+
+def _is_trade_position_event(kind: str, payload: JsonDict) -> bool:
+    if _position_id(payload):
+        return True
+    if kind == "accounting.lifecycle_truth_rebuilt" and isinstance(payload.get("truth"), dict):
+        return True
+    return False
+
+
+def _add_market_windows_from_event(
+    windows_by_symbol: dict[str, list[tuple[int, int, set[str]]]],
+    event: JsonDict,
+    *,
+    market_match_window_ms: int,
+) -> None:
+    ts_ms = _event_ts_ms(event)
+    if ts_ms <= 0:
+        return
+    payload = _payload(event)
+    symbols = _event_symbols(payload)
+    if not symbols:
+        return
+    venues = _event_venues(payload)
+    start_ms = max(0, ts_ms - max(0, int(market_match_window_ms)))
+    end_ms = ts_ms + max(0, int(market_match_window_ms))
+    for symbol in symbols:
+        windows_by_symbol[symbol].append((start_ms, end_ms, venues))
+
+
+def _market_event_in_windows(
+    event: JsonDict,
+    windows_by_symbol: dict[str, list[tuple[int, int, set[str]]]],
+) -> bool:
+    ts_ms = _event_ts_ms(event)
+    if ts_ms <= 0:
+        return False
+    payload = _payload(event)
+    symbols = _event_symbols(payload)
+    if not symbols:
+        return False
+    venues = _event_venues(payload)
+    for symbol in symbols:
+        for start_ms, end_ms, required_venues in windows_by_symbol.get(symbol, []):
+            if ts_ms < start_ms or ts_ms > end_ms:
+                continue
+            if not required_venues or not venues or required_venues.intersection(venues):
+                return True
+    return False
+
+
+def _event_symbols(payload: JsonDict) -> set[str]:
+    values: list[Any] = [
+        payload.get("symbol"),
+        payload.get("instId"),
+        payload.get("instrument_id"),
+    ]
+    truth = payload.get("truth")
+    if isinstance(truth, dict):
+        values.append(truth.get("symbol"))
+    return {
+        _canonical_symbol(value)
+        for value in values
+        if _canonical_symbol(value)
+    }
+
+
+def _event_venues(payload: JsonDict) -> set[str]:
+    values: list[Any] = [
+        payload.get("venue"),
+        payload.get("exchange"),
+        payload.get("long_venue"),
+        payload.get("short_venue"),
+        payload.get("long_exchange"),
+        payload.get("short_exchange"),
+        payload.get("maker_venue"),
+        payload.get("hedge_venue"),
+        payload.get("maker_exchange"),
+        payload.get("hedge_exchange"),
+    ]
+    values.extend(_venue_values_from_rows(payload.get("long_legs")))
+    values.extend(_venue_values_from_rows(payload.get("short_legs")))
+    values.extend(_venue_values_from_rows(payload.get("statement_probe_candidates")))
+    truth = payload.get("truth")
+    if isinstance(truth, dict):
+        values.extend(
+            [
+                truth.get("long_venue"),
+                truth.get("short_venue"),
+                truth.get("long_exchange"),
+                truth.get("short_exchange"),
+            ]
+        )
+        values.extend(_venue_values_from_rows(truth.get("open_legs")))
+        values.extend(_venue_values_from_rows(truth.get("close_legs")))
+    return {
+        _canonical_venue(value)
+        for value in values
+        if _canonical_venue(value)
+    }
+
+
+def _venue_values_from_rows(rows: Any) -> Iterable[Any]:
+    if not isinstance(rows, list):
+        return []
+    values: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        values.extend([row.get("venue"), row.get("exchange")])
+    return values
+
+
+def _canonical_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _canonical_venue(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _payload(event: JsonDict) -> JsonDict:
