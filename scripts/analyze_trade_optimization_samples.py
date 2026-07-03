@@ -48,6 +48,7 @@ CSV_COLUMNS = [
     "exit_fee_quote",
     "rebate_adjustment_quote",
     "net_pnl_quote",
+    "pnl_notional_quote",
     "net_pnl_bps",
     "close_path",
     "entry_spread_bps",

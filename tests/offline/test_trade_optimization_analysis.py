@@ -349,15 +349,163 @@ def test_market_coverage_gaps_are_reported_as_insufficient_evidence():
 
     report = build_trade_optimization_analysis(events, normal_only=True)
 
-    sample = report["samples"][0]
-    assert "missing_entry_market_snapshot" in sample["coverage_gaps"]
-    coverage_review = next(
-        item
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["field_gap_excluded_count"] == 1
+    assert report["summary"]["required_field_gap_count"] == 2
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_market_gap"
+    assert excluded["field_gaps"] == [
+        "missing_entry_market_snapshot",
+        "missing_exit_market_snapshot",
+    ]
+    assert not any(
+        item["kind"] == "market_data_coverage_gap"
         for item in report["recommendations"]
-        if item["kind"] == "market_data_coverage_gap"
     )
-    assert coverage_review["evidence_tier"] == "insufficient_evidence"
-    assert coverage_review["action_mode"] == "observe_only"
+
+
+def test_close_ws_bbo_evidence_supplies_exit_market_snapshot():
+    events = _complete_exchange_sample_events(
+        position_id="entry-close-bbo-LAB",
+        include_market=False,
+    )
+    events.extend(
+        [
+            _event(
+                100_050,
+                "runtime.snapshot_freshness_decision",
+                {
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "best_bid": "99.90",
+                    "best_ask": "100.10",
+                    "bid_size": "200",
+                    "ask_size": "180",
+                    "open_interest": "2500000",
+                    "volume_24h": "9000000",
+                    "freshness_status": "current_ok",
+                },
+            ),
+            _event(
+                129_950,
+                "runtime.close_price_evidence_ws_bbo_used",
+                {
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "source": "ws_bbo_cache",
+                    "bid": "98.90",
+                    "ask": "99.10",
+                    "mid": "99.00",
+                    "observed_at_ms": 129_900,
+                    "age_ms": 50,
+                    "decision": "use_price_hint",
+                },
+            ),
+        ]
+    )
+
+    report = build_trade_optimization_analysis(
+        events,
+        normal_only=True,
+        market_match_window_ms=1_000,
+    )
+
+    assert report["summary"]["normal_sample_count"] == 1
+    assert report["summary"]["field_gap_excluded_count"] == 0
+    sample = report["samples"][0]
+    assert sample["market"]["exit_snapshot"]["source_kind"] == (
+        "runtime.close_price_evidence_ws_bbo_used"
+    )
+    assert sample["market"]["exit_snapshot"]["bid_price"] == "98.9"
+    assert "missing_exit_market_snapshot" not in sample["coverage_gaps"]
+
+
+def test_close_ws_bbo_evidence_cannot_backfill_entry_market_snapshot():
+    events = _complete_exchange_sample_events(
+        position_id="entry-close-only-LAB",
+        include_market=False,
+    )
+    events.append(
+        _event(
+            129_950,
+            "runtime.close_price_evidence_ws_bbo_used",
+            {
+                "symbol": "LABUSDT",
+                "venue": "bitget",
+                "source": "ws_bbo_cache",
+                "bid": "98.90",
+                "ask": "99.10",
+                "decision": "use_price_hint",
+            },
+        )
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["field_gap_excluded_count"] == 1
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_market_gap"
+    assert excluded["field_gaps"] == ["missing_entry_market_snapshot"]
+
+
+def test_close_stale_evidence_is_diagnostic_only_not_market_snapshot():
+    events = _complete_exchange_sample_events(
+        position_id="entry-close-stale-LAB",
+        include_market=False,
+    )
+    events.extend(
+        [
+            _event(
+                100_050,
+                "runtime.snapshot_freshness_decision",
+                {
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "best_bid": "99.90",
+                    "best_ask": "100.10",
+                    "freshness_status": "current_ok",
+                },
+            ),
+            _event(
+                129_950,
+                "runtime.close_price_evidence_stale",
+                {
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "age_ms": 10_000,
+                    "decision": "reject_price_hint",
+                },
+            ),
+        ]
+    )
+
+    report = build_trade_optimization_analysis(
+        events,
+        normal_only=True,
+        market_match_window_ms=1_000,
+    )
+
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["field_gap_excluded_count"] == 1
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_market_gap"
+    assert excluded["field_gaps"] == ["missing_exit_market_snapshot"]
+
+
+def test_missing_required_pnl_notional_excludes_complete_lifecycle_sample():
+    events = _complete_exchange_sample_events(
+        position_id="entry-missing-notional-LAB",
+        entry_price="0",
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["field_gap_excluded_count"] == 1
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_required_field_gap"
+    assert excluded["field_gaps"] == ["missing_required_pnl_field:notional_quote"]
 
 
 def test_legacy_exit_closed_requires_full_qty_and_close_fill_evidence():
@@ -374,6 +522,32 @@ def test_legacy_exit_closed_requires_full_qty_and_close_fill_evidence():
                 "long_entry_price": 1.00,
                 "short_entry_price": 1.01,
                 "entry_fee_quote": "0.01",
+                "funding_ts": 61_000,
+            },
+        ),
+        _event(
+            4_900,
+            "runtime.snapshot_freshness_decision",
+            {
+                "symbol": "TAIKOUSDT",
+                "venue": "bybit",
+                "best_bid": 0.999,
+                "best_ask": 1.001,
+                "bid_size": 1000,
+                "ask_size": 900,
+                "freshness_status": "current_ok",
+            },
+        ),
+        _event(
+            5_150,
+            "runtime.close_price_evidence_ws_bbo_used",
+            {
+                "symbol": "TAIKOUSDT",
+                "venue": "bybit",
+                "bid": 1.019,
+                "ask": 1.021,
+                "source": "ws_bbo_cache",
+                "decision": "use_price_hint",
             },
         ),
         _event(
@@ -577,6 +751,7 @@ def test_sidecar_liquidity_snapshot_fields_are_preserved():
                 "short_venue": "okx",
                 "long_entry_price": 12,
                 "short_entry_price": 12,
+                "funding_ts": 70_000,
             },
         ),
         _event(
@@ -681,6 +856,30 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
                 "short_venue": "okx",
                 "long_entry_price": 10,
                 "short_entry_price": 10,
+                "funding_ts": 61_000,
+            },
+        ),
+        _event(
+            1_100,
+            "runtime.snapshot_freshness_decision",
+            {
+                "symbol": "LABUSDT",
+                "venue": "bitget",
+                "best_bid": 9.99,
+                "best_ask": 10.01,
+                "freshness_status": "current_ok",
+            },
+        ),
+        _event(
+            1_950,
+            "runtime.close_price_evidence_ws_bbo_used",
+            {
+                "symbol": "LABUSDT",
+                "venue": "bitget",
+                "bid": 10.49,
+                "ask": 10.51,
+                "source": "ws_bbo_cache",
+                "decision": "use_price_hint",
             },
         ),
         _event(
@@ -756,6 +955,8 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
             "all",
             "--normal-only",
             "--include-counterfactual",
+            "--market-match-window-ms",
+            "100",
             "--json",
             str(json_path),
             "--csv",
@@ -768,7 +969,12 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["summary"]["normal_sample_count"] == 1
-    assert "entry-cli-LAB" in csv_path.read_text(encoding="utf-8")
+    assert payload["samples"][0]["market"]["exit_snapshot"]["source_kind"] == (
+        "runtime.close_price_evidence_ws_bbo_used"
+    )
+    csv_text = csv_path.read_text(encoding="utf-8")
+    assert "pnl_notional_quote" in csv_text.splitlines()[0]
+    assert "entry-cli-LAB" in csv_text
     assert "Trade Optimization Sample Report" in report_path.read_text(encoding="utf-8")
 
 

@@ -16,12 +16,29 @@ from lightfee.lifecycle.exchange_truth_ledger import (
 
 JsonDict = dict[str, Any]
 
-MARKET_SNAPSHOT_KINDS = {
+ENTRY_MARKET_SNAPSHOT_KINDS = {
     "runtime.snapshot_freshness_decision",
     "runtime.entry_quote_evidence_resolved_by_ws_bbo",
 }
+EXIT_MARKET_SNAPSHOT_KINDS = {
+    "runtime.snapshot_freshness_decision",
+    "runtime.close_price_evidence_ws_bbo_used",
+    "runtime.close_price_evidence_ws_rewarm_succeeded",
+    "runtime.close_price_evidence_rest_rewarm_succeeded",
+}
+MARKET_SNAPSHOT_KINDS = ENTRY_MARKET_SNAPSHOT_KINDS | EXIT_MARKET_SNAPSHOT_KINDS
 COUNTERFACTUAL_KINDS = {"execution.entry_selected"}
 DEFAULT_MARKET_MATCH_WINDOW_MS = 300_000
+REQUIRED_PNL_FIELDS = (
+    "price_pnl_quote",
+    "funding_pnl_quote",
+    "entry_fee_quote",
+    "exit_fee_quote",
+    "rebate_adjustment_quote",
+    "net_pnl_quote",
+    "notional_quote",
+)
+FIELD_GAP_REASON_DELIMITER = "::field_gaps="
 
 
 def iter_jsonl_events(paths: list[Path]) -> Iterator[JsonDict]:
@@ -243,6 +260,12 @@ def build_trade_optimization_analysis(
             "normal_sample_count": len(samples),
             "excluded_position_count": len(excluded),
             "coverage_gap_count": sum(len(sample["coverage_gaps"]) for sample in samples),
+            "field_gap_excluded_count": sum(
+                1 for row in excluded if row.get("field_gaps")
+            ),
+            "required_field_gap_count": sum(
+                len(row.get("field_gaps") or []) for row in excluded
+            ),
             "normal_only": normal_only,
             "include_counterfactual": include_counterfactual,
             "lifecycle_truth_summary": lifecycle_report.get("summary", {}),
@@ -298,6 +321,7 @@ def sample_rows_for_csv(report: JsonDict) -> list[JsonDict]:
                 "exit_fee_quote": pnl.get("exit_fee_quote"),
                 "rebate_adjustment_quote": pnl.get("rebate_adjustment_quote"),
                 "net_pnl_quote": pnl.get("net_pnl_quote"),
+                "pnl_notional_quote": pnl.get("notional_quote"),
                 "net_pnl_bps": pnl.get("net_pnl_bps"),
                 "close_path": execution.get("close_path"),
                 "entry_spread_bps": features.get("entry_spread_bps")
@@ -324,6 +348,8 @@ def render_markdown_report(report: JsonDict) -> str:
         f"- Normal samples: {summary.get('normal_sample_count', 0)}",
         f"- Excluded positions: {summary.get('excluded_position_count', 0)}",
         f"- Coverage gaps: {summary.get('coverage_gap_count', 0)}",
+        f"- Field-gap excluded positions: {summary.get('field_gap_excluded_count', 0)}",
+        f"- Required field gaps: {summary.get('required_field_gap_count', 0)}",
         "",
         "## By Symbol",
         "",
@@ -464,26 +490,32 @@ def _build_position_sample(
     if features.get("time_to_funding_ms") is None:
         coverage_gaps.append("missing_time_to_funding")
 
-    return (
-        {
-            "position_id": position_id,
-            "symbol": str(entry.get("symbol") or exit_payload.get("symbol") or "").upper(),
-            "long_venue": long_venue,
-            "short_venue": short_venue,
-            "route": f"{long_venue}->{short_venue}",
-            "open_ts_ms": open_ts_ms,
-            "close_ts_ms": close_ts_ms,
-            "normality_source": exit_source,
-            "verification_status": verification_status,
-            "pnl": pnl,
-            "features": features,
-            "market": market,
-            "execution": execution,
-            "exit_shadow": shadow,
-            "coverage_gaps": sorted(set(coverage_gaps)),
-        },
-        None,
-    )
+    sample = {
+        "position_id": position_id,
+        "symbol": str(entry.get("symbol") or exit_payload.get("symbol") or "").upper(),
+        "long_venue": long_venue,
+        "short_venue": short_venue,
+        "route": f"{long_venue}->{short_venue}",
+        "open_ts_ms": open_ts_ms,
+        "close_ts_ms": close_ts_ms,
+        "normality_source": exit_source,
+        "verification_status": verification_status,
+        "pnl": pnl,
+        "features": features,
+        "market": market,
+        "execution": execution,
+        "exit_shadow": shadow,
+        "coverage_gaps": sorted(set(coverage_gaps)),
+    }
+    required_field_gaps = _required_sample_field_gaps(sample)
+    if required_field_gaps:
+        reason = (
+            "lifecycle_complete_market_gap"
+            if any(gap.endswith("_market_snapshot") for gap in required_field_gaps)
+            else "lifecycle_complete_required_field_gap"
+        )
+        return None, _field_gap_exclusion_reason(reason, required_field_gaps)
+    return sample, None
 
 
 def _select_verified_exit(position: JsonDict) -> tuple[str, JsonDict | None, str, str | None]:
@@ -574,6 +606,7 @@ def _pnl_label_from_lifecycle_truth(payload: JsonDict) -> JsonDict:
             _decimal(payload.get("rebate_adjustment_quote"))
         ),
         "net_pnl_quote": _decimal_str(_decimal(payload.get("net_pnl_quote"))),
+        "notional_quote": _decimal_str(_decimal(payload.get("notional_quote"))),
         "net_pnl_bps": _decimal_str(_decimal(payload.get("net_pnl_bps"))),
         "evidence_refs": list(payload.get("evidence_refs") or []),
     }
@@ -645,6 +678,7 @@ def _pnl_label(payload: JsonDict, *, notional: Decimal) -> JsonDict:
         "exit_fee_quote": _decimal_str(exit_fee),
         "rebate_adjustment_quote": _decimal_str(adjustment),
         "net_pnl_quote": _decimal_str(net),
+        "notional_quote": _decimal_str(notional),
         "net_pnl_bps": _decimal_str(net_bps),
         "evidence_refs": _pnl_evidence_refs(payload),
     }
@@ -731,6 +765,7 @@ def _market_context(
     gaps: list[str] = []
     entry_snapshot = _nearest_market_snapshot(
         market_events,
+        phase="entry",
         symbol=symbol,
         venues=venues,
         target_ts_ms=open_ts_ms,
@@ -738,6 +773,7 @@ def _market_context(
     )
     exit_snapshot = _nearest_market_snapshot(
         market_events,
+        phase="exit",
         symbol=symbol,
         venues=venues,
         target_ts_ms=close_ts_ms,
@@ -753,9 +789,52 @@ def _market_context(
     }, gaps
 
 
+def _required_sample_field_gaps(sample: JsonDict) -> list[str]:
+    gaps: list[str] = []
+    pnl = sample.get("pnl") if isinstance(sample.get("pnl"), dict) else {}
+    for field in REQUIRED_PNL_FIELDS:
+        value = pnl.get(field)
+        if value is None or value == "":
+            gaps.append(f"missing_required_pnl_field:{field}")
+            continue
+        if field == "notional_quote" and _decimal(value) <= 0:
+            gaps.append(f"missing_required_pnl_field:{field}")
+    refs = pnl.get("evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        gaps.append("missing_required_pnl_field:evidence_refs")
+
+    market = sample.get("market") if isinstance(sample.get("market"), dict) else {}
+    for label in ("entry", "exit"):
+        snapshot = market.get(f"{label}_snapshot")
+        if not _market_snapshot_has_quote(snapshot):
+            gaps.append(f"missing_{label}_market_snapshot")
+    if "missing_time_to_funding" in set(sample.get("coverage_gaps") or []):
+        gaps.append("missing_time_to_funding")
+    return sorted(set(gaps))
+
+
+def _field_gap_exclusion_reason(reason: str, gaps: list[str]) -> str:
+    return f"{reason}{FIELD_GAP_REASON_DELIMITER}{','.join(sorted(set(gaps)))}"
+
+
+def _split_field_gap_exclusion_reason(reason: str) -> tuple[str, list[str]]:
+    if FIELD_GAP_REASON_DELIMITER not in reason:
+        return reason, []
+    base, _, raw_gaps = reason.partition(FIELD_GAP_REASON_DELIMITER)
+    gaps = [gap for gap in raw_gaps.split(",") if gap]
+    return base, sorted(set(gaps))
+
+
+def _market_snapshot_has_quote(snapshot: Any) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    return _decimal(snapshot.get("bid_price")) > 0 and _decimal(snapshot.get("ask_price")) > 0
+
+
 def _nearest_market_snapshot(
     market_events: list[JsonDict],
     *,
+    phase: str,
     symbol: str,
     venues: list[str],
     target_ts_ms: int,
@@ -764,8 +843,12 @@ def _nearest_market_snapshot(
     if not target_ts_ms:
         return None
     venue_set = {venue.lower() for venue in venues if venue}
+    allowed_kinds = _market_snapshot_kinds_for_phase(phase)
     candidates: list[tuple[int, JsonDict]] = []
     for event in market_events:
+        kind = str(event.get("kind") or "")
+        if kind not in allowed_kinds:
+            continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         event_symbol = str(payload.get("symbol") or "").upper()
         event_venue = str(payload.get("venue") or payload.get("exchange") or "").lower()
@@ -776,12 +859,22 @@ def _nearest_market_snapshot(
         age_ms = abs(int(event.get("ts_ms") or 0) - target_ts_ms)
         if age_ms > window_ms:
             continue
-        candidates.append((age_ms, event))
+        snapshot = _normalize_market_snapshot(event, payload, target_ts_ms)
+        if not _market_snapshot_has_quote(snapshot):
+            continue
+        candidates.append((age_ms, snapshot))
     if not candidates:
         return None
-    _, event = min(candidates, key=lambda item: item[0])
-    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-    return _normalize_market_snapshot(event, payload, target_ts_ms)
+    _, snapshot = min(candidates, key=lambda item: item[0])
+    return snapshot
+
+
+def _market_snapshot_kinds_for_phase(phase: str) -> set[str]:
+    if phase == "entry":
+        return ENTRY_MARKET_SNAPSHOT_KINDS
+    if phase == "exit":
+        return EXIT_MARKET_SNAPSHOT_KINDS
+    return MARKET_SNAPSHOT_KINDS
 
 
 def _normalize_market_snapshot(event: JsonDict, payload: JsonDict, target_ts_ms: int) -> JsonDict:
@@ -1218,7 +1311,8 @@ def _fee_drag_quote(sample: JsonDict) -> Decimal:
 
 
 def _excluded_position(position_id: str, entry: JsonDict, reason: str) -> JsonDict:
-    return {
+    reason, field_gaps = _split_field_gap_exclusion_reason(reason)
+    row = {
         "position_id": position_id,
         "symbol": str(entry.get("symbol") or "").upper(),
         "route": "{long}->{short}".format(
@@ -1227,6 +1321,10 @@ def _excluded_position(position_id: str, entry: JsonDict, reason: str) -> JsonDi
         ),
         "reason": reason,
     }
+    if field_gaps:
+        row["field_gaps"] = field_gaps
+        row["field_gap_count"] = len(field_gaps)
+    return row
 
 
 def _markdown_aggregate_table(group: JsonDict) -> list[str]:
