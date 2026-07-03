@@ -12,6 +12,161 @@ def _event(ts_ms: int, kind: str, payload: dict) -> dict:
     return {"ts_ms": ts_ms, "kind": kind, "payload": payload}
 
 
+def _complete_exchange_sample_events(
+    *,
+    position_id: str,
+    symbol: str = "LABUSDT",
+    long_venue: str = "bitget",
+    short_venue: str = "okx",
+    ts_base: int = 100_000,
+    quantity: str = "10",
+    entry_price: str = "100",
+    long_close_price: str = "99",
+    short_close_price: str = "101",
+    funding_pnl_quote: str = "12",
+    open_fee_quote: str = "1",
+    close_fee_quote: str = "1.5",
+    selected_edge_bps: str = "20",
+    selected_total_funding_edge_bps: str = "150",
+    include_market: bool = True,
+    include_passive_events: bool = False,
+) -> list[dict]:
+    events = [
+        _event(
+            ts_base,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "quantity": quantity,
+                "long_venue": long_venue,
+                "short_venue": short_venue,
+                "long_entry_price": entry_price,
+                "short_entry_price": entry_price,
+                "selected_edge_bps": selected_edge_bps,
+                "selected_total_funding_edge_bps": selected_total_funding_edge_bps,
+                "funding_ts": ts_base + 30 * 60_000,
+            },
+        ),
+        _event(
+            ts_base + 100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "phase": "open",
+                "venue": long_venue,
+                "leg": "long",
+                "order_id": f"{position_id}-long-open",
+                "quantity": quantity,
+                "average_price": entry_price,
+                "fee_quote": str(float(open_fee_quote) / 2),
+            },
+        ),
+        _event(
+            ts_base + 200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "phase": "open",
+                "venue": short_venue,
+                "leg": "short",
+                "order_id": f"{position_id}-short-open",
+                "quantity": quantity,
+                "average_price": entry_price,
+                "fee_quote": str(float(open_fee_quote) / 2),
+            },
+        ),
+        _event(
+            ts_base + 30_000,
+            "exit.reconciled",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "accounting_status": "complete",
+                "evidence_gap": False,
+                "pending_backfill": False,
+                "funding_pnl_quote": funding_pnl_quote,
+                "long_legs": [
+                    {
+                        "venue": long_venue,
+                        "order_id": f"{position_id}-long-close",
+                        "quantity": quantity,
+                        "average_price": long_close_price,
+                        "fee_quote": str(float(close_fee_quote) / 2),
+                    }
+                ],
+                "short_legs": [
+                    {
+                        "venue": short_venue,
+                        "order_id": f"{position_id}-short-close",
+                        "quantity": quantity,
+                        "average_price": short_close_price,
+                        "fee_quote": str(float(close_fee_quote) / 2),
+                    }
+                ],
+            },
+        ),
+    ]
+    if include_market:
+        events.extend(
+            [
+                _event(
+                    ts_base + 50,
+                    "runtime.snapshot_freshness_decision",
+                    {
+                        "symbol": symbol,
+                        "venue": long_venue,
+                        "best_bid": "99.90",
+                        "best_ask": "100.10",
+                        "bid_size": "200",
+                        "ask_size": "180",
+                        "open_interest": "2500000",
+                        "volume_24h": "9000000",
+                        "freshness_status": "current_ok",
+                    },
+                ),
+                _event(
+                    ts_base + 29_950,
+                    "runtime.snapshot_freshness_decision",
+                    {
+                        "symbol": symbol,
+                        "venue": long_venue,
+                        "best_bid": "98.90",
+                        "best_ask": "99.10",
+                        "bid_size": "160",
+                        "ask_size": "150",
+                        "open_interest": "2400000",
+                        "volume_24h": "8800000",
+                        "freshness_status": "current_ok",
+                    },
+                ),
+            ]
+        )
+    if include_passive_events:
+        events.extend(
+            [
+                _event(
+                    ts_base + 20_000,
+                    "exit.passive_close_maker_submitted",
+                    {"position_id": position_id, "symbol": symbol},
+                ),
+                _event(
+                    ts_base + 22_000,
+                    "exit.passive_close_zero_fill_reprice",
+                    {"position_id": position_id, "symbol": symbol},
+                ),
+                _event(
+                    ts_base + 25_000,
+                    "exit.passive_close_deadline_fallback",
+                    {"position_id": position_id, "symbol": symbol},
+                ),
+            ]
+        )
+    return events
+
+
 def test_current_reconciled_complete_sample_gets_real_accounting_label():
     events = [
         _event(
@@ -127,6 +282,82 @@ def test_current_reconciled_complete_sample_gets_real_accounting_label():
     assert sample["market"]["entry_snapshot"]["spread_bps"] == "100"
     assert sample["features"]["time_to_funding_ms"] == 60_000
     assert report["aggregates"]["by_symbol"]["LABUSDT"]["net_pnl_quote"] == "-0.62"
+
+
+def test_verified_sample_exposes_real_cost_metrics_and_spread_bucket():
+    events = _complete_exchange_sample_events(position_id="entry-cost-LAB")
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    sample = report["samples"][0]
+    assert sample["features"]["fee_drag_bps"] == "25"
+    assert sample["features"]["close_markout_bps"] == "-200"
+    assert sample["features"]["funding_pnl_bps"] == "120"
+    assert sample["features"]["realized_edge_after_cost_bps"] == "-105"
+    assert sample["features"]["funding_capture_ratio"] == "0.8"
+    assert sample["features"]["entry_spread_bucket"] == "15_50bps"
+    assert report["aggregates"]["by_entry_spread_bucket"]["15_50bps"]["count"] == 1
+    assert report["aggregates"]["by_entry_spread_bucket"]["15_50bps"]["avg_fee_drag_bps"] == "25"
+
+
+def test_recommendations_are_observe_only_and_evidence_tiered():
+    events = []
+    events.extend(_complete_exchange_sample_events(position_id="entry-neg-1-LAB", ts_base=100_000))
+    events.extend(_complete_exchange_sample_events(position_id="entry-neg-2-LAB", ts_base=200_000))
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    symbol_review = next(
+        item
+        for item in report["recommendations"]
+        if item["kind"] == "symbol_filter_review"
+    )
+    assert symbol_review["evidence_tier"] == "shadow"
+    assert symbol_review["action_mode"] == "observe_only"
+    assert symbol_review["blocks_live_threshold_change"] is False
+    assert symbol_review["sample_count"] == 2
+
+
+def test_passive_close_wait_cost_is_observed_without_live_threshold_action():
+    events = _complete_exchange_sample_events(
+        position_id="entry-passive-LAB",
+        include_passive_events=True,
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    sample = report["samples"][0]
+    assert sample["execution"]["close_path"] == "passive"
+    assert sample["execution"]["zero_fill_event_count"] == 1
+    assert sample["execution"]["reprice_event_count"] == 1
+    assert sample["execution"]["fallback_event_count"] == 1
+    assert sample["execution"]["passive_wait_cost_observed"] is True
+    passive_review = next(
+        item
+        for item in report["recommendations"]
+        if item["kind"] == "passive_close_wait_cost_observed"
+    )
+    assert passive_review["evidence_tier"] == "shadow"
+    assert passive_review["action_mode"] == "observe_only"
+
+
+def test_market_coverage_gaps_are_reported_as_insufficient_evidence():
+    events = _complete_exchange_sample_events(
+        position_id="entry-coverage-LAB",
+        include_market=False,
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    sample = report["samples"][0]
+    assert "missing_entry_market_snapshot" in sample["coverage_gaps"]
+    coverage_review = next(
+        item
+        for item in report["recommendations"]
+        if item["kind"] == "market_data_coverage_gap"
+    )
+    assert coverage_review["evidence_tier"] == "insufficient_evidence"
+    assert coverage_review["action_mode"] == "observe_only"
 
 
 def test_legacy_exit_closed_requires_full_qty_and_close_fill_evidence():

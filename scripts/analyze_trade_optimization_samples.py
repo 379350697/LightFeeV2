@@ -37,6 +37,11 @@ CSV_COLUMNS = [
     "notional_quote",
     "selected_edge_bps",
     "time_to_funding_ms",
+    "funding_capture_ratio",
+    "fee_drag_bps",
+    "close_markout_bps",
+    "funding_pnl_bps",
+    "realized_edge_after_cost_bps",
     "price_pnl_quote",
     "funding_pnl_quote",
     "entry_fee_quote",
@@ -46,6 +51,8 @@ CSV_COLUMNS = [
     "net_pnl_bps",
     "close_path",
     "entry_spread_bps",
+    "entry_spread_bucket",
+    "passive_wait_cost_observed",
     "coverage_gaps",
 ]
 

@@ -173,6 +173,13 @@ def sample_rows_for_csv(report: JsonDict) -> list[JsonDict]:
                 "notional_quote": features.get("notional_quote"),
                 "selected_edge_bps": features.get("selected_edge_bps"),
                 "time_to_funding_ms": features.get("time_to_funding_ms"),
+                "funding_capture_ratio": features.get("funding_capture_ratio"),
+                "fee_drag_bps": features.get("fee_drag_bps"),
+                "close_markout_bps": features.get("close_markout_bps"),
+                "funding_pnl_bps": features.get("funding_pnl_bps"),
+                "realized_edge_after_cost_bps": features.get(
+                    "realized_edge_after_cost_bps"
+                ),
                 "price_pnl_quote": pnl.get("price_pnl_quote"),
                 "funding_pnl_quote": pnl.get("funding_pnl_quote"),
                 "entry_fee_quote": pnl.get("entry_fee_quote"),
@@ -181,7 +188,12 @@ def sample_rows_for_csv(report: JsonDict) -> list[JsonDict]:
                 "net_pnl_quote": pnl.get("net_pnl_quote"),
                 "net_pnl_bps": pnl.get("net_pnl_bps"),
                 "close_path": execution.get("close_path"),
-                "entry_spread_bps": entry_snapshot.get("spread_bps"),
+                "entry_spread_bps": features.get("entry_spread_bps")
+                or entry_snapshot.get("spread_bps"),
+                "entry_spread_bucket": features.get("entry_spread_bucket"),
+                "passive_wait_cost_observed": execution.get(
+                    "passive_wait_cost_observed"
+                ),
                 "coverage_gaps": ",".join(sample.get("coverage_gaps") or []),
             }
         )
@@ -207,6 +219,10 @@ def render_markdown_report(report: JsonDict) -> str:
     lines.extend(_markdown_aggregate_table(aggregates.get("by_symbol") or {}))
     lines.extend(["", "## By Route", ""])
     lines.extend(_markdown_aggregate_table(aggregates.get("by_route") or {}))
+    lines.extend(["", "## By Close Path", ""])
+    lines.extend(_markdown_aggregate_table(aggregates.get("by_close_path") or {}))
+    lines.extend(["", "## By Entry Spread Bucket", ""])
+    lines.extend(_markdown_aggregate_table(aggregates.get("by_entry_spread_bucket") or {}))
     lines.extend(["", "## Recommendations", ""])
     recommendations = report.get("recommendations") or []
     if not recommendations:
@@ -215,10 +231,12 @@ def render_markdown_report(report: JsonDict) -> str:
         if not isinstance(item, dict):
             continue
         lines.append(
-            "- {kind}: {title} | samples={sample_count} | net={net_pnl_quote} | "
-            "confidence={confidence}".format(
+            "- {kind}: {title} | tier={tier} | action={action} | "
+            "samples={sample_count} | net={net_pnl_quote} | confidence={confidence}".format(
                 kind=item.get("kind", ""),
                 title=item.get("title", ""),
+                tier=item.get("evidence_tier", ""),
+                action=item.get("action_mode", ""),
                 sample_count=item.get("sample_count", 0),
                 net_pnl_quote=item.get("net_pnl_quote", "0"),
                 confidence=item.get("confidence", "low"),
@@ -291,7 +309,12 @@ def _build_position_sample(
         or entry.get("quantity")
         or entry.get("matched_quantity")
     )
-    notional = _notional_quote(entry, quantity)
+    truth_pnl = (
+        lifecycle_truth.get("pnl")
+        if isinstance(lifecycle_truth, dict) and isinstance(lifecycle_truth.get("pnl"), dict)
+        else {}
+    )
+    notional = _decimal(truth_pnl.get("notional_quote")) or _notional_quote(entry, quantity)
     if pnl is None:
         pnl = _pnl_label(exit_payload, notional=notional)
     market, market_gaps = _market_context(
@@ -305,6 +328,16 @@ def _build_position_sample(
     execution = _execution_context(position, exit_source)
     shadow = _exit_shadow_summary(position.get("exit_shadow") or [])
     features = _features(entry, open_ts_ms, close_ts_ms, quantity, notional, pnl)
+    entry_snapshot = market.get("entry_snapshot") if isinstance(market, dict) else {}
+    entry_spread_bps = (
+        entry_snapshot.get("spread_bps") if isinstance(entry_snapshot, dict) else None
+    )
+    features["entry_spread_bps"] = entry_spread_bps
+    features["entry_spread_bucket"] = _entry_spread_bucket(entry_spread_bps)
+    execution["passive_wait_cost_observed"] = bool(
+        execution.get("passive_close_event_count")
+        and _decimal(features.get("close_markout_bps")) < 0
+    )
     coverage_gaps = list(market_gaps)
     if lifecycle_truth is not None:
         source_coverage = lifecycle_truth.get("source_coverage")
@@ -549,6 +582,14 @@ def _features(
         funding_capture_ratio = _decimal_str(
             _decimal(pnl.get("funding_pnl_quote")) / expected_funding
         )
+    entry_fee_pnl = _decimal(pnl.get("entry_fee_quote"))
+    exit_fee_pnl = _decimal(pnl.get("exit_fee_quote"))
+    fee_drag_quote = -(entry_fee_pnl + exit_fee_pnl)
+    if fee_drag_quote < 0:
+        fee_drag_quote = Decimal("0")
+    price_pnl_quote = _decimal(pnl.get("price_pnl_quote"))
+    funding_pnl_quote = _decimal(pnl.get("funding_pnl_quote"))
+    net_pnl_quote = _decimal(pnl.get("net_pnl_quote"))
     return {
         "quantity": _decimal_str(quantity),
         "notional_quote": _decimal_str(notional),
@@ -559,6 +600,10 @@ def _features(
         ),
         "time_to_funding_ms": time_to_funding_ms,
         "funding_capture_ratio": funding_capture_ratio,
+        "fee_drag_bps": _decimal_str(_bps(fee_drag_quote, notional)),
+        "close_markout_bps": _decimal_str(_bps(price_pnl_quote, notional)),
+        "funding_pnl_bps": _decimal_str(_bps(funding_pnl_quote, notional)),
+        "realized_edge_after_cost_bps": _decimal_str(_bps(net_pnl_quote, notional)),
     }
 
 
@@ -705,14 +750,33 @@ def _execution_context(position: JsonDict, exit_source: str) -> JsonDict:
         if phase == "close" or "close" in source or trade_side == "close":
             close_fill_count += 1
     execution_events = position.get("execution_events") or []
+    event_kind_text = [
+        str(event.get("kind") or "").lower()
+        for event in execution_events
+        if isinstance(event, dict)
+    ]
     passive_count = sum(
-        1 for event in execution_events if str(event.get("kind") or "").startswith("exit.passive")
+        1 for kind in event_kind_text if kind.startswith("exit.passive")
     )
     reject_count = sum(
         1
-        for event in execution_events
-        if "reject" in str(event.get("kind") or "").lower()
-        or "error" in str(event.get("kind") or "").lower()
+        for kind in event_kind_text
+        if "reject" in kind or "error" in kind
+    )
+    zero_fill_count = sum(
+        1 for kind in event_kind_text if "zero_fill" in kind or "no_fill" in kind
+    )
+    reprice_count = sum(1 for kind in event_kind_text if "reprice" in kind)
+    post_only_reject_count = sum(
+        1
+        for kind in event_kind_text
+        if ("post_only" in kind or "post-only" in kind)
+        and ("reject" in kind or "would_take" in kind or "blocked" in kind)
+    )
+    fallback_count = sum(
+        1
+        for kind in event_kind_text
+        if "fallback" in kind or "dual_taker" in kind or "dual-taker" in kind
     )
     if exit_source == "legacy.exit.closed":
         close_path = "legacy"
@@ -725,7 +789,12 @@ def _execution_context(position: JsonDict, exit_source: str) -> JsonDict:
         "close_fill_evidence_count": close_fill_count,
         "order_fill_fee_quote": _decimal_str(fee_quote),
         "passive_close_event_count": passive_count,
+        "zero_fill_event_count": zero_fill_count,
+        "reprice_event_count": reprice_count,
+        "post_only_reject_event_count": post_only_reject_count,
+        "fallback_event_count": fallback_count,
         "venue_error_or_reject_count": reject_count,
+        "passive_wait_cost_observed": False,
         "close_path": close_path,
     }
 
@@ -771,6 +840,12 @@ def _build_aggregates(samples: list[JsonDict]) -> JsonDict:
                 (sample.get("features") or {}).get("time_to_funding_ms")
             ),
         ),
+        "by_entry_spread_bucket": _aggregate_samples(
+            samples,
+            lambda sample: str(
+                (sample.get("features") or {}).get("entry_spread_bucket") or "unknown"
+            ),
+        ),
     }
 
 
@@ -788,10 +863,18 @@ def _aggregate_samples(samples: list[JsonDict], key_fn: Any) -> JsonDict:
                 "funding": Decimal("0"),
                 "fees": Decimal("0"),
                 "notional": Decimal("0"),
+                "net_bps": Decimal("0"),
+                "fee_drag_bps": Decimal("0"),
+                "close_markout_bps": Decimal("0"),
+                "funding_capture_ratio": Decimal("0"),
+                "funding_capture_ratio_count": 0,
+                "coverage_gap_count": 0,
+                "passive_wait_cost_count": 0,
             },
         )
         pnl = sample.get("pnl") if isinstance(sample.get("pnl"), dict) else {}
         features = sample.get("features") if isinstance(sample.get("features"), dict) else {}
+        execution = sample.get("execution") if isinstance(sample.get("execution"), dict) else {}
         net = _decimal(pnl.get("net_pnl_quote"))
         row["count"] += 1
         row["wins"] += 1 if net > 0 else 0
@@ -800,6 +883,18 @@ def _aggregate_samples(samples: list[JsonDict], key_fn: Any) -> JsonDict:
         row["funding"] += _decimal(pnl.get("funding_pnl_quote"))
         row["fees"] += _decimal(pnl.get("entry_fee_quote")) + _decimal(pnl.get("exit_fee_quote"))
         row["notional"] += _decimal(features.get("notional_quote"))
+        row["net_bps"] += _decimal(
+            pnl.get("net_pnl_bps") or features.get("realized_edge_after_cost_bps")
+        )
+        row["fee_drag_bps"] += _decimal(features.get("fee_drag_bps"))
+        row["close_markout_bps"] += _decimal(features.get("close_markout_bps"))
+        if features.get("funding_capture_ratio") is not None:
+            row["funding_capture_ratio"] += _decimal(features.get("funding_capture_ratio"))
+            row["funding_capture_ratio_count"] += 1
+        row["coverage_gap_count"] += len(sample.get("coverage_gaps") or [])
+        row["passive_wait_cost_count"] += (
+            1 if bool(execution.get("passive_wait_cost_observed")) else 0
+        )
     finalized: JsonDict = {}
     for key, row in sorted(grouped.items()):
         count = int(row["count"])
@@ -812,6 +907,20 @@ def _aggregate_samples(samples: list[JsonDict], key_fn: Any) -> JsonDict:
             "funding_pnl_quote": _decimal_str(row["funding"]),
             "fee_pnl_quote": _decimal_str(row["fees"]),
             "notional_quote": _decimal_str(row["notional"]),
+            "avg_net_pnl_bps": _decimal_str(row["net_bps"] / Decimal(count) if count else 0),
+            "avg_fee_drag_bps": _decimal_str(
+                row["fee_drag_bps"] / Decimal(count) if count else 0
+            ),
+            "avg_close_markout_bps": _decimal_str(
+                row["close_markout_bps"] / Decimal(count) if count else 0
+            ),
+            "avg_funding_capture_ratio": _decimal_str(
+                row["funding_capture_ratio"] / Decimal(row["funding_capture_ratio_count"])
+                if row["funding_capture_ratio_count"]
+                else 0
+            ),
+            "coverage_gap_count": int(row["coverage_gap_count"]),
+            "passive_wait_cost_count": int(row["passive_wait_cost_count"]),
         }
     return finalized
 
@@ -860,6 +969,8 @@ def _build_recommendations(samples: list[JsonDict], aggregates: JsonDict) -> lis
     for group_name, kind, title_prefix in (
         ("by_symbol", "symbol_filter_review", "Review symbol filter"),
         ("by_route", "route_downweight_review", "Review venue route"),
+        ("by_close_path", "close_path_review", "Review close path"),
+        ("by_entry_spread_bucket", "entry_spread_bucket_review", "Review entry spread bucket"),
     ):
         group = aggregates.get(group_name) if isinstance(aggregates.get(group_name), dict) else {}
         for key, row in group.items():
@@ -868,59 +979,130 @@ def _build_recommendations(samples: list[JsonDict], aggregates: JsonDict) -> lis
             if count < 2 or net >= 0:
                 continue
             recommendations.append(
-                {
-                    "kind": kind,
-                    "title": f"{title_prefix}: {key}",
-                    "sample_count": count,
-                    "net_pnl_quote": _decimal_str(net),
-                    "estimated_impact_if_excluded_quote": _decimal_str(-net),
-                    "confidence": _confidence(count),
-                    "reason": "Historical verified samples in this bucket are net negative.",
-                }
+                _recommendation(
+                    kind=kind,
+                    title=f"{title_prefix}: {key}",
+                    sample_count=count,
+                    net_pnl_quote=net,
+                    confidence=_confidence(count),
+                    reason="Verified exchange-lifecycle samples in this bucket are net negative.",
+                    estimated_impact_if_excluded_quote=_decimal_str(-net),
+                    coverage_gap_count=int(row.get("coverage_gap_count") or 0),
+                    avg_fee_drag_bps=row.get("avg_fee_drag_bps"),
+                    avg_close_markout_bps=row.get("avg_close_markout_bps"),
+                )
             )
 
     fee_drag_samples = [
         sample
         for sample in samples
-        if abs(
-            _decimal((sample.get("pnl") or {}).get("entry_fee_quote"))
-            + _decimal((sample.get("pnl") or {}).get("exit_fee_quote"))
-        )
+        if _fee_drag_quote(sample)
         > abs(_decimal((sample.get("pnl") or {}).get("funding_pnl_quote")))
     ]
     if fee_drag_samples:
         recommendations.append(
-            {
-                "kind": "entry_threshold_fee_drag_review",
-                "title": "Review entry edge after real fee drag",
-                "sample_count": len(fee_drag_samples),
-                "net_pnl_quote": _decimal_str(
-                    sum(
-                        (_decimal((sample.get("pnl") or {}).get("net_pnl_quote")) for sample in fee_drag_samples),
-                        Decimal("0"),
-                    )
+            _recommendation(
+                kind="entry_threshold_fee_drag_review",
+                title="Review entry edge after real fee drag",
+                sample_count=len(fee_drag_samples),
+                net_pnl_quote=_sum_sample_net(fee_drag_samples),
+                confidence=_confidence(len(fee_drag_samples)),
+                reason="Real fee drag exceeded funding income on these verified samples.",
+            )
+        )
+    passive_wait_samples = [
+        sample
+        for sample in samples
+        if bool((sample.get("execution") or {}).get("passive_wait_cost_observed"))
+    ]
+    if passive_wait_samples:
+        recommendations.append(
+            _recommendation(
+                kind="passive_close_wait_cost_observed",
+                title="Review passive close wait cost",
+                sample_count=len(passive_wait_samples),
+                net_pnl_quote=_sum_sample_net(passive_wait_samples),
+                confidence=_confidence(len(passive_wait_samples)),
+                reason=(
+                    "Passive close lifecycle events coincided with negative close markout; "
+                    "keep as shadow evidence until sample size is stronger."
                 ),
-                "confidence": _confidence(len(fee_drag_samples)),
-                "reason": "Fees exceeded funding income on these samples.",
-            }
+            )
+        )
+    coverage_gap_samples = [
+        sample for sample in samples if sample.get("coverage_gaps")
+    ]
+    if coverage_gap_samples:
+        recommendations.append(
+            _recommendation(
+                kind="market_data_coverage_gap",
+                title="Keep market-feature conclusions out of live thresholds",
+                sample_count=len(coverage_gap_samples),
+                net_pnl_quote=_sum_sample_net(coverage_gap_samples),
+                confidence="low",
+                reason=(
+                    "Some verified lifecycle samples lack entry/exit market snapshots or "
+                    "source coverage, so market-feature conclusions are incomplete."
+                ),
+                evidence_tier="insufficient_evidence",
+                coverage_gap_count=sum(
+                    len(sample.get("coverage_gaps") or []) for sample in coverage_gap_samples
+                ),
+            )
         )
     if len(samples) < 30:
         recommendations.append(
-            {
-                "kind": "sample_size_guardrail",
-                "title": "Keep changes shadow-only until more verified samples accrue",
-                "sample_count": len(samples),
-                "net_pnl_quote": _decimal_str(
-                    sum(
-                        (_decimal((sample.get("pnl") or {}).get("net_pnl_quote")) for sample in samples),
-                        Decimal("0"),
-                    )
-                ),
-                "confidence": "low",
-                "reason": "Verified normal sample count is still small for live threshold changes.",
-            }
+            _recommendation(
+                kind="sample_size_guardrail",
+                title="Keep changes shadow-only until more verified samples accrue",
+                sample_count=len(samples),
+                net_pnl_quote=_sum_sample_net(samples),
+                confidence="low",
+                reason="Verified normal sample count is still small for live threshold changes.",
+                evidence_tier="insufficient_evidence",
+            )
         )
     return recommendations
+
+
+def _recommendation(
+    *,
+    kind: str,
+    title: str,
+    sample_count: int,
+    net_pnl_quote: Any,
+    confidence: str,
+    reason: str,
+    evidence_tier: str = "shadow",
+    **extra: Any,
+) -> JsonDict:
+    item = {
+        "kind": kind,
+        "title": title,
+        "sample_count": sample_count,
+        "net_pnl_quote": _decimal_str(net_pnl_quote),
+        "confidence": confidence,
+        "evidence_tier": evidence_tier,
+        "action_mode": "observe_only",
+        "blocks_live_threshold_change": False,
+        "minimum_live_action_sample_count": 30,
+        "reason": reason,
+    }
+    item.update(extra)
+    return item
+
+
+def _sum_sample_net(samples: list[JsonDict]) -> Decimal:
+    return sum(
+        (_decimal((sample.get("pnl") or {}).get("net_pnl_quote")) for sample in samples),
+        Decimal("0"),
+    )
+
+
+def _fee_drag_quote(sample: JsonDict) -> Decimal:
+    pnl = sample.get("pnl") if isinstance(sample.get("pnl"), dict) else {}
+    fee_drag = -(_decimal(pnl.get("entry_fee_quote")) + _decimal(pnl.get("exit_fee_quote")))
+    return fee_drag if fee_drag > 0 else Decimal("0")
 
 
 def _excluded_position(position_id: str, entry: JsonDict, reason: str) -> JsonDict:
@@ -975,6 +1157,27 @@ def _time_to_funding_bucket(value: Any) -> str:
     if ms <= 60 * 60_000:
         return "15_60m"
     return "60m_plus"
+
+
+def _entry_spread_bucket(value: Any) -> str:
+    if value is None:
+        return "missing"
+    spread_bps = _decimal(value)
+    if spread_bps <= 0:
+        return "0bps"
+    if spread_bps <= 5:
+        return "0_5bps"
+    if spread_bps <= 15:
+        return "5_15bps"
+    if spread_bps <= 50:
+        return "15_50bps"
+    return "50bps_plus"
+
+
+def _bps(value: Decimal, notional: Decimal) -> Decimal:
+    if notional <= 0:
+        return Decimal("0")
+    return (value / notional) * Decimal("10000")
 
 
 def _confidence(count: int) -> str:
