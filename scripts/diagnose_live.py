@@ -2006,6 +2006,7 @@ def _local_open_position_rows(local_state: dict[str, Any]) -> list[dict[str, Any
 def _active_owner_managed_scope(local_state: dict[str, Any]) -> dict[str, set[str]]:
     position_ids: set[str] = set()
     symbols: set[str] = set()
+    venues: set[str] = set()
     for row in _local_open_position_rows(local_state):
         symbol = str(row.get("symbol") or "").upper()
         position_id = str(
@@ -2029,7 +2030,11 @@ def _active_owner_managed_scope(local_state: dict[str, Any]) -> dict[str, set[st
             position_ids.add(position_id)
         if symbol:
             symbols.add(symbol)
-    return {"position_ids": position_ids, "symbols": symbols}
+        for venue_key in ("long_venue", "short_venue", "venue"):
+            venue = str(row.get(venue_key) or "").lower()
+            if venue:
+                venues.add(venue)
+    return {"position_ids": position_ids, "symbols": symbols, "venues": venues}
 
 
 def _position_side_from_truth(row: dict[str, Any], quantity: float) -> str:
@@ -4654,6 +4659,49 @@ def _exchange_truth_probe_gaps(
                 "blocking": blocking,
             })
     return gaps
+
+
+def _suppress_nonblocking_probe_gap_required_venues(
+    exchange_truth: dict[str, Any],
+    probe_gaps: list[dict[str, Any]],
+    *,
+    active_venues: set[str] | None = None,
+) -> None:
+    active = {
+        str(venue or "").lower()
+        for venue in active_venues or set()
+        if str(venue or "")
+    }
+    blocking_gap_venues = {
+        str(gap.get("venue") or "").lower()
+        for gap in probe_gaps
+        if gap.get("blocking") is True
+    }
+    nonblocking_gap_venues = {
+        str(gap.get("venue") or "").lower()
+        for gap in probe_gaps
+        if gap.get("blocking") is False
+        and gap.get("kind") in {"symbol_removed", "unsupported_symbol"}
+        and str(gap.get("venue") or "").lower() not in active
+        and str(gap.get("venue") or "").lower() not in blocking_gap_venues
+    }
+    if not nonblocking_gap_venues:
+        return
+    missing_required = [
+        str(venue or "").lower()
+        for venue in exchange_truth.get("missing_required_venues", []) or []
+        if str(venue or "").lower() not in nonblocking_gap_venues
+    ]
+    exchange_truth["missing_required_venues"] = missing_required
+    missing_evidence = [
+        evidence
+        for evidence in exchange_truth.get("missing_evidence", []) or []
+        if not any(
+            evidence == f"exchange_truth_required_venue_missing_{venue}"
+            for venue in nonblocking_gap_venues
+        )
+    ]
+    exchange_truth["missing_evidence"] = missing_evidence
 
 
 def _classify_exchange_truth_probe_error(row: dict[str, Any]) -> str:
@@ -8563,6 +8611,14 @@ def _build_production_acceptance_gate(
     )
     if exchange_truth_probe_gaps:
         exchange_truth["probe_gaps"] = [dict(gap) for gap in exchange_truth_probe_gaps]
+        _suppress_nonblocking_probe_gap_required_venues(
+            exchange_truth,
+            exchange_truth_probe_gaps,
+            active_venues=active_owner_scope.get("venues", set()),
+        )
+        exchange_truth_missing_required_venues = list(
+            exchange_truth.get("missing_required_venues") or []
+        )
     exchange_truth_probe_gap_count = len(exchange_truth_probe_gaps)
     exchange_truth_stale_symbol_probe_gap_count = sum(
         1

@@ -6211,6 +6211,157 @@ def test_run_diagnose_treats_delisted_stale_symbol_error_as_probe_gap(
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_does_not_mark_ownerless_delisted_symbol_as_required_venue_missing(
+    monkeypatch,
+):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_close_reconciliation_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        def delisted_required_venue_exchange_truth(runtime_dir, symbols, venues=None):
+            return {
+                "available": True,
+                "available_venues": [],
+                "confidence": "medium",
+                "positions": {
+                    "bitget": {
+                        "MAVIAUSDT": {
+                            "error": 'HTTP 400 {"code":"40309","msg":"The symbol has been removed"}',
+                            "code": "40309",
+                        }
+                    }
+                },
+                "open_orders": {
+                    "bitget": {
+                        "MAVIAUSDT": {
+                            "error": 'HTTP 400 {"code":"40309","msg":"The symbol has been removed"}',
+                            "code": "40309",
+                        }
+                    }
+                },
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "errors": [],
+                "missing_evidence": [
+                    "bitget_position_fetch_failed_MAVIAUSDT",
+                    "bitget_open_order_fetch_failed_MAVIAUSDT",
+                ],
+            }
+
+        monkeypatch.setattr(
+            dl,
+            "_build_exchange_truth",
+            delisted_required_venue_exchange_truth,
+        )
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="MAVIAUSDT",
+            venues=["bitget"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["exchange_truth_probe_gap_count"] == 1
+        assert gate["exchange_truth_blocking_probe_gap_count"] == 0
+        assert gate["exchange_truth_missing_required_venues"] == []
+        assert "exchange_truth_required_venues_missing" not in gate["blocking_reasons"]
+        assert result["exchange_truth"]["missing_required_venues"] == []
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_keeps_required_venue_missing_when_same_venue_has_active_owner(
+    monkeypatch,
+):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "open_positions": [
+                {
+                    "position_id": "entry-1783158802520-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "long_venue": "bitget",
+                    "short_venue": "bybit",
+                    "quantity": 1.0,
+                    "matched_quantity": 1.0,
+                }
+            ],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_close_reconciliation_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        def delisted_symbol_plus_missing_active_venue(runtime_dir, symbols, venues=None):
+            return {
+                "available": True,
+                "available_venues": [],
+                "confidence": "medium",
+                "positions": {"bitget": {}},
+                "open_orders": {
+                    "bitget": {
+                        "MAVIAUSDT": {
+                            "error": 'HTTP 400 {"code":"40309","msg":"The symbol has been removed"}',
+                            "code": "40309",
+                        }
+                    }
+                },
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "errors": [],
+                "missing_evidence": [
+                    "bitget_open_order_fetch_failed_MAVIAUSDT",
+                ],
+            }
+
+        monkeypatch.setattr(
+            dl,
+            "_build_exchange_truth",
+            delisted_symbol_plus_missing_active_venue,
+        )
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            venues=["bitget"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert result["exchange_truth"]["missing_required_venues"] == ["bitget"]
+        assert gate["exchange_truth_missing_required_venues"] == ["bitget"]
+        assert "exchange_truth_required_venues_missing" in gate["blocking_reasons"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_production_gate_blocks_delisted_symbol_error_for_active_owner():
     from scripts import diagnose_live as dl
 

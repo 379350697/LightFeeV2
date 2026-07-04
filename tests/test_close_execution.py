@@ -43,8 +43,9 @@ from lightfee.engine.close_executor import (
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.exit import CloseExecution
+from lightfee.engine.pending_entry_runtime import PendingEntryRuntime
 from lightfee.engine.residual import ResidualOrigin
-from lightfee.engine.state import EngineState, OpenPosition
+from lightfee.engine.state import CloseLegRecord, EngineState, OpenPosition, PendingClose
 from lightfee.persistence.journal import Journal
 
 
@@ -621,6 +622,49 @@ async def test_statement_probe_candidates_tolerate_missing_candidate_then_fill()
     assert [fill.order_id for fill in fills] == ["filled-late-truth-gap"]
 
 
+def test_close_reconciliation_venue_can_come_from_probe_leg():
+    runtime = CloseRuntime(ctx=None)
+
+    venue = runtime._venue_from_close_reconciliation_legs([
+        {
+            "venue": Venue.BYBIT.value,
+            "order_id": "6dc20eae-2383-4702-ad7d-f07acabc49ad",
+            "client_order_id": "lfxsb76bddcab80ca379",
+            "statement_probe_candidate": True,
+        }
+    ])
+
+    assert venue == Venue.BYBIT
+
+
+def test_top_level_statement_probe_candidates_are_retained():
+    reconciliation = {
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "kind": "final",
+        "long_legs": [],
+        "short_legs": [],
+        "statement_probe_candidates": [
+            {
+                "leg": "short",
+                "venue": Venue.BYBIT.value,
+                "order_id": "51596e70-b330-4806-a6d7-0314b8b08164",
+                "client_order_id": "lfxs207f506de9660eee",
+                "source": "pending_close_orphaned",
+                "quantity_hint": 4.0,
+                "submitted_at_ms": 1783162830984,
+            }
+        ],
+    }
+
+    candidates = CloseRuntime._statement_probe_candidates_from_reconciliation(
+        reconciliation
+    )
+
+    assert CloseRuntime._has_statement_probe_candidates(reconciliation) is True
+    assert candidates == reconciliation["statement_probe_candidates"]
+
+
 def test_terminal_flat_accounting_gap_is_retained_as_accounting_only_backfill():
     class _Ctx:
         pass
@@ -716,6 +760,261 @@ def test_accounting_only_backfill_does_not_block_entry_gate():
 
     assert allowed is True
     assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_accounting_only_backfill_with_probe_candidates_is_not_abandoned():
+    class _Journal:
+        def __init__(self):
+            self.critical_events = []
+
+        def append_critical(self, now_ms, kind, payload):
+            self.critical_events.append((now_ms, kind, payload))
+
+    class _Ctx:
+        pass
+
+    class _Runtime(CloseRuntime):
+        async def _call_fetch_pending_close_terminal_live_sizes(self, **kwargs):
+            return (0.0, 0.0)
+
+    ctx = _Ctx()
+    ctx.state = EngineState()
+    ctx.journal = _Journal()
+    runtime = _Runtime(ctx=ctx)
+    reconciliation = {
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "closed_at_ms": 1783162830984,
+        "accounting_only_backfill": True,
+        "blocking_trading": False,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "statement_probe_candidates": [
+            {
+                "leg": "short",
+                "venue": Venue.BYBIT.value,
+                "order_id": "51596e70-b330-4806-a6d7-0314b8b08164",
+                "client_order_id": "lfxs207f506de9660eee",
+                "quantity_hint": 4.0,
+            }
+        ],
+    }
+
+    abandoned = await runtime._try_abandon_stale_pending_close_reconciliation(
+        reconciliation,
+        now_ms=1783162833042,
+        symbol="LABUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        error="close fill reconciliation not yet available",
+    )
+
+    assert abandoned is False
+    assert ctx.journal.critical_events == []
+
+
+@pytest.mark.asyncio
+async def test_orphaned_uncertain_pending_close_becomes_accounting_only_backfill():
+    class _Journal:
+        def __init__(self):
+            self.events = []
+
+        def append(self, kind, payload):
+            self.events.append((kind, payload))
+
+    class _Ctx:
+        async def _process_pending_close_reconciliations(self, now_ms):
+            return None
+
+    ctx = _Ctx()
+    ctx._venue_adapters = {Venue.BYBIT: object()}
+    ctx.reconciler = object()
+    ctx.state = EngineState()
+    ctx.journal = _Journal()
+    pending = PendingClose(
+        close_id="close-entry-1783158802520-LABUSDT-1783159505016",
+        position_id="entry-1783158802520-LABUSDT",
+        reason="funding_capture",
+        created_at_ms=1783159505016,
+        short_order_id="6dc20eae-2383-4702-ad7d-f07acabc49ad",
+        short_client_order_id="lfxsb76bddcab80ca379",
+        long_target_close_qty=1.0,
+        short_target_close_qty=1.0,
+        short_uncertain=True,
+        short_legs=[
+            CloseLegRecord(
+                venue=Venue.BYBIT.value,
+                order_id="6dc20eae-2383-4702-ad7d-f07acabc49ad",
+                client_order_id="lfxsb76bddcab80ca379",
+                quantity=0.0,
+            )
+        ],
+    )
+    ctx.state.pending_closes[pending.close_id] = pending
+
+    await PendingEntryRuntime(ctx)._reconcile_pending_state(now_ms=1783159506565)
+
+    assert pending.close_id not in ctx.state.pending_closes
+    assert ctx.state.pending_close_reconciliations == [
+        {
+            "position_id": "entry-1783158802520-LABUSDT",
+            "symbol": "LABUSDT",
+            "kind": "final",
+            "reason": "funding_capture",
+            "source": "pending_close_orphaned_terminal_flat",
+            "closed_at_ms": 1783159505016,
+            "created_cycle": 0,
+            "position_snapshot": {
+                "symbol": "LABUSDT",
+                "long_venue": "",
+                "short_venue": Venue.BYBIT.value,
+            },
+            "long_legs": [],
+            "short_legs": [
+                {
+                    "venue": Venue.BYBIT.value,
+                    "order_id": "6dc20eae-2383-4702-ad7d-f07acabc49ad",
+                    "client_order_id": "lfxsb76bddcab80ca379",
+                    "quantity": 0.0,
+                    "average_price": 0.0,
+                    "fee_quote": 0.0,
+                    "source": "pending_close_orphaned",
+                    "quantity_hint": 1.0,
+                    "statement_probe_candidate": True,
+                }
+            ],
+            "attempt_count": 0,
+            "next_attempt_ms": 1783159506565,
+            "truth_gap_candidate_count": 1,
+            "pending_backfill": True,
+            "accounting_only_backfill": True,
+            "blocking_trading": False,
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "component_evidence_status": "statement_probe_pending",
+            "statement_probe_candidates": [
+                {
+                    "leg": "short",
+                    "venue": Venue.BYBIT.value,
+                    "order_id": "6dc20eae-2383-4702-ad7d-f07acabc49ad",
+                    "client_order_id": "lfxsb76bddcab80ca379",
+                    "source": "pending_close_orphaned",
+                    "quantity_hint": 1.0,
+                    "submitted_at_ms": 1783159505016,
+                }
+            ],
+            "original_payload": {
+                "close_id": "close-entry-1783158802520-LABUSDT-1783159505016",
+                "source": "pending_close_orphaned",
+            },
+        }
+    ]
+    assert (
+        "reconciliation.pending_close_orphaned_accounting_backfill_registered",
+        {
+            "close_id": pending.close_id,
+            "position_id": pending.position_id,
+            "symbol": "LABUSDT",
+            "statement_probe_candidate_count": 1,
+        },
+    ) in ctx.journal.events
+
+
+@pytest.mark.asyncio
+async def test_orphaned_pending_close_merges_statement_probe_candidate_into_existing_backfill():
+    class _Journal:
+        def __init__(self):
+            self.events = []
+
+        def append(self, kind, payload):
+            self.events.append((kind, payload))
+
+    class _Ctx:
+        async def _process_pending_close_reconciliations(self, now_ms):
+            return None
+
+    ctx = _Ctx()
+    ctx._venue_adapters = {Venue.BYBIT: object()}
+    ctx.reconciler = object()
+    ctx.state = EngineState()
+    ctx.journal = _Journal()
+    ctx.state.pending_close_reconciliations = [
+        {
+            "position_id": "entry-1783158802520-LABUSDT",
+            "symbol": "LABUSDT",
+            "kind": "final",
+            "source": "existing_terminal_flat_gap",
+            "closed_at_ms": 1783159504000,
+            "long_legs": [],
+            "short_legs": [
+                {
+                    "venue": Venue.BYBIT.value,
+                    "order_id": "old-ack-only",
+                    "client_order_id": "old-client",
+                    "quantity": 0.0,
+                    "statement_probe_candidate": True,
+                }
+            ],
+            "statement_probe_candidates": [
+                {
+                    "leg": "short",
+                    "venue": Venue.BYBIT.value,
+                    "order_id": "old-ack-only",
+                    "client_order_id": "old-client",
+                    "source": "existing_terminal_flat_gap",
+                    "quantity_hint": 1.0,
+                    "submitted_at_ms": 1783159504000,
+                }
+            ],
+            "truth_gap_candidate_count": 1,
+            "pending_backfill": True,
+            "accounting_only_backfill": True,
+            "blocking_trading": False,
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+        }
+    ]
+    pending = PendingClose(
+        close_id="close-entry-1783158802520-LABUSDT-1783159505016",
+        position_id="entry-1783158802520-LABUSDT",
+        reason="funding_capture",
+        created_at_ms=1783159505016,
+        short_order_id="6dc20eae-2383-4702-ad7d-f07acabc49ad",
+        short_client_order_id="lfxsb76bddcab80ca379",
+        short_target_close_qty=1.0,
+        short_uncertain=True,
+        short_legs=[
+            CloseLegRecord(
+                venue=Venue.BYBIT.value,
+                order_id="6dc20eae-2383-4702-ad7d-f07acabc49ad",
+                client_order_id="lfxsb76bddcab80ca379",
+                quantity=0.0,
+            )
+        ],
+    )
+    ctx.state.pending_closes[pending.close_id] = pending
+
+    await PendingEntryRuntime(ctx)._reconcile_pending_state(now_ms=1783159506565)
+
+    assert len(ctx.state.pending_close_reconciliations) == 1
+    merged = ctx.state.pending_close_reconciliations[0]
+    assert merged["accounting_only_backfill"] is True
+    assert merged["blocking_trading"] is False
+    assert merged["truth_gap_candidate_count"] == 2
+    assert {
+        candidate["order_id"]
+        for candidate in merged["statement_probe_candidates"]
+    } == {
+        "old-ack-only",
+        "6dc20eae-2383-4702-ad7d-f07acabc49ad",
+    }
+    assert {
+        leg["order_id"]
+        for leg in merged["short_legs"]
+    } == {
+        "old-ack-only",
+        "6dc20eae-2383-4702-ad7d-f07acabc49ad",
+    }
 
 
 # ---------------------------------------------------------------------------

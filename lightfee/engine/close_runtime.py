@@ -300,6 +300,19 @@ class CloseRuntime:
             except ValueError:
                 return None
         return None
+
+    @classmethod
+    def _venue_from_close_reconciliation_legs(cls, legs: Any) -> Venue | None:
+        if not isinstance(legs, list):
+            return None
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            venue = cls._venue_from_close_reconciliation(leg.get("venue"))
+            if venue is not None:
+                return venue
+        return None
+
     @staticmethod
     def _close_reconciliation_leg_identity(leg: Any) -> tuple[str, str]:
         if not isinstance(leg, dict):
@@ -350,9 +363,48 @@ class CloseRuntime:
         missing_leg: str = "",
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
         allowed_legs = {"long", "short"}
         if missing_leg in allowed_legs:
             allowed_legs = {missing_leg}
+
+        def _int_or_zero(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _append_candidate(row: dict[str, Any], *, leg_name: str) -> None:
+            if leg_name not in allowed_legs:
+                return
+            order_id, client_order_id = cls._close_reconciliation_leg_identity(row)
+            if not order_id and not client_order_id:
+                return
+            venue = str(row.get("venue") or "")
+            key = (leg_name, venue.lower(), order_id, client_order_id)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                {
+                    "leg": leg_name,
+                    "venue": venue,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "source": str(row.get("source") or ""),
+                    "quantity_hint": cls._close_reconciliation_leg_quantity_hint(row),
+                    "submitted_at_ms": _int_or_zero(row.get("submitted_at_ms")),
+                }
+            )
+
+        top_level_candidates = reconciliation.get("statement_probe_candidates")
+        if isinstance(top_level_candidates, list):
+            for candidate in top_level_candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                leg_name = str(candidate.get("leg") or "")
+                _append_candidate(candidate, leg_name=leg_name)
+
         for leg_name, key in (("long", "long_legs"), ("short", "short_legs")):
             if leg_name not in allowed_legs:
                 continue
@@ -364,22 +416,7 @@ class CloseRuntime:
                     continue
                 if not cls._close_reconciliation_leg_statement_probe_candidate(leg):
                     continue
-                order_id, client_order_id = cls._close_reconciliation_leg_identity(leg)
-                if not order_id and not client_order_id:
-                    continue
-                candidates.append(
-                    {
-                        "leg": leg_name,
-                        "venue": str(leg.get("venue") or ""),
-                        "order_id": order_id,
-                        "client_order_id": client_order_id,
-                        "source": str(leg.get("source") or ""),
-                        "quantity_hint": cls._close_reconciliation_leg_quantity_hint(
-                            leg
-                        ),
-                        "submitted_at_ms": int(leg.get("submitted_at_ms") or 0),
-                    }
-                )
+                _append_candidate(leg, leg_name=leg_name)
         return candidates
 
     @classmethod
@@ -527,6 +564,13 @@ class CloseRuntime:
         error: str,
     ) -> bool:
         if str(reconciliation.get("kind") or "final") != "final":
+            return False
+        if (
+            bool(reconciliation.get("accounting_only_backfill"))
+            or str(reconciliation.get("close_reconciliation_state") or "")
+            == "terminal_flat_accounting_gap"
+            or self._has_statement_probe_candidates(reconciliation)
+        ):
             return False
         position_id = str(reconciliation.get("position_id") or "")
         if any(
@@ -1386,13 +1430,30 @@ class CloseRuntime:
             snapshot = reconciliation.get("position_snapshot") or {}
             if not isinstance(snapshot, dict):
                 snapshot = {}
+            long_legs = reconciliation.get("long_legs")
+            short_legs = reconciliation.get("short_legs")
+            long_has_identity = self._has_close_reconciliation_leg_identity(long_legs)
+            short_has_identity = self._has_close_reconciliation_leg_identity(short_legs)
             long_venue = self._venue_from_close_reconciliation(
                 reconciliation.get("long_venue") or snapshot.get("long_venue")
             )
             short_venue = self._venue_from_close_reconciliation(
                 reconciliation.get("short_venue") or snapshot.get("short_venue")
             )
-            if long_venue is None or short_venue is None:
+            if long_venue is None and long_has_identity:
+                long_venue = self._venue_from_close_reconciliation_legs(long_legs)
+            if short_venue is None and short_has_identity:
+                short_venue = self._venue_from_close_reconciliation_legs(short_legs)
+            if long_venue is None and not long_has_identity:
+                long_venue = short_venue
+            if short_venue is None and not short_has_identity:
+                short_venue = long_venue
+            if (
+                long_venue is None
+                or short_venue is None
+                or (long_has_identity and long_venue is None)
+                or (short_has_identity and short_venue is None)
+            ):
                 self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
@@ -1406,10 +1467,7 @@ class CloseRuntime:
                 changed = True
                 continue
 
-            if not (
-                self._has_close_reconciliation_leg_identity(reconciliation.get("long_legs"))
-                or self._has_close_reconciliation_leg_identity(reconciliation.get("short_legs"))
-            ):
+            if not (long_has_identity or short_has_identity):
                 self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
@@ -1427,12 +1485,12 @@ class CloseRuntime:
             long_fills = await self._call_fetch_close_leg_reconciliations(
                 symbol=symbol,
                 venue=long_venue,
-                legs=reconciliation.get("long_legs"),
+                legs=long_legs,
             )
             short_fills = await self._call_fetch_close_leg_reconciliations(
                 symbol=symbol,
                 venue=short_venue,
-                legs=reconciliation.get("short_legs"),
+                legs=short_legs,
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
                 payload = self._exit_reconciled_payload_from_leg_fills(

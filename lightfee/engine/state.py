@@ -1120,11 +1120,128 @@ class EngineState:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)
         position_id = str(item.get("position_id") or "")
         kind = str(item.get("kind") or "final")
+
+        def _row_key(row: Any, *, default_leg: str = "") -> tuple[str, str, str, str]:
+            if not isinstance(row, dict):
+                return "", "", "", ""
+            leg = str(row.get("leg") or default_leg or "")
+            venue = str(row.get("venue") or "").lower()
+            order_id = str(row.get("order_id") or "")
+            client_order_id = str(row.get("client_order_id") or "")
+            return leg, venue, order_id, client_order_id
+
+        def _merge_dict_rows(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+            merged = dict(base)
+            for key, value in incoming.items():
+                if value in (None, "", [], {}):
+                    continue
+                if merged.get(key) in (None, "", [], {}):
+                    merged[key] = value
+                elif key in {
+                    "statement_probe_candidate",
+                    "truth_gap_candidate",
+                    "accepted_order_truth_gap",
+                    "accounting_only_backfill",
+                } and value is True:
+                    merged[key] = True
+            return merged
+
+        def _merge_row_list(existing: dict[str, Any], key: str, *, default_leg: str = "") -> None:
+            current = [
+                dict(row)
+                for row in existing.get(key, []) or []
+                if isinstance(row, dict)
+            ]
+            by_key = {
+                _row_key(row, default_leg=default_leg): idx
+                for idx, row in enumerate(current)
+            }
+            for row in item.get(key, []) or []:
+                if not isinstance(row, dict):
+                    continue
+                row_key = _row_key(row, default_leg=default_leg)
+                if row_key == ("", "", "", ""):
+                    continue
+                if row_key in by_key:
+                    idx = by_key[row_key]
+                    current[idx] = _merge_dict_rows(current[idx], row)
+                    continue
+                by_key[row_key] = len(current)
+                current.append(dict(row))
+            if current:
+                existing[key] = current
+
+        def _int_or_zero(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def _merge_existing(existing: dict[str, Any]) -> None:
+            _merge_row_list(existing, "long_legs", default_leg="long")
+            _merge_row_list(existing, "short_legs", default_leg="short")
+            _merge_row_list(existing, "statement_probe_candidates")
+            _merge_row_list(existing, "unresolved_statement_probe_candidates")
+
+            existing_count = _int_or_zero(existing.get("truth_gap_candidate_count"))
+            incoming_count = _int_or_zero(item.get("truth_gap_candidate_count"))
+            statement_count = len(existing.get("statement_probe_candidates", []) or [])
+            existing["truth_gap_candidate_count"] = max(
+                existing_count,
+                incoming_count,
+                statement_count,
+            )
+
+            for field in ("symbol", "reason", "candidate_owner_id", "missing_leg"):
+                if not existing.get(field) and item.get(field):
+                    existing[field] = item[field]
+            for field in ("long_venue", "short_venue"):
+                if not existing.get(field) and item.get(field):
+                    existing[field] = item[field]
+
+            incoming_snapshot = item.get("position_snapshot")
+            if isinstance(incoming_snapshot, dict):
+                snapshot = existing.get("position_snapshot")
+                if not isinstance(snapshot, dict):
+                    snapshot = {}
+                snapshot = dict(snapshot)
+                for key, value in incoming_snapshot.items():
+                    if not snapshot.get(key) and value:
+                        snapshot[key] = value
+                existing["position_snapshot"] = snapshot
+
+            for flag in ("pending_backfill",):
+                if item.get(flag) is True:
+                    existing[flag] = True
+            if (
+                item.get("accounting_only_backfill") is True
+                and existing.get("blocking_trading") is not True
+            ):
+                existing["accounting_only_backfill"] = True
+                existing["blocking_trading"] = False
+            elif item.get("blocking_trading") is False and "blocking_trading" not in existing:
+                existing["blocking_trading"] = False
+
+            for field in ("component_evidence_status", "last_evidence_gap_reason"):
+                if item.get(field):
+                    existing[field] = item[field]
+            incoming_state = str(item.get("close_reconciliation_state") or "")
+            if incoming_state and existing.get("blocking_trading") is not True:
+                existing["close_reconciliation_state"] = incoming_state
+
+            current_next = _int_or_zero(existing.get("next_attempt_ms"))
+            incoming_next = _int_or_zero(item.get("next_attempt_ms"))
+            if incoming_next and (not current_next or incoming_next < current_next):
+                existing["next_attempt_ms"] = incoming_next
+            if not existing.get("closed_at_ms") and item.get("closed_at_ms"):
+                existing["closed_at_ms"] = item["closed_at_ms"]
+
         for existing in self.pending_close_reconciliations:
             if (
                 str(existing.get("position_id") or "") == position_id
                 and str(existing.get("kind") or "final") == kind
             ):
+                _merge_existing(existing)
                 return
         self.pending_close_reconciliations.append(dict(item))
         if len(self.pending_close_reconciliations) > MAX_PENDING_CLOSE_RECONCILIATIONS:

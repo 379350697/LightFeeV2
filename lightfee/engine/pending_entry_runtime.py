@@ -59,6 +59,179 @@ class PendingEntryRuntime:
     def __init__(self, ctx: RuntimeContext) -> None:
         self.ctx = ctx
 
+    @staticmethod
+    def _infer_symbol_from_pending_close(pending: Any) -> str:
+        symbol = str(getattr(pending, "symbol", "") or "").upper()
+        if symbol:
+            return symbol
+        for value in (
+            getattr(pending, "position_id", ""),
+            getattr(pending, "close_id", ""),
+        ):
+            text = str(value or "")
+            candidate = text.rsplit("-", 1)[-1].upper() if "-" in text else ""
+            if candidate.endswith("USDT") or candidate.endswith("USDC"):
+                return candidate
+        return ""
+
+    @staticmethod
+    def _pending_close_orphan_leg_records(
+        pending: Any,
+        *,
+        leg: str,
+    ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
+        def _float_or_zero(value: Any) -> float:
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _int_or_zero(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        records: list[dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
+        venue_hint = ""
+        uncertain = bool(getattr(pending, f"{leg}_uncertain", False))
+        target_qty = _float_or_zero(getattr(pending, f"{leg}_target_close_qty", 0.0))
+        target_qty = max(target_qty, _float_or_zero(getattr(pending, f"{leg}_closed", 0.0)))
+        order_id_hint = str(getattr(pending, f"{leg}_order_id", "") or "")
+        client_id_hint = str(getattr(pending, f"{leg}_client_order_id", "") or "")
+
+        source_records = list(getattr(pending, f"{leg}_legs", []) or [])
+        if not source_records and (order_id_hint or client_id_hint):
+            source_records = [
+                {
+                    "venue": "",
+                    "order_id": order_id_hint,
+                    "client_order_id": client_id_hint,
+                    "quantity": 0.0,
+                    "average_price": 0.0,
+                    "fee_quote": 0.0,
+                }
+            ]
+
+        seen: set[tuple[str, str, str]] = set()
+        for source in source_records:
+            if isinstance(source, dict):
+                venue = str(source.get("venue") or "")
+                order_id = str(source.get("order_id") or "")
+                client_order_id = str(source.get("client_order_id") or "")
+                quantity = _float_or_zero(source.get("quantity"))
+                average_price = _float_or_zero(source.get("average_price"))
+                fee_quote = _float_or_zero(source.get("fee_quote"))
+            else:
+                venue = str(getattr(source, "venue", "") or "")
+                order_id = str(getattr(source, "order_id", "") or "")
+                client_order_id = str(getattr(source, "client_order_id", "") or "")
+                quantity = _float_or_zero(getattr(source, "quantity", 0.0))
+                average_price = _float_or_zero(getattr(source, "average_price", 0.0))
+                fee_quote = _float_or_zero(getattr(source, "fee_quote", 0.0))
+            if not order_id:
+                order_id = order_id_hint
+            if not client_order_id:
+                client_order_id = client_id_hint
+            if venue and not venue_hint:
+                venue_hint = venue
+            key = (venue, order_id, client_order_id)
+            if key in seen or not (order_id or client_order_id or quantity > 1e-12):
+                continue
+            seen.add(key)
+            record = {
+                "venue": venue,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "quantity": quantity,
+                "average_price": average_price,
+                "fee_quote": fee_quote,
+            }
+            if uncertain and quantity <= 1e-12 and (order_id or client_order_id):
+                record["source"] = "pending_close_orphaned"
+                record["quantity_hint"] = target_qty
+                record["statement_probe_candidate"] = True
+                candidates.append({
+                    "leg": leg,
+                    "venue": venue,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "source": "pending_close_orphaned",
+                    "quantity_hint": target_qty,
+                    "submitted_at_ms": _int_or_zero(getattr(pending, "created_at_ms", 0)),
+                })
+            records.append(record)
+        return records, venue_hint, candidates
+
+    def _register_orphaned_pending_close_accounting_backfill(
+        self,
+        close_id: str,
+        pending: Any,
+        *,
+        now_ms: int,
+    ) -> bool:
+        def _int_or_default(value: Any, default: int) -> int:
+            try:
+                return int(value or default)
+            except (TypeError, ValueError):
+                return default
+
+        long_legs, long_venue, long_candidates = self._pending_close_orphan_leg_records(
+            pending,
+            leg="long",
+        )
+        short_legs, short_venue, short_candidates = self._pending_close_orphan_leg_records(
+            pending,
+            leg="short",
+        )
+        statement_probe_candidates = [*long_candidates, *short_candidates]
+        if not statement_probe_candidates:
+            return False
+
+        symbol = self._infer_symbol_from_pending_close(pending)
+        closed_at_ms = _int_or_default(getattr(pending, "created_at_ms", 0), now_ms)
+        reconciliation = {
+            "position_id": str(getattr(pending, "position_id", "") or ""),
+            "symbol": symbol,
+            "kind": "final",
+            "reason": str(getattr(pending, "reason", "") or ""),
+            "source": "pending_close_orphaned_terminal_flat",
+            "closed_at_ms": closed_at_ms,
+            "created_cycle": int(getattr(self.ctx.state, "tick_count", 0) or 0),
+            "position_snapshot": {
+                "symbol": symbol,
+                "long_venue": long_venue,
+                "short_venue": short_venue,
+            },
+            "long_legs": long_legs,
+            "short_legs": short_legs,
+            "attempt_count": 0,
+            "next_attempt_ms": now_ms,
+            "truth_gap_candidate_count": len(statement_probe_candidates),
+            "pending_backfill": True,
+            "accounting_only_backfill": True,
+            "blocking_trading": False,
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "component_evidence_status": "statement_probe_pending",
+            "statement_probe_candidates": statement_probe_candidates,
+            "original_payload": {
+                "close_id": close_id,
+                "source": "pending_close_orphaned",
+            },
+        }
+        self.ctx.state.enqueue_pending_close_reconciliation(reconciliation)
+        self.ctx.journal.append(
+            "reconciliation.pending_close_orphaned_accounting_backfill_registered",
+            {
+                "close_id": close_id,
+                "position_id": reconciliation["position_id"],
+                "symbol": symbol,
+                "statement_probe_candidate_count": len(statement_probe_candidates),
+            },
+        )
+        return True
+
     async def _reconcile_pending_state(self, now_ms: int) -> None:
         """Process pending closes and pending entries through venue adapters.
 
@@ -572,10 +745,15 @@ class PendingEntryRuntime:
                 pos = self.ctx.state.open_positions.get(pending.position_id)
                 if pos is None:
                     resolved_ids.append(close_id)
-                    self.ctx.journal.append(
-                        "reconciliation.pending_close_orphaned",
-                        {"close_id": close_id, "position_id": pending.position_id},
-                    )
+                    if not self._register_orphaned_pending_close_accounting_backfill(
+                        close_id,
+                        pending,
+                        now_ms=now_ms,
+                    ):
+                        self.ctx.journal.append(
+                            "reconciliation.pending_close_orphaned",
+                            {"close_id": close_id, "position_id": pending.position_id},
+                        )
                     continue
 
                 pending.reconcile_attempt += 1
