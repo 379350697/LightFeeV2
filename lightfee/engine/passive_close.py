@@ -1283,7 +1283,6 @@ class PassiveCloseExecutor:
             return {"handled": True, "status": result.status, "cleared": cleared}
 
         if result.status == "live_flat":
-            state.remove_pending_close_reconciliation(active_truth_gap)
             self._journal.append(
                 "exit.accepted_order_truth_gap_resolved",
                 {
@@ -1309,6 +1308,8 @@ class PassiveCloseExecutor:
                     "resolution_status": result.status,
                 },
             )
+            if cleared:
+                state.remove_pending_close_reconciliation(active_truth_gap)
             if not cleared:
                 pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_POLL_INTERVAL_MS
             return {"handled": True, "status": result.status, "cleared": cleared}
@@ -5647,7 +5648,20 @@ class PassiveCloseExecutor:
                         if v
                     ]
                     count = max(len(client_ids), len(order_ids))
+                    accepted_probe_candidate = bool(
+                        extra.get("accepted_order_ids")
+                        or extra.get("accepted_client_order_ids")
+                        or extra.get("accepted_order_id")
+                        or extra.get("accepted_client_order_id")
+                    )
                     for idx in range(count):
+                        record_kwargs: dict[str, Any] = {}
+                        if accepted_probe_candidate:
+                            record_kwargs = {
+                                "source": "accepted_order_truth_gap",
+                                "quantity_hint": flattened_quantity if idx == 0 else 0.0,
+                                "statement_probe_candidate": True,
+                            }
                         add_record(
                             target,
                             self._close_reconciliation_record(
@@ -5655,6 +5669,7 @@ class PassiveCloseExecutor:
                                 order_id=order_ids[idx] if idx < len(order_ids) else "",
                                 client_order_id=client_ids[idx] if idx < len(client_ids) else "",
                                 quantity=flattened_quantity if idx == 0 else 0.0,
+                                **record_kwargs,
                             ),
                         )
 
@@ -5734,6 +5749,8 @@ class PassiveCloseExecutor:
         for existing in state.pending_close_reconciliations:
             if not isinstance(existing, dict):
                 continue
+            if str(existing.get("kind") or "") == "accepted_order_truth_gap":
+                continue
             existing_key = tuple(
                 sorted(
                     str(record.get("order_id") or record.get("client_order_id") or "")
@@ -5787,8 +5804,15 @@ class PassiveCloseExecutor:
             )
         ]
         if statement_probe_candidates:
+            truth_gap_candidate_count = max(
+                truth_gap_candidate_count,
+                len(statement_probe_candidates),
+            )
+            reconciliation["truth_gap_candidate_count"] = truth_gap_candidate_count
             reconciliation["accounting_only_backfill"] = True
             reconciliation["blocking_trading"] = False
+            reconciliation["close_reconciliation_state"] = "terminal_flat_accounting_gap"
+            reconciliation["component_evidence_status"] = "statement_probe_pending"
             reconciliation["statement_probe_candidates"] = statement_probe_candidates
         exchange_truth = payload.get("exchange_truth")
         if isinstance(exchange_truth, dict):
@@ -5806,6 +5830,13 @@ class PassiveCloseExecutor:
                 "order_ids": order_key,
                 "accounting_only_backfill": bool(
                     reconciliation.get("accounting_only_backfill")
+                ),
+                "blocking_trading": bool(reconciliation.get("blocking_trading", True)),
+                "close_reconciliation_state": str(
+                    reconciliation.get("close_reconciliation_state") or ""
+                ),
+                "component_evidence_status": str(
+                    reconciliation.get("component_evidence_status") or ""
                 ),
                 "statement_probe_candidates": statement_probe_candidates,
                 "truth_gap_candidate_count": truth_gap_candidate_count,

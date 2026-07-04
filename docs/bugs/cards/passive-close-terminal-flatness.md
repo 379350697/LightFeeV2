@@ -32,6 +32,11 @@ residuals, and live-flat cleanup.
 - Bybit close `110017 current position is zero, cannot fix reduce-only order qty`
 - `exit.reconciled` with `evidence_gap_reason`,
   `statement_probe_status`, and `trade_probe_status`
+- `terminal_flat_accounting_gap`
+- `accounting_only_backfill=true`
+- `statement_probe_candidates`
+- `overcoverage_gap`
+- `funding_statement_pending`
 - `price_unavailable_for_min_notional`
 - `passive_close_maker_filled_under_chunk`
 - `entry.cleanup_leg_exposure`
@@ -73,6 +78,15 @@ truth has not jointly proven flat, retain `pending_passive_close`, keep the
 close owner, emit `exit.passive_close_waiting_exchange_flat_truth`, and let
 passive close maintenance probe again. Paper/backtest may keep local execution
 completion as terminal because no live exchange truth exists.
+
+Exchange-flat/no-open-orders truth releases trading risk, not accounting
+obligations. If terminal flat proof exists while accepted/truth-gap close order
+identity or statement-probe candidates remain, keep a nonblocking
+`terminal_flat_accounting_gap` reconciliation with `accounting_only_backfill=true`
+and `blocking_trading=false`. That record must continue read-only exchange
+statement probing until close PnL evidence is complete; it must not enter the
+offline optimization sample set while funding, fee, close-fill, market, or
+component evidence is missing.
 
 Bybit reduce-only close `110017/orderQty will be truncated to zero` is terminal
 zero-qty evidence for that reduce-only request, not a confirmed close fill and

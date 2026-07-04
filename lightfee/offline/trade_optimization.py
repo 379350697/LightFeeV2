@@ -266,6 +266,25 @@ def build_trade_optimization_analysis(
             "required_field_gap_count": sum(
                 len(row.get("field_gaps") or []) for row in excluded
             ),
+            "component_evidence_gap_count": sum(
+                1
+                for row in excluded
+                if any(
+                    str(gap).startswith("missing_component_evidence:")
+                    or str(gap) == "funding_statement_pending"
+                    for gap in row.get("field_gaps") or []
+                )
+            ),
+            "overcoverage_excluded_count": sum(
+                1
+                for row in excluded
+                if any(str(gap).startswith("overcoverage_") for gap in row.get("field_gaps") or [])
+            ),
+            "funding_statement_pending_count": sum(
+                1
+                for row in excluded
+                if "funding_statement_pending" in set(row.get("field_gaps") or [])
+            ),
             "normal_only": normal_only,
             "include_counterfactual": include_counterfactual,
             "lifecycle_truth_summary": lifecycle_report.get("summary", {}),
@@ -483,6 +502,11 @@ def _build_position_sample(
             coverage_gaps.extend(
                 str(gap) for gap in source_coverage.get("gaps", []) if str(gap)
             )
+        for gap in lifecycle_truth.get("overcoverage_gaps") or []:
+            if str(gap):
+                coverage_gaps.append(str(gap))
+        if str(lifecycle_truth.get("funding_statement_status") or "") == "pending":
+            coverage_gaps.append("funding_statement_pending")
     if not pnl.get("evidence_refs"):
         coverage_gaps.append("missing_pnl_evidence_refs")
     if notional <= 0:
@@ -609,6 +633,7 @@ def _pnl_label_from_lifecycle_truth(payload: JsonDict) -> JsonDict:
         "notional_quote": _decimal_str(_decimal(payload.get("notional_quote"))),
         "net_pnl_bps": _decimal_str(_decimal(payload.get("net_pnl_bps"))),
         "evidence_refs": list(payload.get("evidence_refs") or []),
+        "component_evidence": dict(payload.get("component_evidence") or {}),
     }
 
 
@@ -802,6 +827,22 @@ def _required_sample_field_gaps(sample: JsonDict) -> list[str]:
     refs = pnl.get("evidence_refs")
     if not isinstance(refs, list) or not refs:
         gaps.append("missing_required_pnl_field:evidence_refs")
+    component_evidence = pnl.get("component_evidence")
+    if isinstance(component_evidence, dict):
+        for component in ("price", "entry_fee", "exit_fee", "funding", "adjustment", "net"):
+            evidence = component_evidence.get(component)
+            if not isinstance(evidence, dict):
+                gaps.append(f"missing_component_evidence:{component}")
+                continue
+            if bool(evidence.get("complete")):
+                continue
+            if component == "funding" and str(evidence.get("statement_status") or "") == "pending":
+                gaps.append("funding_statement_pending")
+            else:
+                gaps.append(f"missing_component_evidence:{component}")
+    else:
+        for component in ("price", "entry_fee", "exit_fee", "funding", "adjustment", "net"):
+            gaps.append(f"missing_component_evidence:{component}")
 
     market = sample.get("market") if isinstance(sample.get("market"), dict) else {}
     for label in ("entry", "exit"):
@@ -810,6 +851,12 @@ def _required_sample_field_gaps(sample: JsonDict) -> list[str]:
             gaps.append(f"missing_{label}_market_snapshot")
     if "missing_time_to_funding" in set(sample.get("coverage_gaps") or []):
         gaps.append("missing_time_to_funding")
+    coverage_gap_set = set(sample.get("coverage_gaps") or [])
+    if "funding_statement_pending" in coverage_gap_set:
+        gaps.append("funding_statement_pending")
+    for gap in coverage_gap_set:
+        if str(gap).startswith("overcoverage_"):
+            gaps.append(str(gap))
     return sorted(set(gaps))
 
 

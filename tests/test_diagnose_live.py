@@ -6140,6 +6140,134 @@ def test_run_diagnose_conclusion_is_unhealthy_when_acceptance_gate_has_open_orde
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_treats_delisted_stale_symbol_error_as_probe_gap(
+    monkeypatch,
+):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_close_reconciliation_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1779816050000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        def stale_symbol_exchange_truth(runtime_dir, symbols, venues=None):
+            return {
+                "available": True,
+                "available_venues": ["bitget"],
+                "confidence": "high",
+                "positions": {"bitget": {}},
+                "open_orders": {
+                    "bitget": {
+                        "HEIUSDT": {
+                            "error": 'HTTP 400 {"code":"40309","msg":"The symbol has been removed"}',
+                            "code": "40309",
+                        }
+                    }
+                },
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "fetch_status": {"bitget": {"status": "ok"}},
+                "errors": [],
+                "missing_evidence": [],
+            }
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", stale_symbol_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="",
+            venues=["bitget"],
+            now_ms=1779816055000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["exchange_truth_actual_open_orders_present"] is False
+        assert gate["exchange_truth_probe_gap_count"] == 1
+        assert gate["exchange_truth_stale_symbol_probe_gap_count"] == 1
+        assert "exchange_truth_open_orders_present" not in gate["blocking_reasons"]
+        assert gate["gate_passed"] is True
+        assert result["exchange_truth"]["probe_gaps"] == [
+            {
+                "venue": "bitget",
+                "symbol": "HEIUSDT",
+                "kind": "symbol_removed",
+                "blocking": False,
+            }
+        ]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_production_gate_blocks_delisted_symbol_error_for_active_owner():
+    from scripts import diagnose_live as dl
+
+    local_state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "open_position_count": 1,
+        "open_positions": [
+            {
+                "position_id": "entry-active-hei",
+                "symbol": "HEIUSDT",
+                "long_venue": "bitget",
+                "short_venue": "okx",
+                "quantity": 10,
+                "matched_quantity": 10,
+            }
+        ],
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_close_reconciliation_count": 0,
+        "pending_residual_repair_count": 0,
+    }
+    exchange_truth = {
+        "available": True,
+        "available_venues": ["bitget"],
+        "confidence": "high",
+        "positions": {"bitget": {}},
+        "open_orders": {
+            "bitget": {
+                "HEIUSDT": {
+                    "error": 'HTTP 400 {"code":"40309","msg":"The symbol has been removed"}',
+                    "code": "40309",
+                }
+            }
+        },
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "errors": [],
+        "missing_evidence": [],
+    }
+
+    gate = dl._build_production_acceptance_gate([], local_state, exchange_truth)
+
+    assert gate["gate_passed"] is False
+    assert gate["exchange_truth_probe_gap_count"] == 1
+    assert gate["exchange_truth_blocking_probe_gap_count"] == 1
+    assert gate["exchange_truth_probe_gaps"] == [
+        {
+            "venue": "bitget",
+            "symbol": "HEIUSDT",
+            "kind": "symbol_removed",
+            "blocking": True,
+        }
+    ]
+    assert "exchange_truth_missing_required_evidence" in gate["blocking_reasons"]
+
+
 def test_production_gate_counts_journal_owned_pending_passive_close():
     from scripts import diagnose_live as dl
 

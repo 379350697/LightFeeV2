@@ -16,6 +16,7 @@ from typing import Any
 
 JsonDict = dict[str, Any]
 QTY_TOLERANCE = Decimal("0.999")
+OVER_COVERAGE_TOLERANCE = Decimal("1.001")
 
 
 class LifecycleClassification(str, Enum):
@@ -44,6 +45,7 @@ class _FillFact:
     exec_id: str = ""
     fill_event_id: str = ""
     fill_event_anchor_id: str = ""
+    fee_evidence_ref: str = ""
 
     def to_dict(self) -> JsonDict:
         return {
@@ -64,6 +66,7 @@ class _FillFact:
             "exec_id": self.exec_id,
             "fill_event_id": self.fill_event_id,
             "fill_event_anchor_id": self.fill_event_anchor_id,
+            "fee_evidence_ref": self.fee_evidence_ref,
         }
 
 
@@ -168,14 +171,27 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
         "long": [fill for fill in fills if fill.phase == "close" and fill.leg == "long"],
         "short": [fill for fill in fills if fill.phase == "close" and fill.leg == "short"],
     }
-    open_coverage = {
+    raw_open_coverage = {
         leg: _coverage_row(open_by_leg[leg], target_qty)
         for leg in ("long", "short")
     }
-    close_coverage = {
+    raw_close_coverage = {
         leg: _coverage_row(close_by_leg[leg], target_qty)
         for leg in ("long", "short")
     }
+    open_coverage = {
+        leg: _normalized_coverage_row(open_by_leg[leg], target_qty)
+        for leg in ("long", "short")
+    }
+    close_coverage = {
+        leg: _normalized_coverage_row(close_by_leg[leg], target_qty)
+        for leg in ("long", "short")
+    }
+    overcoverage_gaps = _overcoverage_gaps(
+        raw_open_coverage,
+        raw_close_coverage,
+        target_qty,
+    )
     open_long_covered = bool(open_coverage["long"]["covered"])
     open_short_covered = bool(open_coverage["short"]["covered"])
     close_long_covered = bool(close_coverage["long"]["covered"])
@@ -193,7 +209,13 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
         classification = LifecycleClassification.PHANTOM_ZERO_QTY_OPENED.value
     elif target_qty <= 0:
         classification = LifecycleClassification.EVIDENCE_INCOMPLETE.value
-    elif open_long_covered and open_short_covered and close_long_covered and close_short_covered:
+    elif (
+        open_long_covered
+        and open_short_covered
+        and close_long_covered
+        and close_short_covered
+        and not overcoverage_gaps
+    ):
         classification = LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
     elif any(fill.qty > 0 for fill in fills):
         classification = LifecycleClassification.EXCHANGE_LIFECYCLE_INCOMPLETE.value
@@ -216,6 +238,7 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
         open_coverage,
         close_coverage,
         classification,
+        overcoverage_gaps,
     )
     return {
         "position_id": facts.position_id,
@@ -229,9 +252,23 @@ def _finalize_position(facts: _PositionFacts) -> JsonDict:
         "close_legs": [fill.to_dict() for fill in close_by_leg["long"] + close_by_leg["short"]],
         "open_coverage": open_coverage,
         "close_coverage": close_coverage,
+        "raw_coverage": {
+            "open": raw_open_coverage,
+            "close": raw_close_coverage,
+        },
+        "normalized_coverage": {
+            "open": open_coverage,
+            "close": close_coverage,
+        },
+        "overcoverage_gaps": overcoverage_gaps,
         "order_identity_history": facts.order_identities,
         "funding_facts": facts.funding_facts,
         "terminal_flat_truth": terminal_flat_truth,
+        "component_evidence": pnl.get("component_evidence", {}),
+        "funding_statement_status": str(
+            (pnl.get("component_evidence") or {}).get("funding_statement_status")
+            or ""
+        ),
         "pnl": pnl,
         "source_coverage": {
             "event_kind_counts": dict(sorted(facts.event_kinds.items())),
@@ -284,6 +321,18 @@ def _collect_entry_opened_fills(facts: _PositionFacts, payload: JsonDict, ts_ms:
                 filled_at_ms=_entry_opened_leg_filled_at_ms(payload, leg, ts_ms),
                 source="entry.opened",
                 confidence="exchange_fill_exact",
+                fee_evidence_ref=_fee_evidence_ref_from_identity(
+                    "open",
+                    leg,
+                    venue,
+                    trade_id="",
+                    exec_id="",
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fallback=f"open:{leg}:{venue}:fee:entry.opened:{facts.position_id}",
+                )
+                if _has_any_key(payload, f"{leg}_entry_fee_quote")
+                else "",
             )
         )
 
@@ -409,6 +458,18 @@ def _collect_exit_reconciled_fills(facts: _PositionFacts, payload: JsonDict, ts_
             fee_quote=_decimal(payload.get(f"{leg}_fee_quote")),
             filled_at_ms=ts_ms,
             source="exit.reconciled",
+            fee_evidence_ref=_fee_evidence_ref_from_identity(
+                "close",
+                leg,
+                str(payload.get(f"{leg}_venue") or ""),
+                trade_id="",
+                exec_id="",
+                order_id=order_id,
+                client_order_id=client_order_id,
+                fallback=f"close:{leg}:fee:exit.reconciled:{facts.position_id}",
+            )
+            if _has_any_key(payload, f"{leg}_fee_quote", f"{leg}_fee")
+            else "",
         )
         facts.fills.append(fill)
         _collect_identity_from_payload(facts, fill.to_dict(), kind="exit.reconciled", ts_ms=ts_ms)
@@ -510,7 +571,7 @@ def _fill_fact_from_order_filled(facts: _PositionFacts, payload: JsonDict, ts_ms
             or payload.get("price")
             or payload.get("avgPx")
         ),
-        fee_quote=_decimal(payload.get("fee_quote") or payload.get("fee")),
+        fee_quote=_decimal(payload.get("fee_quote") or payload.get("fee") or payload.get("commission")),
         trade_side=str(payload.get("tradeSide") or payload.get("trade_side") or ""),
         raw_side=str(payload.get("side") or ""),
         filled_at_ms=_first_int(payload.get("filled_at_ms"), ts_ms),
@@ -519,6 +580,24 @@ def _fill_fact_from_order_filled(facts: _PositionFacts, payload: JsonDict, ts_ms
         exec_id=str(payload.get("exec_id") or payload.get("execId") or ""),
         fill_event_id=str(payload.get("fill_event_id") or ""),
         fill_event_anchor_id=str(payload.get("fill_event_anchor_id") or ""),
+        fee_evidence_ref=_fee_evidence_ref_from_identity(
+            phase,
+            leg,
+            str(payload.get("venue") or payload.get("exchange") or ""),
+            trade_id=str(payload.get("trade_id") or payload.get("tradeId") or ""),
+            exec_id=str(payload.get("exec_id") or payload.get("execId") or ""),
+            order_id=str(payload.get("order_id") or payload.get("orderId") or ""),
+            client_order_id=str(
+                payload.get("client_order_id")
+                or payload.get("clientOrderId")
+                or payload.get("clientOid")
+                or payload.get("orderLinkId")
+                or ""
+            ),
+            fallback=f"{phase}:{leg}:fee:order.filled:{ts_ms}",
+        )
+        if _has_any_key(payload, "fee_quote", "fee", "commission")
+        else "",
     )
 
 
@@ -548,7 +627,7 @@ def _fill_fact_from_leg_row(
         ),
         qty=qty,
         price=_decimal(row.get("average_price") or row.get("avg_price") or row.get("price")),
-        fee_quote=_decimal(row.get("fee_quote") or row.get("fee")),
+        fee_quote=_decimal(row.get("fee_quote") or row.get("fee") or row.get("commission")),
         trade_side=str(row.get("tradeSide") or row.get("trade_side") or ""),
         raw_side=str(row.get("side") or ""),
         filled_at_ms=_first_int(row.get("filled_at_ms"), ts_ms),
@@ -557,6 +636,23 @@ def _fill_fact_from_leg_row(
         exec_id=str(row.get("exec_id") or row.get("execId") or ""),
         fill_event_id=str(row.get("fill_event_id") or ""),
         fill_event_anchor_id=str(row.get("fill_event_anchor_id") or ""),
+        fee_evidence_ref=_fee_evidence_ref_from_identity(
+            phase,
+            leg,
+            str(row.get("venue") or row.get("exchange") or ""),
+            trade_id=str(row.get("trade_id") or row.get("tradeId") or ""),
+            exec_id=str(row.get("exec_id") or row.get("execId") or ""),
+            order_id=str(row.get("order_id") or row.get("orderId") or ""),
+            client_order_id=str(
+                row.get("client_order_id")
+                or row.get("clientOrderId")
+                or row.get("clientOid")
+                or ""
+            ),
+            fallback=f"{phase}:{leg}:fee:{default_source}:{ts_ms}",
+        )
+        if _has_any_key(row, "fee_quote", "fee", "commission")
+        else "",
     )
 
 
@@ -1033,6 +1129,63 @@ def _coverage_row(fills: list[_FillFact], target_qty: Decimal) -> JsonDict:
     }
 
 
+def _normalized_coverage_row(fills: list[_FillFact], target_qty: Decimal) -> JsonDict:
+    if target_qty <= 0:
+        return _coverage_row(fills, target_qty)
+    remaining = target_qty
+    normalized: list[_FillFact] = []
+    for fill in sorted(fills, key=lambda item: (item.filled_at_ms, item.order_id, item.client_order_id)):
+        if remaining <= 0:
+            break
+        qty = fill.qty if fill.qty <= remaining else remaining
+        if qty <= 0:
+            continue
+        if qty == fill.qty:
+            normalized.append(fill)
+        else:
+            ratio = qty / fill.qty if fill.qty > 0 else Decimal("0")
+            normalized.append(
+                _FillFact(
+                    phase=fill.phase,
+                    leg=fill.leg,
+                    venue=fill.venue,
+                    order_id=fill.order_id,
+                    client_order_id=fill.client_order_id,
+                    qty=qty,
+                    price=fill.price,
+                    fee_quote=fill.fee_quote * ratio,
+                    trade_side=fill.trade_side,
+                    raw_side=fill.raw_side,
+                    filled_at_ms=fill.filled_at_ms,
+                    source=fill.source,
+                    confidence=fill.confidence,
+                    trade_id=fill.trade_id,
+                    exec_id=fill.exec_id,
+                    fill_event_id=fill.fill_event_id,
+                    fill_event_anchor_id=fill.fill_event_anchor_id,
+                    fee_evidence_ref=fill.fee_evidence_ref,
+                )
+            )
+        remaining -= qty
+    return _coverage_row(normalized, target_qty)
+
+
+def _overcoverage_gaps(
+    open_coverage: dict[str, JsonDict],
+    close_coverage: dict[str, JsonDict],
+    target_qty: Decimal,
+) -> list[str]:
+    if target_qty <= 0:
+        return []
+    gaps: list[str] = []
+    limit = target_qty * OVER_COVERAGE_TOLERANCE
+    for phase, coverage in (("open", open_coverage), ("close", close_coverage)):
+        for leg in ("long", "short"):
+            if _decimal(coverage[leg].get("filled_qty")) > limit:
+                gaps.append(f"overcoverage_{phase}_{leg}")
+    return sorted(gaps)
+
+
 def _project_record_status(
     facts: _PositionFacts,
     open_coverage: dict[str, JsonDict],
@@ -1130,7 +1283,7 @@ def _pnl_from_truth(
         price += (long_close - long_entry) * target_qty
     if short_entry > 0 and short_close > 0:
         price += (short_entry - short_close) * target_qty
-    funding, funding_refs = _funding_truth(entry, facts)
+    funding, funding_refs, funding_statement_status = _funding_truth(entry, facts)
     entry_fee = sum(
         (_fee_as_pnl(fill.fee_quote) for fill in open_by_leg["long"] + open_by_leg["short"]),
         Decimal("0"),
@@ -1144,6 +1297,11 @@ def _pnl_from_truth(
     if target_qty > 0 and long_entry > 0 and short_entry > 0:
         notional = target_qty * ((long_entry + short_entry) / Decimal("2"))
     net_bps = (net / notional) * Decimal("10000") if notional > 0 else Decimal("0")
+    refs_by_component = _pnl_component_refs(open_by_leg, close_by_leg, funding_refs)
+    component_evidence = _pnl_component_evidence(
+        refs_by_component,
+        funding_statement_status=funding_statement_status,
+    )
     return {
         "price_pnl_quote": _decimal_str(price),
         "funding_pnl_quote": _decimal_str(funding),
@@ -1154,6 +1312,7 @@ def _pnl_from_truth(
         "notional_quote": _decimal_str(notional),
         "net_pnl_bps": _decimal_str(net_bps),
         "evidence_refs": _pnl_refs(open_by_leg, close_by_leg, funding_refs),
+        "component_evidence": component_evidence,
     }
 
 
@@ -1168,10 +1327,11 @@ def _empty_pnl() -> JsonDict:
         "notional_quote": "0",
         "net_pnl_bps": "0",
         "evidence_refs": [],
+        "component_evidence": {},
     }
 
 
-def _funding_truth(entry: JsonDict, facts: _PositionFacts) -> tuple[Decimal, list[str]]:
+def _funding_truth(entry: JsonDict, facts: _PositionFacts) -> tuple[Decimal, list[str], str]:
     statement_total = Decimal("0")
     statement_refs: list[str] = []
     seen: set[tuple[str, str, str, str, str]] = set()
@@ -1183,8 +1343,6 @@ def _funding_truth(entry: JsonDict, facts: _PositionFacts) -> tuple[Decimal, lis
             or payload.get("amount_quote")
             or payload.get("amount")
         )
-        if amount == 0:
-            continue
         venue = str(payload.get("venue") or payload.get("exchange") or "")
         statement_id = str(
             payload.get("statement_id")
@@ -1194,6 +1352,9 @@ def _funding_truth(entry: JsonDict, facts: _PositionFacts) -> tuple[Decimal, lis
             or payload.get("order_id")
             or ""
         )
+        if not statement_id:
+            if amount == 0:
+                continue
         ts_key = str(
             payload.get("funding_ts_ms")
             or payload.get("funding_time_ms")
@@ -1211,18 +1372,132 @@ def _funding_truth(entry: JsonDict, facts: _PositionFacts) -> tuple[Decimal, lis
         else:
             statement_refs.append(f"funding:{venue}:ts_ms:{ts_key}:amount:{_decimal_str(amount)}")
     if statement_refs:
-        return statement_total, _unique(statement_refs)
+        return statement_total, _unique(statement_refs), "complete"
     for event in facts.exit_reconciled:
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         if _exit_reconciled_complete(payload):
             amount = _decimal(payload.get("funding_pnl_quote") or payload.get("funding"))
             if amount:
-                return amount, [f"funding:exit.reconciled:{facts.position_id}"]
+                return amount, [f"funding:exit.reconciled:{facts.position_id}"], "pending"
             break
     amount = _decimal(entry.get("captured_funding_quote") or entry.get("funding_pnl_quote"))
     if amount:
-        return amount, [f"funding:entry.opened:{facts.position_id}"]
-    return Decimal("0"), []
+        return amount, [f"funding:entry.opened:{facts.position_id}"], "pending"
+    return Decimal("0"), [], "pending"
+
+
+def _pnl_component_refs(
+    open_by_leg: dict[str, list[_FillFact]],
+    close_by_leg: dict[str, list[_FillFact]],
+    funding_refs: list[str],
+) -> dict[str, list[str]]:
+    open_refs = _fill_refs(open_by_leg)
+    close_refs = _fill_refs(close_by_leg)
+    entry_fee_refs, entry_fee_missing_count = _fee_refs_with_missing(open_by_leg)
+    exit_fee_refs, exit_fee_missing_count = _fee_refs_with_missing(close_by_leg)
+    return {
+        "price": _unique(open_refs + close_refs),
+        "entry_fee": entry_fee_refs,
+        "exit_fee": exit_fee_refs,
+        "funding": _unique(funding_refs),
+        "adjustment": [],
+        "net": _unique(open_refs + close_refs + entry_fee_refs + exit_fee_refs + funding_refs),
+        "_entry_fee_missing_count": [str(entry_fee_missing_count)],
+        "_exit_fee_missing_count": [str(exit_fee_missing_count)],
+    }
+
+
+def _pnl_component_evidence(
+    refs_by_component: dict[str, list[str]],
+    *,
+    funding_statement_status: str,
+) -> JsonDict:
+    evidence: JsonDict = {}
+    price_refs = refs_by_component.get("price") or []
+    evidence["price"] = {"complete": bool(price_refs), "refs": price_refs}
+    for component, missing_key in (
+        ("entry_fee", "_entry_fee_missing_count"),
+        ("exit_fee", "_exit_fee_missing_count"),
+    ):
+        refs = refs_by_component.get(component) or []
+        missing_count = int((refs_by_component.get(missing_key) or ["0"])[0] or "0")
+        evidence[component] = {
+            "complete": bool(refs) and missing_count == 0,
+            "refs": refs,
+            "missing_count": missing_count,
+        }
+    funding_refs = refs_by_component.get("funding") or []
+    evidence["funding"] = {
+        "complete": funding_statement_status == "complete" and bool(funding_refs),
+        "refs": funding_refs,
+        "statement_status": funding_statement_status,
+    }
+    evidence["adjustment"] = {"complete": True, "refs": [], "status": "not_applicable"}
+    net_refs = refs_by_component.get("net") or []
+    evidence["net"] = {
+        "complete": bool(net_refs)
+        and all(
+            bool(evidence.get(component, {}).get("complete"))
+            for component in ("price", "entry_fee", "exit_fee", "funding", "adjustment")
+        ),
+        "refs": net_refs,
+    }
+    evidence["funding_statement_status"] = funding_statement_status
+    return evidence
+
+
+def _fill_refs(by_leg: dict[str, list[_FillFact]]) -> list[str]:
+    refs: list[str] = []
+    for leg, fills in by_leg.items():
+        for fill in fills:
+            refs.extend(_single_fill_refs(fill.phase, leg, fill))
+    return _unique(refs)
+
+
+def _fee_refs_with_missing(by_leg: dict[str, list[_FillFact]]) -> tuple[list[str], int]:
+    refs: list[str] = []
+    missing_count = 0
+    for fills in by_leg.values():
+        for fill in fills:
+            if fill.fee_evidence_ref:
+                refs.append(fill.fee_evidence_ref)
+            else:
+                missing_count += 1
+    return _unique(refs), missing_count
+
+
+def _single_fill_refs(phase: str, leg: str, fill: _FillFact) -> list[str]:
+    if fill.trade_id:
+        return [f"{phase}:{leg}:{fill.venue}:trade_id:{fill.trade_id}"]
+    if fill.exec_id:
+        return [f"{phase}:{leg}:{fill.venue}:exec_id:{fill.exec_id}"]
+    if fill.order_id:
+        return [f"{phase}:{leg}:{fill.venue}:order_id:{fill.order_id}"]
+    if fill.client_order_id:
+        return [f"{phase}:{leg}:{fill.venue}:client_order_id:{fill.client_order_id}"]
+    return []
+
+
+def _fee_evidence_ref_from_identity(
+    phase: str,
+    leg: str,
+    venue: str,
+    *,
+    trade_id: str,
+    exec_id: str,
+    order_id: str,
+    client_order_id: str,
+    fallback: str,
+) -> str:
+    if trade_id:
+        return f"{phase}:{leg}:{venue}:trade_id:{trade_id}:fee"
+    if exec_id:
+        return f"{phase}:{leg}:{venue}:exec_id:{exec_id}:fee"
+    if order_id:
+        return f"{phase}:{leg}:{venue}:order_id:{order_id}:fee"
+    if client_order_id:
+        return f"{phase}:{leg}:{venue}:client_order_id:{client_order_id}:fee"
+    return fallback
 
 
 def _pnl_refs(
@@ -1252,8 +1527,9 @@ def _source_coverage_gaps(
     open_coverage: dict[str, JsonDict],
     close_coverage: dict[str, JsonDict],
     classification: str,
+    overcoverage_gaps: list[str],
 ) -> list[str]:
-    gaps: list[str] = []
+    gaps: list[str] = list(overcoverage_gaps)
     if target_qty <= 0:
         gaps.append("missing_target_quantity")
     for phase, coverage in (("open", open_coverage), ("close", close_coverage)):
@@ -1277,6 +1553,13 @@ def _source_coverage_gaps(
 def _dedupe_fills(fills: list[_FillFact]) -> list[_FillFact]:
     out: list[_FillFact] = []
     seen: set[tuple[str, ...]] = set()
+    open_order_identities = {
+        identity
+        for fill in fills
+        if fill.phase == "open"
+        for identity in [_fill_order_identity_key(fill)]
+        if identity
+    }
     detailed_open_legs = {
         (fill.phase, fill.leg)
         for fill in fills
@@ -1284,6 +1567,12 @@ def _dedupe_fills(fills: list[_FillFact]) -> list[_FillFact]:
     }
     for fill in fills:
         if fill.source == "entry.opened" and (fill.phase, fill.leg) in detailed_open_legs:
+            continue
+        if (
+            fill.phase == "close"
+            and _fill_order_identity_key(fill) in open_order_identities
+            and not _fill_has_strong_close_evidence(fill)
+        ):
             continue
         key = _fill_dedupe_key(fill)
         if key in seen:
@@ -1297,9 +1586,9 @@ def _fill_dedupe_key(fill: _FillFact) -> tuple[str, ...]:
     if fill.fill_event_id:
         return ("fill_event_id", fill.fill_event_id)
     if fill.trade_id:
-        return ("trade_id", fill.phase, fill.leg, fill.venue, fill.trade_id)
+        return ("trade_id", fill.venue, fill.trade_id)
     if fill.exec_id:
-        return ("exec_id", fill.phase, fill.leg, fill.venue, fill.exec_id)
+        return ("exec_id", fill.venue, fill.exec_id)
     identity = fill.order_id or fill.client_order_id
     if identity:
         return (
@@ -1311,7 +1600,6 @@ def _fill_dedupe_key(fill: _FillFact) -> tuple[str, ...]:
             fill.client_order_id,
             _decimal_str(fill.qty),
             _decimal_str(fill.price),
-            _decimal_str(fill.fee_quote),
         )
     return (
         "weak_exact",
@@ -1320,9 +1608,27 @@ def _fill_dedupe_key(fill: _FillFact) -> tuple[str, ...]:
         fill.venue,
         _decimal_str(fill.qty),
         _decimal_str(fill.price),
-        _decimal_str(fill.fee_quote),
         str(fill.filled_at_ms),
     )
+
+
+def _fill_order_identity_key(fill: _FillFact) -> tuple[str, str, str] | None:
+    if fill.order_id:
+        return (fill.venue.lower(), "order_id", fill.order_id)
+    if fill.client_order_id:
+        return (fill.venue.lower(), "client_order_id", fill.client_order_id)
+    return None
+
+
+def _fill_has_strong_close_evidence(fill: _FillFact) -> bool:
+    if str(fill.trade_side or "").lower() == "close":
+        return True
+    raw_side = str(fill.raw_side or "").lower()
+    if fill.leg == "long" and raw_side in {"sell", "ask"}:
+        return True
+    if fill.leg == "short" and raw_side in {"buy", "bid"}:
+        return True
+    return False
 
 
 def _fill_phase(payload: JsonDict) -> str:
@@ -1333,11 +1639,13 @@ def _fill_phase(payload: JsonDict) -> str:
     trade_side = str(payload.get("tradeSide") or payload.get("trade_side") or "").lower()
     leg = str(payload.get("leg") or "").lower()
     side = str(payload.get("side") or "").lower()
+    if trade_side in {"open", "close"}:
+        return trade_side
+    if _boolish(payload.get("reduceOnly") or payload.get("reduce_only")):
+        return "close"
     if (
         "close" in source
         or "backfill" in source
-        or "exchange_trade_history" in source
-        or trade_side == "close"
         or (leg == "long" and side in {"sell", "ask"})
         or (leg == "short" and side in {"buy", "bid"})
     ):
@@ -1350,6 +1658,13 @@ def _fill_phase(payload: JsonDict) -> str:
     ):
         return "open"
     return ""
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y"}
 
 
 def _fill_leg(payload: JsonDict, entry: JsonDict) -> str:
@@ -1452,6 +1767,10 @@ def _fee_as_pnl(value: Any) -> Decimal:
     if fee > 0:
         return -fee
     return fee
+
+
+def _has_any_key(row: JsonDict, *keys: str) -> bool:
+    return any(key in row for key in keys)
 
 
 def _decimal_str(value: Any) -> str:

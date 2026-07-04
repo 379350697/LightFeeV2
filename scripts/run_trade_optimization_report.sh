@@ -5,15 +5,37 @@ ROOT="${LIGHTFEE_ROOT:-/opt/lightfee-v2}"
 PYTHON="${LIGHTFEE_PYTHON:-$ROOT/.venv/bin/python3}"
 AUDIT_DIR="$ROOT/runtime/audits/trade_optimization"
 LOG_DIR="$ROOT/logs"
+DRY_RUN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    *)
+      printf 'unknown argument: %s\n' "$arg" >&2
+      exit 2
+      ;;
+  esac
+done
 
 mkdir -p "$AUDIT_DIR" "$LOG_DIR"
 exec >>"$LOG_DIR/trade-optimization-report.log" 2>&1
 
 LOCK_FILE="$AUDIT_DIR/.refresh.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  printf '%s trade_optimization_report skipped reason=already_running\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  exit 0
+LOCK_DIR=""
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    printf '%s trade_optimization_report skipped reason=already_running\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    exit 0
+  fi
+else
+  LOCK_DIR="$AUDIT_DIR/.refresh.lockdir"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s trade_optimization_report skipped reason=already_running\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    exit 0
+  fi
 fi
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -23,6 +45,9 @@ TMP_REPORT="$AUDIT_DIR/report.$RUN_ID.tmp.md"
 
 cleanup() {
   rm -f "$TMP_JSON" "$TMP_CSV" "$TMP_REPORT"
+  if [ -n "$LOCK_DIR" ]; then
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -85,6 +110,22 @@ for sample in report.get("samples") or []:
     refs = pnl.get("evidence_refs")
     if not isinstance(refs, list) or not refs:
         gaps.append("missing_required_pnl_field:evidence_refs")
+    component_evidence = pnl.get("component_evidence")
+    if isinstance(component_evidence, dict):
+        for component in ("price", "entry_fee", "exit_fee", "funding", "adjustment", "net"):
+            evidence = component_evidence.get(component)
+            if not isinstance(evidence, dict):
+                gaps.append(f"missing_component_evidence:{component}")
+                continue
+            if evidence.get("complete") is True:
+                continue
+            if component == "funding" and evidence.get("statement_status") == "pending":
+                gaps.append("funding_statement_pending")
+            else:
+                gaps.append(f"missing_component_evidence:{component}")
+    else:
+        for component in ("price", "entry_fee", "exit_fee", "funding", "adjustment", "net"):
+            gaps.append(f"missing_component_evidence:{component}")
     market = sample.get("market") if isinstance(sample.get("market"), dict) else {}
     if not snapshot_has_quote(market.get("entry_snapshot")):
         gaps.append("missing_entry_market_snapshot")
@@ -93,6 +134,12 @@ for sample in report.get("samples") or []:
     features = sample.get("features") if isinstance(sample.get("features"), dict) else {}
     if features.get("time_to_funding_ms") is None:
         gaps.append("missing_time_to_funding")
+    coverage_gaps = set(sample.get("coverage_gaps") or [])
+    if "funding_statement_pending" in coverage_gaps:
+        gaps.append("funding_statement_pending")
+    for gap in coverage_gaps:
+        if str(gap).startswith("overcoverage_"):
+            gaps.append(str(gap))
     if gaps:
         bad_samples.append(
             {
@@ -127,6 +174,12 @@ print(
     )
 )
 PY
+
+if [ "$DRY_RUN" = true ]; then
+  "$PYTHON" -c 'import json, sys; p=json.load(open(sys.argv[1])); s=p.get("summary", {}); print("trade_optimization_report dry_run_summary normal=%s excluded=%s field_gap_excluded=%s required_field_gaps=%s component_evidence_gaps=%s funding_statement_pending=%s event_count=%s recommendations=%s" % (s.get("normal_sample_count"), s.get("excluded_position_count"), s.get("field_gap_excluded_count"), s.get("required_field_gap_count"), s.get("component_evidence_gap_count"), s.get("funding_statement_pending_count"), s.get("event_count"), len(p.get("recommendations", []))))' "$TMP_JSON"
+  printf '%s trade_optimization_report dry_run_complete run_id=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUN_ID"
+  exit 0
+fi
 
 mv -f "$TMP_JSON" "$AUDIT_DIR/latest.json"
 mv -f "$TMP_CSV" "$AUDIT_DIR/samples.csv"

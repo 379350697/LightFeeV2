@@ -42,6 +42,8 @@ evidence must map to the matrix before runtime code changes.
 - `orphan_maker_order`
 - `unpaired_live_position`
 - `owned_pending_entry_live_conflict`
+- `exchange_truth_probe_gap`
+- `exchange_truth_missing_required_evidence`
 - Bitget `passive_maintenance.maker_progress` lacks `progress_evidence` while a
   later positive-fill/live-truth conflict needs source/merge proof.
 - OKX order detail has positive `accFillSz` / `fillSz`, but
@@ -465,3 +467,8 @@ without owner ids.
     `RUNNING_CLEAN` clear after `no_live_positions`. Do not use position-flat
     truth to clear `orphan_maker_order`; require open-order truth for that
     blocker.
+25. Treat stale/delisted/unsupported symbol open-order probe errors as
+    `exchange_truth_probe_gap`, not as true open orders, only when there is no
+    active owner/current order candidate for that symbol. The same probe error
+    remains blocking `exchange_truth_missing_required_evidence` when scoped to
+    an active owner.

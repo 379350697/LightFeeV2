@@ -4317,7 +4317,23 @@ class TestFallbackResidualReal:
 
         assert result is True
         bybit.place_order.assert_not_called()
-        assert state.pending_close_reconciliations == []
+        assert len(state.pending_close_reconciliations) == 1
+        retained = state.pending_close_reconciliations[0]
+        assert retained["position_id"] == position.position_id
+        assert retained["accounting_only_backfill"] is True
+        assert retained["blocking_trading"] is False
+        assert retained["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+        assert retained["statement_probe_candidates"] == [
+            {
+                "leg": "short",
+                "venue": Venue.BYBIT.value,
+                "order_id": "ack-flat-order",
+                "client_order_id": "ack-flat-cid",
+                "source": "accepted_order_truth_gap",
+                "quantity_hint": 20.0,
+                "submitted_at_ms": 0,
+            }
+        ]
         assert position.position_id not in state.pending_passive_closes
         resolved = [
             record["payload"]
@@ -6064,7 +6080,23 @@ class TestFallbackResidualReal:
         )
 
         assert result is True
-        assert state.pending_close_reconciliations == []
+        assert len(state.pending_close_reconciliations) == 1
+        retained = state.pending_close_reconciliations[0]
+        assert retained["accounting_only_backfill"] is True
+        assert retained["blocking_trading"] is False
+        assert retained["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+        assert retained["truth_gap_candidate_count"] == 1
+        assert retained["statement_probe_candidates"] == [
+            {
+                "venue": Venue.BYBIT.value,
+                "leg": "short",
+                "order_id": "ack-oid",
+                "client_order_id": "ack-cid",
+                "source": "accepted_order_truth_gap",
+                "quantity_hint": 7000.0,
+                "submitted_at_ms": 0,
+            }
+        ]
         resolved = [
             record["payload"]
             for record in journal.read_all()

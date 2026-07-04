@@ -5,7 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from lightfee.offline.trade_optimization import build_trade_optimization_analysis
+from lightfee.offline.trade_optimization import (
+    _required_sample_field_gaps,
+    build_trade_optimization_analysis,
+)
 
 
 def _event(ts_ms: int, kind: str, payload: dict) -> dict:
@@ -29,6 +32,7 @@ def _complete_exchange_sample_events(
     selected_edge_bps: str = "20",
     selected_total_funding_edge_bps: str = "150",
     include_market: bool = True,
+    include_funding_statement: bool = True,
     include_passive_events: bool = False,
 ) -> list[dict]:
     events = [
@@ -109,6 +113,20 @@ def _complete_exchange_sample_events(
             },
         ),
     ]
+    if include_funding_statement:
+        events.append(
+            _event(
+                ts_base + 20_000,
+                "funding.settled",
+                {
+                    "position_id": position_id,
+                    "symbol": symbol,
+                    "venue": long_venue,
+                    "statement_id": f"{position_id}-funding",
+                    "funding_pnl_quote": funding_pnl_quote,
+                },
+            )
+        )
     if include_market:
         events.extend(
             [
@@ -231,9 +249,9 @@ def test_current_reconciled_complete_sample_gets_real_accounting_label():
                 "fee_quote": "0.06",
             },
         ),
-        _event(
-            20_000,
-            "exit.reconciled",
+            _event(
+                20_000,
+                "exit.reconciled",
             {
                 "position_id": "entry-1-LABUSDT",
                 "symbol": "LABUSDT",
@@ -261,10 +279,22 @@ def test_current_reconciled_complete_sample_gets_real_accounting_label():
                         "average_price": 2.10,
                         "fee_quote": "0.07",
                     }
-                ],
-            },
-        ),
-    ]
+                    ],
+                },
+            ),
+            _event(
+                20_500,
+                "funding.settled",
+                {
+                    "position_id": "entry-1-LABUSDT",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "statement_id": "funding-entry-1",
+                    "funding_pnl_quote": "0.80",
+                    "funding_ts_ms": 20_000,
+                },
+            ),
+        ]
 
     report = build_trade_optimization_analysis(events, normal_only=True)
 
@@ -506,6 +536,115 @@ def test_missing_required_pnl_notional_excludes_complete_lifecycle_sample():
     excluded = report["excluded_positions"][0]
     assert excluded["reason"] == "lifecycle_complete_required_field_gap"
     assert excluded["field_gaps"] == ["missing_required_pnl_field:notional_quote"]
+
+
+def test_funding_capture_without_statement_ref_excludes_complete_lifecycle_sample():
+    events = _complete_exchange_sample_events(
+        position_id="entry-funding-statement-pending-LAB",
+        funding_pnl_quote="0",
+        include_funding_statement=False,
+    )
+    events.append(
+        _event(
+            120_000,
+            "runtime.funding_capture_state_updated",
+            {
+                "position_id": "entry-funding-statement-pending-LAB",
+                "symbol": "LABUSDT",
+                "state": "captured",
+            },
+        )
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["funding_statement_pending_count"] == 1
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_required_field_gap"
+    assert excluded["field_gaps"] == [
+        "funding_statement_pending",
+        "missing_component_evidence:net",
+    ]
+
+
+def test_zero_funding_without_statement_ref_excludes_complete_lifecycle_sample():
+    events = _complete_exchange_sample_events(
+        position_id="entry-zero-funding-no-statement-LAB",
+        funding_pnl_quote="0",
+        include_funding_statement=False,
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 0
+    assert report["summary"]["funding_statement_pending_count"] == 1
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_required_field_gap"
+    assert excluded["field_gaps"] == [
+        "funding_statement_pending",
+        "missing_component_evidence:net",
+    ]
+
+
+def test_missing_fee_statement_evidence_excludes_complete_lifecycle_sample():
+    events = _complete_exchange_sample_events(
+        position_id="entry-missing-fee-evidence-LAB",
+    )
+    for event in events:
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        payload.pop("fee_quote", None)
+        for key in ("long_legs", "short_legs"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        row.pop("fee_quote", None)
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 0
+    excluded = report["excluded_positions"][0]
+    assert excluded["reason"] == "lifecycle_complete_required_field_gap"
+    assert excluded["field_gaps"] == [
+        "missing_component_evidence:entry_fee",
+        "missing_component_evidence:exit_fee",
+        "missing_component_evidence:net",
+    ]
+
+
+def test_required_field_gate_rejects_missing_component_evidence_object():
+    snapshot = {"bid_price": "1", "ask_price": "2"}
+    sample = {
+        "pnl": {
+            "price_pnl_quote": "1",
+            "funding_pnl_quote": "0",
+            "entry_fee_quote": "-0.1",
+            "exit_fee_quote": "-0.1",
+            "rebate_adjustment_quote": "0",
+            "net_pnl_quote": "0.8",
+            "notional_quote": "100",
+            "net_pnl_bps": "80",
+            "evidence_refs": ["open:long:bitget:order_id:o1"],
+        },
+        "market": {
+            "entry_snapshot": snapshot,
+            "exit_snapshot": snapshot,
+        },
+        "features": {"time_to_funding_ms": 1},
+        "coverage_gaps": [],
+    }
+
+    assert _required_sample_field_gaps(sample) == [
+        "missing_component_evidence:adjustment",
+        "missing_component_evidence:entry_fee",
+        "missing_component_evidence:exit_fee",
+        "missing_component_evidence:funding",
+        "missing_component_evidence:net",
+        "missing_component_evidence:price",
+    ]
 
 
 def test_legacy_exit_closed_requires_full_qty_and_close_fill_evidence():
@@ -757,17 +896,18 @@ def test_sidecar_liquidity_snapshot_fields_are_preserved():
         _event(
             10_100,
             "order.filled",
-            {
-                "position_id": "entry-liquidity-LAB",
-                "symbol": "LABUSDT",
-                "phase": "open",
-                "venue": "bitget",
-                "leg": "long",
-                "order_id": "long-liquidity-open",
-                "quantity": 2,
-                "average_price": 12,
-            },
-        ),
+                {
+                    "position_id": "entry-liquidity-LAB",
+                    "symbol": "LABUSDT",
+                    "phase": "open",
+                    "venue": "bitget",
+                    "leg": "long",
+                    "order_id": "long-liquidity-open",
+                    "quantity": 2,
+                    "average_price": 12,
+                    "fee_quote": "0.01",
+                },
+            ),
         _event(
             10_200,
             "order.filled",
@@ -776,15 +916,27 @@ def test_sidecar_liquidity_snapshot_fields_are_preserved():
                 "symbol": "LABUSDT",
                 "phase": "open",
                 "venue": "okx",
-                "leg": "short",
-                "order_id": "short-liquidity-open",
-                "quantity": 2,
-                "average_price": 12,
-            },
-        ),
-        _event(
-            9_900,
-            "runtime.snapshot_freshness_decision",
+                    "leg": "short",
+                    "order_id": "short-liquidity-open",
+                    "quantity": 2,
+                    "average_price": 12,
+                    "fee_quote": "0.01",
+                },
+            ),
+            _event(
+                19_500,
+                "funding.settled",
+                {
+                    "position_id": "entry-liquidity-LAB",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "statement_id": "funding-liquidity",
+                    "funding_pnl_quote": "0",
+                },
+            ),
+            _event(
+                9_900,
+                "runtime.snapshot_freshness_decision",
             {
                 "symbol": "LABUSDT",
                 "venue": "bitget",
@@ -810,21 +962,23 @@ def test_sidecar_liquidity_snapshot_fields_are_preserved():
                 "net_quote": "0.10",
                 "long_legs": [
                     {
-                        "venue": "bitget",
-                        "order_id": "long-liquidity-close",
-                        "quantity": 2,
-                        "average_price": 12.01,
-                    }
-                ],
+                            "venue": "bitget",
+                            "order_id": "long-liquidity-close",
+                            "quantity": 2,
+                            "average_price": 12.01,
+                            "fee_quote": "0.01",
+                        }
+                    ],
                 "short_legs": [
                     {
-                        "venue": "okx",
-                        "order_id": "short-liquidity-close",
-                        "quantity": 2,
-                        "average_price": 11.99,
-                    }
-                ],
-            },
+                            "venue": "okx",
+                            "order_id": "short-liquidity-close",
+                            "quantity": 2,
+                            "average_price": 11.99,
+                            "fee_quote": "0.01",
+                        }
+                    ],
+                },
         ),
     ]
 
@@ -890,12 +1044,13 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
                 "symbol": "LABUSDT",
                 "phase": "open",
                 "venue": "bitget",
-                "leg": "long",
-                "order_id": "long-cli-open",
-                "quantity": 1,
-                "average_price": 10,
-            },
-        ),
+                    "leg": "long",
+                    "order_id": "long-cli-open",
+                    "quantity": 1,
+                    "average_price": 10,
+                    "fee_quote": "0.01",
+                },
+            ),
         _event(
             1_200,
             "order.filled",
@@ -904,14 +1059,26 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
                 "symbol": "LABUSDT",
                 "phase": "open",
                 "venue": "okx",
-                "leg": "short",
-                "order_id": "short-cli-open",
-                "quantity": 1,
-                "average_price": 10,
-            },
-        ),
-        _event(
-            2_000,
+                    "leg": "short",
+                    "order_id": "short-cli-open",
+                    "quantity": 1,
+                    "average_price": 10,
+                    "fee_quote": "0.01",
+                },
+            ),
+            _event(
+                1_500,
+                "funding.settled",
+                {
+                    "position_id": "entry-cli-LAB",
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "statement_id": "funding-cli",
+                    "funding_pnl_quote": "0",
+                },
+            ),
+            _event(
+                2_000,
             "exit.reconciled",
             {
                 "position_id": "entry-cli-LAB",
@@ -922,20 +1089,22 @@ def test_cli_writes_json_csv_and_markdown_outputs(tmp_path: Path):
                 "net_quote": "1.25",
                 "long_legs": [
                     {
-                        "venue": "bitget",
-                        "order_id": "long-cli-close",
-                        "quantity": 1,
-                        "average_price": 10.75,
-                    }
-                ],
+                            "venue": "bitget",
+                            "order_id": "long-cli-close",
+                            "quantity": 1,
+                            "average_price": 10.75,
+                            "fee_quote": "0.01",
+                        }
+                    ],
                 "short_legs": [
                     {
-                        "venue": "okx",
-                        "order_id": "short-cli-close",
-                        "quantity": 1,
-                        "average_price": 10.25,
-                    }
-                ],
+                            "venue": "okx",
+                            "order_id": "short-cli-close",
+                            "quantity": 1,
+                            "average_price": 10.25,
+                            "fee_quote": "0.01",
+                        }
+                    ],
             },
         ),
     ]

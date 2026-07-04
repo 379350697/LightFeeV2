@@ -397,6 +397,111 @@ def test_bitget_trade_side_close_is_mapped_by_venue_not_raw_side():
     assert truth["close_coverage"]["long"]["order_ids"] == ["1a95-close-long"]
 
 
+def test_exchange_trade_history_trade_side_open_stays_open():
+    position_id = "entry-history-open-LABUSDT"
+    truth = _truth(
+        [
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "quantity": 3,
+                    "long_venue": "bitget",
+                    "short_venue": "bybit",
+                },
+            ),
+            _event(
+                1_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "exchange_trade_history",
+                    "tradeSide": "open",
+                    "venue": "bitget",
+                    "leg": "long",
+                    "order_id": "open-long-history",
+                    "side": "buy",
+                    "quantity": 3,
+                    "price": 0.10,
+                    "fee_quote": 0.01,
+                },
+            ),
+            _event(
+                1_200,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "exchange_trade_history",
+                    "tradeSide": "open",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "order_id": "open-short-history",
+                    "side": "sell",
+                    "quantity": 3,
+                    "price": 0.11,
+                    "fee_quote": 0.01,
+                },
+            ),
+            _event(
+                2_000,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "exchange_trade_history",
+                    "tradeSide": "close",
+                    "venue": "bitget",
+                    "leg": "long",
+                    "order_id": "close-long-history",
+                    "side": "sell",
+                    "quantity": 3,
+                    "price": 0.12,
+                    "fee_quote": 0.01,
+                },
+            ),
+            _event(
+                2_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "exchange_trade_history",
+                    "tradeSide": "close",
+                    "venue": "bybit",
+                    "leg": "short",
+                    "order_id": "close-short-history",
+                    "side": "buy",
+                    "quantity": 3,
+                    "price": 0.09,
+                    "fee_quote": 0.01,
+                },
+            ),
+            _event(
+                2_200,
+                "funding.settled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "venue": "bitget",
+                    "statement_id": "funding-history-open",
+                    "funding_pnl_quote": 0,
+                },
+            ),
+        ],
+        position_id,
+    )
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["open_coverage"]["long"]["order_ids"] == ["open-long-history"]
+    assert truth["open_coverage"]["short"]["order_ids"] == ["open-short-history"]
+    assert truth["close_coverage"]["long"]["order_ids"] == ["close-long-history"]
+    assert truth["close_coverage"]["short"]["order_ids"] == ["close-short-history"]
+
+
 def test_legacy_exit_closed_without_exchange_fill_is_not_complete():
     position_id = "entry-legacy-gap"
     truth = _truth(
@@ -624,6 +729,202 @@ def test_legacy_order_filled_close_infers_phase_from_leg_and_side():
     assert truth["project_record_status"] == "legacy_exit_closed_project_record_gap"
     assert truth["close_coverage"]["long"]["covered"] is True
     assert truth["close_coverage"]["short"]["covered"] is True
+
+
+def test_exchange_query_close_source_cannot_turn_open_order_into_close_fill():
+    position_id = "entry-aergo-open-order-not-close"
+    truth = _truth(
+        [
+            _event(
+                1_000,
+                "entry.opened",
+                {
+                    "position_id": position_id,
+                    "symbol": "AERGOUSDT",
+                    "quantity": 461,
+                    "long_venue": "binance",
+                    "short_venue": "bitget",
+                },
+            ),
+            _event(
+                1_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "AERGOUSDT",
+                    "phase": "open",
+                    "venue": "binance",
+                    "leg": "long",
+                    "order_id": "open-long",
+                    "quantity": 461,
+                    "price": 0.1,
+                },
+            ),
+            _event(
+                1_200,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "AERGOUSDT",
+                    "phase": "open",
+                    "venue": "bitget",
+                    "leg": "short",
+                    "order_id": "828457112",
+                    "quantity": 461,
+                    "price": 0.11,
+                },
+            ),
+            _event(
+                2_000,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "AERGOUSDT",
+                    "source": "rebuild_lifecycle_truth_exchange_query_close",
+                    "venue": "binance",
+                    "leg": "long",
+                    "order_id": "close-long",
+                    "tradeSide": "close",
+                    "quantity": 461,
+                    "price": 0.101,
+                },
+            ),
+            _event(
+                2_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "AERGOUSDT",
+                    "source": "rebuild_lifecycle_truth_exchange_query_close",
+                    "venue": "bitget",
+                    "leg": "short",
+                    "order_id": "828457112",
+                    "quantity": 461,
+                    "price": 0.11,
+                },
+            ),
+        ],
+        position_id,
+    )
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_INCOMPLETE.value
+    assert truth["close_coverage"]["short"]["covered"] is False
+    assert truth["close_coverage"]["short"]["filled_qty"] == "0"
+    assert "828457112" not in truth["close_coverage"]["short"]["order_ids"]
+
+
+def test_same_close_order_from_multiple_sources_counts_once_and_records_normalized_coverage():
+    position_id = "entry-lab-duplicate-close-source"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 3,
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 3,
+                "price": 6.1,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 3,
+                "price": 6.11,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.reconciled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "accounting_status": "complete",
+                "evidence_gap": False,
+                "pending_backfill": False,
+                "long_legs": [
+                    {
+                        "venue": "binance",
+                        "order_id": "4815052825",
+                        "quantity": 3,
+                        "average_price": 6.08,
+                        "fee_quote": 0.01,
+                    }
+                ],
+                "short_legs": [
+                    {
+                        "venue": "bybit",
+                        "order_id": "291573c5-c6ff-46f1-a2eb-093b376c4c39",
+                        "quantity": 3,
+                        "average_price": 6.09,
+                        "fee_quote": 0.01,
+                    }
+                ],
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "source": "terminal_maker_filled_hedge_ack_live_flat",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "4815052825",
+                "quantity": 3,
+                "price": 6.08,
+                "fee_quote": 0,
+            },
+        ),
+        _event(
+            2_020,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "source": "terminal_maker_filled_hedge_ack_live_flat",
+                "phase": "close",
+                "venue": "bybit",
+                "leg": "short",
+                "order_id": "291573c5-c6ff-46f1-a2eb-093b376c4c39",
+                "quantity": 3,
+                "price": 6.09,
+                "fee_quote": 0,
+            },
+        ),
+    ]
+
+    truth = _truth(events, position_id)
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "3"
+    assert truth["close_coverage"]["short"]["filled_qty"] == "3"
+    assert truth["normalized_coverage"]["close"]["long"]["filled_qty"] == "3"
+    assert truth["overcoverage_gaps"] == []
 
 
 def test_rebuild_lifecycle_truth_cli_dry_run(tmp_path: Path):

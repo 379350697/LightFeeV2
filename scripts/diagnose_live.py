@@ -4593,23 +4593,89 @@ def _exchange_truth_flat(exchange_truth: dict[str, Any]) -> bool:
 def _exchange_truth_no_open_orders(exchange_truth: dict[str, Any]) -> bool:
     if not exchange_truth.get("available"):
         return False
-    if exchange_truth.get("has_open_order"):
+    if _exchange_truth_actual_open_orders_present(exchange_truth):
         return False
+    return True
+
+
+def _exchange_truth_actual_open_orders_present(exchange_truth: dict[str, Any]) -> bool:
     for venue_orders in (exchange_truth.get("open_orders") or {}).values():
         if not isinstance(venue_orders, dict):
             continue
-        if venue_orders.get("error"):
-            return False
         for orders in venue_orders.values():
             if isinstance(orders, list):
                 if orders:
-                    return False
+                    return True
                 continue
             if isinstance(orders, dict):
-                return False
+                if orders.get("error"):
+                    continue
+                return True
             if orders not in (None, "", False):
-                return False
-    return True
+                return True
+    return bool(exchange_truth.get("has_open_order")) and not _exchange_truth_probe_gaps(
+        exchange_truth
+    )
+
+
+def _exchange_truth_probe_gaps(
+    exchange_truth: dict[str, Any],
+    *,
+    active_symbols: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    active = {str(symbol or "").upper() for symbol in active_symbols or set() if symbol}
+    gaps: list[dict[str, Any]] = []
+    for venue, venue_orders in (exchange_truth.get("open_orders") or {}).items():
+        venue_name = str(venue or "").lower()
+        if not isinstance(venue_orders, dict):
+            continue
+        if venue_orders.get("error"):
+            kind = _classify_exchange_truth_probe_error(venue_orders)
+            gaps.append({
+                "venue": venue_name,
+                "symbol": "",
+                "kind": kind,
+                "blocking": True,
+            })
+        for symbol, orders in venue_orders.items():
+            if not isinstance(orders, dict) or not orders.get("error"):
+                continue
+            symbol_name = str(symbol or "").upper()
+            kind = _classify_exchange_truth_probe_error(orders)
+            blocking = not (
+                kind in {"symbol_removed", "unsupported_symbol"}
+                and symbol_name
+                and symbol_name not in active
+            )
+            gaps.append({
+                "venue": venue_name,
+                "symbol": symbol_name,
+                "kind": kind,
+                "blocking": blocking,
+            })
+    return gaps
+
+
+def _classify_exchange_truth_probe_error(row: dict[str, Any]) -> str:
+    code = str(row.get("code") or row.get("error_code") or "")
+    error = str(row.get("error") or row.get("msg") or row.get("message") or "").lower()
+    if code == "40309" or "symbol has been removed" in error or "has been removed" in error:
+        return "symbol_removed"
+    if (
+        "unsupported" in error
+        or "not supported" in error
+        or "does not exist" in error
+        or "invalid symbol" in error
+        or "unknown symbol" in error
+    ):
+        return "unsupported_symbol"
+    if "rate limit" in error or "too many requests" in error:
+        return "rate_limited"
+    if "auth" in error or "signature" in error or "permission" in error:
+        return "auth_or_transport_error"
+    if error:
+        return "unknown"
+    return "unknown"
 
 
 def _build_entry_outcome_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -8261,6 +8327,9 @@ def _build_production_acceptance_gate(
         local_state.get("pending_close_reconciliation_symbols") or []
     )
     exchange_truth_flat = _exchange_truth_flat(exchange_truth)
+    exchange_truth_actual_open_orders_present = (
+        _exchange_truth_actual_open_orders_present(exchange_truth)
+    )
     exchange_truth_no_open_orders = _exchange_truth_no_open_orders(exchange_truth)
     exchange_truth_required_venues = list(
         exchange_truth.get("required_venues") or []
@@ -8488,6 +8557,21 @@ def _build_production_acceptance_gate(
             if entry_opened_count:
                 exception_conclusions["entry_opened"] = "active_lifecycle_in_progress"
     active_owner_scope = _active_owner_managed_scope(local_state)
+    exchange_truth_probe_gaps = _exchange_truth_probe_gaps(
+        exchange_truth,
+        active_symbols=active_owner_scope.get("symbols", set()),
+    )
+    if exchange_truth_probe_gaps:
+        exchange_truth["probe_gaps"] = [dict(gap) for gap in exchange_truth_probe_gaps]
+    exchange_truth_probe_gap_count = len(exchange_truth_probe_gaps)
+    exchange_truth_stale_symbol_probe_gap_count = sum(
+        1
+        for gap in exchange_truth_probe_gaps
+        if gap.get("kind") in {"symbol_removed", "unsupported_symbol"}
+    )
+    exchange_truth_blocking_probe_gap_count = sum(
+        1 for gap in exchange_truth_probe_gaps if gap.get("blocking") is True
+    )
     active_residual_lifecycle_closed = (
         active_positions_with_capacity
         and recovery_lifecycle["unclosed_residual_lifecycle_count"] == 0
@@ -8552,6 +8636,8 @@ def _build_production_acceptance_gate(
             blocking_reasons.append("exchange_truth_nonzero_position")
         if not exchange_truth_no_open_orders:
             blocking_reasons.append("exchange_truth_open_orders_present")
+        if exchange_truth_blocking_probe_gap_count:
+            blocking_reasons.append("exchange_truth_missing_required_evidence")
     if (
         (entry_opened_count or position_opened_count)
         and not trade_lifecycle_closed
@@ -8724,6 +8810,17 @@ def _build_production_acceptance_gate(
         "recovery_lifecycle": recovery_lifecycle,
         "exchange_truth_flat": exchange_truth_flat,
         "exchange_truth_no_open_orders": exchange_truth_no_open_orders,
+        "exchange_truth_actual_open_orders_present": (
+            exchange_truth_actual_open_orders_present
+        ),
+        "exchange_truth_probe_gap_count": exchange_truth_probe_gap_count,
+        "exchange_truth_stale_symbol_probe_gap_count": (
+            exchange_truth_stale_symbol_probe_gap_count
+        ),
+        "exchange_truth_blocking_probe_gap_count": (
+            exchange_truth_blocking_probe_gap_count
+        ),
+        "exchange_truth_probe_gaps": exchange_truth_probe_gaps,
         "exchange_truth_required_venues": exchange_truth_required_venues,
         "exchange_truth_missing_required_venues": (
             exchange_truth_missing_required_venues
