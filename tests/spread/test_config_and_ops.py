@@ -32,6 +32,19 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_paper_excluded_symbols == ["BBUSDT", "QNTUSDT"]
     assert strategy.spread_paper_allowed_opportunity_labels == ["spread_reversion"]
     assert strategy.spread_paper_episode_cooldown_ms == 1_800_000
+    assert strategy.spread_paper_bot_ids == [
+        "tt_conservative",
+        "mt_long_maker",
+        "mt_short_maker",
+        "mt_selected_maker",
+        "mt_selected_maker_delay_1000ms",
+        "core_v1_bot",
+        "core_v1_exec100_bot",
+        "core_v1_z10_bot",
+        "bad_pair_control_bot",
+        "low_liquidity_control_bot",
+        "low_edge_control_bot",
+    ]
     assert strategy.spread_paper_markout_secs == [60, 300, 900, 1800]
     assert strategy.spread_paper_terminal_secs == 1800
     assert strategy.spread_paper_slippage_buffer_bps == 0.0
@@ -69,6 +82,7 @@ spread_paper_finalist_limit = 2
 spread_paper_excluded_symbols = ["BBUSDT", "QNTUSDT", "EDGEUSDT"]
 spread_paper_allowed_opportunity_labels = ["spread_reversion", "single_venue_dislocation"]
 spread_paper_episode_cooldown_ms = 900000
+spread_paper_bot_ids = ["tt_conservative", "core_v1_bot"]
 spread_paper_markout_secs = [10, 20]
 spread_paper_terminal_secs = 20
 spread_paper_slippage_buffer_bps = 4.0
@@ -79,6 +93,8 @@ spread_paper_event_log_path = "runtime/custom-spread-paper.jsonl"
 
 [[venues]]
 venue = "binance"
+taker_fee_bps = 0.6
+maker_fee_bps = 0.2
 
 [[venues]]
 venue = "okx"
@@ -115,11 +131,14 @@ venue = "okx"
         "single_venue_dislocation",
     ]
     assert config.strategy.spread_paper_episode_cooldown_ms == 900_000
+    assert config.strategy.spread_paper_bot_ids == ["tt_conservative", "core_v1_bot"]
     assert config.strategy.spread_paper_markout_secs == [10, 20]
     assert config.strategy.spread_paper_terminal_secs == 20
     assert config.strategy.spread_paper_slippage_buffer_bps == 4.0
     assert config.strategy.spread_paper_default_funding_interval_ms == 14_400_000
     assert config.persistence.spread_paper_event_log_path == "runtime/custom-spread-paper.jsonl"
+    assert config.venues[0].taker_fee_bps == 0.6
+    assert config.venues[0].maker_fee_bps == 0.2
 
 
 def test_spread_sidecar_systemd_unit_is_validated_like_sidecar() -> None:

@@ -454,6 +454,20 @@ class TestJournalAnalysisIntegration:
         report = analyze_journal_records(records)
         assert report.paper_outcome_closed_count == 1
 
+    def test_analyze_counts_paper_hedge_filled_without_pnl_totals(self):
+        from lightfee.offline.analysis.journal import analyze_journal_records
+        records = [
+            {"kind": "opportunity.paper_hedge_filled", "payload": {
+                "paper_id": "p1",
+                "paper_bot_id": "mt_selected_maker_delay_1000ms",
+            }},
+        ]
+        report = analyze_journal_records(records)
+        assert report.paper_outcome_hedge_filled_count == 1
+        assert report.paper_outcome_markout_count == 0
+        assert report.paper_outcome_closed_count == 0
+        assert report.paper_outcome_net_quote_total == 0.0
+
     def test_analyze_counts_real_vs_paper_joined(self):
         from lightfee.offline.analysis.journal import analyze_journal_records
         records = [

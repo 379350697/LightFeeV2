@@ -3,13 +3,22 @@ from __future__ import annotations
 from lightfee.offline.spread_paper_analysis import analyze_spread_paper_events
 
 
-def _closed(symbol: str, net_quote: float, *, label: str = "spread_reversion") -> dict:
+def _closed(
+    symbol: str,
+    net_quote: float,
+    *,
+    label: str = "spread_reversion",
+    bot_id: str = "tt_conservative",
+    cohort: str = "baseline_current",
+) -> dict:
     return {
         "kind": "opportunity.paper_closed",
         "payload": {
             "paper_id": f"spread:{symbol}:gate->binance:1000",
             "symbol": symbol,
             "candidate_opportunity_label": label,
+            "paper_bot_id": bot_id,
+            "paper_cohort": cohort,
             "paper_net_quote": net_quote,
             "paper_gross_quote": net_quote + 0.02,
             "paper_fee_quote": 0.01,
@@ -69,3 +78,20 @@ def test_spread_paper_analyzer_can_include_single_venue_when_requested() -> None
     assert report.closed_count == 2
     assert report.net_quote_total == 1.0
     assert report.by_label["single_venue_dislocation"].closed_count == 1
+
+
+def test_spread_paper_analyzer_groups_by_bot_and_cohort() -> None:
+    report = analyze_spread_paper_events(
+        [
+            _closed("LABUSDT", 1.0, bot_id="tt_conservative", cohort="baseline_current"),
+            _closed("LABUSDT", 2.0, bot_id="core_v1_bot", cohort="core_v1"),
+            _closed("DOGSUSDT", -0.5, bot_id="core_v1_bot", cohort="core_v1"),
+            _closed("INITUSDT", -1.0, bot_id="bad_pair_control_bot", cohort="bad_pair_control"),
+        ]
+    )
+
+    assert report.by_bot["tt_conservative"].net_quote_total == 1.0
+    assert report.by_bot["core_v1_bot"].closed_count == 2
+    assert report.by_bot["core_v1_bot"].net_quote_total == 1.5
+    assert report.by_cohort["core_v1"].closed_count == 2
+    assert report.by_cohort["bad_pair_control"].win_rate == 0.0

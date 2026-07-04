@@ -82,6 +82,7 @@ class JournalAnalysisReport:
 
     # Paper outcome tracking (V1: paper_outcome event kinds)
     paper_outcome_registered_count: int = 0
+    paper_outcome_hedge_filled_count: int = 0
     paper_outcome_markout_count: int = 0
     paper_outcome_closed_count: int = 0
     paper_outcome_joined_count: int = 0
@@ -130,6 +131,7 @@ _LOCAL_L2_SYNC_FAILED = "runtime.local_l2_sync_failed"
 
 _PAPER_OUTCOME_KINDS = frozenset({
     "opportunity.paper_registered",
+    "opportunity.paper_hedge_filled",
     "opportunity.paper_markout",
     "opportunity.paper_closed",
     "opportunity.real_vs_paper_joined",
@@ -233,6 +235,9 @@ def _float_payload(payload: dict, key: str) -> float:
 def _record_paper_outcome(report: JournalAnalysisReport, kind: str, payload: dict) -> None:
     if kind == "opportunity.paper_registered":
         report.paper_outcome_registered_count += 1
+        return
+    if kind == "opportunity.paper_hedge_filled":
+        report.paper_outcome_hedge_filled_count += 1
         return
 
     label = payload.get("opportunity_label", "unknown")

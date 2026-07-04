@@ -22,6 +22,13 @@ from lightfee.spread.reversion import (
 from lightfee.venues.specs import get_spec
 
 
+def _venue_maker_fee_bps(venue_config: object) -> float:
+    maker_fee = getattr(venue_config, "maker_fee_bps", None)
+    if maker_fee is None:
+        maker_fee = getattr(venue_config, "taker_fee_bps", 0.0)
+    return float(maker_fee or 0.0)
+
+
 class SpreadSidecarService:
     """Public-data signal process for spread reversion.
 
@@ -122,8 +129,11 @@ class SpreadSidecarService:
         for rank, candidate in enumerate(candidates):
             if rank >= self._paper_tracker.config.finalist_limit:
                 break
-            registered_event = self._paper_tracker.register(candidate, quotes, finalist_rank=rank)
-            if registered_event is not None:
+            for registered_event in self._paper_tracker.register_many(
+                candidate,
+                quotes,
+                finalist_rank=rank,
+            ):
                 self._paper_journal.append(
                     str(registered_event["kind"]),
                     dict(registered_event["payload"]),
@@ -191,6 +201,13 @@ class SpreadSidecarService:
                 for venue in config.venues
                 if str(getattr(venue, "venue", "") or "").strip()
             },
+            maker_fee_bps_by_venue={
+                str(getattr(venue, "venue", "") or "").lower(): _venue_maker_fee_bps(
+                    venue
+                )
+                for venue in config.venues
+                if str(getattr(venue, "venue", "") or "").strip()
+            },
             slippage_buffer_bps=slippage_bps,
             default_funding_interval_ms=int(
                 getattr(strategy, "spread_paper_default_funding_interval_ms", 0) or 0
@@ -204,6 +221,7 @@ class SpreadSidecarService:
             episode_cooldown_ms=int(
                 getattr(strategy, "spread_paper_episode_cooldown_ms", 0) or 0
             ),
+            paper_bot_ids=list(getattr(strategy, "spread_paper_bot_ids", []) or []),
         )
 
     async def _fetch_quotes_direct(

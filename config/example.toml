@@ -101,6 +101,7 @@ spread_paper_finalist_limit = 10
 spread_paper_excluded_symbols = ["BBUSDT", "QNTUSDT"]
 spread_paper_allowed_opportunity_labels = ["spread_reversion"]
 spread_paper_episode_cooldown_ms = 1800000
+spread_paper_bot_ids = ["tt_conservative", "mt_long_maker", "mt_short_maker", "mt_selected_maker", "mt_selected_maker_delay_1000ms", "core_v1_bot", "core_v1_exec100_bot", "core_v1_z10_bot", "bad_pair_control_bot", "low_liquidity_control_bot", "low_edge_control_bot"]
 spread_paper_markout_secs = [60, 300, 900, 1800]
 spread_paper_terminal_secs = 1800
 spread_paper_slippage_buffer_bps = 0.0
@@ -195,11 +196,13 @@ tuning_diagnostics_max_records = 10000
 [[venues]]
 venue = "binance"
 taker_fee_bps = 0.5
+maker_fee_bps = 0.5
 max_notional = 1000.0
 
 [[venues]]
 venue = "okx"
 taker_fee_bps = 0.5
+maker_fee_bps = 0.5
 max_notional = 1000.0
 [venues.live.passive_maker]
 prefer_amend_over_cancel = true
@@ -222,11 +225,13 @@ small_fill_buffer_max_wait_ms = 1500
 [[venues]]
 venue = "bybit"
 taker_fee_bps = 0.6
+maker_fee_bps = 0.6
 max_notional = 1000.0
 
 [[venues]]
 venue = "hyperliquid"
 taker_fee_bps = 0.3
+maker_fee_bps = 0.3
 max_notional = 1000.0
 [venues.live.trade_credentials]
 wallet_private_key_env = "LIGHTFEE_HYPERLIQUID_WALLET_PRIVATE_KEY"

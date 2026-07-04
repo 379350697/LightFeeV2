@@ -170,6 +170,7 @@ async def test_spread_sidecar_service_writes_shadow_paper_to_dedicated_journal(
             spread_min_net_edge_bps=0.0,
             spread_paper_enabled=True,
             spread_paper_finalist_limit=5,
+            spread_paper_bot_ids=["tt_conservative"],
             spread_paper_markout_secs=[0],
             spread_paper_terminal_secs=0,
             spread_paper_slippage_buffer_bps=2.0,
@@ -234,6 +235,92 @@ async def test_spread_sidecar_service_writes_shadow_paper_to_dedicated_journal(
 
 
 @pytest.mark.asyncio
+async def test_spread_sidecar_service_writes_default_paper_bots_to_journal(
+    tmp_path,
+) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    paper_path = tmp_path / "spread-paper-events.jsonl"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_min_samples=2,
+            spread_min_history_ms=0,
+            spread_fair_price_min_venues=2,
+            spread_min_fair_price_confidence=0.0,
+            spread_min_liquidity_capacity_ratio=1.0,
+            spread_entry_z=0.0,
+            spread_min_net_edge_bps=0.0,
+            spread_paper_enabled=True,
+            spread_paper_finalist_limit=5,
+            spread_paper_markout_secs=[2],
+            spread_paper_terminal_secs=2,
+        ),
+        venues=[
+            VenueConfig(venue="cheap", taker_fee_bps=1.0, maker_fee_bps=0.1),
+            VenueConfig(venue="rich", taker_fee_bps=2.0, maker_fee_bps=0.2),
+        ],
+    )
+    publish_snapshot(
+        SidecarSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            quotes={
+                "cheap:BTCUSDT": QuoteSnapshot(
+                    venue="cheap",
+                    symbol="BTCUSDT",
+                    bid=99.8,
+                    ask=100.0,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                    volume_24h_quote=10_000.0,
+                ),
+                "rich:BTCUSDT": QuoteSnapshot(
+                    venue="rich",
+                    symbol="BTCUSDT",
+                    bid=101.0,
+                    ask=101.2,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                    volume_24h_quote=10_000.0,
+                ),
+            },
+        ),
+        sidecar_path,
+    )
+    service = SpreadSidecarService(config)
+
+    await service.refresh_once(now_ms=10_000)
+    await service.refresh_once(now_ms=11_000)
+    await service.refresh_once(now_ms=12_000)
+    await service.refresh_once(now_ms=13_000)
+    await service.close()
+
+    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
+    registered_bot_ids = [
+        record["payload"]["paper_bot_id"]
+        for record in records
+        if record["kind"] == "opportunity.paper_registered"
+    ]
+    assert "tt_conservative" in registered_bot_ids
+    assert "mt_selected_maker_delay_1000ms" in registered_bot_ids
+    assert "low_liquidity_control_bot" in registered_bot_ids
+    assert any(record["kind"] == "opportunity.paper_hedge_filled" for record in records)
+    assert any(
+        record["payload"].get("paper_cohort") == "maker_taker_delay_control"
+        and record["kind"] == "opportunity.paper_closed"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
 async def test_spread_sidecar_restores_open_paper_orders_from_dedicated_journal(
     tmp_path,
 ) -> None:
@@ -257,6 +344,7 @@ async def test_spread_sidecar_restores_open_paper_orders_from_dedicated_journal(
             spread_min_net_edge_bps=0.0,
             spread_paper_enabled=True,
             spread_paper_finalist_limit=5,
+            spread_paper_bot_ids=["tt_conservative"],
             spread_paper_markout_secs=[1],
             spread_paper_terminal_secs=2,
         ),

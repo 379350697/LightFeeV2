@@ -13,24 +13,30 @@ def _candidate(
     signal_ts_ms: int = 1_000,
     entry_notional_quote: float = 20.0,
     opportunity_label: str = "spread_reversion",
+    long_venue: str = "cheap",
+    short_venue: str = "rich",
+    executable_spread_bps: float = 40.0,
+    net_edge_bps: float = 20.0,
+    z_score: float = 3.0,
+    capacity_quote: float = 100.0,
 ) -> SpreadReversionCandidate:
     return SpreadReversionCandidate(
-        candidate_id=f"spread:{symbol}:cheap->rich",
+        candidate_id=f"spread:{symbol}:{long_venue}->{short_venue}",
         symbol=symbol,
-        long_venue="cheap",
-        short_venue="rich",
+        long_venue=long_venue,
+        short_venue=short_venue,
         spread_mid_bps=50.0,
-        executable_spread_bps=40.0,
+        executable_spread_bps=executable_spread_bps,
         rolling_mean_bps=10.0,
         rolling_std_bps=5.0,
-        z_score=3.0,
-        net_edge_bps=20.0,
+        z_score=z_score,
+        net_edge_bps=net_edge_bps,
         sample_count=120,
         signal_ts_ms=signal_ts_ms,
         long_quote_ts_ms=signal_ts_ms,
         short_quote_ts_ms=signal_ts_ms,
         entry_notional_quote=entry_notional_quote,
-        capacity_quote=100.0,
+        capacity_quote=capacity_quote,
         signal_status="entry_ready",
         fair_price=100.5,
         venue_premium_bps=25.0,
@@ -138,6 +144,206 @@ def test_register_deduplicates_and_respects_finalist_limit() -> None:
     assert tracker.register(candidate, quotes, finalist_rank=0) is None
     assert tracker.register(_candidate(signal_ts_ms=1_001), quotes, finalist_rank=1) is None
     assert tracker.tracked_count == 1
+
+
+def test_register_many_creates_independent_bot_positions() -> None:
+    tracker = SpreadPaperTracker(
+        SpreadPaperConfig(
+            enabled=True,
+            finalist_limit=10,
+            markout_secs=[1],
+            paper_bot_ids=[
+                "tt_conservative",
+                "mt_long_maker",
+                "mt_short_maker",
+                "mt_selected_maker",
+                "core_v1_bot",
+                "core_v1_z10_bot",
+            ],
+            taker_fee_bps_by_venue={"binance": 1.0, "gate": 2.0},
+            maker_fee_bps_by_venue={"binance": 0.1, "gate": 0.2},
+        )
+    )
+    candidate = _candidate(
+        long_venue="binance",
+        short_venue="gate",
+        executable_spread_bps=120.0,
+        net_edge_bps=90.0,
+        z_score=12.0,
+    )
+    quotes = {
+        "binance:BTCUSDT": _quote(
+            "binance",
+            bid=99.8,
+            ask=100.0,
+            observed_at_ms=1_000,
+            volume_24h_quote=2_000_000.0,
+        ),
+        "gate:BTCUSDT": _quote(
+            "gate",
+            bid=101.0,
+            ask=101.2,
+            observed_at_ms=1_000,
+            volume_24h_quote=2_000_000.0,
+        ),
+    }
+
+    events = tracker.register_many(candidate, quotes, finalist_rank=0)
+
+    bot_ids = [event["payload"]["paper_bot_id"] for event in events]
+    assert bot_ids == [
+        "tt_conservative",
+        "mt_long_maker",
+        "mt_short_maker",
+        "mt_selected_maker",
+        "core_v1_bot",
+        "core_v1_z10_bot",
+    ]
+    assert len({event["payload"]["paper_id"] for event in events}) == len(events)
+    by_bot = {event["payload"]["paper_bot_id"]: event["payload"] for event in events}
+    assert by_bot["tt_conservative"]["paper_cohort"] == "baseline_current"
+    assert by_bot["core_v1_bot"]["paper_cohort"] == "core_v1"
+    assert by_bot["core_v1_z10_bot"]["paper_cohort"] == "core_v1_z10"
+    assert by_bot["mt_long_maker"]["long_leg"]["entry_liquidity_role"] == "maker"
+    assert by_bot["mt_long_maker"]["long_leg"]["entry_raw_price"] == pytest.approx(99.8)
+    assert by_bot["mt_long_maker"]["long_leg"]["entry_fee_bps"] == pytest.approx(0.1)
+    assert by_bot["mt_short_maker"]["short_leg"]["entry_liquidity_role"] == "maker"
+    assert by_bot["mt_short_maker"]["short_leg"]["entry_raw_price"] == pytest.approx(101.2)
+    assert by_bot["mt_selected_maker"]["paper_maker_leg"] == "long"
+    assert tracker.tracked_count == 6
+
+
+def test_core_and_control_bots_filter_candidates_by_factor() -> None:
+    tracker = SpreadPaperTracker(
+        SpreadPaperConfig(
+            enabled=True,
+            finalist_limit=10,
+            markout_secs=[1],
+            paper_bot_ids=[
+                "core_v1_bot",
+                "core_v1_exec100_bot",
+                "core_v1_z10_bot",
+                "bad_pair_control_bot",
+                "low_liquidity_control_bot",
+                "low_edge_control_bot",
+            ],
+        )
+    )
+    quotes = {
+        "binance:BTCUSDT": _quote(
+            "binance",
+            bid=99.8,
+            ask=100.0,
+            observed_at_ms=1_000,
+            volume_24h_quote=20_000.0,
+        ),
+        "gate:BTCUSDT": _quote(
+            "gate",
+            bid=101.0,
+            ask=101.2,
+            observed_at_ms=1_000,
+            volume_24h_quote=20_000.0,
+        ),
+    }
+    low_edge = _candidate(
+        long_venue="binance",
+        short_venue="gate",
+        executable_spread_bps=55.0,
+        net_edge_bps=30.0,
+        z_score=4.0,
+        capacity_quote=30.0,
+    )
+
+    low_edge_events = tracker.register_many(low_edge, quotes, finalist_rank=0)
+
+    assert [event["payload"]["paper_bot_id"] for event in low_edge_events] == [
+        "low_liquidity_control_bot",
+        "low_edge_control_bot",
+    ]
+
+    bad_pair = _candidate(
+        signal_ts_ms=2_000,
+        long_venue="binance",
+        short_venue="bybit",
+        executable_spread_bps=120.0,
+        net_edge_bps=90.0,
+        z_score=12.0,
+    )
+    bad_quotes = {
+        "binance:BTCUSDT": _quote(
+            "binance",
+            bid=99.8,
+            ask=100.0,
+            observed_at_ms=2_000,
+            volume_24h_quote=2_000_000.0,
+        ),
+        "bybit:BTCUSDT": _quote(
+            "bybit",
+            bid=101.0,
+            ask=101.2,
+            observed_at_ms=2_000,
+            volume_24h_quote=2_000_000.0,
+        ),
+    }
+
+    bad_pair_events = tracker.register_many(bad_pair, bad_quotes, finalist_rank=0)
+
+    assert [event["payload"]["paper_bot_id"] for event in bad_pair_events] == [
+        "bad_pair_control_bot"
+    ]
+
+
+def test_delayed_maker_hedge_bot_fills_hedge_from_later_quote() -> None:
+    tracker = SpreadPaperTracker(
+        SpreadPaperConfig(
+            enabled=True,
+            finalist_limit=10,
+            markout_secs=[2],
+            terminal_secs=2,
+            paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        )
+    )
+    candidate = _candidate(
+        long_venue="binance",
+        short_venue="gate",
+        executable_spread_bps=120.0,
+        net_edge_bps=90.0,
+        z_score=12.0,
+    )
+    entry_quotes = {
+        "binance:BTCUSDT": _quote("binance", bid=99.8, ask=100.0, observed_at_ms=1_000),
+        "gate:BTCUSDT": _quote("gate", bid=101.0, ask=101.2, observed_at_ms=1_000),
+    }
+
+    registered = tracker.register_many(candidate, entry_quotes, finalist_rank=0)
+
+    assert len(registered) == 1
+    payload = registered[0]["payload"]
+    assert payload["paper_bot_id"] == "mt_selected_maker_delay_1000ms"
+    assert payload["paper_hedge_delay_ms"] == 1000
+    assert payload["paper_maker_leg"] == "long"
+    assert payload["short_leg"]["entry_pending"] is True
+    assert payload["short_leg"]["entry_price"] is None
+
+    later_quotes = {
+        "binance:BTCUSDT": _quote("binance", bid=100.2, ask=100.4, observed_at_ms=2_000),
+        "gate:BTCUSDT": _quote("gate", bid=100.5, ask=100.7, observed_at_ms=2_000),
+    }
+    hedge_events = tracker.evaluate_due(2_000, later_quotes)
+
+    assert [event["kind"] for event in hedge_events] == ["opportunity.paper_hedge_filled"]
+    hedge_payload = hedge_events[0]["payload"]
+    assert hedge_payload["short_leg"]["entry_pending"] is False
+    assert hedge_payload["short_leg"]["entry_raw_price"] == pytest.approx(100.5)
+    assert hedge_payload["short_leg"]["entry_observed_at_ms"] == 2_000
+
+    closed_events = tracker.evaluate_due(3_000, later_quotes)
+
+    assert [event["kind"] for event in closed_events] == [
+        "opportunity.paper_markout",
+        "opportunity.paper_closed",
+    ]
+    assert closed_events[-1]["payload"]["paper_net_quote"] is not None
 
 
 def test_register_excludes_default_symbols_and_non_allowed_labels() -> None:

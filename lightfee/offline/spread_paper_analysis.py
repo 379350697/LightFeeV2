@@ -43,6 +43,8 @@ class SpreadPaperAnalysisReport(SpreadPaperGroupStats):
     allowed_opportunity_labels: list[str] = field(default_factory=list)
     by_symbol: dict[str, SpreadPaperGroupStats] = field(default_factory=dict)
     by_label: dict[str, SpreadPaperGroupStats] = field(default_factory=dict)
+    by_bot: dict[str, SpreadPaperGroupStats] = field(default_factory=dict)
+    by_cohort: dict[str, SpreadPaperGroupStats] = field(default_factory=dict)
 
 
 def analyze_spread_paper_events(
@@ -72,9 +74,13 @@ def analyze_spread_paper_events(
         label = str(payload.get("candidate_opportunity_label", "") or "spread_reversion")
         if allowed_labels and label not in allowed_labels:
             continue
+        bot_id = str(payload.get("paper_bot_id", "") or "tt_conservative")
+        cohort = str(payload.get("paper_cohort", "") or "baseline_current")
         report.add(payload)
         report.by_symbol.setdefault(symbol, SpreadPaperGroupStats()).add(payload)
         report.by_label.setdefault(label, SpreadPaperGroupStats()).add(payload)
+        report.by_bot.setdefault(bot_id, SpreadPaperGroupStats()).add(payload)
+        report.by_cohort.setdefault(cohort, SpreadPaperGroupStats()).add(payload)
     return report
 
 

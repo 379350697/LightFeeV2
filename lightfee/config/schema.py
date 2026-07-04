@@ -187,6 +187,21 @@ class StrategyConfig:
         default_factory=lambda: ["spread_reversion"]
     )
     spread_paper_episode_cooldown_ms: int = 1_800_000
+    spread_paper_bot_ids: list[str] = field(
+        default_factory=lambda: [
+            "tt_conservative",
+            "mt_long_maker",
+            "mt_short_maker",
+            "mt_selected_maker",
+            "mt_selected_maker_delay_1000ms",
+            "core_v1_bot",
+            "core_v1_exec100_bot",
+            "core_v1_z10_bot",
+            "bad_pair_control_bot",
+            "low_liquidity_control_bot",
+            "low_edge_control_bot",
+        ]
+    )
     spread_paper_markout_secs: list[int] = field(
         default_factory=lambda: [60, 300, 900, 1800]
     )
@@ -446,6 +461,7 @@ class VenueLiveConfig:
 class VenueConfig:
     venue: str = ""
     taker_fee_bps: float = 0.5
+    maker_fee_bps: Optional[float] = None
     max_notional: float = 1000.0
     market_data_file: Optional[str] = None
     live: VenueLiveConfig = field(default_factory=VenueLiveConfig)
