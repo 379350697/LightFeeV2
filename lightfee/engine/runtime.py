@@ -49,6 +49,7 @@ from lightfee.engine.lifecycle import (
     set_lifecycle,
     transition_to_reconciling,
 )
+from lightfee.engine.business_contract import pending_entry_has_unhedged_maker_exposure
 from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.loop_control import (
     ExportState,
@@ -589,6 +590,12 @@ class LiveRuntime:
                 "official_doc_url": LiveRuntime._ASTER_OPENABLE_NOTIONAL_DOC_URL,
                 "evidence_gap": True,
             }
+        if reason == "hedge_rejected_after_maker_exposure":
+            return {
+                "reason": reason,
+                "official_doc_url": "",
+                "evidence_gap": True,
+            }
         return {"reason": reason, "official_doc_url": "", "evidence_gap": True}
 
     @staticmethod
@@ -975,6 +982,10 @@ class LiveRuntime:
         now_ms: int,
     ) -> bool:
         metadata = self._entry_admission_reject_metadata(hedge_venue, error_text)
+        if not metadata and pending_entry_has_unhedged_maker_exposure(pending):
+            metadata = self._entry_admission_evidence(
+                "hedge_rejected_after_maker_exposure"
+            )
         if not metadata:
             return False
 
@@ -8490,6 +8501,76 @@ class LiveRuntime:
             return "long"
         return "short"
 
+    @staticmethod
+    def _record_pending_entry_submit_reject_truth_probe(
+        pending,
+        *,
+        leg: str,
+        venue: Venue,
+        order_id: str,
+        client_order_id: str,
+        truth_status: OrderTruthFillStatus,
+        error: str,
+    ) -> None:
+        if leg != "hedge":
+            return
+        metadata = getattr(pending, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        probe_status = OrderFillProbeStatus.UNAVAILABLE.value
+        if truth_status == OrderTruthFillStatus.CONFIRMED_NO_FILL:
+            probe_status = OrderFillProbeStatus.CONFIRMED_NO_FILL.value
+        elif truth_status == OrderTruthFillStatus.CONFIRMED_FILL:
+            probe_status = OrderFillProbeStatus.CONFIRMED_FILL.value
+        elif error:
+            probe_status = OrderFillProbeStatus.ERROR.value
+        metadata["hedge_submit_reject_order_truth_probe"] = {
+            "leg": leg,
+            "venue": venue.value,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "status": probe_status,
+            "error": error,
+            "source": "submit_error_reconciliation",
+        }
+        pending.metadata = metadata
+
+    @staticmethod
+    def _cached_pending_entry_submit_reject_truth_probe(
+        pending,
+        *,
+        leg: str,
+        venue: Venue,
+        order_id: str,
+        client_order_id: str,
+    ) -> dict[str, Any] | None:
+        if leg != "hedge":
+            return None
+        metadata = getattr(pending, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        cached = metadata.get("hedge_submit_reject_order_truth_probe")
+        if not isinstance(cached, dict):
+            return None
+        if str(cached.get("leg") or "") != leg:
+            return None
+        if str(cached.get("venue") or "").lower() != venue.value:
+            return None
+        if str(cached.get("order_id") or "") != str(order_id or ""):
+            return None
+        if str(cached.get("client_order_id") or "") != str(client_order_id or ""):
+            return None
+        status = str(cached.get("status") or "")
+        allowed_statuses = {
+            OrderFillProbeStatus.CONFIRMED_FILL.value,
+            OrderFillProbeStatus.CONFIRMED_NO_FILL.value,
+            OrderFillProbeStatus.UNAVAILABLE.value,
+            OrderFillProbeStatus.ERROR.value,
+        }
+        if status not in allowed_statuses:
+            return None
+        return cached
+
     async def _probe_pending_entry_abort_order_truth(
         self,
         pending,
@@ -8507,6 +8588,22 @@ class LiveRuntime:
             "status": OrderFillProbeStatus.UNAVAILABLE.value,
             "error": "",
         }
+        cached_probe = self._cached_pending_entry_submit_reject_truth_probe(
+            pending,
+            leg=leg,
+            venue=venue,
+            order_id=order_id,
+            client_order_id=client_order_id,
+        )
+        if cached_probe is not None:
+            return {
+                **payload,
+                "status": str(cached_probe.get("status") or payload["status"]),
+                "error": str(cached_probe.get("error") or ""),
+                "source": str(
+                    cached_probe.get("source") or "submit_error_reconciliation"
+                ),
+            }
         if adapter is None:
             return {**payload, "error": "adapter_unavailable"}
         fetch_probe = getattr(adapter, "fetch_order_fill_probe", None)
@@ -10449,9 +10546,28 @@ class LiveRuntime:
                     pending.outcome = "filled"
                 return True
             if e.is_rejected:
+                self._record_pending_entry_submit_reject_truth_probe(
+                    pending,
+                    leg="hedge",
+                    venue=hedge_venue,
+                    order_id="",
+                    client_order_id=hedge_client_order_id,
+                    truth_status=truth_decision.fill_status,
+                    error=reconciliation_error_text,
+                )
                 pending.hedge_inflight = None
                 phase_state = ensure_pending_entry_phase_state(pending)
                 phase_state.hedge_deadline_at_ms = None
+                if await self._handle_pending_hedge_admission_reject(
+                    pending=pending,
+                    entry_id=pending.pending_id,
+                    hedge_venue=hedge_venue,
+                    error_text=str(e),
+                    hedge_client_order_id=hedge_client_order_id,
+                    hedge_attempt=getattr(pending, "hedge_attempt_count", 0),
+                    now_ms=now_ms,
+                ):
+                    return False
             evidence = self._order_submit_error_runtime_evidence(
                 e,
                 venue=hedge_venue,

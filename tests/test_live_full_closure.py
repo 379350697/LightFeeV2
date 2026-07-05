@@ -17,6 +17,7 @@ import pytest
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from lightfee.engine.exit_decision import aligned_settlement_delay_elapsed
+from lightfee.engine.business_contract import pending_entry_has_unhedged_maker_exposure
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.passive_close import PassiveCloseExecutor
 from lightfee.engine.state import EngineState, OpenPosition, PendingEntry, PendingPassiveClose
@@ -759,6 +760,17 @@ class TestMakerEventLane:
             # Should not have woken — interval not elapsed
             assert runtime._last_maker_event_ms == 5000
 
+    def test_single_leg_risk_uses_v1_missing_hedge_quantity(self):
+        pending = _mk_passive_pending("pe-hedged-target", "BTCUSDT", Venue.BINANCE, Venue.OKX)
+        pending.target_quantity = 10.0
+        pending.long_quantity = 10.0
+        pending.short_quantity = 10.0
+        pending.maker_leg_filled = 12.0
+        pending.hedge_leg_filled = 10.0
+
+        assert pending.missing_hedge_quantity() == pytest.approx(0.0)
+        assert pending_entry_has_unhedged_maker_exposure(pending) is False
+
     @pytest.mark.asyncio
     async def test_no_passive_entries_skips(self):
         """No passive entries → no repricing work to do."""
@@ -1188,6 +1200,182 @@ class TestMakerEventLane:
                 "insufficient_balance_admission_blocked"
             )
             assert est.get("venue") == "bybit"
+
+    @pytest.mark.asyncio
+    async def test_unhedged_single_leg_pending_blocks_maker_event_reprice(self):
+        """Maker-event lane must not add risk once maker fill outruns hedge fill."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.maker_event_lane_enabled = True
+            config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
+            config.strategy.passive_reprice_threshold_bps = 1.0
+            config.strategy.maker_leg_default = "buy"
+
+            sidecar_path = Path(td) / "sidecar.json"
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["LABUSDT"], 16.5)))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            pending = _mk_passive_pending(
+                "pe-unhedged", "LABUSDT", Venue.BINANCE, Venue.ASTER
+            )
+            pending.maker_leg = "long"
+            pending.maker_leg_filled = 19.0
+            pending.hedge_leg_filled = 0.0
+            runtime.state.pending_entries[pending.pending_id] = pending
+            runtime._last_maker_event_ms = 0
+            runtime._maker_event_state[pending.pending_id] = {
+                "maker_price": 16.0,
+                "last_reprice_ms": 0,
+                "consecutive_failures": 0,
+            }
+
+            class _RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return None
+
+            executor = _RecordingExecutor()
+            runtime.entry_executor = executor
+
+            await runtime._maybe_tick_maker_event(5000)
+
+            assert executor.calls == 0
+            blocked = [
+                event for event in runtime.journal.read_all()
+                if event["kind"] == "runtime.maker_event_reprice_blocked"
+            ]
+            assert blocked[-1]["payload"]["entry_id"] == "pe-unhedged"
+            assert blocked[-1]["payload"]["reason"] == "unhedged_single_leg_risk"
+            assert blocked[-1]["payload"]["maker_leg_filled"] == 19.0
+            assert blocked[-1]["payload"]["hedge_leg_filled"] == 0.0
+            await runtime._maybe_tick_maker_event(7000)
+            blocked_after_retry = [
+                event
+                for event in runtime.journal.read_all()
+                if event["kind"] == "runtime.maker_event_reprice_blocked"
+            ]
+            assert blocked_after_retry == blocked
+            assert executor.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_unhedged_single_leg_block_clears_when_hedge_catches_up(self):
+        """Single-leg risk is a transient pause, not a terminal maker fuse."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.maker_event_lane_enabled = True
+            config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
+            config.strategy.passive_reprice_threshold_bps = 1.0
+            config.strategy.maker_leg_default = "buy"
+
+            sidecar_path = Path(td) / "sidecar.json"
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["LABUSDT"], 16.5)))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            pending = _mk_passive_pending(
+                "pe-unhedged-clears", "LABUSDT", Venue.BINANCE, Venue.ASTER
+            )
+            pending.maker_leg = "long"
+            pending.target_quantity = 10.0
+            pending.long_quantity = 10.0
+            pending.short_quantity = 10.0
+            pending.maker_leg_filled = 5.0
+            pending.hedge_leg_filled = 0.0
+            runtime.state.pending_entries[pending.pending_id] = pending
+            runtime._last_maker_event_ms = 0
+            runtime._maker_event_state[pending.pending_id] = {
+                "maker_price": 16.0,
+                "last_reprice_ms": 0,
+                "consecutive_failures": 0,
+            }
+
+            class _RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return None
+
+            executor = _RecordingExecutor()
+            runtime.entry_executor = executor
+
+            await runtime._maybe_tick_maker_event(5000)
+
+            assert executor.calls == 0
+            first_state = runtime._maker_event_state[pending.pending_id]
+            assert first_state.get("terminal_reject_reason") is None
+            assert first_state.get("transient_block_reason") == "unhedged_single_leg_risk"
+
+            pending.hedge_leg_filled = 5.0
+
+            await runtime._maybe_tick_maker_event(7000)
+
+            assert executor.calls == 1
+            resumed_state = runtime._maker_event_state[pending.pending_id]
+            assert resumed_state.get("terminal_reject_reason") is None
+            assert resumed_state.get("transient_block_reason") is None
+
+    @pytest.mark.asyncio
+    async def test_binance_margin_reject_terminally_blocks_maker_reprice(self):
+        """Binance -2019 is an admission block, not a repeatable reprice error."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.maker_event_lane_enabled = True
+            config.runtime.maker_event_lane_min_wake_interval_ms = 1000
+            config.runtime.opportunity_input_mode = "non_parity"
+            config.strategy.passive_reprice_threshold_bps = 1.0
+            config.strategy.passive_max_consecutive_failures = 5
+            config.strategy.maker_leg_default = "buy"
+
+            sidecar_path = Path(td) / "sidecar.json"
+            sidecar_path.write_text(json.dumps(_mk_sidecar(["LABUSDT"], 16.5)))
+
+            runtime = LiveRuntime(config)
+            await runtime.start()
+
+            runtime.state.pending_entries["pe-binance-margin"] = _mk_passive_pending(
+                "pe-binance-margin", "LABUSDT", Venue.BINANCE, Venue.ASTER
+            )
+            runtime._last_maker_event_ms = 0
+            runtime._maker_event_state["pe-binance-margin"] = {
+                "maker_price": 16.0,
+                "last_reprice_ms": 0,
+                "consecutive_failures": 0,
+            }
+
+            class _MarginRejectExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise RuntimeError(
+                        'binance error code=-2019 msg="Margin is insufficient."'
+                    )
+
+            executor = _MarginRejectExecutor()
+            runtime.entry_executor = executor
+
+            await runtime._maybe_tick_maker_event(5000)
+
+            est = runtime._maker_event_state.get("pe-binance-margin", {})
+            assert est.get("terminal_reject_reason") == (
+                "insufficient_margin_admission_blocked"
+            )
+            assert est.get("consecutive_failures") == 5
+            error_events = [
+                event for event in runtime.journal.read_all()
+                if event["kind"] == "runtime.maker_event_reprice_error"
+            ]
+            assert error_events[-1]["payload"]["response_classification"] == (
+                "insufficient_margin_admission_blocked"
+            )
 
     @pytest.mark.asyncio
     async def test_no_entry_executor_skips_reprice(self):

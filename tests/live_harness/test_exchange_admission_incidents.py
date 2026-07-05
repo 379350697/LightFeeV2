@@ -929,6 +929,103 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
 
 
 @pytest.mark.asyncio
+async def test_pending_hedge_unclassified_reject_after_maker_exposure_aborts_without_retry():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingHedgeAdapter(
+            "aster_v3 order rejected: aster_v3 POST /fapi/v3/order rejected status=400"
+        )
+        runtime = LiveRuntime(
+            make_harness_config(td),
+            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-lab-generic-reject",
+            symbol="LABUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 1778787001000
+        )
+
+        assert driven is False
+        assert aster.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == (
+            "hedge_admission_blocked:hedge_rejected_after_maker_exposure"
+        )
+        cooldown = runtime.state.venue_entry_cooldowns["aster:LABUSDT"]
+        assert cooldown["reason"] == "hedge_rejected_after_maker_exposure"
+        assert cooldown["source"] == "pending_hedge"
+        assert cooldown["block_scope"] == "symbol"
+        assert cooldown["evidence_gap"] is True
+        records = runtime.journal.read_all()
+        admission = [
+            record for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]
+        assert admission["reason"] == "hedge_rejected_after_maker_exposure"
+        assert admission["evidence_gap"] is True
+        assert not [
+            record
+            for record in records
+            if record["kind"] == "pending_entry.hedge_submit_result"
+            and record["payload"].get("outcome") == "error"
+        ]
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_pending_hedge_unclassified_reject_after_maker_exposure_aborts_without_truth_gap_retry():
+    with tempfile.TemporaryDirectory() as td:
+        aster = RejectingHedgeAdapter(
+            "aster_v3 order rejected: aster_v3 POST /fapi/v3/order rejected status=400"
+        )
+        runtime = LiveRuntime(
+            make_harness_config(td),
+            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+        )
+        runtime.journal.open()
+        pending = _pending_for_hedge_reject(
+            entry_id="entry-lab-recovery-generic-reject",
+            symbol="LABUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.ASTER,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        driven = await runtime._recover_drive_missing_hedge(
+            pending, "startup_recovery"
+        )
+
+        assert driven is False
+        assert aster.place_order_calls == 1
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.repair_state == (
+            "hedge_admission_blocked:hedge_rejected_after_maker_exposure"
+        )
+        records = runtime.journal.read_all()
+        assert [
+            record for record in records
+            if record["kind"] == "pending_entry.hedge_admission_blocked"
+        ][-1]["payload"]["reason"] == "hedge_rejected_after_maker_exposure"
+        assert not [
+            record for record in records
+            if record["kind"] == "pending_entry.accepted_order_truth_gap_registered"
+        ]
+        assert not [
+            record for record in records
+            if record["kind"] == "recovery.hedge_submit_error"
+        ]
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_hedge_bybit_auth_invalid_recovers_owned_single_leg_on_maker_venue():
     with tempfile.TemporaryDirectory() as td:
         binance = LiveSingleLegCleanupAdapter(Venue.BINANCE, Side.BUY, 4.0)

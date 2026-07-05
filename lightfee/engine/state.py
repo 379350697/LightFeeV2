@@ -1186,13 +1186,15 @@ class EngineState:
             existing_count = _int_or_zero(existing.get("truth_gap_candidate_count"))
             incoming_count = _int_or_zero(item.get("truth_gap_candidate_count"))
             statement_count = len(existing.get("statement_probe_candidates", []) or [])
-            existing["truth_gap_candidate_count"] = max(
+            truth_gap_candidate_count = max(
                 existing_count,
                 incoming_count,
                 statement_count,
             )
+            if truth_gap_candidate_count:
+                existing["truth_gap_candidate_count"] = truth_gap_candidate_count
 
-            for field in ("symbol", "reason", "candidate_owner_id", "missing_leg"):
+            for field in ("symbol", "candidate_owner_id", "missing_leg"):
                 if not existing.get(field) and item.get(field):
                     existing[field] = item[field]
             for field in ("long_venue", "short_venue"):

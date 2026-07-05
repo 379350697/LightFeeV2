@@ -118,13 +118,15 @@ class BybitAdapter(VenueAdapter):
         """
         from lightfee.core.domain import OrderFillReconciliation
 
-        status = await self._transport.fetch_order_status(
-            symbol,
-            order_id=order_id,
-            client_order_id=client_order_id or "",
-            start_time_ms=start_time_ms,
-            end_time_ms=end_time_ms,
-        )
+        kwargs = {
+            "order_id": order_id,
+            "client_order_id": client_order_id or "",
+        }
+        if start_time_ms is not None:
+            kwargs["start_time_ms"] = start_time_ms
+        if end_time_ms is not None:
+            kwargs["end_time_ms"] = end_time_ms
+        status = await self._transport.fetch_order_status(symbol, **kwargs)
         if status is not None:
             return status
         return None

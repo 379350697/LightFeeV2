@@ -2473,7 +2473,10 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
             ("BTCUSDT", "", pending.hedge_client_order_id)
         ]
         events = runtime.journal.read_all()
-        assert events[-1]["kind"] == "recovery.hedge_submit_error"
+        event_kinds = [event["kind"] for event in events]
+        assert "pending_entry.hedge_admission_blocked" in event_kinds
+        assert "recovery.hedge_submit_error" not in event_kinds
+        assert "pending_entry.accepted_order_truth_gap_registered" not in event_kinds
 
     @pytest.mark.asyncio
     async def test_recovery_submit_error_reconciles_current_submit_cid_not_stale_pending_cid(
@@ -2505,6 +2508,9 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         assert hedge_adapter._fetch_order_fill_reconciliation_calls == [
             ("BTCUSDT", "", submitted_cid)
         ]
+        event_kinds = [event["kind"] for event in runtime.journal.read_all()]
+        assert "pending_entry.hedge_admission_blocked" in event_kinds
+        assert "pending_entry.accepted_order_truth_gap_registered" not in event_kinds
 
 
 class TestRealPathAbortCleanupDeadline:

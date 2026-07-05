@@ -1061,6 +1061,65 @@ class CloseRuntime:
         return "|".join(parts)
 
     @staticmethod
+    def _close_reconciliation_retained_evidence_key(
+        payload: dict[str, Any],
+        *,
+        truth_hash: str,
+    ) -> str:
+        def _safe_float(value: Any) -> float:
+            try:
+                result = float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+            return result if math.isfinite(result) else 0.0
+
+        def _leg_fingerprint(leg: str) -> list[dict[str, Any]]:
+            raw_legs = payload.get(f"{leg}_legs")
+            if not isinstance(raw_legs, list):
+                return []
+            normalized: list[dict[str, Any]] = []
+            for raw in raw_legs:
+                if not isinstance(raw, dict):
+                    continue
+                normalized.append({
+                    "leg": leg,
+                    "venue": str(raw.get("venue") or "").lower(),
+                    "order_id": str(raw.get("order_id") or ""),
+                    "client_order_id": str(raw.get("client_order_id") or ""),
+                    "trade_id": str(raw.get("trade_id") or ""),
+                    "exec_id": str(raw.get("exec_id") or ""),
+                    "quantity": f"{_safe_float(raw.get('quantity')):.12g}",
+                    "average_price": f"{_safe_float(raw.get('average_price') or raw.get('price')):.12g}",
+                    "fee_quote": f"{_safe_float(raw.get('fee_quote')):.12g}",
+                    "filled_at_ms": str(raw.get("filled_at_ms") or ""),
+                })
+            return sorted(
+                normalized,
+                key=lambda item: (
+                    item["leg"],
+                    item["venue"],
+                    item["order_id"],
+                    item["client_order_id"],
+                    item["trade_id"],
+                    item["exec_id"],
+                    item["quantity"],
+                    item["filled_at_ms"],
+                ),
+            )
+
+        fingerprint = {
+            "position_id": str(payload.get("position_id") or ""),
+            "symbol": str(payload.get("symbol") or "").upper(),
+            "missing_leg": str(payload.get("missing_leg") or ""),
+            "evidence_gap_reason": str(payload.get("evidence_gap_reason") or ""),
+            "truth_hash": truth_hash,
+            "long": _leg_fingerprint("long"),
+            "short": _leg_fingerprint("short"),
+        }
+        raw = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    @staticmethod
     def _annotate_terminal_flat_accounting_gap_payload(
         payload: dict[str, Any],
         *,
@@ -1505,6 +1564,8 @@ class CloseRuntime:
                 truth_hash = ""
                 archive_key = ""
                 archive_already_emitted = False
+                retained_evidence_key = ""
+                retained_already_emitted = False
                 if bool(payload.get("pending_backfill")):
                     exchange_truth = self._current_exchange_truth_for_close_reconciliation(
                         reconciliation
@@ -1539,6 +1600,24 @@ class CloseRuntime:
                             archive_key
                             in self._close_reconciliation_archive_emitted_keys
                         )
+                    if not archive_reconciliation:
+                        retained_evidence_key = (
+                            self._close_reconciliation_retained_evidence_key(
+                                payload,
+                                truth_hash=truth_hash,
+                            )
+                        )
+                        retained_keys = reconciliation.get(
+                            "retained_reconciliation_evidence_keys"
+                        )
+                        retained_already_emitted = (
+                            isinstance(retained_keys, list)
+                            and retained_evidence_key in {
+                                str(item)
+                                for item in retained_keys
+                                if isinstance(item, (str, int, float))
+                            }
+                        )
                 emitted_fill_event_ids = reconciliation.get("emitted_fill_event_ids")
                 if isinstance(emitted_fill_event_ids, list):
                     payload["emitted_fill_event_ids"] = list(emitted_fill_event_ids)
@@ -1549,7 +1628,8 @@ class CloseRuntime:
                     payload["emitted_fill_event_quantities"] = dict(
                         emitted_fill_event_quantities
                     )
-                if not archive_already_emitted:
+                emit_reconciled = not archive_already_emitted and not retained_already_emitted
+                if emit_reconciled:
                     self.ctx.journal.append_critical(
                         now_ms,
                         "exit.reconciled",
@@ -1565,6 +1645,16 @@ class CloseRuntime:
                 reconciliation["emitted_fill_event_quantities"] = dict(
                     payload.get("emitted_fill_event_quantities") or {}
                 )
+                if retained_evidence_key and emit_reconciled:
+                    retained_keys = reconciliation.get(
+                        "retained_reconciliation_evidence_keys"
+                    )
+                    if not isinstance(retained_keys, list):
+                        retained_keys = []
+                    retained_keys.append(retained_evidence_key)
+                    reconciliation["retained_reconciliation_evidence_keys"] = (
+                        retained_keys
+                    )
                 if bool(payload.get("pending_backfill")):
                     reconciliation["pending_backfill"] = True
                     reconciliation["missing_leg"] = payload.get("missing_leg", "")
@@ -1614,6 +1704,12 @@ class CloseRuntime:
                         if self._has_statement_probe_candidates(reconciliation):
                             reconciliation["accounting_only_backfill"] = True
                             reconciliation["blocking_trading"] = False
+                            reconciliation["archive_reconciliation"] = False
+                            reconciliation["business_contract_action"] = str(
+                                contract.get("state") or ""
+                            )
+                            if truth_hash:
+                                reconciliation["exchange_truth_hash"] = truth_hash
                             reconciliation[
                                 "unresolved_statement_probe_candidates"
                             ] = self._statement_probe_candidates_from_reconciliation(
@@ -1630,7 +1726,7 @@ class CloseRuntime:
                         if archive_reconciliation
                         else "reconciliation.pending_close_backfill_retained"
                     )
-                    if not archive_already_emitted:
+                    if emit_reconciled:
                         self.ctx.journal.append(
                             event_kind,
                             {

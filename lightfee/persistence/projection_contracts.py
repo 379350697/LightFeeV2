@@ -220,6 +220,7 @@ JOURNAL_ONLY_DIAGNOSTIC_KINDS: frozenset[str] = frozenset({
     "runtime.entry_quote_rewarm_terminal_stale",
     "runtime.maker_event_lane_wake",
     "runtime.maker_event_reprice",
+    "runtime.maker_event_reprice_blocked",
     "runtime.maker_event_reprice_error",
     "runtime.maker_event_tick_error",
     "runtime.normal_close_routing_aggressive",

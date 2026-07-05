@@ -636,6 +636,73 @@ def _pending_close_reconciliation(**overrides) -> dict:
     return values
 
 
+def _pending_close_backfill_retained_payloads(journal) -> list[dict]:
+    return [
+        record["payload"]
+        for record in journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_retained"
+    ]
+
+
+def _pending_close_backfill_archived_payloads(journal) -> list[dict]:
+    return [
+        record["payload"]
+        for record in journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+
+
+def _assert_terminal_flat_accounting_backfill_retained(
+    runtime,
+    journal,
+    *,
+    position_id: str | None = None,
+    symbol: str | None = None,
+    missing_leg: str | None = None,
+    evidence_gap_reason: str | None = None,
+) -> dict:
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    if position_id is not None:
+        assert retained["position_id"] == position_id
+    if symbol is not None:
+        assert retained["symbol"] == symbol
+    if missing_leg is not None:
+        assert retained["missing_leg"] == missing_leg
+    if evidence_gap_reason is not None:
+        assert retained["last_evidence_gap_reason"] == evidence_gap_reason
+    assert retained["pending_backfill"] is True
+    assert retained["accounting_only_backfill"] is True
+    assert retained["blocking_trading"] is False
+    assert retained["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert retained["archive_reconciliation"] is False
+    assert retained["unresolved_statement_probe_candidates"]
+    retained_events = _pending_close_backfill_retained_payloads(journal)
+    assert retained_events
+    assert retained_events[-1]["accounting_only_backfill"] is True
+    assert retained_events[-1]["blocking_trading"] is False
+    assert retained_events[-1]["archive_reconciliation"] is False
+    assert retained_events[-1]["close_reconciliation_state"] == (
+        "terminal_flat_accounting_gap"
+    )
+    assert _pending_close_backfill_archived_payloads(journal) == []
+    return retained
+
+
+def _assert_close_reconciliation_retry_retained(runtime, journal) -> dict:
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert retained["attempt_count"] == 1
+    assert retained["next_attempt_ms"] > 3000
+    assert "accounting_only_backfill" not in retained
+    assert "archive_reconciliation" not in retained
+    assert _pending_close_backfill_archived_payloads(journal) == []
+    assert "exit.reconciliation_abandoned" not in [
+        record["kind"] for record in journal.read_all()
+    ]
+    return retained
+
+
 def _terminal_flat_exchange_truth(
     *,
     symbol: str,
@@ -1468,23 +1535,14 @@ async def test_pending_close_reconciliation_archives_terminal_flat_backfill(
     await runtime._reconcile_pending_state(now_ms=3000)
     await runtime._reconcile_pending_state(now_ms=4000)
 
-    assert runtime.state.pending_close_reconciliations == []
-    records = tmp_journal.read_all()
-    retained = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ]
-    assert retained == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["symbol"] == symbol
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-h",
+        symbol=symbol,
+        missing_leg="short",
+        evidence_gap_reason="missing_short_close_trade_statement",
+    )
 
 
 @pytest.mark.asyncio
@@ -1553,7 +1611,6 @@ async def test_pending_close_reconciliation_uses_current_flat_truth_when_payload
     await runtime._reconcile_pending_state(now_ms=3000)
     await runtime._reconcile_pending_state(now_ms=4000)
 
-    assert runtime.state.pending_close_reconciliations == []
     records = tmp_journal.read_all()
     reconciled = [
         record["payload"]
@@ -1571,69 +1628,28 @@ async def test_pending_close_reconciliation_uses_current_flat_truth_when_payload
         reconciled[0]["close_reconciliation_state"]
         == "terminal_flat_accounting_gap"
     )
-    retained = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ]
-    assert retained == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    retained = _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="long",
+        evidence_gap_reason="missing_long_close_trade_statement",
+    )
 
     runtime.state.tick_count = 3
-    runtime.state.pending_close_reconciliations.append(
-        _pending_close_reconciliation(
-            position_id="entry-husdt",
-            symbol=symbol,
-            created_cycle=1,
-            long_venue=Venue.BYBIT.value,
-            short_venue=Venue.OKX.value,
-            position_snapshot={
-                "position_id": "entry-husdt",
-                "symbol": symbol,
-                "long_venue": Venue.BYBIT.value,
-                "short_venue": Venue.OKX.value,
-                "long_entry_price": 0.03700,
-                "short_entry_price": 0.03740,
-            },
-            long_legs=[{
-                "venue": Venue.BYBIT.value,
-                "order_id": "bybit-close-order",
-                "client_order_id": "bybit-close-cid",
-            }],
-            short_legs=[{
-                "venue": Venue.OKX.value,
-                "order_id": "okx-close-order",
-                "client_order_id": "okx-close-cid",
-            }],
-        )
-    )
+    retained["next_attempt_ms"] = 0
 
     await runtime._reconcile_pending_state(now_ms=5000)
 
-    assert runtime.state.pending_close_reconciliations == []
+    assert len(runtime.state.pending_close_reconciliations) == 1
     records = tmp_journal.read_all()
     assert len([
         record
         for record in records
         if record["kind"] == "exit.reconciled"
     ]) == 1
-    assert len([
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]) == 1
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
+    assert _pending_close_backfill_archived_payloads(tmp_journal) == []
 
 
 @pytest.mark.asyncio
@@ -1699,21 +1715,7 @@ async def test_pending_close_reconciliation_uses_account_level_flat_truth(
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert runtime.state.pending_close_reconciliations == []
     records = tmp_journal.read_all()
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["symbol"] == symbol
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
     reconciled = [
         record["payload"]
         for record in records
@@ -1722,6 +1724,14 @@ async def test_pending_close_reconciliation_uses_account_level_flat_truth(
     assert len(reconciled) == 1
     assert reconciled[0]["missing_leg_terminality"] == (
         "flat_by_position_truth_no_trade_statement"
+    )
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="long",
+        evidence_gap_reason="missing_long_close_trade_statement",
     )
 
 
@@ -1778,23 +1788,14 @@ async def test_pending_close_reconciliation_archives_recovery_ledger_truth_befor
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert runtime.state.pending_close_reconciliations == []
-    records = tmp_journal.read_all()
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["symbol"] == symbol
-    assert archived[0]["missing_leg"] == "long"
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="long",
+        evidence_gap_reason="missing_long_close_trade_statement",
+    )
 
 
 @pytest.mark.asyncio
@@ -1853,23 +1854,14 @@ async def test_pending_close_reconciliation_refreshes_account_truth_before_backo
     assert short_adapter.account_position_calls == 1
     assert long_adapter.account_open_order_calls == [None]
     assert short_adapter.account_open_order_calls == [None]
-    assert runtime.state.pending_close_reconciliations == []
-    records = tmp_journal.read_all()
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["symbol"] == symbol
-    assert archived[0]["missing_leg"] == "long"
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="long",
+        evidence_gap_reason="missing_long_close_trade_statement",
+    )
 
 
 @pytest.mark.asyncio
@@ -1936,24 +1928,14 @@ async def test_pending_close_reconciliation_archives_accepted_order_gap_with_acc
     assert short_adapter.account_position_calls == 1
     assert long_adapter.account_open_order_calls == [None]
     assert short_adapter.account_open_order_calls == [None]
-    assert runtime.state.pending_close_reconciliations == []
-    records = tmp_journal.read_all()
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["symbol"] == symbol
-    assert archived[0]["missing_leg"] == "long"
-    assert archived[0]["evidence_gap_reason"] == "accepted_order_truth_gap"
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-lab",
+        symbol=symbol,
+        missing_leg="long",
+        evidence_gap_reason="accepted_order_truth_gap",
+    )
 
 
 @pytest.mark.asyncio
@@ -2081,7 +2063,6 @@ async def test_pending_close_reconciliation_archives_terminal_flat_no_fill_when_
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert runtime.state.pending_close_reconciliations == []
     records = tmp_journal.read_all()
     assert [
         record
@@ -2089,21 +2070,14 @@ async def test_pending_close_reconciliation_archives_terminal_flat_no_fill_when_
         if record["kind"] == "reconciliation.pending_close_reconciliation_invalid"
         and record["payload"].get("reason") == "confirmed_no_close_fill"
     ] == []
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["missing_leg"] == "both"
-    assert archived[0]["evidence_gap_reason"] == "missing_both_close_trade_statements"
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="both",
+        evidence_gap_reason="missing_both_close_trade_statements",
+    )
 
 
 @pytest.mark.asyncio
@@ -2156,23 +2130,14 @@ async def test_pending_close_reconciliation_archives_terminal_flat_no_fill_with_
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert runtime.state.pending_close_reconciliations == []
-    records = tmp_journal.read_all()
-    assert [
-        record
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_retained"
-    ] == []
-    archived = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "reconciliation.pending_close_backfill_archived"
-    ]
-    assert len(archived) == 1
-    assert archived[0]["missing_leg"] == "both"
-    assert archived[0]["evidence_gap_reason"] == "missing_both_close_trade_statements"
-    assert archived[0]["close_reconciliation_state"] == "terminal_flat_accounting_gap"
-    assert archived[0]["archive_reconciliation"] is True
+    _assert_terminal_flat_accounting_backfill_retained(
+        runtime,
+        tmp_journal,
+        position_id="entry-husdt",
+        symbol=symbol,
+        missing_leg="both",
+        evidence_gap_reason="missing_both_close_trade_statements",
+    )
 
 
 @pytest.mark.asyncio
@@ -2414,25 +2379,11 @@ async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_un
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert runtime.state.pending_close_reconciliations == []
-    assert long_adapter.position_calls == ["BEATUSDT"]
-    assert short_adapter.position_calls == ["BEATUSDT"]
-    records = tmp_journal.read_all()
-    abandoned = [
-        record["payload"] for record in records
-        if record["kind"] == "exit.reconciliation_abandoned"
-    ][0]
-    assert abandoned["terminal_reason"] == "fill_reconciliation_unavailable_after_terminal_budget"
-    assert abandoned["attempt_count"] == 1
-    assert abandoned["long_live_size"] == pytest.approx(0.0)
-    assert abandoned["short_live_size"] == pytest.approx(0.0)
+    _assert_close_reconciliation_retry_retained(runtime, tmp_journal)
+    assert long_adapter.position_calls == []
+    assert short_adapter.position_calls == []
     assert runtime.state.lifecycle == EngineLifecycle.RUNNING
     assert runtime.state.last_error is None
-    allowed, reason = runtime._gate_pending_close_reconciliation(
-        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
-    )
-    assert allowed is True
-    assert reason == ""
 
 
 @pytest.mark.asyncio
@@ -2517,15 +2468,9 @@ async def test_pending_close_reconciliation_retains_when_terminal_live_size_nonz
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
-    assert len(runtime.state.pending_close_reconciliations) == 1
-    retained = runtime.state.pending_close_reconciliations[0]
-    assert retained["attempt_count"] == 1
-    assert retained["next_attempt_ms"] > 3000
-    assert long_adapter.position_calls == ["BEATUSDT"]
-    assert short_adapter.position_calls == ["BEATUSDT"]
-    assert "exit.reconciliation_abandoned" not in [
-        record["kind"] for record in tmp_journal.read_all()
-    ]
+    _assert_close_reconciliation_retry_retained(runtime, tmp_journal)
+    assert long_adapter.position_calls == []
+    assert short_adapter.position_calls == []
 
 
 @pytest.mark.asyncio

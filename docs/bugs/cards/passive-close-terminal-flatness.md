@@ -121,6 +121,11 @@ and then throw before `open_positions` / `pending_passive_closes` are removed
 or before the V1 recovery decision core sees the clear evidence.
 The same normalized queue boundary applies to pending-close reconciliation
 processing, supervisor venue coverage, and entry-conflict gating.
+Queue dedupe is one owner record per `(position_id, kind)`: merge append-only
+long/short legs, statement probe candidates, backfill state, and positive
+truth-gap candidate counts, but do not let a later duplicate overwrite ordinary
+owner metadata such as close reason or create `truth_gap_candidate_count=0`
+noise.
 
 Diagnostics must separate current risk from recovered process quality. An
 `exit.passive_close_resolved` payload without explicit exchange position-flat
@@ -136,6 +141,9 @@ truth. `exit.reconciled evidence_gap=true` must explain the missing proof via
 open-order truth; missing statement/trade evidence is retained as historical
 process evidence so future reviews do not confuse "currently safe" with "the
 close path had perfect evidence".
+Retained accounting-only backfill must be idempotent: the same position,
+missing leg, exchange-truth hash, and close fill evidence may update retry state
+but must not emit duplicate `exit.reconciled` lifecycle audit events.
 `close_reconciliation_evidence_contract(...)` is the shared classifier:
 exchange flat plus no open orders produces `terminal_flat_accounting_gap`;
 unclean or unavailable exchange truth produces

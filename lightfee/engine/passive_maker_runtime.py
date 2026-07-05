@@ -9,6 +9,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from lightfee.core.domain import Side
+from lightfee.engine.business_contract import (
+    classify_maker_event_reprice_reject_reason,
+    maker_event_reprice_block_is_terminal,
+    pending_entry_has_unhedged_maker_exposure,
+)
 from lightfee.engine.runtime_context import PassiveMakerRuntimeContext
 
 if TYPE_CHECKING:
@@ -45,15 +50,96 @@ class PassiveMakerRuntime:
 
     @staticmethod
     def _maker_event_reprice_reject_reason(error: Exception) -> str:
-        text = str(error or "").lower()
-        if (
-            "110007" in text
-            or "available balance is insufficient" in text
-            or "insufficient available balance" in text
-            or "insufficient_balance_admission_blocked" in text
-        ):
-            return "insufficient_balance_admission_blocked"
+        return classify_maker_event_reprice_reject_reason(error)
+
+    @staticmethod
+    def _maker_event_reprice_block_reason(pending) -> str:
+        if pending_entry_has_unhedged_maker_exposure(pending):
+            return "unhedged_single_leg_risk"
+        if str(getattr(pending, "repair_state", "") or "").strip():
+            return "pending_entry_repair_state"
         return ""
+
+    def _block_maker_event_reprice(
+        self,
+        entry_id: str,
+        pending,
+        *,
+        now_ms: int,
+        reason: str,
+        fallback_price: float = 0.0,
+    ) -> None:
+        stored = self._maker_event_state.get(entry_id)
+        if isinstance(stored, dict) and stored.get("terminal_reject_reason"):
+            if stored.get("terminal_reject_reason") == reason:
+                return
+            return
+        stored_price = 0.0
+        stored_last_reprice_ms = 0
+        consecutive_failures = 0
+        if isinstance(stored, dict):
+            stored_price = float(stored.get("maker_price", 0.0) or 0.0)
+            stored_last_reprice_ms = int(stored.get("last_reprice_ms", 0) or 0)
+            consecutive_failures = int(stored.get("consecutive_failures", 0) or 0)
+        elif isinstance(stored, tuple) and len(stored) == 2:
+            stored_price = float(stored[1] or 0.0)
+        if stored_price <= 0:
+            stored_price = float(
+                fallback_price
+                or getattr(pending, "maker_price", 0.0)
+                or getattr(pending, "maker_fill_price", 0.0)
+                or 0.0
+            )
+        if maker_event_reprice_block_is_terminal(reason):
+            self._terminally_block_maker_event_reprice(
+                entry_id,
+                pending,
+                stored_price=stored_price,
+                now_ms=now_ms,
+                reason=reason,
+            )
+        else:
+            if (
+                isinstance(stored, dict)
+                and stored.get("transient_block_reason") == reason
+            ):
+                return
+            maker_leg = (
+                Side.BUY
+                if self.ctx.config.strategy.maker_leg_default == "buy"
+                else Side.SELL
+            )
+            maker_venue = (
+                pending.long_venue if maker_leg == Side.BUY else pending.short_venue
+            )
+            self._maker_event_state[entry_id] = {
+                "maker_price": stored_price,
+                "last_reprice_ms": stored_last_reprice_ms,
+                "consecutive_failures": consecutive_failures,
+                "transient_block_reason": reason,
+                "venue": (
+                    maker_venue.value
+                    if hasattr(maker_venue, "value")
+                    else str(maker_venue)
+                ),
+                "symbol": pending.symbol,
+            }
+        self.ctx.journal.append(
+            "runtime.maker_event_reprice_blocked",
+            {
+                "entry_id": entry_id,
+                "symbol": getattr(pending, "symbol", ""),
+                "reason": reason,
+                "maker_leg_filled": float(
+                    getattr(pending, "maker_leg_filled", 0.0) or 0.0
+                ),
+                "hedge_leg_filled": float(
+                    getattr(pending, "hedge_leg_filled", 0.0) or 0.0
+                ),
+                "repair_state": str(getattr(pending, "repair_state", "") or ""),
+                "ts_ms": now_ms,
+            },
+        )
 
     def _terminally_block_maker_event_reprice(
         self,
@@ -258,6 +344,16 @@ class PassiveMakerRuntime:
             maker_mid = long_mid if maker_venue == pending.long_venue else short_mid
             mid = maker_mid
             if mid <= 0:
+                continue
+            block_reason = self._maker_event_reprice_block_reason(pending)
+            if block_reason:
+                self._block_maker_event_reprice(
+                    entry_id,
+                    pending,
+                    now_ms=now_ms,
+                    reason=block_reason,
+                    fallback_price=mid,
+                )
                 continue
 
             # Cooldown and ops budget check via V1 PassiveOrderManager
@@ -470,6 +566,16 @@ class PassiveMakerRuntime:
                 continue
 
             mid = (bid + ask) / 2.0
+            block_reason = self._maker_event_reprice_block_reason(pending)
+            if block_reason:
+                self._block_maker_event_reprice(
+                    entry_id,
+                    pending,
+                    now_ms=now_ms,
+                    reason=block_reason,
+                    fallback_price=mid,
+                )
+                continue
             stored = self._maker_event_state.get(entry_id)
             if isinstance(stored, dict) and stored.get("terminal_reject_reason"):
                 continue
@@ -624,6 +730,16 @@ class PassiveMakerRuntime:
         for entry_id, pending in pending_passive:
             mid = price_hints.get(pending.symbol, 0.0)
             if mid <= 0:
+                continue
+            block_reason = self._maker_event_reprice_block_reason(pending)
+            if block_reason:
+                self._block_maker_event_reprice(
+                    entry_id,
+                    pending,
+                    now_ms=now_ms,
+                    reason=block_reason,
+                    fallback_price=mid,
+                )
                 continue
 
             est = self._maker_event_state.get(entry_id, {})

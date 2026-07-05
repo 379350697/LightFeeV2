@@ -111,6 +111,8 @@ evidence must map to the matrix before runtime code changes.
   `lifecycle_risk_only` or `recovery_ledger_blocked` is a dispatch viability
   block, not permission to repost maker and not a fake passive-unfilled
   terminal state.
+- `runtime.maker_event_reprice_blocked(reason=unhedged_single_leg_risk)` after a
+  pending entry has maker fill greater than hedge fill.
 
 ## Current Effective Rule
 
@@ -227,6 +229,12 @@ pending entry can be removed as passive-unfilled only after maker terminal
 no-fill, realtime open-order absence, and live-position flat proof. Positive
 fill, live exposure, matching open orders, or unavailable truth still retain or
 route to cleanup/recovery.
+
+Maker-event reprice is part of the same boundary. It must not submit or reprice
+additional maker risk for a pending entry with maker fill greater than hedge
+fill, or for a pending entry already in repair state. That condition is
+`unhedged_single_leg_risk` / `pending_entry_repair_state`: block maker-event work
+and leave cleanup/recovery as the only owner of the exposure.
 
 Terminal cleanup/recovery events close their owner for current closure indexing.
 Once `pending_entry.owned_live_conflict_cleanup_succeeded` or

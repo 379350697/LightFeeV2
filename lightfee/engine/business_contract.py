@@ -20,6 +20,60 @@ DETERMINISTIC_ENTRY_ADMISSION_REASONS = frozenset({
     "venue_auth_invalid",
 })
 
+TRANSIENT_MAKER_EVENT_REPRICE_BLOCK_REASONS = frozenset({
+    "pending_entry_repair_state",
+    "unhedged_single_leg_risk",
+})
+
+
+def pending_entry_has_unhedged_maker_exposure(
+    pending: Any,
+    *,
+    epsilon: float = 1e-9,
+) -> bool:
+    missing_hedge_quantity = getattr(pending, "missing_hedge_quantity", None)
+    if callable(missing_hedge_quantity):
+        try:
+            return float(missing_hedge_quantity() or 0.0) > epsilon
+        except (TypeError, ValueError):
+            pass
+    maker_qty = _float_field(pending, "maker_leg_filled")
+    hedge_qty = _float_field(pending, "hedge_leg_filled")
+    target_qty = _float_field(pending, "target_quantity")
+    if target_qty > epsilon:
+        maker_qty = min(maker_qty, target_qty)
+    return maker_qty > epsilon and hedge_qty + epsilon < maker_qty
+
+
+def maker_event_reprice_block_is_terminal(reason: str) -> bool:
+    reason = str(reason or "").strip()
+    return bool(reason) and reason not in TRANSIENT_MAKER_EVENT_REPRICE_BLOCK_REASONS
+
+
+def classify_maker_event_reprice_reject_reason(error: Any) -> str:
+    text = str(error or "").lower()
+    if (
+        "110007" in text
+        or "available balance is insufficient" in text
+        or "insufficient available balance" in text
+        or "insufficient_balance_admission_blocked" in text
+    ):
+        return "insufficient_balance_admission_blocked"
+    if (
+        "-2019" in text
+        or "margin is insufficient" in text
+        or "insufficient_margin_admission_blocked" in text
+    ):
+        return "insufficient_margin_admission_blocked"
+    return ""
+
+
+def _float_field(obj: Any, field: str) -> float:
+    try:
+        return float(getattr(obj, field, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def classify_business_event_kind(
     kind: str,
