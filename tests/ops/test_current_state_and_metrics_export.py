@@ -121,6 +121,17 @@ class TestCurrentStateExportV1Semantics:
                 "archived": True,
                 "archive_reason": "terminal_flat_accounting_gap",
             },
+            {
+                "position_id": "entry-siren",
+                "symbol": "SIRENUSDT",
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+                "kind": "accepted_order_truth_gap",
+                "close_reconciliation_state": "terminal_flat_accounting_gap",
+                "accounting_only_backfill": True,
+                "blocking_trading": False,
+                "exchange_truth": {"truth_available": True},
+            },
         ]
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -131,12 +142,13 @@ class TestCurrentStateExportV1Semantics:
             with open(path) as f:
                 data = json.load(f)
 
-            assert data["pending_close_reconciliation_count"] == 2
+            assert data["pending_close_reconciliation_count"] == 3
             assert data["pending_close_reconciliation_blocking_count"] == 1
-            assert data["pending_close_reconciliation_terminal_flat_count"] == 1
+            assert data["pending_close_reconciliation_terminal_flat_count"] == 2
             assert data["pending_close_reconciliation_symbols"] == [
                 "HUSDT",
                 "IDUSDT",
+                "SIRENUSDT",
             ]
         finally:
             os.unlink(path)
