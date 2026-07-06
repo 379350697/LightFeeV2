@@ -3956,6 +3956,38 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert ack.order_id == "12345"
 
     @pytest.mark.asyncio
+    async def test_okx_cancel_normalizes_none_ack_identity(self):
+        transport = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(
+                api_key="okx-key",
+                api_secret="okx-secret",
+                api_passphrase="okx-pass",
+            ),
+        )
+        sent: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, body=None, params=None, private=False, **kwargs):
+            sent.append({"body": dict(body or {})})
+            return {
+                "code": "0",
+                "data": [{"ordId": "None", "clOrdId": "None", "sCode": "0"}],
+            }
+
+        transport._request = fake_request
+
+        ack = await transport.cancel_passive_order(
+            "UBUSDT",
+            "None",
+            client_order_id="okx-cid",
+        )
+
+        assert sent[-1]["body"] == {"instId": "UB-USDT-SWAP", "clOrdId": "okx-cid"}
+        assert ack.order_id == ""
+        assert ack.client_order_id == "okx-cid"
+
+    @pytest.mark.asyncio
     async def test_bybit_live_place_order_quantizes_and_records_sanitized_attempt_result(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
@@ -10652,6 +10684,265 @@ class TestOkxPassiveAckValidation:
         assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
 
 
+class TestBitgetPassiveOrderIdentityNormalization:
+    """Bitget passive close paths must never serialize absent order ids as "None"."""
+
+    def _make_bitget_transport(self):
+        return VenueTransport(spec=bitget_spec(), mode="paper")
+
+    def _make_passive_req(self):
+        return OrderRequest(
+            venue=Venue.BITGET,
+            symbol="SIRENUSDT",
+            side=Side.BUY,
+            quantity=460.0,
+            price=0.03427,
+            reduce_only=True,
+            post_only=True,
+            client_order_id="lfex-siren-close",
+        )
+
+    def test_bitget_passive_ack_null_order_id_keeps_client_oid_only(self):
+        transport = self._make_bitget_transport()
+        req = self._make_passive_req()
+        raw = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": None,
+                "clientOid": "lfex-siren-close",
+                "price": "0.03427",
+                "size": "460",
+                "status": "live",
+            },
+        }
+
+        ack = transport._parse_passive_order_ack(raw, req, "SIRENUSDT", 1783300000000)
+
+        assert ack.order_id == ""
+        assert ack.client_order_id == "lfex-siren-close"
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_cancel_normalizes_none_order_id_to_client_oid(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = self._make_bitget_transport()
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = kwargs.get("body")
+            return {"code": "00000", "data": {"clientOid": "lfex-siren-close"}}
+
+        transport._request = fake_request
+
+        await transport.cancel_passive_order(
+            symbol="SIRENUSDT",
+            order_id="None",
+            client_order_id="lfex-siren-close",
+        )
+
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/api/v2/mix/order/cancel-order"
+        assert seen["body"] == {
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "symbol": "SIRENUSDT",
+            "clientOid": "lfex-siren-close",
+        }
+        assert "orderId" not in seen["body"]
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_cancel_normalizes_none_order_id_to_client_oid(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = self._make_bitget_transport()
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.UTA_V3
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["body"] = kwargs.get("body")
+            return {"code": "00000", "data": {"clientOid": "lfex-siren-close"}}
+
+        transport._request = fake_request
+
+        await transport.cancel_passive_order(
+            symbol="SIRENUSDT",
+            order_id="None",
+            client_order_id="lfex-siren-close",
+        )
+
+        assert seen["method"] == "POST"
+        assert seen["path"] == "/api/v3/trade/cancel-order"
+        assert seen["body"] == {
+            "category": "USDT-FUTURES",
+            "clientOid": "lfex-siren-close",
+        }
+        assert "orderId" not in seen["body"]
+
+    @pytest.mark.asyncio
+    async def test_bitget_order_detail_normalizes_none_order_id_to_client_oid(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = self._make_bitget_transport()
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["params"] = kwargs.get("params")
+            return {
+                "code": "00000",
+                "data": {
+                    "orderId": "",
+                    "clientOid": "lfex-siren-close",
+                    "status": "live",
+                },
+            }
+
+        transport._request = fake_request
+
+        raw = await transport._fetch_bitget_order_detail(
+            "SIRENUSDT",
+            order_id="None",
+            client_order_id="lfex-siren-close",
+        )
+
+        assert raw is not None
+        assert seen["method"] == "GET"
+        assert seen["path"] == "/api/v2/mix/order/detail"
+        assert seen["params"]["clientOid"] == "lfex-siren-close"
+        assert "orderId" not in seen["params"]
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_order_detail_normalizes_none_order_id_to_client_oid(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = self._make_bitget_transport()
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.UTA_V3
+        )
+        seen: dict[str, Any] = {}
+
+        async def fake_request(method, path, **kwargs):
+            seen["method"] = method
+            seen["path"] = path
+            seen["params"] = kwargs.get("params")
+            return {
+                "code": "00000",
+                "data": {
+                    "orderId": "",
+                    "clientOid": "lfex-siren-close",
+                    "status": "live",
+                },
+            }
+
+        transport._request = fake_request
+
+        raw = await transport._fetch_bitget_order_detail(
+            "SIRENUSDT",
+            order_id="None",
+            client_order_id="lfex-siren-close",
+        )
+
+        assert raw is not None
+        assert seen["method"] == "GET"
+        assert seen["path"] == "/api/v3/trade/order-info"
+        assert seen["params"]["clientOid"] == "lfex-siren-close"
+        assert "orderId" not in seen["params"]
+
+    @pytest.mark.asyncio
+    async def test_bitget_query_passive_progress_normalizes_none_order_id_to_client_oid(self):
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = self._make_bitget_transport()
+        transport.mode = "live"
+        transport._bitget_resolve_contract_family = AsyncMock(
+            return_value=BitgetContractFamily.CLASSIC_MIX_V2
+        )
+        seen_params: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, **kwargs):
+            seen_params.append(dict(kwargs.get("params") or {}))
+            return {
+                "code": "00000",
+                "data": {
+                    "orderId": "",
+                    "clientOid": "lfex-siren-close",
+                    "size": "460",
+                    "baseVolume": "0",
+                    "price": "0.03427",
+                    "status": "live",
+                    "side": "buy",
+                },
+            }
+
+        transport._request = fake_request
+
+        progress = await transport.query_passive_order_progress(
+            "SIRENUSDT",
+            order_id="None",
+            client_order_id="lfex-siren-close",
+            side=Side.BUY,
+        )
+
+        assert progress is not None
+        assert progress.order_id == ""
+        assert progress.client_order_id == "lfex-siren-close"
+        assert seen_params
+        assert all(params.get("clientOid") == "lfex-siren-close" for params in seen_params)
+        assert all("orderId" not in params for params in seen_params)
+
+    def test_generic_order_identifier_extraction_normalizes_absent_strings(self):
+        raw = {"data": {"orderId": "None", "clientOrderId": "null"}}
+
+        order_id, client_order_id = VenueTransport._extract_order_identifiers(raw)
+
+        assert order_id == ""
+        assert client_order_id == ""
+
+    def test_bitget_order_status_reconciliation_normalizes_none_order_id(self):
+        transport = self._make_bitget_transport()
+        raw = {
+            "code": "00000",
+            "data": {
+                "orderId": "None",
+                "clientOid": "cid-fill",
+                "cumExecQty": "2",
+                "priceAvg": "3.5",
+                "uTime": "1783350000000",
+                "side": "sell",
+                "status": "filled",
+            },
+        }
+
+        fill = transport._parse_order_status_bitget(
+            raw,
+            "SIRENUSDT",
+            1783350000000,
+            queried_endpoint="/api/v2/mix/order/detail",
+        )
+
+        assert fill is not None
+        assert fill.order_id == ""
+        assert fill.client_order_id == "cid-fill"
+
+
 # ====================================================================# Root Fix: Preflight/Normalization in Passive Path Tests
 # ====================================================================
 
@@ -12297,6 +12588,47 @@ class TestPassiveAmendWireContracts:
         assert "signature=" in query
 
     @pytest.mark.asyncio
+    async def test_binance_amend_normalizes_none_order_id_to_orig_client_order_id(self):
+        cred = LiveCredential(api_key="key", api_secret="secret")
+        transport = VenueTransport(spec=binance_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["query"] = request.url.query.decode()
+            captured["content"] = request.content
+            return httpx.Response(
+                200,
+                json={
+                    "clientOrderId": "cid-old",
+                    "price": "50001",
+                    "origQty": "0.2",
+                    "status": "NEW",
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            order_id="None",
+            client_order_id="cid-old",
+            new_price_hint=50001.0,
+            new_quantity=0.2,
+        )
+        try:
+            ack = await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        query = captured["query"]
+        assert captured["content"] == b""
+        assert "origClientOrderId=cid-old" in query
+        assert "orderId=" not in query
+        assert ack.order_id == ""
+        assert ack.client_order_id == "cid-old"
+
+    @pytest.mark.asyncio
     async def test_aster_amend_is_unsupported_and_does_not_send_put(self):
         cred = LiveCredential(api_key="key", api_secret="secret")
         transport = VenueTransport(spec=aster_spec(), mode="live", credential=cred)
@@ -12372,6 +12704,49 @@ class TestPassiveAmendWireContracts:
         assert captured["body"]["cxlOnFail"] is False
 
     @pytest.mark.asyncio
+    async def test_okx_amend_normalizes_none_order_id_to_client_order_id(self):
+        cred = LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass")
+        transport = VenueTransport(spec=okx_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        transport.set_symbol_metadata({
+            "HOME-USDT-SWAP": {
+                "ctVal": "0.01",
+                "lotSz": "1",
+                "minSz": "1",
+                "ctType": "linear",
+            }
+        })
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "code": "0",
+                    "data": [{"ordId": None, "clOrdId": "okx-cid", "sCode": "0"}],
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="HOMEUSDT",
+            side=Side.SELL,
+            order_id="None",
+            client_order_id="okx-cid",
+            new_price_hint=0.044,
+            new_quantity=0.2,
+        )
+        try:
+            with pytest.raises(TransportError, match="empty identifiers"):
+                await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        assert "ordId" not in captured["body"]
+        assert captured["body"]["clOrdId"] == "okx-cid"
+
+    @pytest.mark.asyncio
     async def test_bybit_amend_uses_v5_amend_endpoint_not_create_path(self):
         cred = LiveCredential(api_key="key", api_secret="secret")
         transport = VenueTransport(spec=bybit_spec(), mode="live", credential=cred)
@@ -12414,6 +12789,44 @@ class TestPassiveAmendWireContracts:
         assert captured["body"]["orderId"] == "bybit-oid"
         assert captured["body"]["price"] == "0.045"
         assert captured["body"]["qty"] == "1500"
+
+    @pytest.mark.asyncio
+    async def test_bybit_amend_normalizes_none_order_id_to_client_order_id(self):
+        cred = LiveCredential(api_key="key", api_secret="secret")
+        transport = VenueTransport(spec=bybit_spec(), mode="live", credential=cred)
+        transport._time_offset_ms = 0
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"orderId": None, "orderLinkId": "bybit-cid"},
+                    "time": 1781350000000,
+                },
+            )
+
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        request = PassiveOrderAmendRequest(
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            order_id="None",
+            client_order_id="bybit-cid",
+            new_price_hint=0.045,
+            new_quantity=1500.0,
+        )
+        try:
+            ack = await transport.amend_passive_order(request)
+        finally:
+            await transport.close()
+
+        assert "orderId" not in captured["body"]
+        assert captured["body"]["orderLinkId"] == "bybit-cid"
+        assert ack.order_id == ""
+        assert ack.client_order_id == "bybit-cid"
 
 
 class TestBinanceAsterPrecisionFix:
