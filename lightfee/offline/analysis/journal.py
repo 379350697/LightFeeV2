@@ -83,6 +83,7 @@ class JournalAnalysisReport:
     # Paper outcome tracking (V1: paper_outcome event kinds)
     paper_outcome_registered_count: int = 0
     paper_outcome_hedge_filled_count: int = 0
+    paper_outcome_evaluation_skipped_count: int = 0
     paper_outcome_markout_count: int = 0
     paper_outcome_closed_count: int = 0
     paper_outcome_joined_count: int = 0
@@ -132,6 +133,7 @@ _LOCAL_L2_SYNC_FAILED = "runtime.local_l2_sync_failed"
 _PAPER_OUTCOME_KINDS = frozenset({
     "opportunity.paper_registered",
     "opportunity.paper_hedge_filled",
+    "opportunity.paper_evaluation_skipped",
     "opportunity.paper_markout",
     "opportunity.paper_closed",
     "opportunity.real_vs_paper_joined",
@@ -246,6 +248,8 @@ def _record_paper_outcome(report: JournalAnalysisReport, kind: str, payload: dic
     )
     if kind == "opportunity.paper_markout":
         report.paper_outcome_markout_count += 1
+    elif kind == "opportunity.paper_evaluation_skipped":
+        report.paper_outcome_evaluation_skipped_count += 1
     elif kind == "opportunity.paper_closed":
         report.paper_outcome_closed_count += 1
     elif kind == "opportunity.real_vs_paper_joined":

@@ -512,19 +512,65 @@ def test_episode_cooldown_restores_from_journal_records() -> None:
     )
 
 
-def test_missing_exit_quote_emits_unknown_payload() -> None:
+def test_terminal_missing_exit_quote_keeps_position_open_until_quotes_recover() -> None:
     tracker = SpreadPaperTracker(
-        SpreadPaperConfig(enabled=True, finalist_limit=10, markout_secs=[1])
+        SpreadPaperConfig(enabled=True, finalist_limit=10, markout_secs=[], terminal_secs=1)
     )
     assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is not None
 
     events = tracker.evaluate_due(2_000, {})
 
+    assert [event["kind"] for event in events] == [
+        "opportunity.paper_evaluation_skipped"
+    ]
     payload = events[0]["payload"]
     assert payload["paper_net_quote"] is None
     assert payload["opportunity_label"] == "unknown_due_to_missing_snapshot"
     assert payload["market_snapshot"]["snapshot_available"] is False
+    assert payload["paper_skip_reason"] == "missing_exit_quotes"
+    assert payload["paper_skip_terminal"] is True
     assert payload["paper_fee_quote"] == pytest.approx(payload["paper_entry_fee_quote"])
+    assert tracker.tracked_count == 1
+
+    closed = tracker.evaluate_due(3_000, _quotes(now_ms=3_000))
+
+    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
+    assert closed[0]["payload"]["paper_net_quote"] is not None
+    assert tracker.tracked_count == 0
+
+
+def test_active_exit_convergence_closes_before_terminal() -> None:
+    tracker = SpreadPaperTracker(
+        SpreadPaperConfig(
+            enabled=True,
+            finalist_limit=10,
+            markout_secs=[],
+            terminal_secs=30,
+            active_exit_enabled=True,
+            exit_z=0.5,
+            stop_z=3.5,
+            max_hold_ms=30_000,
+        )
+    )
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    closed = tracker.evaluate_due(
+        2_000,
+        _quotes(
+            now_ms=2_000,
+            long_bid=100.0,
+            long_ask=100.1,
+            short_bid=100.1,
+            short_ask=100.2,
+        ),
+    )
+
+    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
+    payload = closed[0]["payload"]
+    assert payload["horizon_kind"] == "active_exit:spread_converged"
+    assert payload["paper_close_reason"] == "spread_converged"
+    assert payload["paper_net_quote"] is not None
+    assert tracker.tracked_count == 0
 
 
 def test_tracker_restores_open_orders_from_local_journal_records() -> None:

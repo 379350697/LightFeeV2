@@ -468,6 +468,25 @@ class TestJournalAnalysisIntegration:
         assert report.paper_outcome_closed_count == 0
         assert report.paper_outcome_net_quote_total == 0.0
 
+    def test_analyze_counts_paper_evaluation_skipped_without_pnl_totals(self):
+        from lightfee.offline.analysis.journal import analyze_journal_records
+        records = [
+            {"kind": "opportunity.paper_evaluation_skipped", "payload": {
+                "paper_id": "p1",
+                "opportunity_label": "unknown_due_to_missing_snapshot",
+                "paper_fee_quote": 10.0,
+                "paper_slippage_quote": 10.0,
+            }},
+        ]
+        report = analyze_journal_records(records)
+        assert report.paper_outcome_evaluation_skipped_count == 1
+        assert report.paper_outcome_markout_count == 0
+        assert report.paper_outcome_closed_count == 0
+        assert report.paper_outcome_by_label["unknown_due_to_missing_snapshot"] == 1
+        assert report.paper_outcome_net_quote_total == 0.0
+        assert report.paper_outcome_fee_quote_total == 0.0
+        assert report.paper_outcome_slippage_quote_total == 0.0
+
     def test_analyze_counts_real_vs_paper_joined(self):
         from lightfee.offline.analysis.journal import analyze_journal_records
         records = [

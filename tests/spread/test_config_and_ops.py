@@ -49,6 +49,9 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_paper_terminal_secs == 1800
     assert strategy.spread_paper_slippage_buffer_bps == 0.0
     assert strategy.spread_paper_default_funding_interval_ms == 28_800_000
+    assert strategy.spread_paper_last_good_quote_max_age_ms == 60_000
+    assert strategy.spread_paper_quote_repair_enabled is True
+    assert strategy.spread_paper_quote_repair_timeout_s == 3.0
     assert PersistenceConfig().spread_paper_event_log_path == "runtime/spread-paper-events.jsonl"
 
 
@@ -87,6 +90,9 @@ spread_paper_markout_secs = [10, 20]
 spread_paper_terminal_secs = 20
 spread_paper_slippage_buffer_bps = 4.0
 spread_paper_default_funding_interval_ms = 14400000
+spread_paper_last_good_quote_max_age_ms = 30000
+spread_paper_quote_repair_enabled = false
+spread_paper_quote_repair_timeout_s = 1.5
 
 [persistence]
 spread_paper_event_log_path = "runtime/custom-spread-paper.jsonl"
@@ -136,6 +142,9 @@ venue = "okx"
     assert config.strategy.spread_paper_terminal_secs == 20
     assert config.strategy.spread_paper_slippage_buffer_bps == 4.0
     assert config.strategy.spread_paper_default_funding_interval_ms == 14_400_000
+    assert config.strategy.spread_paper_last_good_quote_max_age_ms == 30_000
+    assert config.strategy.spread_paper_quote_repair_enabled is False
+    assert config.strategy.spread_paper_quote_repair_timeout_s == 1.5
     assert config.persistence.spread_paper_event_log_path == "runtime/custom-spread-paper.jsonl"
     assert config.venues[0].taker_fee_bps == 0.6
     assert config.venues[0].maker_fee_bps == 0.2

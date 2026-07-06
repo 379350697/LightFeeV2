@@ -235,6 +235,330 @@ async def test_spread_sidecar_service_writes_shadow_paper_to_dedicated_journal(
 
 
 @pytest.mark.asyncio
+async def test_spread_paper_can_close_from_last_good_quotes_when_sidecar_snapshot_missing(
+    tmp_path,
+) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    paper_path = tmp_path / "spread-paper-events.jsonl"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_min_samples=2,
+            spread_min_history_ms=0,
+            spread_fair_price_min_venues=2,
+            spread_min_fair_price_confidence=0.0,
+            spread_min_liquidity_capacity_ratio=1.0,
+            spread_entry_z=0.0,
+            spread_min_net_edge_bps=0.0,
+            spread_paper_enabled=True,
+            spread_paper_finalist_limit=5,
+            spread_paper_bot_ids=["tt_conservative"],
+            spread_paper_markout_secs=[],
+            spread_paper_terminal_secs=1,
+        ),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    publish_snapshot(
+        SidecarSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            quotes={
+                "cheap:BTCUSDT": QuoteSnapshot(
+                    venue="cheap",
+                    symbol="BTCUSDT",
+                    bid=99.9,
+                    ask=100.0,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                ),
+                "rich:BTCUSDT": QuoteSnapshot(
+                    venue="rich",
+                    symbol="BTCUSDT",
+                    bid=101.0,
+                    ask=101.1,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                ),
+            },
+        ),
+        sidecar_path,
+    )
+    service = SpreadSidecarService(config)
+
+    await service.refresh_once(now_ms=10_000)
+    await service.refresh_once(now_ms=10_001)
+    sidecar_path.unlink()
+    snapshot = await service.refresh_once(now_ms=11_001)
+    await service.close()
+
+    assert snapshot.candidates == []
+    assert snapshot.source_mode == "sidecar_snapshot_unavailable"
+    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
+    kinds = [record["kind"] for record in records]
+    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
+    closed_payload = records[-1]["payload"]
+    assert closed_payload["paper_net_quote"] is not None
+    assert closed_payload["market_snapshot"]["snapshot_available"] is True
+    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
+        "spread_paper_last_good_quote"
+    )
+    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
+        "spread_paper_last_good_quote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spread_paper_actively_repairs_missing_terminal_quotes(
+    tmp_path,
+) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    paper_path = tmp_path / "spread-paper-events.jsonl"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_min_samples=2,
+            spread_min_history_ms=0,
+            spread_fair_price_min_venues=2,
+            spread_min_fair_price_confidence=0.0,
+            spread_min_liquidity_capacity_ratio=1.0,
+            spread_entry_z=0.0,
+            spread_min_net_edge_bps=0.0,
+            spread_paper_enabled=True,
+            spread_paper_finalist_limit=5,
+            spread_paper_bot_ids=["tt_conservative"],
+            spread_paper_markout_secs=[],
+            spread_paper_terminal_secs=1,
+            spread_paper_quote_repair_enabled=True,
+            spread_paper_quote_repair_timeout_s=1.0,
+        ),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    publish_snapshot(
+        SidecarSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            quotes={
+                "cheap:BTCUSDT": QuoteSnapshot(
+                    venue="cheap",
+                    symbol="BTCUSDT",
+                    bid=99.9,
+                    ask=100.0,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                ),
+                "rich:BTCUSDT": QuoteSnapshot(
+                    venue="rich",
+                    symbol="BTCUSDT",
+                    bid=101.0,
+                    ask=101.1,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=10_000,
+                ),
+            },
+        ),
+        sidecar_path,
+    )
+    service = SpreadSidecarService(config)
+
+    class FakeRepairSource:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+            self.fetches: list[list[str]] = []
+
+        async def fetch_all(self, symbols):
+            self.fetches.append(list(symbols))
+            if self.venue == "cheap":
+                return {
+                    "cheap:BTCUSDT": QuoteSnapshot(
+                        venue="cheap",
+                        symbol="BTCUSDT",
+                        bid=100.4,
+                        ask=100.5,
+                        bid_size=12.0,
+                        ask_size=12.0,
+                        observed_at_ms=11_001,
+                    )
+                }
+            return {
+                "rich:BTCUSDT": QuoteSnapshot(
+                    venue="rich",
+                    symbol="BTCUSDT",
+                    bid=100.6,
+                    ask=100.7,
+                    bid_size=12.0,
+                    ask_size=12.0,
+                    observed_at_ms=11_001,
+                )
+            }
+
+        async def close(self):
+            return None
+
+    cheap_source = FakeRepairSource("cheap")
+    rich_source = FakeRepairSource("rich")
+    service._exchange_sources = {"cheap": cheap_source, "rich": rich_source}
+
+    await service.refresh_once(now_ms=10_000)
+    await service.refresh_once(now_ms=10_001)
+    sidecar_path.unlink()
+    snapshot = await service.refresh_once(now_ms=11_001)
+    await service.close()
+
+    assert snapshot.candidates == []
+    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
+    kinds = [record["kind"] for record in records]
+    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
+    assert cheap_source.fetches[-1] == ["BTCUSDT"]
+    assert rich_source.fetches[-1] == ["BTCUSDT"]
+    closed_payload = records[-1]["payload"]
+    assert closed_payload["paper_net_quote"] is not None
+    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
+        "spread_paper_quote_repair"
+    )
+    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
+        "spread_paper_quote_repair"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spread_paper_repairs_quotes_for_active_convergence_close_before_terminal(
+    tmp_path,
+) -> None:
+    sidecar_path = tmp_path / "missing-sidecar.json"
+    paper_path = tmp_path / "spread-paper-events.jsonl"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_paper_enabled=True,
+            spread_paper_finalist_limit=5,
+            spread_paper_bot_ids=["tt_conservative"],
+            spread_paper_markout_secs=[],
+            spread_paper_terminal_secs=30,
+            spread_paper_last_good_quote_max_age_ms=0,
+            spread_paper_quote_repair_enabled=True,
+            spread_paper_quote_repair_timeout_s=1.0,
+            spread_exit_z=0.5,
+            spread_stop_z=3.5,
+            spread_max_hold_ms=30_000,
+        ),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    service = SpreadSidecarService(config)
+    initial_quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=1_000,
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=101.0,
+            ask=101.1,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=1_000,
+        ),
+    }
+    registered = service._paper_tracker.register(
+        _candidate(),
+        initial_quotes,
+        finalist_rank=0,
+    )
+    assert registered is not None
+    assert service._paper_journal is not None
+    service._paper_journal.append(
+        str(registered["kind"]),
+        dict(registered["payload"]),
+        ts_ms=1_000,
+    )
+
+    class FakeRepairSource:
+        def __init__(self, venue: str) -> None:
+            self.venue = venue
+            self.fetches: list[list[str]] = []
+
+        async def fetch_all(self, symbols):
+            self.fetches.append(list(symbols))
+            if self.venue == "cheap":
+                return {
+                    "cheap:BTCUSDT": QuoteSnapshot(
+                        venue="cheap",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=100.1,
+                        bid_size=12.0,
+                        ask_size=12.0,
+                        observed_at_ms=2_000,
+                    )
+                }
+            return {
+                "rich:BTCUSDT": QuoteSnapshot(
+                    venue="rich",
+                    symbol="BTCUSDT",
+                    bid=100.1,
+                    ask=100.2,
+                    bid_size=12.0,
+                    ask_size=12.0,
+                    observed_at_ms=2_000,
+                )
+            }
+
+        async def close(self):
+            return None
+
+    cheap_source = FakeRepairSource("cheap")
+    rich_source = FakeRepairSource("rich")
+    service._exchange_sources = {"cheap": cheap_source, "rich": rich_source}
+
+    snapshot = await service.refresh_once(now_ms=2_000)
+    await service.close()
+
+    assert snapshot.candidates == []
+    assert cheap_source.fetches[-1] == ["BTCUSDT"]
+    assert rich_source.fetches[-1] == ["BTCUSDT"]
+    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
+    kinds = [record["kind"] for record in records]
+    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
+    closed_payload = records[-1]["payload"]
+    assert closed_payload["horizon_kind"] == "active_exit:spread_converged"
+    assert closed_payload["paper_close_reason"] == "spread_converged"
+    assert closed_payload["paper_net_quote"] is not None
+    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
+        "spread_paper_quote_repair"
+    )
+    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
+        "spread_paper_quote_repair"
+    )
+
+
+@pytest.mark.asyncio
 async def test_spread_sidecar_service_writes_default_paper_bots_to_journal(
     tmp_path,
 ) -> None:

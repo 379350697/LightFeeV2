@@ -208,6 +208,9 @@ class StrategyConfig:
     spread_paper_terminal_secs: int = 1800
     spread_paper_slippage_buffer_bps: float = 0.0
     spread_paper_default_funding_interval_ms: int = 28_800_000
+    spread_paper_last_good_quote_max_age_ms: int = 60_000
+    spread_paper_quote_repair_enabled: bool = True
+    spread_paper_quote_repair_timeout_s: float = 3.0
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     exit_shadow_enabled: bool = False

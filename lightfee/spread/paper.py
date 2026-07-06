@@ -69,6 +69,10 @@ class SpreadPaperConfig:
     finalist_limit: int = 0
     markout_secs: list[int] = field(default_factory=lambda: [60, 300, 900, 1800])
     terminal_secs: int = 1800
+    active_exit_enabled: bool = False
+    exit_z: float = 0.5
+    stop_z: float = 3.5
+    max_hold_ms: int = 0
     taker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     maker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     slippage_buffer_bps: float = 0.0
@@ -139,6 +143,7 @@ class SpreadPaperTracker:
         self.config = config
         self._positions: dict[str, SpreadPaperPosition] = {}
         self._emitted_horizons: dict[str, set[str]] = {}
+        self._skipped_horizons: dict[str, set[str]] = {}
         self._known_paper_ids: set[str] = set()
         self._episode_started_at_ms: dict[tuple[str, str, str, str], int] = {}
 
@@ -149,6 +154,44 @@ class SpreadPaperTracker:
     @property
     def tracked_count(self) -> int:
         return len(self._positions)
+
+    def missing_due_quote_keys(
+        self,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> set[tuple[str, str]]:
+        return self.missing_evaluation_quote_keys(now_ms, quotes)
+
+    def missing_evaluation_quote_keys(
+        self,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> set[tuple[str, str]]:
+        if not self.enabled:
+            return set()
+        missing: set[tuple[str, str]] = set()
+        for position in self._positions.values():
+            if _position_has_pending_entry(position):
+                delay_ms = max(int(position.paper_hedge_delay_ms or 0), 0)
+                if now_ms < position.registered_at_ms + delay_ms:
+                    continue
+                missing.update(self._missing_entry_quote_keys(position, quotes))
+                continue
+            if (
+                self.config.active_exit_enabled
+                and now_ms > int(position.registered_at_ms or 0)
+            ):
+                missing.update(self._missing_exit_quote_keys(position, quotes))
+            emitted = self._emitted_horizons.get(position.paper_id, set())
+            for horizon in position.due_horizons:
+                horizon_kind = str(horizon["kind"])
+                if int(horizon["due_at_ms"]) > now_ms:
+                    continue
+                if horizon_kind in emitted:
+                    continue
+                missing.update(self._missing_exit_quote_keys(position, quotes))
+                break
+        return missing
 
     def register(
         self,
@@ -215,6 +258,7 @@ class SpreadPaperTracker:
         """Restore open paper orders from the local paper journal."""
         self._positions.clear()
         self._emitted_horizons.clear()
+        self._skipped_horizons.clear()
         self._known_paper_ids.clear()
         self._episode_started_at_ms.clear()
         for record in records:
@@ -232,6 +276,7 @@ class SpreadPaperTracker:
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
                 self._emitted_horizons.setdefault(paper_id, set())
+                self._skipped_horizons.setdefault(paper_id, set())
                 self._record_episode(position)
             elif kind == "opportunity.paper_hedge_filled":
                 position = _position_from_registration_payload(payload)
@@ -240,7 +285,14 @@ class SpreadPaperTracker:
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
                 self._emitted_horizons.setdefault(paper_id, set())
+                self._skipped_horizons.setdefault(paper_id, set())
                 self._record_episode(position)
+            elif kind == "opportunity.paper_evaluation_skipped":
+                self._record_episode_from_payload(payload)
+                self._known_paper_ids.add(paper_id)
+                horizon_kind = str(payload.get("horizon_kind", "") or "")
+                if horizon_kind:
+                    self._skipped_horizons.setdefault(paper_id, set()).add(horizon_kind)
             elif kind in {"opportunity.paper_markout", "opportunity.paper_closed"}:
                 self._record_episode_from_payload(payload)
                 self._known_paper_ids.add(paper_id)
@@ -250,6 +302,7 @@ class SpreadPaperTracker:
                 if kind == "opportunity.paper_closed":
                     self._positions.pop(paper_id, None)
                     self._emitted_horizons.pop(paper_id, None)
+                    self._skipped_horizons.pop(paper_id, None)
 
     def evaluate_due(
         self,
@@ -264,26 +317,240 @@ class SpreadPaperTracker:
             if _position_has_pending_entry(position):
                 continue
             emitted = self._emitted_horizons.setdefault(position.paper_id, set())
-            for horizon in position.due_horizons:
-                horizon_kind = str(horizon["kind"])
-                if int(horizon["due_at_ms"]) > now_ms:
+            due_horizons = self._pending_due_horizons(position, now_ms, emitted)
+            due_horizon = due_horizons[0] if due_horizons else None
+            active_check_due = (
+                self.config.active_exit_enabled
+                and now_ms > int(position.registered_at_ms or 0)
+            )
+            if active_check_due:
+                skip_reason = self._exit_pricing_skip_reason(position, quotes)
+                if skip_reason is not None:
+                    horizon = due_horizon or {
+                        "kind": "active_exit_check",
+                        "due_at_ms": now_ms,
+                        "terminal": False,
+                    }
+                    horizon_kind = str(horizon["kind"])
+                    skipped = self._skipped_horizons.setdefault(position.paper_id, set())
+                    if horizon_kind not in skipped:
+                        events.append(
+                            self._build_skipped_event(
+                                position=position,
+                                horizon=horizon,
+                                now_ms=now_ms,
+                                quotes=quotes,
+                                reason=skip_reason,
+                            )
+                        )
+                        skipped.add(horizon_kind)
                     continue
-                if horizon_kind in emitted:
+                active_horizon = self._active_exit_horizon(position, now_ms, quotes)
+                if active_horizon is not None:
+                    emitted.add(str(active_horizon["kind"]))
+                    events.append(
+                        self._build_due_event(
+                            position=position,
+                            horizon=active_horizon,
+                            now_ms=now_ms,
+                            quotes=quotes,
+                        )
+                    )
+                    closed_ids.append(position.paper_id)
+                    continue
+            if not due_horizons:
+                continue
+            for due_horizon in due_horizons:
+                horizon_kind = str(due_horizon["kind"])
+                skip_reason = self._exit_pricing_skip_reason(position, quotes)
+                if skip_reason is not None:
+                    skipped = self._skipped_horizons.setdefault(position.paper_id, set())
+                    if horizon_kind not in skipped:
+                        events.append(
+                            self._build_skipped_event(
+                                position=position,
+                                horizon=due_horizon,
+                                now_ms=now_ms,
+                                quotes=quotes,
+                                reason=skip_reason,
+                            )
+                        )
+                        skipped.add(horizon_kind)
                     continue
                 emitted.add(horizon_kind)
                 event = self._build_due_event(
                     position=position,
-                    horizon=horizon,
+                    horizon=due_horizon,
                     now_ms=now_ms,
                     quotes=quotes,
                 )
                 events.append(event)
-                if bool(horizon["terminal"]):
+                if bool(due_horizon["terminal"]):
                     closed_ids.append(position.paper_id)
         for paper_id in closed_ids:
             self._positions.pop(paper_id, None)
             self._emitted_horizons.pop(paper_id, None)
+            self._skipped_horizons.pop(paper_id, None)
         return events
+
+    def _pending_due_horizons(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        emitted: set[str],
+    ) -> list[dict]:
+        due: list[dict] = []
+        for horizon in position.due_horizons:
+            horizon_kind = str(horizon["kind"])
+            if int(horizon["due_at_ms"]) > now_ms:
+                continue
+            if horizon_kind in emitted:
+                continue
+            due.append(horizon)
+        return due
+
+    def _active_exit_horizon(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> dict | None:
+        reason, spread_mid_bps, z_score = self._active_exit_reason(
+            position,
+            now_ms,
+            quotes,
+        )
+        if reason is None:
+            return None
+        return {
+            "kind": f"active_exit:{reason}",
+            "due_at_ms": now_ms,
+            "terminal": True,
+            "close_reason": reason,
+            "exit_spread_mid_bps": spread_mid_bps,
+            "exit_z_score": z_score,
+        }
+
+    def _active_exit_reason(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> tuple[str | None, float | None, float | None]:
+        max_hold_ms = max(int(self.config.max_hold_ms or 0), 0)
+        if (
+            max_hold_ms > 0
+            and now_ms - int(position.registered_at_ms or 0) > max_hold_ms
+        ):
+            return "spread_max_hold_elapsed", None, None
+
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        spread_mid_bps = _spread_mid_bps(long_quote, short_quote)
+        z_score = _position_exit_z_score(position, spread_mid_bps)
+        if z_score is None:
+            return None, spread_mid_bps, None
+        stop_z = max(float(self.config.stop_z or 0.0), 0.0)
+        if stop_z > 0.0 and z_score >= stop_z:
+            return "spread_stop_z_reached", spread_mid_bps, z_score
+        exit_z = max(float(self.config.exit_z or 0.0), 0.0)
+        if abs(z_score) <= exit_z:
+            return "spread_converged", spread_mid_bps, z_score
+        return None, spread_mid_bps, z_score
+
+    def _exit_pricing_skip_reason(
+        self,
+        position: SpreadPaperPosition,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> str | None:
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        if long_quote is None or short_quote is None:
+            return "missing_exit_quotes"
+        long_exit_raw = _exit_raw_price(
+            long_quote,
+            side="long",
+            role=position.long_leg.exit_liquidity_role,
+        )
+        short_exit_raw = _exit_raw_price(
+            short_quote,
+            side="short",
+            role=position.short_leg.exit_liquidity_role,
+        )
+        if long_exit_raw <= 0.0 or short_exit_raw <= 0.0:
+            return "invalid_exit_prices"
+        if (
+            position.long_leg.entry_raw_price is None
+            or position.short_leg.entry_raw_price is None
+        ):
+            return "missing_entry_prices"
+        return None
+
+    def _missing_entry_quote_keys(
+        self,
+        position: SpreadPaperPosition,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> set[tuple[str, str]]:
+        missing: set[tuple[str, str]] = set()
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        if long_quote is None or _entry_raw_price(
+            long_quote,
+            "long",
+            position.long_leg.entry_liquidity_role,
+        ) <= 0.0:
+            missing.add((position.long_venue, position.symbol))
+        if short_quote is None or _entry_raw_price(
+            short_quote,
+            "short",
+            position.short_leg.entry_liquidity_role,
+        ) <= 0.0:
+            missing.add((position.short_venue, position.symbol))
+        return missing
+
+    def _missing_exit_quote_keys(
+        self,
+        position: SpreadPaperPosition,
+        quotes: dict[str, QuoteSnapshot],
+    ) -> set[tuple[str, str]]:
+        missing: set[tuple[str, str]] = set()
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        if long_quote is None or _exit_raw_price(
+            long_quote,
+            side="long",
+            role=position.long_leg.exit_liquidity_role,
+        ) <= 0.0:
+            missing.add((position.long_venue, position.symbol))
+        if short_quote is None or _exit_raw_price(
+            short_quote,
+            side="short",
+            role=position.short_leg.exit_liquidity_role,
+        ) <= 0.0:
+            missing.add((position.short_venue, position.symbol))
+        return missing
+
+    def _build_skipped_event(
+        self,
+        *,
+        position: SpreadPaperPosition,
+        horizon: dict,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+        reason: str,
+    ) -> dict:
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        payload = self._build_payload(
+            position=position,
+            horizon_kind=str(horizon["kind"]),
+            now_ms=now_ms,
+            long_quote=long_quote,
+            short_quote=short_quote,
+        )
+        payload["paper_skip_reason"] = reason
+        payload["paper_skip_terminal"] = bool(horizon["terminal"])
+        return {"kind": "opportunity.paper_evaluation_skipped", "payload": payload}
 
     def _fill_due_pending_hedges(
         self,
@@ -552,6 +819,13 @@ class SpreadPaperTracker:
             long_quote=long_quote,
             short_quote=short_quote,
         )
+        close_reason = str(horizon.get("close_reason", "") or "")
+        if close_reason:
+            payload["paper_close_reason"] = close_reason
+        if horizon.get("exit_spread_mid_bps") is not None:
+            payload["paper_exit_spread_mid_bps"] = float(horizon["exit_spread_mid_bps"])
+        if horizon.get("exit_z_score") is not None:
+            payload["paper_exit_z_score"] = float(horizon["exit_z_score"])
         return {"kind": kind, "payload": payload}
 
     def _build_payload(
@@ -993,6 +1267,10 @@ def _candidate_snapshot(candidate: SpreadReversionCandidate) -> dict:
             getattr(candidate, "executable_spread_bps", 0.0) or 0.0
         ),
         "spread_mid_bps": float(getattr(candidate, "spread_mid_bps", 0.0) or 0.0),
+        "rolling_mean_bps": float(
+            getattr(candidate, "rolling_mean_bps", 0.0) or 0.0
+        ),
+        "rolling_std_bps": float(getattr(candidate, "rolling_std_bps", 0.0) or 0.0),
         "z_score": float(getattr(candidate, "z_score", 0.0) or 0.0),
         "net_edge_bps": float(getattr(candidate, "net_edge_bps", 0.0) or 0.0),
         "fair_price": float(getattr(candidate, "fair_price", 0.0) or 0.0),
@@ -1030,6 +1308,7 @@ def _quote_payload(quote: QuoteSnapshot | None) -> dict | None:
     return {
         "venue": str(getattr(quote, "venue", "") or "").lower(),
         "symbol": str(getattr(quote, "symbol", "") or "").upper(),
+        "source": str(getattr(quote, "source", "") or ""),
         "bid": float(getattr(quote, "bid", 0.0) or 0.0),
         "ask": float(getattr(quote, "ask", 0.0) or 0.0),
         "bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
@@ -1349,3 +1628,31 @@ def _mid(quote: QuoteSnapshot | None) -> float | None:
     if bid <= 0.0 or ask <= 0.0:
         return None
     return (bid + ask) / 2.0
+
+
+def _spread_mid_bps(
+    long_quote: QuoteSnapshot | None,
+    short_quote: QuoteSnapshot | None,
+) -> float | None:
+    long_mid = _mid(long_quote)
+    short_mid = _mid(short_quote)
+    if long_mid is None or short_mid is None:
+        return None
+    reference_mid = (long_mid + short_mid) / 2.0
+    if reference_mid <= 0.0:
+        return None
+    return ((short_mid - long_mid) / reference_mid) * 10_000.0
+
+
+def _position_exit_z_score(
+    position: SpreadPaperPosition,
+    spread_mid_bps: float | None,
+) -> float | None:
+    if spread_mid_bps is None:
+        return None
+    snapshot = position.candidate_snapshot or {}
+    rolling_mean = float(snapshot.get("rolling_mean_bps", 0.0) or 0.0)
+    rolling_std = float(snapshot.get("rolling_std_bps", 0.0) or 0.0)
+    if rolling_std <= 0.0:
+        return None
+    return (spread_mid_bps - rolling_mean) / rolling_std

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
@@ -20,6 +21,14 @@ from lightfee.spread.reversion import (
     build_spread_reversion_candidates,
 )
 from lightfee.venues.specs import get_spec
+
+
+_PAPER_LAST_GOOD_QUOTE_SOURCE = "spread_paper_last_good_quote"
+_PAPER_QUOTE_REPAIR_SOURCE = "spread_paper_quote_repair"
+
+
+def _paper_quote_key(venue: str, symbol: str) -> str:
+    return f"{str(venue).lower()}:{str(symbol).upper()}"
 
 
 def _venue_maker_fee_bps(venue_config: object) -> float:
@@ -54,6 +63,22 @@ class SpreadSidecarService:
         self._exchange_sources: dict[str, object] = {}
         self._paper_journal: Journal | None = None
         self._paper_tracker = SpreadPaperTracker(self._paper_config(config))
+        self._paper_last_good_quotes: dict[str, QuoteSnapshot] = {}
+        self._paper_quote_repair_enabled = bool(
+            getattr(
+                config.strategy,
+                "spread_paper_quote_repair_enabled",
+                True,
+            )
+        )
+        self._paper_quote_repair_timeout_s = float(
+            getattr(
+                config.strategy,
+                "spread_paper_quote_repair_timeout_s",
+                3.0,
+            )
+            or 0.0
+        )
         if self._paper_tracker.enabled:
             persistence = config.persistence
             self._paper_journal = Journal(
@@ -65,7 +90,10 @@ class SpreadSidecarService:
             self._paper_journal.open()
             self._paper_tracker.restore_from_records(self._paper_journal.read_all())
 
-        if self.source_mode != "direct_market" or not self.direct_fetch_enabled:
+        needs_exchange_sources = (
+            self.source_mode == "direct_market" and self.direct_fetch_enabled
+        ) or (self._paper_tracker.enabled and self._paper_quote_repair_enabled)
+        if not needs_exchange_sources:
             return
 
         from lightfee.sidecar.sources.exchange import ExchangeSource
@@ -115,10 +143,10 @@ class SpreadSidecarService:
             candidates=candidates,
         )
         publish_spread_snapshot(snapshot, self.snapshot_path)
-        self._refresh_paper(candidates, quotes, observed_ms)
+        await self._refresh_paper(candidates, quotes, observed_ms)
         return snapshot
 
-    def _refresh_paper(
+    async def _refresh_paper(
         self,
         candidates: list,
         quotes: dict[str, QuoteSnapshot],
@@ -139,12 +167,143 @@ class SpreadSidecarService:
                     dict(registered_event["payload"]),
                     ts_ms=observed_ms,
                 )
-        for event in self._paper_tracker.evaluate_due(observed_ms, quotes):
+        if quotes:
+            self._remember_paper_quotes(quotes)
+        paper_quotes = await self._repair_paper_quotes_if_needed(
+            dict(quotes),
+            observed_ms,
+        )
+        if paper_quotes:
+            self._remember_paper_quotes(paper_quotes)
+        paper_quotes = self._paper_quotes_for_evaluation(paper_quotes, observed_ms)
+        for event in self._paper_tracker.evaluate_due(observed_ms, paper_quotes):
             self._paper_journal.append(
                 str(event["kind"]),
                 dict(event["payload"]),
                 ts_ms=observed_ms,
             )
+
+    def _paper_quotes_for_evaluation(
+        self,
+        quotes: dict[str, QuoteSnapshot],
+        observed_ms: int,
+    ) -> dict[str, QuoteSnapshot]:
+        max_age_ms = int(
+            getattr(
+                self.config.strategy,
+                "spread_paper_last_good_quote_max_age_ms",
+                60_000,
+            )
+            or 0
+        )
+        if max_age_ms <= 0 or not self._paper_last_good_quotes:
+            return dict(quotes)
+        paper_quotes: dict[str, QuoteSnapshot] = {}
+        for key, quote in self._paper_last_good_quotes.items():
+            quote_observed_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            if quote_observed_ms <= 0:
+                continue
+            if observed_ms - quote_observed_ms > max_age_ms:
+                continue
+            paper_quotes[str(key)] = replace(
+                quote,
+                source=_PAPER_LAST_GOOD_QUOTE_SOURCE,
+            )
+        paper_quotes.update(quotes)
+        return paper_quotes
+
+    async def _repair_paper_quotes_if_needed(
+        self,
+        quotes: dict[str, QuoteSnapshot],
+        observed_ms: int,
+    ) -> dict[str, QuoteSnapshot]:
+        if not self._paper_quote_repair_enabled:
+            return quotes
+        missing = self._paper_tracker.missing_evaluation_quote_keys(observed_ms, quotes)
+        if not missing:
+            return quotes
+        repairs = await self._fetch_paper_quote_repairs(missing, observed_ms)
+        if not repairs:
+            return quotes
+        repaired_quotes = dict(quotes)
+        repaired_quotes.update(repairs)
+        return repaired_quotes
+
+    async def _fetch_paper_quote_repairs(
+        self,
+        requests: set[tuple[str, str]],
+        observed_ms: int,
+    ) -> dict[str, QuoteSnapshot]:
+        by_venue: dict[str, set[str]] = {}
+        requested_keys: set[str] = set()
+        for venue, symbol in requests:
+            venue_name = str(venue).lower()
+            symbol_name = str(symbol).upper()
+            if not venue_name or not symbol_name:
+                continue
+            by_venue.setdefault(venue_name, set()).add(symbol_name)
+            requested_keys.add(_paper_quote_key(venue_name, symbol_name))
+        if not by_venue:
+            return {}
+
+        timeout_s = self._paper_quote_repair_timeout_s
+        if timeout_s <= 0.0:
+            timeout_s = self.refresh_timeout_s
+
+        async def _fetch_venue(
+            venue_name: str,
+            symbols: set[str],
+        ) -> dict[str, QuoteSnapshot]:
+            source = self._exchange_sources.get(venue_name)
+            if source is None:
+                return {}
+            try:
+                result = await asyncio.wait_for(
+                    source.fetch_all(sorted(symbols)),
+                    timeout=timeout_s,
+                )
+            except Exception:
+                return {}
+            repaired: dict[str, QuoteSnapshot] = {}
+            for raw_key, quote in (result or {}).items():
+                quote_venue = str(getattr(quote, "venue", "") or venue_name).lower()
+                quote_symbol = str(getattr(quote, "symbol", "") or "").upper()
+                key = _paper_quote_key(quote_venue, quote_symbol)
+                if key not in requested_keys and str(raw_key) in requested_keys:
+                    key = str(raw_key)
+                if key not in requested_keys:
+                    continue
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                if bid <= 0.0 or ask <= 0.0:
+                    continue
+                observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+                repaired[key] = replace(
+                    quote,
+                    venue=key.split(":", 1)[0],
+                    symbol=key.split(":", 1)[1],
+                    observed_at_ms=observed_at_ms if observed_at_ms > 0 else observed_ms,
+                    source=_PAPER_QUOTE_REPAIR_SOURCE,
+                )
+            return repaired
+
+        results = await asyncio.gather(
+            *[_fetch_venue(venue, symbols) for venue, symbols in by_venue.items()],
+            return_exceptions=False,
+        )
+        repairs: dict[str, QuoteSnapshot] = {}
+        for result in results:
+            repairs.update(result)
+        return repairs
+
+    def _remember_paper_quotes(self, quotes: dict[str, QuoteSnapshot]) -> None:
+        for key, quote in quotes.items():
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            if bid <= 0.0 or ask <= 0.0 or observed_at_ms <= 0:
+                continue
+            self._paper_last_good_quotes[str(key)] = quote
 
     async def _fetch_quotes(
         self,
@@ -194,6 +353,10 @@ class SpreadSidecarService:
             finalist_limit=int(getattr(strategy, "spread_paper_finalist_limit", 0) or 0),
             markout_secs=list(getattr(strategy, "spread_paper_markout_secs", []) or []),
             terminal_secs=int(getattr(strategy, "spread_paper_terminal_secs", 0) or 0),
+            active_exit_enabled=True,
+            exit_z=float(getattr(strategy, "spread_exit_z", 0.5) or 0.0),
+            stop_z=float(getattr(strategy, "spread_stop_z", 3.5) or 0.0),
+            max_hold_ms=int(getattr(strategy, "spread_max_hold_ms", 0) or 0),
             taker_fee_bps_by_venue={
                 str(getattr(venue, "venue", "") or "").lower(): float(
                     getattr(venue, "taker_fee_bps", 0.0) or 0.0
