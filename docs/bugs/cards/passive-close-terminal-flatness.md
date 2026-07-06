@@ -17,6 +17,10 @@ residuals, and live-flat cleanup.
 - `passive_close_final_truth_actions.flatten_remaining_live_leg`
 - `passive_close_actionable_single_leg_wait_count`
 - `risk_only_live_single_leg_exposure_count`
+- `passive_close_active_recovery_pending_count`
+- `recovery.identity_sanitized`
+- `exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc`
+- `exit.passive_close_owned_one_sided_ioc_blocked`
 - `runtime.passive_close_recovery_result`
 - `runtime.stale_fail_closed_cleared`
 - `passive_close_resolved_without_terminal_truth_count`
@@ -120,6 +124,22 @@ when both identifiers are present. A matching live reduce-only close order can
 be adopted by normalized order id/client id, or by consistent
 venue+symbol+side+reduce-only+quantity coverage; an unproven open order still
 fails closed.
+
+Recovered passive-close state obeys the same identity boundary on snapshot
+load and on every passive-close tick before retry filtering. A persisted
+`maker_order_id="None"` must be cleared while preserving the client id and
+emitting `recovery.identity_sanitized`; owner ledger, diagnostics, journal, and
+identity history must never consume `"None"` as an order identity. For owned
+one-sided passive closes, `risk_only` means block new risk plus active recovery
+pending, not a quiet terminal state. If a matching close-only open order exists,
+adopt it first; after the V1 fallback deadline or stale maker price, cancel the
+owned close order, prove terminal order truth and fresh no-open-order truth,
+then issue the reduce-only IOC flatten. If cancel/detail/open-order truth is
+missing, or any remaining order is not a close-only match, keep fail-closed and
+do not submit a duplicate order. Bitget Classic hedge close-short uses internal
+`Side.BUY` while the exchange may report `side=sell, tradeSide=close`; Bitget
+UTA must use `posSide=short/long` as close-intent evidence instead of naked side
+alone.
 
 Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry

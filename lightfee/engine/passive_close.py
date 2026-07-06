@@ -5089,6 +5089,12 @@ class PassiveCloseExecutor:
         if not state.pending_passive_closes:
             return set()
 
+        self._sanitize_pending_passive_close_identities(
+            state,
+            source="process_pending_passive_closes",
+            now_ms=now_ms,
+        )
+
         pending_ids = [
             pid for pid, ppc in state.pending_passive_closes.items()
             if ppc.next_retry_at_ms <= now_ms
@@ -5109,6 +5115,80 @@ class PassiveCloseExecutor:
             await self.drive_pending_passive_close(state, pid, wait_until_terminal=False)
 
         return set(state.pending_passive_closes.keys())
+
+    def _sanitize_pending_passive_close_identities(
+        self,
+        state: EngineState,
+        *,
+        source: str,
+        now_ms: int,
+    ) -> int:
+        sanitized_count = 0
+        for pid, pending in list(state.pending_passive_closes.items()):
+            changed_fields: list[str] = []
+
+            def normalize_attr(obj: Any, attr: str, field_name: str) -> None:
+                nonlocal sanitized_count
+                raw = getattr(obj, attr, "")
+                normalized = normalize_order_identity(raw)
+                if raw != normalized:
+                    setattr(obj, attr, normalized)
+                    changed_fields.append(field_name)
+                    sanitized_count += 1
+
+            normalize_attr(pending.phase_state, "maker_order_id", "phase_state.maker_order_id")
+            normalize_attr(
+                pending.phase_state,
+                "maker_client_order_id",
+                "phase_state.maker_client_order_id",
+            )
+            normalize_attr(pending.maker_fill, "order_id", "maker_fill.order_id")
+            normalize_attr(pending.maker_fill, "client_order_id", "maker_fill.client_order_id")
+            normalize_attr(pending.hedge_fill, "order_id", "hedge_fill.order_id")
+            normalize_attr(pending.hedge_fill, "client_order_id", "hedge_fill.client_order_id")
+
+            for index, record in enumerate(pending.close_order_identity_history):
+                if not isinstance(record, dict):
+                    continue
+                for key in ("order_id", "orderId", "id"):
+                    if key not in record:
+                        continue
+                    raw = record.get(key)
+                    normalized = normalize_order_identity(raw)
+                    if raw != normalized:
+                        record[key] = normalized
+                        changed_fields.append(f"close_order_identity_history[{index}].{key}")
+                        sanitized_count += 1
+                for key in (
+                    "client_order_id",
+                    "clientOrderId",
+                    "clientOid",
+                    "orderLinkId",
+                ):
+                    if key not in record:
+                        continue
+                    raw = record.get(key)
+                    normalized = normalize_order_identity(raw)
+                    if raw != normalized:
+                        record[key] = normalized
+                        changed_fields.append(f"close_order_identity_history[{index}].{key}")
+                        sanitized_count += 1
+
+            if changed_fields:
+                self._journal.append(
+                    "recovery.identity_sanitized",
+                    {
+                        "position_id": pending.position_id or pid,
+                        "source": source,
+                        "sanitized_fields": changed_fields,
+                        "maker_order_id": pending.phase_state.maker_order_id,
+                        "maker_client_order_id": pending.phase_state.maker_client_order_id,
+                        "decision": "retain_pending_active_recovery",
+                        "next_action": "continue_owned_passive_close_recovery",
+                        "ts_ms": now_ms,
+                    },
+                )
+        return sanitized_count
 
     # ------------------------------------------------------------------
     # Fallback to aggressive
@@ -6979,6 +7059,7 @@ class PassiveCloseExecutor:
         else:
             open_orders_flat, open_orders_evidence = True, None
         if open_orders_flat is not True:
+            owned_ioc_recovery_ready = False
             adopted = await self._adopt_matching_reduce_only_close_order(
                 pending,
                 position,
@@ -6988,43 +7069,101 @@ class PassiveCloseExecutor:
                 order_id="",
                 client_order_id="",
                 source="one_sided_flatten_open_orders_not_flat",
-                now_ms=self._now_ms(),
+                now_ms=now_ms,
                 open_orders=open_order_items,
             )
             if adopted:
+                deadline = self._passive_close_fallback_deadline_decision(
+                    pending,
+                    position,
+                    now_ms,
+                )
+                if not deadline.get("hard_breached"):
+                    return False
+                cancelled = await self._cancel_owned_one_sided_close_order_for_ioc(
+                    pending,
+                    position,
+                    venue=venue,
+                    side=close_side,
+                    leg_label=leg_label,
+                    deadline=deadline,
+                    now_ms=now_ms,
+                )
+                if not cancelled:
+                    return False
+                post_cancel_items, post_cancel_error = await self._fetch_venue_open_order_items(
+                    venue,
+                    position.symbol,
+                    self._adapters,
+                )
+                if post_cancel_error:
+                    self._journal.append(
+                        "exit.passive_close_owned_one_sided_ioc_blocked",
+                        {
+                            "position_id": position.position_id,
+                            "symbol": position.symbol,
+                            "venue": venue.value,
+                            "leg": leg_label,
+                            "reason": "post_cancel_open_order_truth_unavailable",
+                            "open_orders_evidence": post_cancel_error,
+                            "decision": "retain_pending_block_new_risk",
+                        },
+                    )
+                    pending.next_retry_at_ms = now_ms + 5_000
+                    return False
+                if post_cancel_items:
+                    self._journal.append(
+                        "exit.passive_close_owned_one_sided_ioc_blocked",
+                        {
+                            "position_id": position.position_id,
+                            "symbol": position.symbol,
+                            "venue": venue.value,
+                            "leg": leg_label,
+                            "reason": "post_cancel_open_orders_not_flat",
+                            "open_orders_count": len(post_cancel_items),
+                            "decision": "retain_pending_block_new_risk",
+                        },
+                    )
+                    pending.next_retry_at_ms = now_ms + 5_000
+                    return False
+                open_orders_flat = True
+                open_orders_evidence = "owned_reduce_only_close_cancelled_for_ioc"
+                owned_ioc_recovery_ready = True
+            if owned_ioc_recovery_ready:
+                pass
+            else:
+                self._journal.append(
+                    "exit.passive_close_live_one_sided_truth_gap",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "venue": venue.value,
+                        "leg": leg_label,
+                        "live_quantity": live_qty,
+                        "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
+                        "open_orders_flat": open_orders_flat,
+                        "open_orders_evidence": open_orders_evidence,
+                        "decision": "retain_pending",
+                        "reason": "one_sided_flatten_requires_open_order_flat_proof",
+                    },
+                )
+                self._journal.append(
+                    "exit.passive_close_open_order_ownerless_blocked",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "venue": venue.value,
+                        "leg": leg_label,
+                        "live_quantity": live_qty,
+                        "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
+                        "open_orders_flat": open_orders_flat,
+                        "open_orders_evidence": open_orders_evidence,
+                        "decision": "retain_pending_block_new_risk",
+                        "reason": "open_order_not_adoptable_for_one_sided_flatten",
+                    },
+                )
+                pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
-            self._journal.append(
-                "exit.passive_close_live_one_sided_truth_gap",
-                {
-                    "position_id": position.position_id,
-                    "symbol": position.symbol,
-                    "venue": venue.value,
-                    "leg": leg_label,
-                    "live_quantity": live_qty,
-                    "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
-                    "open_orders_flat": open_orders_flat,
-                    "open_orders_evidence": open_orders_evidence,
-                    "decision": "retain_pending",
-                    "reason": "one_sided_flatten_requires_open_order_flat_proof",
-                },
-            )
-            self._journal.append(
-                "exit.passive_close_open_order_ownerless_blocked",
-                {
-                    "position_id": position.position_id,
-                    "symbol": position.symbol,
-                    "venue": venue.value,
-                    "leg": leg_label,
-                    "live_quantity": live_qty,
-                    "live_side": live_side.value if isinstance(live_side, Side) else str(live_side),
-                    "open_orders_flat": open_orders_flat,
-                    "open_orders_evidence": open_orders_evidence,
-                    "decision": "retain_pending_block_new_risk",
-                    "reason": "open_order_not_adoptable_for_one_sided_flatten",
-                },
-            )
-            pending.next_retry_at_ms = self._now_ms() + 5_000
-            return False
 
         refreshed_snapshot, refreshed_error = await self._fetch_live_position_snapshot(
             venue,
@@ -7416,6 +7555,125 @@ class PassiveCloseExecutor:
 
         pending.next_retry_at_ms = self._now_ms() + 5_000
         return False
+
+    async def _cancel_owned_one_sided_close_order_for_ioc(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        venue: Venue,
+        side: Side,
+        leg_label: str,
+        deadline: dict[str, Any],
+        now_ms: int,
+    ) -> bool:
+        adapter = self._adapter(venue)
+        if adapter is None:
+            return False
+        order_id = normalize_order_identity(pending.phase_state.maker_order_id)
+        client_order_id = normalize_order_identity(pending.phase_state.maker_client_order_id)
+        pending.phase_state.maker_order_id = order_id
+        pending.phase_state.maker_client_order_id = client_order_id
+        if not order_id and not client_order_id:
+            self._journal.append(
+                "exit.passive_close_owned_one_sided_ioc_blocked",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "reason": "adopted_close_order_identity_missing",
+                    "decision": "retain_pending_block_new_risk",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + 5_000
+            return False
+
+        self._journal.append(
+            "exit.passive_close_owned_one_sided_close_order_cancel_requested",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value,
+                "leg": leg_label,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "side": side.value,
+                "deadline_ms": deadline.get("hard_deadline_ms", 0),
+                "elapsed_ms": deadline.get("elapsed_ms", 0),
+                "decision": "cancel_before_reduce_only_ioc",
+            },
+        )
+        cancel_ok = False
+        try:
+            await adapter.cancel_passive_order(
+                symbol=position.symbol,
+                order_id=order_id,
+                client_order_id=client_order_id,
+            )
+            cancel_ok = True
+        except Exception as exc:
+            self._journal.append(
+                "exit.passive_close_owned_one_sided_ioc_blocked",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "reason": "cancel_failed_old_order_may_still_be_alive",
+                    "error": str(exc),
+                    "decision": "retain_pending_block_new_risk",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + 5_000
+            return False
+
+        old_dead = await self._probe_order_dead(
+            adapter,
+            position.symbol,
+            order_id,
+            client_order_id,
+            side=side,
+        )
+        if not old_dead:
+            self._journal.append(
+                "exit.passive_close_owned_one_sided_ioc_blocked",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "venue": venue.value,
+                    "leg": leg_label,
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "cancel_ack_received": cancel_ok,
+                    "reason": "cancel_ack_without_terminal_order_truth",
+                    "decision": "retain_pending_block_new_risk",
+                },
+            )
+            pending.next_retry_at_ms = now_ms + 5_000
+            return False
+
+        pending.phase_state.maker_order_id = ""
+        pending.phase_state.maker_client_order_id = ""
+        pending.phase_state.maker_resting_limit_price = None
+        pending.phase_state.maker_resting_since_ms = 0
+        self._journal.append(
+            "exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": venue.value,
+                "leg": leg_label,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "side": side.value,
+                "decision": "submit_reduce_only_ioc_after_open_order_flat_truth",
+                "reason": "owned_close_order_deadline_breached",
+            },
+        )
+        return True
 
     async def _handle_live_balanced_close_target(
         self,
@@ -8473,6 +8731,7 @@ class PassiveCloseExecutor:
             items = open_orders
         match = self._find_matching_reduce_only_close_order(
             items,
+            venue=venue,
             symbol=position.symbol,
             side=side,
             target_quantity=target_quantity,
@@ -8525,6 +8784,7 @@ class PassiveCloseExecutor:
         self,
         orders: list[Any],
         *,
+        venue: Venue | None = None,
         symbol: str,
         side: Side,
         target_quantity: float,
@@ -8532,7 +8792,6 @@ class PassiveCloseExecutor:
         client_order_id: str = "",
     ) -> Any | None:
         target_symbol_key = self._canonical_symbol_key(symbol)
-        target_side = side.value.lower()
         expected_order_id = normalize_order_identity(order_id)
         expected_client_id = normalize_order_identity(client_order_id)
         for order in orders:
@@ -8541,10 +8800,9 @@ class PassiveCloseExecutor:
             )
             if order_symbol and target_symbol_key and order_symbol != target_symbol_key:
                 continue
-            if not self._order_bool(order, "reduce_only", "reduceOnly", "reduce-only"):
+            if not self._order_is_close_only(order, venue=venue):
                 continue
-            order_side = self._order_side_text(order)
-            if order_side and order_side != target_side:
+            if not self._order_matches_close_intent(order, venue=venue, side=side):
                 continue
             current_order_id = normalize_order_identity(
                 self._order_field(order, "order_id", "orderId", "id")
@@ -8569,6 +8827,39 @@ class PassiveCloseExecutor:
             if id_matches or (quantity_matches and order_qty > 0.0):
                 return order
         return None
+
+    def _order_is_close_only(self, order: Any, *, venue: Venue | None = None) -> bool:
+        if self._order_bool(order, "reduce_only", "reduceOnly", "reduce-only"):
+            return True
+        if venue == Venue.BITGET:
+            trade_side = self._order_field(order, "tradeSide", "trade_side").strip().lower()
+            if trade_side == "close":
+                return True
+        return False
+
+    def _order_matches_close_intent(
+        self,
+        order: Any,
+        *,
+        venue: Venue | None = None,
+        side: Side,
+    ) -> bool:
+        order_side = self._order_side_text(order)
+        target_side = side.value.lower()
+        if venue != Venue.BITGET:
+            return not order_side or order_side == target_side
+
+        pos_side = self._order_field(order, "posSide", "pos_side", "holdSide").strip().lower()
+        if pos_side:
+            expected_pos_side = "short" if side == Side.BUY else "long"
+            return pos_side == expected_pos_side
+
+        trade_side = self._order_field(order, "tradeSide", "trade_side").strip().lower()
+        if trade_side == "close":
+            classic_side = "sell" if side == Side.BUY else "buy"
+            return not order_side or order_side in {target_side, classic_side}
+
+        return not order_side or order_side == target_side
 
     @staticmethod
     def _order_field(order: Any, *names: str) -> str:

@@ -6989,6 +6989,10 @@ def _build_business_progression_quality_summary(
     passive_close_actionable_single_leg_wait_count = 0
     passive_close_final_truth_actions: dict[str, int] = {}
     risk_only_live_single_leg_exposure_count = 0
+    passive_close_active_recovery_pending_count = 0
+    passive_close_identity_sanitized_count = 0
+    passive_close_owned_ioc_handoff_count = 0
+    passive_close_owned_ioc_blocked_count = 0
     close_cost_entries: dict[str, dict[str, Any]] = {}
 
     def close_cost_entry(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -7298,6 +7302,15 @@ def _build_business_progression_quality_summary(
         elif kind == "exit.passive_close_reduce_only_quantity_covered_by_open_order":
             duplicate_reduce_only_submit_blocked_count += 1
             owned_pending_passive_close_count += 1
+        elif kind == "recovery.identity_sanitized":
+            passive_close_identity_sanitized_count += 1
+            passive_close_active_recovery_pending_count += 1
+        elif kind == "exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc":
+            passive_close_owned_ioc_handoff_count += 1
+            passive_close_active_recovery_pending_count += 1
+        elif kind == "exit.passive_close_owned_one_sided_ioc_blocked":
+            passive_close_owned_ioc_blocked_count += 1
+            passive_close_active_recovery_pending_count += 1
         elif kind == "order.rejected":
             code = str(
                 payload.get("exchange_code")
@@ -7659,6 +7672,18 @@ def _build_business_progression_quality_summary(
         ),
         "risk_only_live_single_leg_exposure_count": (
             risk_only_live_single_leg_exposure_count
+        ),
+        "passive_close_active_recovery_pending_count": (
+            passive_close_active_recovery_pending_count
+        ),
+        "passive_close_identity_sanitized_count": (
+            passive_close_identity_sanitized_count
+        ),
+        "passive_close_owned_ioc_handoff_count": (
+            passive_close_owned_ioc_handoff_count
+        ),
+        "passive_close_owned_ioc_blocked_count": (
+            passive_close_owned_ioc_blocked_count
         ),
         "passive_close_final_truth_actions": dict(
             sorted(passive_close_final_truth_actions.items())

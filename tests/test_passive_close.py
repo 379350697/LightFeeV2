@@ -7991,6 +7991,64 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
 
+    def test_tick_sanitizes_recovered_none_close_identity_before_retry_filter(self):
+        """Recovered passive close identity placeholders must not survive a tick."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-siren",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+                maker_order_id="None",
+                maker_client_order_id="lfex-siren-close",
+            ),
+            maker_fill=PendingPassiveLegFill(order_id="None", client_order_id="null"),
+            hedge_fill=PendingPassiveLegFill(order_id=" null ", client_order_id=""),
+            close_order_identity_history=[
+                {
+                    "venue": "bitget",
+                    "leg": "short",
+                    "order_id": "None",
+                    "client_order_id": "lfex-siren-close",
+                    "source": "recovered",
+                }
+            ],
+            next_retry_at_ms=9_999_999,
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3_000))
+
+        assert remaining == {position.position_id}
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == "lfex-siren-close"
+        assert pending.maker_fill.order_id == ""
+        assert pending.maker_fill.client_order_id == ""
+        assert pending.hedge_fill.order_id == ""
+        assert pending.close_order_identity_history[-1]["order_id"] == ""
+        assert pending.close_order_identity_history[-1]["client_order_id"] == "lfex-siren-close"
+        events = journal.read_all()
+        sanitized = [e for e in events if e.get("kind") == "recovery.identity_sanitized"]
+        assert sanitized
+        assert sanitized[-1]["payload"]["position_id"] == position.position_id
+        assert sanitized[-1]["payload"]["decision"] == "retain_pending_active_recovery"
+
     def test_live_flat_cleanup_normalizes_dict_shaped_pending_close_reconciliation_queue(self):
         state, position, journal, executor, long_adapter, short_adapter = (
             self._arrange_live_flat_cleanup()
@@ -9807,6 +9865,302 @@ class TestReduceOnlyRejectedEscalation:
         ]
         assert adopted_events[-1]["payload"]["order_id"] == ""
         assert adopted_events[-1]["payload"]["client_order_id"] == "lfex-siren-close"
+
+    def test_adopt_bitget_classic_hedge_close_short_sell_trade_side(self):
+        """Bitget Classic close-short is exchange side=sell + tradeSide=close."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        position = _make_position(
+            position_id="entry-siren",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+
+        adopted = asyncio.run(executor._adopt_matching_reduce_only_close_order(
+            pending,
+            position,
+            venue=Venue.BITGET,
+            side=Side.BUY,
+            target_quantity=460.0,
+            source="test",
+            now_ms=1783300000000,
+            open_orders=[
+                {
+                    "venue": "bitget",
+                    "symbol": "SIRENUSDT",
+                    "side": "sell",
+                    "tradeSide": "close",
+                    "quantity": 460.0,
+                    "price": 0.03,
+                    "reduceOnly": "yes",
+                    "orderId": "1457877662440255627",
+                    "clientOid": "lfex-siren-close",
+                }
+            ],
+        ))
+
+        assert adopted is True
+        assert pending.phase_state.maker_order_id == "1457877662440255627"
+        assert pending.phase_state.maker_client_order_id == "lfex-siren-close"
+        adopted_events = [
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_existing_reduce_only_order_adopted"
+        ]
+        assert adopted_events[-1]["payload"]["side"] == "buy"
+        assert adopted_events[-1]["payload"]["matched_quantity"] == pytest.approx(460.0)
+
+    def test_adopt_bitget_uta_pos_side_short_close_intent(self):
+        """Bitget UTA hedge close intent is carried by posSide, not naked side."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        position = _make_position(
+            position_id="entry-siren-uta",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+        )
+
+        adopted = asyncio.run(executor._adopt_matching_reduce_only_close_order(
+            pending,
+            position,
+            venue=Venue.BITGET,
+            side=Side.BUY,
+            target_quantity=460.0,
+            source="test_uta",
+            now_ms=1783300000000,
+            open_orders=[
+                {
+                    "venue": "bitget",
+                    "symbol": "SIRENUSDT",
+                    "side": "sell",
+                    "posSide": "short",
+                    "tradeSide": "close",
+                    "quantity": 460.0,
+                    "price": 0.03,
+                    "reduceOnly": True,
+                    "orderId": "uta-close-short",
+                    "clientOid": "lfex-siren-uta-close",
+                }
+            ],
+        ))
+
+        assert adopted is True
+        assert pending.phase_state.maker_order_id == "uta-close-short"
+        assert pending.phase_state.maker_client_order_id == "lfex-siren-uta-close"
+
+    def test_one_sided_flatten_adopts_bitget_close_short_order_before_ownerless_block(self):
+        """A known pending passive close may adopt a matching live close order."""
+        journal = _open_journal()
+        bitget = _mock_adapter_with_tick(Venue.BITGET)
+        bitget.fetch_open_orders = AsyncMock(return_value=[
+            {
+                "venue": "bitget",
+                "symbol": "SIRENUSDT",
+                "side": "sell",
+                "tradeSide": "close",
+                "quantity": 460.0,
+                "price": 0.03,
+                "reduceOnly": True,
+                "orderId": "1457877662440255627",
+                "clientOid": "lfex-siren-close",
+            }
+        ])
+        bitget.place_order = AsyncMock()
+        executor = PassiveCloseExecutor({Venue.BITGET: bitget}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-siren",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(executor._flatten_live_one_sided_position(
+            state,
+            pending,
+            position,
+            venue=Venue.BITGET,
+            live_snapshot=PositionSnapshot(
+                venue=Venue.BITGET,
+                symbol="SIRENUSDT",
+                side=Side.SELL,
+                quantity=460.0,
+                entry_price=0.03,
+                observed_at_ms=1783300000000,
+            ),
+            leg_label="short",
+        ))
+
+        assert result is False
+        assert pending.phase_state.maker_order_id == "1457877662440255627"
+        assert pending.phase_state.maker_client_order_id == "lfex-siren-close"
+        bitget.place_order.assert_not_called()
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_existing_reduce_only_order_adopted" in kinds
+        assert "exit.passive_close_open_order_ownerless_blocked" not in kinds
+
+    def test_stale_adopted_one_sided_order_cancelled_then_ioc_flattened(self):
+        """Owned one-sided recovery must not sit in risk_only after deadline breach."""
+        journal = _open_journal()
+        bitget = _mock_adapter_with_tick(Venue.BITGET)
+        bitget.fetch_open_orders = AsyncMock(side_effect=[
+            [
+                {
+                    "venue": "bitget",
+                    "symbol": "SIRENUSDT",
+                    "side": "sell",
+                    "tradeSide": "close",
+                    "quantity": 460.0,
+                    "price": 0.03,
+                    "reduceOnly": True,
+                    "orderId": "1457877662440255627",
+                    "clientOid": "lfex-siren-close",
+                }
+            ],
+            [],
+        ])
+        bitget.cancel_passive_order = AsyncMock(
+            return_value=_make_passive_ack(
+                venue=Venue.BITGET,
+                order_id="1457877662440255627",
+                client_order_id="lfex-siren-close",
+            )
+        )
+        bitget.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BITGET,
+            side=Side.BUY,
+            order_id="1457877662440255627",
+            client_order_id="lfex-siren-close",
+            state=PassiveOrderState.CANCELED,
+        ))
+        bitget.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="SIRENUSDT",
+            side=Side.SELL,
+            quantity=460.0,
+            entry_price=0.03,
+            observed_at_ms=20_000,
+        ))
+        bitget.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BITGET,
+            symbol="SIRENUSDT",
+            side=Side.BUY,
+            quantity=460.0,
+            price=0.03,
+            order_id="ioc-close",
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BITGET: bitget},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        executor._now_ms = lambda: 20_000
+        executor.set_l2_mid_resolver(lambda venue, symbol: 0.03)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (0.0299, 0.0301))
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-siren",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+                phase_started_at_ms=1_000,
+                maker_resting_since_ms=1_000,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(executor._flatten_live_one_sided_position(
+            state,
+            pending,
+            position,
+            venue=Venue.BITGET,
+            live_snapshot=PositionSnapshot(
+                venue=Venue.BITGET,
+                symbol="SIRENUSDT",
+                side=Side.SELL,
+                quantity=460.0,
+                entry_price=0.03,
+                observed_at_ms=20_000,
+            ),
+            leg_label="short",
+        ))
+
+        assert result is False
+        bitget.cancel_passive_order.assert_called_once()
+        bitget.place_order.assert_called_once()
+        placed = bitget.place_order.call_args.args[0]
+        assert placed.reduce_only is True
+        assert placed.time_in_force == TimeInForce.IOC
+        assert placed.side == Side.BUY
+        assert placed.quantity == pytest.approx(460.0)
+        kinds = [e.get("kind") for e in journal.read_all()]
+        assert "exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc" in kinds
+        assert "exit.passive_close_live_one_sided_flatten" in kinds
 
     def test_recovered_terminal_rejected_maker_order_escalates_without_spin(self):
         """Recovered terminal rejected maker order must not be polled forever."""

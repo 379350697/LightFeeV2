@@ -10002,6 +10002,10 @@ def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):
             "passive_close_truth_lag_resolved_count": 0,
             "passive_close_actionable_single_leg_wait_count": 0,
             "risk_only_live_single_leg_exposure_count": 0,
+            "passive_close_active_recovery_pending_count": 0,
+            "passive_close_identity_sanitized_count": 0,
+            "passive_close_owned_ioc_handoff_count": 0,
+            "passive_close_owned_ioc_blocked_count": 0,
             "passive_close_final_truth_actions": {},
             "close_cost_inefficiency_summary": {
                 "count": 0,
@@ -12889,6 +12893,34 @@ def test_business_progression_quality_counts_reduce_only_adopt_and_deterministic
                 "venue": "bybit",
             },
         },
+        {
+            "ts_ms": 1700000000400,
+            "kind": "recovery.identity_sanitized",
+            "payload": {
+                "position_id": "entry-siren",
+                "decision": "retain_pending_active_recovery",
+            },
+        },
+        {
+            "ts_ms": 1700000000500,
+            "kind": "exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc",
+            "payload": {
+                "position_id": "entry-siren",
+                "symbol": "SIRENUSDT",
+                "venue": "bitget",
+                "decision": "submit_reduce_only_ioc_after_open_order_flat_truth",
+            },
+        },
+        {
+            "ts_ms": 1700000000600,
+            "kind": "exit.passive_close_owned_one_sided_ioc_blocked",
+            "payload": {
+                "position_id": "entry-siren",
+                "symbol": "SIRENUSDT",
+                "venue": "bitget",
+                "decision": "retain_pending_block_new_risk",
+            },
+        },
     ]
 
     summary = dl._build_business_progression_quality_summary(events)
@@ -12898,6 +12930,10 @@ def test_business_progression_quality_counts_reduce_only_adopt_and_deterministic
     assert summary["duplicate_reduce_only_submit_blocked_count"] == 1
     assert summary["owned_pending_passive_close_count"] == 2
     assert summary["ownerless_open_order_count"] == 1
+    assert summary["passive_close_identity_sanitized_count"] == 1
+    assert summary["passive_close_owned_ioc_handoff_count"] == 1
+    assert summary["passive_close_owned_ioc_blocked_count"] == 1
+    assert summary["passive_close_active_recovery_pending_count"] == 3
 
 
 def test_business_progression_quality_summary_reports_phase_takeover_gaps():

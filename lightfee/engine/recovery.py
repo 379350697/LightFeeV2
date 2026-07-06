@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
     PendingEntryTerminalizer,
@@ -332,6 +333,17 @@ def _restore_close_leg_records(data: list[dict[str, Any]]) -> list[CloseLegRecor
                 fee_quote=float(item.get("fee_quote", 0)),
             ))
     return records
+
+
+def _normalize_close_order_identity_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    for key in ("order_id", "orderId", "id"):
+        if key in normalized:
+            normalized[key] = normalize_order_identity(normalized.get(key))
+    for key in ("client_order_id", "clientOrderId", "clientOid", "orderLinkId"):
+        if key in normalized:
+            normalized[key] = normalize_order_identity(normalized.get(key))
+    return normalized
 
 
 def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
@@ -714,8 +726,10 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     cycle_started_at_ms=int(ps_data.get("cycle_started_at_ms", 0)),
                     zero_fill_cycles_in_phase=int(ps_data.get("zero_fill_cycles_in_phase", 0)),
                     maker_submit_attempt=int(ps_data.get("maker_submit_attempt", 0)),
-                    maker_order_id=str(ps_data.get("maker_order_id", "")),
-                    maker_client_order_id=str(ps_data.get("maker_client_order_id", "")),
+                    maker_order_id=normalize_order_identity(ps_data.get("maker_order_id", "")),
+                    maker_client_order_id=normalize_order_identity(
+                        ps_data.get("maker_client_order_id", "")
+                    ),
                     maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
                     maker_resting_since_ms=int(ps_data.get("maker_resting_since_ms", 0)),
                     maker_viability_rejected_this_cycle=bool(
@@ -734,8 +748,8 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     average_price=float(mf.get("average_price", 0)),
                     fee_quote=float(mf.get("fee_quote", 0)),
                     last_fill_time_ms=int(mf.get("last_fill_time_ms", 0)),
-                    order_id=str(mf.get("order_id", "")),
-                    client_order_id=str(mf.get("client_order_id", "")),
+                    order_id=normalize_order_identity(mf.get("order_id", "")),
+                    client_order_id=normalize_order_identity(mf.get("client_order_id", "")),
                 )
                 hf = pdata.get("hedge_fill", {})
                 hedge_fill = PendingPassiveLegFill(
@@ -743,8 +757,8 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     average_price=float(hf.get("average_price", 0)),
                     fee_quote=float(hf.get("fee_quote", 0)),
                     last_fill_time_ms=int(hf.get("last_fill_time_ms", 0)),
-                    order_id=str(hf.get("order_id", "")),
-                    client_order_id=str(hf.get("client_order_id", "")),
+                    order_id=normalize_order_identity(hf.get("order_id", "")),
+                    client_order_id=normalize_order_identity(hf.get("client_order_id", "")),
                 )
                 state.pending_passive_closes[pid] = PendingPassiveClose(
                     position_id=pdata.get("position_id", pid),
@@ -759,7 +773,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     maker_fill=maker_fill,
                     hedge_fill=hedge_fill,
                     close_order_identity_history=[
-                        dict(item)
+                        _normalize_close_order_identity_record(item)
                         for item in pdata.get("close_order_identity_history", [])
                         if isinstance(item, dict)
                     ],

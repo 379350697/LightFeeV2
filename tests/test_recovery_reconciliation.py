@@ -172,6 +172,65 @@ class TestRecoveryFromSnapshot:
             # Clean state with no recovery work → should go to RECONCILING briefly then RUNNING
             assert state.lifecycle in (EngineLifecycle.RUNNING, EngineLifecycle.RECONCILING)
 
+    def test_snapshot_restore_sanitizes_pending_passive_close_none_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            journal_path = Path(td) / "events.jsonl"
+            snap_path = Path(td) / "state.json"
+
+            snap = SnapshotStore(snap_path)
+            snap.write({
+                "lifecycle": "risk_only",
+                "risk_mode": "fail_closed",
+                "pending_passive_closes": {
+                    "entry-siren": {
+                        "position_id": "entry-siren",
+                        "reason": "funding_capture",
+                        "target_quantity": 460.0,
+                        "chunk_quantities": [460.0],
+                        "phase_state": {
+                            "phase": "dual_taker",
+                            "preferred_maker_leg": "short",
+                            "active_maker_leg": "short",
+                            "maker_order_id": "None",
+                            "maker_client_order_id": "lfex-siren-close",
+                        },
+                        "maker_fill": {
+                            "quantity": 0.0,
+                            "order_id": "None",
+                            "client_order_id": "null",
+                        },
+                        "hedge_fill": {
+                            "quantity": 0.0,
+                            "order_id": " null ",
+                            "client_order_id": "",
+                        },
+                        "close_order_identity_history": [
+                            {
+                                "venue": "bitget",
+                                "leg": "short",
+                                "order_id": "None",
+                                "client_order_id": "lfex-siren-close",
+                            }
+                        ],
+                    }
+                },
+            })
+
+            journal = Journal(journal_path)
+            journal.open()
+            journal.close()
+
+            state = recover_from_snapshot(snap, journal)
+
+            pending = state.pending_passive_closes["entry-siren"]
+            assert pending.phase_state.maker_order_id == ""
+            assert pending.phase_state.maker_client_order_id == "lfex-siren-close"
+            assert pending.maker_fill.order_id == ""
+            assert pending.maker_fill.client_order_id == ""
+            assert pending.hedge_fill.order_id == ""
+            assert pending.close_order_identity_history[-1]["order_id"] == ""
+            assert pending.close_order_identity_history[-1]["client_order_id"] == "lfex-siren-close"
+
     def test_snapshot_with_open_positions_enters_reconciling(self):
         with tempfile.TemporaryDirectory() as td:
             journal_path = Path(td) / "events.jsonl"
