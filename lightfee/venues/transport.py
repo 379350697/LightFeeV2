@@ -4627,13 +4627,13 @@ class VenueTransport(MarketDataClient):
                     side=request.side,
                     quantity=abs(float(filled.get("totalSz", 0))),
                     price=float(filled.get("avgPx", request.price or 0)),
-                    order_id=str(filled.get("oid", "")),
+                    order_id=normalize_order_identity(filled.get("oid", "")),
                     client_order_id=request.client_order_id,
                     filled_at_ms=now_ms,
                 )
             elif "resting" in status_entry:
                 resting = status_entry["resting"]
-                oid = str(resting.get("oid", ""))
+                oid = normalize_order_identity(resting.get("oid", ""))
                 raise OrderSubmitError(
                     SubmitFailureClass.UNCERTAIN,
                     f"Hyperliquid order resting (oid={oid}) — fill not confirmed",
@@ -4664,12 +4664,12 @@ class VenueTransport(MarketDataClient):
                 "unexpected order response shape — cannot parse fill",
             )
 
-        order_id = str(data.get(
-            "orderId",
-            data.get("ordId",
-            data.get("id",
-            data.get("order_id", "")))
-        ))
+        order_id = normalize_order_identity(
+            data.get(
+                "orderId",
+                data.get("ordId", data.get("id", data.get("order_id", ""))),
+            )
+        )
 
         # Explicit fill quantity fields — do NOT fall back to request.quantity
         exec_qty_raw = data.get(
@@ -4707,7 +4707,7 @@ class VenueTransport(MarketDataClient):
                     f"order accepted (id={order_id}) with status={status_str or 'unknown'} "
                     "but terminal fill not confirmed",
                 )
-                accepted_client_order_id = str(
+                accepted_client_order_id = normalize_order_identity(
                     data.get(
                         "orderLinkId",
                         data.get(
@@ -4741,7 +4741,7 @@ class VenueTransport(MarketDataClient):
                 "filledQty",
                 "filled_size",
             ]
-            accepted_client_order_id = str(
+            accepted_client_order_id = normalize_order_identity(
                 data.get(
                     "orderLinkId",
                     data.get(
@@ -4874,13 +4874,14 @@ class VenueTransport(MarketDataClient):
             data = data[0]
         if not isinstance(data, dict):
             return "", ""
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", data.get("order_id", "")))) or "")
-        client_order_id = str(
+        order_id = normalize_order_identity(
+            data.get("orderId", data.get("ordId", data.get("id", data.get("order_id", ""))))
+        )
+        client_order_id = normalize_order_identity(
             data.get(
                 "orderLinkId",
                 data.get("clientOrderId", data.get("clOrdId", data.get("client_order_id", ""))),
             )
-            or ""
         )
         return order_id, client_order_id
 
@@ -5114,8 +5115,8 @@ class VenueTransport(MarketDataClient):
             side=side,
             quantity=qty,
             average_price=price,
-            order_id=str(row.get("orderId", "")),
-            client_order_id=str(row.get("clientOrderId", "")) or None,
+            order_id=normalize_order_identity(row.get("orderId", "")),
+            client_order_id=normalize_order_identity(row.get("clientOrderId", "")) or None,
             fee_quote=fee_quote,
             filled_at_ms=int(row.get("time", now_ms) or now_ms),
             metadata={
@@ -5201,8 +5202,8 @@ class VenueTransport(MarketDataClient):
             side=side,
             quantity=qty,
             average_price=price,
-            order_id=str(row.get("orderId", "")),
-            client_order_id=str(row.get("orderLinkId", "")) or None,
+            order_id=normalize_order_identity(row.get("orderId", "")),
+            client_order_id=normalize_order_identity(row.get("orderLinkId", "")) or None,
             fee_quote=abs(_safe_float(row.get("execFee", "0"))) or None,
             filled_at_ms=int(row.get("execTime", now_ms) or now_ms),
             metadata={
@@ -5286,8 +5287,8 @@ class VenueTransport(MarketDataClient):
                         contract_size,
                     ),
                     average_price=price,
-                    order_id=str(row.get("ordId", "")),
-                    client_order_id=str(row.get("clOrdId", "")) or None,
+                    order_id=normalize_order_identity(row.get("ordId", "")),
+                    client_order_id=normalize_order_identity(row.get("clOrdId", "")) or None,
                     fee_quote=abs(_safe_float(row.get("fee", "0"))) or None,
                     filled_at_ms=int(row.get("ts", row.get("fillTime", now_ms)) or now_ms),
                     metadata={
@@ -5390,8 +5391,10 @@ class VenueTransport(MarketDataClient):
                     side=side,
                     quantity=qty,
                     average_price=price,
-                    order_id=str(row.get("orderId", row.get("ordId", ""))),
-                    client_order_id=str(row.get("clientOid", "")) or None,
+                    order_id=normalize_order_identity(
+                        row.get("orderId", row.get("ordId", ""))
+                    ),
+                    client_order_id=normalize_order_identity(row.get("clientOid", "")) or None,
                     fee_quote=self._bitget_fee_quote_from_row(row),
                     filled_at_ms=int(row.get("cTime", row.get("uTime", now_ms)) or now_ms),
                     metadata={
@@ -5516,8 +5519,14 @@ class VenueTransport(MarketDataClient):
         )
         self._record_order_reconcile_query(
             symbol=venue_sym,
-            order_id=str(raw.get("orderId", order_id)) if isinstance(raw, dict) else order_id,
-            client_order_id=str(raw.get("clientOrderId", client_order_id)) if isinstance(raw, dict) else client_order_id,
+            order_id=normalize_order_identity(raw.get("orderId", order_id))
+            if isinstance(raw, dict)
+            else order_id,
+            client_order_id=normalize_order_identity(
+                raw.get("clientOrderId", client_order_id)
+            )
+            if isinstance(raw, dict)
+            else client_order_id,
             queried_endpoints=["/fapi/v1/order"],
             response_classification=classification,
             uncertain_subtype=subtype,
@@ -5537,8 +5546,8 @@ class VenueTransport(MarketDataClient):
         endpoints: list[str],
     ) -> Optional["OrderFillReconciliation"]:
         queried_endpoints = list(endpoints)
-        order_id_text = str(order_id or "").strip()
-        client_order_id_text = str(client_order_id or "").strip()
+        order_id_text = normalize_order_identity(order_id)
+        client_order_id_text = normalize_order_identity(client_order_id)
         matched_order: dict[str, Any] = {}
         window_params = self._binance_order_query_window_params(
             start_time_ms,
@@ -5564,10 +5573,12 @@ class VenueTransport(MarketDataClient):
                 client_order_id=client_order_id_text,
             )
 
-        resolved_order_id = str(matched_order.get("orderId") or order_id_text or "").strip()
-        resolved_client_id = str(
+        resolved_order_id = normalize_order_identity(
+            matched_order.get("orderId") or order_id_text
+        )
+        resolved_client_id = normalize_order_identity(
             matched_order.get("clientOrderId") or client_order_id_text or ""
-        ).strip()
+        )
 
         if resolved_order_id.isdigit():
             trade_params: dict[str, Any] = {
@@ -5687,7 +5698,7 @@ class VenueTransport(MarketDataClient):
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            row_order_id = str(row.get("orderId") or "")
+            row_order_id = normalize_order_identity(row.get("orderId"))
             if order_id and row_order_id and row_order_id != order_id:
                 continue
             qty = _safe_float(row.get("qty", row.get("quantity", "0")))
@@ -5790,8 +5801,8 @@ class VenueTransport(MarketDataClient):
             side=side,
             quantity=qty,
             average_price=avg_price,
-            order_id=str(raw.get("orderId", "")),
-            client_order_id=str(raw.get("clientOrderId", "")) or None,
+            order_id=normalize_order_identity(raw.get("orderId", "")),
+            client_order_id=normalize_order_identity(raw.get("clientOrderId", "")) or None,
             filled_at_ms=int(raw.get("updateTime", raw.get("time", now_ms)) or now_ms),
             metadata={
                 "raw_exchange_status": status,
@@ -5941,10 +5952,12 @@ class VenueTransport(MarketDataClient):
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
     ) -> Optional["OrderFillReconciliation"]:
-        resolved_order_id = str(order_row.get("ordId") or fallback_order_id or "").strip()
-        resolved_client_id = str(
+        resolved_order_id = normalize_order_identity(
+            order_row.get("ordId") or fallback_order_id
+        )
+        resolved_client_id = normalize_order_identity(
             order_row.get("clOrdId") or fallback_client_order_id or ""
-        ).strip()
+        )
         if not resolved_order_id:
             self._record_order_reconcile_query(
                 symbol=venue_sym,
@@ -6097,8 +6110,8 @@ class VenueTransport(MarketDataClient):
             side=side,
             quantity=qty,
             average_price=avg_price,
-            order_id=str(row.get("ordId", "")),
-            client_order_id=str(row.get("clOrdId", "")) or None,
+            order_id=normalize_order_identity(row.get("ordId", "")),
+            client_order_id=normalize_order_identity(row.get("clOrdId", "")) or None,
             fee_quote=abs(_safe_float(row.get("fee", "0"))) or None,
             filled_at_ms=int(row.get("uTime", row.get("fillTime", now_ms)) or now_ms),
             metadata={
@@ -6178,7 +6191,9 @@ class VenueTransport(MarketDataClient):
             total_fee += abs(_safe_float(row.get("fee", "0")))
             fill_ms = int(row.get("ts", row.get("fillTime", now_ms)) or now_ms)
             latest_fill_ms = max(latest_fill_ms, fill_ms)
-            resolved_client_id = str(row.get("clOrdId") or resolved_client_id or "")
+            resolved_client_id = normalize_order_identity(
+                row.get("clOrdId") or resolved_client_id
+            )
 
         if total_qty <= 0.0 or resolved_side is None:
             return None
@@ -6281,8 +6296,8 @@ class VenueTransport(MarketDataClient):
                 if not isinstance(data, dict):
                     continue
 
-                resolved_order_id = str(data.get("orderId", ""))
-                resolved_client_id = str(data.get("orderLinkId", ""))
+                resolved_order_id = normalize_order_identity(data.get("orderId", ""))
+                resolved_client_id = normalize_order_identity(data.get("orderLinkId", ""))
                 if resolved_order_id:
                     break
 
@@ -6388,8 +6403,8 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             return None
 
-        order_id = str(data.get("orderId", ""))
-        client_id = str(data.get("orderLinkId", ""))
+        order_id = normalize_order_identity(data.get("orderId", ""))
+        client_id = normalize_order_identity(data.get("orderLinkId", ""))
         cum_qty = _safe_float(data.get("cumExecQty", "0"))
         avg_price = _safe_float(data.get("avgPrice", "0"))
         side_raw = str(data.get("side", "")).strip()
@@ -6530,8 +6545,8 @@ class VenueTransport(MarketDataClient):
 
         # V1: json_string(&row, &["orderId", "ordId"]).unwrap_or_else(|| order_id.to_string())
         # Note: caller provides fallback order_id
-        order_id = str(data.get("orderId", data.get("ordId", "")))
-        client_id = str(data.get("clientOid", ""))
+        order_id = normalize_order_identity(data.get("orderId", data.get("ordId", "")))
+        client_id = normalize_order_identity(data.get("clientOid", ""))
         # Bitget order detail separates original order size from executed size.
         # `size`/`qty`/`baseSize`/`amount` are order amount fields and must not
         # be used as fill quantity evidence.
@@ -7886,8 +7901,8 @@ class VenueTransport(MarketDataClient):
             order_item = data_raw[0] if isinstance(data_raw, list) and data_raw else {}
             s_code = str(order_item.get("sCode", "0"))
             s_msg = order_item.get("sMsg", "")
-            ord_id = str(order_item.get("ordId", ""))
-            cl_ord_id = str(order_item.get("clOrdId", ""))
+            ord_id = normalize_order_identity(order_item.get("ordId", ""))
+            cl_ord_id = normalize_order_identity(order_item.get("clOrdId", ""))
             tag = str(order_item.get("tag", ""))
 
             if code != "0":
@@ -7912,8 +7927,8 @@ class VenueTransport(MarketDataClient):
                     f"okx passive order rejected: sCode={s_code} sMsg={s_msg}"
                     f" ordId={ord_id} clOrdId={cl_ord_id} tag={tag}",
                 )
-            ord_id = str(order_item.get("ordId", ""))
-            cl_ord_id = str(order_item.get("clOrdId", ""))
+            ord_id = normalize_order_identity(order_item.get("ordId", ""))
+            cl_ord_id = normalize_order_identity(order_item.get("clOrdId", ""))
             if not ord_id or not cl_ord_id:
                 raise OrderSubmitError(
                     SubmitFailureClass.UNCERTAIN,
@@ -7951,8 +7966,10 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             data = {}
 
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
-        client_order_id = str(data.get(
+        order_id = normalize_order_identity(
+            data.get("orderId", data.get("ordId", data.get("id", "")))
+        )
+        client_order_id = normalize_order_identity(data.get(
             "clientOrderId",
             data.get("clOrdId",
             data.get("orderLinkId",
@@ -8003,6 +8020,8 @@ class VenueTransport(MarketDataClient):
         spec = self._spec
         venue_sym = self._venue_symbol(symbol)
         now_ms = int(time.time() * 1000)
+        order_id = normalize_order_identity(order_id)
+        client_order_id = normalize_order_identity(client_order_id)
 
         if self.mode == "paper":
             return None
@@ -8385,6 +8404,8 @@ class VenueTransport(MarketDataClient):
     ) -> Optional[dict[str, Any]]:
         """Fetch Bitget order detail through the resolved account-family contract."""
         # Build query params: orderId or clientOid
+        order_id = normalize_order_identity(order_id)
+        client_order_id = normalize_order_identity(client_order_id)
         query_params: dict[str, Any] = {}
         if order_id and order_id != "bitget-unknown":
             query_params["orderId"] = order_id
@@ -8438,8 +8459,10 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             return None
 
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
-        client_order_id = str(data.get(
+        order_id = normalize_order_identity(
+            data.get("orderId", data.get("ordId", data.get("id", "")))
+        )
+        client_order_id = normalize_order_identity(data.get(
             "clientOrderId",
             data.get("clOrdId",
             data.get("orderLinkId",
@@ -8589,6 +8612,9 @@ class VenueTransport(MarketDataClient):
         spec = self._spec
         venue_sym = self._venue_symbol(request.symbol)
         now_ms = int(time.time() * 1000)
+        order_id = normalize_order_identity(request.order_id)
+        client_order_id = normalize_order_identity(request.client_order_id)
+        new_client_order_id = normalize_order_identity(request.new_client_order_id)
         contract = get_operation_contract(spec, VenueOperation.AMEND_ORDER)
 
         if self.mode == "paper":
@@ -8596,8 +8622,8 @@ class VenueTransport(MarketDataClient):
                 venue=spec.venue_id,
                 symbol=venue_sym,
                 side=request.side,
-                order_id=request.order_id,
-                client_order_id=request.client_order_id or "",
+                order_id=order_id,
+                client_order_id=client_order_id,
                 price=request.new_price_hint or 0.0,
                 quantity=request.new_quantity or 0.0,
                 accepted_at_ms=now_ms,
@@ -8609,12 +8635,22 @@ class VenueTransport(MarketDataClient):
                 f"{spec.venue_id.value} passive amend not supported: "
                 f"{contract.official_doc_url or 'cancel_replace_required'}"
             )
+        if spec.venue_id in (Venue.BINANCE, Venue.OKX, Venue.BYBIT) and not (
+            order_id or client_order_id
+        ):
+            raise TransportError(
+                TransportErrorCategory.ORDER_STATE_UNCERTAIN,
+                f"{spec.venue_id.value} passive amend requires order_id or client_order_id",
+            )
 
         try:
             body: dict[str, Any] = {"symbol": venue_sym}
 
             if spec.venue_id == Venue.BINANCE:
-                body["orderId"] = request.order_id
+                if order_id:
+                    body["orderId"] = order_id
+                elif client_order_id:
+                    body["origClientOrderId"] = client_order_id
                 body["side"] = request.side.value.upper()
                 if request.new_price_hint is not None and request.new_price_hint > 0:
                     body["price"] = _format_decimal(request.new_price_hint)
@@ -8624,12 +8660,12 @@ class VenueTransport(MarketDataClient):
                 raise NotImplementedError("Aster passive amend not supported")
             elif spec.venue_id == Venue.OKX:
                 body["instId"] = venue_sym
-                if request.order_id:
-                    body["ordId"] = request.order_id
-                elif request.client_order_id:
-                    body["clOrdId"] = request.client_order_id
-                if request.new_client_order_id:
-                    body["newClOrdId"] = request.new_client_order_id
+                if order_id:
+                    body["ordId"] = order_id
+                elif client_order_id:
+                    body["clOrdId"] = client_order_id
+                if new_client_order_id:
+                    body["newClOrdId"] = new_client_order_id
                 if request.new_price_hint is not None and request.new_price_hint > 0:
                     body["newPx"] = _format_decimal(request.new_price_hint)
                 if request.new_quantity is not None and request.new_quantity > 0:
@@ -8682,7 +8718,10 @@ class VenueTransport(MarketDataClient):
                 body["cxlOnFail"] = False
             elif spec.venue_id == Venue.BYBIT:
                 body["category"] = "linear"
-                body["orderId"] = request.order_id
+                if order_id:
+                    body["orderId"] = order_id
+                elif client_order_id:
+                    body["orderLinkId"] = client_order_id
                 if request.new_price_hint is not None and request.new_price_hint > 0:
                     body["price"] = _format_decimal(request.new_price_hint)
                 if request.new_quantity is not None and request.new_quantity > 0:
@@ -8708,7 +8747,7 @@ class VenueTransport(MarketDataClient):
                 OrderRequest(venue=spec.venue_id, symbol=venue_sym, side=request.side,
                              quantity=request.new_quantity or 0.0,
                              price=request.new_price_hint,
-                             client_order_id=request.new_client_order_id or request.client_order_id),
+                             client_order_id=new_client_order_id or client_order_id),
                 venue_sym, now_ms,
             )
 
@@ -8775,8 +8814,8 @@ class VenueTransport(MarketDataClient):
             venue=Venue.OKX,
             symbol=venue_sym,
             side=Side.BUY,
-            order_id=order_id or str(row.get("ordId", "") or ""),
-            client_order_id=client_order_id or str(row.get("clOrdId", "") or ""),
+            order_id=order_id or normalize_order_identity(row.get("ordId", "")),
+            client_order_id=client_order_id or normalize_order_identity(row.get("clOrdId", "")),
             price=0.0,
             quantity=0.0,
             accepted_at_ms=now_ms,
@@ -8796,6 +8835,8 @@ class VenueTransport(MarketDataClient):
         spec = self._spec
         venue_sym = self._venue_symbol(symbol)
         now_ms = int(time.time() * 1000)
+        order_id = normalize_order_identity(order_id)
+        client_order_id = normalize_order_identity(client_order_id)
 
         if self.mode == "paper":
             return PassiveOrderAck(

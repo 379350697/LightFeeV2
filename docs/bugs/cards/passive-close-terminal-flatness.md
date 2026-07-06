@@ -29,6 +29,8 @@ residuals, and live-flat cleanup.
 - Binance close `-5022 GTX_ORDER_REJECT` post-only maker reject
 - Binance close `-2022 ReduceOnly Order is rejected`
 - Bitget close `40786 Duplicate clientOid`
+- Bitget passive close `orderId=None` / `order_id="None"` /
+  `40017 Parameter verification failed None`
 - Bybit close `110017 current position is zero, cannot fix reduce-only order qty`
 - `exit.reconciled` with `evidence_gap_reason`,
   `statement_probe_status`, and `trade_probe_status`
@@ -108,6 +110,16 @@ themselves. Bybit `110072` and Bitget `40786 Duplicate clientOid` must query
 order/fill truth by client id and current live position truth. They may clear
 only when reconciliation proves filled/flat or current exchange truth is flat;
 truth gaps remain fail-closed.
+
+Absent close-order venue ids are not string identities. Passive close ACK,
+cancel, detail/progress query, amend, state, identity-history, and journal
+paths must normalize `None`, `"None"`, `"null"`, and empty strings before they
+touch owner matching. For Bitget, when normalized `orderId` is absent, cancel
+and detail/progress must use `clientOid` alone because `orderId` takes priority
+when both identifiers are present. A matching live reduce-only close order can
+be adopted by normalized order id/client id, or by consistent
+venue+symbol+side+reduce-only+quantity coverage; an unproven open order still
+fails closed.
 
 Passive close retry/backoff is also bounded by the V1 exit hedge/fallback hard
 deadline. Once the deadline is hard-breached, V2 must stop passive retry

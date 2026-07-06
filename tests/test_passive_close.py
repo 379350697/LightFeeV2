@@ -7426,6 +7426,68 @@ class TestAmendCancelReplace:
         assert executor._passive_amend_supported(Venue.ASTER) is False
         assert executor._passive_amend_supported(Venue.HYPERLIQUID) is False
 
+    def test_amend_normalizes_none_order_id_before_request_state_and_journal(self):
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="None",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.amend_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="None", client_order_id="new-cid", price=50100.0,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+
+        asyncio.run(
+            executor._amend_maker_order(
+                state,
+                pending,
+                position,
+                Venue.BINANCE,
+                Side.SELL,
+                "long",
+                50100.0,
+                0.01,
+                0.01,
+                50100.0,
+            )
+        )
+
+        amend_req = mock_adapter.amend_passive_order.call_args.args[0]
+        assert amend_req.order_id == ""
+        assert amend_req.client_order_id == "old-cid"
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == "new-cid"
+
+        events = journal.read_all()
+        requested = [
+            event for event in events
+            if event["kind"] == "exit.passive_close_amend_requested"
+        ][-1]
+        assert requested["payload"]["order_id"] == ""
+        assert requested["payload"]["client_order_id"] == "old-cid"
+        succeeded = [
+            event for event in events
+            if event["kind"] == "exit.passive_close_amend_succeeded"
+        ][-1]
+        assert succeeded["payload"]["order_id"] == ""
+        assert succeeded["payload"]["client_order_id"] == "new-cid"
+
     def test_amend_not_implemented_falls_back_to_cancel_replace(self):
         """When amend raises NotImplementedError, cancel-replace is used."""
         journal = _open_journal()
@@ -9359,6 +9421,111 @@ class TestCancelReplaceSubmitFailure:
         submit_failed = [e for e in events if e.get("kind") == "exit.passive_close_cancel_replace_submit_failed"]
         assert len(submit_failed) == 0
 
+    def test_cancel_replace_normalizes_old_none_order_id_before_cancel(self):
+        """Recovered maker state with order_id='None' must cancel by client id only."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="None",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="", client_order_id="old-cid",
+        ))
+        mock_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="new-oid", client_order_id="new-cid", price=50100.0,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        cancel_kwargs = mock_adapter.cancel_passive_order.call_args.kwargs
+        assert cancel_kwargs["order_id"] == ""
+        assert cancel_kwargs["client_order_id"] == "old-cid"
+        requested = [
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_cancel_replace_requested"
+        ][-1]
+        assert requested["payload"]["old_order_id"] == ""
+
+    def test_replacement_submit_normalizes_none_ack_before_state_history_and_journal(self):
+        """A venue ACK with order_id='None' must preserve only client id in close state."""
+        journal = _open_journal()
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-oid",
+                maker_client_order_id="old-cid",
+                maker_resting_limit_price=50000.0,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        mock_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        mock_adapter.cancel_passive_order = AsyncMock(return_value=_make_passive_ack(order_id="old-oid"))
+        mock_adapter.submit_passive_order = AsyncMock(return_value=_make_passive_ack(
+            order_id="None", client_order_id="new-cid", price=50100.0,
+        ))
+
+        executor = PassiveCloseExecutor({Venue.BINANCE: mock_adapter}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (50099.99, 50100.01))
+
+        asyncio.run(
+            executor._cancel_replace_maker_order(
+                state, pending, position, Venue.BINANCE, Side.SELL,
+                "long", 50100.0, 0.01, 0.01, 50100.0,
+            )
+        )
+
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == "new-cid"
+        assert pending.close_order_identity_history[-1]["order_id"] == ""
+        assert pending.close_order_identity_history[-1]["client_order_id"] == "new-cid"
+
+        events = journal.read_all()
+        submitted = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_maker_submitted"
+        ][-1]
+        assert submitted["payload"]["order_id"] == ""
+        assert submitted["payload"]["client_order_id"] == "new-cid"
+        completed = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_cancel_replace_completed"
+        ][-1]
+        assert completed["payload"]["new_order_id"] == ""
+
 
 # ---------------------------------------------------------------------------
 # Production path semantic tests — coroutine safety, reduce-only escalation,
@@ -9581,6 +9748,65 @@ class TestReduceOnlyRejectedEscalation:
         kinds = [event["kind"] for event in journal.read_all()]
         assert "exit.passive_close_reduce_only_quantity_covered_by_open_order" in kinds
         assert "exit.passive_close_existing_reduce_only_order_adopted" in kinds
+
+    def test_adopt_matching_reduce_only_order_normalizes_none_order_id(self):
+        """Adoption must not persist a placeholder order id from exchange open-order truth."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        position = _make_position(
+            position_id="entry-siren",
+            symbol="SIRENUSDT",
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BITGET,
+            matched_quantity=460.0,
+            long_quantity=460.0,
+            short_quantity=460.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=460.0,
+            chunk_quantities=[460.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.SHORT,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+
+        adopted = asyncio.run(executor._adopt_matching_reduce_only_close_order(
+            pending,
+            position,
+            venue=Venue.BITGET,
+            side=Side.BUY,
+            target_quantity=460.0,
+            source="test",
+            now_ms=1783300000000,
+            open_orders=[
+                {
+                    "venue": "bitget",
+                    "symbol": "SIRENUSDT",
+                    "side": "buy",
+                    "quantity": 460.0,
+                    "price": 0.03,
+                    "reduce_only": True,
+                    "order_id": "None",
+                    "client_order_id": "lfex-siren-close",
+                }
+            ],
+        ))
+
+        assert adopted is True
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == "lfex-siren-close"
+        adopted_events = [
+            e for e in journal.read_all()
+            if e.get("kind") == "exit.passive_close_existing_reduce_only_order_adopted"
+        ]
+        assert adopted_events[-1]["payload"]["order_id"] == ""
+        assert adopted_events[-1]["payload"]["client_order_id"] == "lfex-siren-close"
 
     def test_recovered_terminal_rejected_maker_order_escalates_without_spin(self):
         """Recovered terminal rejected maker order must not be polled forever."""

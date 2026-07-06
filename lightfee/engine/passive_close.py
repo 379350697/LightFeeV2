@@ -2885,16 +2885,18 @@ class PassiveCloseExecutor:
         # Success: reset failure counters
         pending.phase_state.maker_submit_consecutive_failures = 0
 
-        pending.phase_state.maker_order_id = ack.order_id
-        pending.phase_state.maker_client_order_id = ack.client_order_id
+        ack_order_id = normalize_order_identity(ack.order_id)
+        ack_client_order_id = normalize_order_identity(ack.client_order_id)
+        pending.phase_state.maker_order_id = ack_order_id
+        pending.phase_state.maker_client_order_id = ack_client_order_id
         pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
         self._record_close_order_identity_history(
             pending,
             venue=maker_venue,
             leg=maker_leg_label,
-            order_id=ack.order_id,
-            client_order_id=ack.client_order_id,
+            order_id=ack_order_id,
+            client_order_id=ack_client_order_id,
             source="maker_submitted",
             quantity_hint=chunk_quantity,
             submitted_at_ms=ack.accepted_at_ms,
@@ -2907,8 +2909,8 @@ class PassiveCloseExecutor:
                 "exit_shadow_id": _exit_shadow_id_for_position(position),
                 "maker_venue": maker_venue.value,
                 "maker_leg": maker_leg_label,
-                "order_id": ack.order_id,
-                "client_order_id": ack.client_order_id,
+                "order_id": ack_order_id,
+                "client_order_id": ack_client_order_id,
                 "price": pending.phase_state.maker_resting_limit_price,
                 "quantity": chunk_quantity,
                 "chunk_index": pending.active_chunk_index,
@@ -4379,11 +4381,16 @@ class PassiveCloseExecutor:
         if adapter is None:
             return
 
+        old_order_id = normalize_order_identity(pending.phase_state.maker_order_id)
+        old_client_id = normalize_order_identity(pending.phase_state.maker_client_order_id)
+        pending.phase_state.maker_order_id = old_order_id
+        pending.phase_state.maker_client_order_id = old_client_id
+
         amend_req = PassiveOrderAmendRequest(
             symbol=position.symbol,
             side=maker_side,
-            order_id=pending.phase_state.maker_order_id,
-            client_order_id=pending.phase_state.maker_client_order_id,
+            order_id=old_order_id,
+            client_order_id=old_client_id,
             new_price_hint=target_price,
             new_quantity=remaining_quantity,
         )
@@ -4395,7 +4402,8 @@ class PassiveCloseExecutor:
                 "position_id": position.position_id,
                 "maker_venue": maker_venue.value,
                 "maker_leg": maker_leg_label,
-                "order_id": pending.phase_state.maker_order_id,
+                "order_id": old_order_id,
+                "client_order_id": old_client_id,
                 "previous_price": pending.phase_state.maker_resting_limit_price,
                 "new_price": target_price,
                 "tick_size": tick_size,
@@ -4405,8 +4413,10 @@ class PassiveCloseExecutor:
 
         try:
             ack = await adapter.amend_passive_order(amend_req)
-            pending.phase_state.maker_order_id = ack.order_id
-            pending.phase_state.maker_client_order_id = ack.client_order_id
+            ack_order_id = normalize_order_identity(ack.order_id)
+            ack_client_order_id = normalize_order_identity(ack.client_order_id)
+            pending.phase_state.maker_order_id = ack_order_id
+            pending.phase_state.maker_client_order_id = ack_client_order_id
             pending.phase_state.maker_resting_limit_price = target_price
             pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
 
@@ -4414,7 +4424,8 @@ class PassiveCloseExecutor:
                 "exit.passive_close_amend_succeeded",
                 {
                     "position_id": position.position_id,
-                    "order_id": ack.order_id,
+                    "order_id": ack_order_id,
+                    "client_order_id": ack_client_order_id,
                     "price": target_price,
                 },
             )
@@ -4542,8 +4553,10 @@ class PassiveCloseExecutor:
         if adapter is None:
             return
 
-        old_order_id = pending.phase_state.maker_order_id
-        old_client_id = pending.phase_state.maker_client_order_id
+        old_order_id = normalize_order_identity(pending.phase_state.maker_order_id)
+        old_client_id = normalize_order_identity(pending.phase_state.maker_client_order_id)
+        pending.phase_state.maker_order_id = old_order_id
+        pending.phase_state.maker_client_order_id = old_client_id
 
         now_ms = self._now_ms()
         self._journal.append(
@@ -8469,9 +8482,13 @@ class PassiveCloseExecutor:
         if match is None:
             return False
 
-        matched_order_id = self._order_field(match, "order_id", "orderId", "id")
-        matched_client_id = self._order_field(
-            match, "client_order_id", "clientOrderId", "clientOid", "orderLinkId"
+        matched_order_id = normalize_order_identity(
+            self._order_field(match, "order_id", "orderId", "id")
+        )
+        matched_client_id = normalize_order_identity(
+            self._order_field(
+                match, "client_order_id", "clientOrderId", "clientOid", "orderLinkId"
+            )
         )
         matched_price = self._positive_float(
             self._order_field(match, "price", "limit_price", "order_price")
@@ -8516,8 +8533,8 @@ class PassiveCloseExecutor:
     ) -> Any | None:
         target_symbol_key = self._canonical_symbol_key(symbol)
         target_side = side.value.lower()
-        expected_order_id = str(order_id or "")
-        expected_client_id = str(client_order_id or "")
+        expected_order_id = normalize_order_identity(order_id)
+        expected_client_id = normalize_order_identity(client_order_id)
         for order in orders:
             order_symbol = self._canonical_symbol_key(
                 self._order_field(order, "symbol", "instId", "s")
@@ -8529,9 +8546,17 @@ class PassiveCloseExecutor:
             order_side = self._order_side_text(order)
             if order_side and order_side != target_side:
                 continue
-            current_order_id = self._order_field(order, "order_id", "orderId", "id")
-            current_client_id = self._order_field(
-                order, "client_order_id", "clientOrderId", "clientOid", "orderLinkId"
+            current_order_id = normalize_order_identity(
+                self._order_field(order, "order_id", "orderId", "id")
+            )
+            current_client_id = normalize_order_identity(
+                self._order_field(
+                    order,
+                    "client_order_id",
+                    "clientOrderId",
+                    "clientOid",
+                    "orderLinkId",
+                )
             )
             id_matches = (
                 (expected_order_id and current_order_id == expected_order_id)
