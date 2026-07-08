@@ -312,7 +312,11 @@ def main() -> None:
     reports = []
     unit_texts: dict[str, str] = {}
     unit_dir = Path(args.unit_dir)
-    for name in ("lightfee-sidecar.service", "lightfee-live.service"):
+    for name in (
+        "lightfee-sidecar.service",
+        "lightfee-spread-sidecar.service",
+        "lightfee-live.service",
+    ):
         path = unit_dir / name
         if path.exists():
             unit_text = path.read_text()

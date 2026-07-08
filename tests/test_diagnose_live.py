@@ -36,6 +36,14 @@ def test_deploy_status_treats_short_git_head_as_matching_full_deploy_version(mon
     assert status["version_mismatch"] is False
 
 
+def test_diagnose_service_status_includes_spread_sidecar():
+    import scripts.diagnose_live as diagnose_live
+
+    assert "lightfee-live.service" in diagnose_live.SERVICE_NAMES
+    assert "lightfee-sidecar.service" in diagnose_live.SERVICE_NAMES
+    assert "lightfee-spread-sidecar.service" in diagnose_live.SERVICE_NAMES
+
+
 def _write_jsonl(path, records):
     with open(path, "w") as f:
         for r in records:

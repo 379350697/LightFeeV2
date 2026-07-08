@@ -7,10 +7,27 @@ import asyncio
 import logging
 import sys
 
+from lightfee.apps.sidecar import _install_shutdown_handlers
+from lightfee.apps.sidecar import _run as _run_refresh_loop
 from lightfee.config.loader import load_config
 from lightfee.spread.service import SpreadSidecarService
 
 logger = logging.getLogger("lightfee.spread_sidecar")
+
+
+async def _run(
+    service: SpreadSidecarService,
+    *,
+    once: bool,
+    refresh_interval_s: float,
+    install_shutdown_handlers=_install_shutdown_handlers,
+) -> None:
+    await _run_refresh_loop(
+        service,
+        once=once,
+        refresh_interval_s=refresh_interval_s,
+        install_shutdown_handlers=install_shutdown_handlers,
+    )
 
 
 def main() -> None:
@@ -29,18 +46,13 @@ def main() -> None:
     config = load_config(args.config)
     service = SpreadSidecarService(config)
 
-    async def _run() -> None:
-        try:
-            if args.once:
-                await service.refresh_once()
-                return
-            while True:
-                await service.refresh_once()
-                await asyncio.sleep(config.runtime.spread_sidecar_refresh_ms / 1000.0)
-        finally:
-            await service.close()
-
-    asyncio.run(_run())
+    asyncio.run(
+        _run(
+            service,
+            once=bool(args.once),
+            refresh_interval_s=config.runtime.spread_sidecar_refresh_ms / 1000.0,
+        )
+    )
 
 
 if __name__ == "__main__":

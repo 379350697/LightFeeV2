@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 
@@ -53,6 +54,28 @@ class TestMarketDataClientConstruction:
         spec = binance_spec()
         client = MarketDataClient(spec)
         # Should not raise even though _client is None
+        asyncio.run(client.close())
+
+    def test_public_http_client_default_keeps_total_connection_unbounded(self):
+        spec = binance_spec()
+        client = MarketDataClient(spec)
+
+        http = asyncio.run(client._get_client())
+
+        limits = http._transport._pool
+        assert limits._max_connections == sys.maxsize
+        assert limits._max_keepalive_connections == 4
+        asyncio.run(client.close())
+
+    def test_configured_public_http_client_has_total_connection_limit(self):
+        spec = binance_spec()
+        client = MarketDataClient(spec, http_max_connections=32)
+
+        http = asyncio.run(client._get_client())
+
+        limits = http._transport._pool
+        assert limits._max_connections == 32
+        assert limits._max_keepalive_connections == 4
         asyncio.run(client.close())
 
 

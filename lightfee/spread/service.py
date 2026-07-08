@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import replace
 from typing import Optional
@@ -25,6 +26,7 @@ from lightfee.venues.specs import get_spec
 
 _PAPER_LAST_GOOD_QUOTE_SOURCE = "spread_paper_last_good_quote"
 _PAPER_QUOTE_REPAIR_SOURCE = "spread_paper_quote_repair"
+logger = logging.getLogger("lightfee.spread.service")
 
 
 def _paper_quote_key(venue: str, symbol: str) -> str:
@@ -97,6 +99,7 @@ class SpreadSidecarService:
             return
 
         from lightfee.sidecar.sources.exchange import ExchangeSource
+        from lightfee.sidecar.service import SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS
         from lightfee.venues.transport import EndpointRateLimiter
 
         for vc in config.venues:
@@ -111,18 +114,31 @@ class SpreadSidecarService:
             self._exchange_sources[venue_name] = ExchangeSource(
                 spec,
                 rate_limiter=EndpointRateLimiter(1000, 8000, 50),
+                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
 
     async def close(self) -> None:
         if self._paper_journal is not None:
-            self._paper_journal.close()
-            self._paper_journal = None
-        for source in self._exchange_sources.values():
+            try:
+                self._paper_journal.close()
+            except Exception:
+                logger.exception(
+                    "spread sidecar journal close failed; continuing resource cleanup"
+                )
+            finally:
+                self._paper_journal = None
+        for venue_name, source in list(self._exchange_sources.items()):
             close = getattr(source, "close", None)
             if close is not None:
-                result = close()
-                if hasattr(result, "__await__"):
-                    await result
+                try:
+                    result = close()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    logger.exception(
+                        "spread sidecar source close failed; continuing resource cleanup",
+                        extra={"venue": venue_name},
+                    )
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
         observed_ms = int(now_ms if now_ms is not None else time.time() * 1000)

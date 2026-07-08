@@ -49,6 +49,30 @@ def _has_environment_file(unit_text: str) -> bool:
     )
 
 
+def _has_limit_nofile(unit_text: str) -> bool:
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("LimitNOFILE="):
+            continue
+        value = stripped.split("=", 1)[1].strip()
+        try:
+            return int(value) >= 65536
+        except ValueError:
+            return value.lower() in {"infinity", "infinite", "unlimited"}
+    return False
+
+
+def _has_requires_unit(unit_text: str, unit_name: str) -> bool:
+    for line in unit_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Requires="):
+            continue
+        required_units = stripped.split("=", 1)[1].split()
+        if unit_name in required_units:
+            return True
+    return False
+
+
 def analyze_systemd_unit(name: str, text: str) -> HealthReport:
     fingerprints: list[str] = []
     details: dict[str, Any] = {"service": name}
@@ -66,6 +90,10 @@ def analyze_systemd_unit(name: str, text: str) -> HealthReport:
         fingerprints.append("example_config_in_production")
     if is_sidecar and not _has_environment_file(text):
         fingerprints.append("missing_environment_file")
+    if (is_sidecar or is_live) and not _has_limit_nofile(text):
+        fingerprints.append("missing_limit_nofile")
+    if is_live and _has_requires_unit(text, "lightfee-sidecar.service"):
+        fingerprints.append("live_requires_sidecar_service")
     if is_sidecar and "opportunity_input_sidecar" in command and "live.auto.toml" not in command:
         fingerprints.append("rust_sidecar_without_live_auto_config")
 

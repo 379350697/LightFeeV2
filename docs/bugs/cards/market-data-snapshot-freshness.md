@@ -10,6 +10,10 @@ and slow enrichment that must not block publication.
 - `sidecar_snapshot` degraded or stale while `current_state` remains healthy
 - Long sidecar log sequences of per-symbol enrichment calls before snapshot
   publication
+- `OSError: [Errno 24] Too many open files` in sidecar publication or public
+  market-data refresh logs
+- `missing_limit_nofile` or `live_requires_sidecar_service` from production
+  service verification
 
 ## Current Effective Rule
 
@@ -29,6 +33,25 @@ default instead of independently pulling Binance/Aster-compatible quote or OI
 HTTP. If the main snapshot is missing, malformed, or stale, spread-sidecar
 publishes a degraded empty spread snapshot. Direct public fetch is an explicit
 emergency fallback only, and must record `source_mode=direct_market_fallback`.
+
+Sidecar public IO must also be resource-bounded. Sidecar-owned public
+`httpx.AsyncClient` instances need both a keepalive cap and a total connection
+cap, while credentialed `VenueTransport` order/position/account IO must not
+inherit that sidecar FD cap by default. The same cap applies to spread-sidecar
+direct-market fallback and paper quote repair sources, because they use the same
+public exchange source family. Liquidity lifecycle should reuse same-cycle quote
+snapshots when funding/market refresh already succeeded rather than re-entering
+the same public funding path. Sidecar and spread-sidecar app exit paths,
+including `--once` SIGTERM during an in-flight refresh, must close the service,
+and source cleanup must be best-effort across all exchange/liquidity/transfer
+sources. Best-effort cleanup must iterate a source snapshot so one source cannot
+mutate the registry and skip later cleanup. Spread-sidecar paper journal cleanup
+and transfer source per-client cleanup are part of the same best-effort shutdown
+boundary. Production units must set `LimitNOFILE=65536`, and production
+verification plus diagnose service-status evidence must check sidecar,
+spread-sidecar, and live units. Live may want sidecar for startup ordering, but
+must not hard-require sidecar at runtime; a sidecar restart must not cascade
+into a live restart when trading truth is otherwise clean.
 
 Binance/Aster-compatible symbol-level OI is gated before OI HTTP. Full sidecar
 OI enrichment may call `/fapi/v1/openInterest` only when bulk `premiumIndex`
@@ -143,11 +166,15 @@ quote TTL, OI floor, liquidity floor, or post-only execution quality.
 | 2026-06-27 | Public OI pre-HTTP symbol filter and spread snapshot sharing | code fix `d2d89af` deployed/cloud verified | CL-123 filters Binance/Aster-compatible OI symbols before OI HTTP when bulk premiumIndex/bookTicker does not confirm tradeability or candidate mark truth is missing/rejected. Spread-sidecar defaults to consuming the main sidecar snapshot and only direct-fetches public data through an explicit fallback config that marks `source_mode=direct_market_fallback`. |
 | 2026-06-27 | Private truth pre-HTTP symbol filter and spread source-state classification | code fix `a839074` deployed/cloud verified | CL-124 adds shared `venue_symbol_eligibility(...)` for Aster private position/open-order probes, reports `symbol_not_listed_before_private_truth_http` before V3 private HTTP, keeps account-level unfiltered truth untouched, and splits spread stale source evidence into current degraded vs `transient_stale_recovered`. Cloud diagnose passed with flat/no-open-orders, `private_truth_pre_http_filtered_count=0`, and recovered spread stale source not counted as current degraded. No quote/OI threshold, entry sizing, order, close, or recovery behavior is changed. |
 | 2026-07-01 | Deploy readiness bucket for quote/OI candidate noise | `a9269db` deployed/cloud verified | CL-143 adds `market_data_readiness_summary` for quote stale, OI below floor, OI unavailable, structural OI suppression, and prewarm pending samples. The fix explains candidate-readiness volume without lowering OI/quote/liquidity gates and without misclassifying readiness as order-path failure. |
+| 2026-07-08 | Sidecar FD exhaustion and live restart cascade | local green, deploy pending | CL-156 caps sidecar and spread-sidecar direct public HTTP total connections without constraining credentialed `VenueTransport`, reuses same-cycle quote snapshots for liquidity lifecycle, closes sidecar/spread-sidecar services on SIGTERM/every app exit path including in-flight refresh cancellation, makes source close best-effort, requires `LimitNOFILE=65536`, verifies sidecar/spread-sidecar/live units, and removes live's hard `Requires=lightfee-sidecar.service` dependency. This is operational IO lifecycle hardening; it does not change quote TTL, OI/liquidity floors, entry admission, close truth, or owner recovery semantics. |
 
 ## Regression Harness
 
 - `tests/venues/test_market_data_client.py`
+- `tests/sidecar/test_app_shutdown.py`
 - `tests/sidecar/test_sources.py`
+- `tests/spread/test_app_shutdown.py`
 - `tests/spread/test_snapshot_and_service.py`
 - `tests/sidecar/test_v1_parity_lifecycle.py`
 - `tests/ops/test_production_health.py`
+- `tests/test_diagnose_live.py`

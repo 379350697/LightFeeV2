@@ -155,6 +155,7 @@ def test_spread_sidecar_systemd_unit_is_validated_like_sidecar() -> None:
 [Service]
 EnvironmentFile=/etc/lightfee/lightfee.env
 ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-spread-sidecar --config /opt/lightfee-v2/config/live.toml
+LimitNOFILE=65536
 """
 
     report = analyze_systemd_unit("lightfee-spread-sidecar.service", text)

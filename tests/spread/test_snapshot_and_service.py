@@ -72,6 +72,63 @@ def test_spread_snapshot_round_trips_without_funding_candidate_shape(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_spread_sidecar_close_continues_after_cleanup_errors() -> None:
+    closed: list[str] = []
+
+    class FailingJournal:
+        def close(self):
+            closed.append("journal")
+            raise RuntimeError("journal close failed")
+
+    class FakeSource:
+        def __init__(self, name: str, *, fail: bool = False) -> None:
+            self.name = name
+            self.fail = fail
+
+        async def close(self):
+            closed.append(self.name)
+            if self.fail:
+                raise RuntimeError(f"{self.name} close failed")
+
+    service = object.__new__(SpreadSidecarService)
+    service._paper_journal = FailingJournal()
+    service._exchange_sources = {
+        "bad": FakeSource("bad", fail=True),
+        "good": FakeSource("good"),
+    }
+
+    await service.close()
+
+    assert closed == ["journal", "bad", "good"]
+    assert service._paper_journal is None
+
+
+@pytest.mark.asyncio
+async def test_spread_sidecar_close_uses_source_snapshot_when_close_mutates_registry() -> None:
+    closed: list[str] = []
+    service = object.__new__(SpreadSidecarService)
+    service._paper_journal = None
+
+    class MutatingSource:
+        async def close(self):
+            closed.append("mutating")
+            service._exchange_sources.clear()
+
+    class Source:
+        async def close(self):
+            closed.append("good")
+
+    service._exchange_sources = {
+        "mutating": MutatingSource(),
+        "good": Source(),
+    }
+
+    await service.close()
+
+    assert closed == ["mutating", "good"]
+
+
+@pytest.mark.asyncio
 async def test_spread_sidecar_service_uses_main_sidecar_snapshot_by_default(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar-current.json"
     config = AppConfig(
@@ -871,3 +928,39 @@ async def test_spread_sidecar_direct_market_fallback_requires_explicit_config(
 
     assert snapshot.candidates
     assert snapshot.source_mode == "direct_market_fallback"
+
+
+def test_spread_sidecar_direct_exchange_sources_are_http_bounded(monkeypatch, tmp_path) -> None:
+    from lightfee.sidecar import service as sidecar_service
+    from lightfee.sidecar.sources import exchange as exchange_module
+
+    seen_limits: list[int | None] = []
+
+    class FakeExchangeSource:
+        def __init__(self, spec, rate_limiter=None, http_max_connections=None):
+            seen_limits.append(http_max_connections)
+            self.venue = spec.venue_id.value
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(exchange_module, "ExchangeSource", FakeExchangeSource)
+
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            spread_sidecar_source_mode="direct_market",
+            spread_sidecar_direct_fetch_enabled=True,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+    )
+
+    SpreadSidecarService(config)
+
+    assert seen_limits == [
+        sidecar_service.SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+        sidecar_service.SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+    ]

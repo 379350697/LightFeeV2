@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -128,6 +129,91 @@ class TestLastGoodFallback:
         assert "okx:BTCUSDT" not in result
 
 
+class TestSidecarResourceLifecycle:
+    """Sidecar runtime must release public HTTP clients on every exit path."""
+
+    def test_app_once_closes_service(self, monkeypatch):
+        from lightfee.apps import sidecar as sidecar_app
+
+        calls: list[str] = []
+        config = type("Config", (), {
+            "runtime": type("Runtime", (), {"sidecar_refresh_ms": 1})(),
+        })()
+
+        class FakeService:
+            def __init__(self, config):
+                calls.append("init")
+
+            async def refresh_once(self):
+                calls.append("refresh")
+
+            async def close(self):
+                calls.append("close")
+
+        monkeypatch.setattr(sidecar_app, "load_config", lambda path: config)
+        monkeypatch.setattr(sidecar_app, "SidecarService", FakeService)
+        monkeypatch.setattr(sys, "argv", ["lightfee-sidecar", "--once"])
+
+        sidecar_app.main()
+
+        assert calls == ["init", "refresh", "close"]
+
+    @pytest.mark.asyncio
+    async def test_service_close_continues_after_source_close_error(self):
+        from lightfee.sidecar.service import SidecarService
+
+        closed: list[str] = []
+
+        class Source:
+            def __init__(self, name: str, *, fail: bool = False) -> None:
+                self.name = name
+                self.fail = fail
+
+            async def close(self) -> None:
+                closed.append(self.name)
+                if self.fail:
+                    raise RuntimeError(f"{self.name} close failed")
+
+        svc = object.__new__(SidecarService)
+        svc._exchange_sources = {
+            "bad": Source("exchange_bad", fail=True),
+            "good": Source("exchange_good"),
+        }
+        svc._liquidity_sources = {"liq": Source("liquidity")}
+        svc._transfer_sources = [Source("transfer")]
+
+        await svc.close()
+
+        assert closed == ["exchange_bad", "exchange_good", "liquidity", "transfer"]
+
+    @pytest.mark.asyncio
+    async def test_service_close_uses_source_snapshot_when_close_mutates_registry(self):
+        from lightfee.sidecar.service import SidecarService
+
+        closed: list[str] = []
+        svc = object.__new__(SidecarService)
+
+        class MutatingSource:
+            async def close(self) -> None:
+                closed.append("mutating")
+                svc._exchange_sources.clear()
+
+        class Source:
+            async def close(self) -> None:
+                closed.append("good")
+
+        svc._exchange_sources = {
+            "mutating": MutatingSource(),
+            "good": Source(),
+        }
+        svc._liquidity_sources = {}
+        svc._transfer_sources = []
+
+        await svc.close()
+
+        assert closed == ["mutating", "good"]
+
+
 class TestSnapshotRoundTripWithAllV1Fields:
     """Full snapshot round-trip preserves all V1 parity lifecycle fields."""
 
@@ -219,6 +305,55 @@ class TestLiquiditySourceWiredIntoRefresh:
         from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
         assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
 
+    @pytest.mark.asyncio
+    async def test_refresh_reuses_quote_snapshots_for_liquidity_without_second_public_fetch(self, tmp_path):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        class FakeExchangeSource:
+            async def fetch_all(self, symbols):
+                return {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=123,
+                    )
+                }
+
+            async def close(self):
+                return None
+
+        class DuplicateLiquidityFetch:
+            async def fetch_perp_liquidity(self, symbols):
+                raise AssertionError(
+                    "quote-derived liquidity lifecycle must not duplicate public IO"
+                )
+
+            async def close(self):
+                return None
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(sidecar_snapshot_path=str(tmp_path / "sidecar.json")),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"] = FakeExchangeSource()
+        service._liquidity_sources["binance"] = DuplicateLiquidityFetch()
+        service._transfer_sources = []
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        assert snapshot.degraded_venues == []
+        assert len(snapshot.liquidity_lifecycle) == 1
+        assert snapshot.liquidity_lifecycle[0].coverage_usable == 1
+        assert snapshot.liquidity_lifecycle[0].symbol_count == 1
+
 
 class TestRefreshPublicationSemantics:
     """Refresh metadata must distinguish market observation from publish time."""
@@ -248,7 +383,7 @@ class TestRefreshPublicationSemantics:
                 set(),
             )]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
+        async def fake_fetch_liquidity_all_venues(symbols, timeout_s, quote_liquidity_by_venue=None):
             return [("binance", {"binance:BTCUSDT": object()}, None, set())]
 
         svc._fetch_all_venues = fake_fetch_all_venues
@@ -294,10 +429,10 @@ class TestRefreshPublicationSemantics:
                 set(),
             )]
 
-        async def failed_liquidity(symbols, timeout_s):
+        async def failed_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
             return [("binance", None, TimeoutError("liquidity timeout 10.0s"), set())]
 
-        async def successful_liquidity(symbols, timeout_s):
+        async def successful_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
             return [("binance", {"binance:BTCUSDT": object()}, None, set())]
 
         svc._fetch_all_venues = fake_fetch_all_venues
@@ -351,7 +486,7 @@ class TestRefreshPublicationSemantics:
                 )}, None, set()),
             ]
 
-        async def mixed_liquidity(symbols, timeout_s):
+        async def mixed_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
             return [
                 ("okx", {"okx:BTCUSDT": object()}, None, set()),
                 ("bybit", None, TimeoutError("liquidity timeout 10.0s"), set()),
@@ -422,7 +557,7 @@ class TestRefreshPublicationSemantics:
                 )}, None, set()),
             ]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
+        async def fake_fetch_liquidity_all_venues(symbols, timeout_s, quote_liquidity_by_venue=None):
             return []
 
         svc._fetch_all_venues = fake_fetch_all_venues

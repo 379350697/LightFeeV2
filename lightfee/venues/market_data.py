@@ -176,10 +176,14 @@ class MarketDataClient:
         spec: VenueSpec,
         exchange_http_timeout_ms: int = 10000,
         rate_limiter: Optional[object] = None,
+        http_max_connections: int | None = None,
+        http_max_keepalive_connections: int = 4,
     ) -> None:
         self._spec = spec
         self._exchange_http_timeout_ms = exchange_http_timeout_ms
         self._rate_limiter = rate_limiter
+        self._http_max_connections = http_max_connections
+        self._http_max_keepalive_connections = http_max_keepalive_connections
         self._client: Optional[httpx.AsyncClient] = None
         # V1 parity: per-symbol funding rate cache (OKX, etc.)
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
@@ -213,9 +217,14 @@ class MarketDataClient:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             timeout_s = self._exchange_http_timeout_ms / 1000.0
+            limit_kwargs = {
+                "max_keepalive_connections": self._http_max_keepalive_connections,
+            }
+            if self._http_max_connections is not None:
+                limit_kwargs["max_connections"] = self._http_max_connections
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout_s),
-                limits=httpx.Limits(max_keepalive_connections=4),
+                limits=httpx.Limits(**limit_kwargs),
             )
         return self._client
 

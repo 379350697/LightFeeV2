@@ -10,6 +10,7 @@ WorkingDirectory=/opt/lightfee-v2
 EnvironmentFile=/etc/lightfee/lightfee.env
 Environment=LIGHTFEE_PRODUCTION_GUARD=1
 ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml
+LimitNOFILE=65536
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM

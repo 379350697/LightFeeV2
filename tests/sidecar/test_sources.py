@@ -104,6 +104,28 @@ class TestTransferSource:
             await src.close()
         asyncio.run(_run())
 
+    @pytest.mark.asyncio
+    async def test_close_continues_after_first_client_close_error(self):
+        closed: list[str] = []
+
+        class FakeClient:
+            def __init__(self, name: str, *, fail: bool = False) -> None:
+                self.name = name
+                self.fail = fail
+
+            async def close(self):
+                closed.append(self.name)
+                if self.fail:
+                    raise RuntimeError(f"{self.name} close failed")
+
+        src = object.__new__(TransferSource)
+        src._from_client = FakeClient("from", fail=True)
+        src._to_client = FakeClient("to")
+
+        await src.close()
+
+        assert closed == ["from", "to"]
+
 
 class TestSidecarServiceRateLimitWiring:
     def test_service_shares_public_rate_limiter_per_venue(self):

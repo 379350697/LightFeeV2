@@ -12,13 +12,31 @@ from lightfee.venues.specs import VenueSpec, get_spec
 class LiquiditySource:
     """Fetches perp liquidity and execution depth snapshots from public endpoints."""
 
-    def __init__(self, spec: VenueSpec, rate_limiter: Optional[object] = None) -> None:
-        self._client = MarketDataClient(spec, rate_limiter=rate_limiter)
+    def __init__(
+        self,
+        spec: VenueSpec,
+        rate_limiter: Optional[object] = None,
+        http_max_connections: int | None = None,
+    ) -> None:
+        self._client = MarketDataClient(
+            spec,
+            rate_limiter=rate_limiter,
+            http_max_connections=http_max_connections,
+        )
         self.venue = spec.venue_id.value
 
     @classmethod
-    def for_venue(cls, venue: Venue, rate_limiter: Optional[object] = None) -> LiquiditySource:
-        return cls(get_spec(venue), rate_limiter=rate_limiter)
+    def for_venue(
+        cls,
+        venue: Venue,
+        rate_limiter: Optional[object] = None,
+        http_max_connections: int | None = None,
+    ) -> LiquiditySource:
+        return cls(
+            get_spec(venue),
+            rate_limiter=rate_limiter,
+            http_max_connections=http_max_connections,
+        )
 
     async def close(self) -> None:
         await self._client.close()

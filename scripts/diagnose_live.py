@@ -89,7 +89,11 @@ FALLBACK_STATE_FILE = "state-current.json"
 DEFAULT_DEPLOY_FILE = ".deploy_version"
 DEFAULT_UNIT_DIR = "/etc/systemd/system"
 DEFAULT_MAX_EVENTS = 50_000
-SERVICE_NAMES = ["lightfee-live.service", "lightfee-sidecar.service"]
+SERVICE_NAMES = [
+    "lightfee-live.service",
+    "lightfee-sidecar.service",
+    "lightfee-spread-sidecar.service",
+]
 DEFAULT_EXCHANGE_TRUTH_VENUES = [
     "binance",
     "bybit",
