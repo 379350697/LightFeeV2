@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    EntryLeverageEvidence,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -373,7 +374,7 @@ class AsterAdapter(VenueAdapter):
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
+    ) -> EntryLeverageEvidence | None:
         if self._private is not None:
             return await self._private.ensure_entry_leverage(
                 symbol,

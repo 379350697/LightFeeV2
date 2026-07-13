@@ -465,7 +465,9 @@ class TestEntryExecutionIdempotency:
             second_funding_timestamp_ms=second_funding_ms,
             first_funding_leg="long",
             funding_edge_bps_entry=7.45,
-            total_funding_edge_bps_entry=7.45,
+            # A positive incremental carry is required before a staggered
+            # lifecycle can retain the second settlement.
+            total_funding_edge_bps_entry=9.45,
             expected_edge_bps_entry=6.9,
         )
         maker_fill = OrderFill(
@@ -496,7 +498,7 @@ class TestEntryExecutionIdempotency:
         assert pos.second_funding_timestamp_ms == second_funding_ms
         assert pos.second_stage_enabled_at_entry is True
         assert pos.funding_edge_bps_entry == pytest.approx(7.45)
-        assert pos.total_funding_edge_bps_entry == pytest.approx(7.45)
+        assert pos.total_funding_edge_bps_entry == pytest.approx(9.45)
         assert pos.expected_edge_bps_entry == pytest.approx(6.9)
         assert standard_close_reason(
             pos,

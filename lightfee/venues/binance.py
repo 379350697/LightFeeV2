@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    EntryLeverageEvidence,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -90,8 +91,8 @@ class BinanceAdapter(VenueAdapter):
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
-        await self._transport.ensure_entry_leverage(
+    ) -> EntryLeverageEvidence | None:
+        return await self._transport.ensure_entry_leverage(
             symbol,
             leverage,
             notional_quote=notional_quote,

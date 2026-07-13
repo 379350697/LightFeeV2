@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from lightfee.config.schema import RuntimeConfig, StrategyConfig
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -180,11 +181,11 @@ class TestSidecarResourceLifecycle:
             "good": Source("exchange_good"),
         }
         svc._liquidity_sources = {"liq": Source("liquidity")}
-        svc._transfer_sources = [Source("transfer")]
-
         await svc.close()
 
-        assert closed == ["exchange_bad", "exchange_good", "liquidity", "transfer"]
+        # Inventory evidence belongs to the live admission path, so lifecycle
+        # cleanup has no synthetic pairwise clients to close.
+        assert closed == ["exchange_bad", "exchange_good", "liquidity"]
 
     @pytest.mark.asyncio
     async def test_service_close_uses_source_snapshot_when_close_mutates_registry(self):
@@ -207,7 +208,6 @@ class TestSidecarResourceLifecycle:
             "good": Source(),
         }
         svc._liquidity_sources = {}
-        svc._transfer_sources = []
 
         await svc.close()
 
@@ -291,14 +291,12 @@ class TestLiquiditySourceWiredIntoRefresh:
     def test_liquidity_timeout_s_read_from_runtime(self):
         from lightfee.sidecar.service import SidecarService, DEFAULT_LIQUIDITY_TIMEOUT_S
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": type("r", (), {"sidecar_snapshot_path": "/tmp"})(), "venues": [], "symbols": []})()
+        svc.config = type("c", (), {"runtime": RuntimeConfig(sidecar_snapshot_path="/tmp"), "strategy": StrategyConfig(), "venues": [], "symbols": []})()
         svc._liquidity_sources = {}
         svc._exchange_sources = {}
-        svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._funding_timeout_s = 10
         svc._liquidity_timeout_s = 7.0
-        svc._transfer_timeout_s = 5
         assert svc._liquidity_timeout_s == 7.0
 
     def test_liquidity_timeout_default(self):
@@ -342,7 +340,6 @@ class TestLiquiditySourceWiredIntoRefresh:
         service = SidecarService(config)
         service._exchange_sources["binance"] = FakeExchangeSource()
         service._liquidity_sources["binance"] = DuplicateLiquidityFetch()
-        service._transfer_sources = []
 
         try:
             snapshot = await service.refresh_once()
@@ -363,11 +360,10 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
-        svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
         svc._last_liquidity_publish_at_ms = 1000
@@ -409,11 +405,10 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
-        svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
         svc._last_liquidity_publish_at_ms = 1000
@@ -461,11 +456,10 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
-        svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
         svc._last_liquidity_publish_at_ms = 1000
@@ -525,6 +519,9 @@ class TestRefreshPublicationSemantics:
             ranking_edge_bps=10.0,
             entry_notional_quote=50.0,
             sizing_liquidity_source="sidecar_perp_liquidity",
+            forecast_shadow_age_ms=7 * 24 * 60 * 60 * 1000,
+            forecast_sample_count=42,
+            forecast_ready=True,
         )
         snapshot = SidecarSnapshot(candidates=[candidate])
 
@@ -534,17 +531,19 @@ class TestRefreshPublicationSemantics:
 
         assert loaded is not None
         assert loaded.candidates[0].sizing_liquidity_source == "sidecar_perp_liquidity"
+        assert loaded.candidates[0].forecast_shadow_age_ms == 7 * 24 * 60 * 60 * 1000
+        assert loaded.candidates[0].forecast_sample_count == 42
+        assert loaded.candidates[0].forecast_ready is True
 
     @pytest.mark.asyncio
     async def test_first_partial_degradation_without_cache_is_degraded_sidecar(self, tmp_path):
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
+        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
-        svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
 

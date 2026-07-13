@@ -55,12 +55,12 @@ def test_entry_plan_reuses_order_request_contract_without_submitting() -> None:
     assert plan.strategy_bucket == "spread_reversion"
     assert plan.long_request.venue == Venue.BINANCE
     assert plan.long_request.side == Side.BUY
-    assert plan.long_request.quantity == pytest.approx(0.2)
+    assert plan.long_request.quantity == pytest.approx(20.0 / 101.0)
     assert plan.long_request.price_hint == pytest.approx(100.0)
     assert plan.long_request.reduce_only is False
     assert plan.short_request.venue == Venue.OKX
     assert plan.short_request.side == Side.SELL
-    assert plan.short_request.quantity == pytest.approx(20.0 / 101.0)
+    assert plan.short_request.quantity == pytest.approx(plan.long_request.quantity)
     assert plan.short_request.price_hint == pytest.approx(101.0)
     assert plan.short_request.reduce_only is False
     assert plan.long_request.client_order_id.startswith("lf-spread-entry-long-")
@@ -78,6 +78,7 @@ def test_exit_plan_uses_reduce_only_reverse_legs() -> None:
         entry_z_score=2.2,
         entry_notional_quote=20.0,
         opened_at_ms=1_000,
+        base_quantity=20.0 / 101.0,
     )
 
     plan = planner.build_exit_plan(
@@ -96,6 +97,8 @@ def test_exit_plan_uses_reduce_only_reverse_legs() -> None:
     assert plan.short_request.side == Side.BUY
     assert plan.short_request.reduce_only is True
     assert plan.short_request.price_hint == pytest.approx(100.8)
+    assert plan.long_request.quantity == pytest.approx(20.0 / 101.0)
+    assert plan.short_request.quantity == pytest.approx(plan.long_request.quantity)
     assert plan.reason == "spread_converged"
 
 
@@ -120,6 +123,38 @@ def test_execution_plan_blocks_stale_or_insufficient_quote_capacity() -> None:
             now_ms=10_100,
         )
 
+
+def test_exit_plan_fails_closed_without_actual_matched_base_quantity() -> None:
+    planner = SpreadExecutionPlanner(signal_ttl_ms=1_000)
+    intent = SpreadOrderIntent(
+        candidate_id="spread:BTCUSDT:cheap->rich",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_notional_quote=20.0,
+        reason="spread_entry_allowed",
+    )
+    position = SpreadPosition(
+        position_id="missing-qty",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_spread_bps=10.0,
+        entry_z_score=2.0,
+        entry_notional_quote=20.0,
+        opened_at_ms=1_000,
+    )
+    with pytest.raises(SpreadExecutionPlanError, match="spread_base_quantity_missing"):
+        planner.build_exit_plan(
+            position,
+            quotes={
+                "binance:BTCUSDT": _quote("binance", bid=100.0, ask=100.1, observed_at_ms=2_000),
+                "okx:BTCUSDT": _quote("okx", bid=100.2, ask=100.3, observed_at_ms=2_000),
+            },
+            now_ms=2_000,
+            reason="spread_converged",
+        )
+
     with pytest.raises(SpreadExecutionPlanError, match="spread_quote_capacity_below_notional"):
         planner.build_entry_plan(
             intent,
@@ -134,4 +169,106 @@ def test_execution_plan_blocks_stale_or_insufficient_quote_capacity() -> None:
                 "okx:BTCUSDT": _quote("okx", bid=101.0, ask=101.1, observed_at_ms=11_000),
             },
             now_ms=11_000,
+        )
+
+
+def test_exit_plan_requires_visible_opposite_side_capacity_and_finite_prices() -> None:
+    planner = SpreadExecutionPlanner(signal_ttl_ms=1_000)
+    position = SpreadPosition(
+        position_id="pos-exit-capacity",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_spread_bps=10.0,
+        entry_z_score=2.0,
+        entry_notional_quote=20.0,
+        opened_at_ms=1_000,
+        base_quantity=0.2,
+    )
+    with pytest.raises(SpreadExecutionPlanError, match="spread_quote_capacity_below_notional"):
+        planner.build_exit_plan(
+            position,
+            quotes={
+                "binance:BTCUSDT": _quote(
+                    "binance", bid=100.0, ask=100.1, bid_size=0.1, observed_at_ms=2_000
+                ),
+                "okx:BTCUSDT": _quote(
+                    "okx", bid=100.2, ask=100.3, ask_size=0.1, observed_at_ms=2_000
+                ),
+            },
+            now_ms=2_000,
+            reason="spread_converged",
+        )
+
+    intent = SpreadOrderIntent(
+        candidate_id="spread:BTCUSDT:cheap->rich",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_notional_quote=20.0,
+        reason="spread_entry_allowed",
+    )
+    with pytest.raises(SpreadExecutionPlanError, match="spread_quote_price_invalid"):
+        planner.build_entry_plan(
+            intent,
+            quotes={
+                "binance:BTCUSDT": _quote(
+                    "binance", bid=99.9, ask=float("nan"), observed_at_ms=2_000
+                ),
+                "okx:BTCUSDT": _quote(
+                    "okx", bid=101.0, ask=101.1, observed_at_ms=2_000
+                ),
+            },
+            now_ms=2_000,
+        )
+
+
+def test_execution_plan_rejects_crossed_quotes_before_creating_order_intents() -> None:
+    planner = SpreadExecutionPlanner(signal_ttl_ms=1_000)
+    intent = SpreadOrderIntent(
+        candidate_id="spread:BTCUSDT:cheap->rich",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_notional_quote=20.0,
+        reason="spread_entry_allowed",
+    )
+    with pytest.raises(SpreadExecutionPlanError, match="spread_quote_price_invalid"):
+        planner.build_entry_plan(
+            intent,
+            quotes={
+                "binance:BTCUSDT": _quote(
+                    "binance", bid=100.1, ask=100.0, observed_at_ms=2_000
+                ),
+                "okx:BTCUSDT": _quote(
+                    "okx", bid=101.0, ask=101.1, observed_at_ms=2_000
+                ),
+            },
+            now_ms=2_000,
+        )
+
+    position = SpreadPosition(
+        position_id="pos-crossed-exit",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        entry_spread_bps=10.0,
+        entry_z_score=2.0,
+        entry_notional_quote=20.0,
+        opened_at_ms=1_000,
+        base_quantity=0.2,
+    )
+    with pytest.raises(SpreadExecutionPlanError, match="spread_quote_price_invalid"):
+        planner.build_exit_plan(
+            position,
+            quotes={
+                "binance:BTCUSDT": _quote(
+                    "binance", bid=100.0, ask=100.1, observed_at_ms=2_000
+                ),
+                "okx:BTCUSDT": _quote(
+                    "okx", bid=100.4, ask=100.3, observed_at_ms=2_000
+                ),
+            },
+            now_ms=2_000,
+            reason="spread_converged",
         )

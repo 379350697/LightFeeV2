@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Optional
 
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 
 
 class SnapshotFreshness(Enum):
@@ -87,8 +87,35 @@ class QuoteSnapshot:
     source: str = "sidecar_quote"
     bid_size: float = 0.0
     ask_size: float = 0.0
+    # Optional executable L2 ladders.  They are complete books in price-time
+    # priority (bids descending, asks ascending) and quantities are canonical
+    # base units.  An absent ladder deliberately means BBO-only, rather than
+    # an inferred depth profile.  Keeping this optional preserves schema-v1/
+    # v2/v3 reads and lets the spread paper engine use VWAP only when evidence
+    # has actually been supplied by its market-data boundary.
+    bid_depth: tuple[tuple[float, float], ...] = ()
+    ask_depth: tuple[tuple[float, float], ...] = ()
     funding_rate_bps: float = 0.0
     funding_timestamp_ms: int = 0
+    funding_interval_ms: int = 0
+    predicted_funding_rate_bps: Optional[float] = None
+    funding_forecast_source: str = "quoted_rate"
+    # Count of settled forecast-vs-realised observations held by the source.
+    # A prediction is never high-confidence until this clears the configured
+    # calibration threshold.
+    funding_forecast_sample_count: int = 0
+    funding_forecast_uncertainty_bps: float = 0.0
+    # First observed forecast in the current persisted calibration epoch.
+    # Enhanced live mode uses this to enforce the required shadow duration,
+    # not merely a burst of quickly accumulated samples.
+    funding_forecast_started_at_ms: int = 0
+    # The calibrator validates that the older and newer halves of the observed
+    # error distribution agree before enhanced-live may use a forecast.
+    funding_forecast_distribution_stable: bool = False
+    funding_forecast_stability_reason: str = "not_calibrated"
+    funding_forecast_median_drift_bps: float = 0.0
+    funding_forecast_p90_drift_bps: float = 0.0
+    settled_funding_rate_bps: Optional[float] = None
     mark_price: float = 0.0
     index_price: float = 0.0
     volume_24h_quote: float = 0.0
@@ -103,6 +130,19 @@ class QuoteSnapshot:
     oi_deferred_count: int = 0
     oi_timeout_count: int = 0
     oi_refresh_elapsed_ms: int = 0
+    # Contract normalisation evidence used by spread/reversion admission.
+    underlying: str = ""
+    quote_currency: str = ""
+    contract_type: str = "linear"
+    contract_multiplier: float = 1.0
+    mark_index_source: str = ""
+    price_precision: int = 0
+    quantity_precision: int = 0
+    venue_status: str = "active"
+    # `False` is intentionally fail-closed for spread paper: public BBO alone
+    # cannot prove that two venue contracts represent the same economic unit.
+    # Funding discovery does not consume this field.
+    contract_normalization_complete: bool = False
 
 
 @dataclass
@@ -118,10 +158,33 @@ class CandidateInput:
     worst_case_edge_bps: float
     ranking_edge_bps: float
     total_funding_edge_bps: float = 0.0
+    # A staggered trade is admitted on what can be earned at the first actual
+    # settlement, never on carry that requires holding an extra interval.
+    # These V1-compatible fields make that lifecycle explicit while preserving
+    # the legacy `funding_edge_bps` (which is the first-stage edge).
+    first_stage_funding_edge_bps: float = 0.0
+    first_stage_expected_edge_bps: float = 0.0
+    first_stage_worst_case_edge_bps: float = 0.0
+    second_stage_incremental_funding_edge_bps: float = 0.0
+    second_stage_worst_case_funding_edge_bps: float = 0.0
+    stagger_gap_ms: int = 0
     transfer_bias_bps: float = 0.0
     entry_cross_bps: float = 0.0
     fee_bps: float = 0.0
     entry_slippage_bps: float = 0.0
+    # Per-leg heuristic estimates are evidence for the V1 passive-maker
+    # selection.  The aggregate fields above and below remain the actual
+    # economics inputs; these four fields make that selection auditable.
+    long_entry_slippage_bps: float = 0.0
+    short_entry_slippage_bps: float = 0.0
+    long_exit_slippage_bps: float = 0.0
+    short_exit_slippage_bps: float = 0.0
+    # The final IOC fallback must charge four taker legs, even when the
+    # shortlist assumed V1 passive execution.  These are immutable fee inputs
+    # rather than a second edge formula.
+    long_taker_fee_bps: float = 0.0
+    short_taker_fee_bps: float = 0.0
+    taker_fee_evidence_complete: bool = False
     opportunity_type: str = "aligned"
     blocked: bool = False
     blocked_reasons: list[str] = field(default_factory=list)
@@ -162,6 +225,43 @@ class CandidateInput:
     # Optional execution dependency marker. Empty means sizing/execution uses quote
     # and local-L2 gates rather than coarse sidecar perp liquidity.
     sizing_liquidity_source: str = ""
+    # Shared economics schema: the legacy flat fields above remain dual-written
+    # while these fields make every cost and haircut attributable.
+    gross_signal_edge_bps: float = 0.0
+    expected_exit_cross_bps: float = 0.0
+    entry_fee_bps: float = 0.0
+    exit_fee_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
+    adverse_selection_bps: float = 0.0
+    capital_buffer_bps: float = 0.0
+    execution_buffer_bps: float = 0.0
+    venue_risk_haircut_bps: float = 0.0
+    transfer_or_inventory_bias_bps: float = 0.0
+    expected_net_edge_bps: float = 0.0
+    economics_observed_at_ms: int = 0
+    # A hand-built or older-schema candidate must never inherit permission to
+    # trade merely because the field was omitted.  Publishers explicitly set
+    # this to true only after all v3 economics inputs were constructed.
+    economics_complete: bool = False
+    # Parser-boundary diagnostic for a V3 record that claimed completeness but
+    # omitted/contradicted a required economics or sizing assertion.  It is
+    # intentionally descriptive only: recovery and close workflows must never
+    # reinterpret it as a reason to mutate an existing live position.
+    economics_incomplete_reason: str = ""
+    calculation_version: str = "v1_exact"
+    model_epoch: str = "v1_exact"
+    forecast_long_rate_bps: float = 0.0
+    forecast_short_rate_bps: float = 0.0
+    forecast_worst_funding_edge_bps: float = 0.0
+    forecast_confidence: float = 0.0
+    forecast_sample_count: int = 0
+    forecast_shadow_age_ms: int = 0
+    forecast_ready: bool = False
+    forecast_distribution_stable: bool = False
+    forecast_stability_reason: str = "not_calibrated"
+    forecast_median_drift_bps: float = 0.0
+    forecast_p90_drift_bps: float = 0.0
+    forecast_source: str = "quoted_rate"
 
 
 @dataclass

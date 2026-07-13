@@ -12,6 +12,60 @@ from lightfee.core.domain import OrderFill, PassiveOrderState, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
+@dataclass(frozen=True)
+class FundingSettlementRecord:
+    """An allocated exchange-statement funding settlement.
+
+    ``captured_funding_quote`` remains the V1 lifecycle estimate used to decide
+    when a position may close.  This record is deliberately separate: only an
+    exchange statement that is allocated to this internal position can make
+    realised funding official.
+    """
+
+    leg: str
+    venue: str
+    settlement_timestamp_ms: int
+    amount_quote: float
+    observed_at_ms: int
+    source: str
+    statement_reference: str = ""
+
+    def __post_init__(self) -> None:
+        if self.leg not in {"long", "short"}:
+            raise ValueError("funding settlement leg must be long or short")
+        if not self.venue:
+            raise ValueError("funding settlement venue is required")
+        if self.settlement_timestamp_ms <= 0 or self.observed_at_ms <= 0:
+            raise ValueError("funding settlement timestamps must be positive")
+        if not math.isfinite(self.amount_quote):
+            raise ValueError("funding settlement amount must be finite")
+        if not self.source:
+            raise ValueError("funding settlement source is required")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "leg": self.leg,
+            "venue": self.venue,
+            "settlement_timestamp_ms": self.settlement_timestamp_ms,
+            "amount_quote": self.amount_quote,
+            "observed_at_ms": self.observed_at_ms,
+            "source": self.source,
+            "statement_reference": self.statement_reference,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "FundingSettlementRecord":
+        return cls(
+            leg=str(data.get("leg", "")),
+            venue=str(data.get("venue", "")),
+            settlement_timestamp_ms=int(data.get("settlement_timestamp_ms", 0) or 0),
+            amount_quote=float(data.get("amount_quote", 0.0) or 0.0),
+            observed_at_ms=int(data.get("observed_at_ms", 0) or 0),
+            source=str(data.get("source", "")),
+            statement_reference=str(data.get("statement_reference", "") or ""),
+        )
+
+
 @dataclass
 class OpenPosition:
     position_id: str
@@ -44,11 +98,22 @@ class OpenPosition:
     # --- Funding accrual (Rust V1 captured_funding_quote, funding_captured) ---
     captured_funding_quote: float = 0.0
     funding_captured: bool = False
+    # --- Actual funding attribution (separate from V1 lifecycle estimate) ---
+    calculation_version: str = "v1_exact"
+    model_epoch: str = "v1_exact"
+    # The source-market timestamp for the entry economics must survive until
+    # terminal attribution; it is not interchangeable with execution time.
+    economics_observed_at_ms: int = 0
+    funding_settlement_records: list[FundingSettlementRecord] = field(default_factory=list)
+    settled_funding_quote: float = 0.0
+    funding_settlement_evidence_status: str = "missing"
+    funding_forecast_error_quote: float | None = None
     # --- Edge breakdowns (V1 funding_edge_bps_entry, total_funding_edge_bps_entry, expected_edge_bps_entry) ---
     funding_edge_bps_entry: float = 0.0
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
     worst_case_edge_bps_entry: float = 0.0
+    expected_shortfall_bps_entry: float = 0.0
     entry_cross_bps_entry: float = 0.0
     fee_bps_entry: float = 0.0
     entry_slippage_bps_entry: float = 0.0
@@ -418,6 +483,7 @@ class PendingEntry:
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
     worst_case_edge_bps_entry: float = 0.0
+    expected_shortfall_bps_entry: float = 0.0
     entry_maker_leg: str = ""
     exit_maker_leg: str = ""
     entry_cross_bps_entry: float = 0.0
@@ -1010,6 +1076,7 @@ class RecoveryWorkSnapshot:
 
 
 MAX_PENDING_CLOSE_RECONCILIATIONS = 256
+MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS = 256
 
 
 def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
@@ -1060,6 +1127,43 @@ def _invalid_pending_close_reconciliation(raw: Any, reason: str) -> dict[str, An
     }
 
 
+def normalize_pending_funding_settlement_reconciliations(raw: Any) -> list[dict[str, Any]]:
+    """Normalize accounting-only post-close funding evidence tasks.
+
+    These tasks never represent exchange exposure and therefore must remain
+    separate from V1 pending-close truth reconciliation.  A malformed task is
+    retained visibly for diagnosis rather than being coerced into a funding
+    zero or a trading gate.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict):
+        items = [raw] if any(
+            key in raw for key in ("position_id", "required_settlements", "kind")
+        ) else list(raw.values())
+    else:
+        return [{
+            "invalid_pending_funding_settlement_reconciliation": True,
+            "reason": "invalid_container",
+            "raw_type": type(raw).__name__,
+            "raw_repr": repr(raw)[:240],
+        }]
+    normalized: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+        else:
+            normalized.append({
+                "invalid_pending_funding_settlement_reconciliation": True,
+                "reason": "invalid_item",
+                "raw_type": type(item).__name__,
+                "raw_repr": repr(item)[:240],
+            })
+    return normalized
+
+
 @dataclass
 class EngineState:
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
@@ -1099,6 +1203,10 @@ class EngineState:
     entry_liquidity_qualification_records: list = field(default_factory=list)
     # --- Pending close reconciliations (V1 pending_close_reconciliations) ---
     pending_close_reconciliations: list[dict[str, Any]] = field(default_factory=list)
+    # --- Accounting-only private funding statement evidence after a close ---
+    pending_funding_settlement_reconciliations: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     # --- Local-L2 state for persistence/recovery (V1 parity) ---
     retained_local_l2_books: list[dict] = field(default_factory=list)
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
@@ -1115,6 +1223,45 @@ class EngineState:
         self.pending_close_reconciliations = normalize_pending_close_reconciliations(raw)[
             -MAX_PENDING_CLOSE_RECONCILIATIONS:
         ]
+
+    def set_pending_funding_settlement_reconciliations(self, raw: Any) -> None:
+        self.pending_funding_settlement_reconciliations = (
+            normalize_pending_funding_settlement_reconciliations(raw)[
+                -MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS:
+            ]
+        )
+
+    def enqueue_pending_funding_settlement_reconciliation(self, item: dict[str, Any]) -> None:
+        """Upsert an accounting task without merging it into exposure truth."""
+        self.set_pending_funding_settlement_reconciliations(
+            self.pending_funding_settlement_reconciliations
+        )
+        key = (
+            str(item.get("position_id") or ""),
+            int(item.get("closed_at_ms") or 0),
+        )
+        for existing in self.pending_funding_settlement_reconciliations:
+            if (
+                str(existing.get("position_id") or ""),
+                int(existing.get("closed_at_ms") or 0),
+            ) != key:
+                continue
+            merged = dict(existing)
+            for field, value in item.items():
+                if value not in (None, "", [], {}):
+                    merged[field] = value
+            existing.clear()
+            existing.update(merged)
+            return
+        self.pending_funding_settlement_reconciliations.append(dict(item))
+        if len(self.pending_funding_settlement_reconciliations) > (
+            MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS
+        ):
+            self.pending_funding_settlement_reconciliations = (
+                self.pending_funding_settlement_reconciliations[
+                    -MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS:
+                ]
+            )
 
     def enqueue_pending_close_reconciliation(self, item: dict[str, Any]) -> None:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)
@@ -1298,6 +1445,11 @@ class EngineState:
             "pending_close_reconciliations": normalize_pending_close_reconciliations(
                 self.pending_close_reconciliations
             ),
+            "pending_funding_settlement_reconciliations": (
+                normalize_pending_funding_settlement_reconciliations(
+                    self.pending_funding_settlement_reconciliations
+                )
+            ),
             "last_scan": self.last_scan,
             "runtime_progress": dict(self.runtime_progress or {}),
             "runtime_market_data_config": dict(self.runtime_market_data_config or {}),
@@ -1330,6 +1482,17 @@ class EngineState:
                     "entered_at_ms": pos.entered_at_ms,
                     "captured_funding_quote": pos.captured_funding_quote,
                     "funding_captured": pos.funding_captured,
+                    "calculation_version": pos.calculation_version,
+                    "model_epoch": pos.model_epoch,
+                    "economics_observed_at_ms": pos.economics_observed_at_ms,
+                    "funding_settlement_records": [
+                        record.to_dict() for record in pos.funding_settlement_records
+                    ],
+                    "settled_funding_quote": pos.settled_funding_quote,
+                    "funding_settlement_evidence_status": (
+                        pos.funding_settlement_evidence_status
+                    ),
+                    "funding_forecast_error_quote": pos.funding_forecast_error_quote,
                     "peak_net_quote": pos.peak_net_quote,
                     "current_net_quote": pos.current_net_quote,
                     "realized_price_pnl_quote": pos.realized_price_pnl_quote,
@@ -1345,6 +1508,7 @@ class EngineState:
                     "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": pos.expected_edge_bps_entry,
                     "worst_case_edge_bps_entry": pos.worst_case_edge_bps_entry,
+                    "expected_shortfall_bps_entry": pos.expected_shortfall_bps_entry,
                     "entry_cross_bps_entry": pos.entry_cross_bps_entry,
                     "fee_bps_entry": pos.fee_bps_entry,
                     "entry_slippage_bps_entry": pos.entry_slippage_bps_entry,
@@ -1437,6 +1601,7 @@ class EngineState:
                     "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": p.expected_edge_bps_entry,
                     "worst_case_edge_bps_entry": p.worst_case_edge_bps_entry,
+                    "expected_shortfall_bps_entry": p.expected_shortfall_bps_entry,
                     "entry_maker_leg": p.entry_maker_leg,
                     "exit_maker_leg": p.exit_maker_leg,
                     "entry_cross_bps_entry": p.entry_cross_bps_entry,

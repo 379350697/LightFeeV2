@@ -15,6 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from lightfee.core.domain import (
+    EntryLeverageEvidence,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -469,10 +470,10 @@ class AsterV3Client:
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
+    ) -> EntryLeverageEvidence | None:
         target = int(leverage or 0)
         if target <= 0:
-            return
+            return None
 
         position_raw = await self._request(
             "GET",
@@ -490,6 +491,7 @@ class AsterV3Client:
         current = next(iter(current_leverages)) if len(current_leverages) == 1 else 0
 
         effective = target
+        bracket_verified = False
         try:
             bracket_raw = await self._request(
                 "GET",
@@ -516,15 +518,76 @@ class AsterV3Client:
                         break
                 if matched:
                     break
+            bracket_verified = matched
         except TransportError:
             effective = target
 
         if current == effective:
-            return
-        await self._request(
+            return EntryLeverageEvidence(
+                venue=Venue.ASTER,
+                symbol=symbol,
+                requested_leverage=target,
+                effective_leverage=effective,
+                notional_quote=max(float(notional_quote or 0.0), 0.0),
+                bracket_verified=bracket_verified,
+                account_verified=bracket_verified,
+                source="aster_v3_position_risk",
+                observed_at_ms=int(time.time() * 1000),
+            )
+        response = await self._request(
             "POST",
             ASTER_V3_LEVERAGE_PATH,
             params={"symbol": symbol, "leverage": effective},
+        )
+        response_leverage = int(
+            _safe_float(
+                response.get("leverage") if isinstance(response, dict) else None,
+                default=0.0,
+            )
+        )
+        if response_leverage and response_leverage != effective:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "entry leverage prepare returned unexpected leverage "
+                f"symbol={symbol} expected={effective} actual={response_leverage}",
+            )
+        # Do not promote a set-leverage acknowledgement into sizing evidence.
+        # The position endpoint is the account truth source and catches a
+        # concurrent mutation or an asynchronously applied venue setting.
+        post_set_raw = await self._request(
+            "GET",
+            ASTER_V3_POSITION_PATH,
+            params={"symbol": symbol},
+        )
+        post_set_leverages: set[int] = set()
+        for row in _extract_rows(post_set_raw):
+            row_symbol = str(row.get("symbol", symbol) or symbol)
+            if row_symbol != symbol:
+                continue
+            value = int(_safe_float(row.get("leverage"), default=0.0))
+            if value > 0:
+                post_set_leverages.add(value)
+        post_set_leverage = (
+            next(iter(post_set_leverages))
+            if len(post_set_leverages) == 1
+            else 0
+        )
+        if post_set_leverage != effective:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "entry leverage post-set position verification failed "
+                f"symbol={symbol} expected={effective} actual={post_set_leverage}",
+            )
+        return EntryLeverageEvidence(
+            venue=Venue.ASTER,
+            symbol=symbol,
+            requested_leverage=target,
+            effective_leverage=effective,
+            notional_quote=max(float(notional_quote or 0.0), 0.0),
+            bracket_verified=bracket_verified,
+            account_verified=True,
+            source="aster_v3_post_set_position_risk",
+            observed_at_ms=int(time.time() * 1000),
         )
 
     def _order_params(

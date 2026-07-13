@@ -162,6 +162,8 @@ class EntryOpenInterestRefresher:
 class MarketDataRuntime:
     def __init__(self, ctx: MarketDataRuntimeContext) -> None:
         self.ctx = ctx
+        self._last_local_l2_depth_bridge_publish_ms = 0
+        self._last_local_l2_depth_bridge_error_ms = 0
 
     @property
     def ws_bbo_rest_refresher(self):
@@ -316,18 +318,14 @@ class MarketDataRuntime:
         provider = self._entry_readiness_provider_name()
         return {
             "entry_readiness_provider_effective": provider,
-            "local_l2_configured_enabled": bool(
-                getattr(self.ctx.config.strategy, "local_l2_enabled", False)
-            ),
-            "local_l2_ws_configured_enabled": bool(
-                getattr(self.ctx.config.strategy, "local_l2_ws_enabled", False)
-            ),
+            "local_l2_configured_enabled": self.ctx.config.strategy.local_l2_enabled,
+            "local_l2_ws_configured_enabled": self.ctx.config.strategy.local_l2_ws_enabled,
             "local_l2_effective_enabled": self._local_l2_effective_enabled(),
             "local_l2_effective_disabled_reason": (
                 "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
                 if (
                     provider == "ws_bbo_quote_lease"
-                    and bool(getattr(self.ctx.config.strategy, "local_l2_enabled", False))
+                    and self.ctx.config.strategy.local_l2_enabled
                 )
                 else ""
             ),
@@ -339,17 +337,14 @@ class MarketDataRuntime:
         )
 
     def _entry_quote_lease_max_age_ms(self) -> int:
-        budgets = []
-        for value in (
-            getattr(self.ctx.config.runtime, "max_market_age_ms", 0),
-            getattr(self.ctx.config.strategy, "entry_quote_lease_ttl_ms", 0),
-        ):
-            try:
-                parsed = int(value or 0)
-            except (TypeError, ValueError):
-                parsed = 0
-            if parsed > 0:
-                budgets.append(parsed)
+        budgets = [
+            value
+            for value in (
+                self.ctx.config.runtime.max_market_age_ms,
+                self.ctx.config.strategy.entry_quote_lease_ttl_ms,
+            )
+            if value > 0
+        ]
         return min(budgets) if budgets else 0
 
     async def _activate_local_l2_phase(self, now_ms: int) -> None:
@@ -396,12 +391,8 @@ class MarketDataRuntime:
                     target_pairs.add((ven, sym))
 
             # 2. Hot symbols from active positions (V1: hot_local_l2_symbols)
-            hot_budget = max(
-                getattr(self.ctx.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
-            )
-            hot_global_budget = max(
-                getattr(self.ctx.config.strategy, 'local_l2_hot_exec_global_budget', 0), 0,
-            )
+            hot_budget = max(self.ctx.config.strategy.local_l2_hot_exec_per_venue_budget, 1)
+            hot_global_budget = max(self.ctx.config.strategy.local_l2_hot_exec_global_budget, 0)
             hot_count = 0
             hot_global_count = 0
             for pos in getattr(self.ctx.state, 'open_positions', []) or []:
@@ -496,7 +487,7 @@ class MarketDataRuntime:
         # This ensures delta updates are captured (buffered) during bootstrap gap
         if (
             self._local_l2_effective_enabled()
-            and getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False)
+            and self.ctx.config.strategy.local_l2_ws_enabled
             and self.ctx.config.runtime.mode != "paper"
         ):
             ws_started = 0
@@ -530,9 +521,9 @@ class MarketDataRuntime:
         # Each worker fetches REST snapshots with concurrency control and retry
         if self.ctx.config.runtime.mode != "paper":
             bs_total = 0
-            bs_batch = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_batch_size', 4)
-            bs_jitter = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
-            bs_retry = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+            bs_batch = self.ctx.config.strategy.local_l2_bootstrap_batch_size
+            bs_jitter = self.ctx.config.strategy.local_l2_bootstrap_jitter_ms
+            bs_retry = self.ctx.config.strategy.local_l2_bootstrap_retry_backoff_ms
 
             for venue_str, symbols in venue_symbols.items():
                 try:
@@ -662,7 +653,7 @@ class MarketDataRuntime:
         from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
 
         def hot_book_needs_ws_lifecycle_attention(venue: str, symbol: str) -> bool:
-            if not getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False):
+            if not self.ctx.config.strategy.local_l2_ws_enabled:
                 return False
             policy = policy_for_venue(venue)
             if policy.bridge_mode not in (
@@ -787,9 +778,7 @@ class MarketDataRuntime:
             )
             return
 
-        per_venue_budget = max(
-            getattr(self.ctx.config.strategy, 'local_l2_hot_exec_per_venue_budget', 20), 1,
-        )
+        per_venue_budget = max(self.ctx.config.strategy.local_l2_hot_exec_per_venue_budget, 1)
         from lightfee.marketdata.local_l2_venues import get_venue_rules
 
         for ven_str, symbols in needed.items():
@@ -831,7 +820,7 @@ class MarketDataRuntime:
                 if book.status == L2BookStatus.COLD:
                     book.transition_to_bootstrapping(now_ms)
 
-            if getattr(self.ctx.config.strategy, 'local_l2_ws_enabled', False):
+            if self.ctx.config.strategy.local_l2_ws_enabled:
                 stream_state_fn = getattr(self.ctx.l2_data_plane, "ws_stream_state", None)
                 before_states = (
                     {
@@ -863,9 +852,9 @@ class MarketDataRuntime:
                     connect_ws_streams_needed = True
 
             # Start background bootstrap worker
-            bs_batch = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_batch_size', 4)
-            bs_jitter = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_jitter_ms', 250)
-            bs_retry = getattr(self.ctx.config.strategy, 'local_l2_bootstrap_retry_backoff_ms', 5000)
+            bs_batch = self.ctx.config.strategy.local_l2_bootstrap_batch_size
+            bs_jitter = self.ctx.config.strategy.local_l2_bootstrap_jitter_ms
+            bs_retry = self.ctx.config.strategy.local_l2_bootstrap_retry_backoff_ms
             self.ctx.l2_data_plane.start_background_bootstrap(
                 venue=ven_str,
                 symbols=symbols_list,
@@ -969,14 +958,7 @@ class MarketDataRuntime:
             )
             return
 
-        per_venue_budget = max(
-            getattr(
-                self.ctx.config.strategy,
-                "entry_ws_bbo_per_venue_budget",
-                getattr(self.ctx.config.strategy, "local_l2_hot_exec_per_venue_budget", 20),
-            ),
-            1,
-        )
+        per_venue_budget = max(self.ctx.config.strategy.entry_ws_bbo_per_venue_budget, 1)
         budgeted_keys: set[tuple[str, str]] = set()
         budget_excluded_keys: set[tuple[str, str]] = set()
         for venue_str, symbols in needed.items():
@@ -1151,13 +1133,7 @@ class MarketDataRuntime:
         )
 
     def _entry_quote_probe_diagnostics_enabled(self) -> bool:
-        return bool(
-            getattr(
-                getattr(self.ctx.config, "runtime", None),
-                "debug_journal_diagnostics_enabled",
-                False,
-            )
-        )
+        return bool(self.ctx.config.runtime.debug_journal_diagnostics_enabled)
 
     def _emit_entry_quote_revalidate_probe(
         self,
@@ -1503,6 +1479,8 @@ class MarketDataRuntime:
         ask = float(getattr(quote, "ask", 0.0) or 0.0)
         if observed_at_ms <= 0:
             return "missing_observed_at"
+        if observed_at_ms > now_ms:
+            return "timestamp_after_now"
         if age_ms > self._entry_quote_lease_max_age_ms():
             return "stale"
         if bid <= 0.0 or ask <= bid:
@@ -1940,7 +1918,9 @@ class MarketDataRuntime:
 
         V1: PersistedRetainedLocalL2Book with bids/asks + generation tracking.
         """
+        now_ms = wall_clock_now_ms()
         if not self._local_l2_effective_enabled():
+            self._publish_local_l2_depth_bridge(now_ms, force_empty=True)
             self._clear_local_l2_runtime_state()
             return
         diag = self.ctx.local_l2_runtime.diagnostics_snapshot()
@@ -1985,6 +1965,53 @@ class MarketDataRuntime:
             s.diagnostics_snapshot(now_ms=wall_clock_now_ms(), stale_after_ms=5000)
             for s in self.ctx.entry_l2_sessions.sessions.values()
         ]
+        self._publish_local_l2_depth_bridge(now_ms)
+
+    def _publish_local_l2_depth_bridge(
+        self,
+        now_ms: int,
+        *,
+        force_empty: bool = False,
+    ) -> None:
+        """Publish a bounded local-L2 bridge without adding market requests."""
+        runtime = self.ctx.config.runtime
+        if not runtime.local_l2_depth_bridge_enabled:
+            return
+        interval_ms = runtime.local_l2_depth_bridge_publish_interval_ms
+        if (
+            not force_empty
+            and self._last_local_l2_depth_bridge_publish_ms > 0
+            and now_ms - self._last_local_l2_depth_bridge_publish_ms < interval_ms
+        ):
+            return
+        try:
+            from lightfee.marketdata.l2_depth_bridge import publish_local_l2_depth_bridge
+
+            publish_local_l2_depth_bridge(
+                runtime.local_l2_depth_bridge_path,
+                () if force_empty else self.ctx.local_l2_runtime.books.values(),
+                now_ms=now_ms,
+                max_age_ms=self._entry_local_l2_stale_after_ms(),
+                max_levels=runtime.local_l2_depth_bridge_max_levels,
+            )
+            self._last_local_l2_depth_bridge_publish_ms = now_ms
+        except (OSError, TypeError, ValueError) as exc:
+            # The bridge is optional evidence.  A failed write must leave
+            # execution, recovery and closing paths untouched; the consumer
+            # safely falls back to BBO when the last bridge becomes stale.
+            if (
+                self._last_local_l2_depth_bridge_error_ms <= 0
+                or now_ms - self._last_local_l2_depth_bridge_error_ms >= 30_000
+            ):
+                self._last_local_l2_depth_bridge_error_ms = now_ms
+                self.ctx.journal.append(
+                    "runtime.local_l2_depth_bridge_publish_failed",
+                    {
+                        "path": runtime.local_l2_depth_bridge_path,
+                        "error": str(exc)[:300],
+                        "ts_ms": now_ms,
+                    },
+                )
 
     def _snapshot_domain_budget_ms(self, domain: str, row=None) -> int:
         domain_s = str(domain or "").lower()
@@ -1997,9 +2024,7 @@ class MarketDataRuntime:
                 )
                 or 0
             )
-            refresh_ms = int(
-                getattr(self.ctx.config.runtime, "sidecar_refresh_ms", 0) or 0
-            )
+            refresh_ms = self.ctx.config.runtime.sidecar_refresh_ms
             timeout_ms = int(
                 float(
                     getattr(
@@ -2027,13 +2052,13 @@ class MarketDataRuntime:
             )
         if domain_s == "quote":
             return int(
-                getattr(self.ctx.config.runtime, "max_order_quote_age_ms", 0)
+                self.ctx.config.runtime.max_order_quote_age_ms
                 or self.ctx.config.runtime.max_market_age_ms
                 or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "market":
             return int(
-                getattr(self.ctx.config.runtime, "max_market_age_ms", 0)
+                self.ctx.config.runtime.max_market_age_ms
                 or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "funding":
@@ -2141,7 +2166,7 @@ class MarketDataRuntime:
             if market_observed_at_ms > 0 else 0
         )
         market_budget_ms = int(
-            getattr(self.ctx.config.runtime, "max_market_age_ms", 0)
+            self.ctx.config.runtime.max_market_age_ms
             or self._snapshot_domain_budget_ms("market")
         )
         self._record_snapshot_scoped_status(
@@ -2507,8 +2532,8 @@ class MarketDataRuntime:
         if (
             not candidates
             or snapshot is None
-            or str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live"
-            or not bool(getattr(self.ctx.config.strategy, "execution_liquidity_enabled", True))
+            or self.ctx.config.runtime.mode != "live"
+            or not self.ctx.config.strategy.execution_liquidity_enabled
         ):
             return stats
         if getattr(self.ctx.state, "last_scan", None) is None:
@@ -2988,8 +3013,7 @@ class MarketDataRuntime:
             else self.ctx.config.runtime.sidecar_snapshot_max_age_ms
         )
         market_max_age_ms = int(
-            getattr(self.ctx.config.runtime, "max_market_age_ms", snapshot_max_age_ms)
-            or snapshot_max_age_ms
+            self.ctx.config.runtime.max_market_age_ms or snapshot_max_age_ms
         )
         stale_overages: list[int] = []
         published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
@@ -3383,9 +3407,7 @@ class MarketDataRuntime:
         market_observed_age_ms = (
             now_ms - market_observed_at_ms if market_observed_at_ms > 0 else 0
         )
-        market_max_age_ms = int(
-            getattr(self.ctx.config.runtime, "max_market_age_ms", max_age_ms) or max_age_ms
-        )
+        market_max_age_ms = int(self.ctx.config.runtime.max_market_age_ms or max_age_ms)
         degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
         degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
         degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}

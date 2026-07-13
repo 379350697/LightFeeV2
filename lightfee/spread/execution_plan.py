@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from math import isfinite
 
 from lightfee.core.domain import OrderRequest, Side, Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot
@@ -31,8 +32,9 @@ class SpreadExecutionPlan:
 
 
 class SpreadExecutionPlanner:
-    def __init__(self, *, signal_ttl_ms: int = 1000) -> None:
+    def __init__(self, *, signal_ttl_ms: int = 1000, quote_skew_ms: int = 250) -> None:
         self.signal_ttl_ms = max(int(signal_ttl_ms or 0), 0)
+        self.quote_skew_ms = max(int(quote_skew_ms or 0), 0)
 
     def build_entry_plan(
         self,
@@ -43,17 +45,19 @@ class SpreadExecutionPlanner:
     ) -> SpreadExecutionPlan:
         long_quote = self._quote_for(quotes, intent.long_venue, intent.symbol)
         short_quote = self._quote_for(quotes, intent.short_venue, intent.symbol)
-        self._require_fresh(long_quote, now_ms)
-        self._require_fresh(short_quote, now_ms)
+        self._require_pair_fresh(long_quote, short_quote, now_ms)
         notional = float(intent.entry_notional_quote or 0.0)
         if notional <= 0.0:
             raise SpreadExecutionPlanError("spread_notional_not_positive")
         long_price = float(long_quote.ask or 0.0)
         short_price = float(short_quote.bid or 0.0)
-        if long_price <= 0.0 or short_price <= 0.0:
+        if not _finite_positive(long_price) or not _finite_positive(short_price):
             raise SpreadExecutionPlanError("spread_quote_price_invalid")
-        self._require_capacity(long_quote, Side.BUY, notional)
-        self._require_capacity(short_quote, Side.SELL, notional)
+        # A hedged spread position is one common base quantity.  Dividing the
+        # same quote notional by two prices creates an immediate delta leg.
+        quantity = notional / max(long_price, short_price)
+        self._require_capacity(long_quote, Side.BUY, quantity)
+        self._require_capacity(short_quote, Side.SELL, quantity)
         return SpreadExecutionPlan(
             strategy_bucket=intent.strategy_bucket,
             action="entry",
@@ -62,7 +66,7 @@ class SpreadExecutionPlanner:
                 venue=Venue.from_str(intent.long_venue),
                 symbol=intent.symbol,
                 side=Side.BUY,
-                quantity=notional / long_price,
+                quantity=quantity,
                 price_hint=long_price,
                 observed_at_ms=int(long_quote.observed_at_ms or 0),
                 reduce_only=False,
@@ -72,7 +76,7 @@ class SpreadExecutionPlanner:
                 venue=Venue.from_str(intent.short_venue),
                 symbol=intent.symbol,
                 side=Side.SELL,
-                quantity=notional / short_price,
+                quantity=quantity,
                 price_hint=short_price,
                 observed_at_ms=int(short_quote.observed_at_ms or 0),
                 reduce_only=False,
@@ -90,15 +94,16 @@ class SpreadExecutionPlanner:
     ) -> SpreadExecutionPlan:
         long_quote = self._quote_for(quotes, position.long_venue, position.symbol)
         short_quote = self._quote_for(quotes, position.short_venue, position.symbol)
-        self._require_fresh(long_quote, now_ms)
-        self._require_fresh(short_quote, now_ms)
-        notional = float(position.entry_notional_quote or 0.0)
-        if notional <= 0.0:
-            raise SpreadExecutionPlanError("spread_notional_not_positive")
+        self._require_pair_fresh(long_quote, short_quote, now_ms)
+        quantity = float(position.base_quantity or 0.0)
+        if quantity <= 0.0:
+            raise SpreadExecutionPlanError("spread_base_quantity_missing")
         long_price = float(long_quote.bid or 0.0)
         short_price = float(short_quote.ask or 0.0)
-        if long_price <= 0.0 or short_price <= 0.0:
+        if not _finite_positive(long_price) or not _finite_positive(short_price):
             raise SpreadExecutionPlanError("spread_quote_price_invalid")
+        self._require_capacity(long_quote, Side.SELL, quantity)
+        self._require_capacity(short_quote, Side.BUY, quantity)
         return SpreadExecutionPlan(
             strategy_bucket=position.strategy_bucket,
             action="exit",
@@ -107,7 +112,7 @@ class SpreadExecutionPlanner:
                 venue=Venue.from_str(position.long_venue),
                 symbol=position.symbol,
                 side=Side.SELL,
-                quantity=notional / long_price,
+                quantity=quantity,
                 price_hint=long_price,
                 observed_at_ms=int(long_quote.observed_at_ms or 0),
                 reduce_only=True,
@@ -117,7 +122,7 @@ class SpreadExecutionPlanner:
                 venue=Venue.from_str(position.short_venue),
                 symbol=position.symbol,
                 side=Side.BUY,
-                quantity=notional / short_price,
+                quantity=quantity,
                 price_hint=short_price,
                 observed_at_ms=int(short_quote.observed_at_ms or 0),
                 reduce_only=True,
@@ -142,26 +147,71 @@ class SpreadExecutionPlanner:
         raise SpreadExecutionPlanError("spread_quote_missing")
 
     def _require_fresh(self, quote: QuoteSnapshot, now_ms: int) -> None:
-        observed = int(getattr(quote, "observed_at_ms", 0) or 0)
+        try:
+            observed = int(getattr(quote, "observed_at_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise SpreadExecutionPlanError("spread_quote_stale") from None
         if observed <= 0:
             raise SpreadExecutionPlanError("spread_quote_stale")
-        if self.signal_ttl_ms and now_ms - observed > self.signal_ttl_ms:
+        if observed > now_ms or (
+            self.signal_ttl_ms and now_ms - observed > self.signal_ttl_ms
+        ):
             raise SpreadExecutionPlanError("spread_quote_stale")
+
+    def _require_pair_fresh(
+        self,
+        long_quote: QuoteSnapshot,
+        short_quote: QuoteSnapshot,
+        now_ms: int,
+    ) -> None:
+        self._require_price_integrity(long_quote)
+        self._require_price_integrity(short_quote)
+        self._require_fresh(long_quote, now_ms)
+        self._require_fresh(short_quote, now_ms)
+        if abs(
+            int(long_quote.observed_at_ms or 0)
+            - int(short_quote.observed_at_ms or 0)
+        ) > self.quote_skew_ms:
+            raise SpreadExecutionPlanError("spread_quote_skew_exceeded")
+
+    @staticmethod
+    def _require_price_integrity(quote: QuoteSnapshot) -> None:
+        try:
+            bid = float(getattr(quote, "bid", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            raise SpreadExecutionPlanError("spread_quote_price_invalid") from None
+        if not _finite_positive(bid) or not _finite_positive(ask) or bid > ask:
+            raise SpreadExecutionPlanError("spread_quote_price_invalid")
 
     @staticmethod
     def _require_capacity(
         quote: QuoteSnapshot,
         side: Side,
-        notional: float,
+        quantity: float,
     ) -> None:
-        if side == Side.BUY:
-            capacity = float(getattr(quote, "ask_size", 0.0) or 0.0) * float(quote.ask or 0.0)
-        else:
-            capacity = float(getattr(quote, "bid_size", 0.0) or 0.0) * float(quote.bid or 0.0)
-        if capacity > 0.0 and capacity < notional:
+        try:
+            capacity = float(
+                getattr(quote, "ask_size" if side == Side.BUY else "bid_size", 0.0)
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            raise SpreadExecutionPlanError("spread_quote_capacity_below_notional") from None
+        if (
+            not _finite_positive(capacity)
+            or not _finite_positive(quantity)
+            or capacity < quantity
+        ):
             raise SpreadExecutionPlanError("spread_quote_capacity_below_notional")
 
 
 def _client_order_id(prefix: str, source: str) -> str:
     digest = hashlib.sha1(str(source or "").encode("utf-8")).hexdigest()[:12]
     return f"lf-spread-{prefix}-{digest}"
+
+
+def _finite_positive(value: float) -> bool:
+    try:
+        return isfinite(float(value)) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False

@@ -52,6 +52,9 @@ class MarketDataRuntimeContext(RuntimeCommonContext, Protocol):
     def local_l2_runtime(self) -> Any: ...
 
     @property
+    def funding_risk_runtime(self) -> Any: ...
+
+    @property
     def ws_bbo_cache(self) -> Any: ...
 
     @property
@@ -424,6 +427,14 @@ class EntryDispatchRuntimeContext(RuntimeCommonContext, Protocol):
     def _entry_reject_is_post_only_would_take(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def _record_post_only_reject_cooldown(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def _queue_pending_residual_repair(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    async def _funding_entry_margin_evidence(
+        self,
+        venue: Venue,
+        now_ms: int,
+    ) -> dict[str, Any]: ...
 
 
 class CloseRuntimeContext(RuntimeCommonContext, Protocol):

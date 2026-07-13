@@ -24,6 +24,7 @@ from lightfee.engine.state import (
     ActiveMakerLeg,
     CloseLegRecord,
     EngineState,
+    FundingSettlementRecord,
     HedgeInflight,
     OpenPosition,
     PassiveOrderManagerRuntime,
@@ -38,6 +39,7 @@ from lightfee.engine.state import (
     PendingPassiveOrder,
     RecoveryWorkSnapshot,
     normalize_pending_close_reconciliations,
+    normalize_pending_funding_settlement_reconciliations,
 )
 from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.persistence.journal import Journal
@@ -192,6 +194,30 @@ def build_recovery_snapshot(state: EngineState) -> RecoveryWorkSnapshot:
 # State reconstruction from snapshot + journal
 # ---------------------------------------------------------------------------
 
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _restore_funding_settlement_records(value: object) -> list[FundingSettlementRecord]:
+    """Restore only well-formed statement facts; corrupt facts stay untrusted."""
+    if not isinstance(value, list):
+        return []
+    records: list[FundingSettlementRecord] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            records.append(FundingSettlementRecord.from_dict(raw))
+        except (TypeError, ValueError):
+            continue
+    return records
+
+
 def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
     """Deserialize an OpenPosition from snapshot dict."""
     from lightfee.core.domain import Venue as DomainVenue
@@ -226,6 +252,19 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         entered_at_ms=int(data.get("entered_at_ms", data.get("opened_at_ms", 0)) or 0),
         captured_funding_quote=float(data.get("captured_funding_quote", 0)),
         funding_captured=bool(data.get("funding_captured", False)),
+        calculation_version=str(data.get("calculation_version", "v1_exact") or "v1_exact"),
+        model_epoch=str(data.get("model_epoch", data.get("calculation_version", "v1_exact")) or "v1_exact"),
+        economics_observed_at_ms=int(data.get("economics_observed_at_ms", 0) or 0),
+        funding_settlement_records=_restore_funding_settlement_records(
+            data.get("funding_settlement_records")
+        ),
+        settled_funding_quote=float(data.get("settled_funding_quote", 0.0) or 0.0),
+        funding_settlement_evidence_status=str(
+            data.get("funding_settlement_evidence_status", "missing") or "missing"
+        ),
+        funding_forecast_error_quote=_optional_float(
+            data.get("funding_forecast_error_quote")
+        ),
         peak_net_quote=float(data.get("peak_net_quote", 0)),
         current_net_quote=float(data.get("current_net_quote", 0)),
         realized_price_pnl_quote=float(data.get("realized_price_pnl_quote", 0)),
@@ -241,6 +280,7 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         total_funding_edge_bps_entry=float(data.get("total_funding_edge_bps_entry", 0)),
         expected_edge_bps_entry=float(data.get("expected_edge_bps_entry", 0)),
         worst_case_edge_bps_entry=float(data.get("worst_case_edge_bps_entry", 0)),
+        expected_shortfall_bps_entry=float(data.get("expected_shortfall_bps_entry", 0)),
         entry_cross_bps_entry=float(data.get("entry_cross_bps_entry", 0)),
         fee_bps_entry=float(data.get("fee_bps_entry", 0)),
         entry_slippage_bps_entry=float(data.get("entry_slippage_bps_entry", 0)),
@@ -367,6 +407,15 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "entered_at_ms": pos.entered_at_ms,
         "captured_funding_quote": pos.captured_funding_quote,
         "funding_captured": pos.funding_captured,
+        "calculation_version": pos.calculation_version,
+        "model_epoch": pos.model_epoch,
+        "economics_observed_at_ms": pos.economics_observed_at_ms,
+        "funding_settlement_records": [
+            record.to_dict() for record in pos.funding_settlement_records
+        ],
+        "settled_funding_quote": pos.settled_funding_quote,
+        "funding_settlement_evidence_status": pos.funding_settlement_evidence_status,
+        "funding_forecast_error_quote": pos.funding_forecast_error_quote,
         "peak_net_quote": pos.peak_net_quote,
         "current_net_quote": pos.current_net_quote,
         "realized_price_pnl_quote": pos.realized_price_pnl_quote,
@@ -382,6 +431,7 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
         "expected_edge_bps_entry": pos.expected_edge_bps_entry,
         "worst_case_edge_bps_entry": pos.worst_case_edge_bps_entry,
+        "expected_shortfall_bps_entry": pos.expected_shortfall_bps_entry,
         "entry_cross_bps_entry": pos.entry_cross_bps_entry,
         "fee_bps_entry": pos.fee_bps_entry,
         "entry_slippage_bps_entry": pos.entry_slippage_bps_entry,
@@ -518,6 +568,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.transfer_truth = snap.get("transfer_truth", {})
     state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
     state.set_pending_close_reconciliations(snap.get("pending_close_reconciliations", []))
+    state.set_pending_funding_settlement_reconciliations(
+        snap.get("pending_funding_settlement_reconciliations", [])
+    )
     state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
 
     # Restore operator control state
@@ -618,6 +671,7 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     total_funding_edge_bps_entry=float(pdata.get("total_funding_edge_bps_entry", 0.0)),
                     expected_edge_bps_entry=float(pdata.get("expected_edge_bps_entry", 0.0)),
                     worst_case_edge_bps_entry=float(pdata.get("worst_case_edge_bps_entry", 0.0)),
+                    expected_shortfall_bps_entry=float(pdata.get("expected_shortfall_bps_entry", 0.0)),
                     entry_maker_leg=str(pdata.get("entry_maker_leg", "")),
                     exit_maker_leg=str(pdata.get("exit_maker_leg", "")),
                     entry_cross_bps_entry=float(pdata.get("entry_cross_bps_entry", 0.0)),
@@ -1204,6 +1258,11 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     view["pending_close_reconciliations"] = normalize_pending_close_reconciliations(
         state.pending_close_reconciliations
     )
+    view["pending_funding_settlement_reconciliations"] = (
+        normalize_pending_funding_settlement_reconciliations(
+            state.pending_funding_settlement_reconciliations
+        )
+    )
 
     # Add open position details
     view["open_positions"] = {
@@ -1262,6 +1321,7 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
             "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
             "expected_edge_bps_entry": p.expected_edge_bps_entry,
             "worst_case_edge_bps_entry": p.worst_case_edge_bps_entry,
+            "expected_shortfall_bps_entry": p.expected_shortfall_bps_entry,
             "entry_maker_leg": p.entry_maker_leg,
             "exit_maker_leg": p.exit_maker_leg,
             "entry_cross_bps_entry": p.entry_cross_bps_entry,

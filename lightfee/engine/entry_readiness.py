@@ -113,6 +113,18 @@ class QuoteLease:
     created_at_ms: int
     expires_at_ms: int
     provider: str = "quote_lease"
+    # Filled only by the final local-L2 revalidator. BBO-only evidence must
+    # never be mistaken for a depth-confirmed executable price.
+    long_buy_vwap: float = 0.0
+    short_sell_vwap: float = 0.0
+    # Limit prices for the exact base quantity used by a standard IOC.  These
+    # are the final consumed L2 levels, not BBO hints and not VWAPs.
+    long_buy_sweep_limit: float = 0.0
+    short_sell_sweep_limit: float = 0.0
+    long_l2_capacity_quantity: float = 0.0
+    short_l2_capacity_quantity: float = 0.0
+    l2_vwap_quantity: float = 0.0
+    l2_vwap_complete: bool = False
 
 
 class RestTopBookEntryReadinessProvider:
@@ -222,10 +234,12 @@ class RestTopBookEntryReadinessProvider:
             evidence["blocker_family"] = "invalid_quote"
             return self._reason("invalid_quote"), evidence
         observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-        max_age_ms = int(getattr(self._runtime.config.runtime, "max_market_age_ms", 0) or 0)
-        if observed_at_ms <= 0 or max_age_ms <= 0:
+        max_age_ms = self._runtime.config.runtime.max_market_age_ms
+        if observed_at_ms <= 0 or max_age_ms <= 0 or observed_at_ms > now_ms:
             evidence = self._quote_base_evidence(quote, now_ms)
             evidence["blocker_family"] = "stale_quote"
+            if observed_at_ms > now_ms:
+                evidence["timestamp_after_now"] = True
             return self._reason("stale_quote"), evidence
         age_ms = max(now_ms - observed_at_ms, 0)
         if age_ms > max_age_ms:
@@ -310,9 +324,7 @@ class QuoteLeaseEntryReadinessProvider(RestTopBookEntryReadinessProvider):
         short_quote: Any,
         now_ms: int,
     ) -> QuoteLease:
-        ttl_ms = int(
-            getattr(self._runtime.config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
-        )
+        ttl_ms = self._runtime.config.strategy.entry_quote_lease_ttl_ms
         return QuoteLease(
             pair_id=pair_id,
             symbol=symbol,
@@ -402,20 +414,29 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         if bid >= ask:
             return self._reason("crossed_book"), self._book_evidence(book, now_ms)
 
-        max_age_ms = int(getattr(self._runtime.config.runtime, "max_market_age_ms", 0) or 0)
+        max_age_ms = self._runtime.config.runtime.max_market_age_ms
         observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
-        if observed_at_ms <= 0 or max_age_ms <= 0 or (now_ms - observed_at_ms) > max_age_ms:
+        if (
+            observed_at_ms <= 0
+            or max_age_ms <= 0
+            or observed_at_ms > now_ms
+            or (now_ms - observed_at_ms) > max_age_ms
+        ):
             evidence = self._book_evidence(book, now_ms)
             evidence["max_age_ms"] = max_age_ms
+            if observed_at_ms > now_ms:
+                evidence["timestamp_after_now"] = True
             return self._reason("stale_book"), evidence
 
         ws_evidence_ms = self._ws_evidence_ms(str(book.venue), str(book.symbol))
         if ws_evidence_ms <= 0:
             return self._reason("missing_ws_evidence"), self._book_evidence(book, now_ms)
-        if (now_ms - ws_evidence_ms) > max_age_ms:
+        if ws_evidence_ms > now_ms or (now_ms - ws_evidence_ms) > max_age_ms:
             evidence = self._book_evidence(book, now_ms)
             evidence["ws_evidence_at_ms"] = ws_evidence_ms
             evidence["max_age_ms"] = max_age_ms
+            if ws_evidence_ms > now_ms:
+                evidence["ws_timestamp_after_now"] = True
             return self._reason("stale_ws_evidence"), evidence
         return None
 
@@ -667,9 +688,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         return reason == self._reason("stale_quote")
 
     def _quote_lease_age_budget_ms(self) -> int:
-        return int(
-            getattr(self._runtime.config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
-        )
+        return self._runtime.config.strategy.entry_quote_lease_ttl_ms
 
     def _rest_top_book_refresher(self) -> Any:
         refresher = getattr(self._runtime, "ws_bbo_rest_refresher", None)
@@ -693,9 +712,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
 
 
 def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
-    provider = str(
-        getattr(runtime.config.strategy, "entry_readiness_provider", "local_l2") or "local_l2"
-    ).strip().lower()
+    provider = runtime.config.strategy.entry_readiness_provider.strip().lower()
     if provider == "local_l2":
         return LocalL2EntryReadinessProvider(runtime)
     if provider == "rest_top_book":

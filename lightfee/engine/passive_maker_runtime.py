@@ -48,6 +48,55 @@ class PassiveMakerRuntime:
     def _entry_quote_lease_max_age_ms(self) -> int:
         return self.ctx._entry_quote_lease_max_age_ms()
 
+    def _pending_maker_side(self, pending) -> Side:
+        """Resolve the durable actual maker leg without reinterpreting legacy state.
+
+        New entries persist ``entry_maker_leg`` from the candidate/execution
+        decision.  Older deserialised ``PendingEntry`` objects, however,
+        acquire the dataclass default ``maker_leg='long'`` even when no maker
+        was ever selected.  Treating that synthetic default as evidence
+        silently changes a configured sell-maker flow into a long maker.  A
+        legacy ``maker_leg`` remains authoritative once a real working-order,
+        phase, or fill proves it; otherwise preserve V1's config fallback.
+        """
+
+        def side_for(label: object) -> Side | None:
+            value = str(label or "").strip().lower()
+            if value == "short":
+                return Side.SELL
+            if value == "long":
+                return Side.BUY
+            return None
+
+        selected = side_for(getattr(pending, "entry_maker_leg", ""))
+        if selected is not None:
+            return selected
+        phase_state = getattr(pending, "phase_state", None)
+        active_phase_leg = (
+            phase_state.get("active_maker_leg", "")
+            if isinstance(phase_state, dict)
+            else getattr(phase_state, "active_maker_leg", "")
+        )
+        selected = side_for(active_phase_leg)
+        if selected is not None:
+            return selected
+        has_working_maker_evidence = bool(
+            getattr(pending, "maker_order_id", "")
+            or getattr(pending, "maker_client_order_id", "")
+            or getattr(pending, "passive_order", None) is not None
+            or float(getattr(pending, "maker_leg_filled", 0.0) or 0.0) > 0.0
+            or float(getattr(pending, "hedge_leg_filled", 0.0) or 0.0) > 0.0
+        )
+        if has_working_maker_evidence:
+            selected = side_for(getattr(pending, "maker_leg", ""))
+            if selected is not None:
+                return selected
+        return (
+            Side.BUY
+            if self.ctx.config.strategy.maker_leg_default == "buy"
+            else Side.SELL
+        )
+
     @staticmethod
     def _maker_event_reprice_reject_reason(error: Exception) -> str:
         return classify_maker_event_reprice_reject_reason(error)
@@ -104,11 +153,7 @@ class PassiveMakerRuntime:
                 and stored.get("transient_block_reason") == reason
             ):
                 return
-            maker_leg = (
-                Side.BUY
-                if self.ctx.config.strategy.maker_leg_default == "buy"
-                else Side.SELL
-            )
+            maker_leg = self._pending_maker_side(pending)
             maker_venue = (
                 pending.long_venue if maker_leg == Side.BUY else pending.short_venue
             )
@@ -150,11 +195,8 @@ class PassiveMakerRuntime:
         now_ms: int,
         reason: str,
     ) -> None:
-        max_failures = int(
-            getattr(self.ctx.config.strategy, "passive_max_consecutive_failures", 5)
-            or 5
-        )
-        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        max_failures = self.ctx.config.strategy.passive_max_consecutive_failures
+        maker_leg = self._pending_maker_side(pending)
         maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
         self._maker_event_state[entry_id] = {
             "maker_price": stored_price,
@@ -264,9 +306,7 @@ class PassiveMakerRuntime:
                 {
                     "ts_ms": now_ms,
                     "local_l2_enabled": local_l2_enabled,
-                    "local_l2_configured_enabled": bool(
-                        getattr(self.ctx.config.strategy, "local_l2_enabled", False)
-                    ),
+                    "local_l2_configured_enabled": self.ctx.config.strategy.local_l2_enabled,
                     "opportunity_input_mode": self.ctx.config.runtime.opportunity_input_mode,
                     "reason": "non-parity fallback requires explicit opportunity_input_mode='non_parity'",
                 },
@@ -313,7 +353,6 @@ class PassiveMakerRuntime:
             return
 
         strategy = self.ctx.config.strategy
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
 
@@ -325,6 +364,7 @@ class PassiveMakerRuntime:
         venues: set[str] = set()
 
         for entry_id, pending in pending_passive:
+            maker_leg = self._pending_maker_side(pending)
             # Check if any matching event involves this entry's venues
             entry_venues = {(pending.long_venue.value, pending.symbol),
                           (pending.short_venue.value, pending.symbol)}
@@ -501,7 +541,6 @@ class PassiveMakerRuntime:
     ) -> None:
         """WS BBO maker-event lane using the in-situ pending hedge driver."""
         strategy = self.ctx.config.strategy
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
 
@@ -521,6 +560,7 @@ class PassiveMakerRuntime:
         min_quote_age_ms = 1_000_000_000
 
         for entry_id, pending in pending_passive:
+            maker_leg = self._pending_maker_side(pending)
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
             venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
             quote = None
@@ -834,7 +874,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry import EntryContext, EntryType
 
-        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = self._pending_maker_side(pending)
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -861,6 +901,7 @@ class PassiveMakerRuntime:
             total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
             expected_edge_bps_entry=pending.expected_edge_bps_entry,
             worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            expected_shortfall_bps_entry=pending.expected_shortfall_bps_entry,
             entry_maker_leg=pending.entry_maker_leg,
             exit_maker_leg=pending.exit_maker_leg,
             entry_cross_bps_entry=pending.entry_cross_bps_entry,
@@ -916,7 +957,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry_sync import drive_pending_entry_hedge
 
-        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = self._pending_maker_side(pending)
 
         result = await drive_pending_entry_hedge(
             entry_id=entry_id,

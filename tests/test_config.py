@@ -1,15 +1,11 @@
 """Tests for config loading, validation, and Chillybot removal."""
 
-import tempfile
-from pathlib import Path
-
 import pytest
 
 from lightfee.config.validation import check_raw_toml_for_chillybot
 from lightfee.config.loader import load_config
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
 from lightfee.config.validation import validate_config
-from lightfee.core.errors import ConfigError
 
 
 def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
@@ -18,6 +14,111 @@ def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
     cfg = StrategyConfig()
 
     assert cfg.entry_min_first_funding_remaining_secs == 60
+
+
+def test_strategy_config_forecast_default_is_reachable_in_a_seven_day_8h_window():
+    """There are only 21 independent 8-hour settlements in seven days."""
+    assert StrategyConfig().funding_forecast_min_samples <= 21
+
+
+def test_enhanced_live_requires_a_positive_forecast_sample_threshold():
+    cfg = AppConfig()
+    cfg.strategy.funding_economics_mode = "enhanced_live"
+    cfg.strategy.funding_forecast_mode = "live"
+    cfg.strategy.funding_forecast_min_samples = 0
+
+    issues = validate_config(cfg)
+
+    assert any("funding_forecast_min_samples" in issue for issue in issues)
+
+
+def test_strategy_config_rejects_invalid_forecast_distribution_drift_limit():
+    cfg = AppConfig()
+    cfg.strategy.funding_forecast_stability_max_quantile_drift_bps = -0.1
+
+    issues = validate_config(cfg)
+
+    assert any("funding_forecast_stability_max_quantile_drift_bps" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "funding_missing_margin_fallback_notional_quote",
+        "funding_max_venue_pair_exposure_quote",
+        "funding_max_global_gross_exposure_quote",
+        "funding_max_settlement_bucket_exposure_quote",
+        "funding_max_correlation_group_exposure_quote",
+        "funding_expected_shortfall_bps",
+        "funding_expected_shortfall_budget_quote",
+    ],
+)
+def test_strategy_config_rejects_nonfinite_funding_risk_limits(field_name: str):
+    cfg = AppConfig()
+    setattr(cfg.strategy, field_name, float("nan"))
+
+    issues = validate_config(cfg)
+
+    assert f"strategy.{field_name} must be finite and >= 0" in issues
+
+
+def test_strategy_config_rejects_nonfinite_or_invalid_funding_risk_contracts():
+    cfg = AppConfig()
+    cfg.strategy.funding_risk_health_buffer_ratio = float("inf")
+    cfg.strategy.funding_settlement_crowding_bucket_ms = 1.5  # type: ignore[assignment]
+    cfg.strategy.funding_venue_risk_haircut_bps_by_venue = {"binance": float("nan")}
+    cfg.strategy.funding_correlation_group_by_symbol = ["BTCUSDT"]  # type: ignore[assignment]
+
+    issues = validate_config(cfg)
+
+    assert (
+        "strategy.funding_risk_health_buffer_ratio must be finite and within (0, 1]"
+        in issues
+    )
+    assert "strategy.funding_settlement_crowding_bucket_ms must be > 0" in issues
+    assert (
+        "strategy.funding_venue_risk_haircut_bps_by_venue values must be finite and >= 0"
+        in issues
+    )
+    assert "strategy.funding_correlation_group_by_symbol must be a mapping" in issues
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "funding_new_entries_enabled",
+        "funding_dynamic_expected_shortfall_enabled",
+        "risk_monitor_enabled",
+        "spread_live_enabled",
+        "spread_paper_enabled",
+    ],
+)
+def test_strategy_safety_switches_require_literal_booleans(field_name: str):
+    cfg = AppConfig()
+    setattr(cfg.strategy, field_name, "false")
+
+    issues = validate_config(cfg)
+
+    assert f"strategy.{field_name} must be a boolean" in issues
+
+
+def test_live_config_does_not_accept_truthy_risk_monitor_value():
+    cfg = AppConfig()
+    cfg.runtime.mode = "live"
+    cfg.strategy.risk_monitor_enabled = "false"  # type: ignore[assignment]
+
+    issues = validate_config(cfg)
+
+    assert "strategy.risk_monitor_enabled must be true in live mode" in issues
+
+
+def test_runtime_basis_risk_checkpoint_path_must_be_non_empty():
+    cfg = AppConfig()
+    cfg.runtime.funding_basis_risk_checkpoint_path = " "
+
+    issues = validate_config(cfg)
+
+    assert "runtime.funding_basis_risk_checkpoint_path must be non-empty" in issues
 
 
 def test_strategy_config_rejects_negative_first_funding_horizon():
@@ -30,6 +131,30 @@ def test_strategy_config_rejects_negative_first_funding_horizon():
     issues = validate_config(cfg)
 
     assert any("entry_min_first_funding_remaining_secs" in issue for issue in issues)
+
+
+def test_strategy_config_requires_positive_maker_reconcile_backoff():
+    cfg = AppConfig()
+    cfg.strategy.maker_entry_reconcile_backoff_ms = 0
+
+    issues = validate_config(cfg)
+
+    assert any("maker_entry_reconcile_backoff_ms" in issue for issue in issues)
+
+
+def test_strategy_config_requires_ordered_positive_maker_hedge_deadlines():
+    cfg = AppConfig()
+    cfg.strategy.maker_hedge_soft_deadline_ms = 0
+
+    issues = validate_config(cfg)
+
+    assert any("maker_hedge_soft_deadline_ms" in issue for issue in issues)
+
+    cfg.strategy.maker_hedge_soft_deadline_ms = 900
+    cfg.strategy.maker_hedge_deadline_ms = 800
+    issues = validate_config(cfg)
+
+    assert any("must be <= maker_hedge_deadline_ms" in issue for issue in issues)
 
 
 class TestChillybotRejection:
@@ -86,6 +211,7 @@ symbols = ["BTCUSDT"]
 mode = "live"
 
 [strategy]
+risk_monitor_enabled = true
 local_l2_enabled = true
 local_l2_ws_enabled = true
 """,
@@ -108,6 +234,7 @@ symbols = ["BTCUSDT"]
 mode = "live"
 
 [strategy]
+risk_monitor_enabled = true
 entry_readiness_provider = "local_l2"
 local_l2_enabled = true
 """,
@@ -136,6 +263,29 @@ local_l2_enabled = true
         config = load_config(path)
 
         assert config.strategy.entry_readiness_provider == "local_l2"
+
+    def test_retired_transfer_bias_keys_are_ignored_at_config_boundary(self, tmp_path):
+        path = tmp_path / "paper.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+
+[strategy]
+transfer_healthy_bias_bps = 99.0
+transfer_unknown_bias_bps = -99.0
+transfer_degraded_bias_bps = -199.0
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert not hasattr(config.strategy, "transfer_healthy_bias_bps")
+        assert not hasattr(config.strategy, "transfer_unknown_bias_bps")
+        assert not hasattr(config.strategy, "transfer_degraded_bias_bps")
 
     def test_loads_v1_entry_perp_liquidity_thresholds(self, tmp_path):
         path = tmp_path / "paper.toml"
@@ -205,6 +355,47 @@ entry_min_perp_open_interest_quote = 1100000.0
 
 
 class TestConfigValidation:
+    def test_spread_v2_statistical_safety_contract_cannot_be_relaxed(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.spread_min_samples = 119
+        config.strategy.spread_min_history_ms = 299_999
+        config.strategy.spread_mean_reversion_max_half_life_ms = 1_800_001
+        config.strategy.spread_signal_ttl_ms = 0
+        config.strategy.spread_quote_skew_ms = 0
+        config.strategy.spread_structural_break_consecutive = 4
+        config.strategy.spread_structural_break_cooldown_ms = 1_799_999
+
+        issues = validate_config(config)
+
+        for field_name in (
+            "spread_min_samples",
+            "spread_min_history_ms",
+            "spread_mean_reversion_max_half_life_ms",
+            "spread_signal_ttl_ms",
+            "spread_quote_skew_ms",
+            "spread_structural_break_consecutive",
+            "spread_structural_break_cooldown_ms",
+        ):
+            assert any(field_name in issue for issue in issues)
+
+    def test_spread_paper_epoch_and_taker_baseline_are_startup_contracts(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.spread_paper_enabled = True
+        config.strategy.spread_paper_model_epoch = "v2_other_epoch"
+        config.strategy.spread_paper_primary_fill_model = "maker_taker"
+        config.strategy.spread_paper_require_taker_taker = False
+        config.strategy.spread_paper_finalist_limit = 0
+
+        issues = validate_config(config)
+
+        for field_name in (
+            "spread_paper_model_epoch",
+            "spread_paper_primary_fill_model",
+            "spread_paper_require_taker_taker",
+            "spread_paper_finalist_limit",
+        ):
+            assert any(field_name in issue for issue in issues)
+
     def test_strategy_defaults_keep_entry_window_valid(self):
         strategy = StrategyConfig()
         assert strategy.entry_window_secs >= strategy.min_scan_minutes_before_funding * 60

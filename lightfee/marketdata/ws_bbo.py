@@ -89,7 +89,11 @@ class VenueBboCache:
         quote = self.get_quote(venue, symbol)
         if quote is None:
             return None
-        if quote.observed_at_ms <= 0 or max_age_ms <= 0:
+        if (
+            quote.observed_at_ms <= 0
+            or quote.observed_at_ms > now_ms
+            or max_age_ms <= 0
+        ):
             return None
         if now_ms - quote.observed_at_ms > max_age_ms:
             return None

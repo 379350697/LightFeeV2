@@ -82,6 +82,12 @@ class EntryContext:
     total_funding_edge_bps_entry: float = 0.0
     expected_edge_bps_entry: float = 0.0
     worst_case_edge_bps_entry: float = 0.0
+    # Entry-time ES is retained for later portfolio admission.  Re-estimating
+    # an existing position with a new candidate's volatility is unsafe.
+    expected_shortfall_bps_entry: float = 0.0
+    calculation_version: str = "v1_exact"
+    model_epoch: str = "v1_exact"
+    economics_observed_at_ms: int = 0
     entry_maker_leg: str = ""
     exit_maker_leg: str = ""
     entry_cross_bps_entry: float = 0.0
@@ -273,6 +279,15 @@ def build_open_position(
         opportunity_type == "staggered"
         and inferred_first_funding_ms > 0
         and inferred_second_funding_ms > inferred_first_funding_ms
+        # V1 only holds a staggered position through the second settlement
+        # when that incremental carry is beneficial and the entry explicitly
+        # selected evaluate-second-stage.  A timestamp alone is not consent to
+        # hold a negative second leg.
+        and not bool(ctx.exit_after_first_stage)
+        and (
+            float(ctx.total_funding_edge_bps_entry or 0.0)
+            - float(ctx.funding_edge_bps_entry or 0.0)
+        ) > 0.0
     )
 
     return OpenPosition(
@@ -310,6 +325,10 @@ def build_open_position(
         ),
         expected_edge_bps_entry=float(ctx.expected_edge_bps_entry or 0.0),
         worst_case_edge_bps_entry=float(ctx.worst_case_edge_bps_entry or 0.0),
+        expected_shortfall_bps_entry=float(ctx.expected_shortfall_bps_entry or 0.0),
+        calculation_version=str(ctx.calculation_version or "v1_exact"),
+        model_epoch=str(ctx.model_epoch or ctx.calculation_version or "v1_exact"),
+        economics_observed_at_ms=_positive_int(ctx.economics_observed_at_ms),
         first_funding_leg=str(ctx.first_funding_leg or ""),
         entry_maker_leg=str(ctx.entry_maker_leg or ""),
         exit_maker_leg=str(ctx.exit_maker_leg or ""),

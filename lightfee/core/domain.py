@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
@@ -30,6 +32,39 @@ class Venue(Enum):
             return cls(v)
         except ValueError:
             raise ValueError(f"unsupported venue: {value}")
+
+
+@dataclass(frozen=True)
+class EntryLeverageEvidence:
+    """Exact, pre-entry leverage evidence returned by a private venue adapter.
+
+    A configured target is merely an intent: venue brackets can lower it and
+    an accepted set-leverage response is not proof unless the effective value
+    is explicit.  Consumers must use ``evidence_complete`` before treating
+    ``effective_leverage`` as a sizing input.
+    """
+
+    venue: Venue
+    symbol: str
+    requested_leverage: int
+    effective_leverage: int
+    notional_quote: float
+    bracket_verified: bool
+    account_verified: bool
+    source: str
+    observed_at_ms: int
+
+    @property
+    def evidence_complete(self) -> bool:
+        return (
+            self.requested_leverage > 0
+            and self.effective_leverage > 0
+            and self.effective_leverage <= self.requested_leverage
+            and math.isfinite(self.notional_quote)
+            and self.notional_quote >= 0.0
+            and self.bracket_verified
+            and self.account_verified
+        )
 
 
 class Symbol:
@@ -168,6 +203,46 @@ class OrderFillReconciliation:
     fee_quote: Optional[float] = None
     filled_at_ms: int = 0
     metadata: Optional[dict] = field(default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class FundingSettlement:
+    """One immutable funding cash-flow fact from a private exchange statement.
+
+    The amount is expressed in the strategy's quote currency and preserves the
+    exchange sign: positive means the account received funding, negative means
+    it paid funding.  This is intentionally an account-level fact, not an
+    internal-position attribution.  The reconciliation layer allocates it only
+    when one position can be proven to own the exact venue/symbol/settlement
+    target.
+    """
+
+    venue: Venue
+    symbol: str
+    settlement_timestamp_ms: int
+    amount_quote: float
+    quote_currency: str
+    observed_at_ms: int
+    source: str
+    statement_reference: str
+    account_reference: str = ""
+    metadata: Optional[dict] = field(default=None)
+
+    def __post_init__(self) -> None:
+        if not str(self.symbol).strip():
+            raise ValueError("funding settlement symbol is required")
+        if int(self.settlement_timestamp_ms or 0) <= 0:
+            raise ValueError("funding settlement timestamp must be positive")
+        if not math.isfinite(float(self.amount_quote)):
+            raise ValueError("funding settlement amount must be finite")
+        if not str(self.quote_currency).strip():
+            raise ValueError("funding settlement quote currency is required")
+        if int(self.observed_at_ms or 0) <= 0:
+            raise ValueError("funding settlement observation timestamp must be positive")
+        if not str(self.source).strip():
+            raise ValueError("funding settlement source is required")
+        if not str(self.statement_reference).strip():
+            raise ValueError("funding settlement statement reference is required")
 
 
 class OrderFillProbeStatus(Enum):

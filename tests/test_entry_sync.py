@@ -327,6 +327,118 @@ class TestEntrySyncHedgeRejectAfterMakerFill:
 
 
 # ---------------------------------------------------------------------------
+# First fill repricing: never over-hedge or abandon naked delta
+# ---------------------------------------------------------------------------
+
+
+class TestEntrySyncPostFirstFillDecision:
+    @pytest.mark.asyncio
+    async def test_reprices_hedge_and_uses_actual_first_fill_quantity(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001"),
+        ]
+        okx_ada.place_order_outcomes = [
+            _fake_fill(Venue.OKX, "BTCUSDT", Side.SELL, 0.01, 49940.0, "h001"),
+        ]
+        executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+            config_overrides={
+                "post_first_fill_decider": lambda **_: {
+                    "action": "complete_hedge",
+                    "reason": "fresh_l2_complete_hedge",
+                    "hedge_price": 49940.0,
+                    "complete_hedge_loss_quote": 0.6,
+                    "unwind_first_leg_loss_quote": 1.2,
+                },
+            },
+        )
+
+        result = await executor.execute(btc_context)
+
+        assert result.state == EntryState.COMPLETED
+        assert okx_ada.last_request.quantity == pytest.approx(0.01)
+        assert okx_ada.last_request.price == pytest.approx(49940.0)
+        decision = [
+            record for record in journal.read_all()
+            if record["kind"] == "entry.post_first_fill_decision"
+        ]
+        assert decision[-1]["payload"]["action"] == "complete_hedge"
+
+    @pytest.mark.asyncio
+    async def test_full_unwind_is_terminal_and_never_submits_hedge(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001"),
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.SELL, 0.01, 49950.0, "u001"),
+        ]
+        executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+            config_overrides={
+                "post_first_fill_decider": lambda **_: {
+                    "action": "unwind_first_leg",
+                    "reason": "fresh_l2_lower_unwind_loss",
+                    "unwind_price": 49950.0,
+                    "complete_hedge_loss_quote": 2.0,
+                    "unwind_first_leg_loss_quote": 0.5,
+                },
+            },
+        )
+
+        result = await executor.execute(btc_context)
+
+        assert result.state == EntryState.FAILED
+        assert result.pending_entry is None
+        assert result.residual_task is None
+        assert binance_ada.place_order_call_count == 2
+        assert binance_ada.last_request.reduce_only is True
+        assert binance_ada.last_request.side is Side.SELL
+        assert okx_ada.place_order_call_count == 0
+        assert any(
+            record["kind"] == "entry.unwound_after_first_fill"
+            for record in journal.read_all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_unwind_becomes_residual_not_pending_entry(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "m001"),
+            _fake_fill(Venue.BINANCE, "BTCUSDT", Side.SELL, 0.004, 49950.0, "u001"),
+        ]
+        executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+            config_overrides={
+                "post_first_fill_decider": lambda **_: {
+                    "action": "unwind_first_leg",
+                    "reason": "fresh_l2_lower_unwind_loss",
+                    "unwind_price": 49950.0,
+                },
+            },
+        )
+
+        result = await executor.execute(btc_context)
+
+        assert result.state == EntryState.FAILED_WITH_RESIDUAL
+        assert result.pending_entry is None
+        assert result.residual_task is not None
+        assert result.residual_task.exposure_venue is Venue.BINANCE
+        assert result.residual_task.exposure_side is Side.SELL
+        assert result.residual_task.exposure_quantity == pytest.approx(0.006)
+
+
+# ---------------------------------------------------------------------------
 # Full dual-taker: both legs fill → OpenPosition
 # ---------------------------------------------------------------------------
 
