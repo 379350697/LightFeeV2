@@ -11,12 +11,20 @@ Rust references:
 
 from __future__ import annotations
 
+import inspect
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
-from lightfee.core.domain import OrderFill, OrderRequest, PassiveOrderState, Side, Venue
+from lightfee.core.domain import (
+    OrderFill,
+    OrderRequest,
+    PassiveOrderState,
+    Side,
+    TimeInForce,
+    Venue,
+)
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.exchange_errors import (
     RequestContext,
@@ -48,6 +56,7 @@ from lightfee.engine.state import (
     PendingPassiveOrder,
 )
 from lightfee.persistence.journal import Journal
+from lightfee.venues.cid import generate_exchange_cid
 
 
 @dataclass
@@ -98,6 +107,12 @@ class EntrySyncExecutor:
         self.review_observability_enabled: bool = overrides.get(
             "review_observability_enabled", False
         )
+        # The executor deliberately has no market-data dependency.  The live
+        # runtime injects this callback so the irrevocable first-leg fill is
+        # repriced from its newest executable book before we either finish the
+        # hedge or flatten that first leg.  A missing callback remains
+        # conservative: complete the hedge rather than leaving naked delta.
+        self.post_first_fill_decider = overrides.get("post_first_fill_decider")
 
     # ------------------------------------------------------------------
     # Main execution entry point
@@ -229,7 +244,54 @@ class EntrySyncExecutor:
         ctx = advance_entry_state(ctx, EntryState.MAKER_RESTING)
         ctx = advance_entry_state(ctx, EntryState.SUBMITTING_HEDGE)
 
-        # --- Phase 2: Submit hedge ---
+        # --- Phase 2: reprice after the irrevocable first fill ---
+        # A partial first fill must never cause the original target quantity to
+        # be hedged.  It creates over-hedge delta.  The callback also lets the
+        # live runtime compare the current cost of completing the pair with an
+        # immediate first-leg unwind, using fresh executable prices.
+        post_fill = await self._decide_after_first_fill(
+            ctx=ctx,
+            maker_fill=maker_fill,
+            hedge_request=hedge_req,
+            now_ms=now_ms,
+        )
+        action = str(post_fill.get("action", "complete_hedge") or "complete_hedge")
+        if action == "unwind_first_leg":
+            return await self._unwind_first_leg_after_fill(
+                result=result,
+                ctx=ctx,
+                maker_request=maker_req,
+                maker_fill=maker_fill,
+                decision=post_fill,
+                now_ms=now_ms,
+            )
+
+        hedge_price = float(post_fill.get("hedge_price", 0.0) or 0.0)
+        hedge_req = replace(
+            hedge_req,
+            quantity=maker_fill.quantity,
+            price=hedge_price if hedge_price > 0.0 else hedge_req.price,
+        )
+        self.journal.append(
+            "entry.post_first_fill_decision",
+            {
+                "position_id": ctx.entry_id,
+                "action": "complete_hedge",
+                "reason": str(post_fill.get("reason", "complete_hedge_default")),
+                "maker_filled_quantity": maker_fill.quantity,
+                "hedge_quantity": hedge_req.quantity,
+                "hedge_price": hedge_req.price,
+                "complete_hedge_loss_quote": float(
+                    post_fill.get("complete_hedge_loss_quote", 0.0) or 0.0
+                ),
+                "unwind_first_leg_loss_quote": float(
+                    post_fill.get("unwind_first_leg_loss_quote", 0.0) or 0.0
+                ),
+                "market_evidence": dict(post_fill.get("market_evidence", {}) or {}),
+            },
+        )
+
+        # --- Phase 3: submit the sized, repriced hedge ---
         hedge_result = await self._submit_hedge(ctx, hedge_req, now_ms)
         result.journal_entries.extend(hedge_result.get("journal", []))
         result.hedge_fill = hedge_result.get("fill")
@@ -554,6 +616,7 @@ class EntrySyncExecutor:
             total_funding_edge_bps_entry=ctx.total_funding_edge_bps_entry,
             expected_edge_bps_entry=ctx.expected_edge_bps_entry,
             worst_case_edge_bps_entry=ctx.worst_case_edge_bps_entry,
+            expected_shortfall_bps_entry=ctx.expected_shortfall_bps_entry,
             entry_maker_leg=ctx.entry_maker_leg,
             exit_maker_leg=ctx.exit_maker_leg,
             entry_cross_bps_entry=ctx.entry_cross_bps_entry,
@@ -637,6 +700,187 @@ class EntrySyncExecutor:
             },
         )
         return await self._submit_order(request, ctx.entry_id, "hedge", now_ms)
+
+    async def _decide_after_first_fill(
+        self,
+        *,
+        ctx: EntryContext,
+        maker_fill: OrderFill,
+        hedge_request: OrderRequest,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Ask the runtime to choose a fully hedgeable closure after a fill.
+
+        The absence of a fresh decision is not permission to abandon the
+        exposure: it explicitly defaults to completing the hedge at the
+        original executable limit.  This preserves the V1 no-naked-leg
+        invariant during startup/recovery and in test harnesses that do not
+        own a live market-data runtime.
+        """
+        default = {
+            "action": "complete_hedge",
+            "reason": "post_first_fill_market_data_unavailable_complete_hedge",
+            "hedge_price": hedge_request.price,
+            "complete_hedge_loss_quote": 0.0,
+            "unwind_first_leg_loss_quote": 0.0,
+            "market_evidence": {},
+        }
+        decider = self.post_first_fill_decider
+        if not callable(decider):
+            return default
+        try:
+            decision = decider(
+                ctx=ctx,
+                maker_fill=maker_fill,
+                hedge_request=hedge_request,
+                now_ms=now_ms,
+            )
+            if inspect.isawaitable(decision):
+                decision = await decision
+            if not isinstance(decision, dict):
+                raise TypeError("post_first_fill_decider must return a mapping")
+            action = str(decision.get("action", "") or "")
+            if action not in {"complete_hedge", "unwind_first_leg"}:
+                raise ValueError(f"unsupported post-first-fill action: {action!r}")
+            merged = dict(default)
+            merged.update(decision)
+            return merged
+        except Exception as exc:
+            self.journal.append(
+                "entry.post_first_fill_decision_unavailable",
+                {
+                    "position_id": ctx.entry_id,
+                    "reason": "post_first_fill_decider_error_complete_hedge",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                },
+            )
+            return default
+
+    async def _unwind_first_leg_after_fill(
+        self,
+        *,
+        result: EntryExecutionResult,
+        ctx: EntryContext,
+        maker_request: OrderRequest,
+        maker_fill: OrderFill,
+        decision: dict[str, Any],
+        now_ms: int,
+    ) -> EntryExecutionResult:
+        """Flatten the filled first leg and queue any incomplete unwind.
+
+        This is a terminal branch.  It intentionally never creates a pending
+        *entry* that could later submit the rejected hedge direction; an
+        incomplete flatten becomes the normal V1 residual-repair lifecycle.
+        """
+        unwind_price = float(decision.get("unwind_price", 0.0) or 0.0)
+        unwind_request = replace(
+            maker_request,
+            side=maker_fill.side.opposite(),
+            quantity=maker_fill.quantity,
+            price=unwind_price if unwind_price > 0.0 else maker_request.price,
+            reduce_only=True,
+            post_only=False,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=generate_exchange_cid(
+                ctx.entry_id,
+                "unwind_after_first_fill",
+                maker_fill.venue,
+            ),
+        )
+        self.journal.append(
+            "entry.post_first_fill_decision",
+            {
+                "position_id": ctx.entry_id,
+                "action": "unwind_first_leg",
+                "reason": str(decision.get("reason", "lower_expected_loss")),
+                "maker_filled_quantity": maker_fill.quantity,
+                "unwind_quantity": unwind_request.quantity,
+                "unwind_price": unwind_request.price,
+                "complete_hedge_loss_quote": float(
+                    decision.get("complete_hedge_loss_quote", 0.0) or 0.0
+                ),
+                "unwind_first_leg_loss_quote": float(
+                    decision.get("unwind_first_leg_loss_quote", 0.0) or 0.0
+                ),
+                "market_evidence": dict(decision.get("market_evidence", {}) or {}),
+            },
+        )
+        self.journal.append(
+            "order.submitted",
+            {
+                "position_id": ctx.entry_id,
+                "internal_entry_id": ctx.entry_id,
+                "leg": "unwind",
+                "symbol": unwind_request.symbol,
+                "venue": unwind_request.venue.value,
+                "side": unwind_request.side.value,
+                "quantity": unwind_request.quantity,
+                "price": unwind_request.price,
+                "reduce_only": True,
+                "is_maker": False,
+                "client_order_id": unwind_request.client_order_id,
+                "time_in_force": unwind_request.time_in_force.value,
+            },
+        )
+        unwind = await self._submit_order(
+            unwind_request,
+            ctx.entry_id,
+            "unwind",
+            now_ms,
+        )
+        unwind_fill = unwind.get("fill")
+        unwinded_quantity = max(
+            min(float(getattr(unwind_fill, "quantity", 0.0) or 0.0), maker_fill.quantity),
+            0.0,
+        )
+        remaining = max(maker_fill.quantity - unwinded_quantity, 0.0)
+        result.reject_reason = "unwound_after_first_fill"
+        result.route = ExecutionRoute.REJECTED
+        result.has_uncertainty = unwind.get("outcome") == "uncertain"
+        if remaining <= 1e-9:
+            result.state = EntryState.FAILED
+            self.journal.append(
+                "entry.unwound_after_first_fill",
+                {
+                    "position_id": ctx.entry_id,
+                    "maker_filled_quantity": maker_fill.quantity,
+                    "unwind_filled_quantity": unwinded_quantity,
+                    "reason": str(decision.get("reason", "lower_expected_loss")),
+                    "terminal": True,
+                },
+            )
+            return result
+
+        result.state = EntryState.FAILED_WITH_RESIDUAL
+        result.residual_task = ResidualExposureTask(
+            position_id=ctx.entry_id,
+            pair_id=f"{ctx.symbol.lower()}:{ctx.long_venue.value}->{ctx.short_venue.value}",
+            symbol=ctx.symbol,
+            long_venue=ctx.long_venue,
+            short_venue=ctx.short_venue,
+            origin=ResidualOrigin.ENTRY_OPEN,
+            exposure_venue=maker_fill.venue,
+            exposure_side=maker_fill.side.opposite(),
+            exposure_quantity=remaining,
+            created_cycle=0,
+            created_at_ms=now_ms,
+            deadline_ms=now_ms + self.deadline_ms,
+        )
+        self.journal.append(
+            "entry.unwind_after_first_fill_residual",
+            {
+                "position_id": ctx.entry_id,
+                "maker_filled_quantity": maker_fill.quantity,
+                "unwind_filled_quantity": unwinded_quantity,
+                "residual_quantity": remaining,
+                "residual_venue": maker_fill.venue.value,
+                "residual_side": maker_fill.side.opposite().value,
+                "unwind_outcome": unwind.get("outcome", "unknown"),
+                "reason": str(decision.get("reason", "lower_expected_loss")),
+            },
+        )
+        return result
 
     async def _submit_order(
         self, request: OrderRequest, position_id: str, leg: str,

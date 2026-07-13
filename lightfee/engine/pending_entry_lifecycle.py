@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from lightfee.config.schema import StrategyConfig
 from lightfee.core.domain import PassiveOrderState
 from lightfee.engine.state import (
     PassiveOrderManagerRuntime,
@@ -62,24 +63,26 @@ def note_passive_operation(pending: Any) -> None:
     pending.passive_ops_total = int(getattr(pending, "passive_ops_total", 0) or 0) + 1
 
 
-def pending_entry_phase_zero_fill_budget(strategy: Any) -> int:
+def pending_entry_phase_zero_fill_budget(strategy: StrategyConfig) -> int:
     """V1: `pending_entry_phase_zero_fill_budget`."""
 
-    budget = int(getattr(strategy, "pending_entry_phase_zero_fill_budget", 0) or 0)
+    budget = int(strategy.pending_entry_phase_zero_fill_budget or 0)
     if budget <= 0:
-        budget = int(getattr(strategy, "maker_phase_max_zero_fill_cycles", 0) or 0)
+        budget = int(strategy.maker_phase_max_zero_fill_cycles or 0)
     return max(1, budget)
 
 
-def _maker_cycle_retry_delay_ms(strategy: Any, completed_cycles: int) -> int:
-    delays = list(getattr(strategy, "maker_cycle_retry_delays_ms", []) or [])
+def _maker_cycle_retry_delay_ms(strategy: StrategyConfig, completed_cycles: int) -> int:
+    delays = list(strategy.maker_cycle_retry_delays_ms or [])
     if not delays:
         return 0
     index = min(max(completed_cycles - 1, 0), len(delays) - 1)
     return max(0, int(delays[index] or 0))
 
 
-def record_pending_entry_zero_fill_cycle(pending: Any, strategy: Any, now_ms: int) -> int:
+def record_pending_entry_zero_fill_cycle(
+    pending: Any, strategy: StrategyConfig, now_ms: int
+) -> int:
     """V1: first half of `handle_pending_entry_zero_fill_completion`."""
 
     phase_state = ensure_pending_entry_phase_state(pending, now_ms)
@@ -380,7 +383,7 @@ def prepare_pending_entry_passive_cycle(
 
 def prepare_pending_entry_remainder_repost(
     pending: Any,
-    strategy: Any,
+    strategy: StrategyConfig,
     *,
     normalized_quantity: float,
     passive_attempt_limit: int = 3,
@@ -397,7 +400,7 @@ def prepare_pending_entry_remainder_repost(
                 "normalized_quantity": None,
             },
         )
-    max_reposts = int(getattr(strategy, "maker_entry_max_reposts", 0) or 0)
+    max_reposts = int(strategy.maker_entry_max_reposts or 0)
     if int(getattr(pending, "repost_attempt_count", 0) or 0) >= max_reposts:
         return PendingEntryLifecycleAction(
             kind="finalized",

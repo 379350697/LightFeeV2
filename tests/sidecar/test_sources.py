@@ -1,4 +1,4 @@
-"""Tests for ExchangeSource, LiquiditySource, TransferSource backing by MarketDataClient."""
+"""Tests for ExchangeSource and LiquiditySource backing by MarketDataClient."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from lightfee.core.domain import Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
-from lightfee.sidecar.sources.transfer import TransferSource
 from lightfee.venues.specs import binance_spec, okx_spec, get_spec
 
 
@@ -85,48 +84,6 @@ class TestLiquiditySource:
         asyncio.run(_run())
 
 
-class TestTransferSource:
-    """TransferSource returns compatible empty results, not sentinel."""
-
-    def test_construct(self):
-        src = TransferSource.for_venue_pair(Venue.BINANCE, Venue.OKX)
-        assert src.from_venue == "binance"
-        assert src.to_venue == "okx"
-
-    def test_fetch_transfer_statuses_returns_list(self):
-        async def _run():
-            src = TransferSource.for_venue_pair(Venue.BINANCE, Venue.OKX)
-            results = await src.fetch_transfer_statuses(["USDT"])
-            assert isinstance(results, list)
-            assert len(results) == 1
-            assert results[0].asset == "USDT"
-            assert results[0].available == 0.0
-            await src.close()
-        asyncio.run(_run())
-
-    @pytest.mark.asyncio
-    async def test_close_continues_after_first_client_close_error(self):
-        closed: list[str] = []
-
-        class FakeClient:
-            def __init__(self, name: str, *, fail: bool = False) -> None:
-                self.name = name
-                self.fail = fail
-
-            async def close(self):
-                closed.append(self.name)
-                if self.fail:
-                    raise RuntimeError(f"{self.name} close failed")
-
-        src = object.__new__(TransferSource)
-        src._from_client = FakeClient("from", fail=True)
-        src._to_client = FakeClient("to")
-
-        await src.close()
-
-        assert closed == ["from", "to"]
-
-
 class TestSidecarServiceRateLimitWiring:
     def test_service_shares_public_rate_limiter_per_venue(self):
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
@@ -147,12 +104,6 @@ class TestSidecarServiceRateLimitWiring:
         assert binance_limiter is not aster_limiter
         assert binance_limiter is not None
         assert aster_limiter is not None
-
-    def test_close(self):
-        async def _run():
-            src = TransferSource.for_venue_pair(Venue.BINANCE, Venue.OKX)
-            await src.close()
-        asyncio.run(_run())
 
     @pytest.mark.asyncio
     async def test_refresh_once_keeps_binance_quotes_when_open_interest_is_slow(self, tmp_path):

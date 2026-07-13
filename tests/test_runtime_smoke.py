@@ -55,7 +55,7 @@ class TestImportSmoke:
         from lightfee.sidecar import snapshot, publisher, pairing, service
 
     def test_strategy_imports(self):
-        from lightfee.strategy import discovery, scoring, market_view, transfer_bias
+        from lightfee.strategy import discovery, market_view
 
     def test_risk_imports(self):
         from lightfee.risk import modes, budgets, health, operator
@@ -92,6 +92,146 @@ class TestImportSmoke:
 
 class TestRuntimeLaneScheduling:
     """V1 parity: run_loop schedules all eight lanes in V1 order."""
+
+    @pytest.mark.asyncio
+    async def test_tick_marks_funding_basis_risk_unhealthy_after_observation_error(
+        self, tmp_path, monkeypatch
+    ):
+        from lightfee.config.schema import RuntimeConfig, PersistenceConfig
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.sidecar.publisher import publish_snapshot
+        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+
+        now_ms = 2_000_000
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="paper",
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_snapshot_max_age_ms=60_000,
+                live_scan_last_good_max_age_ms=60_000,
+                max_market_age_ms=60_000,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+            symbols=["BTCUSDT"],
+        )
+        publish_snapshot(
+            SidecarSnapshot(
+                published_at_ms=now_ms,
+                market_observed_at_ms=now_ms,
+                quotes={
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=now_ms,
+                    )
+                },
+            ),
+            config.runtime.sidecar_snapshot_path,
+        )
+        runtime = LiveRuntime(config)
+        runtime.journal.open()
+
+        class FailingFundingRiskRuntime:
+            def __init__(self) -> None:
+                self.marked_reasons: list[str] = []
+
+            def observe_fresh_snapshot(self, *_args, **_kwargs):
+                raise RuntimeError("basis checkpoint write failed")
+
+            def mark_unhealthy(self, reason: str) -> None:
+                self.marked_reasons.append(reason)
+
+        fake_risk_runtime = FailingFundingRiskRuntime()
+        runtime.funding_risk_runtime = fake_risk_runtime
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+
+        try:
+            await runtime.tick()
+        finally:
+            runtime.journal.close()
+
+        assert fake_risk_runtime.marked_reasons == ["RuntimeError"]
+        assert runtime.state.last_scan["funding_basis_risk"]["checkpoint_healthy"] is False
+
+    @pytest.mark.asyncio
+    async def test_tick_marks_funding_basis_risk_unhealthy_when_snapshot_not_fresh(
+        self, tmp_path, monkeypatch
+    ):
+        from lightfee.config.schema import RuntimeConfig, PersistenceConfig
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.sidecar.publisher import publish_snapshot
+        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+
+        now_ms = 2_000_000
+        config = AppConfig(
+            runtime=RuntimeConfig(
+                mode="paper",
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_snapshot_max_age_ms=60_000,
+                live_scan_last_good_max_age_ms=60_000,
+                max_market_age_ms=60_000,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+            symbols=["BTCUSDT"],
+        )
+        publish_snapshot(
+            SidecarSnapshot(
+                published_at_ms=now_ms,
+                market_observed_at_ms=now_ms,
+                degraded_domains=["perp_liquidity"],
+                quotes={
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=now_ms,
+                    )
+                },
+            ),
+            config.runtime.sidecar_snapshot_path,
+        )
+        runtime = LiveRuntime(config)
+        runtime.journal.open()
+
+        class FundingRiskRuntimeSpy:
+            def __init__(self) -> None:
+                self.marked_reasons: list[str] = []
+                self.observe_calls = 0
+
+            def observe_fresh_snapshot(self, *_args, **_kwargs):
+                self.observe_calls += 1
+                return {"checkpoint_healthy": True}
+
+            def mark_unhealthy(self, reason: str) -> None:
+                self.marked_reasons.append(reason)
+
+        fake_risk_runtime = FundingRiskRuntimeSpy()
+        runtime.funding_risk_runtime = fake_risk_runtime
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+
+        try:
+            await runtime.tick()
+        finally:
+            runtime.journal.close()
+
+        assert fake_risk_runtime.observe_calls == 0
+        assert fake_risk_runtime.marked_reasons == ["fresh_snapshot_required"]
+        assert runtime.state.last_scan["funding_basis_risk"]["checkpoint_healthy"] is False
 
     @pytest.mark.asyncio
     async def test_run_loop_schedules_all_lanes(self, monkeypatch):

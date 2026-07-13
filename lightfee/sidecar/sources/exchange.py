@@ -46,6 +46,20 @@ class ExchangeSource:
     async def close(self) -> None:
         await self._client.close()
 
+    def prime_funding_schedule(self, quotes: list[QuoteSnapshot]) -> None:
+        """Restore observed funding cadence from a prior published snapshot."""
+        self._client.prime_funding_schedule(
+            FundingTicker(
+                venue=quote.venue,
+                symbol=quote.symbol,
+                bid=quote.bid,
+                ask=quote.ask,
+                funding_timestamp_ms=quote.funding_timestamp_ms,
+                funding_interval_ms=quote.funding_interval_ms,
+            )
+            for quote in quotes
+        )
+
     @staticmethod
     def _from_funding_ticker(ft: FundingTicker) -> QuoteSnapshot:
         return QuoteSnapshot(
@@ -59,6 +73,11 @@ class ExchangeSource:
             ask_size=ft.ask_size,
             funding_rate_bps=ft.funding_rate_bps,
             funding_timestamp_ms=ft.funding_timestamp_ms,
+            funding_interval_ms=ft.funding_interval_ms,
+            predicted_funding_rate_bps=ft.predicted_funding_rate_bps,
+            funding_forecast_source=ft.funding_forecast_source,
+            funding_forecast_sample_count=ft.funding_forecast_sample_count,
+            settled_funding_rate_bps=ft.settled_funding_rate_bps,
             mark_price=ft.mark_price,
             index_price=ft.index_price,
             volume_24h_quote=ft.volume_24h_quote,
@@ -73,6 +92,15 @@ class ExchangeSource:
             oi_deferred_count=ft.oi_deferred_count,
             oi_timeout_count=ft.oi_timeout_count,
             oi_refresh_elapsed_ms=ft.oi_refresh_elapsed_ms,
+            underlying=ft.underlying,
+            quote_currency=ft.quote_currency,
+            contract_type=ft.contract_type,
+            contract_multiplier=ft.contract_multiplier,
+            mark_index_source=ft.mark_index_source,
+            price_precision=ft.price_precision,
+            quantity_precision=ft.quantity_precision,
+            venue_status=ft.venue_status,
+            contract_normalization_complete=ft.contract_normalization_complete,
         )
 
     async def fetch_funding_rates(self, symbols: list[str]) -> dict[str, float]:

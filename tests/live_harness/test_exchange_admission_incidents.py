@@ -7,6 +7,7 @@ import pytest
 
 from lightfee.engine.entry import EntryState
 from lightfee.engine.business_contract import entry_route_key
+from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
@@ -53,12 +54,46 @@ class StrictReadonlyDisabledAdapter(TrustedVenueAdapter):
 def make_harness_config(tmp_path: str):
     config = make_test_config(tmp_path)
     config.strategy.pending_entry_pre_submit_hedgeable_fill_guard_enabled = False
+    # Entry-admission tests intentionally begin after final executable BBO
+    # validation.  A fixed, fresh lease keeps their focus on exchange rejects
+    # rather than bypassing the production final-economics gate.
+    config.strategy.entry_readiness_provider = "quote_lease"
+    config.strategy.entry_quote_lease_ttl_ms = 5_000
     return config
+
+
+class StaticQuoteLeaseProvider:
+    def get_lease(self, pair_id: str) -> QuoteLease | None:
+        try:
+            symbol, venues = str(pair_id).split(":", 1)
+            long_venue, short_venue = venues.split("->", 1)
+        except ValueError:
+            return None
+        return QuoteLease(
+            pair_id=str(pair_id),
+            symbol=symbol.upper(),
+            long_venue=long_venue,
+            short_venue=short_venue,
+            long_bid=0.999,
+            long_ask=1.0,
+            short_bid=1.001,
+            short_ask=1.002,
+            long_observed_at_ms=1778787000000,
+            short_observed_at_ms=1778787000000,
+            created_at_ms=1778787000000,
+            expires_at_ms=1778787005000,
+            provider="quote_lease",
+        )
+
+
+def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
+    runtime.entry_readiness_provider = StaticQuoteLeaseProvider()
+    return runtime
 
 
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
     adapter = TrustedVenueAdapter()
-    return LiveRuntime(
+    return _with_final_quote_lease(LiveRuntime(
         make_harness_config(tmp_path),
         venue_adapters={
             Venue.ASTER: adapter,
@@ -67,7 +102,7 @@ def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
             Venue.HYPERLIQUID: adapter,
             Venue.OKX: adapter,
         },
-    )
+    ))
 
 
 def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespace:
@@ -84,6 +119,27 @@ def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespac
         expected_edge_bps=10.0,
         funding_edge_bps=0.0,
         worst_case_edge_bps=8.0,
+        gross_signal_edge_bps=10.0,
+        expected_exit_cross_bps=0.0,
+        entry_fee_bps=0.0,
+        exit_fee_bps=0.0,
+        entry_slippage_bps=0.0,
+        exit_slippage_bps=0.0,
+        adverse_selection_bps=0.0,
+        capital_buffer_bps=0.0,
+        execution_buffer_bps=0.0,
+        venue_risk_haircut_bps=0.0,
+        transfer_or_inventory_bias_bps=0.0,
+        calculation_version="v1_exact",
+        model_epoch="v1_exact",
+        forecast_worst_funding_edge_bps=0.0,
+        # Zero is a valid simulated fee, but all-taker live candidates must
+        # carry explicit fee evidence rather than rely on a default.
+        taker_fee_evidence_complete=True,
+        # This harness exercises exchange-admission paths after a candidate has
+        # already passed the mandatory live economics contract.
+        economics_complete=True,
+        economics_observed_at_ms=1778786999000,
         blocked=False,
         blocked_reasons=[],
     )
@@ -452,13 +508,13 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
         bybit = RejectingBybitPrecheckAdapter(
             "bybit order precheck failed: bybit retCode=33004 retMsg=Your api key has expired"
         )
-        runtime = LiveRuntime(
+        runtime = _with_final_quote_lease(LiveRuntime(
             make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.BYBIT: bybit,
             },
-        )
+        ))
         runtime.journal.open()
 
         class CountingExecutor:
@@ -520,13 +576,13 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
             "max_notional_admission_blocked: requested_notional=23.90043 "
             "remaining_openable_notional=0.0"
         )
-        runtime = LiveRuntime(
+        runtime = _with_final_quote_lease(LiveRuntime(
             make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,
             },
-        )
+        ))
         runtime.journal.open()
 
         class CountingExecutor:
@@ -615,13 +671,13 @@ async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth
             "get_symbol_rules_cache",
             lambda: FakeAsterRulesCache(),
         )
-        runtime = LiveRuntime(
+        runtime = _with_final_quote_lease(LiveRuntime(
             make_harness_config(td),
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,
             },
-        )
+        ))
         runtime.journal.open()
 
         class CountingExecutor:

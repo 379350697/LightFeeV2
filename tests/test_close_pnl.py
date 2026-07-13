@@ -13,6 +13,7 @@ import pytest
 from lightfee.core.domain import Side, Venue
 from lightfee.engine.close_executor import (
     build_exit_pnl_attribution,
+    build_position_pnl_attribution,
 )
 from lightfee.engine.exit import CloseExecution, compute_close_pnl
 from lightfee.engine.state import OpenPosition
@@ -127,6 +128,21 @@ class TestPnLAttribution:
         assert attr["price_pnl_quote"] == -2.0
         assert attr["funding_quote"] == 10.0
         assert attr["net_quote"] == -2.0
+
+    def test_terminal_position_attribution_uses_all_prior_close_chunks_once(self):
+        pos = _make_position(
+            captured_funding_quote=10.0,
+            second_stage_funding_quote=0.0,
+            realized_price_pnl_quote=3.0,
+            realized_exit_fee_quote=4.0,
+        )
+
+        attr = build_position_pnl_attribution(pos)
+
+        assert attr["price_pnl_quote"] == 3.0
+        assert attr["entry_fee_quote"] == 5.0
+        assert attr["exit_fee_quote"] == 4.0
+        assert attr["net_quote"] == 4.0
 
 
 # ---------------------------------------------------------------------------

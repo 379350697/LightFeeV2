@@ -11,6 +11,8 @@ from typing import Optional
 
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    EntryLeverageEvidence,
+    FundingSettlement,
     AccountRiskSnapshot,
     AssetTransferStatus,
     ExecutionLiquiditySnapshot,
@@ -85,6 +87,29 @@ class VenueAdapter(ABC):
 
     async def fetch_account_balance_snapshot(self) -> Optional[AccountBalanceSnapshot]:
         return None
+
+    async def fetch_funding_settlements(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[FundingSettlement]:
+        """Return private account funding statements in the requested window.
+
+        An empty result means no evidence was available; it never means that
+        funding was zero.  The engine allocates returned account facts to an
+        internal position separately, so adapters must preserve exchange
+        statement identity and timestamps.
+        """
+        transport = getattr(self, "_transport", None)
+        if transport is not None and hasattr(transport, "fetch_funding_settlements"):
+            return await transport.fetch_funding_settlements(
+                symbol,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+            )
+        return []
 
     async def fetch_order_fill_reconciliation(
         self,
@@ -212,8 +237,8 @@ class VenueAdapter(ABC):
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
-        pass
+    ) -> EntryLeverageEvidence | None:
+        return None
 
     @property
     def supports_risk_health(self) -> bool:

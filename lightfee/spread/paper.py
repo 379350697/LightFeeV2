@@ -1,66 +1,53 @@
-"""Shadow paper tracking for spread-reversion candidates."""
+"""Conservative, journalled paper execution for signed-basis spread signals.
+
+The paper engine deliberately models an executable two-leg trade, not a mark-to-
+market of a theoretical cross-exchange spread.  ``taker/taker`` is the only
+official acceptance cohort.  Maker experiments are retained as controls but
+remain non-official unless a trade-tape/queue adapter is added.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
+from math import isfinite
 
 from lightfee.offline.paper_outcome import classify_paper_outcome
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.models import SpreadReversionCandidate
-
-
-DEFAULT_SPREAD_PAPER_BOT_IDS = (
-    "tt_conservative",
-    "mt_long_maker",
-    "mt_short_maker",
-    "mt_selected_maker",
-    "mt_selected_maker_delay_1000ms",
-    "core_v1_bot",
-    "core_v1_exec100_bot",
-    "core_v1_z10_bot",
-    "bad_pair_control_bot",
-    "low_liquidity_control_bot",
-    "low_edge_control_bot",
+from lightfee.spread.research_manifest import (
+    DEFAULT_SPREAD_RESEARCH_MANIFEST,
+    SpreadResearchManifest,
 )
 
-GOOD_SPREAD_PAIRS = {
-    ("binance", "gate"),
-    ("gate", "binance"),
-    ("gate", "bybit"),
-    ("gate", "bitget"),
-    ("bybit", "gate"),
-    ("gate", "aster"),
-}
 
-BAD_SPREAD_PAIRS = {
-    ("hyperliquid", "aster"),
-    ("hyperliquid", "gate"),
-    ("aster", "bitget"),
-    ("binance", "bybit"),
-    ("binance", "bitget"),
-    ("aster", "bybit"),
-}
+SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 2
+
+
+class PaperOrderState(StrEnum):
+    NEW = "NEW"
+    WORKING = "WORKING"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
 class SpreadPaperBotSpec:
     bot_id: str
     cohort: str
+    hypothesis: str = ""
+    manifest_version: str = "spread_research_manifest_v2"
+    acceptance_eligible: bool = False
     entry_long_role: str = "taker"
     entry_short_role: str = "taker"
     exit_long_role: str = "taker"
     exit_short_role: str = "taker"
     maker_leg: str = ""
     hedge_delay_ms: int = 0
-    delayed_leg: str = ""
     control_group: bool = False
-    min_executable_spread_bps: float | None = None
-    min_net_edge_bps: float | None = None
-    min_z_score: float | None = None
-    require_good_pair: bool = False
-    require_bad_pair: bool = False
-    require_low_liquidity: bool = False
-    require_low_edge: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,13 +63,42 @@ class SpreadPaperConfig:
     taker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     maker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     slippage_buffer_bps: float = 0.0
-    default_funding_interval_ms: int = 28_800_000
-    excluded_symbols: list[str] = field(default_factory=lambda: ["BBUSDT", "QNTUSDT"])
+    excluded_symbols: list[str] = field(default_factory=list)
     allowed_opportunity_labels: list[str] = field(
         default_factory=lambda: ["spread_reversion"]
     )
     episode_cooldown_ms: int = 1_800_000
     paper_bot_ids: list[str] = field(default_factory=lambda: ["tt_conservative"])
+    model_epoch: str = "v2_signed_reversion"
+    primary_fill_model: str = "taker_taker"
+    require_taker_taker: bool = True
+    quote_ttl_ms: int = 1_000
+    # Paper PnL must use a contemporaneous two-venue observation.  Reuse the
+    # signal skew contract rather than treating two individually fresh quotes
+    # as an executable exit.
+    quote_skew_ms: int = 250
+    research_manifest: SpreadResearchManifest = field(
+        default_factory=lambda: DEFAULT_SPREAD_RESEARCH_MANIFEST
+    )
+
+
+@dataclass(frozen=True)
+class FundingSettlement:
+    """An exact funding credit/debit allocated to one paper position leg.
+
+    Funding records supplied by an exchange are account-level facts. They may
+    only enter an individual paper position after the caller has supplied the
+    position and leg allocation key, rather than being inferred from the entry
+    quote. ``amount_quote`` uses account PnL sign convention: positive is a
+    credit and negative is a debit.
+    """
+
+    paper_id: str
+    leg_side: str
+    settlement_timestamp_ms: int
+    amount_quote: float
+    observed_at_ms: int
+    source: str
 
 
 @dataclass(frozen=True)
@@ -110,6 +126,17 @@ class SpreadPaperLeg:
     entry_slippage_quote: float
     funding_rate_bps: float
     funding_timestamp_ms: int
+    funding_interval_ms: int = 0
+    entry_filled_at_ms: int = 0
+    order_state: str = PaperOrderState.NEW.value
+    requested_qty: float = 0.0
+    residual_qty: float = 0.0
+    funding_settlements: tuple[FundingSettlement, ...] = ()
+    funding_settlement_conflict: bool = False
+    # ``l2_vwap`` is only emitted when the published snapshot supplied a
+    # coherent depth ladder.  All legacy and BBO-only positions keep the
+    # explicit top-book label, rather than pretending to have VWAP evidence.
+    entry_execution_source: str = "top_book_only"
 
 
 @dataclass(frozen=True)
@@ -136,61 +163,80 @@ class SpreadPaperPosition:
     candidate_snapshot: dict
     entry_market_snapshot: dict
     due_horizons: list[dict]
+    requested_base_qty: float = 0.0
+    filled_base_qty: float = 0.0
+    residual_base_qty: float = 0.0
+    # Matched quantity is distinct from temporary naked maker exposure.
+    delta_exposure_base_qty: float = 0.0
+    maker_fill_observed_at_ms: int = 0
+    model_epoch: str = "v2_signed_reversion"
+    # Official PnL is permissioned evidence, never a dataclass convenience
+    # default.  The paper state machine grants it only to a complete baseline
+    # taker/taker fill, and markout additionally requires settlement proof.
+    official_pnl: bool = False
+    research_manifest_version: str = "spread_research_manifest_v2"
+    research_hypothesis: str = ""
+    acceptance_eligible: bool = False
+
+
+@dataclass(frozen=True)
+class _ExecutionEstimate:
+    """A price/capacity observation for one paper leg.
+
+    ``capacity`` is what the actually observed book can absorb.  It is not a
+    liquidity forecast, so callers must use a common quantity across both
+    legs and re-evaluate the VWAP at that matched quantity.
+    """
+
+    price: float
+    capacity: float
+    source: str
 
 
 class SpreadPaperTracker:
+    """State machine for paper-only execution and PnL attribution."""
+
     def __init__(self, config: SpreadPaperConfig) -> None:
         self.config = config
         self._positions: dict[str, SpreadPaperPosition] = {}
         self._emitted_horizons: dict[str, set[str]] = {}
-        self._skipped_horizons: dict[str, set[str]] = {}
         self._known_paper_ids: set[str] = set()
         self._episode_started_at_ms: dict[tuple[str, str, str, str], int] = {}
 
     @property
     def enabled(self) -> bool:
-        return self.config.enabled and self.config.finalist_limit > 0
+        # The primary acceptance cohort is deliberately fixed at taker/taker.
+        # A config typo must disable paper admission rather than silently turn
+        # a maker control into the official result stream.
+        return (
+            self.config.enabled is True
+            and self.config.finalist_limit > 0
+            and str(self.config.primary_fill_model or "").lower() == "taker_taker"
+            and self.config.require_taker_taker is True
+            and self.config.research_manifest.model_epoch == self.config.model_epoch
+        )
 
     @property
     def tracked_count(self) -> int:
         return len(self._positions)
 
     def missing_due_quote_keys(
-        self,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
+        self, now_ms: int, quotes: dict[str, QuoteSnapshot]
     ) -> set[tuple[str, str]]:
         return self.missing_evaluation_quote_keys(now_ms, quotes)
 
     def missing_evaluation_quote_keys(
-        self,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
+        self, now_ms: int, quotes: dict[str, QuoteSnapshot]
     ) -> set[tuple[str, str]]:
         if not self.enabled:
             return set()
         missing: set[tuple[str, str]] = set()
         for position in self._positions.values():
             if _position_has_pending_entry(position):
-                delay_ms = max(int(position.paper_hedge_delay_ms or 0), 0)
-                if now_ms < position.registered_at_ms + delay_ms:
-                    continue
-                missing.update(self._missing_entry_quote_keys(position, quotes))
+                missing.update(_missing_quote_keys(position, quotes))
                 continue
-            if (
-                self.config.active_exit_enabled
-                and now_ms > int(position.registered_at_ms or 0)
-            ):
-                missing.update(self._missing_exit_quote_keys(position, quotes))
-            emitted = self._emitted_horizons.get(position.paper_id, set())
-            for horizon in position.due_horizons:
-                horizon_kind = str(horizon["kind"])
-                if int(horizon["due_at_ms"]) > now_ms:
-                    continue
-                if horizon_kind in emitted:
-                    continue
-                missing.update(self._missing_exit_quote_keys(position, quotes))
-                break
+            if self._has_due_evaluation(position, now_ms):
+                missing.update(_missing_quote_keys(position, quotes))
         return missing
 
     def register(
@@ -210,32 +256,51 @@ class SpreadPaperTracker:
         *,
         finalist_rank: int,
     ) -> list[dict]:
-        if not self.enabled:
+        if not self.enabled or finalist_rank >= self.config.finalist_limit:
             return []
-        if finalist_rank >= self.config.finalist_limit:
+        if (
+            candidate.signal_status != "entry_ready"
+            or candidate.economics_complete is not True
+            or candidate.fee_evidence_complete is not True
+        ):
             return []
-        if str(candidate.signal_status) != "entry_ready":
+        # Do not let a manually constructed candidate turn an unverified
+        # contract into an official paper observation.  Snapshot v1/v2
+        # compatibility defaults to ``unknown`` and must remain diagnostic
+        # only until the signed-basis builder proves the two legs compatible.
+        if str(candidate.contract_normalization_status or "").lower() != "complete":
             return []
-        opportunity_label = str(
-            getattr(candidate, "opportunity_label", "") or "spread_reversion"
-        )
-        if str(candidate.symbol).upper() in _excluded_symbols(self.config):
+        if candidate.calculation_version != "spread_v2_signed_reversion":
             return []
-        allowed_labels = _allowed_labels(self.config)
-        if allowed_labels and opportunity_label not in allowed_labels:
+        if str(candidate.model_epoch or "") != self.config.model_epoch:
+            return []
+        if candidate.symbol.upper() in _excluded_symbols(self.config):
+            return []
+        if _allowed_labels(self.config) and candidate.opportunity_label not in _allowed_labels(self.config):
             return []
         long_quote = _quote_for(quotes, candidate.long_venue, candidate.symbol)
         short_quote = _quote_for(quotes, candidate.short_venue, candidate.symbol)
         if long_quote is None or short_quote is None:
             return []
+        if not _quotes_fresh(
+            long_quote,
+            short_quote,
+            now_ms=candidate.signal_ts_ms,
+            ttl_ms=self.config.quote_ttl_ms,
+            quote_skew_ms=self.config.quote_skew_ms,
+        ):
+            return []
+
         events: list[dict] = []
         for bot in _paper_bot_specs(self.config):
-            if not _bot_accepts_candidate(bot, candidate, long_quote, short_quote):
-                continue
-            if self._episode_in_cooldown(candidate, opportunity_label, bot.bot_id):
+            if not _paper_fee_evidence_complete(
+                self.config,
+                candidate,
+                bot,
+            ):
                 continue
             paper_id = _paper_id(candidate, bot.bot_id)
-            if paper_id in self._known_paper_ids:
+            if paper_id in self._known_paper_ids or self._episode_in_cooldown(candidate, bot.bot_id):
                 continue
             position = self._build_position(
                 paper_id=paper_id,
@@ -255,408 +320,207 @@ class SpreadPaperTracker:
         return events
 
     def restore_from_records(self, records: list[dict]) -> None:
-        """Restore open paper orders from the local paper journal."""
+        """Restore v2 open positions; legacy records remain diagnostic-only."""
         self._positions.clear()
         self._emitted_horizons.clear()
-        self._skipped_horizons.clear()
         self._known_paper_ids.clear()
         self._episode_started_at_ms.clear()
         for record in records:
             kind = str(record.get("kind", "") or "")
-            payload = record.get("payload", {})
+            payload = record.get("payload")
             if not isinstance(payload, dict):
                 continue
             paper_id = str(payload.get("paper_id", "") or "")
             if not paper_id:
                 continue
-            if kind == "opportunity.paper_registered":
-                position = _position_from_registration_payload(payload)
+            if kind in {
+                "opportunity.paper_registered",
+                "opportunity.paper_maker_fill_observed",
+                "opportunity.paper_hedge_filled",
+                "opportunity.paper_funding_settlement_observed",
+            }:
+                # A journal is an external restart boundary.  Older records
+                # remain readable on disk, but may not acquire current-model
+                # execution authority or official-PnL status by being loaded
+                # into a newer process.
+                if not _restorable_current_v2_record(payload, self.config):
+                    self._known_paper_ids.add(paper_id)
+                    continue
+                position = _position_from_payload(payload)
                 if position is None:
                     continue
+                if not _restored_position_has_fee_evidence(position, self.config):
+                    self._known_paper_ids.add(paper_id)
+                    continue
+                if not _restored_position_is_official_eligible(position):
+                    position = replace(position, official_pnl=False)
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
                 self._emitted_horizons.setdefault(paper_id, set())
-                self._skipped_horizons.setdefault(paper_id, set())
                 self._record_episode(position)
-            elif kind == "opportunity.paper_hedge_filled":
-                position = _position_from_registration_payload(payload)
-                if position is None:
-                    continue
+            elif kind in {"opportunity.paper_markout", "opportunity.paper_delta_markout", "opportunity.paper_closed", "opportunity.paper_expired"}:
                 self._known_paper_ids.add(paper_id)
-                self._positions[paper_id] = position
-                self._emitted_horizons.setdefault(paper_id, set())
-                self._skipped_horizons.setdefault(paper_id, set())
-                self._record_episode(position)
-            elif kind == "opportunity.paper_evaluation_skipped":
-                self._record_episode_from_payload(payload)
-                self._known_paper_ids.add(paper_id)
-                horizon_kind = str(payload.get("horizon_kind", "") or "")
-                if horizon_kind:
-                    self._skipped_horizons.setdefault(paper_id, set()).add(horizon_kind)
-            elif kind in {"opportunity.paper_markout", "opportunity.paper_closed"}:
-                self._record_episode_from_payload(payload)
-                self._known_paper_ids.add(paper_id)
-                horizon_kind = str(payload.get("horizon_kind", "") or "")
-                if horizon_kind:
-                    self._emitted_horizons.setdefault(paper_id, set()).add(horizon_kind)
-                if kind == "opportunity.paper_closed":
+                horizon = str(payload.get("horizon_kind", "") or "")
+                if horizon:
+                    self._emitted_horizons.setdefault(paper_id, set()).add(horizon)
+                if kind in {"opportunity.paper_closed", "opportunity.paper_expired"}:
                     self._positions.pop(paper_id, None)
                     self._emitted_horizons.pop(paper_id, None)
-                    self._skipped_horizons.pop(paper_id, None)
 
-    def evaluate_due(
+    def record_funding_settlements(
+        self,
+        settlements: list[FundingSettlement],
+    ) -> list[dict]:
+        """Attach actual, pre-allocated funding facts to live paper positions.
+
+        The paper tracker deliberately refuses account-level or forecast rates:
+        callers must provide the target ``paper_id`` and ``leg_side``. This
+        keeps overlapping positions from silently sharing a settlement and
+        makes official PnL fail closed until a real allocation is present.
+        """
+        events: list[dict] = []
+        for settlement in settlements:
+            position = self._positions.get(str(settlement.paper_id or ""))
+            if position is None or not _valid_funding_settlement(position, settlement):
+                continue
+            current_leg = (
+                position.long_leg
+                if settlement.leg_side == "long"
+                else position.short_leg
+            )
+            existing = next(
+                (
+                    item
+                    for item in current_leg.funding_settlements
+                    if int(item.settlement_timestamp_ms)
+                    == int(settlement.settlement_timestamp_ms)
+                ),
+                None,
+            )
+            if current_leg.funding_settlement_conflict:
+                continue
+            if existing is not None and float(existing.amount_quote) == float(
+                settlement.amount_quote
+            ):
+                # A sidecar can refresh several times inside the post-settlement
+                # proof window.  One immutable cash fact gets one journal
+                # event; replay is still defensively idempotent for crashes.
+                continue
+            next_leg = _with_funding_settlement(current_leg, settlement)
+            next_position = (
+                replace(position, long_leg=next_leg)
+                if settlement.leg_side == "long"
+                else replace(position, short_leg=next_leg)
+            )
+            self._positions[position.paper_id] = next_position
+            events.append(_funding_settlement_observed_event(next_position, settlement))
+        return events
+
+    def record_observed_public_funding_settlements(
         self,
         now_ms: int,
         quotes: dict[str, QuoteSnapshot],
     ) -> list[dict]:
+        """Allocate a just-observed public settled rate to paper legs.
+
+        A paper position has no exchange account statement, so account-level
+        funding ledgers cannot identify it.  The public sidecar instead
+        supplies an explicitly labelled *settled* rate and a contemporaneous
+        mark.  We use that fact only when it was observed within the normal
+        quote TTL immediately after the known settlement timestamp.  A late,
+        absent, malformed, or schedule-inconsistent observation deliberately
+        produces no ledger row; official PnL then remains fail-closed.
+        """
+        settlements: list[FundingSettlement] = []
+        for position in self._positions.values():
+            settlements.extend(
+                _public_settled_funding_for_position(
+                    position,
+                    now_ms=int(now_ms),
+                    quotes=quotes,
+                    config=self.config,
+                )
+            )
+        return self.record_funding_settlements(settlements)
+
+    def evaluate_due(self, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> list[dict]:
         if not self.enabled:
             return []
-        events: list[dict] = self._fill_due_pending_hedges(now_ms, quotes)
-        closed_ids: list[str] = []
+        events: list[dict] = []
+        closed: set[str] = set()
         for position in list(self._positions.values()):
             if _position_has_pending_entry(position):
-                continue
-            emitted = self._emitted_horizons.setdefault(position.paper_id, set())
-            due_horizons = self._pending_due_horizons(position, now_ms, emitted)
-            due_horizon = due_horizons[0] if due_horizons else None
-            active_check_due = (
-                self.config.active_exit_enabled
-                and now_ms > int(position.registered_at_ms or 0)
-            )
-            if active_check_due:
-                skip_reason = self._exit_pricing_skip_reason(position, quotes)
-                if skip_reason is not None:
-                    horizon = due_horizon or {
-                        "kind": "active_exit_check",
-                        "due_at_ms": now_ms,
-                        "terminal": False,
-                    }
-                    horizon_kind = str(horizon["kind"])
-                    skipped = self._skipped_horizons.setdefault(position.paper_id, set())
-                    if horizon_kind not in skipped:
-                        events.append(
-                            self._build_skipped_event(
-                                position=position,
-                                horizon=horizon,
-                                now_ms=now_ms,
-                                quotes=quotes,
-                                reason=skip_reason,
-                            )
-                        )
-                        skipped.add(horizon_kind)
-                    continue
-                active_horizon = self._active_exit_horizon(position, now_ms, quotes)
-                if active_horizon is not None:
-                    emitted.add(str(active_horizon["kind"]))
+                transition = self._advance_pending_entry(position, now_ms, quotes)
+                if transition is not None:
+                    position, transition_kind = transition
+                    self._positions[position.paper_id] = position
+                    if transition_kind == "maker_fill_observed":
+                        events.append(_maker_fill_observed_event(position))
+                    else:
+                        events.append(_hedge_filled_event(position))
+                elif self._terminal_due(position, now_ms):
                     events.append(
-                        self._build_due_event(
-                            position=position,
-                            horizon=active_horizon,
-                            now_ms=now_ms,
-                            quotes=quotes,
+                        _expired_event(
+                            position,
+                            now_ms,
+                            quotes,
+                            "entry_not_filled",
+                            self.config,
                         )
                     )
-                    closed_ids.append(position.paper_id)
-                    continue
-            if not due_horizons:
-                continue
-            for due_horizon in due_horizons:
-                horizon_kind = str(due_horizon["kind"])
-                skip_reason = self._exit_pricing_skip_reason(position, quotes)
-                if skip_reason is not None:
-                    skipped = self._skipped_horizons.setdefault(position.paper_id, set())
-                    if horizon_kind not in skipped:
+                    closed.add(position.paper_id)
+                elif position.maker_fill_observed_at_ms > 0:
+                    # A maker cross leaves a directional exposure until the
+                    # delayed hedge is eligible.  Persist every scheduled
+                    # markout instead of hiding adverse movement until expiry.
+                    horizon = self._next_horizon(position, now_ms)
+                    if horizon is not None:
                         events.append(
-                            self._build_skipped_event(
-                                position=position,
-                                horizon=due_horizon,
-                                now_ms=now_ms,
-                                quotes=quotes,
-                                reason=skip_reason,
+                            _delta_markout_event(
+                                position,
+                                horizon,
+                                now_ms,
+                                quotes,
+                                self.config,
                             )
                         )
-                        skipped.add(horizon_kind)
+                        self._emitted_horizons.setdefault(position.paper_id, set()).add(
+                            str(horizon["kind"])
+                        )
+                continue
+
+            active = self._active_exit_horizon(position, now_ms, quotes)
+            # A delayed evaluator must emit every outstanding observation in
+            # chronological order.  Emitting only the first due markout would
+            # leave the terminal close open until another refresh, which is a
+            # false lifecycle state for a paper position.
+            horizons = [active] if active is not None else [
+                horizon
+                for horizon in position.due_horizons
+                if int(horizon["due_at_ms"]) <= now_ms
+            ]
+            if not horizons:
+                continue
+            emitted = self._emitted_horizons.setdefault(position.paper_id, set())
+            for horizon in horizons:
+                horizon_kind = str(horizon["kind"])
+                if horizon_kind in emitted:
                     continue
-                emitted.add(horizon_kind)
-                event = self._build_due_event(
-                    position=position,
-                    horizon=due_horizon,
-                    now_ms=now_ms,
-                    quotes=quotes,
-                )
+                if not self._exit_quotes_fresh(position, now_ms, quotes):
+                    event = _unpriced_event(
+                        position, horizon, now_ms, quotes, self.config
+                    )
+                else:
+                    event = self._build_due_event(position, horizon, now_ms, quotes)
                 events.append(event)
-                if bool(due_horizon["terminal"]):
-                    closed_ids.append(position.paper_id)
-        for paper_id in closed_ids:
+                emitted.add(horizon_kind)
+                if bool(horizon.get("terminal")):
+                    closed.add(position.paper_id)
+                    break
+        for paper_id in closed:
             self._positions.pop(paper_id, None)
             self._emitted_horizons.pop(paper_id, None)
-            self._skipped_horizons.pop(paper_id, None)
         return events
-
-    def _pending_due_horizons(
-        self,
-        position: SpreadPaperPosition,
-        now_ms: int,
-        emitted: set[str],
-    ) -> list[dict]:
-        due: list[dict] = []
-        for horizon in position.due_horizons:
-            horizon_kind = str(horizon["kind"])
-            if int(horizon["due_at_ms"]) > now_ms:
-                continue
-            if horizon_kind in emitted:
-                continue
-            due.append(horizon)
-        return due
-
-    def _active_exit_horizon(
-        self,
-        position: SpreadPaperPosition,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> dict | None:
-        reason, spread_mid_bps, z_score = self._active_exit_reason(
-            position,
-            now_ms,
-            quotes,
-        )
-        if reason is None:
-            return None
-        return {
-            "kind": f"active_exit:{reason}",
-            "due_at_ms": now_ms,
-            "terminal": True,
-            "close_reason": reason,
-            "exit_spread_mid_bps": spread_mid_bps,
-            "exit_z_score": z_score,
-        }
-
-    def _active_exit_reason(
-        self,
-        position: SpreadPaperPosition,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> tuple[str | None, float | None, float | None]:
-        max_hold_ms = max(int(self.config.max_hold_ms or 0), 0)
-        if (
-            max_hold_ms > 0
-            and now_ms - int(position.registered_at_ms or 0) > max_hold_ms
-        ):
-            return "spread_max_hold_elapsed", None, None
-
-        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        spread_mid_bps = _spread_mid_bps(long_quote, short_quote)
-        z_score = _position_exit_z_score(position, spread_mid_bps)
-        if z_score is None:
-            return None, spread_mid_bps, None
-        stop_z = max(float(self.config.stop_z or 0.0), 0.0)
-        if stop_z > 0.0 and z_score >= stop_z:
-            return "spread_stop_z_reached", spread_mid_bps, z_score
-        exit_z = max(float(self.config.exit_z or 0.0), 0.0)
-        if abs(z_score) <= exit_z:
-            return "spread_converged", spread_mid_bps, z_score
-        return None, spread_mid_bps, z_score
-
-    def _exit_pricing_skip_reason(
-        self,
-        position: SpreadPaperPosition,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> str | None:
-        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        if long_quote is None or short_quote is None:
-            return "missing_exit_quotes"
-        long_exit_raw = _exit_raw_price(
-            long_quote,
-            side="long",
-            role=position.long_leg.exit_liquidity_role,
-        )
-        short_exit_raw = _exit_raw_price(
-            short_quote,
-            side="short",
-            role=position.short_leg.exit_liquidity_role,
-        )
-        if long_exit_raw <= 0.0 or short_exit_raw <= 0.0:
-            return "invalid_exit_prices"
-        if (
-            position.long_leg.entry_raw_price is None
-            or position.short_leg.entry_raw_price is None
-        ):
-            return "missing_entry_prices"
-        return None
-
-    def _missing_entry_quote_keys(
-        self,
-        position: SpreadPaperPosition,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> set[tuple[str, str]]:
-        missing: set[tuple[str, str]] = set()
-        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        if long_quote is None or _entry_raw_price(
-            long_quote,
-            "long",
-            position.long_leg.entry_liquidity_role,
-        ) <= 0.0:
-            missing.add((position.long_venue, position.symbol))
-        if short_quote is None or _entry_raw_price(
-            short_quote,
-            "short",
-            position.short_leg.entry_liquidity_role,
-        ) <= 0.0:
-            missing.add((position.short_venue, position.symbol))
-        return missing
-
-    def _missing_exit_quote_keys(
-        self,
-        position: SpreadPaperPosition,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> set[tuple[str, str]]:
-        missing: set[tuple[str, str]] = set()
-        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        if long_quote is None or _exit_raw_price(
-            long_quote,
-            side="long",
-            role=position.long_leg.exit_liquidity_role,
-        ) <= 0.0:
-            missing.add((position.long_venue, position.symbol))
-        if short_quote is None or _exit_raw_price(
-            short_quote,
-            side="short",
-            role=position.short_leg.exit_liquidity_role,
-        ) <= 0.0:
-            missing.add((position.short_venue, position.symbol))
-        return missing
-
-    def _build_skipped_event(
-        self,
-        *,
-        position: SpreadPaperPosition,
-        horizon: dict,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
-        reason: str,
-    ) -> dict:
-        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        payload = self._build_payload(
-            position=position,
-            horizon_kind=str(horizon["kind"]),
-            now_ms=now_ms,
-            long_quote=long_quote,
-            short_quote=short_quote,
-        )
-        payload["paper_skip_reason"] = reason
-        payload["paper_skip_terminal"] = bool(horizon["terminal"])
-        return {"kind": "opportunity.paper_evaluation_skipped", "payload": payload}
-
-    def _fill_due_pending_hedges(
-        self,
-        now_ms: int,
-        quotes: dict[str, QuoteSnapshot],
-    ) -> list[dict]:
-        events: list[dict] = []
-        for position in list(self._positions.values()):
-            if not _position_has_pending_entry(position):
-                continue
-            delay_ms = max(int(position.paper_hedge_delay_ms or 0), 0)
-            if now_ms < position.registered_at_ms + delay_ms:
-                continue
-            long_quote = _quote_for(quotes, position.long_venue, position.symbol)
-            short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-            if long_quote is None or short_quote is None:
-                continue
-            filled = self._fill_pending_hedge(position, long_quote, short_quote)
-            if filled is None:
-                continue
-            self._positions[position.paper_id] = filled
-            events.append(_hedge_filled_event(filled))
-        return events
-
-    def _fill_pending_hedge(
-        self,
-        position: SpreadPaperPosition,
-        long_quote: QuoteSnapshot,
-        short_quote: QuoteSnapshot,
-    ) -> SpreadPaperPosition | None:
-        if position.long_leg.entry_pending:
-            long_leg = self._entry_leg(
-                venue=position.long_venue,
-                side="long",
-                role=position.long_leg.entry_liquidity_role,
-                notional_quote=position.entry_notional_quote,
-                quote=long_quote,
-            )
-            if long_leg is None:
-                return None
-            return replace(position, long_leg=long_leg)
-        if position.short_leg.entry_pending:
-            short_leg = self._entry_leg(
-                venue=position.short_venue,
-                side="short",
-                role=position.short_leg.entry_liquidity_role,
-                notional_quote=position.entry_notional_quote,
-                quote=short_quote,
-            )
-            if short_leg is None:
-                return None
-            return replace(position, short_leg=short_leg)
-        return position
-
-    def _episode_in_cooldown(
-        self,
-        candidate: SpreadReversionCandidate,
-        opportunity_label: str,
-        paper_bot_id: str,
-    ) -> bool:
-        cooldown_ms = max(int(self.config.episode_cooldown_ms or 0), 0)
-        if cooldown_ms <= 0:
-            return False
-        signal_ts_ms = int(candidate.signal_ts_ms or 0)
-        if signal_ts_ms <= 0:
-            return False
-        key = _episode_key(
-            candidate.symbol,
-            candidate.long_venue,
-            candidate.short_venue,
-            opportunity_label,
-            paper_bot_id,
-        )
-        last_started_at_ms = int(self._episode_started_at_ms.get(key, 0) or 0)
-        return last_started_at_ms > 0 and signal_ts_ms - last_started_at_ms < cooldown_ms
-
-    def _record_episode(self, position: SpreadPaperPosition) -> None:
-        key = _episode_key(
-            position.symbol,
-            position.long_venue,
-            position.short_venue,
-            position.candidate_opportunity_label,
-            position.paper_bot_id,
-        )
-        started_at_ms = int(position.registered_at_ms or 0)
-        if started_at_ms <= 0:
-            return
-        self._episode_started_at_ms[key] = max(
-            int(self._episode_started_at_ms.get(key, 0) or 0),
-            started_at_ms,
-        )
-
-    def _record_episode_from_payload(self, payload: dict) -> None:
-        symbol = str(payload.get("symbol", "") or "")
-        long_venue = str(payload.get("long_venue", "") or "")
-        short_venue = str(payload.get("short_venue", "") or "")
-        label = str(payload.get("candidate_opportunity_label", "") or "spread_reversion")
-        paper_bot_id = str(payload.get("paper_bot_id", "") or "tt_conservative")
-        started_at_ms = int(payload.get("registered_at_ms", 0) or 0)
-        if not symbol or not long_venue or not short_venue or started_at_ms <= 0:
-            return
-        key = _episode_key(symbol, long_venue, short_venue, label, paper_bot_id)
-        self._episode_started_at_ms[key] = max(
-            int(self._episode_started_at_ms.get(key, 0) or 0),
-            started_at_ms,
-        )
 
     def _build_position(
         self,
@@ -668,930 +532,1323 @@ class SpreadPaperTracker:
         finalist_rank: int,
         bot: SpreadPaperBotSpec,
     ) -> SpreadPaperPosition | None:
-        entry_notional = float(candidate.entry_notional_quote or 0.0)
-        if entry_notional <= 0.0:
+        # A BBO timestamp says when the market observation was made, not when
+        # the simulator entered the position.  Funding eligibility is a
+        # lifecycle fact, so use the signal/admission instant for a taker
+        # simulation and the later state-machine event instant for maker legs.
+        simulated_entry_at_ms = int(candidate.signal_ts_ms or 0)
+        if simulated_entry_at_ms <= 0:
             return None
-        resolved = _resolve_bot_roles(bot, long_quote, short_quote)
-        delayed_leg = resolved.delayed_leg
-        long_leg = self._entry_leg(
-            venue=candidate.long_venue,
-            side="long",
-            role=resolved.entry_long_role,
-            notional_quote=entry_notional,
-            quote=long_quote,
-            pending=delayed_leg == "long",
-        )
-        short_leg = self._entry_leg(
-            venue=candidate.short_venue,
-            side="short",
-            role=resolved.entry_short_role,
-            notional_quote=entry_notional,
-            quote=short_quote,
-            pending=delayed_leg == "short",
-        )
-        if long_leg is None or short_leg is None:
+        target_notional = float(candidate.entry_notional_quote or 0.0)
+        long_raw = _entry_raw_price(long_quote, "long", bot.entry_long_role)
+        short_raw = _entry_raw_price(short_quote, "short", bot.entry_short_role)
+        if target_notional <= 0.0 or long_raw <= 0.0 or short_raw <= 0.0:
             return None
-        long_leg = replace(long_leg, exit_liquidity_role=resolved.exit_long_role)
-        short_leg = replace(short_leg, exit_liquidity_role=resolved.exit_short_role)
-        entry_mode = f"long_{resolved.entry_long_role}:short_{resolved.entry_short_role}"
-        exit_mode = f"long_{resolved.exit_long_role}:short_{resolved.exit_short_role}"
+        requested_qty = target_notional / max(long_raw, short_raw)
+        if requested_qty <= 0.0:
+            return None
+        if not _paper_bot_execution_supported(bot):
+            return None
+        maker = _paper_bot_has_entry_maker(bot)
+        if maker:
+            long_leg = _pending_leg(
+                long_quote, candidate.long_venue, "long", bot.entry_long_role, long_raw, requested_qty, self.config
+            )
+            short_leg = _pending_leg(
+                short_quote, candidate.short_venue, "short", bot.entry_short_role, short_raw, requested_qty, self.config
+            )
+            filled_qty = 0.0
+            residual_qty = requested_qty
+        else:
+            long_execution = _entry_execution(
+                long_quote, "long", bot.entry_long_role, requested_qty
+            )
+            short_execution = _entry_execution(
+                short_quote, "short", bot.entry_short_role, requested_qty
+            )
+            if long_execution is None or short_execution is None:
+                return None
+            filled_qty = min(
+                requested_qty,
+                long_execution.capacity,
+                short_execution.capacity,
+            )
+            # A deeper ask ladder can make the BBO-derived requested quantity
+            # cost more than the candidate's per-leg notional cap.  Solve the
+            # common base quantity against actual cashflows before recording a
+            # fill; never let VWAP turn a conservative signal into a larger
+            # position.
+            filled_qty = min(
+                filled_qty,
+                _entry_quantity_under_notional_cap(
+                    long_quote, "long", bot.entry_long_role, filled_qty, target_notional
+                ),
+                _entry_quantity_under_notional_cap(
+                    short_quote, "short", bot.entry_short_role, filled_qty, target_notional
+                ),
+            )
+            if filled_qty <= 0.0:
+                return None
+            residual_qty = max(requested_qty - filled_qty, 0.0)
+            state = PaperOrderState.FILLED if residual_qty <= 1e-12 else PaperOrderState.PARTIAL
+            long_execution = _entry_execution(
+                long_quote, "long", bot.entry_long_role, filled_qty
+            )
+            short_execution = _entry_execution(
+                short_quote, "short", bot.entry_short_role, filled_qty
+            )
+            if long_execution is None or short_execution is None:
+                return None
+            long_leg = _filled_leg(
+                long_quote, candidate.long_venue, "long", bot.entry_long_role, long_execution.price, filled_qty, requested_qty, self.config, state,
+                filled_at_ms=simulated_entry_at_ms,
+                execution_source=long_execution.source,
+            )
+            short_leg = _filled_leg(
+                short_quote, candidate.short_venue, "short", bot.entry_short_role, short_execution.price, filled_qty, requested_qty, self.config, state,
+                filled_at_ms=simulated_entry_at_ms,
+                execution_source=short_execution.source,
+            )
+        entry_mode = f"long_{bot.entry_long_role}:short_{bot.entry_short_role}"
+        exit_mode = f"long_{bot.exit_long_role}:short_{bot.exit_short_role}"
+        acceptance_eligible = bot.acceptance_eligible is True
+        control_group = bot.control_group is True
         return SpreadPaperPosition(
             paper_id=paper_id,
             candidate_id=candidate.candidate_id,
             symbol=candidate.symbol,
             long_venue=candidate.long_venue,
             short_venue=candidate.short_venue,
-            candidate_opportunity_label=str(
-                getattr(candidate, "opportunity_label", "") or "spread_reversion"
-            ),
-            paper_bot_id=resolved.bot_id,
-            paper_cohort=resolved.cohort,
+            candidate_opportunity_label=candidate.opportunity_label,
+            paper_bot_id=bot.bot_id,
+            paper_cohort=bot.cohort,
             paper_entry_mode=entry_mode,
             paper_exit_mode=exit_mode,
-            paper_maker_leg=resolved.maker_leg,
-            paper_hedge_delay_ms=resolved.hedge_delay_ms,
-            paper_control_group=resolved.control_group,
-            paper_fill_assumption=_fill_assumption(resolved),
+            paper_maker_leg=bot.maker_leg,
+            paper_hedge_delay_ms=bot.hedge_delay_ms,
+            paper_control_group=control_group,
+            paper_fill_assumption=_fill_assumption(bot),
             finalist_rank=finalist_rank,
-            registered_at_ms=int(candidate.signal_ts_ms or 0),
-            entry_notional_quote=entry_notional,
-            long_leg=long_leg,
-            short_leg=short_leg,
+            registered_at_ms=simulated_entry_at_ms,
+            entry_notional_quote=target_notional,
+            long_leg=replace(long_leg, exit_liquidity_role=bot.exit_long_role),
+            short_leg=replace(short_leg, exit_liquidity_role=bot.exit_short_role),
             candidate_snapshot=_candidate_snapshot(candidate),
             entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
-            due_horizons=self._due_horizons(int(candidate.signal_ts_ms or 0)),
+            due_horizons=_due_horizons(simulated_entry_at_ms, self.config),
+            requested_base_qty=requested_qty,
+            filled_base_qty=filled_qty,
+            residual_base_qty=residual_qty,
+            delta_exposure_base_qty=0.0,
+            model_epoch=self.config.model_epoch,
+            # BBO crossing is not queue/trade-tape evidence.  Maker cohorts
+            # remain useful as experiments but never contaminate the baseline.
+            official_pnl=(
+                not maker
+                and residual_qty <= 1e-12
+                and acceptance_eligible
+                and not control_group
+            ),
+            research_manifest_version=bot.manifest_version,
+            research_hypothesis=bot.hypothesis,
+            acceptance_eligible=acceptance_eligible,
         )
 
-    def _entry_leg(
+    def _advance_pending_entry(
         self,
-        *,
-        venue: str,
-        side: str,
-        role: str,
-        notional_quote: float,
-        quote: QuoteSnapshot,
-        pending: bool = False,
-    ) -> SpreadPaperLeg | None:
-        if notional_quote <= 0.0:
-            return None
-        role = _liquidity_role(role)
-        raw_price = None if pending else _entry_raw_price(quote, side, role)
-        if raw_price is not None and raw_price <= 0.0:
-            return None
-        entry_price = None
-        qty = 0.0
-        entry_slippage_quote = 0.0
-        entry_fee_bps = _fee_bps(self.config, venue, role)
-        entry_fee_quote = 0.0
-        if raw_price is not None:
-            entry_price = _apply_slippage(
-                raw_price,
-                bps=self.config.slippage_buffer_bps,
-                action="buy" if side == "long" else "sell",
-            )
-            qty = notional_quote / entry_price
-            entry_slippage_quote = abs(entry_price - raw_price) * qty
-            entry_fee_quote = notional_quote * entry_fee_bps / 10_000.0
-        return SpreadPaperLeg(
-            venue=str(venue).lower(),
-            side=side,
-            entry_liquidity_role=role,
-            exit_liquidity_role="taker",
-            entry_pending=pending,
-            entry_bid=float(getattr(quote, "bid", 0.0) or 0.0),
-            entry_ask=float(getattr(quote, "ask", 0.0) or 0.0),
-            entry_bid_size=float(getattr(quote, "bid_size", 0.0) or 0.0),
-            entry_ask_size=float(getattr(quote, "ask_size", 0.0) or 0.0),
-            entry_observed_at_ms=int(getattr(quote, "observed_at_ms", 0) or 0),
-            mark_price=float(getattr(quote, "mark_price", 0.0) or 0.0),
-            index_price=float(getattr(quote, "index_price", 0.0) or 0.0),
-            volume_24h_quote=float(getattr(quote, "volume_24h_quote", 0.0) or 0.0),
-            open_interest=float(getattr(quote, "open_interest", 0.0) or 0.0),
-            entry_raw_price=raw_price,
-            entry_price=entry_price,
-            qty=qty,
-            entry_notional_quote=notional_quote,
-            entry_fee_bps=entry_fee_bps,
-            entry_fee_quote=entry_fee_quote,
-            entry_slippage_quote=entry_slippage_quote,
-            funding_rate_bps=float(getattr(quote, "funding_rate_bps", 0.0) or 0.0),
-            funding_timestamp_ms=int(getattr(quote, "funding_timestamp_ms", 0) or 0),
-        )
-
-    def _due_horizons(self, registered_at_ms: int) -> list[dict]:
-        horizons: list[dict] = []
-        for secs in self.config.markout_secs:
-            sec = int(secs or 0)
-            horizons.append(
-                {
-                    "kind": f"markout_{sec}s",
-                    "due_at_ms": registered_at_ms + sec * 1000,
-                    "terminal": False,
-                }
-            )
-        terminal_secs = int(self.config.terminal_secs or 0)
-        horizons.append(
-            {
-                "kind": f"terminal_{terminal_secs}s",
-                "due_at_ms": registered_at_ms + terminal_secs * 1000,
-                "terminal": True,
-            }
-        )
-        horizons.sort(key=lambda item: (int(item["due_at_ms"]), str(item["kind"])))
-        return horizons
-
-    def _build_due_event(
-        self,
-        *,
         position: SpreadPaperPosition,
-        horizon: dict,
         now_ms: int,
         quotes: dict[str, QuoteSnapshot],
-    ) -> dict:
+    ) -> tuple[SpreadPaperPosition, str] | None:
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
         short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        terminal = bool(horizon["terminal"])
-        kind = "opportunity.paper_closed" if terminal else "opportunity.paper_markout"
-        payload = self._build_payload(
-            position=position,
-            horizon_kind=str(horizon["kind"]),
+        if long_quote is None or short_quote is None:
+            return None
+        if not _quotes_fresh(
+            long_quote,
+            short_quote,
             now_ms=now_ms,
-            long_quote=long_quote,
-            short_quote=short_quote,
+            ttl_ms=self.config.quote_ttl_ms,
+            quote_skew_ms=self.config.quote_skew_ms,
+        ):
+            return None
+        maker_leg = position.paper_maker_leg
+        if not maker_leg:
+            return None
+        if position.maker_fill_observed_at_ms <= 0:
+            maker_position_leg = position.long_leg if maker_leg == "long" else position.short_leg
+            maker_quote = long_quote if maker_leg == "long" else short_quote
+            if not _maker_crossed(maker_position_leg, maker_quote):
+                return None
+            maker_qty = min(
+                position.requested_base_qty,
+                _entry_capacity(maker_quote, maker_leg),
+            )
+            if maker_qty <= 0.0 or maker_position_leg.entry_raw_price is None:
+                return None
+            filled_maker = _filled_leg(
+                maker_quote,
+                maker_position_leg.venue,
+                maker_leg,
+                maker_position_leg.entry_liquidity_role,
+                maker_position_leg.entry_raw_price,
+                maker_qty,
+                position.requested_base_qty,
+                self.config,
+                PaperOrderState.UNKNOWN,
+                filled_at_ms=now_ms,
+                execution_source="maker_bbo_unknown",
+            )
+            if maker_leg == "long":
+                next_position = replace(
+                    position,
+                    long_leg=replace(
+                        filled_maker,
+                        exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                    ),
+                    maker_fill_observed_at_ms=now_ms,
+                    delta_exposure_base_qty=maker_qty,
+                )
+            else:
+                next_position = replace(
+                    position,
+                    short_leg=replace(
+                        filled_maker,
+                        exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                    ),
+                    maker_fill_observed_at_ms=now_ms,
+                    delta_exposure_base_qty=-maker_qty,
+                )
+            return next_position, "maker_fill_observed"
+
+        if now_ms < position.maker_fill_observed_at_ms + max(position.paper_hedge_delay_ms, 0):
+            return None
+        maker_position_leg = position.long_leg if maker_leg == "long" else position.short_leg
+        hedge_position_leg = position.short_leg if maker_leg == "long" else position.long_leg
+        hedge_quote = short_quote if maker_leg == "long" else long_quote
+        hedge_side = "short" if maker_leg == "long" else "long"
+        hedge_execution = _entry_execution(
+            hedge_quote,
+            hedge_side,
+            hedge_position_leg.entry_liquidity_role,
+            maker_position_leg.qty,
         )
-        close_reason = str(horizon.get("close_reason", "") or "")
-        if close_reason:
-            payload["paper_close_reason"] = close_reason
-        if horizon.get("exit_spread_mid_bps") is not None:
-            payload["paper_exit_spread_mid_bps"] = float(horizon["exit_spread_mid_bps"])
+        if hedge_execution is None:
+            return None
+        qty = min(maker_position_leg.qty, hedge_execution.capacity)
+        qty = min(
+            qty,
+            _entry_quantity_under_notional_cap(
+                hedge_quote,
+                hedge_side,
+                hedge_position_leg.entry_liquidity_role,
+                qty,
+                position.entry_notional_quote,
+            ),
+        )
+        if qty <= 0.0:
+            return None
+        residual = max(position.requested_base_qty - qty, 0.0)
+        hedge_execution = _entry_execution(
+            hedge_quote,
+            hedge_side,
+            hedge_position_leg.entry_liquidity_role,
+            qty,
+        )
+        if hedge_execution is None:
+            return None
+        filled_hedge = _filled_leg(
+            hedge_quote,
+            hedge_position_leg.venue,
+            hedge_side,
+            hedge_position_leg.entry_liquidity_role,
+            hedge_execution.price,
+            qty,
+            position.requested_base_qty,
+            self.config,
+            PaperOrderState.UNKNOWN,
+            filled_at_ms=now_ms,
+            execution_source=hedge_execution.source,
+        )
+        if maker_leg == "long":
+            next_position = replace(
+                position,
+                short_leg=replace(
+                    filled_hedge,
+                    exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                ),
+                filled_base_qty=qty,
+                residual_base_qty=residual,
+                delta_exposure_base_qty=position.long_leg.qty - qty,
+            )
+        else:
+            next_position = replace(
+                position,
+                long_leg=replace(
+                    filled_hedge,
+                    exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                ),
+                filled_base_qty=qty,
+                residual_base_qty=residual,
+                delta_exposure_base_qty=qty - position.short_leg.qty,
+            )
+        return next_position, "hedge_filled"
+
+    def _has_due_evaluation(self, position: SpreadPaperPosition, now_ms: int) -> bool:
+        return self._next_horizon(position, now_ms) is not None or (
+            self.config.active_exit_enabled and now_ms > position.registered_at_ms
+        )
+
+    def _next_horizon(self, position: SpreadPaperPosition, now_ms: int) -> dict | None:
+        emitted = self._emitted_horizons.setdefault(position.paper_id, set())
+        for horizon in position.due_horizons:
+            if int(horizon["due_at_ms"]) <= now_ms and str(horizon["kind"]) not in emitted:
+                return horizon
+        return None
+
+    def _terminal_due(self, position: SpreadPaperPosition, now_ms: int) -> bool:
+        return any(bool(item["terminal"]) and int(item["due_at_ms"]) <= now_ms for item in position.due_horizons)
+
+    def _exit_quotes_fresh(self, position: SpreadPaperPosition, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> bool:
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        if long_quote is None or short_quote is None:
+            return False
+        if not _quotes_fresh(
+            long_quote,
+            short_quote,
+            now_ms=now_ms,
+            ttl_ms=self.config.quote_ttl_ms,
+            quote_skew_ms=self.config.quote_skew_ms,
+        ):
+            return False
+        long_execution = _exit_execution(
+            long_quote,
+            "long",
+            position.long_leg.exit_liquidity_role,
+            position.long_leg.qty,
+        )
+        short_execution = _exit_execution(
+            short_quote,
+            "short",
+            position.short_leg.exit_liquidity_role,
+            position.short_leg.qty,
+        )
+        return bool(
+            long_execution is not None
+            and short_execution is not None
+            and long_execution.capacity + 1e-12 >= position.long_leg.qty
+            and short_execution.capacity + 1e-12 >= position.short_leg.qty
+        )
+
+    def _active_exit_horizon(self, position: SpreadPaperPosition, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> dict | None:
+        if not self.config.active_exit_enabled:
+            return None
+        if self.config.max_hold_ms > 0 and now_ms - position.registered_at_ms >= self.config.max_hold_ms:
+            return {"kind": "active_exit:max_hold", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_max_hold_elapsed"}
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        spread = _position_signed_spread_bps(position, long_quote, short_quote)
+        z = _position_exit_z_score(position, spread)
+        if z is None:
+            return None
+        if self.config.stop_z > 0.0 and abs(z) >= self.config.stop_z:
+            return {"kind": "active_exit:stop", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_stop_z_reached", "exit_z_score": z}
+        if abs(z) <= max(self.config.exit_z, 0.0):
+            return {"kind": "active_exit:converged", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_converged", "exit_z_score": z}
+        return None
+
+    def _build_due_event(self, position: SpreadPaperPosition, horizon: dict, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> dict:
+        long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+        short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+        payload = _payload(position, str(horizon["kind"]), now_ms, long_quote, short_quote, self.config)
+        if horizon.get("close_reason"):
+            payload["paper_close_reason"] = str(horizon["close_reason"])
         if horizon.get("exit_z_score") is not None:
             payload["paper_exit_z_score"] = float(horizon["exit_z_score"])
-        return {"kind": kind, "payload": payload}
+        return {"kind": "opportunity.paper_closed" if bool(horizon["terminal"]) else "opportunity.paper_markout", "payload": payload}
 
-    def _build_payload(
-        self,
-        *,
-        position: SpreadPaperPosition,
-        horizon_kind: str,
-        now_ms: int,
-        long_quote: QuoteSnapshot | None,
-        short_quote: QuoteSnapshot | None,
-    ) -> dict:
-        long_mid = _mid(long_quote)
-        short_mid = _mid(short_quote)
-        base_payload = {
-            "paper_id": position.paper_id,
-            "candidate_id": position.candidate_id,
-            "review_id": None,
-            "symbol": position.symbol,
-            "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}",
-            "long_venue": position.long_venue,
-            "short_venue": position.short_venue,
-            "horizon_kind": horizon_kind,
-            "registered_at_ms": position.registered_at_ms,
-            "evaluated_at_ms": now_ms,
-            "selected_real_trade": False,
-            "not_selected_reason": "spread_shadow_paper",
-            "candidate_opportunity_label": position.candidate_opportunity_label,
-            "paper_bot_id": position.paper_bot_id,
-            "paper_cohort": position.paper_cohort,
-            "paper_entry_mode": position.paper_entry_mode,
-            "paper_exit_mode": position.paper_exit_mode,
-            "paper_execution_model": position.paper_entry_mode,
-            "paper_maker_leg": position.paper_maker_leg,
-            "paper_hedge_delay_ms": position.paper_hedge_delay_ms,
-            "paper_control_group": position.paper_control_group,
-            "paper_fill_assumption": position.paper_fill_assumption,
-            "paper_order_status": (
-                "entry_pending" if _position_has_pending_entry(position) else "hedged"
-            ),
-            "paper_entry_notional_quote": position.entry_notional_quote,
-            "candidate_snapshot": dict(position.candidate_snapshot),
-            "entry_market_snapshot": dict(position.entry_market_snapshot),
-            "exit_market_snapshot": _market_snapshot_payload(long_quote, short_quote),
-            "funding_advantage_bps": (
-                position.short_leg.funding_rate_bps - position.long_leg.funding_rate_bps
-            ),
-            "market_snapshot": {
-                "long_mid": long_mid,
-                "short_mid": short_mid,
-                "snapshot_available": long_quote is not None and short_quote is not None,
-            },
-        }
-        if long_quote is None or short_quote is None:
-            base_payload.update(
-                {
-                    "paper_gross_quote": None,
-                    "paper_fee_quote": _entry_fee_quote(position),
-                    "paper_entry_fee_quote": _entry_fee_quote(position),
-                    "paper_exit_fee_quote": 0.0,
-                    "paper_funding_quote": 0.0,
-                    "accrued_funding_estimate_quote": 0.0,
-                    "settlement_realized_funding_quote": 0.0,
-                    "paper_slippage_quote": _entry_slippage_quote(position),
-                    "paper_entry_slippage_quote": _entry_slippage_quote(position),
-                    "paper_exit_slippage_quote": 0.0,
-                    "paper_net_quote": None,
-                    "paper_net_bps": None,
-                    "opportunity_label": classify_paper_outcome(False, None, None),
-                    "long_leg": _leg_payload(position.long_leg),
-                    "short_leg": _leg_payload(position.short_leg),
-                }
-            )
-            return base_payload
+    def _episode_in_cooldown(self, candidate: SpreadReversionCandidate, bot_id: str) -> bool:
+        if self.config.episode_cooldown_ms <= 0:
+            return False
+        key = _episode_key(candidate, bot_id)
+        prior = self._episode_started_at_ms.get(key, 0)
+        return prior > 0 and candidate.signal_ts_ms - prior < self.config.episode_cooldown_ms
 
-        markout = self._markout(position, now_ms, long_quote, short_quote)
-        paper_net_quote = markout.get("paper_net_quote")
-        paper_net_bps = (
-            paper_net_quote / position.entry_notional_quote * 10_000.0
-            if paper_net_quote is not None
-            else None
-        )
-        base_payload.update(markout)
-        base_payload.update(
-            {
-                "paper_net_bps": paper_net_bps,
-                "opportunity_label": classify_paper_outcome(
-                    False,
-                    paper_net_quote,
-                    None,
-                ),
-            }
-        )
-        return base_payload
-
-    def _markout(
-        self,
-        position: SpreadPaperPosition,
-        now_ms: int,
-        long_quote: QuoteSnapshot,
-        short_quote: QuoteSnapshot,
-    ) -> dict:
-        long_exit_raw = _exit_raw_price(
-            long_quote,
-            side="long",
-            role=position.long_leg.exit_liquidity_role,
-        )
-        short_exit_raw = _exit_raw_price(
-            short_quote,
-            side="short",
-            role=position.short_leg.exit_liquidity_role,
-        )
-        if (
-            long_exit_raw <= 0.0
-            or short_exit_raw <= 0.0
-            or position.long_leg.entry_raw_price is None
-            or position.short_leg.entry_raw_price is None
-        ):
-            return {
-                "paper_gross_quote": None,
-                "paper_fee_quote": _entry_fee_quote(position),
-                "paper_entry_fee_quote": _entry_fee_quote(position),
-                "paper_exit_fee_quote": 0.0,
-                "paper_funding_quote": 0.0,
-                "accrued_funding_estimate_quote": 0.0,
-                "settlement_realized_funding_quote": 0.0,
-                "paper_slippage_quote": _entry_slippage_quote(position),
-                "paper_entry_slippage_quote": _entry_slippage_quote(position),
-                "paper_exit_slippage_quote": 0.0,
-                "paper_net_quote": None,
-                "long_leg": _leg_payload(position.long_leg),
-                "short_leg": _leg_payload(position.short_leg),
-            }
-        long_exit = _apply_slippage(
-            long_exit_raw,
-            bps=self.config.slippage_buffer_bps,
-            action="sell",
-        )
-        short_exit = _apply_slippage(
-            short_exit_raw,
-            bps=self.config.slippage_buffer_bps,
-            action="buy",
-        )
-        long_gross = position.long_leg.qty * (
-            long_exit_raw - position.long_leg.entry_raw_price
-        )
-        short_gross = position.short_leg.qty * (
-            position.short_leg.entry_raw_price - short_exit_raw
-        )
-        paper_gross_quote = long_gross + short_gross
-        long_exit_notional = position.long_leg.qty * long_exit_raw
-        short_exit_notional = position.short_leg.qty * short_exit_raw
-        long_exit_fee_bps = _fee_bps(
-            self.config,
-            position.long_venue,
-            position.long_leg.exit_liquidity_role,
-        )
-        short_exit_fee_bps = _fee_bps(
-            self.config,
-            position.short_venue,
-            position.short_leg.exit_liquidity_role,
-        )
-        long_exit_fee = long_exit_notional * long_exit_fee_bps / 10_000.0
-        short_exit_fee = (
-            short_exit_notional * short_exit_fee_bps / 10_000.0
-        )
-        entry_fee_quote = _entry_fee_quote(position)
-        exit_fee_quote = long_exit_fee + short_exit_fee
-        entry_slippage_quote = _entry_slippage_quote(position)
-        exit_slippage_quote = (
-            abs(long_exit_raw - long_exit) * position.long_leg.qty
-            + abs(short_exit - short_exit_raw) * position.short_leg.qty
-        )
-        fee_quote = entry_fee_quote + exit_fee_quote
-        slippage_quote = entry_slippage_quote + exit_slippage_quote
-        accrued_funding = _accrued_funding_quote(
-            position,
-            now_ms,
-            max(int(self.config.default_funding_interval_ms or 0), 1),
-        )
-        settlement_funding = _settlement_funding_quote(position, now_ms)
-        paper_net_quote = paper_gross_quote + accrued_funding - fee_quote - slippage_quote
-        return {
-            "paper_gross_quote": paper_gross_quote,
-            "paper_fee_quote": fee_quote,
-            "paper_entry_fee_quote": entry_fee_quote,
-            "paper_exit_fee_quote": exit_fee_quote,
-            "paper_funding_quote": accrued_funding,
-            "accrued_funding_estimate_quote": accrued_funding,
-            "settlement_realized_funding_quote": settlement_funding,
-            "paper_slippage_quote": slippage_quote,
-            "paper_entry_slippage_quote": entry_slippage_quote,
-            "paper_exit_slippage_quote": exit_slippage_quote,
-            "paper_net_quote": paper_net_quote,
-            "long_leg": _leg_payload(
-                position.long_leg,
-                exit_raw_price=long_exit_raw,
-                exit_price=long_exit,
-                exit_fee_quote=long_exit_fee,
-                exit_fee_bps=long_exit_fee_bps,
-                exit_slippage_quote=abs(long_exit_raw - long_exit) * position.long_leg.qty,
-                gross_quote=long_gross,
-            ),
-            "short_leg": _leg_payload(
-                position.short_leg,
-                exit_raw_price=short_exit_raw,
-                exit_price=short_exit,
-                exit_fee_quote=short_exit_fee,
-                exit_fee_bps=short_exit_fee_bps,
-                exit_slippage_quote=abs(short_exit - short_exit_raw)
-                * position.short_leg.qty,
-                gross_quote=short_gross,
-            ),
-        }
-
-
-def _excluded_symbols(config: SpreadPaperConfig) -> set[str]:
-    return {
-        str(symbol).upper()
-        for symbol in (config.excluded_symbols or [])
-        if str(symbol).strip()
-    }
+    def _record_episode(self, position: SpreadPaperPosition) -> None:
+        self._episode_started_at_ms[_episode_key_from_position(position)] = position.registered_at_ms
 
 
 def _paper_bot_specs(config: SpreadPaperConfig) -> list[SpreadPaperBotSpec]:
     specs: list[SpreadPaperBotSpec] = []
-    for raw_bot_id in config.paper_bot_ids or ["tt_conservative"]:
-        spec = _paper_bot_spec(str(raw_bot_id or "").strip())
-        if spec is not None:
+    manifest = config.research_manifest
+    requested = config.paper_bot_ids or list(manifest.enabled_bot_ids)
+    for bot_id in requested:
+        cohort = manifest.cohort_for(str(bot_id or "").strip())
+        if cohort is None or not cohort.enabled:
+            continue
+        spec = SpreadPaperBotSpec(
+            bot_id=cohort.bot_id,
+            cohort=cohort.cohort,
+            hypothesis=cohort.hypothesis,
+            manifest_version=manifest.version,
+            acceptance_eligible=cohort.acceptance_eligible,
+            entry_long_role=cohort.entry_long_role,
+            entry_short_role=cohort.entry_short_role,
+            exit_long_role=cohort.exit_long_role,
+            exit_short_role=cohort.exit_short_role,
+            maker_leg=cohort.maker_leg,
+            hedge_delay_ms=cohort.hedge_delay_ms,
+            control_group=cohort.control_group,
+        )
+        # The loader validates JSON manifests.  This second gate protects
+        # programmatically assembled manifests used by integrations/tests.
+        if _paper_bot_execution_supported(spec):
             specs.append(spec)
-    if not specs:
-        specs.append(_paper_bot_spec("tt_conservative"))
-    return [spec for spec in specs if spec is not None]
+    return specs
 
 
-def _paper_bot_spec(bot_id: str) -> SpreadPaperBotSpec | None:
-    if bot_id == "tt_conservative":
-        return SpreadPaperBotSpec(bot_id=bot_id, cohort="baseline_current")
-    if bot_id == "mt_long_maker":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="maker_taker_control",
-            entry_long_role="maker",
-            entry_short_role="taker",
-            maker_leg="long",
-            control_group=True,
-        )
-    if bot_id == "mt_short_maker":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="maker_taker_control",
-            entry_long_role="taker",
-            entry_short_role="maker",
-            maker_leg="short",
-            control_group=True,
-        )
-    if bot_id == "mt_selected_maker":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="maker_taker_control",
-            entry_long_role="auto",
-            entry_short_role="auto",
-            maker_leg="auto",
-            control_group=True,
-        )
-    if bot_id == "mt_selected_maker_delay_1000ms":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="maker_taker_delay_control",
-            entry_long_role="auto",
-            entry_short_role="auto",
-            maker_leg="auto",
-            hedge_delay_ms=1000,
-            delayed_leg="hedge",
-            control_group=True,
-        )
-    if bot_id == "core_v1_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="core_v1",
-            min_executable_spread_bps=80.0,
-            min_net_edge_bps=80.0,
-            require_good_pair=True,
-        )
-    if bot_id == "core_v1_exec100_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="core_v1_exec100",
-            min_executable_spread_bps=100.0,
-            min_net_edge_bps=80.0,
-            require_good_pair=True,
-        )
-    if bot_id == "core_v1_z10_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="core_v1_z10",
-            min_executable_spread_bps=80.0,
-            min_net_edge_bps=80.0,
-            min_z_score=10.0,
-            require_good_pair=True,
-        )
-    if bot_id == "bad_pair_control_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="bad_pair_control",
-            require_bad_pair=True,
-            control_group=True,
-        )
-    if bot_id == "low_liquidity_control_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="low_liquidity_control",
-            require_low_liquidity=True,
-            control_group=True,
-        )
-    if bot_id == "low_edge_control_bot":
-        return SpreadPaperBotSpec(
-            bot_id=bot_id,
-            cohort="low_edge_control",
-            require_low_edge=True,
-            control_group=True,
-        )
-    return None
+def _paper_bot_has_entry_maker(bot: SpreadPaperBotSpec) -> bool:
+    return bot.entry_long_role == "maker" or bot.entry_short_role == "maker"
 
 
-def _resolve_bot_roles(
-    bot: SpreadPaperBotSpec,
-    long_quote: QuoteSnapshot,
-    short_quote: QuoteSnapshot,
-) -> SpreadPaperBotSpec:
-    if bot.maker_leg != "auto":
-        return bot
-    maker_leg = _selected_maker_leg(long_quote, short_quote)
-    delayed_leg = bot.delayed_leg
-    if delayed_leg == "hedge":
-        delayed_leg = "short" if maker_leg == "long" else "long"
-    return replace(
-        bot,
-        entry_long_role="maker" if maker_leg == "long" else "taker",
-        entry_short_role="maker" if maker_leg == "short" else "taker",
-        maker_leg=maker_leg,
-        delayed_leg=delayed_leg,
-    )
-
-
-def _selected_maker_leg(long_quote: QuoteSnapshot, short_quote: QuoteSnapshot) -> str:
-    long_spread = float(getattr(long_quote, "ask", 0.0) or 0.0) - float(
-        getattr(long_quote, "bid", 0.0) or 0.0
-    )
-    short_spread = float(getattr(short_quote, "ask", 0.0) or 0.0) - float(
-        getattr(short_quote, "bid", 0.0) or 0.0
-    )
-    return "long" if long_spread >= short_spread else "short"
-
-
-def _bot_accepts_candidate(
-    bot: SpreadPaperBotSpec,
-    candidate: SpreadReversionCandidate,
-    long_quote: QuoteSnapshot,
-    short_quote: QuoteSnapshot,
-) -> bool:
-    executable_spread_bps = float(getattr(candidate, "executable_spread_bps", 0.0) or 0.0)
-    net_edge_bps = float(getattr(candidate, "net_edge_bps", 0.0) or 0.0)
-    z_score = float(getattr(candidate, "z_score", 0.0) or 0.0)
+def _paper_bot_execution_supported(bot: SpreadPaperBotSpec) -> bool:
+    """Mirror the manifest's state-machine contract at the runtime boundary."""
     if (
-        bot.min_executable_spread_bps is not None
-        and executable_spread_bps < bot.min_executable_spread_bps
+        not isinstance(bot.acceptance_eligible, bool)
+        or not isinstance(bot.control_group, bool)
     ):
         return False
-    if bot.min_net_edge_bps is not None and net_edge_bps < bot.min_net_edge_bps:
-        return False
-    if bot.min_z_score is not None and z_score < bot.min_z_score:
-        return False
-    pair = (
-        str(getattr(candidate, "long_venue", "") or "").lower(),
-        str(getattr(candidate, "short_venue", "") or "").lower(),
+    acceptance_eligible = bot.acceptance_eligible is True
+    control_group = bot.control_group is True
+    entry_maker_legs = tuple(
+        leg
+        for leg, role in (
+            ("long", str(bot.entry_long_role or "").lower()),
+            ("short", str(bot.entry_short_role or "").lower()),
+        )
+        if role == "maker"
     )
-    if bot.require_good_pair and pair not in GOOD_SPREAD_PAIRS:
+    roles = (
+        str(bot.entry_long_role or "").lower(),
+        str(bot.entry_short_role or "").lower(),
+        str(bot.exit_long_role or "").lower(),
+        str(bot.exit_short_role or "").lower(),
+    )
+    if any(role not in {"maker", "taker"} for role in roles):
         return False
-    if bot.require_bad_pair and pair not in BAD_SPREAD_PAIRS:
+    if str(bot.exit_long_role).lower() == "maker" or str(bot.exit_short_role).lower() == "maker":
         return False
-    if bot.require_low_edge and not (executable_spread_bps < 60.0 or net_edge_bps < 40.0):
+    if len(entry_maker_legs) > 1:
         return False
-    if bot.require_low_liquidity and not _is_low_liquidity_candidate(
-        candidate,
+    if entry_maker_legs:
+        return (
+            str(bot.maker_leg or "").lower() == entry_maker_legs[0]
+            and control_group
+            and not acceptance_eligible
+        )
+    return (
+        not str(bot.maker_leg or "")
+        and (not acceptance_eligible or not control_group)
+    )
+
+
+def _pending_leg(quote: QuoteSnapshot, venue: str, side: str, role: str, raw_price: float, requested_qty: float, config: SpreadPaperConfig) -> SpreadPaperLeg:
+    return _leg(quote, venue, side, role, raw_price, 0.0, requested_qty, config, pending=True, state=PaperOrderState.WORKING)
+
+
+def _filled_leg(
+    quote: QuoteSnapshot,
+    venue: str,
+    side: str,
+    role: str,
+    raw_price: float,
+    qty: float,
+    requested_qty: float,
+    config: SpreadPaperConfig,
+    state: PaperOrderState,
+    *,
+    filled_at_ms: int,
+    execution_source: str = "top_book_only",
+) -> SpreadPaperLeg:
+    return _leg(
+        quote,
+        venue,
+        side,
+        role,
+        raw_price,
+        qty,
+        requested_qty,
+        config,
+        pending=False,
+        state=state,
+        filled_at_ms=filled_at_ms,
+        execution_source=execution_source,
+    )
+
+
+def _leg(
+    quote: QuoteSnapshot,
+    venue: str,
+    side: str,
+    role: str,
+    raw_price: float,
+    qty: float,
+    requested_qty: float,
+    config: SpreadPaperConfig,
+    *,
+    pending: bool,
+    state: PaperOrderState,
+    filled_at_ms: int = 0,
+    execution_source: str = "top_book_only",
+) -> SpreadPaperLeg:
+    entry_price = None if pending else _apply_slippage(raw_price, bps=config.slippage_buffer_bps, action="buy" if side == "long" else "sell")
+    notional = 0.0 if entry_price is None else qty * entry_price
+    fee_bps = _fee_bps(config, venue, role)
+    slippage = 0.0 if entry_price is None else abs(entry_price - raw_price) * qty
+    return SpreadPaperLeg(
+        venue=str(venue).lower(), side=side, entry_liquidity_role=_liquidity_role(role), exit_liquidity_role="taker", entry_pending=pending,
+        entry_bid=float(quote.bid or 0.0), entry_ask=float(quote.ask or 0.0), entry_bid_size=float(quote.bid_size or 0.0), entry_ask_size=float(quote.ask_size or 0.0), entry_observed_at_ms=int(quote.observed_at_ms or 0),
+        mark_price=float(quote.mark_price or 0.0), index_price=float(quote.index_price or 0.0), volume_24h_quote=float(quote.volume_24h_quote or 0.0), open_interest=float(quote.open_interest or 0.0),
+        entry_raw_price=raw_price, entry_price=entry_price, qty=qty, entry_notional_quote=notional, entry_fee_bps=fee_bps, entry_fee_quote=notional * fee_bps / 10_000.0, entry_slippage_quote=slippage,
+        funding_rate_bps=float(quote.funding_rate_bps or 0.0), funding_timestamp_ms=int(quote.funding_timestamp_ms or 0), funding_interval_ms=int(quote.funding_interval_ms or 0),
+        entry_filled_at_ms=0 if pending else max(int(filled_at_ms or 0), 0), order_state=state.value, requested_qty=requested_qty, residual_qty=max(requested_qty - qty, 0.0),
+        entry_execution_source=execution_source,
+    )
+
+
+def _entry_capacity(quote: QuoteSnapshot, side: str) -> float:
+    """BBO-only capacity used for queue-unknown maker experiments."""
+    return max(float(quote.ask_size if side == "long" else quote.bid_size) or 0.0, 0.0)
+
+
+def _exit_capacity(quote: QuoteSnapshot, side: str) -> float:
+    """BBO-only capacity retained for maker/legacy paths."""
+    return max(float(quote.bid_size if side == "long" else quote.ask_size) or 0.0, 0.0)
+
+
+def _entry_execution(
+    quote: QuoteSnapshot,
+    side: str,
+    role: str,
+    quantity: float,
+) -> _ExecutionEstimate | None:
+    if _liquidity_role(role) == "maker":
+        price = _entry_raw_price(quote, side, role)
+        capacity = _entry_capacity(quote, side)
+        return _execution_estimate(price, capacity, quantity, "maker_bbo_unknown")
+    return _taker_execution(quote, side, quantity, entry=True)
+
+
+def _exit_execution(
+    quote: QuoteSnapshot,
+    side: str,
+    role: str,
+    quantity: float,
+) -> _ExecutionEstimate | None:
+    if _liquidity_role(role) == "maker":
+        price = _exit_raw_price(quote, side, role)
+        capacity = _exit_capacity(quote, side)
+        return _execution_estimate(price, capacity, quantity, "maker_bbo_unknown")
+    return _taker_execution(quote, side, quantity, entry=False)
+
+
+def _taker_execution(
+    quote: QuoteSnapshot,
+    side: str,
+    quantity: float,
+    *,
+    entry: bool,
+) -> _ExecutionEstimate | None:
+    # A long entry/short exit buys asks.  A short entry/long exit sells bids.
+    buy = (entry and side == "long") or (not entry and side == "short")
+    book_side = "ask" if buy else "bid"
+    levels = _coherent_depth_levels(quote, book_side)
+    if levels:
+        capacity = sum(level_qty for _, level_qty in levels)
+        return _execution_estimate(
+            _vwap(levels, min(max(float(quantity or 0.0), 0.0), capacity)),
+            capacity,
+            quantity,
+            "l2_vwap",
+        )
+    price = float((quote.ask if book_side == "ask" else quote.bid) or 0.0)
+    capacity = float((quote.ask_size if book_side == "ask" else quote.bid_size) or 0.0)
+    return _execution_estimate(price, capacity, quantity, "top_book_only")
+
+
+def _execution_estimate(
+    price: float,
+    capacity: float,
+    quantity: float,
+    source: str,
+) -> _ExecutionEstimate | None:
+    try:
+        price = float(price)
+        capacity = float(capacity)
+        quantity = float(quantity)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (isfinite(price) and isfinite(capacity) and isfinite(quantity)):
+        return None
+    if price <= 0.0 or capacity <= 0.0 or quantity <= 0.0:
+        return None
+    return _ExecutionEstimate(price=price, capacity=capacity, source=source)
+
+
+def _coherent_depth_levels(
+    quote: QuoteSnapshot,
+    book_side: str,
+) -> tuple[tuple[float, float], ...]:
+    """Return a validated L2 side or no levels.
+
+    The paper engine must not combine a stale/deformed ladder with a newer
+    BBO.  A nonempty ladder only qualifies when it is finite, correctly
+    sorted, and its best price agrees with the published top-of-book.
+    """
+    raw = quote.ask_depth if book_side == "ask" else quote.bid_depth
+    if not isinstance(raw, (tuple, list)) or not raw:
+        return ()
+    expected_top = float((quote.ask if book_side == "ask" else quote.bid) or 0.0)
+    if not isfinite(expected_top) or expected_top <= 0.0:
+        return ()
+    levels: list[tuple[float, float]] = []
+    prior_price: float | None = None
+    for item in raw:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            return ()
+        try:
+            price = float(item[0])
+            qty = float(item[1])
+        except (TypeError, ValueError, OverflowError):
+            return ()
+        if not (isfinite(price) and isfinite(qty) and price > 0.0 and qty > 0.0):
+            return ()
+        if prior_price is not None:
+            if (book_side == "ask" and price < prior_price) or (book_side == "bid" and price > prior_price):
+                return ()
+        levels.append((price, qty))
+        prior_price = price
+    tolerance = max(abs(expected_top) * 1e-8, 1e-9)
+    if abs(levels[0][0] - expected_top) > tolerance:
+        return ()
+    return tuple(levels)
+
+
+def _vwap(levels: tuple[tuple[float, float], ...], quantity: float) -> float:
+    remaining = max(float(quantity or 0.0), 0.0)
+    if remaining <= 0.0:
+        return 0.0
+    notional = 0.0
+    filled = 0.0
+    for price, available in levels:
+        take = min(remaining, available)
+        notional += take * price
+        filled += take
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    return notional / filled if filled > 0.0 and remaining <= 1e-9 else 0.0
+
+
+def _entry_quantity_under_notional_cap(
+    quote: QuoteSnapshot,
+    side: str,
+    role: str,
+    maximum_quantity: float,
+    notional_cap: float,
+) -> float:
+    """Largest executable quantity whose actual entry cashflow fits the cap."""
+    maximum_quantity = max(float(maximum_quantity or 0.0), 0.0)
+    notional_cap = max(float(notional_cap or 0.0), 0.0)
+    if maximum_quantity <= 0.0 or notional_cap <= 0.0:
+        return 0.0
+    estimate = _entry_execution(quote, side, role, maximum_quantity)
+    if estimate is None:
+        return 0.0
+    if maximum_quantity * estimate.price <= notional_cap + 1e-9:
+        return maximum_quantity
+    low = 0.0
+    high = maximum_quantity
+    # Books are piecewise-linear, so binary search is deterministic enough
+    # here and avoids accidentally choosing a quantity above the cap.
+    for _ in range(48):
+        mid = (low + high) / 2.0
+        if mid <= 0.0:
+            break
+        mid_estimate = _entry_execution(quote, side, role, mid)
+        if mid_estimate is not None and mid * mid_estimate.price <= notional_cap:
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def _maker_crossed(leg: SpreadPaperLeg, quote: QuoteSnapshot) -> bool:
+    if leg.entry_raw_price is None:
+        return False
+    # Strict inequality: merely touching a displayed bid/ask is not a fill.
+    if leg.side == "long":
+        return float(quote.ask or 0.0) < float(leg.entry_raw_price)
+    return float(quote.bid or 0.0) > float(leg.entry_raw_price)
+
+
+def _position_has_pending_entry(position: SpreadPaperPosition) -> bool:
+    return position.long_leg.entry_pending or position.short_leg.entry_pending
+
+
+def _quotes_fresh(
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+    *,
+    now_ms: int,
+    ttl_ms: int,
+    quote_skew_ms: int,
+) -> bool:
+    # A quote with a non-finite price/size is not executable evidence.  In
+    # particular, ``nan <= 0`` is false in Python, so merely testing price
+    # positivity later would let a corrupted source timestamp fabricate an
+    # official paper PnL.
+    for quote in (long_quote, short_quote):
+        try:
+            bid = float(quote.bid or 0.0)
+            ask = float(quote.ask or 0.0)
+            bid_size = float(quote.bid_size or 0.0)
+            ask_size = float(quote.ask_size or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not all(isfinite(value) for value in (bid, ask, bid_size, ask_size))
+            or bid <= 0.0
+            or ask <= 0.0
+            or bid_size < 0.0
+            or ask_size < 0.0
+        ):
+            return False
+    try:
+        timestamps = (
+            int(long_quote.observed_at_ms or 0),
+            int(short_quote.observed_at_ms or 0),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if min(timestamps) <= 0:
+        return False
+    if any(stamp > int(now_ms or 0) for stamp in timestamps):
+        return False
+    if max(int(now_ms or 0) - stamp for stamp in timestamps) > max(int(ttl_ms or 0), 0):
+        return False
+    if abs(timestamps[0] - timestamps[1]) > max(int(quote_skew_ms or 0), 0):
+        return False
+    return all(str(quote.source or "") not in {"spread_paper_last_good_quote"} for quote in (long_quote, short_quote))
+
+
+def _missing_quote_keys(position: SpreadPaperPosition, quotes: dict[str, QuoteSnapshot]) -> set[tuple[str, str]]:
+    missing: set[tuple[str, str]] = set()
+    for venue in (position.long_venue, position.short_venue):
+        if _quote_for(quotes, venue, position.symbol) is None:
+            missing.add((venue, position.symbol))
+    return missing
+
+
+def _due_horizons(registered_at_ms: int, config: SpreadPaperConfig) -> list[dict]:
+    horizons = [{"kind": f"markout_{int(seconds)}s", "due_at_ms": registered_at_ms + int(seconds) * 1000, "terminal": False} for seconds in config.markout_secs if int(seconds) > 0]
+    horizons.append({"kind": f"terminal_{int(config.terminal_secs)}s", "due_at_ms": registered_at_ms + int(config.terminal_secs) * 1000, "terminal": True})
+    return sorted(horizons, key=lambda item: (int(item["due_at_ms"]), str(item["kind"])))
+
+
+def _payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None, config: SpreadPaperConfig) -> dict:
+    base = _base_payload(position, horizon_kind, now_ms, long_quote, short_quote)
+    if long_quote is None or short_quote is None or not _quotes_fresh(
         long_quote,
         short_quote,
+        now_ms=now_ms,
+        ttl_ms=config.quote_ttl_ms,
+        quote_skew_ms=config.quote_skew_ms,
     ):
-        return False
-    return True
+        return _unpriced_payload(base, position, "missing_or_stale_exit_quotes")
+    long_execution = _exit_execution(
+        long_quote, "long", position.long_leg.exit_liquidity_role, position.long_leg.qty
+    )
+    short_execution = _exit_execution(
+        short_quote, "short", position.short_leg.exit_liquidity_role, position.short_leg.qty
+    )
+    if (
+        long_execution is None
+        or short_execution is None
+        or long_execution.capacity + 1e-12 < position.long_leg.qty
+        or short_execution.capacity + 1e-12 < position.short_leg.qty
+    ):
+        return _unpriced_payload(
+            base,
+            position,
+            _exit_capacity_failure_reason(long_execution, short_execution),
+        )
+    return _markout_payload(base, position, now_ms, long_quote, short_quote, config)
 
 
-def _is_low_liquidity_candidate(
-    candidate: SpreadReversionCandidate,
-    long_quote: QuoteSnapshot,
-    short_quote: QuoteSnapshot,
-) -> bool:
-    capacity_quote = float(getattr(candidate, "capacity_quote", 0.0) or 0.0)
-    long_volume = float(getattr(long_quote, "volume_24h_quote", 0.0) or 0.0)
-    short_volume = float(getattr(short_quote, "volume_24h_quote", 0.0) or 0.0)
-    min_volume = min(long_volume, short_volume)
-    return capacity_quote < 50.0 or min_volume < 50_000.0
-
-
-def _fill_assumption(bot: SpreadPaperBotSpec) -> str:
-    if bot.hedge_delay_ms > 0:
-        return "conditional_maker_fill_then_delayed_taker_hedge"
-    if bot.maker_leg:
-        return "conditional_maker_fill_then_taker_hedge"
-    return "taker_top_of_book"
-
-
-def _allowed_labels(config: SpreadPaperConfig) -> set[str]:
+def _base_payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None) -> dict:
     return {
-        str(label)
-        for label in (config.allowed_opportunity_labels or [])
-        if str(label).strip()
+        "journal_schema_version": SPREAD_PAPER_JOURNAL_SCHEMA_VERSION, "calculation_version": "spread_paper_v2", "model_epoch": position.model_epoch,
+        "paper_id": position.paper_id, "candidate_id": position.candidate_id, "review_id": None, "symbol": position.symbol,
+        "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}", "long_venue": position.long_venue, "short_venue": position.short_venue,
+        "candidate_opportunity_label": position.candidate_opportunity_label, "paper_bot_id": position.paper_bot_id, "paper_cohort": position.paper_cohort,
+        "research_manifest_version": position.research_manifest_version, "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
+        "paper_entry_mode": position.paper_entry_mode, "paper_exit_mode": position.paper_exit_mode, "paper_execution_model": position.paper_entry_mode,
+        "paper_maker_leg": position.paper_maker_leg, "paper_hedge_delay_ms": position.paper_hedge_delay_ms, "paper_control_group": position.paper_control_group,
+        "paper_fill_assumption": position.paper_fill_assumption, "horizon_kind": horizon_kind, "registered_at_ms": position.registered_at_ms, "evaluated_at_ms": now_ms,
+        "selected_real_trade": False, "not_selected_reason": "spread_shadow_paper", "paper_order_status": _position_order_state(position),
+        "paper_entry_notional_quote": position.entry_notional_quote, "requested_base_qty": position.requested_base_qty, "filled_base_qty": position.filled_base_qty, "residual_base_qty": position.residual_base_qty,
+        "delta_exposure_base_qty": position.delta_exposure_base_qty, "maker_fill_observed_at_ms": position.maker_fill_observed_at_ms,
+        "paper_fill_capacity_source": _entry_capacity_source(position),
+        "official_pnl": position.official_pnl is True, "candidate_snapshot": dict(position.candidate_snapshot), "entry_market_snapshot": dict(position.entry_market_snapshot),
+        "exit_market_snapshot": _market_snapshot_payload(long_quote, short_quote), "funding_advantage_bps": position.short_leg.funding_rate_bps - position.long_leg.funding_rate_bps,
     }
 
 
-def _episode_key(
-    symbol: str,
-    long_venue: str,
-    short_venue: str,
-    opportunity_label: str,
-    paper_bot_id: str,
-) -> tuple[str, str, str, str, str]:
+def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, long_quote: QuoteSnapshot, short_quote: QuoteSnapshot, config: SpreadPaperConfig) -> dict:
+    long_execution = _exit_execution(
+        long_quote,
+        "long",
+        position.long_leg.exit_liquidity_role,
+        max(position.long_leg.qty, 1e-12),
+    )
+    short_execution = _exit_execution(
+        short_quote,
+        "short",
+        position.short_leg.exit_liquidity_role,
+        max(position.short_leg.qty, 1e-12),
+    )
+    if (
+        long_execution is None
+        or short_execution is None
+        or position.long_leg.entry_raw_price is None
+        or position.short_leg.entry_raw_price is None
+    ):
+        return _unpriced_payload(base, position, "invalid_exit_prices")
+    if (
+        (position.long_leg.qty > 0.0 and long_execution.capacity + 1e-12 < position.long_leg.qty)
+        or (position.short_leg.qty > 0.0 and short_execution.capacity + 1e-12 < position.short_leg.qty)
+    ):
+        return _unpriced_payload(
+            base,
+            position,
+            _exit_capacity_failure_reason(long_execution, short_execution),
+        )
+    long_raw = long_execution.price
+    short_raw = short_execution.price
+    long_exit = _apply_slippage(long_raw, bps=config.slippage_buffer_bps, action="sell")
+    short_exit = _apply_slippage(short_raw, bps=config.slippage_buffer_bps, action="buy")
+    long_gross = position.long_leg.qty * (long_raw - position.long_leg.entry_raw_price)
+    short_gross = position.short_leg.qty * (position.short_leg.entry_raw_price - short_raw)
+    long_exit_fee = position.long_leg.qty * long_exit * _fee_bps(config, position.long_venue, position.long_leg.exit_liquidity_role) / 10_000.0
+    short_exit_fee = position.short_leg.qty * short_exit * _fee_bps(config, position.short_venue, position.short_leg.exit_liquidity_role) / 10_000.0
+    entry_fee = position.long_leg.entry_fee_quote + position.short_leg.entry_fee_quote
+    entry_slippage = position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote
+    exit_slippage = abs(long_exit - long_raw) * position.long_leg.qty + abs(short_exit - short_raw) * position.short_leg.qty
+    settled = _settlement_funding_quote(position, now_ms)
+    accrued = _accrued_funding_quote(position, now_ms)
+    gross = long_gross + short_gross
+    fee = entry_fee + long_exit_fee + short_exit_fee
+    slippage = entry_slippage + exit_slippage
+    net = gross + settled - fee - slippage
+    matched_notional = max(
+        (position.long_leg.entry_notional_quote + position.short_leg.entry_notional_quote) / 2.0,
+        1e-12,
+    )
+    funding_evidence_complete = _funding_settlement_evidence_complete(
+        position,
+        now_ms,
+        long_quote,
+        short_quote,
+    )
+    official_pnl = bool(
+        position.official_pnl is True
+        and abs(position.delta_exposure_base_qty) <= 1e-12
+        and position.residual_base_qty <= 1e-12
+        and funding_evidence_complete
+    )
+    base.update({
+        "paper_gross_quote": gross, "paper_fee_quote": fee, "paper_entry_fee_quote": entry_fee, "paper_exit_fee_quote": long_exit_fee + short_exit_fee,
+        "paper_funding_quote": settled, "accrued_funding_estimate_quote": accrued, "settlement_realized_funding_quote": settled,
+        "settlement_funding_rate_evidence": _settlement_funding_evidence(
+            position,
+            now_ms,
+            long_quote,
+            short_quote,
+        ),
+        "funding_settlement_evidence_complete": funding_evidence_complete,
+        "paper_slippage_quote": slippage, "paper_entry_slippage_quote": entry_slippage, "paper_exit_slippage_quote": exit_slippage,
+        "paper_hedge_delay_quote": _hedge_delay_quote(position), "paper_residual_quote": _residual_gross_quote(position, long_gross, short_gross),
+        "paper_adverse_selection_quote": 0.0,
+        "paper_adverse_selection_assumption_quote": matched_notional * max(float(position.candidate_snapshot.get("adverse_selection_bps", 0.0) or 0.0), 0.0) / 10_000.0,
+        "paper_matched_entry_notional_quote": matched_notional,
+        "paper_net_quote": net, "paper_net_bps": net / matched_notional * 10_000.0,
+        "paper_unpriced": False, "official_pnl": official_pnl, "opportunity_label": classify_paper_outcome(False, net, None),
+        "long_leg": _leg_payload(position.long_leg, long_raw, long_exit, long_exit_fee, long_gross, long_execution.source),
+        "short_leg": _leg_payload(position.short_leg, short_raw, short_exit, short_exit_fee, short_gross, short_execution.source),
+        "paper_exit_capacity_source": _sources_summary(long_execution.source, short_execution.source),
+    })
+    return base
+
+
+def _unpriced_payload(base: dict, position: SpreadPaperPosition, reason: str) -> dict:
+    base.update({
+        "paper_gross_quote": None, "paper_fee_quote": position.long_leg.entry_fee_quote + position.short_leg.entry_fee_quote,
+        "paper_entry_fee_quote": position.long_leg.entry_fee_quote + position.short_leg.entry_fee_quote, "paper_exit_fee_quote": 0.0,
+        "paper_funding_quote": 0.0, "accrued_funding_estimate_quote": 0.0, "settlement_realized_funding_quote": 0.0,
+        "paper_slippage_quote": position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote,
+        "paper_entry_slippage_quote": position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote, "paper_exit_slippage_quote": 0.0,
+        "paper_hedge_delay_quote": None, "paper_residual_quote": None, "paper_adverse_selection_quote": None,
+        "paper_adverse_selection_assumption_quote": None, "paper_matched_entry_notional_quote": None,
+        "paper_net_quote": None, "paper_net_bps": None, "paper_unpriced": True, "paper_skip_reason": reason, "official_pnl": False,
+        "opportunity_label": classify_paper_outcome(False, None, None), "long_leg": _leg_payload(position.long_leg), "short_leg": _leg_payload(position.short_leg),
+    })
+    return base
+
+
+def _unpriced_event(
+    position: SpreadPaperPosition,
+    horizon: dict,
+    now_ms: int,
+    quotes: dict[str, QuoteSnapshot],
+    config: SpreadPaperConfig,
+) -> dict:
+    long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+    short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+    reason = "missing_or_stale_exit_quotes"
+    if (
+        long_quote is not None
+        and short_quote is not None
+        and _quotes_fresh(
+            long_quote,
+            short_quote,
+            now_ms=now_ms,
+            ttl_ms=config.quote_ttl_ms,
+            quote_skew_ms=config.quote_skew_ms,
+        )
+    ):
+        long_execution = _exit_execution(
+            long_quote,
+            "long",
+            position.long_leg.exit_liquidity_role,
+            position.long_leg.qty,
+        )
+        short_execution = _exit_execution(
+            short_quote,
+            "short",
+            position.short_leg.exit_liquidity_role,
+            position.short_leg.qty,
+        )
+        if long_execution is None or short_execution is None:
+            reason = "invalid_exit_prices"
+        elif (
+            long_execution.capacity + 1e-12 < position.long_leg.qty
+            or short_execution.capacity + 1e-12 < position.short_leg.qty
+        ):
+            reason = _exit_capacity_failure_reason(long_execution, short_execution)
+    payload = _unpriced_payload(
+        _base_payload(position, str(horizon["kind"]), now_ms, long_quote, short_quote),
+        position,
+        reason,
+    )
+    return {"kind": "opportunity.paper_closed" if bool(horizon["terminal"]) else "opportunity.paper_evaluation_skipped", "payload": payload}
+
+
+def _delta_markout_event(
+    position: SpreadPaperPosition,
+    horizon: dict,
+    now_ms: int,
+    quotes: dict[str, QuoteSnapshot],
+    config: SpreadPaperConfig,
+) -> dict:
+    """Record naked maker-leg markout without manufacturing two-leg PnL."""
+    long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+    short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+    base = _base_payload(position, str(horizon["kind"]), now_ms, long_quote, short_quote)
+    if (
+        long_quote is None
+        or short_quote is None
+        or not _quotes_fresh(
+            long_quote,
+            short_quote,
+            now_ms=now_ms,
+            ttl_ms=config.quote_ttl_ms,
+            quote_skew_ms=config.quote_skew_ms,
+        )
+    ):
+        payload = _unpriced_payload(base, position, "missing_or_stale_delta_markout_quotes")
+        return {"kind": "opportunity.paper_delta_markout", "payload": payload}
+
+    leg = position.long_leg if position.paper_maker_leg == "long" else position.short_leg
+    quote = long_quote if position.paper_maker_leg == "long" else short_quote
+    execution = _exit_execution(quote, leg.side, "taker", leg.qty)
+    if (
+        leg.entry_raw_price is None
+        or execution is None
+        or execution.capacity + 1e-12 < leg.qty
+        or leg.qty <= 0.0
+    ):
+        payload = _unpriced_payload(base, position, "invalid_delta_markout_price")
+        return {"kind": "opportunity.paper_delta_markout", "payload": payload}
+    exit_raw = execution.price
+    gross = (
+        leg.qty * (exit_raw - leg.entry_raw_price)
+        if leg.side == "long"
+        else leg.qty * (leg.entry_raw_price - exit_raw)
+    )
+    base.update({
+        "paper_delta_markout_quote": gross,
+        "paper_delta_markout_price": exit_raw,
+        "paper_delta_capacity_source": execution.source,
+        "paper_unpriced": False,
+        # A one-leg observation is diagnostic evidence only, never an
+        # executable two-leg PnL for the acceptance cohort.
+        "paper_net_quote": None,
+        "paper_net_bps": None,
+        "official_pnl": False,
+        "opportunity_label": classify_paper_outcome(False, None, None),
+        "long_leg": _leg_payload(position.long_leg),
+        "short_leg": _leg_payload(position.short_leg),
+    })
+    return {"kind": "opportunity.paper_delta_markout", "payload": base}
+
+
+def _expired_event(
+    position: SpreadPaperPosition,
+    now_ms: int,
+    quotes: dict[str, QuoteSnapshot],
+    reason: str,
+    config: SpreadPaperConfig,
+) -> dict:
+    long_quote = _quote_for(quotes, position.long_venue, position.symbol)
+    short_quote = _quote_for(quotes, position.short_venue, position.symbol)
+    base = _base_payload(position, "terminal_expired", now_ms, long_quote, short_quote)
+    if (
+        long_quote is not None
+        and short_quote is not None
+        and _quotes_fresh(
+            long_quote,
+            short_quote,
+            now_ms=now_ms,
+            ttl_ms=config.quote_ttl_ms,
+            quote_skew_ms=config.quote_skew_ms,
+        )
+    ):
+        # A failed hedge is never official PnL, but a fresh executable quote is
+        # still valuable evidence of the residual directional markout.
+        payload = _markout_payload(
+            base,
+            position,
+            now_ms,
+            long_quote,
+            short_quote,
+            config,
+        )
+        payload["official_pnl"] = False
+        payload["paper_skip_reason"] = reason
+    else:
+        payload = _unpriced_payload(base, position, reason)
+    payload["paper_order_status"] = PaperOrderState.EXPIRED.value
+    return {"kind": "opportunity.paper_expired", "payload": payload}
+
+
+def _registration_event(position: SpreadPaperPosition) -> dict:
+    payload = _base_payload(position, "", position.registered_at_ms, None, None)
+    payload.update({"paper_funding_quote": 0.0, "accrued_funding_estimate_quote": 0.0, "settlement_realized_funding_quote": 0.0, "due_horizons": position.due_horizons, "long_leg": _leg_payload(position.long_leg), "short_leg": _leg_payload(position.short_leg)})
+    return {"kind": "opportunity.paper_registered", "payload": payload}
+
+
+def _hedge_filled_event(position: SpreadPaperPosition) -> dict:
+    payload = _registration_event(position)["payload"]
+    payload["paper_order_status"] = _position_order_state(position)
+    return {"kind": "opportunity.paper_hedge_filled", "payload": payload}
+
+
+def _maker_fill_observed_event(position: SpreadPaperPosition) -> dict:
+    """Persist naked maker exposure before its delayed hedge is eligible.
+
+    A BBO cross is intentionally not treated as queue/trade-tape-confirmed
+    execution.  Keeping the state as ``UNKNOWN`` prevents experimental maker
+    observations from entering the official taker/taker acceptance cohort.
+    """
+    payload = _registration_event(position)["payload"]
+    payload.update({
+        "paper_order_status": PaperOrderState.UNKNOWN.value,
+        "paper_maker_fill_evidence": "crossed_without_trade_tape_or_queue",
+    })
+    return {"kind": "opportunity.paper_maker_fill_observed", "payload": payload}
+
+
+def _funding_settlement_observed_event(
+    position: SpreadPaperPosition,
+    settlement: FundingSettlement,
+) -> dict:
+    payload = _registration_event(position)["payload"]
+    payload.update({
+        "paper_order_status": _position_order_state(position),
+        "funding_settlement": _funding_settlement_payload(settlement),
+        "settlement_funding_rate_evidence": "actual_position_allocated_funding_ledger",
+    })
+    return {"kind": "opportunity.paper_funding_settlement_observed", "payload": payload}
+
+
+def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
+    long_leg = _leg_from_payload(payload.get("long_leg"))
+    short_leg = _leg_from_payload(payload.get("short_leg"))
+    paper_id = str(payload.get("paper_id", "") or "")
+    if long_leg is None or short_leg is None or not paper_id:
+        return None
+    horizons = _valid_restored_horizons(payload.get("due_horizons"))
+    if horizons is None:
+        return None
+    paper_control_group = _strict_json_bool(payload.get("paper_control_group"))
+    official_pnl = _strict_json_bool(payload.get("official_pnl"))
+    acceptance_eligible = _strict_json_bool(payload.get("acceptance_eligible"))
+    if (
+        paper_control_group is None
+        or official_pnl is None
+        or acceptance_eligible is None
+    ):
+        return None
+    try:
+        position = SpreadPaperPosition(
+        paper_id=paper_id, candidate_id=str(payload.get("candidate_id", "") or ""), symbol=str(payload.get("symbol", "") or ""), long_venue=str(payload.get("long_venue", "") or ""), short_venue=str(payload.get("short_venue", "") or ""),
+        candidate_opportunity_label=str(payload.get("candidate_opportunity_label", "spread_reversion") or "spread_reversion"), paper_bot_id=str(payload.get("paper_bot_id", "tt_conservative") or "tt_conservative"),
+        paper_cohort=str(payload.get("paper_cohort", "legacy") or "legacy"), paper_entry_mode=str(payload.get("paper_entry_mode", "") or ""), paper_exit_mode=str(payload.get("paper_exit_mode", "") or ""),
+        paper_maker_leg=str(payload.get("paper_maker_leg", "") or ""), paper_hedge_delay_ms=int(payload.get("paper_hedge_delay_ms", 0) or 0), paper_control_group=paper_control_group,
+        paper_fill_assumption=str(payload.get("paper_fill_assumption", "") or ""), finalist_rank=int(payload.get("finalist_rank", 0) or 0), registered_at_ms=int(payload.get("registered_at_ms", 0) or 0),
+        entry_notional_quote=float(payload.get("paper_entry_notional_quote", 0.0) or 0.0), long_leg=long_leg, short_leg=short_leg,
+        candidate_snapshot=dict(payload.get("candidate_snapshot", {}) or {}), entry_market_snapshot=dict(payload.get("entry_market_snapshot", {}) or {}), due_horizons=horizons,
+        requested_base_qty=float(payload.get("requested_base_qty", max(long_leg.requested_qty, short_leg.requested_qty)) or 0.0), filled_base_qty=float(payload.get("filled_base_qty", min(long_leg.qty, short_leg.qty)) or 0.0),
+        residual_base_qty=float(payload.get("residual_base_qty", max(long_leg.residual_qty, short_leg.residual_qty)) or 0.0),
+        delta_exposure_base_qty=float(payload.get("delta_exposure_base_qty", long_leg.qty - short_leg.qty) or 0.0),
+        maker_fill_observed_at_ms=int(payload.get("maker_fill_observed_at_ms", 0) or 0), model_epoch=str(payload.get("model_epoch", "v1_legacy") or "v1_legacy"),
+        official_pnl=official_pnl,
+        research_manifest_version=str(payload.get("research_manifest_version", "legacy") or "legacy"),
+        research_hypothesis=str(payload.get("research_hypothesis", "") or ""),
+        acceptance_eligible=acceptance_eligible,
+    )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return position if _paper_position_numerics_valid(position) else None
+
+
+def _valid_restored_horizons(value: object) -> list[dict] | None:
+    if not isinstance(value, list) or not value:
+        return None
+    horizons: list[dict] = []
+    kinds: set[str] = set()
+    terminal_count = 0
+    for raw in value:
+        if not isinstance(raw, dict):
+            return None
+        kind = str(raw.get("kind", "") or "")
+        try:
+            due_at_ms = int(raw.get("due_at_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not kind or kind in kinds or due_at_ms <= 0:
+            return None
+        terminal = _strict_json_bool(raw.get("terminal"))
+        if terminal is None:
+            return None
+        terminal_count += int(terminal)
+        horizons.append({"kind": kind, "due_at_ms": due_at_ms, "terminal": terminal})
+        kinds.add(kind)
+    if terminal_count != 1:
+        return None
+    return sorted(horizons, key=lambda item: (int(item["due_at_ms"]), str(item["kind"])))
+
+
+def _paper_position_numerics_valid(position: SpreadPaperPosition) -> bool:
+    numbers = (
+        position.entry_notional_quote,
+        position.requested_base_qty,
+        position.filled_base_qty,
+        position.residual_base_qty,
+        position.delta_exposure_base_qty,
+    )
+    if not all(isfinite(float(value)) for value in numbers):
+        return False
+    if any(value < 0.0 for value in numbers[:4]):
+        return False
+    return bool(
+        position.candidate_id
+        and position.symbol
+        and position.long_venue
+        and position.short_venue
+        and position.long_venue.lower() != position.short_venue.lower()
+        and position.registered_at_ms > 0
+    )
+
+
+def _restorable_current_v2_record(payload: dict, config: SpreadPaperConfig) -> bool:
+    try:
+        journal_schema_version = int(payload.get("journal_schema_version", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if journal_schema_version != SPREAD_PAPER_JOURNAL_SCHEMA_VERSION:
+        return False
+    if str(payload.get("calculation_version", "") or "") != "spread_paper_v2":
+        return False
+    if str(payload.get("model_epoch", "") or "") != config.model_epoch:
+        return False
+    candidate = payload.get("candidate_snapshot")
+    if not isinstance(candidate, dict):
+        return False
     return (
-        str(symbol).upper(),
-        str(long_venue).lower(),
-        str(short_venue).lower(),
-        str(opportunity_label or "spread_reversion"),
-        str(paper_bot_id or "tt_conservative"),
+        candidate.get("economics_complete") is True
+        and candidate.get("fee_evidence_complete") is True
+        and str(candidate.get("contract_normalization_status", "") or "").lower()
+        == "complete"
+        and str(candidate.get("calculation_version", "") or "")
+        == "spread_v2_signed_reversion"
+        and str(candidate.get("model_epoch", "") or "") == config.model_epoch
+    )
+
+
+def _restored_position_has_fee_evidence(
+    position: SpreadPaperPosition,
+    config: SpreadPaperConfig,
+) -> bool:
+    return _execution_fee_evidence_complete(
+        config,
+        long_venue=position.long_venue,
+        short_venue=position.short_venue,
+        entry_long_role=position.long_leg.entry_liquidity_role,
+        entry_short_role=position.short_leg.entry_liquidity_role,
+        exit_long_role=position.long_leg.exit_liquidity_role,
+        exit_short_role=position.short_leg.exit_liquidity_role,
+    )
+
+
+def _restored_position_is_official_eligible(position: SpreadPaperPosition) -> bool:
+    baseline_entry_sources = {"l2_vwap", "top_book_only"}
+    return bool(
+        position.official_pnl is True
+        and position.paper_entry_mode == "long_taker:short_taker"
+        and position.paper_exit_mode == "long_taker:short_taker"
+        and not position.paper_maker_leg
+        and position.paper_control_group is False
+        and position.acceptance_eligible is True
+        and not position.long_leg.entry_pending
+        and not position.short_leg.entry_pending
+        # The mode strings are reporting fields; on restart they cannot be
+        # trusted as execution evidence.  Re-derive baseline eligibility from
+        # both persisted legs so a forged maker/unknown cohort cannot be
+        # promoted into the taker/taker acceptance sample.
+        and position.long_leg.entry_liquidity_role == "taker"
+        and position.short_leg.entry_liquidity_role == "taker"
+        and position.long_leg.exit_liquidity_role == "taker"
+        and position.short_leg.exit_liquidity_role == "taker"
+        and position.long_leg.entry_execution_source in baseline_entry_sources
+        and position.short_leg.entry_execution_source in baseline_entry_sources
+        and position.long_leg.entry_filled_at_ms > 0
+        and position.short_leg.entry_filled_at_ms > 0
+        and position.long_leg.order_state == PaperOrderState.FILLED.value
+        and position.short_leg.order_state == PaperOrderState.FILLED.value
+        and position.residual_base_qty <= 1e-12
+        and abs(position.delta_exposure_base_qty) <= 1e-12
+        and abs(position.long_leg.qty - position.short_leg.qty) <= 1e-12
+    )
+
+
+def _leg_from_payload(value: object) -> SpreadPaperLeg | None:
+    if not isinstance(value, dict) or str(value.get("side", "")) not in {"long", "short"}:
+        return None
+    entry_pending = _strict_json_bool(value.get("entry_pending"))
+    funding_settlement_conflict = _strict_json_bool(
+        value.get("funding_settlement_conflict")
+    )
+    if entry_pending is None or funding_settlement_conflict is None:
+        return None
+    settlements, restored_settlement_conflict = _settlements_from_payload(
+        value.get("funding_settlements")
+    )
+    try:
+        leg = SpreadPaperLeg(
+            venue=str(value.get("venue", "") or ""), side=str(value["side"]), entry_liquidity_role=str(value.get("entry_liquidity_role", "taker") or "taker"), exit_liquidity_role=str(value.get("exit_liquidity_role", "taker") or "taker"), entry_pending=entry_pending,
+            entry_bid=float(value.get("entry_bid", 0.0) or 0.0), entry_ask=float(value.get("entry_ask", 0.0) or 0.0), entry_bid_size=float(value.get("entry_bid_size", 0.0) or 0.0), entry_ask_size=float(value.get("entry_ask_size", 0.0) or 0.0), entry_observed_at_ms=int(value.get("entry_observed_at_ms", 0) or 0),
+            mark_price=float(value.get("mark_price", 0.0) or 0.0), index_price=float(value.get("index_price", 0.0) or 0.0), volume_24h_quote=float(value.get("volume_24h_quote", 0.0) or 0.0), open_interest=float(value.get("open_interest", 0.0) or 0.0),
+            entry_raw_price=_optional_float(value.get("entry_raw_price")), entry_price=_optional_float(value.get("entry_price")), qty=float(value.get("qty", 0.0) or 0.0), entry_notional_quote=float(value.get("entry_notional_quote", 0.0) or 0.0),
+            entry_fee_bps=float(value.get("entry_fee_bps", 0.0) or 0.0), entry_fee_quote=float(value.get("entry_fee_quote", 0.0) or 0.0), entry_slippage_quote=float(value.get("entry_slippage_quote", 0.0) or 0.0), funding_rate_bps=float(value.get("funding_rate_bps", 0.0) or 0.0), funding_timestamp_ms=int(value.get("funding_timestamp_ms", 0) or 0), funding_interval_ms=int(value.get("funding_interval_ms", 0) or 0), entry_filled_at_ms=int(value.get("entry_filled_at_ms", 0) or 0),
+            order_state=str(value.get("order_state", PaperOrderState.FILLED.value) or PaperOrderState.FILLED.value), requested_qty=float(value.get("requested_qty", value.get("qty", 0.0)) or 0.0), residual_qty=float(value.get("residual_qty", 0.0) or 0.0),
+            funding_settlements=settlements, funding_settlement_conflict=(
+                funding_settlement_conflict or restored_settlement_conflict
+            ),
+            entry_execution_source=str(value.get("entry_execution_source", "top_book_only") or "top_book_only"),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return leg if _paper_leg_numerics_valid(leg) else None
+
+
+def _strict_json_bool(value: object) -> bool | None:
+    """Accept only an actual JSON boolean at the persisted paper boundary."""
+    return value if isinstance(value, bool) else None
+
+
+def _paper_leg_numerics_valid(leg: SpreadPaperLeg) -> bool:
+    """Reject corrupt persisted paper positions before they can emit PnL.
+
+    Journal JSON is an input boundary after a restart.  ``NaN`` and infinity
+    compare unusually in Python and can otherwise turn a malformed historical
+    record into a seemingly official, but non-numeric, paper result.
+    """
+    numbers = (
+        leg.entry_bid,
+        leg.entry_ask,
+        leg.entry_bid_size,
+        leg.entry_ask_size,
+        leg.mark_price,
+        leg.index_price,
+        leg.volume_24h_quote,
+        leg.open_interest,
+        leg.qty,
+        leg.entry_notional_quote,
+        leg.entry_fee_bps,
+        leg.entry_fee_quote,
+        leg.entry_slippage_quote,
+        leg.funding_rate_bps,
+        leg.requested_qty,
+        leg.residual_qty,
+    )
+    return all(isfinite(float(number)) for number in numbers) and all(
+        value >= 0.0
+        for value in (
+            leg.qty,
+            leg.entry_notional_quote,
+            leg.requested_qty,
+            leg.residual_qty,
+        )
     )
 
 
 def _candidate_snapshot(candidate: SpreadReversionCandidate) -> dict:
-    return {
-        "executable_spread_bps": float(
-            getattr(candidate, "executable_spread_bps", 0.0) or 0.0
-        ),
-        "spread_mid_bps": float(getattr(candidate, "spread_mid_bps", 0.0) or 0.0),
-        "rolling_mean_bps": float(
-            getattr(candidate, "rolling_mean_bps", 0.0) or 0.0
-        ),
-        "rolling_std_bps": float(getattr(candidate, "rolling_std_bps", 0.0) or 0.0),
-        "z_score": float(getattr(candidate, "z_score", 0.0) or 0.0),
-        "net_edge_bps": float(getattr(candidate, "net_edge_bps", 0.0) or 0.0),
-        "fair_price": float(getattr(candidate, "fair_price", 0.0) or 0.0),
-        "venue_premium_bps": float(getattr(candidate, "venue_premium_bps", 0.0) or 0.0),
-        "capacity_quote": float(getattr(candidate, "capacity_quote", 0.0) or 0.0),
-        "liquidity_evidence_status": str(
-            getattr(candidate, "liquidity_evidence_status", "") or ""
-        ),
-        "fee_bps": float(getattr(candidate, "fee_bps", 0.0) or 0.0),
-        "slippage_reserve_bps": float(
-            getattr(candidate, "slippage_reserve_bps", 0.0) or 0.0
-        ),
-        "funding_carry_bps": float(
-            getattr(candidate, "funding_carry_bps", 0.0) or 0.0
-        ),
-        "funding_carry_cost_bps": float(
-            getattr(candidate, "funding_carry_cost_bps", 0.0) or 0.0
-        ),
-    }
+    return {"canonical_venue_a": candidate.canonical_venue_a, "canonical_venue_b": candidate.canonical_venue_b, "current_signed_mid_spread_bps": candidate.current_signed_mid_spread_bps, "current_executable_entry_spread_bps": candidate.current_executable_entry_spread_bps, "equilibrium_spread_bps": candidate.equilibrium_spread_bps, "target_exit_spread_bps": candidate.target_exit_spread_bps, "gross_reversion_edge_bps": candidate.gross_reversion_edge_bps, "expected_net_edge_bps": candidate.expected_net_edge_bps, "worst_case_edge_bps": candidate.worst_case_edge_bps, "gross_signal_edge_bps": candidate.gross_signal_edge_bps, "funding_edge_bps": candidate.funding_edge_bps, "entry_cross_bps": candidate.entry_cross_bps, "expected_exit_cross_bps": candidate.expected_exit_cross_bps, "entry_fee_bps": candidate.entry_fee_bps, "exit_fee_bps": candidate.exit_fee_bps, "entry_slippage_bps": candidate.entry_slippage_bps, "exit_slippage_bps": candidate.exit_slippage_bps, "adverse_selection_bps": candidate.adverse_selection_bps, "capital_buffer_bps": candidate.capital_buffer_bps, "execution_buffer_bps": candidate.execution_buffer_bps, "venue_risk_haircut_bps": candidate.venue_risk_haircut_bps, "rolling_mean_bps": candidate.rolling_mean_bps, "rolling_std_bps": candidate.rolling_std_bps, "z_score": candidate.z_score, "calculation_version": candidate.calculation_version, "model_epoch": candidate.model_epoch, "economics_complete": candidate.economics_complete, "fee_evidence_complete": candidate.fee_evidence_complete, "contract_normalization_status": candidate.contract_normalization_status}
 
 
-def _market_snapshot_payload(
-    long_quote: QuoteSnapshot | None,
-    short_quote: QuoteSnapshot | None,
-) -> dict:
-    return {
-        "long_quote": _quote_payload(long_quote),
-        "short_quote": _quote_payload(short_quote),
-    }
+def _market_snapshot_payload(long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None) -> dict:
+    return {"long_quote": _quote_payload(long_quote), "short_quote": _quote_payload(short_quote)}
 
 
 def _quote_payload(quote: QuoteSnapshot | None) -> dict | None:
     if quote is None:
         return None
-    return {
-        "venue": str(getattr(quote, "venue", "") or "").lower(),
-        "symbol": str(getattr(quote, "symbol", "") or "").upper(),
-        "source": str(getattr(quote, "source", "") or ""),
-        "bid": float(getattr(quote, "bid", 0.0) or 0.0),
-        "ask": float(getattr(quote, "ask", 0.0) or 0.0),
-        "bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
-        "ask_size": float(getattr(quote, "ask_size", 0.0) or 0.0),
-        "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
-        "funding_rate_bps": float(getattr(quote, "funding_rate_bps", 0.0) or 0.0),
-        "funding_timestamp_ms": int(getattr(quote, "funding_timestamp_ms", 0) or 0),
-        "mark_price": float(getattr(quote, "mark_price", 0.0) or 0.0),
-        "index_price": float(getattr(quote, "index_price", 0.0) or 0.0),
-        "volume_24h_quote": float(getattr(quote, "volume_24h_quote", 0.0) or 0.0),
-        "open_interest": float(getattr(quote, "open_interest", 0.0) or 0.0),
-    }
+    # Persist only depth provenance/counts, not repeated full ladders in every
+    # journal event.  The corresponding snapshot is the raw market evidence.
+    return {"venue": quote.venue, "symbol": quote.symbol, "source": quote.source, "bid": quote.bid, "ask": quote.ask, "bid_size": quote.bid_size, "ask_size": quote.ask_size, "bid_depth_levels": len(quote.bid_depth), "ask_depth_levels": len(quote.ask_depth), "observed_at_ms": quote.observed_at_ms, "funding_rate_bps": quote.funding_rate_bps, "funding_timestamp_ms": quote.funding_timestamp_ms, "funding_interval_ms": quote.funding_interval_ms}
 
 
-def _dict_payload(payload: object) -> dict:
-    return dict(payload) if isinstance(payload, dict) else {}
-
-
-def _paper_id(candidate: SpreadReversionCandidate, paper_bot_id: str = "tt_conservative") -> str:
-    base = f"spread:{candidate.candidate_id}:{int(candidate.signal_ts_ms or 0)}"
-    if str(paper_bot_id or "tt_conservative") == "tt_conservative":
-        return base
-    return f"{base}:bot:{paper_bot_id}"
-
-
-def _registration_event(position: SpreadPaperPosition) -> dict:
-    return {
-        "kind": "opportunity.paper_registered",
-        "payload": {
-            "paper_id": position.paper_id,
-            "candidate_id": position.candidate_id,
-            "review_id": None,
-            "symbol": position.symbol,
-            "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}",
-            "long_venue": position.long_venue,
-            "short_venue": position.short_venue,
-            "candidate_opportunity_label": position.candidate_opportunity_label,
-            "paper_bot_id": position.paper_bot_id,
-            "paper_cohort": position.paper_cohort,
-            "paper_entry_mode": position.paper_entry_mode,
-            "paper_exit_mode": position.paper_exit_mode,
-            "paper_execution_model": position.paper_entry_mode,
-            "paper_maker_leg": position.paper_maker_leg,
-            "paper_hedge_delay_ms": position.paper_hedge_delay_ms,
-            "paper_control_group": position.paper_control_group,
-            "paper_fill_assumption": position.paper_fill_assumption,
-            "finalist_rank": position.finalist_rank,
-            "registered_at_ms": position.registered_at_ms,
-            "selected_real_trade": False,
-            "not_selected_reason": "spread_shadow_paper",
-            "paper_order_status": (
-                "entry_pending" if _position_has_pending_entry(position) else "open"
-            ),
-            "paper_entry_notional_quote": position.entry_notional_quote,
-            "candidate_snapshot": dict(position.candidate_snapshot),
-            "entry_market_snapshot": dict(position.entry_market_snapshot),
-            "funding_advantage_bps": (
-                position.short_leg.funding_rate_bps - position.long_leg.funding_rate_bps
-            ),
-            "paper_entry_fee_quote": _entry_fee_quote(position),
-            "paper_entry_slippage_quote": _entry_slippage_quote(position),
-            "paper_fee_quote": _entry_fee_quote(position),
-            "paper_slippage_quote": _entry_slippage_quote(position),
-            "paper_funding_quote": 0.0,
-            "accrued_funding_estimate_quote": 0.0,
-            "settlement_realized_funding_quote": 0.0,
-            "due_horizons": position.due_horizons,
-            "long_leg": _leg_payload(position.long_leg),
-            "short_leg": _leg_payload(position.short_leg),
-        },
-    }
-
-
-def _hedge_filled_event(position: SpreadPaperPosition) -> dict:
-    payload = _registration_event(position)["payload"]
-    payload["paper_order_status"] = "hedged"
-    return {"kind": "opportunity.paper_hedge_filled", "payload": payload}
-
-
-def _position_from_registration_payload(payload: dict) -> SpreadPaperPosition | None:
-    long_leg = _leg_from_payload(payload.get("long_leg", {}))
-    short_leg = _leg_from_payload(payload.get("short_leg", {}))
-    if long_leg is None or short_leg is None:
-        return None
-    due_horizons_raw = payload.get("due_horizons", [])
-    due_horizons = [dict(item) for item in due_horizons_raw if isinstance(item, dict)]
-    if not due_horizons:
-        return None
-    paper_id = str(payload.get("paper_id", "") or "")
-    candidate_id = str(payload.get("candidate_id", "") or "")
-    symbol = str(payload.get("symbol", "") or "")
-    long_venue = str(payload.get("long_venue", "") or "")
-    short_venue = str(payload.get("short_venue", "") or "")
-    if not paper_id or not candidate_id or not symbol or not long_venue or not short_venue:
-        return None
-    return SpreadPaperPosition(
-        paper_id=paper_id,
-        candidate_id=candidate_id,
-        symbol=symbol,
-        long_venue=long_venue,
-        short_venue=short_venue,
-        candidate_opportunity_label=str(
-            payload.get("candidate_opportunity_label", "") or "spread_reversion"
-        ),
-        paper_bot_id=str(payload.get("paper_bot_id", "") or "tt_conservative"),
-        paper_cohort=str(payload.get("paper_cohort", "") or "baseline_current"),
-        paper_entry_mode=str(payload.get("paper_entry_mode", "") or "long_taker:short_taker"),
-        paper_exit_mode=str(payload.get("paper_exit_mode", "") or "long_taker:short_taker"),
-        paper_maker_leg=str(payload.get("paper_maker_leg", "") or ""),
-        paper_hedge_delay_ms=int(payload.get("paper_hedge_delay_ms", 0) or 0),
-        paper_control_group=bool(payload.get("paper_control_group", False)),
-        paper_fill_assumption=str(
-            payload.get("paper_fill_assumption", "") or "taker_top_of_book"
-        ),
-        finalist_rank=int(payload.get("finalist_rank", 0) or 0),
-        registered_at_ms=int(payload.get("registered_at_ms", 0) or 0),
-        entry_notional_quote=float(payload.get("paper_entry_notional_quote", 0.0) or 0.0),
-        long_leg=long_leg,
-        short_leg=short_leg,
-        candidate_snapshot=_dict_payload(payload.get("candidate_snapshot", {})),
-        entry_market_snapshot=_dict_payload(payload.get("entry_market_snapshot", {})),
-        due_horizons=due_horizons,
-    )
-
-
-def _leg_from_payload(payload: object) -> SpreadPaperLeg | None:
-    if not isinstance(payload, dict):
-        return None
-    venue = str(payload.get("venue", "") or "")
-    side = str(payload.get("side", "") or "")
-    if not venue or side not in {"long", "short"}:
-        return None
-    return SpreadPaperLeg(
-        venue=venue,
-        side=side,
-        entry_liquidity_role=str(payload.get("entry_liquidity_role", "") or "taker"),
-        exit_liquidity_role=str(payload.get("exit_liquidity_role", "") or "taker"),
-        entry_pending=bool(payload.get("entry_pending", False)),
-        entry_bid=float(payload.get("entry_bid", 0.0) or 0.0),
-        entry_ask=float(payload.get("entry_ask", 0.0) or 0.0),
-        entry_bid_size=float(payload.get("entry_bid_size", 0.0) or 0.0),
-        entry_ask_size=float(payload.get("entry_ask_size", 0.0) or 0.0),
-        entry_observed_at_ms=int(payload.get("entry_observed_at_ms", 0) or 0),
-        mark_price=float(payload.get("mark_price", 0.0) or 0.0),
-        index_price=float(payload.get("index_price", 0.0) or 0.0),
-        volume_24h_quote=float(payload.get("volume_24h_quote", 0.0) or 0.0),
-        open_interest=float(payload.get("open_interest", 0.0) or 0.0),
-        entry_raw_price=_optional_float(payload.get("entry_raw_price")),
-        entry_price=_optional_float(payload.get("entry_price")),
-        qty=float(payload.get("qty", 0.0) or 0.0),
-        entry_notional_quote=float(payload.get("entry_notional_quote", 0.0) or 0.0),
-        entry_fee_bps=float(payload.get("entry_fee_bps", 0.0) or 0.0),
-        entry_fee_quote=float(payload.get("entry_fee_quote", 0.0) or 0.0),
-        entry_slippage_quote=float(payload.get("entry_slippage_quote", 0.0) or 0.0),
-        funding_rate_bps=float(payload.get("funding_rate_bps", 0.0) or 0.0),
-        funding_timestamp_ms=int(payload.get("funding_timestamp_ms", 0) or 0),
-    )
-
-
-def _quote_for(
-    quotes: dict[str, QuoteSnapshot],
-    venue: str,
-    symbol: str,
-) -> QuoteSnapshot | None:
-    direct = quotes.get(f"{str(venue).lower()}:{str(symbol).upper()}")
-    if direct is not None:
-        return direct
-    for quote in quotes.values():
-        if (
-            str(getattr(quote, "venue", "") or "").lower() == str(venue).lower()
-            and str(getattr(quote, "symbol", "") or "").upper() == str(symbol).upper()
-        ):
-            return quote
-    return None
-
-
-def _fee_bps(config: SpreadPaperConfig, venue: str, role: str = "taker") -> float:
-    venue_key = str(venue).lower()
-    taker_fee_bps = float(config.taker_fee_bps_by_venue.get(venue_key, 0.0) or 0.0)
-    if _liquidity_role(role) == "maker":
-        return float(config.maker_fee_bps_by_venue.get(venue_key, taker_fee_bps) or 0.0)
-    return taker_fee_bps
-
-
-def _liquidity_role(role: str) -> str:
-    normalized = str(role or "taker").lower()
-    return "maker" if normalized == "maker" else "taker"
-
-
-def _entry_raw_price(quote: QuoteSnapshot, side: str, role: str) -> float:
-    role = _liquidity_role(role)
-    if side == "long":
-        return float(getattr(quote, "bid" if role == "maker" else "ask", 0.0) or 0.0)
-    return float(getattr(quote, "ask" if role == "maker" else "bid", 0.0) or 0.0)
-
-
-def _exit_raw_price(quote: QuoteSnapshot, side: str, role: str) -> float:
-    role = _liquidity_role(role)
-    if side == "long":
-        return float(getattr(quote, "ask" if role == "maker" else "bid", 0.0) or 0.0)
-    return float(getattr(quote, "bid" if role == "maker" else "ask", 0.0) or 0.0)
-
-
-def _apply_slippage(raw_price: float, *, bps: float, action: str) -> float:
-    factor = max(float(bps or 0.0), 0.0) / 10_000.0
-    if action == "buy":
-        return raw_price * (1.0 + factor)
-    return raw_price * (1.0 - factor)
-
-
-def _entry_fee_quote(position: SpreadPaperPosition) -> float:
-    return position.long_leg.entry_fee_quote + position.short_leg.entry_fee_quote
-
-
-def _entry_slippage_quote(position: SpreadPaperPosition) -> float:
-    return position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote
-
-
-def _position_has_pending_entry(position: SpreadPaperPosition) -> bool:
-    return bool(position.long_leg.entry_pending or position.short_leg.entry_pending)
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _accrued_funding_quote(
-    position: SpreadPaperPosition,
-    now_ms: int,
-    funding_interval_ms: int,
-) -> float:
-    held_ratio = max(now_ms - position.registered_at_ms, 0) / funding_interval_ms
-    long_quote = -(
-        position.long_leg.entry_notional_quote
-        * position.long_leg.funding_rate_bps
-        / 10_000.0
-        * held_ratio
-    )
-    short_quote = (
-        position.short_leg.entry_notional_quote
-        * position.short_leg.funding_rate_bps
-        / 10_000.0
-        * held_ratio
-    )
-    return long_quote + short_quote
-
-
-def _settlement_funding_quote(position: SpreadPaperPosition, now_ms: int) -> float:
-    return _settled_leg_funding(position.long_leg, position.registered_at_ms, now_ms) + (
-        _settled_leg_funding(position.short_leg, position.registered_at_ms, now_ms)
-    )
-
-
-def _settled_leg_funding(leg: SpreadPaperLeg, registered_at_ms: int, now_ms: int) -> float:
-    funding_ts = int(leg.funding_timestamp_ms or 0)
-    if funding_ts <= registered_at_ms or funding_ts > now_ms:
-        return 0.0
-    quote = leg.entry_notional_quote * leg.funding_rate_bps / 10_000.0
-    if leg.side == "long":
-        return -quote
-    return quote
-
-
-def _leg_payload(
-    leg: SpreadPaperLeg,
-    *,
-    exit_raw_price: float | None = None,
-    exit_price: float | None = None,
-    exit_fee_bps: float = 0.0,
-    exit_fee_quote: float = 0.0,
-    exit_slippage_quote: float = 0.0,
-    gross_quote: float | None = None,
-) -> dict:
+def _leg_payload(leg: SpreadPaperLeg, exit_raw_price: float | None = None, exit_price: float | None = None, exit_fee_quote: float = 0.0, gross_quote: float | None = None, exit_execution_source: str = "") -> dict:
     return {
         "venue": leg.venue,
         "side": leg.side,
         "entry_liquidity_role": leg.entry_liquidity_role,
         "exit_liquidity_role": leg.exit_liquidity_role,
+        "entry_execution_source": leg.entry_execution_source,
+        "exit_execution_source": exit_execution_source,
         "entry_pending": leg.entry_pending,
         "entry_bid": leg.entry_bid,
         "entry_ask": leg.entry_ask,
@@ -1607,52 +1864,727 @@ def _leg_payload(
         "exit_raw_price": exit_raw_price,
         "exit_price": exit_price,
         "qty": leg.qty,
+        "requested_qty": leg.requested_qty,
+        "residual_qty": leg.residual_qty,
+        "order_state": leg.order_state,
         "entry_notional_quote": leg.entry_notional_quote,
         "entry_fee_bps": leg.entry_fee_bps,
         "entry_fee_quote": leg.entry_fee_quote,
-        "exit_fee_bps": exit_fee_bps,
         "exit_fee_quote": exit_fee_quote,
         "entry_slippage_quote": leg.entry_slippage_quote,
-        "exit_slippage_quote": exit_slippage_quote,
         "gross_quote": gross_quote,
         "funding_rate_bps": leg.funding_rate_bps,
         "funding_timestamp_ms": leg.funding_timestamp_ms,
+        "funding_interval_ms": leg.funding_interval_ms,
+        "entry_filled_at_ms": leg.entry_filled_at_ms,
+        "funding_settlements": [
+            _funding_settlement_payload(item)
+            for item in leg.funding_settlements
+        ],
+        "funding_settlement_conflict": leg.funding_settlement_conflict,
     }
 
 
-def _mid(quote: QuoteSnapshot | None) -> float | None:
-    if quote is None:
-        return None
-    bid = float(getattr(quote, "bid", 0.0) or 0.0)
-    ask = float(getattr(quote, "ask", 0.0) or 0.0)
-    if bid <= 0.0 or ask <= 0.0:
-        return None
-    return (bid + ask) / 2.0
+def _entry_capacity_source(position: SpreadPaperPosition) -> str:
+    return _sources_summary(
+        position.long_leg.entry_execution_source,
+        position.short_leg.entry_execution_source,
+    )
 
 
-def _spread_mid_bps(
+def _sources_summary(*sources: str) -> str:
+    normalized = tuple(sorted({str(source or "top_book_only") for source in sources}))
+    if normalized == ("l2_vwap",):
+        return "l2_vwap"
+    if normalized == ("top_book_only",):
+        return "top_book_only"
+    return "mixed:" + "+".join(normalized)
+
+
+def _exit_capacity_failure_reason(
+    long_execution: _ExecutionEstimate | None,
+    short_execution: _ExecutionEstimate | None,
+) -> str:
+    sources = tuple(
+        estimate.source
+        for estimate in (long_execution, short_execution)
+        if estimate is not None
+    )
+    if sources and all(source == "top_book_only" for source in sources):
+        return "exit_top_book_capacity_insufficient"
+    return "exit_l2_capacity_insufficient"
+
+
+def _position_order_state(position: SpreadPaperPosition) -> str:
+    if _position_has_pending_entry(position):
+        return PaperOrderState.WORKING.value
+    if position.paper_maker_leg:
+        return PaperOrderState.UNKNOWN.value
+    if position.residual_base_qty > 1e-12:
+        return PaperOrderState.PARTIAL.value
+    return PaperOrderState.FILLED.value
+
+
+def _paper_id(candidate: SpreadReversionCandidate, bot_id: str) -> str:
+    base = f"spread:{candidate.candidate_id}:{int(candidate.signal_ts_ms or 0)}"
+    return base if bot_id == "tt_conservative" else f"{base}:bot:{bot_id}"
+
+
+def _quote_for(quotes: dict[str, QuoteSnapshot], venue: str, symbol: str) -> QuoteSnapshot | None:
+    target = f"{str(venue).lower()}:{str(symbol).upper()}"
+    if target in quotes:
+        return quotes[target]
+    return next((quote for quote in quotes.values() if str(quote.venue).lower() == str(venue).lower() and str(quote.symbol).upper() == str(symbol).upper()), None)
+
+
+def _entry_raw_price(quote: QuoteSnapshot, side: str, role: str) -> float:
+    if side == "long":
+        return float((quote.bid if _liquidity_role(role) == "maker" else quote.ask) or 0.0)
+    return float((quote.ask if _liquidity_role(role) == "maker" else quote.bid) or 0.0)
+
+
+def _exit_raw_price(quote: QuoteSnapshot, side: str, role: str) -> float:
+    if side == "long":
+        return float((quote.ask if _liquidity_role(role) == "maker" else quote.bid) or 0.0)
+    return float((quote.bid if _liquidity_role(role) == "maker" else quote.ask) or 0.0)
+
+
+def _liquidity_role(role: str) -> str:
+    return "maker" if str(role or "").lower() == "maker" else "taker"
+
+
+def _fee_bps(config: SpreadPaperConfig, venue: str, role: str) -> float:
+    fees = (
+        config.maker_fee_bps_by_venue
+        if _liquidity_role(role) == "maker"
+        else config.taker_fee_bps_by_venue
+    )
+    try:
+        fee_bps = float(
+            fees.get(
+                str(venue).lower(),
+                config.taker_fee_bps_by_venue.get(str(venue).lower(), 0.0),
+            )
+            or 0.0
+        )
+    except (TypeError, ValueError):
+        return 0.0
+    return fee_bps if isfinite(fee_bps) and fee_bps >= 0.0 else 0.0
+
+
+def _paper_fee_evidence_complete(
+    config: SpreadPaperConfig,
+    candidate: SpreadReversionCandidate,
+    bot: SpreadPaperBotSpec,
+) -> bool:
+    """Verify all four simulated legs have an explicit fee source."""
+    return _execution_fee_evidence_complete(
+        config,
+        long_venue=candidate.long_venue,
+        short_venue=candidate.short_venue,
+        entry_long_role=bot.entry_long_role,
+        entry_short_role=bot.entry_short_role,
+        exit_long_role=bot.exit_long_role,
+        exit_short_role=bot.exit_short_role,
+    )
+
+
+def _execution_fee_evidence_complete(
+    config: SpreadPaperConfig,
+    *,
+    long_venue: str,
+    short_venue: str,
+    entry_long_role: str,
+    entry_short_role: str,
+    exit_long_role: str,
+    exit_short_role: str,
+) -> bool:
+    """Verify all four simulated legs have an explicit fee source.
+
+    Maker roles may use an explicit maker fee or the explicitly configured
+    taker fallback, exactly as ``_fee_bps`` prices them.  This keeps control
+    cohorts observable without letting a missing map turn into zero-cost PnL.
+    """
+    legs = (
+        (long_venue, entry_long_role),
+        (short_venue, entry_short_role),
+        (long_venue, exit_long_role),
+        (short_venue, exit_short_role),
+    )
+    for venue, role in legs:
+        key = str(venue or "").lower()
+        source = (
+            config.maker_fee_bps_by_venue
+            if _liquidity_role(role) == "maker" and key in config.maker_fee_bps_by_venue
+            else config.taker_fee_bps_by_venue
+        )
+        if key not in source:
+            return False
+        try:
+            fee_bps = float(source[key])
+        except (TypeError, ValueError):
+            return False
+        if not isfinite(fee_bps) or fee_bps < 0.0:
+            return False
+    return True
+
+
+def _apply_slippage(raw_price: float, *, bps: float, action: str) -> float:
+    factor = max(float(bps or 0.0), 0.0) / 10_000.0
+    return raw_price * (1.0 + factor if action == "buy" else 1.0 - factor)
+
+
+def _settlement_funding_quote(position: SpreadPaperPosition, now_ms: int) -> float:
+    """Return only actual, position-allocated settlement cash flows.
+
+    The entry funding quote remains an indicative forecast in
+    ``accrued_funding_estimate_quote``. Treating it as settled PnL was a
+    fictitious accounting entry.
+    """
+    return sum(
+        _settled_leg_funding(leg, position.registered_at_ms, now_ms)
+        for leg in (position.long_leg, position.short_leg)
+    )
+
+
+def _settled_leg_funding(leg: SpreadPaperLeg, opened_at_ms: int, now_ms: int) -> float:
+    opened_at_ms = int(leg.entry_filled_at_ms or opened_at_ms)
+    return sum(
+        float(settlement.amount_quote)
+        for settlement in leg.funding_settlements
+        if (
+            opened_at_ms < int(settlement.settlement_timestamp_ms) <= int(now_ms)
+            and int(settlement.observed_at_ms) <= int(now_ms)
+        )
+    )
+
+
+def _public_settled_funding_for_position(
+    position: SpreadPaperPosition,
+    *,
+    now_ms: int,
+    quotes: dict[str, QuoteSnapshot],
+    config: SpreadPaperConfig,
+) -> list[FundingSettlement]:
+    """Build only settlement facts directly evidenced by the public snapshot.
+
+    ``QuoteSnapshot.settled_funding_rate_bps`` is a source-level statement
+    that the venue has published the previous interval's settled rate.  It is
+    not interchangeable with ``funding_rate_bps`` (the current/quoted rate)
+    or a forecast.  The timestamp is the immediately preceding point in the
+    quote's *current* known schedule; schedule continuity is still checked by
+    the ledger validator before the record can become official.
+    """
+    records: list[FundingSettlement] = []
+    for leg_side, leg in (
+        ("long", position.long_leg),
+        ("short", position.short_leg),
+    ):
+        quote = _quote_for(quotes, leg.venue, position.symbol)
+        settlement = _public_settled_funding_for_leg(
+            position,
+            leg_side=leg_side,
+            leg=leg,
+            quote=quote,
+            now_ms=now_ms,
+            config=config,
+        )
+        if settlement is not None:
+            records.append(settlement)
+    return records
+
+
+def _public_settled_funding_for_leg(
+    position: SpreadPaperPosition,
+    *,
+    leg_side: str,
+    leg: SpreadPaperLeg,
+    quote: QuoteSnapshot | None,
+    now_ms: int,
+    config: SpreadPaperConfig,
+) -> FundingSettlement | None:
+    if leg.entry_pending or leg.qty <= 0.0 or quote is None:
+        return None
+    if not _funding_schedule_matches_entry(leg, quote, now_ms):
+        return None
+    try:
+        interval_ms = int(quote.funding_interval_ms or 0)
+        next_timestamp_ms = int(quote.funding_timestamp_ms or 0)
+        observed_at_ms = int(quote.observed_at_ms or 0)
+        settled_rate_bps = float(quote.settled_funding_rate_bps)
+        mark_price = float(quote.mark_price or 0.0)
+        quantity = float(leg.qty)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        interval_ms <= 0
+        or next_timestamp_ms <= interval_ms
+        or observed_at_ms <= 0
+        or not isfinite(settled_rate_bps)
+        or not isfinite(mark_price)
+        or mark_price <= 0.0
+        or not isfinite(quantity)
+        or quantity <= 0.0
+    ):
+        return None
+    settlement_timestamp_ms = next_timestamp_ms - interval_ms
+    opened_at_ms = int(leg.entry_filled_at_ms or position.registered_at_ms)
+    terminal_due_at_ms = _terminal_due_at_ms(position)
+    if (
+        settlement_timestamp_ms <= opened_at_ms
+        or settlement_timestamp_ms > now_ms
+        or terminal_due_at_ms <= 0
+        or settlement_timestamp_ms > terminal_due_at_ms
+        or observed_at_ms < settlement_timestamp_ms
+        or observed_at_ms > now_ms
+    ):
+        return None
+    # A current quote received long after settlement cannot supply the
+    # settlement mark.  Keeping this bounded turns restart/refresh gaps into
+    # missing evidence instead of a back-filled and potentially fictitious
+    # cash flow.
+    max_observation_lag_ms = max(int(config.quote_ttl_ms or 0), 1)
+    if observed_at_ms - settlement_timestamp_ms > max_observation_lag_ms:
+        return None
+    side_sign = -1.0 if leg_side == "long" else 1.0
+    amount_quote = side_sign * settled_rate_bps * quantity * mark_price / 10_000.0
+    if not isfinite(amount_quote):
+        return None
+    return FundingSettlement(
+        paper_id=position.paper_id,
+        leg_side=leg_side,
+        settlement_timestamp_ms=settlement_timestamp_ms,
+        amount_quote=amount_quote,
+        observed_at_ms=observed_at_ms,
+        source=(
+            "public_settled_rate_position_allocation:"
+            f"{str(leg.venue or '').lower()}"
+        ),
+    )
+
+
+def _funding_settlement_evidence_complete(
+    position: SpreadPaperPosition,
+    now_ms: int,
+    long_quote: QuoteSnapshot | None,
+    short_quote: QuoteSnapshot | None,
+) -> bool:
+    """Require an actual record for every known settlement crossed.
+
+    A forecast can never prove a settled amount. An unknown interval also
+    prevents us from proving that another settlement has not happened, so an
+    evaluation after the first crossing remains diagnostic-only in that case.
+    """
+    return all(
+        _leg_funding_evidence_complete(
+            leg,
+            position.registered_at_ms,
+            now_ms,
+            quote,
+        )
+        for leg, quote in (
+            (position.long_leg, long_quote),
+            (position.short_leg, short_quote),
+        )
+        if leg.qty > 0.0 and not leg.entry_pending
+    )
+
+
+def _leg_funding_evidence_complete(
+    leg: SpreadPaperLeg,
+    registered_at_ms: int,
+    now_ms: int,
+    current_quote: QuoteSnapshot | None,
+) -> bool:
+    if leg.funding_settlement_conflict:
+        return False
+    # An entry snapshot describes the initial settlement schedule, not a
+    # permanent exchange contract.  If the venue changes either the interval
+    # *or the next settlement point* while a paper position is open, a missing
+    # intermediate ledger row could be a real settlement rather than a zero.
+    # Without a schedule-history source, official PnL must fail closed instead
+    # of extrapolating the old cadence.
+    if not _funding_schedule_matches_entry(leg, current_quote, now_ms):
+        return False
+    opened_at_ms = int(leg.entry_filled_at_ms or registered_at_ms)
+    first_settlement = int(leg.funding_timestamp_ms or 0)
+    if first_settlement <= 0:
+        return False
+    # Before the first known timestamp after the position opened, funding is
+    # demonstrably zero.  A maker fill (or a delayed paper admission) can
+    # happen after the snapshot's next funding timestamp.  That earlier cash
+    # event belongs to a position that existed before this one and must never
+    # be required as evidence for this paper position.
+    if first_settlement > opened_at_ms:
+        first_required_settlement = first_settlement
+    else:
+        interval = int(leg.funding_interval_ms or 0)
+        if interval <= 0:
+            return False
+        elapsed_intervals = (opened_at_ms - first_settlement) // interval + 1
+        first_required_settlement = first_settlement + elapsed_intervals * interval
+    if now_ms < first_required_settlement:
+        return True
+    interval = int(leg.funding_interval_ms or 0)
+    if interval <= 0:
+        return False
+    required_timestamps = range(
+        first_required_settlement,
+        int(now_ms) + 1,
+        interval,
+    )
+    observed_timestamps = {
+        int(settlement.settlement_timestamp_ms)
+        for settlement in leg.funding_settlements
+        if int(settlement.observed_at_ms) <= int(now_ms)
+    }
+    return all(timestamp in observed_timestamps for timestamp in required_timestamps)
+
+
+def _settlement_funding_evidence(
+    position: SpreadPaperPosition,
+    now_ms: int,
+    long_quote: QuoteSnapshot | None,
+    short_quote: QuoteSnapshot | None,
+) -> str:
+    if any(
+        leg.funding_settlement_conflict
+        for leg in (position.long_leg, position.short_leg)
+    ):
+        return "conflicting_actual_funding_ledger"
+    if not _funding_schedules_unchanged(
+        position,
+        now_ms,
+        long_quote,
+        short_quote,
+    ):
+        return "funding_schedule_changed"
+    if _funding_settlement_evidence_complete(position, now_ms, long_quote, short_quote):
+        return "actual_position_allocated_funding_ledger"
+    if any(
+        settlement.settlement_timestamp_ms <= now_ms
+        and settlement.observed_at_ms <= now_ms
+        for leg in (position.long_leg, position.short_leg)
+        for settlement in leg.funding_settlements
+    ):
+        return "partial_actual_funding_ledger"
+    return "missing_actual_funding_ledger"
+
+
+def _funding_schedules_unchanged(
+    position: SpreadPaperPosition,
+    now_ms: int,
+    long_quote: QuoteSnapshot | None,
+    short_quote: QuoteSnapshot | None,
+) -> bool:
+    return all(
+        _funding_schedule_matches_entry(leg, quote, now_ms)
+        for leg, quote in (
+            (position.long_leg, long_quote),
+            (position.short_leg, short_quote),
+        )
+        if leg.qty > 0.0 and not leg.entry_pending
+    )
+
+
+def _funding_schedule_matches_entry(
+    leg: SpreadPaperLeg,
+    current_quote: QuoteSnapshot | None,
+    now_ms: int,
+) -> bool:
+    """Return whether the current next-funding time preserves entry cadence.
+
+    ``funding_timestamp_ms`` is the venue's next future settlement time.  An
+    unchanged interval alone is insufficient: an exchange can move the
+    settlement clock while retaining the same cadence.  Since no schedule
+    history is available to paper execution, accepting such a quote would let
+    an unknown cash event disappear from official PnL.
+    """
+    if current_quote is None:
+        return False
+    interval_ms = int(leg.funding_interval_ms or 0)
+    first_settlement_ms = int(leg.funding_timestamp_ms or 0)
+    if interval_ms <= 0 or first_settlement_ms <= 0:
+        return False
+    if int(current_quote.funding_interval_ms or 0) != interval_ms:
+        return False
+    next_settlement_ms = int(current_quote.funding_timestamp_ms or 0)
+    if next_settlement_ms <= int(now_ms):
+        return False
+    expected_next_ms = first_settlement_ms
+    if expected_next_ms <= int(now_ms):
+        elapsed_intervals = (int(now_ms) - expected_next_ms) // interval_ms + 1
+        expected_next_ms += elapsed_intervals * interval_ms
+    return next_settlement_ms == expected_next_ms
+
+
+def _accrued_funding_quote(position: SpreadPaperPosition, now_ms: int) -> float:
+    """Indicative carry only; unknown settlement intervals contribute nothing."""
+    return _accrued_leg_funding(position.long_leg, position.registered_at_ms, now_ms) + _accrued_leg_funding(position.short_leg, position.registered_at_ms, now_ms)
+
+
+def _accrued_leg_funding(leg: SpreadPaperLeg, registered_at_ms: int, now_ms: int) -> float:
+    if leg.entry_pending or leg.funding_interval_ms <= 0:
+        return 0.0
+    opened_at_ms = int(leg.entry_filled_at_ms or registered_at_ms)
+    ratio = max(now_ms - opened_at_ms, 0) / leg.funding_interval_ms
+    value = leg.entry_notional_quote * leg.funding_rate_bps / 10_000.0 * ratio
+    return -value if leg.side == "long" else value
+
+
+def _residual_gross_quote(
+    position: SpreadPaperPosition,
+    long_gross: float,
+    short_gross: float,
+) -> float:
+    """Return PnL attributable to any remaining directional base exposure."""
+    matched_qty = min(position.long_leg.qty, position.short_leg.qty)
+    if matched_qty <= 0.0:
+        return long_gross + short_gross
+    long_per_unit = 0.0 if position.long_leg.qty <= 0.0 else long_gross / position.long_leg.qty
+    short_per_unit = 0.0 if position.short_leg.qty <= 0.0 else short_gross / position.short_leg.qty
+    matched_gross = matched_qty * (long_per_unit + short_per_unit)
+    return long_gross + short_gross - matched_gross
+
+
+def _hedge_delay_quote(position: SpreadPaperPosition) -> float:
+    """Isolate price impact caused by waiting after a maker-fill observation."""
+    if position.maker_fill_observed_at_ms <= 0 or not position.paper_maker_leg:
+        return 0.0
+    hedge_leg = position.short_leg if position.paper_maker_leg == "long" else position.long_leg
+    if hedge_leg.entry_filled_at_ms <= position.maker_fill_observed_at_ms:
+        return 0.0
+    initial_raw = _initial_entry_raw_price(position, hedge_leg)
+    if initial_raw is None or hedge_leg.entry_raw_price is None:
+        return 0.0
+    if hedge_leg.side == "long":
+        return hedge_leg.qty * (initial_raw - hedge_leg.entry_raw_price)
+    return hedge_leg.qty * (hedge_leg.entry_raw_price - initial_raw)
+
+
+def _initial_entry_raw_price(position: SpreadPaperPosition, leg: SpreadPaperLeg) -> float | None:
+    entry_side = "long_quote" if leg.side == "long" else "short_quote"
+    snapshot = position.entry_market_snapshot.get(entry_side)
+    if not isinstance(snapshot, dict):
+        return None
+    if leg.side == "long":
+        raw = snapshot.get("bid") if leg.entry_liquidity_role == "maker" else snapshot.get("ask")
+    else:
+        raw = snapshot.get("ask") if leg.entry_liquidity_role == "maker" else snapshot.get("bid")
+    value = _optional_float(raw)
+    return value if value is not None and value > 0.0 else None
+
+
+def _position_signed_spread_bps(
+    position: SpreadPaperPosition,
     long_quote: QuoteSnapshot | None,
     short_quote: QuoteSnapshot | None,
 ) -> float | None:
-    long_mid = _mid(long_quote)
-    short_mid = _mid(short_quote)
-    if long_mid is None or short_mid is None:
+    if long_quote is None or short_quote is None:
         return None
-    reference_mid = (long_mid + short_mid) / 2.0
-    if reference_mid <= 0.0:
+    long_mid = (float(long_quote.bid or 0.0) + float(long_quote.ask or 0.0)) / 2.0
+    short_mid = (float(short_quote.bid or 0.0) + float(short_quote.ask or 0.0)) / 2.0
+    reference = (long_mid + short_mid) / 2.0
+    if reference <= 0.0:
         return None
-    return ((short_mid - long_mid) / reference_mid) * 10_000.0
+    canonical_a = str(
+        position.candidate_snapshot.get("canonical_venue_a", "") or min(position.long_venue, position.short_venue)
+    ).lower()
+    canonical_b = str(
+        position.candidate_snapshot.get("canonical_venue_b", "") or max(position.long_venue, position.short_venue)
+    ).lower()
+    mids = {
+        str(position.long_venue).lower(): long_mid,
+        str(position.short_venue).lower(): short_mid,
+    }
+    if canonical_a not in mids or canonical_b not in mids:
+        return None
+    return (mids[canonical_a] - mids[canonical_b]) / reference * 10_000.0
 
 
-def _position_exit_z_score(
+def _position_exit_z_score(position: SpreadPaperPosition, spread: float | None) -> float | None:
+    if spread is None:
+        return None
+    std = float(position.candidate_snapshot.get("rolling_std_bps", 0.0) or 0.0)
+    return None if std <= 0.0 else (spread - float(position.candidate_snapshot.get("rolling_mean_bps", 0.0) or 0.0)) / std
+
+
+def _excluded_symbols(config: SpreadPaperConfig) -> set[str]:
+    return {str(symbol).upper() for symbol in config.excluded_symbols if str(symbol).strip()}
+
+
+def _allowed_labels(config: SpreadPaperConfig) -> set[str]:
+    return {str(label) for label in config.allowed_opportunity_labels if str(label).strip()}
+
+
+def _fill_assumption(bot: SpreadPaperBotSpec) -> str:
+    # The source may carry a coherent L2 ladder, but BBO-only snapshots remain
+    # a supported conservative fallback.  The position/journal records which
+    # source was actually used for each leg.
+    return "taker_l2_vwap_or_top_book_size_only" if not bot.maker_leg else "maker_cross_control_not_official"
+
+
+def _episode_key(candidate: SpreadReversionCandidate, bot_id: str) -> tuple[str, str, str, str]:
+    return candidate.symbol.upper(), candidate.canonical_venue_a or min(candidate.long_venue, candidate.short_venue), candidate.canonical_venue_b or max(candidate.long_venue, candidate.short_venue), bot_id
+
+
+def _episode_key_from_position(position: SpreadPaperPosition) -> tuple[str, str, str, str]:
+    return position.symbol.upper(), min(position.long_venue, position.short_venue), max(position.long_venue, position.short_venue), position.paper_bot_id
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        numeric = None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric is None or isfinite(numeric) else None
+
+
+def _funding_settlement_payload(settlement: FundingSettlement) -> dict:
+    return {
+        "paper_id": settlement.paper_id,
+        "leg_side": settlement.leg_side,
+        "settlement_timestamp_ms": settlement.settlement_timestamp_ms,
+        "amount_quote": settlement.amount_quote,
+        "observed_at_ms": settlement.observed_at_ms,
+        "source": settlement.source,
+    }
+
+
+def _settlements_from_payload(
+    value: object,
+) -> tuple[tuple[FundingSettlement, ...], bool]:
+    """Restore idempotent settlement facts without double-crediting a journal.
+
+    A leg has exactly one cash settlement for a timestamp.  Journal replay can
+    legitimately duplicate an identical event, while conflicting amounts are
+    an irreconcilable evidence failure.  Return the deduplicated facts and a
+    conflict marker so official PnL remains fail-closed without inflating the
+    diagnostic PnL by summing a duplicate record.
+    """
+    if not isinstance(value, list):
+        return (), False
+    settlements_by_timestamp: dict[int, FundingSettlement] = {}
+    conflict = False
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            settlement = FundingSettlement(
+                paper_id=str(raw.get("paper_id", "") or ""),
+                leg_side=str(raw.get("leg_side", "") or ""),
+                settlement_timestamp_ms=int(raw.get("settlement_timestamp_ms", 0) or 0),
+                amount_quote=float(raw.get("amount_quote", 0.0) or 0.0),
+                observed_at_ms=int(raw.get("observed_at_ms", 0) or 0),
+                source=str(raw.get("source", "") or ""),
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            settlement.paper_id
+            and settlement.leg_side in {"long", "short"}
+            and settlement.settlement_timestamp_ms > 0
+            and settlement.observed_at_ms >= settlement.settlement_timestamp_ms
+            and settlement.source
+            and isfinite(float(settlement.amount_quote))
+        ):
+            timestamp = int(settlement.settlement_timestamp_ms)
+            existing = settlements_by_timestamp.get(timestamp)
+            if existing is None:
+                settlements_by_timestamp[timestamp] = settlement
+            elif float(existing.amount_quote) != float(settlement.amount_quote):
+                conflict = True
+            elif int(settlement.observed_at_ms) < int(existing.observed_at_ms):
+                # Same cash fact, earlier observation is the conservative
+                # evidence timestamp for a later replay of the same event.
+                settlements_by_timestamp[timestamp] = settlement
+    return (
+        tuple(
+            settlements_by_timestamp[timestamp]
+            for timestamp in sorted(settlements_by_timestamp)
+        ),
+        conflict,
+    )
+
+
+def _valid_funding_settlement(
     position: SpreadPaperPosition,
-    spread_mid_bps: float | None,
-) -> float | None:
-    if spread_mid_bps is None:
-        return None
-    snapshot = position.candidate_snapshot or {}
-    rolling_mean = float(snapshot.get("rolling_mean_bps", 0.0) or 0.0)
-    rolling_std = float(snapshot.get("rolling_std_bps", 0.0) or 0.0)
-    if rolling_std <= 0.0:
-        return None
-    return (spread_mid_bps - rolling_mean) / rolling_std
+    settlement: FundingSettlement,
+) -> bool:
+    if settlement.leg_side not in {"long", "short"}:
+        return False
+    if settlement.paper_id != position.paper_id or not str(settlement.source or ""):
+        return False
+    try:
+        amount_quote = float(settlement.amount_quote)
+    except (TypeError, ValueError):
+        return False
+    if not isfinite(amount_quote):
+        return False
+    if (
+        int(settlement.settlement_timestamp_ms or 0) <= 0
+        or int(settlement.observed_at_ms or 0) < int(settlement.settlement_timestamp_ms)
+    ):
+        return False
+    leg = position.long_leg if settlement.leg_side == "long" else position.short_leg
+    opened_at_ms = int(leg.entry_filled_at_ms or position.registered_at_ms)
+    if leg.entry_pending or leg.qty <= 0.0 or settlement.settlement_timestamp_ms <= opened_at_ms:
+        return False
+    first = int(leg.funding_timestamp_ms or 0)
+    interval = int(leg.funding_interval_ms or 0)
+    if first <= 0 or interval <= 0 or settlement.settlement_timestamp_ms < first:
+        return False
+    if (settlement.settlement_timestamp_ms - first) % interval != 0:
+        return False
+    # The terminal horizon is the simulator's deterministic close boundary.
+    # A delayed sidecar refresh may receive a later account-ledger row before
+    # it evaluates that horizon; accepting it would credit funding earned only
+    # after the simulated position had already closed.  The position can only
+    # have held through a settlement at or before this boundary.
+    terminal_due_at_ms = _terminal_due_at_ms(position)
+    if terminal_due_at_ms <= 0 or settlement.settlement_timestamp_ms > terminal_due_at_ms:
+        return False
+    return True
+
+
+def _terminal_due_at_ms(position: SpreadPaperPosition) -> int:
+    """Return the one strict terminal close boundary, or zero if malformed."""
+    terminal_due: list[int] = []
+    for horizon in position.due_horizons:
+        if not isinstance(horizon, dict) or horizon.get("terminal") is not True:
+            continue
+        try:
+            due_at_ms = int(horizon.get("due_at_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if due_at_ms <= 0:
+            return 0
+        terminal_due.append(due_at_ms)
+    return terminal_due[0] if len(terminal_due) == 1 else 0
+
+
+def _with_funding_settlement(
+    leg: SpreadPaperLeg,
+    settlement: FundingSettlement,
+) -> SpreadPaperLeg:
+    records = {
+        int(item.settlement_timestamp_ms): item
+        for item in leg.funding_settlements
+    }
+    timestamp = int(settlement.settlement_timestamp_ms)
+    existing = records.get(timestamp)
+    if existing is not None:
+        # Funding is an immutable cash fact. A revised amount for the same
+        # position/leg/settlement cannot be silently accepted into official
+        # paper PnL: retain the first observation and make the ledger fail
+        # closed for this episode.
+        if float(existing.amount_quote) != float(settlement.amount_quote):
+            return replace(leg, funding_settlement_conflict=True)
+        return leg
+    records[timestamp] = settlement
+    return replace(
+        leg,
+        funding_settlements=tuple(
+            records[timestamp] for timestamp in sorted(records)
+        ),
+    )

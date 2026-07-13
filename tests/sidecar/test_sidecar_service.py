@@ -7,8 +7,58 @@ import json
 
 import pytest
 
-from lightfee.sidecar.pairing import build_same_symbol_pairs
+from lightfee.config.schema import AppConfig, StrategyConfig
+from lightfee.sidecar.pairing import FundingCandidateService, build_same_symbol_pairs
+from lightfee.sidecar.service import SidecarService
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
+
+
+def test_recovery_constructed_calibrator_keeps_strategy_stability_contract(tmp_path):
+    service = object.__new__(SidecarService)
+    config = AppConfig()
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "snapshot.json")
+    config.strategy = StrategyConfig(
+        funding_forecast_min_samples=18,
+        funding_forecast_stability_max_quantile_drift_bps=1.25,
+    )
+    service.config = config
+    service.snapshot_path = config.runtime.sidecar_snapshot_path
+
+    calibrator = service._ensure_forecast_calibrator()
+
+    assert calibrator._min_samples == 18
+    assert calibrator._max_quantile_drift_bps == 1.25
+
+
+def test_funding_candidate_service_reuses_prepared_context() -> None:
+    quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
+            funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
+            funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
+        ),
+    }
+    service = FundingCandidateService(
+        strategy=StrategyConfig(
+            entry_notional_cap_quote=30.0,
+            live_entry_notional_cap_quote=30.0,
+            funding_missing_margin_fallback_notional_quote=15.0,
+        ),
+        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
+        venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},
+        venue_notional_caps={"cheap": 25.0, "rich": 25.0},
+        passive_execution_enabled=False,
+    )
+
+    first = service.build(quotes, ["BTCUSDT"], observed_at_ms=1)
+    allocator_id = id(service._allocator)
+    second = service.build(quotes, ["BTCUSDT"], observed_at_ms=1)
+
+    assert first == second
+    assert id(service._allocator) == allocator_id
 
 
 class TestSidecarPairingV2:
@@ -27,7 +77,12 @@ class TestSidecarPairingV2:
                 funding_timestamp_ms=1700000002000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        strategy = StrategyConfig(
+            entry_notional_cap_quote=40.0,
+            live_entry_notional_cap_quote=30.0,
+            funding_missing_margin_fallback_notional_quote=15.0,
+        )
+        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
         assert len(candidates) == 1
         c = candidates[0]
         assert c.pair_id == "btcusdt:binance->okx"
@@ -48,7 +103,12 @@ class TestSidecarPairingV2:
                 funding_timestamp_ms=1700000002000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        strategy = StrategyConfig(
+            entry_notional_cap_quote=40.0,
+            live_entry_notional_cap_quote=30.0,
+            funding_missing_margin_fallback_notional_quote=15.0,
+        )
+        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
         assert len(candidates) >= 1
         c = candidates[0]
         # funding_diff > 0 and short_mid >= long_mid
@@ -130,11 +190,19 @@ class TestSidecarPairingV2:
                 funding_timestamp_ms=1700000002000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        strategy = StrategyConfig(
+            entry_notional_cap_quote=40.0,
+            live_entry_notional_cap_quote=30.0,
+            funding_missing_margin_fallback_notional_quote=15.0,
+        )
+        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
         assert len(candidates) >= 1
         c = candidates[0]
         assert c.entry_notional_quote > 0.0
-        assert c.entry_notional_quote == 50.0
+        assert c.entry_notional_quote == pytest.approx(15.0)
+        assert c.entry_target_quantity * ((50001 + 50100) / 2.0) == pytest.approx(
+            c.entry_notional_quote
+        )
 
     def test_direction_inconsistent_when_short_mid_below_long_mid(self):
         """When short mid is below long mid, direction_consistent should be False."""
@@ -159,9 +227,9 @@ class TestSidecarPairingV2:
 class TestSidecarSnapshotV2:
     """Snapshot must include all V2 candidate identity fields."""
 
-    def test_schema_is_v2(self):
+    def test_schema_is_v3(self):
         s = SidecarSnapshot()
-        assert s.schema_version == 2
+        assert s.schema_version == 3
 
     def test_candidate_has_v2_fields(self):
         c = CandidateInput(

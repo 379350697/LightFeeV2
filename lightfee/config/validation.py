@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from pathlib import Path
 from typing import Any
 
 from lightfee.config.compatibility import REMOVED_FIELD_MESSAGES, VALID_OPPORTUNITY_INPUT_MODES
@@ -12,7 +14,6 @@ from lightfee.config.schema import (
 )
 from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
-from lightfee.core.errors import ConfigError
 
 
 def validate_config(config: AppConfig) -> list[str]:
@@ -67,6 +68,17 @@ def validate_config(config: AppConfig) -> list[str]:
             f"runtime.max_order_quote_age_ms must be > 0, "
             f"got: {config.runtime.max_order_quote_age_ms}"
         )
+    if not str(config.runtime.funding_basis_risk_checkpoint_path or "").strip():
+        issues.append("runtime.funding_basis_risk_checkpoint_path must be non-empty")
+    if config.runtime.local_l2_depth_bridge_enabled:
+        if not str(config.runtime.local_l2_depth_bridge_path or "").strip():
+            issues.append("runtime.local_l2_depth_bridge_path must be set when enabled")
+        if config.runtime.local_l2_depth_bridge_max_levels <= 0:
+            issues.append("runtime.local_l2_depth_bridge_max_levels must be > 0")
+        if config.runtime.local_l2_depth_bridge_publish_interval_ms <= 0:
+            issues.append(
+                "runtime.local_l2_depth_bridge_publish_interval_ms must be > 0"
+            )
 
     if config.strategy.max_concurrent_positions < 0:
         issues.append("strategy.max_concurrent_positions must be >= 0")
@@ -77,8 +89,260 @@ def validate_config(config: AppConfig) -> list[str]:
     if config.strategy.entry_notional_cap_quote <= 0:
         issues.append("strategy.entry_notional_cap_quote must be > 0")
 
+    # Safety gates must be literal booleans.  Dataclass annotations do not
+    # coerce programmatically assembled configs, and Python treats the string
+    # ``"false"`` as truthy.  Rejecting it at the parser/validation boundary
+    # keeps entry freeze, risk monitoring and paper-only intent fail-closed.
+    for field_name in (
+        "funding_new_entries_enabled",
+        "funding_dynamic_expected_shortfall_enabled",
+        "risk_monitor_enabled",
+        "spread_live_enabled",
+        "spread_paper_enabled",
+    ):
+        value = getattr(config.strategy, field_name)
+        if value is not True and value is not False:
+            issues.append(f"strategy.{field_name} must be a boolean")
+
+    if (
+        config.runtime.mode == "live"
+        and config.strategy.risk_monitor_enabled is not True
+    ):
+        issues.append("strategy.risk_monitor_enabled must be true in live mode")
+
+    if config.strategy.funding_forecast_mode not in {"shadow", "live"}:
+        issues.append("strategy.funding_forecast_mode must be 'shadow' or 'live'")
+    if (
+        not math.isfinite(float(config.strategy.funding_forecast_uncertainty_haircut_bps))
+        or config.strategy.funding_forecast_uncertainty_haircut_bps < 0
+    ):
+        issues.append("strategy.funding_forecast_uncertainty_haircut_bps must be >= 0")
+    if config.strategy.funding_forecast_min_samples < 0:
+        issues.append("strategy.funding_forecast_min_samples must be >= 0")
+    if config.strategy.funding_forecast_shadow_min_days < 0:
+        issues.append("strategy.funding_forecast_shadow_min_days must be >= 0")
+    if (
+        not math.isfinite(
+            float(config.strategy.funding_forecast_stability_max_quantile_drift_bps)
+        )
+        or config.strategy.funding_forecast_stability_max_quantile_drift_bps < 0
+    ):
+        issues.append(
+            "strategy.funding_forecast_stability_max_quantile_drift_bps must be >= 0"
+        )
+    for field_name, value in {
+        "funding_missing_margin_fallback_notional_quote": (
+            config.strategy.funding_missing_margin_fallback_notional_quote
+        ),
+        "funding_max_venue_pair_exposure_quote": config.strategy.funding_max_venue_pair_exposure_quote,
+        "funding_max_global_gross_exposure_quote": config.strategy.funding_max_global_gross_exposure_quote,
+        "funding_max_settlement_bucket_exposure_quote": config.strategy.funding_max_settlement_bucket_exposure_quote,
+        "funding_max_correlation_group_exposure_quote": config.strategy.funding_max_correlation_group_exposure_quote,
+        "funding_expected_shortfall_bps": config.strategy.funding_expected_shortfall_bps,
+        "funding_expected_shortfall_budget_quote": config.strategy.funding_expected_shortfall_budget_quote,
+    }.items():
+        if not _is_finite_nonnegative(value):
+            issues.append(f"strategy.{field_name} must be finite and >= 0")
+    for field_name, value in {
+        "funding_dynamic_expected_shortfall_window_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_window_ms
+        ),
+        "funding_dynamic_expected_shortfall_max_samples": (
+            config.strategy.funding_dynamic_expected_shortfall_max_samples
+        ),
+        "funding_dynamic_expected_shortfall_max_pairs": (
+            config.strategy.funding_dynamic_expected_shortfall_max_pairs
+        ),
+        "funding_dynamic_expected_shortfall_horizon_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_horizon_ms
+        ),
+        "funding_dynamic_expected_shortfall_min_samples": (
+            config.strategy.funding_dynamic_expected_shortfall_min_samples
+        ),
+        "funding_dynamic_expected_shortfall_min_history_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_min_history_ms
+        ),
+        "funding_dynamic_expected_shortfall_quote_skew_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_quote_skew_ms
+        ),
+        "funding_dynamic_expected_shortfall_checkpoint_max_age_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_checkpoint_max_age_ms
+        ),
+        "funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms": (
+            config.strategy.funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms
+        ),
+    }.items():
+        if not _is_positive_int(value):
+            issues.append(f"strategy.{field_name} must be a positive integer")
+    if (
+        config.strategy.funding_dynamic_expected_shortfall_horizon_ms
+        > config.strategy.funding_dynamic_expected_shortfall_window_ms
+    ):
+        issues.append(
+            "strategy.funding_dynamic_expected_shortfall_horizon_ms must not exceed window_ms"
+        )
+    if (
+        config.strategy.funding_dynamic_expected_shortfall_min_history_ms
+        > config.strategy.funding_dynamic_expected_shortfall_window_ms
+    ):
+        issues.append(
+            "strategy.funding_dynamic_expected_shortfall_min_history_ms must not exceed window_ms"
+        )
+    try:
+        dynamic_es_confidence = float(
+            config.strategy.funding_dynamic_expected_shortfall_confidence
+        )
+    except (TypeError, ValueError):
+        dynamic_es_confidence = 0.0
+    if not math.isfinite(dynamic_es_confidence) or not 0.0 < dynamic_es_confidence < 1.0:
+        issues.append(
+            "strategy.funding_dynamic_expected_shortfall_confidence must be finite and within (0, 1)"
+        )
+    if (
+        config.runtime.mode == "live"
+        and config.strategy.funding_new_entries_enabled is True
+    ):
+        if config.strategy.funding_dynamic_expected_shortfall_enabled is not True:
+            issues.append(
+                "strategy.funding_dynamic_expected_shortfall_enabled must be true when live funding entries are enabled"
+            )
+        if config.strategy.funding_expected_shortfall_budget_quote <= 0.0:
+            issues.append(
+                "strategy.funding_expected_shortfall_budget_quote must be > 0 when live funding entries are enabled"
+            )
+    if not _is_finite_ratio(config.strategy.funding_risk_health_buffer_ratio):
+        issues.append(
+            "strategy.funding_risk_health_buffer_ratio must be finite and within (0, 1]"
+        )
+    if not isinstance(config.strategy.funding_venue_risk_haircut_bps_by_venue, dict):
+        issues.append("strategy.funding_venue_risk_haircut_bps_by_venue must be a mapping")
+    else:
+        for venue, haircut_bps in (
+            config.strategy.funding_venue_risk_haircut_bps_by_venue.items()
+        ):
+            if not str(venue).strip() or not _is_finite_nonnegative(haircut_bps):
+                issues.append(
+                    "strategy.funding_venue_risk_haircut_bps_by_venue values "
+                    "must be finite and >= 0"
+                )
+                break
+    if not isinstance(config.strategy.funding_correlation_group_by_symbol, dict):
+        issues.append("strategy.funding_correlation_group_by_symbol must be a mapping")
+    else:
+        for symbol, group in config.strategy.funding_correlation_group_by_symbol.items():
+            if not str(symbol).strip() or not str(group).strip():
+                issues.append(
+                    "strategy.funding_correlation_group_by_symbol keys and values "
+                    "must be non-empty"
+                )
+                break
+    if not _is_positive_int(config.strategy.funding_settlement_crowding_bucket_ms):
+        issues.append(
+            "strategy.funding_settlement_crowding_bucket_ms must be > 0"
+        )
+    if config.strategy.funding_economics_mode not in {
+        "v1_exact",
+        "enhanced_shadow",
+        "enhanced_live",
+    }:
+        issues.append(
+            "strategy.funding_economics_mode must be v1_exact, enhanced_shadow, or enhanced_live"
+        )
+    if (
+        config.strategy.funding_economics_mode == "enhanced_live"
+        and config.strategy.funding_forecast_mode != "live"
+    ):
+        issues.append(
+            "strategy.funding_forecast_mode must be live when funding_economics_mode is enhanced_live"
+        )
+    if (
+        config.strategy.funding_economics_mode == "enhanced_live"
+        and config.strategy.funding_forecast_min_samples <= 0
+    ):
+        issues.append(
+            "strategy.funding_forecast_min_samples must be > 0 when funding_economics_mode is enhanced_live"
+        )
+
     if config.strategy.shadow_entry_opportunity_count < 0:
         issues.append("strategy.shadow_entry_opportunity_count must be >= 0")
+    if config.strategy.maker_entry_reconcile_backoff_ms <= 0:
+        issues.append("strategy.maker_entry_reconcile_backoff_ms must be > 0")
+    if config.strategy.maker_hedge_soft_deadline_ms <= 0:
+        issues.append("strategy.maker_hedge_soft_deadline_ms must be > 0")
+    if config.strategy.maker_hedge_deadline_ms <= 0:
+        issues.append("strategy.maker_hedge_deadline_ms must be > 0")
+    if (
+        config.strategy.maker_hedge_soft_deadline_ms
+        > config.strategy.maker_hedge_deadline_ms
+    ):
+        issues.append(
+            "strategy.maker_hedge_soft_deadline_ms must be <= maker_hedge_deadline_ms"
+        )
+
+    if config.strategy.spread_live_enabled:
+        issues.append("strategy.spread_live_enabled is not supported; spread remains paper-only")
+    # These are the v2 signed-basis model's statistical safety boundaries,
+    # not tuning suggestions.  Letting a config silently relax them turns a
+    # cold/noisy sequence into a tradable signal and makes epochs incomparable.
+    if not 0 < config.strategy.spread_stats_window_ms <= 6 * 60 * 60 * 1000:
+        issues.append("strategy.spread_stats_window_ms must be within (0, 21600000]")
+    if config.strategy.spread_stats_max_samples < 120:
+        issues.append("strategy.spread_stats_max_samples must be >= 120")
+    if config.strategy.spread_stats_max_samples > 7_200:
+        issues.append("strategy.spread_stats_max_samples must be <= 7200")
+    if config.strategy.spread_min_samples < 120:
+        issues.append("strategy.spread_min_samples must be >= 120")
+    if config.strategy.spread_min_history_ms < 5 * 60 * 1000:
+        issues.append("strategy.spread_min_history_ms must be >= 300000")
+    if not 0 < config.strategy.spread_mean_reversion_max_half_life_ms <= 30 * 60 * 1000:
+        issues.append(
+            "strategy.spread_mean_reversion_max_half_life_ms must be within (0, 1800000]"
+        )
+    if config.strategy.spread_signal_ttl_ms <= 0:
+        issues.append("strategy.spread_signal_ttl_ms must be > 0")
+    if config.strategy.spread_quote_skew_ms <= 0:
+        issues.append("strategy.spread_quote_skew_ms must be > 0")
+    if not 0 < config.strategy.spread_stats_short_window_ms <= config.strategy.spread_stats_window_ms:
+        issues.append(
+            "strategy.spread_stats_short_window_ms must be within (0, spread_stats_window_ms]"
+        )
+    if config.strategy.spread_structural_break_consecutive < 5:
+        issues.append("strategy.spread_structural_break_consecutive must be >= 5")
+    if config.strategy.spread_structural_break_sigma <= 0.0:
+        issues.append("strategy.spread_structural_break_sigma must be > 0")
+    if config.strategy.spread_structural_break_cooldown_ms < 30 * 60 * 1000:
+        issues.append(
+            "strategy.spread_structural_break_cooldown_ms must be >= 1800000"
+        )
+    if config.strategy.spread_paper_enabled:
+        if (
+            config.strategy.spread_paper_model_epoch
+            != config.strategy.spread_model_epoch
+        ):
+            issues.append(
+                "strategy.spread_paper_model_epoch must match strategy.spread_model_epoch"
+            )
+        if str(config.strategy.spread_paper_primary_fill_model or "").lower() != "taker_taker":
+            issues.append(
+                "strategy.spread_paper_primary_fill_model must be taker_taker"
+            )
+        if not config.strategy.spread_paper_require_taker_taker:
+            issues.append("strategy.spread_paper_require_taker_taker must be true")
+        if config.strategy.spread_paper_finalist_limit <= 0:
+            issues.append("strategy.spread_paper_finalist_limit must be > 0")
+        if config.strategy.spread_paper_terminal_secs <= 0:
+            issues.append("strategy.spread_paper_terminal_secs must be > 0")
+        if not any(int(value) > 0 for value in config.strategy.spread_paper_markout_secs):
+            issues.append("strategy.spread_paper_markout_secs must include a positive horizon")
+        manifest_path = str(
+            config.strategy.spread_paper_research_manifest_path or ""
+        ).strip()
+        if not manifest_path:
+            issues.append("strategy.spread_paper_research_manifest_path must be set")
+        elif not Path(manifest_path).is_file():
+            issues.append(
+                "strategy.spread_paper_research_manifest_path must reference a file"
+            )
 
     if (
         config.strategy.max_scan_minutes_before_funding > 0
@@ -133,31 +397,19 @@ def validate_config(config: AppConfig) -> list[str]:
             f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
         )
 
-    provider = str(
-        getattr(config.strategy, "entry_readiness_provider", "local_l2") or ""
-    ).strip().lower()
+    provider = config.strategy.entry_readiness_provider.strip().lower()
     if provider not in ENTRY_READINESS_PROVIDERS:
         issues.append(
             "strategy.entry_readiness_provider must be one of "
             f"{list(ENTRY_READINESS_PROVIDERS)}, got: {provider}"
         )
-    try:
-        quote_lease_ttl_ms = int(
-            getattr(config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
-        )
-    except (TypeError, ValueError):
-        quote_lease_ttl_ms = 0
+    quote_lease_ttl_ms = config.strategy.entry_quote_lease_ttl_ms
     if (
         provider in {"quote_lease", "ws_top_book", "ws_bbo_quote_lease"}
         and quote_lease_ttl_ms <= 0
     ):
         issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
-    try:
-        ws_bbo_per_venue_budget = int(
-            getattr(config.strategy, "entry_ws_bbo_per_venue_budget", 0) or 0
-        )
-    except (TypeError, ValueError):
-        ws_bbo_per_venue_budget = 0
+    ws_bbo_per_venue_budget = config.strategy.entry_ws_bbo_per_venue_budget
     if provider == "ws_bbo_quote_lease" and ws_bbo_per_venue_budget <= 0:
         issues.append("strategy.entry_ws_bbo_per_venue_budget must be > 0")
 
@@ -200,6 +452,35 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append("daily_universe.max_symbols must be > 0")
 
     return issues
+
+
+def _is_finite_nonnegative(value: object) -> bool:
+    """Return true only for finite, non-negative numeric policy inputs."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0.0
+
+
+def _is_finite_ratio(value: object) -> bool:
+    """A usable margin-health ratio preserves some collateral and is bounded."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and 0.0 < numeric <= 1.0
+
+
+def _is_positive_int(value: object) -> bool:
+    """Reject fractional/boolean/NaN scheduling horizons at config boundary."""
+    if isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric > 0.0 and numeric.is_integer()
 
 
 def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:

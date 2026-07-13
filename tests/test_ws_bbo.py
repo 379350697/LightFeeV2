@@ -29,6 +29,23 @@ def test_ws_bbo_cache_returns_fresh_quote_and_rejects_stale():
     assert stale is None
 
 
+def test_ws_bbo_cache_rejects_future_timestamp_as_non_executable():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=100.0,
+            observed_at_ms=1_001,
+        )
+    )
+
+    assert cache.fresh_quote("binance", "BTCUSDT", now_ms=1_000, max_age_ms=1_000) is None
+
+
 def test_binance_book_ticker_parser_uses_best_bid_and_ask():
     from lightfee.marketdata.ws_bbo import BinanceBboWsClient, VenueBboCache
 

@@ -61,15 +61,24 @@ def _candidate(
         entry_notional_quote=50.0,
         first_funding_timestamp_ms=400000,
         sizing_liquidity_source=sizing_liquidity_source,
+        economics_complete=True,
+        economics_observed_at_ms=69_000,
+        calculation_version="v1_exact",
+        model_epoch="v1_exact",
+        taker_fee_evidence_complete=True,
     )
 
 
 def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
+    # The test is about snapshot fallback scoping.  Keep its synthetic BBO
+    # economically admissible under the real final-entry repricing gate.
+    bid = 102.0 if venue == "bybit" else 100.0
+    ask = 103.0 if venue == "bybit" else 101.0
     return QuoteSnapshot(
         venue=venue,
         symbol=symbol,
-        bid=100.0,
-        ask=101.0,
+        bid=bid,
+        ask=ask,
         observed_at_ms=observed_at_ms,
         source="sidecar_quote",
         bid_size=100.0,
@@ -98,6 +107,7 @@ def _runtime(tmp_path) -> LiveRuntime:
             min_funding_edge_bps=0,
             max_liquidity_snapshot_age_ms=5000,
             pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
+            funding_new_entries_enabled=True,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),
@@ -172,8 +182,16 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     assert market_scope["fallback_duration_ms"] == 55000
     assert market_scope["blocked"] is False
     assert market_scope["block_reason"] == ""
-    assert len(runtime.entry_executor.contexts) == 1
-    assert not any(record["kind"] == "scan.no_entry_diagnostics" for record in records)
+    # Fallback health is non-blocking, but a real first leg still requires
+    # final executable BBO economics.  This fixture intentionally supplies no
+    # quote lease, so the new admission contract must fail closed here.
+    assert len(runtime.entry_executor.contexts) == 0
+    final_blocks = [
+        record for record in records
+        if record["kind"] == "entry.dispatch_viability_blocked"
+        and record["payload"].get("source") == "final_entry_economics"
+    ]
+    assert final_blocks and final_blocks[0]["payload"]["reason"] == "missing_final_executable_bbo"
 
 
 @pytest.mark.asyncio
@@ -223,8 +241,14 @@ async def test_degraded_other_symbol_does_not_reject_selected_candidate(
     assert liquidity_scope["source_age_ms"] == 1000
     assert liquidity_scope["blocked"] is False
     assert liquidity_scope["block_reason"] == ""
-    assert len(runtime.entry_executor.contexts) == 1
-    assert not any(record["kind"] == "scan.no_entry_diagnostics" for record in records)
+    assert len(runtime.entry_executor.contexts) == 0
+    assert any(
+        record["kind"] == "entry.dispatch_viability_blocked"
+        and record["payload"].get("source") == "final_entry_economics"
+        for record in records
+    )
+    diagnostics = [record for record in records if record["kind"] == "scan.no_entry_diagnostics"]
+    assert diagnostics and diagnostics[0]["payload"]["reason"] == "no_entry_dispatched"
 
 
 @pytest.mark.asyncio

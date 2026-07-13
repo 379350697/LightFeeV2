@@ -26,6 +26,8 @@ import httpx
 
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    EntryLeverageEvidence,
+    FundingSettlement,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -368,6 +370,28 @@ def _parse_optional_float(value: Any) -> Optional[float]:
     if not math.isfinite(result):
         return None
     return result
+
+
+def _parse_optional_int(value: Any) -> Optional[int]:
+    """Return a finite integral exchange field without guessing a default."""
+    numeric = _parse_optional_float(value)
+    if numeric is None or not float(numeric).is_integer():
+        return None
+    return int(numeric)
+
+
+def _underlying_from_perp_symbol(symbol: str) -> str:
+    """Best-effort canonical base coin for documented account-log filters.
+
+    This helper is only an optimization for the Bybit request.  Allocation
+    still requires the returned row's complete exact venue symbol, so an
+    unrecognised symbol cannot widen ownership or create a false match.
+    """
+    normalized = str(symbol or "").upper().replace("-", "").replace("_", "")
+    for quote in ("USDT", "USDC", "BUSD", "USD"):
+        if normalized.endswith(quote) and len(normalized) > len(quote):
+            return normalized[: -len(quote)]
+    return ""
 
 
 def _hyperliquid_spot_usdc_available(raw: Any) -> Optional[tuple[float, float]]:
@@ -1383,7 +1407,6 @@ class VenueTransport(MarketDataClient):
         self._okx_swap_instruments_loaded = False
         self._time_offset_ms: int | None = None  # V1: cached server-time offset
         self._order_diagnostics: list[dict[str, Any]] = []
-        self._entry_leverage_ready_cache: dict[str, int] = {}
         self._trading_capability_trusted = not (
             mode == "live" and spec.venue_id == Venue.HYPERLIQUID
         )
@@ -5057,6 +5080,321 @@ class VenueTransport(MarketDataClient):
             )
         return []
 
+    async def fetch_funding_settlements(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> list[FundingSettlement]:
+        """Return immutable private funding-statement facts for one symbol.
+
+        This deliberately has stricter semantics than a funding-rate query:
+        ``[]`` means there is no statement evidence available in the requested
+        interval, not that the account's funding was zero.  Every parser keeps
+        the exchange statement ID, settlement timestamp, signed amount, and
+        settlement currency so that position allocation happens outside the
+        transport layer.
+
+        Venue coverage is intentionally explicit.  A venue with no documented
+        symbol-level private statement interface returns no evidence rather
+        than fabricating a value from a position snapshot or public rate.
+        """
+        if self.mode != "live":
+            return []
+        start_ms = int(start_time_ms or 0)
+        end_ms = int(end_time_ms or 0)
+        if start_ms <= 0 or end_ms <= 0 or end_ms < start_ms:
+            raise ValueError("funding settlement query window must be positive and ordered")
+
+        now_ms = int(time.time() * 1000)
+        venue_sym = self._venue_symbol(symbol)
+        venue = self._spec.venue_id
+        if venue == Venue.BINANCE:
+            return await self._fetch_binance_funding_settlements(
+                symbol=symbol,
+                venue_sym=venue_sym,
+                start_time_ms=start_ms,
+                end_time_ms=end_ms,
+                now_ms=now_ms,
+            )
+        if venue == Venue.BYBIT:
+            return await self._fetch_bybit_funding_settlements(
+                symbol=symbol,
+                venue_sym=venue_sym,
+                start_time_ms=start_ms,
+                end_time_ms=end_ms,
+                now_ms=now_ms,
+            )
+        if venue == Venue.OKX:
+            return await self._fetch_okx_funding_settlements(
+                symbol=symbol,
+                venue_sym=venue_sym,
+                start_time_ms=start_ms,
+                end_time_ms=end_ms,
+                now_ms=now_ms,
+            )
+        if venue == Venue.GATE:
+            return await self._fetch_gate_funding_settlements(
+                symbol=symbol,
+                venue_sym=venue_sym,
+                start_time_ms=start_ms,
+                end_time_ms=end_ms,
+                now_ms=now_ms,
+            )
+        return []
+
+    @staticmethod
+    def _funding_settlement_from_row(
+        *,
+        venue: Venue,
+        symbol: str,
+        timestamp: Any,
+        amount: Any,
+        quote_currency: Any,
+        reference: Any,
+        source: str,
+        now_ms: int,
+        metadata: dict[str, Any],
+    ) -> FundingSettlement | None:
+        """Parse one statement without silently converting absent fields to 0."""
+        settled_at_ms = _parse_optional_int(timestamp)
+        amount_quote = _parse_optional_float(amount)
+        currency = str(quote_currency or "").strip().upper()
+        statement_reference = str(reference or "").strip()
+        if (
+            settled_at_ms is None
+            or settled_at_ms <= 0
+            or amount_quote is None
+            or not currency
+            or not statement_reference
+        ):
+            return None
+        return FundingSettlement(
+            venue=venue,
+            symbol=symbol,
+            settlement_timestamp_ms=settled_at_ms,
+            amount_quote=amount_quote,
+            quote_currency=currency,
+            observed_at_ms=now_ms,
+            source=source,
+            statement_reference=statement_reference,
+            metadata=metadata,
+        )
+
+    async def _fetch_binance_funding_settlements(
+        self,
+        *,
+        symbol: str,
+        venue_sym: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        now_ms: int,
+    ) -> list[FundingSettlement]:
+        raw = await self._request(
+            "GET",
+            "/fapi/v1/income",
+            params={
+                "symbol": venue_sym,
+                "incomeType": "FUNDING_FEE",
+                "startTime": start_time_ms,
+                "endTime": end_time_ms,
+                "limit": 1000,
+            },
+            private=True,
+        )
+        rows = raw if isinstance(raw, list) else []
+        settlements: list[FundingSettlement] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("incomeType") or "").upper() != "FUNDING_FEE":
+                continue
+            row_symbol = str(row.get("symbol") or "").strip()
+            if row_symbol and row_symbol != venue_sym:
+                continue
+            settlement = self._funding_settlement_from_row(
+                venue=Venue.BINANCE,
+                symbol=symbol,
+                timestamp=row.get("time"),
+                amount=row.get("income"),
+                quote_currency=row.get("asset"),
+                reference=row.get("tranId", row.get("transactionId")),
+                source="binance_fapi_income",
+                now_ms=now_ms,
+                metadata={"endpoint": "/fapi/v1/income", "income_type": "FUNDING_FEE"},
+            )
+            if settlement is not None:
+                settlements.append(settlement)
+        return settlements
+
+    async def _fetch_bybit_funding_settlements(
+        self,
+        *,
+        symbol: str,
+        venue_sym: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        now_ms: int,
+    ) -> list[FundingSettlement]:
+        settlements: list[FundingSettlement] = []
+        cursor = ""
+        for _ in range(20):
+            params: dict[str, Any] = {
+                "accountType": "UNIFIED",
+                "category": "linear",
+                "type": "SETTLEMENT",
+                "startTime": start_time_ms,
+                "endTime": end_time_ms,
+                "limit": 50,
+            }
+            base_coin = _underlying_from_perp_symbol(symbol)
+            if base_coin:
+                params["baseCoin"] = base_coin
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._request(
+                "GET", "/v5/account/transaction-log", params=params, private=True,
+            )
+            self._require_bybit_reconciliation_success(
+                raw, "bybit funding transaction log",
+            )
+            result = raw.get("result", {}) if isinstance(raw, dict) else {}
+            rows = result.get("list", []) if isinstance(result, dict) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("type") or "").upper() != "SETTLEMENT":
+                    continue
+                if "funding" not in row:
+                    continue
+                row_symbol = str(row.get("symbol") or "").strip()
+                if row_symbol != venue_sym:
+                    continue
+                settlement = self._funding_settlement_from_row(
+                    venue=Venue.BYBIT,
+                    symbol=symbol,
+                    timestamp=row.get("transactionTime"),
+                    amount=row.get("funding"),
+                    quote_currency=row.get("currency"),
+                    reference=row.get("id"),
+                    source="bybit_transaction_log",
+                    now_ms=now_ms,
+                    metadata={
+                        "endpoint": "/v5/account/transaction-log",
+                        "type": "SETTLEMENT",
+                        "fee_rate": row.get("feeRate"),
+                    },
+                )
+                if settlement is not None:
+                    settlements.append(settlement)
+            next_cursor = (
+                str(result.get("nextPageCursor", "") or "")
+                if isinstance(result, dict)
+                else ""
+            )
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        return settlements
+
+    async def _fetch_okx_funding_settlements(
+        self,
+        *,
+        symbol: str,
+        venue_sym: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        now_ms: int,
+    ) -> list[FundingSettlement]:
+        raw = await self._request(
+            "GET",
+            "/api/v5/account/bills",
+            params={
+                "instType": "SWAP",
+                "instId": venue_sym,
+                "begin": start_time_ms,
+                "end": end_time_ms,
+                "limit": 100,
+            },
+            private=True,
+        )
+        code = str(raw.get("code", "0") or "0") if isinstance(raw, dict) else "0"
+        if code != "0":
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                f"okx funding bills rejected: code={code} msg={raw.get('msg', '') if isinstance(raw, dict) else ''}",
+            )
+        rows = raw.get("data", []) if isinstance(raw, dict) else []
+        settlements: list[FundingSettlement] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("type") or "") not in {"173", "174"}:
+                continue
+            if str(row.get("instId") or "") != venue_sym:
+                continue
+            settlement = self._funding_settlement_from_row(
+                venue=Venue.OKX,
+                symbol=symbol,
+                timestamp=row.get("ts"),
+                amount=row.get("balChg"),
+                quote_currency=row.get("ccy"),
+                reference=row.get("billId"),
+                source="okx_account_bills",
+                now_ms=now_ms,
+                metadata={"endpoint": "/api/v5/account/bills", "bill_type": row.get("type")},
+            )
+            if settlement is not None:
+                settlements.append(settlement)
+        return settlements
+
+    async def _fetch_gate_funding_settlements(
+        self,
+        *,
+        symbol: str,
+        venue_sym: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        now_ms: int,
+    ) -> list[FundingSettlement]:
+        raw = await self._request(
+            "GET",
+            "/api/v4/futures/usdt/account_book",
+            params={
+                "contract": venue_sym,
+                "type": "fund",
+                "from": start_time_ms // 1000,
+                "to": end_time_ms // 1000,
+                "limit": 100,
+            },
+            private=True,
+        )
+        rows = raw if isinstance(raw, list) else []
+        settlements: list[FundingSettlement] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_contract = str(row.get("contract") or "").strip()
+            if row_contract and row_contract != venue_sym:
+                continue
+            timestamp_seconds = _parse_optional_int(row.get("time"))
+            timestamp_ms = timestamp_seconds * 1000 if timestamp_seconds else None
+            settlement = self._funding_settlement_from_row(
+                venue=Venue.GATE,
+                symbol=symbol,
+                timestamp=timestamp_ms,
+                amount=row.get("change"),
+                quote_currency="USDT",
+                reference=row.get("id"),
+                source="gate_futures_account_book",
+                now_ms=now_ms,
+                metadata={"endpoint": "/api/v4/futures/usdt/account_book", "type": row.get("type")},
+            )
+            if settlement is not None:
+                settlements.append(settlement)
+        return settlements
+
     async def _fetch_binance_account_fill_history(
         self,
         venue_sym: str,
@@ -7504,6 +7842,7 @@ class VenueTransport(MarketDataClient):
                 "initial_leverage": 0,
                 "notional_floor": 0.0,
                 "notional_cap": 0.0,
+                "bracket_verified": False,
                 "raw_symbol": str(symbol_row.get("symbol", venue_sym) if isinstance(symbol_row, dict) else venue_sym),
             }
         notional = max(float(notional_quote or 0.0), 0.0)
@@ -7523,6 +7862,9 @@ class VenueTransport(MarketDataClient):
             "notional_floor": _safe_float(chosen.get("notionalFloor", 0), default=0.0),
             "notional_cap": _safe_float(chosen.get("notionalCap", 0), default=0.0),
             "bracket": int(_safe_float(chosen.get("bracket", 0), default=0.0)),
+            "bracket_verified": bool(
+                int(_safe_float(chosen.get("initialLeverage", 0), default=0.0)) > 0
+            ),
             "raw_symbol": str(symbol_row.get("symbol", venue_sym) if isinstance(symbol_row, dict) else venue_sym),
         }
 
@@ -7548,29 +7890,15 @@ class VenueTransport(MarketDataClient):
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
+    ) -> EntryLeverageEvidence | None:
         """V1 live-entry parity: prepare Binance-compatible symbol leverage before orders."""
         if self._spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
-            return
+            return None
         target = int(leverage or 0)
         if target <= 0 or self.mode != "live":
-            return
+            return None
 
         venue_sym = self._venue_symbol(symbol)
-        cache_key = f"{venue_sym}:{target}:{round(float(notional_quote or 0.0), 8)}"
-        cached_effective = self._entry_leverage_ready_cache.get(cache_key)
-        if cached_effective is not None:
-            self._record_order_diagnostic(
-                "order.entry_leverage_ready",
-                {
-                    "venue": self._spec.venue_id.value,
-                    "symbol": venue_sym,
-                    "requested_leverage": target,
-                    "effective_leverage": cached_effective,
-                    "outcome": "cached_ready",
-                },
-            )
-            return
 
         payload: dict[str, Any] = {
             "venue": self._spec.venue_id.value,
@@ -7604,12 +7932,14 @@ class VenueTransport(MarketDataClient):
                 notional_quote,
             )
             bracket_initial = int(bracket.get("initial_leverage", 0) or 0)
+            bracket_verified = bool(bracket.get("bracket_verified", False))
             effective = min(target, bracket_initial) if bracket_initial > 0 else target
             effective = max(int(effective), 1)
             payload.update(
                 {
                     "effective_leverage": effective,
                     "bracket_initial_leverage": bracket_initial,
+                    "bracket_verified": bracket_verified,
                     "bracket": bracket.get("bracket", 0),
                     "notional_floor": bracket.get("notional_floor", 0.0),
                     "notional_cap": bracket.get("notional_cap", 0.0),
@@ -7618,9 +7948,18 @@ class VenueTransport(MarketDataClient):
 
             if current_leverage == effective:
                 payload["outcome"] = "already_ready"
-                self._entry_leverage_ready_cache[cache_key] = effective
                 self._record_order_diagnostic("order.entry_leverage_ready", payload)
-                return
+                return EntryLeverageEvidence(
+                    venue=self._spec.venue_id,
+                    symbol=venue_sym,
+                    requested_leverage=target,
+                    effective_leverage=effective,
+                    notional_quote=max(float(notional_quote or 0.0), 0.0),
+                    bracket_verified=bracket_verified,
+                    account_verified=True,
+                    source="venue_transport_position_risk",
+                    observed_at_ms=int(time.time() * 1000),
+                )
 
             response = await self._request(
                 "POST",
@@ -7639,9 +7978,42 @@ class VenueTransport(MarketDataClient):
                     "entry leverage prepare returned unexpected leverage "
                     f"symbol={venue_sym} expected={effective} actual={response_leverage}",
                 )
+            # A successful mutation response proves only that the exchange
+            # accepted the request.  Re-read the private position state before
+            # allowing this leverage to increase live sizing: a concurrent
+            # change or asynchronous venue application must fall back to the
+            # ordinary fail-closed entry rejection, never become leverage
+            # evidence on the strength of an acknowledgement alone.
+            post_set_position_raw = await self._request(
+                "GET",
+                self._spec.position_path,
+                params={"symbol": venue_sym},
+                private=True,
+            )
+            post_set_leverage = self._extract_fapi_position_leverage(
+                post_set_position_raw,
+                venue_sym,
+            )
+            payload["post_set_position_risk_leverage"] = post_set_leverage
+            if post_set_leverage != effective:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "entry leverage post-set position verification failed "
+                    f"symbol={venue_sym} expected={effective} actual={post_set_leverage}",
+                )
             payload["outcome"] = "set"
-            self._entry_leverage_ready_cache[cache_key] = effective
             self._record_order_diagnostic("order.entry_leverage_ready", payload)
+            return EntryLeverageEvidence(
+                venue=self._spec.venue_id,
+                symbol=venue_sym,
+                requested_leverage=target,
+                effective_leverage=effective,
+                notional_quote=max(float(notional_quote or 0.0), 0.0),
+                bracket_verified=bracket_verified,
+                account_verified=True,
+                source="venue_transport_post_set_position_risk",
+                observed_at_ms=int(time.time() * 1000),
+            )
         except OrderSubmitError:
             payload["outcome"] = "rejected"
             self._record_order_diagnostic("order.entry_leverage_unavailable", payload)

@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterable, Optional
 
 import httpx
 
@@ -39,6 +40,18 @@ class FundingTicker:
     index_price: float = 0.0
     funding_rate_bps: float = 0.0
     funding_timestamp_ms: int = 0
+    # The public source may expose a next/predicted rate separately from the
+    # last settled/current rate.  ``None`` deliberately means unavailable;
+    # callers must not silently turn that into a high-confidence forecast.
+    predicted_funding_rate_bps: float | None = None
+    funding_forecast_source: str = "quoted_rate"
+    funding_forecast_sample_count: int = 0
+    # Confirmed, already-settled rate used only for forecast calibration.
+    settled_funding_rate_bps: float | None = None
+    # The interval is only populated from exchange evidence (or a measured
+    # transition of the exchange's next-settlement timestamp).  Never assume
+    # a universal eight-hour interval here.
+    funding_interval_ms: int = 0
     volume_24h_quote: float = 0.0
     open_interest_quote: float = 0.0
     open_interest_evidence_status: str = "available"
@@ -51,6 +64,18 @@ class FundingTicker:
     oi_deferred_count: int = 0
     oi_timeout_count: int = 0
     oi_refresh_elapsed_ms: int = 0
+    # Contract-normalisation evidence consumed by the spread strategy.  The
+    # quantities emitted by this public client are already base quantities;
+    # multiplier therefore describes the normalised economic unit.
+    underlying: str = ""
+    quote_currency: str = ""
+    contract_type: str = ""
+    contract_multiplier: float = 0.0
+    mark_index_source: str = ""
+    price_precision: int = 0
+    quantity_precision: int = 0
+    venue_status: str = "unknown"
+    contract_normalization_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +134,37 @@ def _http_error_reason(exc: Exception) -> str:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _optional_rate_bps(item: dict[str, Any], *keys: str) -> float | None:
+    """Return a vendor-supplied rate in bps without inventing a forecast."""
+    for key in keys:
+        if _has_nonempty_field(item, key):
+            return _safe_float(item.get(key)) * 10_000.0
+    return None
+
+
+def _decimal_precision(step: float) -> int:
+    """Return decimal places implied by a configured exchange increment."""
+    try:
+        normalized = Decimal(str(step)).normalize()
+    except (InvalidOperation, ValueError):
+        return 0
+    if normalized <= 0:
+        return 0
+    return max(-normalized.as_tuple().exponent, 0)
+
+
+def _canonical_contract_identity(venue: Venue, symbol: str) -> tuple[str, str]:
+    """Derive the canonical underlying/quote only for known perp endpoints."""
+    canonical = str(symbol or "").upper().replace("-", "").replace("_", "")
+    for quote in ("USDT", "USDC", "USD"):
+        if canonical.endswith(quote) and len(canonical) > len(quote):
+            return canonical[: -len(quote)], quote
+    # Hyperliquid's public perp universe is coin-denominated and USDC settled.
+    if venue == Venue.HYPERLIQUID and canonical:
+        return canonical, "USDC"
+    return "", ""
 
 
 # V1 parity: Binance-compatible OI is a per-symbol endpoint, fetched with bounded
@@ -189,6 +245,11 @@ class MarketDataClient:
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
         self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
         self._funding_cache_observed_at_ms: int = 0
+        # Per-symbol next-settlement observations.  An interval is only
+        # inferred after the exchange itself advances the next timestamp; a
+        # cold process remains explicitly interval-unknown.
+        self._funding_schedule_next_by_key: dict[str, int] = {}
+        self._funding_interval_by_key: dict[str, int] = {}
         # V1-style evidence cache for Binance-compatible per-symbol OI.
         # key -> (open_interest_quote, mark_price, observed_at_ms, status, reason)
         self._binance_style_open_interest_cache: dict[
@@ -357,18 +418,126 @@ class MarketDataClient:
         venue_id = self._spec.venue_id
 
         if venue_id in (Venue.BINANCE, Venue.ASTER):
-            return await self._fetch_binance_style(symbols)
+            tickers = await self._fetch_binance_style(symbols)
         elif venue_id == Venue.OKX:
-            return await self._fetch_okx_style(symbols)
+            tickers = await self._fetch_okx_style(symbols)
         elif venue_id == Venue.BYBIT:
-            return await self._fetch_bybit_style(symbols)
+            tickers = await self._fetch_bybit_style(symbols)
         elif venue_id == Venue.BITGET:
-            return await self._fetch_bitget_style(symbols)
+            tickers = await self._fetch_bitget_style(symbols)
         elif venue_id == Venue.GATE:
-            return await self._fetch_gate_style(symbols)
+            tickers = await self._fetch_gate_style(symbols)
         elif venue_id == Venue.HYPERLIQUID:
-            return await self._fetch_hyperliquid_style(symbols)
-        return {}
+            tickers = await self._fetch_hyperliquid_style(symbols)
+        else:
+            tickers = {}
+        return self._enrich_tickers(tickers, observed_at_ms=_now_ms())
+
+    def _enrich_tickers(
+        self,
+        tickers: dict[str, FundingTicker],
+        *,
+        observed_at_ms: int,
+    ) -> dict[str, FundingTicker]:
+        """Attach only evidence that is shared by funding and spread paths.
+
+        The source-specific parsers own raw vendor fields.  This single
+        post-processing step applies the common base-unit and precision
+        contract, records measured settlement intervals, and prevents the two
+        strategies from drifting into separately invented metadata semantics.
+        """
+        enriched: dict[str, FundingTicker] = {}
+        for key, ticker in tickers.items():
+            interval_ms = self._observe_funding_interval(
+                key,
+                next_timestamp_ms=int(ticker.funding_timestamp_ms or 0),
+                explicit_interval_ms=int(ticker.funding_interval_ms or 0),
+            )
+            underlying, quote_currency = _canonical_contract_identity(
+                self._spec.venue_id,
+                ticker.symbol,
+            )
+            mark_index_source = ""
+            if float(ticker.mark_price or 0.0) > 0.0 and float(ticker.index_price or 0.0) > 0.0:
+                mark_index_source = "venue_mark_and_index"
+            price_precision = _decimal_precision(float(self._spec.price_tick or 0.0))
+            quantity_precision = _decimal_precision(float(self._spec.quantity_step or 0.0))
+            # The parsers below only mark venues complete where their BBO
+            # quantity is documented/converted into base units.  In
+            # particular, an OKX/Bitget top size may be a contract count; a
+            # static spec is not proof that it is comparable to base quantity.
+            contract_type = "linear" if underlying and quote_currency else ""
+            normalised_multiplier = 1.0 if contract_type == "linear" else 0.0
+            base_quantity_evidence = self._spec.venue_id in {
+                Venue.BINANCE,
+                Venue.ASTER,
+                Venue.BYBIT,
+                Venue.GATE,
+                Venue.HYPERLIQUID,
+            }
+            complete_contract = bool(
+                underlying
+                and quote_currency
+                and contract_type
+                and normalised_multiplier > 0.0
+                and mark_index_source
+                and price_precision > 0
+                and quantity_precision > 0
+                and base_quantity_evidence
+            )
+            enriched[key] = replace(
+                ticker,
+                funding_interval_ms=interval_ms,
+                underlying=underlying,
+                quote_currency=quote_currency,
+                contract_type=contract_type,
+                contract_multiplier=normalised_multiplier,
+                mark_index_source=mark_index_source,
+                price_precision=price_precision,
+                quantity_precision=quantity_precision,
+                venue_status="active" if complete_contract else "unknown",
+                contract_normalization_complete=complete_contract,
+            )
+        return enriched
+
+    def _observe_funding_interval(
+        self,
+        key: str,
+        *,
+        next_timestamp_ms: int,
+        explicit_interval_ms: int,
+    ) -> int:
+        """Keep a measured interval cache without assuming an 8-hour cadence."""
+        explicit = max(int(explicit_interval_ms or 0), 0)
+        if explicit > 0:
+            self._funding_interval_by_key[key] = explicit
+        # Hyperliquid's venue protocol is explicitly hourly; this is not the
+        # old cross-venue default and remains tagged by its source parser.
+        elif self._spec.venue_id == Venue.HYPERLIQUID:
+            self._funding_interval_by_key[key] = 3_600_000
+        observed = max(int(next_timestamp_ms or 0), 0)
+        previous = int(self._funding_schedule_next_by_key.get(key, 0) or 0)
+        if observed > 0:
+            if previous > 0 and observed > previous:
+                advanced_by = observed - previous
+                # A malformed timestamp must not poison the cache.  Perpetual
+                # funding cadences outside this bounded range are unsupported
+                # until directly supplied by the venue.
+                if 60_000 <= advanced_by <= 7 * 24 * 60 * 60 * 1_000:
+                    self._funding_interval_by_key[key] = advanced_by
+            self._funding_schedule_next_by_key[key] = observed
+        return max(int(self._funding_interval_by_key.get(key, 0) or 0), 0)
+
+    def prime_funding_schedule(self, tickers: Iterable[FundingTicker]) -> None:
+        """Restore previously measured settlement cadence without HTTP I/O."""
+        for ticker in tickers:
+            key = f"{str(ticker.venue).lower()}:{str(ticker.symbol).upper()}"
+            interval = max(int(ticker.funding_interval_ms or 0), 0)
+            if interval > 0:
+                self._funding_interval_by_key[key] = interval
+            next_timestamp_ms = max(int(ticker.funding_timestamp_ms or 0), 0)
+            if next_timestamp_ms > 0:
+                self._funding_schedule_next_by_key[key] = next_timestamp_ms
 
     async def fetch_entry_open_interest_evidence(
         self,
@@ -1091,6 +1260,19 @@ class MarketDataClient:
                 mark_price=_safe_float(pi.get("markPrice", 0)),
                 index_price=_safe_float(pi.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(pi.get("lastFundingRate", 0)) * 10000.0,
+                settled_funding_rate_bps=(
+                    _safe_float(pi.get("lastFundingRate", 0)) * 10000.0
+                    if _has_nonempty_field(pi, "lastFundingRate")
+                    else None
+                ),
+                predicted_funding_rate_bps=_optional_rate_bps(
+                    pi, "nextFundingRate", "predictedFundingRate"
+                ),
+                funding_forecast_source=(
+                    "venue_predicted_rate"
+                    if _optional_rate_bps(pi, "nextFundingRate", "predictedFundingRate") is not None
+                    else "quoted_rate"
+                ),
                 funding_timestamp_ms=int(_safe_float(pi.get("nextFundingTime", 0))),
                 volume_24h_quote=vol_map.get(venue_sym, 0.0),
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
@@ -1290,6 +1472,14 @@ class MarketDataClient:
                 mark_price=_safe_float(fr.get("markPrice", t.get("markPx", 0))),
                 index_price=_safe_float(fr.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
+                predicted_funding_rate_bps=_optional_rate_bps(
+                    fr, "nextFundingRate", "predictedFundingRate"
+                ),
+                funding_forecast_source=(
+                    "venue_predicted_rate"
+                    if _optional_rate_bps(fr, "nextFundingRate", "predictedFundingRate") is not None
+                    else "quoted_rate"
+                ),
                 funding_timestamp_ms=_funding_timestamp_ms(fr),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
@@ -1341,6 +1531,14 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
+                predicted_funding_rate_bps=_optional_rate_bps(
+                    item, "predictedFundingRate", "nextFundingRate"
+                ),
+                funding_forecast_source=(
+                    "venue_predicted_rate"
+                    if _optional_rate_bps(item, "predictedFundingRate", "nextFundingRate") is not None
+                    else "quoted_rate"
+                ),
                 funding_timestamp_ms=_funding_timestamp_ms(item, fallback_ms=_now_ms()),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
                 open_interest_quote=open_interest_quote,
@@ -1427,6 +1625,16 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(
                     funding_item.get("fundingRate", item.get("fundingRate", 0))
                 ) * 10000.0,
+                predicted_funding_rate_bps=_optional_rate_bps(
+                    funding_item, "nextFundingRate", "predictedFundingRate"
+                ),
+                funding_forecast_source=(
+                    "venue_predicted_rate"
+                    if _optional_rate_bps(
+                        funding_item, "nextFundingRate", "predictedFundingRate"
+                    ) is not None
+                    else "quoted_rate"
+                ),
                 funding_timestamp_ms=funding_timestamp_ms,
                 volume_24h_quote=_safe_float(
                     item.get("usdtVolume", item.get("quoteVolume", 0))
@@ -1548,6 +1756,16 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(
                     contract_item.get("funding_rate", item.get("funding_rate", 0))
                 ) * 10000.0,
+                predicted_funding_rate_bps=_optional_rate_bps(
+                    contract_item, "funding_rate_indicative", "next_funding_rate"
+                ),
+                funding_forecast_source=(
+                    "venue_indicative_rate"
+                    if _optional_rate_bps(
+                        contract_item, "funding_rate_indicative", "next_funding_rate"
+                    ) is not None
+                    else "quoted_rate"
+                ),
                 funding_timestamp_ms=funding_timestamp_ms,
                 volume_24h_quote=_safe_float(
                     item.get("volume_24h_quote", item.get("volume_24h", 0))
@@ -1661,6 +1879,8 @@ class MarketDataClient:
                 index_price=_safe_float(item.get("indexPx", 0)),
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
                 funding_timestamp_ms=funding_ts,
+                funding_interval_ms=3_600_000,
+                funding_forecast_source="quoted_rate_hourly_protocol",
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,

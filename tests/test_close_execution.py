@@ -1518,6 +1518,13 @@ class TestCloseChunkExecutor:
         # Each adapter called exactly once (one chunk)
         assert long_adapter.place_order_call_count == 1
         assert short_adapter.place_order_call_count == 1
+        # Terminal reporting is evaluated after state writeback.  This locks
+        # the V1 lifecycle distinction: a full close emits one durable
+        # ``exit.closed`` record, never a partial-close record or duplicate
+        # terminal record for the same execution.
+        records = journal.read_all()
+        assert [record["kind"] for record in records].count("exit.closed") == 1
+        assert [record["kind"] for record in records].count("exit.partial_closed") == 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

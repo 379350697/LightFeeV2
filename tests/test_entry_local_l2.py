@@ -31,6 +31,76 @@ if TYPE_CHECKING:
     from lightfee.sidecar.snapshot import CandidateInput
 
 
+def _complete_v3_economics_fields(
+    funding_edge_bps: float,
+    observed_at_ms: int,
+    *,
+    entry_notional_quote: float = 30.0,
+) -> dict[str, float | int | bool | str]:
+    """Raw sidecar fields for tests that must reach post-economics gates."""
+    return {
+        "funding_edge_bps": funding_edge_bps,
+        "expected_edge_bps": funding_edge_bps,
+        "worst_case_edge_bps": funding_edge_bps,
+        "ranking_edge_bps": funding_edge_bps,
+        "first_stage_funding_edge_bps": funding_edge_bps,
+        "first_stage_expected_edge_bps": funding_edge_bps,
+        "first_stage_worst_case_edge_bps": funding_edge_bps,
+        "second_stage_incremental_funding_edge_bps": 0.0,
+        "second_stage_worst_case_funding_edge_bps": 0.0,
+        "stagger_gap_ms": 0,
+        "entry_notional_quote": entry_notional_quote,
+        "entry_target_quantity": entry_notional_quote / 50_000.0,
+        "entry_max_executable_quantity": entry_notional_quote / 50_000.0,
+        "gross_signal_edge_bps": 0.0,
+        "entry_cross_bps": 0.0,
+        "expected_exit_cross_bps": 0.0,
+        "entry_fee_bps": 0.0,
+        "exit_fee_bps": 0.0,
+        "entry_slippage_bps": 0.0,
+        "exit_slippage_bps": 0.0,
+        "adverse_selection_bps": 0.0,
+        "capital_buffer_bps": 0.0,
+        "execution_buffer_bps": 0.0,
+        "venue_risk_haircut_bps": 0.0,
+        "transfer_or_inventory_bias_bps": 0.0,
+        "expected_net_edge_bps": funding_edge_bps,
+        "long_taker_fee_bps": 0.0,
+        "short_taker_fee_bps": 0.0,
+        "taker_fee_evidence_complete": True,
+        "forecast_distribution_stable": False,
+        "forecast_stability_reason": "not_calibrated",
+        "forecast_worst_funding_edge_bps": funding_edge_bps,
+        "economics_complete": True,
+        "economics_observed_at_ms": observed_at_ms,
+        "calculation_version": "v1_exact",
+        "model_epoch": "v1_exact",
+    }
+
+
+def _complete_v3_contract_quote(
+    venue: str,
+    symbol: str,
+    **market_fields: float | int | str,
+) -> dict[str, float | int | str | bool]:
+    """Quote evidence required for a V3 live candidate's common base unit."""
+    return {
+        "venue": venue,
+        "symbol": symbol,
+        "funding_interval_ms": 28_800_000,
+        "underlying": symbol.removesuffix("USDT"),
+        "quote_currency": "USDT",
+        "contract_type": "linear",
+        "contract_multiplier": 1.0,
+        "mark_index_source": "venue_index",
+        "price_precision": 2,
+        "quantity_precision": 3,
+        "venue_status": "active",
+        "contract_normalization_complete": True,
+        **market_fields,
+    }
+
+
 # ---------------------------------------------------------------------------
 # TrackedOpportunity
 # ---------------------------------------------------------------------------
@@ -715,7 +785,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         from lightfee.sidecar.publisher import _dict_to_snapshot
 
         snapshot_dict = {
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": 10000,
             "market_observed_at_ms": 10000,
             "funding_lifecycle": [],
@@ -1155,7 +1225,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         from lightfee.sidecar.publisher import _dict_to_snapshot
 
         snapshot_dict = {
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": 10000,
             "market_observed_at_ms": 10000,
             "funding_lifecycle": [],
@@ -1223,7 +1293,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         from lightfee.sidecar.publisher import _dict_to_snapshot
 
         snapshot_dict = {
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": 10000,
             "market_observed_at_ms": 10000,
             "funding_lifecycle": [],
@@ -1540,7 +1610,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         snapshot_path = tmp_path / "sidecar.json"
         event_path = tmp_path / "events.jsonl"
         snapshot_path.write_text(json.dumps({
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
             "funding_lifecycle": [],
@@ -1552,37 +1622,33 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
-                "binance:BTCUSDT": {
-                    "venue": "binance",
-                    "symbol": "BTCUSDT",
-                    "bid": 50000,
-                    "ask": 50010,
-                    "volume_24h_quote": 10_000_000.0,
-                    "open_interest": 2_000_000.0,
-                    "funding_rate_bps": 10.0,
-                    "funding_timestamp_ms": 370000,
-                },
-                "bybit:BTCUSDT": {
-                    "venue": "bybit",
-                    "symbol": "BTCUSDT",
-                    "bid": 50005,
-                    "ask": 50015,
-                    "volume_24h_quote": 10_000_000.0,
-                    "open_interest": 2_000_000.0,
-                    "funding_rate_bps": -5.0,
-                    "funding_timestamp_ms": 370000,
-                },
+                "binance:BTCUSDT": _complete_v3_contract_quote(
+                    "binance",
+                    "BTCUSDT",
+                    bid=50000,
+                    ask=50010,
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    funding_rate_bps=10.0,
+                    funding_timestamp_ms=370000,
+                ),
+                "bybit:BTCUSDT": _complete_v3_contract_quote(
+                    "bybit",
+                    "BTCUSDT",
+                    bid=50005,
+                    ask=50015,
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    funding_rate_bps=-5.0,
+                    funding_timestamp_ms=370000,
+                ),
             },
             "candidates": [{
                 "long_venue": "binance",
                 "short_venue": "bybit",
                 "symbol": "BTCUSDT",
                 "funding_diff_bps": 15.0,
-                "funding_edge_bps": 15.0,
-                "expected_edge_bps": 15.0,
-                "worst_case_edge_bps": 10.0,
-                "ranking_edge_bps": 15.0,
-                "entry_notional_quote": 30.0,
+                **_complete_v3_economics_fields(15.0, now_ms),
             }],
         }))
 
@@ -1596,6 +1662,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             strategy=StrategyConfig(
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
+                funding_new_entries_enabled=True,
                 max_concurrent_positions=2,
                 entry_window_secs=480,
                 local_l2_max_age_ms=1000,
@@ -1704,7 +1771,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         snapshot_path = tmp_path / "sidecar.json"
         event_path = tmp_path / "events.jsonl"
         snapshot_path.write_text(json.dumps({
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
             "funding_lifecycle": [],
@@ -1716,37 +1783,33 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
-                "binance:BTCUSDT": {
-                    "venue": "binance",
-                    "symbol": "BTCUSDT",
-                    "bid": 50000,
-                    "ask": 50010,
-                    "volume_24h_quote": 10_000_000.0,
-                    "open_interest": 2_000_000.0,
-                    "funding_rate_bps": 10.0,
-                    "funding_timestamp_ms": funding_ts,
-                },
-                "bybit:BTCUSDT": {
-                    "venue": "bybit",
-                    "symbol": "BTCUSDT",
-                    "bid": 50005,
-                    "ask": 50015,
-                    "volume_24h_quote": 10_000_000.0,
-                    "open_interest": 2_000_000.0,
-                    "funding_rate_bps": -5.0,
-                    "funding_timestamp_ms": funding_ts,
-                },
+                "binance:BTCUSDT": _complete_v3_contract_quote(
+                    "binance",
+                    "BTCUSDT",
+                    bid=50000,
+                    ask=50010,
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    funding_rate_bps=10.0,
+                    funding_timestamp_ms=funding_ts,
+                ),
+                "bybit:BTCUSDT": _complete_v3_contract_quote(
+                    "bybit",
+                    "BTCUSDT",
+                    bid=50005,
+                    ask=50015,
+                    volume_24h_quote=10_000_000.0,
+                    open_interest=2_000_000.0,
+                    funding_rate_bps=-5.0,
+                    funding_timestamp_ms=funding_ts,
+                ),
             },
             "candidates": [{
                 "long_venue": "binance",
                 "short_venue": "bybit",
                 "symbol": "BTCUSDT",
                 "funding_diff_bps": 15.0,
-                "funding_edge_bps": 15.0,
-                "expected_edge_bps": 15.0,
-                "worst_case_edge_bps": 10.0,
-                "ranking_edge_bps": 15.0,
-                "entry_notional_quote": 30.0,
+                **_complete_v3_economics_fields(15.0, now_ms),
             }],
         }))
 
@@ -1760,6 +1823,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             strategy=StrategyConfig(
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
+                funding_new_entries_enabled=True,
                 max_concurrent_positions=2,
                 entry_window_secs=480,
                 local_l2_max_age_ms=1000,
@@ -1840,15 +1904,11 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 "short_venue": "bybit",
                 "symbol": f"S{i}USDT",
                 "funding_diff_bps": 20.0 - i,
-                "funding_edge_bps": 20.0 - i,
-                "expected_edge_bps": 10.0,
-                "worst_case_edge_bps": 5.0,
-                "ranking_edge_bps": 20.0 - i,
-                "entry_notional_quote": 30.0,
                 "first_funding_timestamp_ms": 370000,
+                **_complete_v3_economics_fields(20.0 - i, now_ms),
             })
         snapshot_path.write_text(json.dumps({
-            "schema_version": 2,
+            "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
             "funding_lifecycle": [],
@@ -1859,7 +1919,18 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "degraded_domains": [],
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
-            "quotes": {},
+            "quotes": {
+                f"{venue}:S{index}USDT": _complete_v3_contract_quote(
+                    venue,
+                    f"S{index}USDT",
+                    bid=50_000.0,
+                    ask=50_001.0,
+                    funding_rate_bps=(10.0 if venue == "binance" else -10.0),
+                    funding_timestamp_ms=370_000,
+                )
+                for index in range(5)
+                for venue in ("binance", "bybit")
+            },
             "candidates": candidates,
         }))
 
@@ -1873,6 +1944,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             strategy=StrategyConfig(
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
+                funding_new_entries_enabled=True,
                 max_concurrent_positions=2,
                 entry_local_l2_primary_count=2,
                 shadow_entry_opportunity_count=1,
@@ -3998,6 +4070,10 @@ class TestEntryReadinessProviderFactory:
             entry_notional_quote=500.0,
             pair_id="bananausdt:bybit->hyperliquid",
             first_funding_timestamp_ms=now_ms + 300_000,
+            economics_complete=True,
+            economics_observed_at_ms=now_ms,
+            calculation_version="v1_exact",
+            model_epoch="v1_exact",
         )
         snapshot = SidecarSnapshot(
             published_at_ms=now_ms,
@@ -4016,6 +4092,7 @@ class TestEntryReadinessProviderFactory:
             strategy=StrategyConfig(
                 local_l2_enabled=False,
                 entry_readiness_provider="ws_bbo_quote_lease",
+                funding_new_entries_enabled=True,
                 max_concurrent_positions=1,
                 min_scan_minutes_before_funding=0,
                 max_scan_minutes_before_funding=10,

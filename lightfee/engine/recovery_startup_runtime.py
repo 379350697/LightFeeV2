@@ -1068,7 +1068,7 @@ class RecoveryStartupRuntime:
         source: str = "startup_live_position_probe",
     ) -> str:
         """Detect balanced exchange positions that local snapshot/journal missed."""
-        if str(getattr(self.ctx.config.runtime, "mode", "")).lower() != "live":
+        if self.ctx.config.runtime.mode != "live":
             return "skipped"
         if not self.ctx._venue_adapters:
             return "skipped"
@@ -1323,7 +1323,7 @@ class RecoveryStartupRuntime:
 
     async def _maybe_recover_clean_live_positions(self, now_ms: int) -> None:
         """Probe private positions when the runtime would otherwise look clean."""
-        if str(getattr(self.ctx.config.runtime, "mode", "")).lower() != "live":
+        if self.ctx.config.runtime.mode != "live":
             return
         if (
             self.ctx.state.open_positions
