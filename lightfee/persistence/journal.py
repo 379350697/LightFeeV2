@@ -12,7 +12,7 @@ import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
     from lightfee.persistence.journal_index import JournalIndex
@@ -82,6 +82,43 @@ class Journal:
         if flush:
             os.fsync(self._file.fileno())
         return self._seq
+
+    def append_many(
+        self,
+        events: Iterable[tuple[str, dict[str, Any]]],
+        *,
+        ts_ms: int | None = None,
+    ) -> list[int]:
+        """Append an ordered non-critical batch with one final flush.
+
+        Each record retains the ordinary ``append`` JSONL layout, monotonically
+        increasing sequence number, and per-record rotation check.  The method
+        only coalesces buffered file flushes; callers that need a durability
+        barrier must keep using :meth:`append_critical`.
+        """
+        if self._file is None:
+            raise RuntimeError("journal not open")
+        sequences: list[int] = []
+        record_time_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)
+        for kind, payload in events:
+            self._seq += 1
+            record = {
+                "seq": self._seq,
+                "run_id": self._run_id,
+                "ts_ms": record_time_ms,
+                "kind": kind,
+                "payload": payload,
+            }
+            line = json.dumps(record, ensure_ascii=False) + "\n"
+            self._rotate_if_needed(len(line.encode("utf-8")))
+            # `_rotate_if_needed` may close and reopen the handle, but it
+            # always leaves an appendable current journal on success.
+            assert self._file is not None
+            self._file.write(line)
+            sequences.append(self._seq)
+        if sequences:
+            self._file.flush()
+        return sequences
 
     def _archive_path(self, index: int) -> Path:
         return self.path.with_name(f"{self.path.name}.{index}")

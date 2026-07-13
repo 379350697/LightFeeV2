@@ -1,0 +1,35 @@
+{
+  "version": "spread_research_manifest_v2",
+  "model_epoch": "v2_signed_reversion",
+  "hypothesis": "signed-basis mean reversion after executable costs",
+  "cohorts": [
+    {
+      "bot_id": "tt_conservative",
+      "cohort": "taker_taker_baseline",
+      "hypothesis": "executable taker/taker baseline",
+      "enabled": true,
+      "control_group": false,
+      "acceptance_eligible": true,
+      "entry_long_role": "taker",
+      "entry_short_role": "taker",
+      "exit_long_role": "taker",
+      "exit_short_role": "taker",
+      "maker_leg": "",
+      "hedge_delay_ms": 0
+    },
+    {
+      "bot_id": "mt_selected_maker_delay_1000ms",
+      "cohort": "maker_taker_delay_control",
+      "hypothesis": "maker fill and delayed hedge control",
+      "enabled": false,
+      "control_group": true,
+      "acceptance_eligible": false,
+      "entry_long_role": "maker",
+      "entry_short_role": "taker",
+      "exit_long_role": "taker",
+      "exit_short_role": "taker",
+      "maker_leg": "long",
+      "hedge_delay_ms": 1000
+    }
+  ]
+}

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from lightfee.config.schema import StrategyConfig
+
 
 @dataclass(frozen=True)
 class LifecyclePhaseBudget:
@@ -96,24 +98,38 @@ DEFAULT_PHASE_BUDGETS: dict[str, LifecyclePhaseBudget] = {
 
 
 def phase_budgets_from_strategy(
-    strategy: Any | None = None,
+    strategy: StrategyConfig | None = None,
 ) -> dict[str, LifecyclePhaseBudget]:
-    """Return lifecycle budgets, honoring lightweight StrategyConfig overrides."""
+    """Return lifecycle budgets from the typed config or static safe defaults."""
 
-    def cfg_ms(name: str, fallback: int) -> int:
-        return _positive_int(getattr(strategy, name, fallback), fallback)
-
-    candidate_hard_ms = cfg_ms("candidate_lease_ms", 60000)
-    selected_hard_ms = cfg_ms("selected_submit_deadline_ms", 15000)
-    maker_soft_ms = cfg_ms("maker_resting_soft_ms", 30000)
-    maker_hard_ms = cfg_ms("maker_resting_hard_ms", 60000)
-    pending_soft_ms = cfg_ms("pending_entry_force_terminal_after_ms", 60000)
-    pending_hard_ms = cfg_ms("pending_entry_hard_ceiling_ms", 120000)
-    entry_selected_soft_ms = cfg_ms("entry_selected_warning_ms", 120000)
-    entry_selected_hard_ms = cfg_ms("entry_selected_terminal_sla_ms", 300000)
-    close_soft_ms = cfg_ms("close_terminal_soft_ms", 60000)
-    close_hard_ms = cfg_ms("close_terminal_hard_ms", 300000)
-    recovery_hard_ms = cfg_ms("recovery_terminal_hard_ms", 300000)
+    if strategy is None:
+        candidate_hard_ms = 60000
+        selected_hard_ms = 15000
+        maker_soft_ms = 30000
+        maker_hard_ms = 60000
+        pending_soft_ms = 60000
+        pending_hard_ms = 120000
+        entry_selected_soft_ms = 120000
+        entry_selected_hard_ms = 300000
+        close_soft_ms = 60000
+        close_hard_ms = 300000
+        recovery_hard_ms = 300000
+    else:
+        candidate_hard_ms = _positive_int(strategy.candidate_lease_ms, 60000)
+        selected_hard_ms = _positive_int(strategy.selected_submit_deadline_ms, 15000)
+        maker_soft_ms = _positive_int(strategy.maker_resting_soft_ms, 30000)
+        maker_hard_ms = _positive_int(strategy.maker_resting_hard_ms, 60000)
+        pending_soft_ms = _positive_int(
+            strategy.pending_entry_force_terminal_after_ms, 60000
+        )
+        pending_hard_ms = _positive_int(strategy.pending_entry_hard_ceiling_ms, 120000)
+        entry_selected_soft_ms = _positive_int(strategy.entry_selected_warning_ms, 120000)
+        entry_selected_hard_ms = _positive_int(
+            strategy.entry_selected_terminal_sla_ms, 300000
+        )
+        close_soft_ms = _positive_int(strategy.close_terminal_soft_ms, 60000)
+        close_hard_ms = _positive_int(strategy.close_terminal_hard_ms, 300000)
+        recovery_hard_ms = _positive_int(strategy.recovery_terminal_hard_ms, 300000)
 
     defaults = DEFAULT_PHASE_BUDGETS
     return {

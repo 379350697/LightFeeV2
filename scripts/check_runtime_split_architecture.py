@@ -158,7 +158,16 @@ def tracked_python_files() -> list[Path]:
         text=True,
         capture_output=True,
     )
-    return [ROOT / line for line in result.stdout.splitlines() if line]
+    # A guard is also run against in-progress worktrees.  `git ls-files`
+    # intentionally still includes paths staged or deleted only in the
+    # worktree; attempting to parse one makes the guard itself fail before it
+    # can report an architectural violation.  Ignore only paths absent from
+    # disk, while preserving every currently readable tracked Python file.
+    return [
+        path
+        for line in result.stdout.splitlines()
+        if line and (path := ROOT / line).is_file()
+    ]
 
 
 def _function_line_ranges(path: Path) -> list[tuple[str, int, int]]:

@@ -276,7 +276,7 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "last_tick_ms": state.last_tick_ms,
         "open_position_count": len(state.open_positions),
         "max_concurrent_positions": max(
-            int(getattr(config.strategy, "max_concurrent_positions", 0) or 0),
+            config.strategy.max_concurrent_positions,
             1,
         ),
         "open_positions": open_positions,

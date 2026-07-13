@@ -221,8 +221,8 @@ class TestV1Schema1CandidateIdentity:
         assert btc_c.long_funding_timestamp_ms == 1700000800000
         assert btc_c.short_funding_timestamp_ms == 1700000950000
 
-    def test_tradeable_candidates_not_blocked_by_missing_timestamp(self):
-        """Candidates with valid identity must pass discover_tradeable_candidates."""
+    def test_schema1_identity_is_usable_for_shadow_but_incomplete_economics_cannot_enter_live(self):
+        """Identity recovery must not disguise an old snapshot as live-safe economics."""
         raw = _make_v1_schema1_snapshot()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "snap.json"
@@ -239,12 +239,19 @@ class TestV1Schema1CandidateIdentity:
             min_expected_edge_bps=1.0,
             min_worst_case_edge_bps=0.0,
             max_concurrent_positions=8,
+            funding_new_entries_enabled=True,
         )
-        tradeable = discover_tradeable_candidates(snap.candidates, config, 1700000000000)
-        assert len(tradeable) > 0, (
-            "Expected at least one tradeable candidate; all were blocked. "
-            "Check that first_funding_timestamp_ms is populated."
+        shadow_tradeable = discover_tradeable_candidates(
+            snap.candidates, config, 1700000000000
         )
+        assert shadow_tradeable, "Recovered identity should remain observable in shadow"
+        assert discover_tradeable_candidates(
+            snap.candidates,
+            config,
+            1700000000000,
+            require_complete_economics=True,
+        ) == []
+        assert all("incomplete_economics" in c.blocked_reasons for c in snap.candidates)
 
     def test_no_tradeable_candidate_has_zero_first_funding(self):
         """No candidate in the tradeable list may have first_funding_timestamp_ms=0."""
@@ -257,7 +264,10 @@ class TestV1Schema1CandidateIdentity:
         for c in snap.candidates:
             c.entry_notional_quote = 100.0
 
-        config = StrategyConfig(max_concurrent_positions=8)
+        config = StrategyConfig(
+            max_concurrent_positions=8,
+            funding_new_entries_enabled=True,
+        )
         tradeable = discover_tradeable_candidates(snap.candidates, config, 1700000000000)
 
         for c in tradeable:

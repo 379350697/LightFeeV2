@@ -1012,8 +1012,10 @@ class PassiveCloseExecutor:
             "exit.passive_close_final_truth_reconciled",
             {
                 "position_id": pending.position_id,
-                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "exit_shadow_id": _exit_shadow_id_for_pending(pending),
                 "hedge_venue": hedge_venue.value,
                 "hedge_leg": hedge_leg,
                 "accepted_order_id": order_id,
@@ -5044,7 +5046,33 @@ class PassiveCloseExecutor:
 
         # If fully closed, remove from open positions
         if position.matched_quantity < 1e-12:
+            # Keep accounting evidence durable without changing the V1 passive
+            # close state machine or issuing any private query on this path.
+            from lightfee.strategy.funding_settlement_reconciler import (
+                FundingSettlementReconciler,
+            )
+
+            funding_task = FundingSettlementReconciler.register_closed_position_task(
+                state,
+                position,
+                closed_at_ms=now_ms,
+                price_pnl_quote=position.realized_price_pnl_quote,
+                exit_fee_quote=position.realized_exit_fee_quote,
+            )
             state.open_positions.pop(pending.position_id, None)
+            if funding_task is not None:
+                self._journal.append(
+                    "funding.settlement_reconciliation_registered",
+                    {
+                        "position_id": position.position_id,
+                        "closed_at_ms": now_ms,
+                        "required_settlement_count": len(
+                            funding_task["required_settlements"]
+                        ),
+                        "calculation_version": funding_task["calculation_version"],
+                        "model_epoch": funding_task["model_epoch"],
+                    },
+                )
 
         closure_fields = self._v1_lifecycle_passive_close_event_fields(
             state,
@@ -5055,6 +5083,13 @@ class PassiveCloseExecutor:
         # Clean up pending passive close
         state.pending_passive_closes.pop(pending.position_id, None)
 
+        # Keep passive and aggressive terminal reports on the same economics
+        # contract.  ``close`` covers only the just-built legs whereas the
+        # position carries the lifecycle funding and any prior close chunks.
+        from lightfee.engine.close_executor import build_position_pnl_attribution
+
+        pnl_attr = build_position_pnl_attribution(position)
+
         self._journal.append(
             "exit.passive_close_resolved",
             {
@@ -5063,8 +5098,27 @@ class PassiveCloseExecutor:
                 "reason": pending.reason,
                 "long_closed_qty": long_closed,
                 "short_closed_qty": short_closed,
-                "price_pnl": close.realized_price_pnl_quote,
-                "net_quote": close.net_quote,
+                "price_pnl": pnl_attr["price_pnl_quote"],
+                "funding_pnl_quote": pnl_attr["funding_quote"],
+                "entry_fee_quote": pnl_attr["entry_fee_quote"],
+                "exit_fee_quote": pnl_attr["exit_fee_quote"],
+                "net_quote": pnl_attr["net_quote"],
+                "lifecycle_forecast_funding_quote": pnl_attr[
+                    "lifecycle_forecast_funding_quote"
+                ],
+                "settled_funding_quote": pnl_attr["settled_funding_quote"],
+                "funding_settlement_evidence_status": pnl_attr[
+                    "funding_settlement_evidence_status"
+                ],
+                "official_pnl": pnl_attr["official_pnl"],
+                "official_funding_quote": pnl_attr["official_funding_quote"],
+                "official_net_quote": pnl_attr["official_net_quote"],
+                "funding_forecast_error_quote": pnl_attr[
+                    "funding_forecast_error_quote"
+                ],
+                "calculation_version": position.calculation_version,
+                "model_epoch": position.model_epoch,
+                "economics_observed_at_ms": position.economics_observed_at_ms,
                 "chunk_count": pending.chunk_count(),
                 "total_legs": len(long_legs) + len(short_legs),
                 **closure_fields,
@@ -6125,6 +6179,8 @@ class PassiveCloseExecutor:
             {
                 "position_id": pending.position_id,
                 "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
                 "reason": pending.reason,
                 "resolution_source": source,
                 "long_closed_qty": long_closed,
@@ -6157,6 +6213,9 @@ class PassiveCloseExecutor:
                 "resolved_at_ms": now_ms,
                 "exchange_truth": truth_payload,
                 "exit_shadow_id": _exit_shadow_id_for_pending(pending),
+                "calculation_version": position.calculation_version,
+                "model_epoch": position.model_epoch,
+                "economics_observed_at_ms": position.economics_observed_at_ms,
                 **terminal_identity_fields,
                 **closure_fields,
             },
@@ -6331,6 +6390,12 @@ class PassiveCloseExecutor:
         original_reconciliations = [
             dict(item) for item in state.pending_close_reconciliations
         ]
+        state.set_pending_funding_settlement_reconciliations(
+            getattr(state, "pending_funding_settlement_reconciliations", [])
+        )
+        original_funding_reconciliations = [
+            dict(item) for item in state.pending_funding_settlement_reconciliations
+        ]
         failure_reason = "pending_close_reconciliation_registration_failed"
         try:
             self._register_close_reconciliation_after_live_flat(
@@ -6343,7 +6408,32 @@ class PassiveCloseExecutor:
             )
             failure_reason = "managed_state_clear_failed"
             state.pending_passive_closes.pop(pending.position_id, None)
+            from lightfee.strategy.funding_settlement_reconciler import (
+                FundingSettlementReconciler,
+            )
+
+            funding_task = FundingSettlementReconciler.register_closed_position_task(
+                state,
+                position,
+                closed_at_ms=self._now_ms(),
+                price_pnl_quote=position.realized_price_pnl_quote,
+                exit_fee_quote=position.realized_exit_fee_quote,
+            )
             state.open_positions.pop(pending.position_id, None)
+            if funding_task is not None:
+                self._journal.append(
+                    "funding.settlement_reconciliation_registered",
+                    {
+                        "position_id": position.position_id,
+                        "closed_at_ms": funding_task["closed_at_ms"],
+                        "required_settlement_count": len(
+                            funding_task["required_settlements"]
+                        ),
+                        "calculation_version": funding_task["calculation_version"],
+                        "model_epoch": funding_task["model_epoch"],
+                        "source": source,
+                    },
+                )
             last_error = getattr(state, "last_error", None)
             if isinstance(last_error, str) and self._last_error_matches_live_flat_cleanup(
                 last_error,
@@ -6416,6 +6506,9 @@ class PassiveCloseExecutor:
             )
         except Exception as error:
             state.pending_close_reconciliations = original_reconciliations
+            state.pending_funding_settlement_reconciliations = (
+                original_funding_reconciliations
+            )
             if original_pending is missing:
                 state.pending_passive_closes.pop(pending.position_id, None)
             else:

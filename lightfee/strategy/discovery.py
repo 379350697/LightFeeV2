@@ -20,12 +20,16 @@ class BlockReason(Enum):
     WORST_CASE_EDGE_BELOW_FLOOR = "worst_case_edge_below_floor"
     TRANSFER_UNAVAILABLE = "transfer_unavailable"
     MISSING_CANDIDATE_IDENTITY = "missing_candidate_identity_or_funding_timestamp"
+    FUNDING_NEW_ENTRIES_DISABLED = "funding_new_entries_disabled"
+    INCOMPLETE_ECONOMICS = "incomplete_economics"
 
 
 def discover_tradeable_candidates(
     candidates: list[CandidateInput],
     config: StrategyConfig,
     now_ms: int,
+    *,
+    require_complete_economics: bool = False,
 ) -> list[CandidateInput]:
     """Filter and rank candidates through strategy gates (V1 parity).
 
@@ -41,6 +45,16 @@ def discover_tradeable_candidates(
             continue
 
         reasons: list[BlockReason] = []
+
+        # This is deliberately an entry-only gate: it never affects pending
+        # hedge, residual repair, recovery or any close lifecycle.
+        if config.funding_new_entries_enabled is not True:
+            reasons.append(BlockReason.FUNDING_NEW_ENTRIES_DISABLED)
+        if require_complete_economics and (
+            c.economics_complete is not True
+            or c.economics_observed_at_ms <= 0
+        ):
+            reasons.append(BlockReason.INCOMPLETE_ECONOMICS)
 
         # Identity
         if c.first_funding_timestamp_ms <= 0:

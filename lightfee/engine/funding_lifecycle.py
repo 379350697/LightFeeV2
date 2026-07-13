@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from lightfee.config.schema import StrategyConfig
+
 
 @dataclass(frozen=True)
 class EntryHorizonDecision:
@@ -44,10 +46,8 @@ class FundingLifecycle:
         return min(positives) if positives else 0
 
     @staticmethod
-    def effective_entry_min_before_ms(strategy: Any) -> int:
-        min_scan_ms = (
-            int(getattr(strategy, "min_scan_minutes_before_funding", 0) or 0) * 60_000
-        )
+    def effective_entry_min_before_ms(strategy: StrategyConfig) -> int:
+        min_scan_ms = int(strategy.min_scan_minutes_before_funding or 0) * 60_000
         return max(min_scan_ms, 0)
 
     @classmethod
@@ -55,7 +55,7 @@ class FundingLifecycle:
         cls,
         obj: Any,
         now_ms: int,
-        strategy: Any,
+        strategy: StrategyConfig,
         *,
         source: str = "candidate",
     ) -> EntryHorizonDecision:

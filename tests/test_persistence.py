@@ -45,6 +45,39 @@ class TestJournal:
             assert records[0]["seq"] == 1
             assert records[0]["payload"]["value"] == 42
 
+    def test_append_many_preserves_append_order_and_record_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+
+            sequences = journal.append_many(
+                [
+                    ("opportunity.paper_registered", {"paper_id": "one"}),
+                    ("opportunity.paper_closed", {"paper_id": "one"}),
+                ],
+                ts_ms=1_234,
+            )
+            journal.close()
+
+            assert sequences == [1, 2]
+            assert journal.read_all() == [
+                {
+                    "seq": 1,
+                    "run_id": journal.run_id,
+                    "ts_ms": 1_234,
+                    "kind": "opportunity.paper_registered",
+                    "payload": {"paper_id": "one"},
+                },
+                {
+                    "seq": 2,
+                    "run_id": journal.run_id,
+                    "ts_ms": 1_234,
+                    "kind": "opportunity.paper_closed",
+                    "payload": {"paper_id": "one"},
+                },
+            ]
+
     def test_has_run_id(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "test.jsonl"

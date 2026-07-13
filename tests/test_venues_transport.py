@@ -114,6 +114,151 @@ class TestTransportConstruction:
         transport = VenueTransport(spec=binance_spec(), mode="live", credential=creds)
         assert transport.mode == "live"
 
+
+class TestFundingSettlementStatements:
+    @pytest.mark.asyncio
+    async def test_binance_funding_statement_preserves_sign_zero_and_identity(self):
+        transport = VenueTransport(
+            spec=binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+
+        async def request(method, path, *, params=None, private=False, **_kwargs):
+            assert (method, path, private) == ("GET", "/fapi/v1/income", True)
+            assert params == {
+                "symbol": "BTCUSDT",
+                "incomeType": "FUNDING_FEE",
+                "startTime": 1_000,
+                "endTime": 2_000,
+                "limit": 1000,
+            }
+            return [
+                {
+                    "symbol": "BTCUSDT",
+                    "incomeType": "FUNDING_FEE",
+                    "income": "-1.25",
+                    "asset": "USDT",
+                    "time": 1_500,
+                    "tranId": "funding-1",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "incomeType": "FUNDING_FEE",
+                    "income": "0",
+                    "asset": "USDT",
+                    "time": 1_800,
+                    "tranId": "funding-zero",
+                },
+                {"symbol": "BTCUSDT", "incomeType": "COMMISSION", "income": "-9"},
+                {"symbol": "ETHUSDT", "incomeType": "FUNDING_FEE", "income": "9"},
+                {"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "nan"},
+            ]
+
+        transport._request = request
+        settlements = await transport.fetch_funding_settlements(
+            "BTCUSDT", start_time_ms=1_000, end_time_ms=2_000,
+        )
+
+        assert [(row.amount_quote, row.statement_reference) for row in settlements] == [
+            (-1.25, "funding-1"),
+            (0.0, "funding-zero"),
+        ]
+        assert all(row.symbol == "BTCUSDT" and row.quote_currency == "USDT" for row in settlements)
+
+    @pytest.mark.asyncio
+    async def test_bybit_and_okx_funding_statements_use_documented_settlement_fields(self):
+        bybit = VenueTransport(
+            spec=bybit_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        seen_bybit: list[dict[str, object]] = []
+
+        async def bybit_request(method, path, *, params=None, private=False, **_kwargs):
+            assert (method, path, private) == ("GET", "/v5/account/transaction-log", True)
+            seen_bybit.append(dict(params or {}))
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "id": "bybit-funding-1",
+                            "type": "SETTLEMENT",
+                            "symbol": "BTCUSDT",
+                            "transactionTime": "1500",
+                            "funding": "2.5",
+                            "currency": "USDT",
+                            "feeRate": "0.0001",
+                        },
+                        {
+                            "id": "bybit-trade",
+                            "type": "TRADE",
+                            "symbol": "BTCUSDT",
+                            "funding": "99",
+                            "currency": "USDT",
+                        },
+                    ],
+                    "nextPageCursor": "",
+                },
+            }
+
+        bybit._request = bybit_request
+        bybit_rows = await bybit.fetch_funding_settlements(
+            "BTCUSDT", start_time_ms=1_000, end_time_ms=2_000,
+        )
+        assert len(bybit_rows) == 1
+        assert bybit_rows[0].amount_quote == pytest.approx(2.5)
+        assert bybit_rows[0].statement_reference == "bybit-funding-1"
+        assert seen_bybit == [{
+            "accountType": "UNIFIED", "category": "linear", "type": "SETTLEMENT",
+            "startTime": 1_000, "endTime": 2_000, "limit": 50, "baseCoin": "BTC",
+        }]
+
+        okx = VenueTransport(
+            spec=okx_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+
+        async def okx_request(method, path, *, params=None, private=False, **_kwargs):
+            assert (method, path, private) == ("GET", "/api/v5/account/bills", True)
+            assert params == {
+                "instType": "SWAP", "instId": "BTC-USDT-SWAP",
+                "begin": 1_000, "end": 2_000, "limit": 100,
+            }
+            return {
+                "code": "0",
+                "data": [
+                    {"type": "173", "instId": "BTC-USDT-SWAP", "ts": "1500", "balChg": "-0.3", "ccy": "USDT", "billId": "okx-1"},
+                    {"type": "174", "instId": "BTC-USDT-SWAP", "ts": "1800", "balChg": "0.8", "ccy": "USDT", "billId": "okx-2"},
+                    {"type": "8", "instId": "BTC-USDT-SWAP", "ts": "1900", "balChg": "99", "ccy": "USDT", "billId": "trade"},
+                ],
+            }
+
+        okx._request = okx_request
+        okx_rows = await okx.fetch_funding_settlements(
+            "BTCUSDT", start_time_ms=1_000, end_time_ms=2_000,
+        )
+        assert [(row.amount_quote, row.statement_reference) for row in okx_rows] == [
+            (-0.3, "okx-1"), (0.8, "okx-2"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unimplemented_venue_and_invalid_window_do_not_fake_funding_evidence(self):
+        transport = VenueTransport(
+            spec=bitget_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        assert await transport.fetch_funding_settlements(
+            "BTCUSDT", start_time_ms=1_000, end_time_ms=2_000,
+        ) == []
+        with pytest.raises(ValueError, match="query window"):
+            await transport.fetch_funding_settlements(
+                "BTCUSDT", start_time_ms=2_000, end_time_ms=1_000,
+            )
+
     def test_live_mode_fails_missing_passphrase_when_required(self):
         creds = LiveCredential(api_key="k", api_secret="s")
         with pytest.raises(ValueError, match="passphrase"):
@@ -530,6 +675,44 @@ class TestBinanceAsterPostSigning:
         assert position.symbol == "ASTERUSDT"
         assert position.quantity == pytest.approx(12.5)
         assert position.entry_price == pytest.approx(0.91)
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_entry_leverage_post_set_position_mismatch_is_not_evidence(self):
+        """A V3 set-leverage acknowledgement is not private account truth."""
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        client = AsterV3Client(credential=LiveCredential(api_secret=private_key))
+        position_reads = 0
+
+        async def fake_request(method, path, *, params=None, **kwargs):
+            nonlocal position_reads
+            if path == "/fapi/v3/positionRisk":
+                position_reads += 1
+                # The venue accepted the set request but its private position
+                # state still reports the old account leverage.
+                return [{"symbol": "ASTERUSDT", "leverage": "20"}]
+            if path == "/fapi/v3/leverageBracket":
+                return [{
+                    "symbol": "ASTERUSDT",
+                    "brackets": [{
+                        "notionalFloor": 0,
+                        "notionalCap": 20_000,
+                        "initialLeverage": 5,
+                    }],
+                }]
+            if path == "/fapi/v3/leverage":
+                return {"symbol": "ASTERUSDT", "leverage": 5}
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        client._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError, match="post-set position verification failed"):
+                await client.ensure_entry_leverage(
+                    "ASTERUSDT", 20, notional_quote=50.0
+                )
+        finally:
+            await client.close()
+
+        assert position_reads == 2
 
     @pytest.mark.asyncio
     async def test_aster_v3_account_risk_uses_account_with_join_margin(self):
@@ -6358,8 +6541,10 @@ class TestV1PassiveBusinessFlowParity:
             credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
         )
         calls: list[tuple[str, str, dict[str, Any]]] = []
+        current_leverage = 20
 
         async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            nonlocal current_leverage
             calls.append((method, path, dict(params or {})))
             if path == "/fapi/v2/positionRisk":
                 return [
@@ -6369,7 +6554,7 @@ class TestV1PassiveBusinessFlowParity:
                         "positionAmt": "0",
                         "entryPrice": "0",
                         "markPrice": "0.57329",
-                        "leverage": "20",
+                        "leverage": str(current_leverage),
                     },
                     {
                         "symbol": "HUSDT",
@@ -6377,7 +6562,7 @@ class TestV1PassiveBusinessFlowParity:
                         "positionAmt": "0",
                         "entryPrice": "0",
                         "markPrice": "0.57329",
-                        "leverage": "20",
+                        "leverage": str(current_leverage),
                     },
                 ]
             if path == "/fapi/v1/leverageBracket":
@@ -6395,6 +6580,7 @@ class TestV1PassiveBusinessFlowParity:
                     }
                 ]
             if path == "/fapi/v1/leverage":
+                current_leverage = 5
                 return {
                     "symbol": "HUSDT",
                     "leverage": 5,
@@ -6404,8 +6590,12 @@ class TestV1PassiveBusinessFlowParity:
 
         transport._request = fake_request
 
-        await transport.ensure_entry_leverage("HUSDT", 20, notional_quote=50.0)
-        await transport.ensure_entry_leverage("HUSDT", 20, notional_quote=50.0)
+        evidence = await transport.ensure_entry_leverage(
+            "HUSDT", 20, notional_quote=50.0
+        )
+        refreshed_evidence = await transport.ensure_entry_leverage(
+            "HUSDT", 20, notional_quote=50.0
+        )
 
         assert ("/fapi/v1/leverage", {"symbol": "HUSDT", "leverage": 5}) in [
             (path, params) for _, path, params in calls
@@ -6422,9 +6612,50 @@ class TestV1PassiveBusinessFlowParity:
         assert diagnostics[0]["outcome"] == "set"
         assert diagnostics[0]["bracket_initial_leverage"] == 5
         assert diagnostics[0]["position_risk_leverage"] == 20
+        assert diagnostics[0]["post_set_position_risk_leverage"] == 5
         assert diagnostics[1]["requested_leverage"] == 20
         assert diagnostics[1]["effective_leverage"] == 5
-        assert diagnostics[1]["outcome"] == "cached_ready"
+        assert diagnostics[1]["outcome"] == "already_ready"
+        assert evidence is not None
+        assert evidence.evidence_complete is True
+        assert evidence.effective_leverage == 5
+        assert refreshed_evidence is not None
+        assert refreshed_evidence.evidence_complete is True
+
+    @pytest.mark.asyncio
+    async def test_binance_entry_leverage_post_set_position_mismatch_is_not_evidence(self):
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        position_reads = 0
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            nonlocal position_reads
+            if path == "/fapi/v2/positionRisk":
+                position_reads += 1
+                return [{"symbol": "HUSDT", "leverage": "20"}]
+            if path == "/fapi/v1/leverageBracket":
+                return [{
+                    "symbol": "HUSDT",
+                    "brackets": [{
+                        "bracket": 1,
+                        "initialLeverage": 5,
+                        "notionalFloor": 0,
+                        "notionalCap": 20000,
+                    }],
+                }]
+            if path == "/fapi/v1/leverage":
+                return {"symbol": "HUSDT", "leverage": 5}
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        transport._request = fake_request
+
+        with pytest.raises(OrderSubmitError, match="post-set position verification failed"):
+            await transport.ensure_entry_leverage("HUSDT", 20, notional_quote=50.0)
+
+        assert position_reads == 2
 
     @pytest.mark.asyncio
     async def test_binance_entry_leverage_prepare_skips_when_account_already_ready(self):
@@ -6464,6 +6695,33 @@ class TestV1PassiveBusinessFlowParity:
         assert not any(path == "/fapi/v1/leverage" for _, path, _ in calls)
         assert transport.order_diagnostics[-1]["kind"] == "order.entry_leverage_ready"
         assert transport.order_diagnostics[-1]["payload"]["outcome"] == "already_ready"
+
+    @pytest.mark.asyncio
+    async def test_binance_entry_leverage_without_matching_bracket_is_not_sizing_evidence(self):
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            if path == "/fapi/v2/positionRisk":
+                return [{"symbol": "HUSDT", "positionAmt": "0", "leverage": "5"}]
+            if path == "/fapi/v1/leverageBracket":
+                return [{"symbol": "HUSDT", "brackets": []}]
+            if path == "/fapi/v1/leverage":
+                raise AssertionError("account leverage is already ready")
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        transport._request = fake_request
+
+        evidence = await transport.ensure_entry_leverage("HUSDT", 5, notional_quote=50.0)
+
+        assert evidence is not None
+        assert evidence.account_verified is True
+        assert evidence.bracket_verified is False
+        assert evidence.evidence_complete is False
+        assert transport.order_diagnostics[-1]["payload"]["bracket_verified"] is False
 
     @pytest.mark.asyncio
     async def test_bybit_delisting_no_new_position_reject_is_classified_as_admission(

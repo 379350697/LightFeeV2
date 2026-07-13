@@ -27,6 +27,14 @@ from lightfee.config.schema import (
 from lightfee.config.validation import check_raw_toml_for_chillybot, validate_config
 from lightfee.core.errors import ConfigError
 
+_RETIRED_TRANSFER_BIAS_FIELDS = frozenset(
+    {
+        "transfer_healthy_bias_bps",
+        "transfer_unknown_bias_bps",
+        "transfer_degraded_bias_bps",
+    }
+)
+
 
 def load_config(path: str | Path) -> AppConfig:
     """Load and validate a TOML config file. Raises ConfigError on failure."""
@@ -101,6 +109,12 @@ def _load_strategy(
 
 def _normalize_entry_perp_liquidity_thresholds(raw: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(raw)
+
+    # These fields formerly ranked opportunities from a non-querying transfer
+    # source. They are accepted only at the parser boundary so an old TOML file
+    # cannot reactivate a fake inventory/transfer signal.
+    for key in _RETIRED_TRANSFER_BIAS_FIELDS:
+        normalized.pop(key, None)
 
     if (
         "entry_open_interest_floor_quote" in normalized

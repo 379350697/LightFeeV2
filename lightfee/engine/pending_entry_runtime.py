@@ -8,6 +8,7 @@ pending-entry removal authority, and recovery-core refresh timing stable.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
@@ -21,6 +22,7 @@ from lightfee.engine.pending_entry_terminalizer import (
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import RuntimeContext
 from lightfee.risk.modes import EngineLifecycle
+from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 
 
 def apply_pending_entry_hedge_progress(
@@ -55,9 +57,291 @@ def apply_pending_entry_hedge_progress(
     return delta
 
 
+def _candidate_positive_float_hint(candidate: Any, *names: str) -> float:
+    """Return the first usable terminal-fallback field without inventing size."""
+    for name in names:
+        try:
+            value = float(getattr(candidate, name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0.0:
+            return value
+    return 0.0
+
+
+def force_standard_candidate_context_values(
+    candidate: Any,
+    pending: Any,
+) -> tuple[float, float, float]:
+    """Derive the V1 terminal-taker context from revalidated evidence.
+
+    This is pending-entry lifecycle logic, not a ``LiveRuntime`` policy.  It
+    intentionally never manufactures a price or quantity: the caller skips
+    the fallback if all validated candidate and pending-entry evidence is
+    absent.
+    """
+    long_price_hint = _candidate_positive_float_hint(
+        candidate,
+        "long_price_hint",
+        "long_order_price_hint",
+        "long_entry_vwap",
+    )
+    short_price_hint = _candidate_positive_float_hint(
+        candidate,
+        "short_price_hint",
+        "short_order_price_hint",
+        "short_entry_vwap",
+    )
+    fallback_price = (
+        getattr(getattr(pending, "passive_order", None), "limit_price", None)
+        or getattr(pending, "maker_price", 0.0)
+        or 0.0
+    )
+    if long_price_hint <= 0.0:
+        long_price_hint = float(fallback_price or 0.0)
+    if short_price_hint <= 0.0:
+        short_price_hint = float(fallback_price or 0.0)
+
+    reference_price = long_price_hint if long_price_hint > 0.0 else short_price_hint
+    entry_notional_quote = float(
+        getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+    )
+    target_quantity = (
+        entry_notional_quote / reference_price
+        if entry_notional_quote > 0.0 and reference_price > 0.0
+        else (
+            float(getattr(pending, "target_quantity", 0.0) or 0.0)
+            or float(getattr(pending, "long_quantity", 0.0) or 0.0)
+            or float(getattr(pending, "short_quantity", 0.0) or 0.0)
+        )
+    )
+    return target_quantity, long_price_hint, short_price_hint
+
+
+def pending_entry_maker_inventory_bias_threshold_quote(strategy: Any) -> float:
+    """Return the V1 inventory-bias cap from typed strategy configuration."""
+    return max(
+        float(strategy.live_entry_notional_cap_quote or 0.0),
+        float(strategy.entry_notional_cap_quote or 0.0),
+        float(strategy.min_entry_leg_notional_quote or 0.0),
+        1.0,
+    )
+
+
+def pending_entry_signed_inventory_notional_quote(
+    open_positions: Any,
+    venue: Venue,
+    symbol: str,
+    price_hint: float,
+) -> float:
+    """Compute signed existing inventory for the passive-maker price domain.
+
+    The state accepts both paired funding positions and legacy single-venue
+    position records.  Keep that boundary compatibility here so the runtime
+    only provides its state snapshot and does not duplicate portfolio logic.
+    """
+    if not (math.isfinite(price_hint) and price_hint > 0.0):
+        return 0.0
+    venue_value = venue.value if hasattr(venue, "value") else str(venue)
+    signed_quantity = 0.0
+    for position in getattr(open_positions, "values", lambda: ())():
+        if getattr(position, "symbol", "") != symbol:
+            continue
+        if hasattr(position, "long_venue") or hasattr(position, "short_venue"):
+            long_venue = getattr(position, "long_venue", "")
+            short_venue = getattr(position, "short_venue", "")
+            long_value = long_venue.value if hasattr(long_venue, "value") else str(long_venue)
+            short_value = short_venue.value if hasattr(short_venue, "value") else str(short_venue)
+            quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+            if long_value == venue_value:
+                signed_quantity += quantity
+            if short_value == venue_value:
+                signed_quantity -= quantity
+            continue
+        pos_venue = getattr(position, "venue", "")
+        pos_value = pos_venue.value if hasattr(pos_venue, "value") else str(pos_venue)
+        if pos_value != venue_value:
+            continue
+        quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+        side = getattr(position, "side", None)
+        signed_quantity += quantity if side == Side.BUY else -quantity
+    return signed_quantity * price_hint
+
+
+def pending_entry_edge_headroom_bps(pending: Any, strategy: Any) -> float | None:
+    """Return V1 passive-price aggression headroom from frozen entry evidence."""
+    source = getattr(pending, "frozen_candidate", None)
+    if not isinstance(source, dict):
+        source = {
+            "entry_notional_quote": getattr(pending, "entry_notional_quote", 0.0),
+            "expected_edge_bps": getattr(pending, "expected_edge_bps_entry", 0.0),
+            "worst_case_edge_bps": getattr(pending, "worst_case_edge_bps_entry", 0.0),
+        }
+    try:
+        entry_notional = float(source.get("entry_notional_quote", 0.0) or 0.0)
+        expected_edge = float(source.get("expected_edge_bps", 0.0) or 0.0)
+        worst_case_edge = float(source.get("worst_case_edge_bps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        math.isfinite(entry_notional)
+        and math.isfinite(expected_edge)
+        and math.isfinite(worst_case_edge)
+    ):
+        return None
+    min_expected = float(strategy.min_expected_edge_bps or 0.0)
+    min_worst = float(strategy.min_worst_case_edge_bps or 0.0)
+    return min(expected_edge - min_expected, worst_case_edge - min_worst)
+
+
 class PendingEntryRuntime:
     def __init__(self, ctx: RuntimeContext) -> None:
         self.ctx = ctx
+
+    def _pending_entry_hedge_price_hint(self, pending: Any) -> float:
+        """Return the validated price anchor for a pending maker fill."""
+        price_hint = 0.0
+        weighted_average = getattr(pending, "unmatched_maker_weighted_average_price", None)
+        if callable(weighted_average):
+            try:
+                price_hint = float(weighted_average() or 0.0)
+            except (TypeError, ValueError):
+                price_hint = 0.0
+        if price_hint <= 0.0:
+            price_hint = float(getattr(pending, "maker_fill_price", 0.0) or 0.0)
+        if price_hint <= 0.0:
+            price_hint = float(getattr(pending, "maker_price", 0.0) or 0.0)
+        return max(0.0, price_hint)
+
+    def _post_first_fill_executable_quote(
+        self,
+        venue: Venue,
+        symbol: str,
+        now_ms: int,
+    ) -> tuple[float, float, dict[str, Any]] | None:
+        """Return a fresh, non-future executable BBO after a maker fill."""
+        max_age_ms = max(self.ctx.config.strategy.max_liquidity_snapshot_age_ms, 0)
+        venue_value = venue.value
+        if max_age_ms <= 0:
+            return None
+        if self.ctx._entry_readiness_provider_uses_ws_bbo():
+            quote = self.ctx.ws_bbo_cache.get_quote(venue_value, symbol)
+            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0) if quote else 0
+            bid = float(getattr(quote, "bid", 0.0) or 0.0) if quote else 0.0
+            ask = float(getattr(quote, "ask", 0.0) or 0.0) if quote else 0.0
+            source = "ws_bbo_quote_lease"
+        elif self.ctx._local_l2_effective_enabled():
+            book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
+            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0) if book else 0
+            try:
+                bid = float(book.best_bid() or 0.0) if book else 0.0
+                ask = float(book.best_ask() or 0.0) if book else 0.0
+            except Exception:
+                bid, ask = 0.0, 0.0
+            status = str(getattr(getattr(book, "status", None), "value", "") or "")
+            if status != "hot":
+                return None
+            source = "local_l2_final_bbo"
+        else:
+            return None
+        if (
+            observed_at_ms <= 0
+            or observed_at_ms > now_ms
+            or now_ms - observed_at_ms > max_age_ms
+            or bid <= 0.0
+            or ask <= bid
+        ):
+            return None
+        return bid, ask, {
+            "venue": venue_value,
+            "bid": bid,
+            "ask": ask,
+            "observed_at_ms": observed_at_ms,
+            "max_age_ms": max_age_ms,
+            "source": source,
+        }
+
+    def _pending_entry_post_first_fill_decision(
+        self,
+        pending: Any,
+        *,
+        entry_id: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Choose the lower-loss hedge or cleanup for a filled maker leg."""
+        default = {
+            "action": "complete_hedge",
+            "reason": "post_first_fill_market_data_unavailable_complete_hedge",
+            "hedge_price": self._pending_entry_hedge_price_hint(pending),
+            "market_evidence": {},
+        }
+        quantity = max(float(pending.missing_hedge_quantity() or 0.0), 0.0)
+        maker_price = self._pending_entry_hedge_price_hint(pending)
+        if quantity <= 1e-9 or maker_price <= 0.0:
+            return default
+        maker_quote = self._post_first_fill_executable_quote(
+            pending.maker_venue(), pending.symbol, now_ms
+        )
+        hedge_quote = self._post_first_fill_executable_quote(
+            pending.hedge_venue(), pending.symbol, now_ms
+        )
+        if maker_quote is None or hedge_quote is None:
+            return default
+        maker_bid, maker_ask, maker_evidence = maker_quote
+        hedge_bid, hedge_ask, hedge_evidence = hedge_quote
+        hedge_venue = pending.hedge_venue()
+        unwind_venue = pending.maker_venue()
+        revalidator = FundingEntryRevalidator()
+        hedge_fee_bps = revalidator.taker_fee_bps_for_venue(
+            hedge_venue, self.ctx.config.venues
+        )
+        unwind_fee_bps = revalidator.taker_fee_bps_for_venue(
+            unwind_venue, self.ctx.config.venues
+        )
+        market_decision = revalidator.decide_from_first_fill_market(
+            maker_side=pending.maker_side(),
+            maker_fill_price=maker_price,
+            quantity=quantity,
+            maker_bid=maker_bid,
+            maker_ask=maker_ask,
+            hedge_bid=hedge_bid,
+            hedge_ask=hedge_ask,
+            hedge_fee_bps=hedge_fee_bps,
+            unwind_fee_bps=unwind_fee_bps,
+        )
+        if market_decision is None:
+            return {
+                **default,
+                "reason": "pending_post_first_fill_fee_evidence_unavailable_complete_hedge",
+                "hedge_price": hedge_bid if pending.maker_side() == Side.BUY else hedge_ask,
+                "market_evidence": {
+                    "entry_id": entry_id,
+                    "maker": maker_evidence,
+                    "hedge": hedge_evidence,
+                    "hedge_taker_fee_evidence": hedge_fee_bps is not None,
+                    "unwind_taker_fee_evidence": unwind_fee_bps is not None,
+                },
+            }
+        choice = market_decision.decision
+        return {
+            "action": choice.action,
+            "reason": f"pending_post_first_fill_{choice.reason}",
+            "hedge_price": market_decision.hedge_price,
+            "unwind_price": market_decision.unwind_price,
+            "complete_hedge_loss_quote": choice.complete_hedge_loss_quote,
+            "unwind_first_leg_loss_quote": choice.unwind_first_leg_loss_quote,
+            "complete_hedge_price_loss_quote": choice.complete_hedge_price_loss_quote,
+            "unwind_first_leg_price_loss_quote": choice.unwind_first_leg_price_loss_quote,
+            "complete_hedge_fee_quote": choice.complete_hedge_fee_quote,
+            "unwind_first_leg_fee_quote": choice.unwind_first_leg_fee_quote,
+            "market_evidence": {
+                "entry_id": entry_id,
+                "maker": maker_evidence,
+                "hedge": hedge_evidence,
+                "hedge_taker_fee_bps": market_decision.hedge_fee_bps,
+                "unwind_taker_fee_bps": market_decision.unwind_fee_bps,
+            },
+        }
 
     @staticmethod
     def _infer_symbol_from_pending_close(pending: Any) -> str:
@@ -1610,7 +1894,7 @@ class PendingEntryRuntime:
         now_ms: int,
     ) -> PendingEntryLiveTruth:
         if not self.ctx._pending_entry_has_maker_order_reference(pending):
-            if str(getattr(self.ctx.config.runtime, "mode", "") or "") == "live":
+            if self.ctx.config.runtime.mode == "live":
                 pending.uncertain_outcome = True
                 pending.reconcile_next_attempt_ms = max(
                     int(getattr(pending, "reconcile_next_attempt_ms", 0) or 0),
@@ -1641,7 +1925,7 @@ class PendingEntryRuntime:
         adapter = self.ctx.get_venue_adapter(maker_venue)
         order_id, client_order_id = self.ctx._pending_entry_maker_order_identifiers(pending)
         if adapter is None:
-            if str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
+            if self.ctx.config.runtime.mode != "live":
                 return PendingEntryLiveTruth(
                     available=True,
                     has_live_open_order=False,
@@ -1662,7 +1946,7 @@ class PendingEntryRuntime:
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         transport = getattr(adapter, "_transport", None)
         if (
-            str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live"
+            self.ctx.config.runtime.mode != "live"
             and not callable(fetch_open_orders)
             and (transport is None or not hasattr(transport, "_request"))
         ):
@@ -1742,7 +2026,7 @@ class PendingEntryRuntime:
         maker_venue = pending.maker_venue()
         adapter = self.ctx.get_venue_adapter(maker_venue)
         if adapter is None:
-            if str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
+            if self.ctx.config.runtime.mode != "live":
                 return PendingEntryLiveTruth(
                     available=True,
                     has_live_open_order=False,
@@ -1762,7 +2046,7 @@ class PendingEntryRuntime:
 
         fetch_position = getattr(adapter, "fetch_position", None)
         if (
-            str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live"
+            self.ctx.config.runtime.mode != "live"
             and not callable(fetch_position)
         ):
             return PendingEntryLiveTruth(
@@ -1854,7 +2138,7 @@ class PendingEntryRuntime:
         entry_id: str,
         now_ms: int,
     ) -> PendingEntryLiveTruth:
-        if str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
+        if self.ctx.config.runtime.mode != "live":
             return PendingEntryLiveTruth(
                 available=True,
                 has_live_open_order=False,
@@ -2391,6 +2675,7 @@ class PendingEntryRuntime:
             total_funding_edge_bps_entry=pending.total_funding_edge_bps_entry,
             expected_edge_bps_entry=pending.expected_edge_bps_entry,
             worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            expected_shortfall_bps_entry=pending.expected_shortfall_bps_entry,
             entry_maker_leg=pending.entry_maker_leg,
             exit_maker_leg=pending.exit_maker_leg,
             entry_cross_bps_entry=pending.entry_cross_bps_entry,
@@ -2708,7 +2993,7 @@ class PendingEntryRuntime:
                 "result": "maker_order_not_terminal_before_pending_release",
                 "has_live_open_order": False,
             }
-            if str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
+            if self.ctx.config.runtime.mode != "live":
                 return True, evidence
             pending.uncertain_outcome = True
             pending.reconcile_next_attempt_ms = max(

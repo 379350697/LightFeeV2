@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-SPREAD_SNAPSHOT_SCHEMA_VERSION = 1
+SPREAD_SNAPSHOT_SCHEMA_VERSION = 2
 SPREAD_STRATEGY_BUCKET = "spread_reversion"
 
 
@@ -57,6 +57,44 @@ class SpreadReversionCandidate:
     screening_reasons: list[str] = field(default_factory=list)
     history_age_ms: int = 0
     opportunity_label: str = "spread_reversion"
+    # v2 signed-basis economics. The original fields remain for old journals
+    # and consumers, but no longer mean "the whole observed spread is profit".
+    canonical_venue_a: str = ""
+    canonical_venue_b: str = ""
+    current_signed_mid_spread_bps: float = 0.0
+    current_executable_entry_spread_bps: float = 0.0
+    equilibrium_spread_bps: float = 0.0
+    target_exit_spread_bps: float = 0.0
+    gross_reversion_edge_bps: float = 0.0
+    # The complete shared `EdgeBreakdown` is dual-written here.  The older
+    # fields above remain readable by legacy paper journals and diagnostics.
+    gross_signal_edge_bps: float = 0.0
+    funding_edge_bps: float = 0.0
+    entry_cross_bps: float = 0.0
+    expected_exit_cross_bps: float = 0.0
+    entry_fee_bps: float = 0.0
+    exit_fee_bps: float = 0.0
+    entry_slippage_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
+    adverse_selection_bps: float = 0.0
+    capital_buffer_bps: float = 0.0
+    execution_buffer_bps: float = 0.0
+    venue_risk_haircut_bps: float = 0.0
+    transfer_or_inventory_bias_bps: float = 0.0
+    ranking_edge_bps: float = 0.0
+    economics_observed_at_ms: int = 0
+    expected_net_edge_bps: float = 0.0
+    worst_case_edge_bps: float = 0.0
+    calculation_version: str = "spread_v2_signed_reversion"
+    model_epoch: str = "v2_signed_reversion"
+    # Construction outside the signed-basis builder must never manufacture
+    # permission for paper registration or a future live adapter.
+    economics_complete: bool = False
+    # Four-leg economics must be backed by explicit fee inputs.  An explicit
+    # zero is valid (for example a VIP tier); a missing key never is.
+    fee_evidence_complete: bool = False
+    contract_normalization_status: str = "unknown"
+    contract_normalization_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -68,6 +106,9 @@ class SpreadSnapshot:
     source_mode: str = ""
     degraded_venues: list[str] = field(default_factory=list)
     degraded_symbols: dict[str, list[str]] = field(default_factory=dict)
+    # Aggregated stable reasons make a zero-candidate refresh diagnostically
+    # useful without pretending blocked pairs are tradeable candidates.
+    rejection_counts: dict[str, int] = field(default_factory=dict)
     candidates: list[SpreadReversionCandidate] = field(default_factory=list)
 
 
@@ -111,6 +152,9 @@ class SpreadPosition:
     entry_notional_quote: float
     opened_at_ms: int
     strategy_bucket: str = SPREAD_STRATEGY_BUCKET
+    # This is the actual matched base quantity, not a target quote amount.
+    # A close planner must never reverse two independently re-derived notionals.
+    base_quantity: float = 0.0
 
 
 @dataclass(frozen=True)

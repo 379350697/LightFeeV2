@@ -34,6 +34,7 @@ from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
+from lightfee.engine.funding_risk_runtime import FundingRiskRuntime
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
@@ -84,6 +85,10 @@ from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
 from lightfee.engine.pending_entry_runtime import (
     PendingEntryRuntime,
     apply_pending_entry_hedge_progress,
+    force_standard_candidate_context_values,
+    pending_entry_edge_headroom_bps,
+    pending_entry_maker_inventory_bias_threshold_quote,
+    pending_entry_signed_inventory_notional_quote,
 )
 from lightfee.engine.residual_repair_runtime import ResidualRepairRuntime
 from lightfee.engine.unpaired_live_position_recovery import (
@@ -338,6 +343,7 @@ class LiveRuntime:
         self.entry_readiness_provider = build_entry_readiness_provider(self)
         self.market_data_runtime = MarketDataRuntime(self)
         self.entry_gate_runtime = EntryGateRuntime(self)
+        self.funding_risk_runtime = FundingRiskRuntime(self)
         self.entry_dispatch_runtime = EntryDispatchRuntime(self)
         self._refresh_runtime_market_data_config_state()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
@@ -624,28 +630,18 @@ class LiveRuntime:
 
     def _entry_admission_margin_buffer_bps(self) -> float:
         strategy = self.config.strategy
-        buffer_bps = 0.0
-        for attr in (
-            "execution_buffer_bps",
-            "capital_buffer_bps",
-            "entry_exit_reserve_bps",
-        ):
-            try:
-                buffer_bps += float(getattr(strategy, attr, 0.0) or 0.0)
-            except (TypeError, ValueError):
-                continue
+        buffer_bps = (
+            float(strategy.execution_buffer_bps)
+            + float(strategy.capital_buffer_bps)
+            + float(strategy.entry_exit_reserve_bps)
+        )
         return max(buffer_bps, 0.0)
 
     def _hyperliquid_entry_required_initial_margin_quote(
         self,
         entry_notional_quote: float,
     ) -> float:
-        try:
-            leverage = float(
-                getattr(self.config.strategy, "live_target_leverage", 1.0) or 1.0
-            )
-        except (TypeError, ValueError):
-            leverage = 1.0
+        leverage = float(self.config.strategy.live_target_leverage)
         leverage = max(leverage, 1.0)
         try:
             notional = float(entry_notional_quote or 0.0)
@@ -1126,10 +1122,7 @@ class LiveRuntime:
         return dict(self._venue_adapters)
 
     def _entry_readiness_provider_name(self) -> str:
-        return str(
-            getattr(self.config.strategy, "entry_readiness_provider", "local_l2")
-            or "local_l2"
-        ).strip().lower()
+        return self.config.strategy.entry_readiness_provider.strip().lower()
 
     def _entry_readiness_provider_uses_local_l2(self) -> bool:
         return self._entry_readiness_provider_name() in {"local_l2", "ws_top_book"}
@@ -1147,7 +1140,7 @@ class LiveRuntime:
     def _local_l2_effective_enabled(self) -> bool:
         """Whether Local-L2 data plane is effective for this runtime profile."""
         return (
-            bool(getattr(self.config.strategy, "local_l2_enabled", False))
+            self.config.strategy.local_l2_enabled
             and self._entry_readiness_provider_uses_local_l2()
         )
 
@@ -1573,18 +1566,32 @@ class LiveRuntime:
         return 0.0
 
     def _pending_entry_hedge_price_hint(self, pending) -> float:
-        price_hint = 0.0
-        weighted_average = getattr(pending, "unmatched_maker_weighted_average_price", None)
-        if callable(weighted_average):
-            try:
-                price_hint = float(weighted_average() or 0.0)
-            except (TypeError, ValueError):
-                price_hint = 0.0
-        if price_hint <= 0.0:
-            price_hint = float(getattr(pending, "maker_fill_price", 0.0) or 0.0)
-        if price_hint <= 0.0:
-            price_hint = float(getattr(pending, "maker_price", 0.0) or 0.0)
-        return max(0.0, price_hint)
+        return self.pending_entry_runtime._pending_entry_hedge_price_hint(pending)
+
+    def _post_first_fill_executable_quote(
+        self,
+        venue: Venue,
+        symbol: str,
+        now_ms: int,
+    ) -> tuple[float, float, dict[str, Any]] | None:
+        return self.pending_entry_runtime._post_first_fill_executable_quote(
+            venue,
+            symbol,
+            now_ms,
+        )
+
+    def _pending_entry_post_first_fill_decision(
+        self,
+        pending,
+        *,
+        entry_id: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        return self.pending_entry_runtime._pending_entry_post_first_fill_decision(
+            pending,
+            entry_id=entry_id,
+            now_ms=now_ms,
+        )
 
     def _pending_entry_hedgeability_plan(
         self,
@@ -1766,15 +1773,8 @@ class LiveRuntime:
         hedge_venue: Venue,
     ) -> None:
         strategy = self.config.strategy
-        hard_ms = int(getattr(strategy, "maker_hedge_deadline_ms", 0) or 0)
-        soft_ms = int(
-            getattr(
-                strategy,
-                "maker_hedge_soft_deadline_ms",
-                min(hard_ms, 800) if hard_ms > 0 else 800,
-            )
-            or 0
-        )
+        hard_ms = int(strategy.maker_hedge_deadline_ms or 0)
+        soft_ms = int(strategy.maker_hedge_soft_deadline_ms or 0)
         hedge_notional = abs(float(normalized_quantity or 0.0) * max(0.0, hedge_price))
         decision = note_pending_entry_hedge_submitted(
             pending,
@@ -1931,6 +1931,28 @@ class LiveRuntime:
             {"run_id": self.state.run_id, "ts_ms": self.state.started_at_ms},
             flush=True,
         )
+        entry_policy = {
+            "run_id": self.state.run_id,
+            "mode": self.config.runtime.mode,
+            # Health evidence must use the identical strict flag semantics as
+            # live admission.  ``bool(\"false\")`` would otherwise tell an
+            # operator that entries were enabled while the dispatcher rightly
+            # keeps them fail-closed.
+            "funding_new_entries_enabled": (
+                self.config.strategy.funding_new_entries_enabled is True
+            ),
+            "funding_economics_mode": self.config.strategy.funding_economics_mode,
+            "funding_forecast_mode": self.config.strategy.funding_forecast_mode,
+            "live_economics_required": self.config.runtime.mode == "live",
+            "spread_live_enabled": self.config.strategy.spread_live_enabled is True,
+            "spread_paper_enabled": self.config.strategy.spread_paper_enabled is True,
+            "ts_ms": self.state.started_at_ms,
+        }
+        # This is both a structured health artifact and an operator-visible
+        # startup line.  It makes an accidental entry unfreeze immediately
+        # evident without changing any close/recovery policy.
+        self.journal.append("startup.strategy_entry_policy", entry_policy, flush=True)
+        logger.info("startup.strategy_entry_policy=%s", entry_policy)
         self._emit_startup_order_path_preflight()
         await self._verify_live_trading_preflights()
         hyperliquid_trading_disabled_reason = (
@@ -2942,7 +2964,7 @@ class LiveRuntime:
                 return []
             static_symbols = [
                 str(symbol)
-                for symbol in getattr(self.config, "symbols", [])
+                for symbol in self.config.symbols
                 if str(symbol)
             ]
             max_static = self._MAX_STATIC_RECOVERY_PROBE_SYMBOLS
@@ -3579,7 +3601,7 @@ class LiveRuntime:
         )
 
     async def _maybe_check_active_position_drift(self, now_ms: int) -> None:
-        if str(getattr(self.config.runtime, "mode", "")).lower() != "live":
+        if self.config.runtime.mode != "live":
             return
         if not self.state.open_positions:
             return
@@ -3891,20 +3913,10 @@ class LiveRuntime:
 
         source_candidates = list(candidates or [])
         primary_count = min(
-            max(int(getattr(self.config.strategy, "entry_local_l2_primary_count", 0) or 0), 0),
-            max(int(getattr(self.config.strategy, "max_concurrent_positions", 1) or 1), 1),
+            max(self.config.strategy.entry_local_l2_primary_count, 0),
+            max(self.config.strategy.max_concurrent_positions, 1),
         )
-        shadow_count = max(
-            int(
-                getattr(
-                    self.config.strategy,
-                    "shadow_entry_opportunity_count",
-                    getattr(self.config.strategy, "entry_local_l2_shadow_count", 0),
-                )
-                or 0
-            ),
-            0,
-        )
+        shadow_count = max(self.config.strategy.shadow_entry_opportunity_count, 0)
         tracked = select_tracked_opportunities(
             source_candidates,
             primary_count,
@@ -4234,10 +4246,7 @@ class LiveRuntime:
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
         self._running = False
-        shutdown_timeout_s = max(
-            int(getattr(self.config.runtime, "shutdown_grace_period_ms", 3000) or 3000),
-            1,
-        ) / 1000.0
+        shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + shutdown_timeout_s
 
@@ -4539,6 +4548,37 @@ class LiveRuntime:
         self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = (
             self.state.last_scan["snapshot_freshness_all_candidate_count"]
         )
+        if freshness == SnapshotFreshness.FRESH:
+            try:
+                self.state.last_scan["funding_basis_risk"] = (
+                    self.funding_risk_runtime.observe_fresh_snapshot(
+                        snapshot,
+                        now_ms=now_ms,
+                    )
+                )
+            except Exception as exc:
+                self.funding_risk_runtime.mark_unhealthy(type(exc).__name__)
+                # Dynamic ES is strictly an entry admission input.  A local
+                # checkpoint/model failure must not stop V1 close, recovery or
+                # exchange-truth work, but it leaves every new live entry
+                # fail-closed through the runtime's unhealthy risk state.
+                self.state.last_scan["funding_basis_risk"] = {
+                    "model_version": "funding_basis_es_v1",
+                    "checkpoint_healthy": False,
+                    "error": type(exc).__name__,
+                    "source": "fresh_sidecar_snapshot",
+                }
+                self.journal.append(
+                    "runtime.funding_basis_risk_observation_error",
+                    {"error": type(exc).__name__, "ts_ms": now_ms},
+                )
+        else:
+            self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
+            self.state.last_scan["funding_basis_risk"] = {
+                "model_version": "funding_basis_es_v1",
+                "checkpoint_healthy": False,
+                "source": "fresh_snapshot_required",
+            }
         try:
             self._maybe_export_current_state_snapshot(ExportState(), now_ms)
         except Exception as exc:
@@ -4664,11 +4704,7 @@ class LiveRuntime:
 
         # --- Discover tradeable candidates ---
         # V1 live scan recovery gate: require consecutive fresh snapshots before entry
-        live_scan_recovery_count = getattr(
-            self.config.runtime,
-            'live_scan_recovery_success_count',
-            getattr(self.config.strategy, 'live_scan_recovery_success_count', 3),
-        )
+        live_scan_recovery_count = self.config.runtime.live_scan_recovery_success_count
         if self._live_scan_success_streak < live_scan_recovery_count:
             self.state.last_scan["no_entry_reason"] = "live_scan_recovery_warmup"
             self.journal.append(
@@ -4681,7 +4717,10 @@ class LiveRuntime:
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
             await self._refresh_hyperliquid_entry_balance_admission(now_ms)
             tradeable = discover_tradeable_candidates(
-                snapshot.candidates, self.config.strategy, now_ms
+                snapshot.candidates,
+                self.config.strategy,
+                now_ms,
+                require_complete_economics=(self.config.runtime.mode == "live"),
             )
             strategy_tradeable_count = len(tradeable)
             raw_candidate_count = len(getattr(snapshot, "candidates", []) or [])
@@ -5169,6 +5208,65 @@ class LiveRuntime:
             # Fetch error → snapshot unavailable, but capability (supports) unchanged.
             # V1: venue supports_risk_health is independent of transient fetch errors.
             return None, True
+
+    async def _funding_entry_margin_evidence(
+        self,
+        venue: Venue,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Return fresh/cached free-collateral evidence for one entry leg.
+
+        This is deliberately an admission-only view.  It reuses the existing
+        private risk cache and does not alter supervisor semantics.  Missing
+        evidence is represented explicitly so the paired allocator can apply
+        its configured small-notional fallback instead of expanding risk.
+        """
+
+        adapter = self.get_venue_adapter(venue)
+        if adapter is None:
+            return {
+                "available_margin_quote": None,
+                "evidence_complete": False,
+                "source": "adapter_missing",
+            }
+
+        if venue is Venue.HYPERLIQUID:
+            snapshot, error = await self._fetch_hyperliquid_entry_balance_snapshot(
+                now_ms
+            )
+            available = getattr(snapshot, "free", None) if snapshot is not None else None
+            source = "hyperliquid_entry_balance_snapshot"
+            raw_error = str(error or "")
+        else:
+            snapshot, _supports = await self._fetch_venue_risk_snapshot(
+                venue,
+                adapter,
+                True,
+                now_ms,
+            )
+            available = getattr(snapshot, "available_balance_quote", None)
+            source = "account_risk_snapshot"
+            raw_error = ""
+
+        try:
+            parsed = float(available)
+        except (TypeError, ValueError):
+            parsed = float("nan")
+        if not math.isfinite(parsed) or parsed < 0.0:
+            return {
+                "available_margin_quote": None,
+                "evidence_complete": False,
+                "source": source,
+                "raw_error": raw_error or "available_margin_unavailable",
+            }
+        return {
+            "available_margin_quote": parsed,
+            "evidence_complete": True,
+            "source": source,
+            "observed_at_ms": int(
+                getattr(snapshot, "observed_at_ms", now_ms) or now_ms
+            ),
+        }
 
     async def tick_active_positions(self) -> None:
         """Fast tick lane: active position monitoring with risk supervision.
@@ -5684,55 +5782,6 @@ class LiveRuntime:
         checked.blocked = bool(blocked_reasons)
         return checked
 
-    @staticmethod
-    def _candidate_float_hint(candidate: Any, *names: str) -> float:
-        for name in names:
-            try:
-                value = float(getattr(candidate, name, 0.0) or 0.0)
-            except (TypeError, ValueError):
-                value = 0.0
-            if value > 0.0:
-                return value
-        return 0.0
-
-    def _force_standard_candidate_context_values(self, candidate: Any, pending: Any) -> tuple[float, float, float]:
-        long_price_hint = self._candidate_float_hint(
-            candidate,
-            "long_price_hint",
-            "long_order_price_hint",
-            "long_entry_vwap",
-        )
-        short_price_hint = self._candidate_float_hint(
-            candidate,
-            "short_price_hint",
-            "short_order_price_hint",
-            "short_entry_vwap",
-        )
-        fallback_price = (
-            getattr(getattr(pending, "passive_order", None), "limit_price", None)
-            or getattr(pending, "maker_price", 0.0)
-            or 0.0
-        )
-        if long_price_hint <= 0.0:
-            long_price_hint = float(fallback_price or 0.0)
-        if short_price_hint <= 0.0:
-            short_price_hint = float(fallback_price or 0.0)
-
-        reference_price = long_price_hint if long_price_hint > 0.0 else short_price_hint
-        entry_notional_quote = float(
-            getattr(candidate, "entry_notional_quote", 0.0) or 0.0
-        )
-        target_quantity = (
-            (entry_notional_quote / reference_price)
-            if entry_notional_quote > 0.0 and reference_price > 0.0
-            else (
-                float(getattr(pending, "target_quantity", 0.0) or 0.0)
-                or float(getattr(pending, "long_quantity", 0.0) or 0.0)
-                or float(getattr(pending, "short_quantity", 0.0) or 0.0)
-            )
-        )
-        return target_quantity, long_price_hint, short_price_hint
-
     async def _execute_pending_entry_terminal_taker_fallback(
         self,
         pending,
@@ -5785,7 +5834,7 @@ class LiveRuntime:
 
         maker_leg = Side.SELL if getattr(pending, "maker_leg", "long") == "short" else Side.BUY
         target_quantity, long_price_hint, short_price_hint = (
-            self._force_standard_candidate_context_values(candidate, pending)
+            force_standard_candidate_context_values(candidate, pending)
         )
         if target_quantity <= 1e-9 or long_price_hint <= 0.0 or short_price_hint <= 0.0:
             self.journal.append(
@@ -5842,6 +5891,7 @@ class LiveRuntime:
                 getattr(candidate, "expected_edge_bps", pending.expected_edge_bps_entry) or 0.0
             ),
             worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
+            expected_shortfall_bps_entry=pending.expected_shortfall_bps_entry,
             entry_maker_leg=pending.entry_maker_leg,
             exit_maker_leg=pending.exit_maker_leg,
             entry_cross_bps_entry=pending.entry_cross_bps_entry,
@@ -5883,9 +5933,8 @@ class LiveRuntime:
             )
             return True
 
-        pending.next_progress_poll_ms = now_ms + (
-            getattr(self.config.strategy, "maker_entry_reconcile_backoff_ms", 1000)
-            or 1000
+        pending.next_progress_poll_ms = (
+            now_ms + self.config.strategy.maker_entry_reconcile_backoff_ms
         )
         self.journal.append(
             "execution.entry_fallback_to_taker_deferred",
@@ -5918,10 +5967,10 @@ class LiveRuntime:
             return
 
         strategy = self.config.strategy
-        try_window_ms = getattr(strategy, "maker_try_window_ms", 0) or 0
-        min_fill_ratio = getattr(strategy, "maker_min_fill_ratio", 0.25) or 0.25
-        rest_timeout_ms = getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000
-        poll_ms = getattr(strategy, "maker_entry_progress_poll_ms", 500) or 500
+        try_window_ms = strategy.maker_try_window_ms
+        min_fill_ratio = strategy.maker_min_fill_ratio
+        rest_timeout_ms = strategy.maker_entry_rest_timeout_ms
+        poll_ms = strategy.maker_entry_progress_poll_ms
 
         resolved: list[str] = []
 
@@ -6274,19 +6323,18 @@ class LiveRuntime:
 
     def _pending_entry_passive_ladder_profile(self, venue: Venue) -> tuple[bool, bool]:
         venue_value = venue.value if hasattr(venue, "value") else str(venue)
-        for venue_config in getattr(self.config, "venues", []) or []:
-            if str(getattr(venue_config, "venue", "")).lower() != venue_value:
+        for venue_config in self.config.venues:
+            if str(venue_config.venue or "").lower() != venue_value:
                 continue
-            passive_maker = getattr(getattr(venue_config, "live", None), "passive_maker", None)
-            if passive_maker is not None:
-                return (
-                    bool(getattr(passive_maker, "adaptive_ladder_enabled", True)),
-                    bool(getattr(passive_maker, "queue_jump_enabled", True)),
-                )
+            passive_maker = venue_config.live.passive_maker
+            return (
+                bool(passive_maker.adaptive_ladder_enabled),
+                bool(passive_maker.queue_jump_enabled),
+            )
         strategy = self.config.strategy
         return (
-            bool(getattr(strategy, "passive_adaptive_ladder_enabled", True)),
-            bool(getattr(strategy, "passive_queue_jump_enabled", True)),
+            bool(strategy.passive_adaptive_ladder_enabled),
+            bool(strategy.passive_queue_jump_enabled),
         )
 
     @staticmethod
@@ -6409,12 +6457,15 @@ class LiveRuntime:
         inventory_bias_enabled = bool(
             getattr(passive_maker, "maker_inventory_bias_enabled", None)
             if passive_maker is not None and hasattr(passive_maker, "maker_inventory_bias_enabled")
-            else getattr(self.config.strategy, "maker_inventory_bias_enabled", True)
+            else self.config.strategy.maker_inventory_bias_enabled
         )
         if not inventory_bias_enabled:
             return base_price
-        threshold = self._pending_entry_maker_inventory_bias_threshold_quote()
-        signed_inventory = self._pending_entry_signed_inventory_notional_quote(
+        threshold = pending_entry_maker_inventory_bias_threshold_quote(
+            self.config.strategy,
+        )
+        signed_inventory = pending_entry_signed_inventory_notional_quote(
+            self.state.open_positions,
             pending.maker_venue(),
             pending.symbol,
             (best_bid + best_ask) * 0.5,
@@ -6430,8 +6481,8 @@ class LiveRuntime:
         pressure = min(max(abs(signed_inventory) / threshold, 0.0), 1.0)
         if pressure <= sys.float_info.epsilon:
             return base_price
-        bps_per_unit = float(getattr(self.config.strategy, "maker_inventory_bias_bps_per_unit", 25.0) or 0.0)
-        max_bps = float(getattr(self.config.strategy, "maker_inventory_bias_max_bps", 25.0) or 0.0)
+        bps_per_unit = float(self.config.strategy.maker_inventory_bias_bps_per_unit)
+        max_bps = float(self.config.strategy.maker_inventory_bias_max_bps)
         shift_bps = min(max(bps_per_unit * pressure, 0.0), max_bps)
         if shift_bps <= sys.float_info.epsilon:
             return base_price
@@ -6454,7 +6505,10 @@ class LiveRuntime:
     ) -> float:
         if attempt == 0:
             return base_price
-        edge_headroom_bps = self._pending_entry_edge_headroom_bps(pending)
+        edge_headroom_bps = pending_entry_edge_headroom_bps(
+            pending,
+            self.config.strategy,
+        )
         if edge_headroom_bps is None:
             return base_price
         full_headroom = self._pending_entry_full_aggression_headroom_bps()
@@ -6484,82 +6538,15 @@ class LiveRuntime:
 
     def _pending_entry_passive_maker_config(self, venue: Venue) -> Any | None:
         venue_value = venue.value if hasattr(venue, "value") else str(venue)
-        for venue_config in getattr(self.config, "venues", []) or []:
-            if str(getattr(venue_config, "venue", "")).lower() != venue_value:
+        for venue_config in self.config.venues:
+            if str(venue_config.venue or "").lower() != venue_value:
                 continue
-            return getattr(getattr(venue_config, "live", None), "passive_maker", None)
+            return venue_config.live.passive_maker
         return None
-
-    def _pending_entry_maker_inventory_bias_threshold_quote(self) -> float:
-        strategy = self.config.strategy
-        return max(
-            float(getattr(strategy, "live_entry_notional_cap_quote", 0.0) or 0.0),
-            float(getattr(strategy, "entry_notional_cap_quote", 0.0) or 0.0),
-            float(getattr(strategy, "min_entry_leg_notional_quote", 0.0) or 0.0),
-            1.0,
-        )
-
-    def _pending_entry_signed_inventory_notional_quote(
-        self,
-        venue: Venue,
-        symbol: str,
-        price_hint: float,
-    ) -> float:
-        if not (math.isfinite(price_hint) and price_hint > 0.0):
-            return 0.0
-        venue_value = venue.value if hasattr(venue, "value") else str(venue)
-        signed_quantity = 0.0
-        for position in getattr(self.state, "open_positions", {}).values():
-            if getattr(position, "symbol", "") != symbol:
-                continue
-            if hasattr(position, "long_venue") or hasattr(position, "short_venue"):
-                long_venue = getattr(position, "long_venue", "")
-                short_venue = getattr(position, "short_venue", "")
-                long_value = long_venue.value if hasattr(long_venue, "value") else str(long_venue)
-                short_value = short_venue.value if hasattr(short_venue, "value") else str(short_venue)
-                quantity = float(getattr(position, "quantity", 0.0) or 0.0)
-                if long_value == venue_value:
-                    signed_quantity += quantity
-                if short_value == venue_value:
-                    signed_quantity -= quantity
-                continue
-            pos_venue = getattr(position, "venue", "")
-            pos_value = pos_venue.value if hasattr(pos_venue, "value") else str(pos_venue)
-            if pos_value != venue_value:
-                continue
-            quantity = float(getattr(position, "quantity", 0.0) or 0.0)
-            side = getattr(position, "side", None)
-            signed_quantity += quantity if side == Side.BUY else -quantity
-        return signed_quantity * price_hint
-
-    def _pending_entry_edge_headroom_bps(self, pending) -> float | None:
-        source = getattr(pending, "frozen_candidate", None)
-        if not isinstance(source, dict):
-            source = {
-                "entry_notional_quote": getattr(pending, "entry_notional_quote", 0.0),
-                "expected_edge_bps": getattr(pending, "expected_edge_bps_entry", 0.0),
-                "worst_case_edge_bps": getattr(pending, "worst_case_edge_bps_entry", 0.0),
-            }
-        try:
-            entry_notional = float(source.get("entry_notional_quote", 0.0) or 0.0)
-            expected_edge = float(source.get("expected_edge_bps", 0.0) or 0.0)
-            worst_case_edge = float(source.get("worst_case_edge_bps", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        if not (
-            math.isfinite(entry_notional)
-            and math.isfinite(expected_edge)
-            and math.isfinite(worst_case_edge)
-        ):
-            return None
-        strategy = self.config.strategy
-        min_expected = float(getattr(strategy, "min_expected_edge_bps", 0.0) or 0.0)
-        min_worst = float(getattr(strategy, "min_worst_case_edge_bps", 0.0) or 0.0)
-        return min(expected_edge - min_expected, worst_case_edge - min_worst)
 
     def _pending_entry_full_aggression_headroom_bps(self) -> float:
         return max(
-            float(getattr(self.config.strategy, "execution_buffer_bps", 0.0) or 0.0) * 4.0,
+            float(self.config.strategy.execution_buffer_bps) * 4.0,
             self._MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR,
         )
 
@@ -6774,7 +6761,7 @@ class LiveRuntime:
             limit_price=float(ack_price) if ack_price and ack_price > 0 else None,
             target_quantity=float(ack_quantity),
             passive_attempt_count=passive_attempt_count,
-            rest_timeout_ms=getattr(self.config.strategy, "maker_entry_rest_timeout_ms", 6000) or 6000,
+            rest_timeout_ms=self.config.strategy.maker_entry_rest_timeout_ms,
         )
         if pending.passive_order is not None:
             pending.passive_order.last_progress_state = ack_state
@@ -6802,7 +6789,7 @@ class LiveRuntime:
     ) -> bool:
         """V1 zero-fill passive cycle: record delay, then repost before terminal abort."""
         strategy = self.config.strategy
-        max_reposts = getattr(strategy, "maker_entry_max_reposts", 0) or 0
+        max_reposts = strategy.maker_entry_max_reposts
 
         if not pending.has_any_fill():
             from lightfee.engine.v1_lifecycle import V1TradingLifecycle
@@ -7071,7 +7058,7 @@ class LiveRuntime:
             limit_price=float(ack_price) if ack_price and ack_price > 0 else po.limit_price,
             target_quantity=float(ack_quantity),
             passive_attempt_count=passive_attempt_count,
-            rest_timeout_ms=getattr(strategy, "maker_entry_rest_timeout_ms", 6000) or 6000,
+            rest_timeout_ms=strategy.maker_entry_rest_timeout_ms,
         )
         po = pending.passive_order
         if po is not None:
@@ -7319,6 +7306,14 @@ class LiveRuntime:
 
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
         return await self.close_runtime._process_pending_close_reconciliations(now_ms)
+
+    async def _process_pending_funding_settlement_reconciliations(
+        self,
+        now_ms: int,
+    ) -> None:
+        return await self.close_runtime._process_pending_funding_settlement_reconciliations(
+            now_ms
+        )
 
     async def _reconcile_pending_state(self, *args, **kwargs):
         return await self.pending_entry_runtime._reconcile_pending_state(*args, **kwargs)
@@ -7589,15 +7584,8 @@ class LiveRuntime:
 
         hedge_elapsed_ms = pending.hedge_inflight.elapsed_ms(now_ms)
         strategy = self.config.strategy
-        base_hard_ms = int(getattr(strategy, "maker_hedge_deadline_ms", 800) or 800)
-        base_soft_ms = int(
-            getattr(
-                strategy,
-                "maker_hedge_soft_deadline_ms",
-                min(base_hard_ms, 800) if base_hard_ms > 0 else 800,
-            )
-            or 0
-        )
+        base_hard_ms = int(strategy.maker_hedge_deadline_ms or 800)
+        base_soft_ms = int(strategy.maker_hedge_soft_deadline_ms or 800)
         hedge_price = self._pending_entry_hedge_price_hint(pending)
         hedge_notional = abs(float(pending.hedge_inflight.quantity or 0.0) * hedge_price)
         deadline_decision = adaptive_entry_hedge_deadline_decision(
@@ -7626,7 +7614,7 @@ class LiveRuntime:
         # hedge drive indefinitely.
         if pending.hedge_inflight.submitted_at_ms <= 0:
             entry_lifetime = pending.compute_lifetime_ms(now_ms)
-            if entry_lifetime >= getattr(strategy, "pending_entry_hard_ceiling_ms", 120000):
+            if entry_lifetime >= strategy.pending_entry_hard_ceiling_ms:
                 hedge_elapsed_ms = entry_lifetime
 
         hard_breached = hedge_elapsed_ms > hard_deadline_ms
@@ -7652,11 +7640,9 @@ class LiveRuntime:
           - lifetime_ms: int
         """
         strategy = self.config.strategy
-        hard_ceiling_ms = getattr(strategy, "pending_entry_hard_ceiling_ms", 120000)
-        force_terminal_after_ms = getattr(strategy, "pending_entry_force_terminal_after_ms", 60000)
-        selected_terminal_sla_ms = int(
-            getattr(strategy, "entry_selected_terminal_sla_ms", 300000) or 0
-        )
+        hard_ceiling_ms = strategy.pending_entry_hard_ceiling_ms
+        force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
+        selected_terminal_sla_ms = int(strategy.entry_selected_terminal_sla_ms or 0)
 
         lifetime_ms = pending.compute_lifetime_ms(now_ms)
         selected_at_ms = self._pending_entry_selected_at_ms(pending)
@@ -8376,7 +8362,7 @@ class LiveRuntime:
         order_id = str(ref.get("order_id") or "")
         client_order_id = str(ref.get("client_order_id") or "")
         adapter = self.get_venue_adapter(venue)
-        runtime_mode = str(getattr(self.config.runtime, "mode", "") or "").lower()
+        runtime_mode = self.config.runtime.mode
         if adapter is None:
             available = runtime_mode != "live"
             error = "" if available else f"{leg}_adapter_unavailable"
@@ -9438,7 +9424,7 @@ class LiveRuntime:
             # --- 4b: Zero fills → abort or try taker fallback ---
             if not pending.has_any_fill():
                 # V1: try taker fallback when tradeable (config gated)
-                if getattr(strategy, "pending_entry_force_fallback_when_tradeable", False):
+                if strategy.pending_entry_force_fallback_when_tradeable:
                     fallback_ok = await self._recover_try_taker_fallback(
                         pending, entry_id, final_reason
                     )
@@ -9465,7 +9451,7 @@ class LiveRuntime:
             # --- 4c: Has fills + missing hedge → try to drive hedge ---
             if pending.missing_hedge_quantity() > 1e-9:
                 # V1: check if tradeable before hedging (config gated)
-                if not getattr(strategy, "pending_entry_force_fallback_when_tradeable", False):
+                if not strategy.pending_entry_force_fallback_when_tradeable:
                     # When fallback_when_tradeable is false (default), skip tradeability
                     # check and go straight to abort on hard ceiling
                     if hard_ceiling_reached:
@@ -10665,6 +10651,42 @@ class LiveRuntime:
             from lightfee.core.domain import OrderRequest
 
             hedge_price = self._pending_entry_hedge_price_hint(pending)
+            # The maker fill may have arrived long after the original entry
+            # quote.  Before any retry hedge, compare the fresh cost of
+            # completing the pair with the fresh cost of flattening the first
+            # leg.  Both branches remain inside the existing V1 pending/abort
+            # lifecycle; no naked leg is silently discarded.
+            post_fill_decision = self._pending_entry_post_first_fill_decision(
+                pending,
+                entry_id=entry_id,
+                now_ms=now_ms,
+            )
+            self.journal.append(
+                "pending_entry.post_first_fill_decision",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "action": post_fill_decision["action"],
+                    "reason": post_fill_decision["reason"],
+                    "hedge_price": post_fill_decision.get("hedge_price", 0.0),
+                    "unwind_price": post_fill_decision.get("unwind_price", 0.0),
+                    "complete_hedge_loss_quote": post_fill_decision.get(
+                        "complete_hedge_loss_quote", 0.0
+                    ),
+                    "unwind_first_leg_loss_quote": post_fill_decision.get(
+                        "unwind_first_leg_loss_quote", 0.0
+                    ),
+                    "market_evidence": post_fill_decision.get("market_evidence", {}),
+                },
+            )
+            if post_fill_decision["action"] == "unwind_first_leg":
+                await self._abort_pending_entry(
+                    pending,
+                    entry_id,
+                    "post_first_fill_lower_unwind_loss",
+                )
+                return False
+            hedge_price = float(post_fill_decision.get("hedge_price", 0.0) or 0.0)
             hedgeability_plan = self._pending_entry_hedgeability_plan(
                 pending,
                 hedge_venue,
@@ -11836,6 +11858,10 @@ class LiveRuntime:
         # Reconciliation of pending/uncertain outcomes
         await self._reconcile_pending_state(now_ms)
 
+        # This post-close queue proves funding cash-flow attribution only.  It
+        # must remain outside V1 exposure reconciliation and admission gates.
+        await self._process_pending_funding_settlement_reconciliations(now_ms)
+
         # V1: residual repairs are normal runtime work, not startup-only work.
         await self._recover_residual_repairs(now_ms)
 
@@ -12183,12 +12209,11 @@ class LiveRuntime:
 
     @staticmethod
     def _configured_entry_l2_stale_after_ms(config) -> int:
-        for field_name in (
-            "entry_local_l2_book_stale_after_ms",
-            "local_l2_quiet_book_grace_ms",
-            "local_l2_max_age_ms",
+        for value in (
+            config.strategy.entry_local_l2_book_stale_after_ms,
+            config.strategy.local_l2_quiet_book_grace_ms,
+            config.strategy.local_l2_max_age_ms,
         ):
-            value = int(getattr(config.strategy, field_name, 0) or 0)
             if value > 0:
                 return value
         return 300_000

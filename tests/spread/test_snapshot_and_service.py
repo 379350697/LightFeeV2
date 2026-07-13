@@ -4,13 +4,7 @@ import json
 
 import pytest
 
-from lightfee.config.schema import (
-    AppConfig,
-    PersistenceConfig,
-    RuntimeConfig,
-    StrategyConfig,
-    VenueConfig,
-)
+from lightfee.config.schema import AppConfig, RuntimeConfig, StrategyConfig, VenueConfig
 from lightfee.sidecar.publisher import publish_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
 from lightfee.spread.models import SpreadReversionCandidate, SpreadSnapshot
@@ -20,7 +14,7 @@ from lightfee.spread.service import SpreadSidecarService
 
 def _candidate() -> SpreadReversionCandidate:
     return SpreadReversionCandidate(
-        candidate_id="spread:BTCUSDT:cheap->rich",
+        candidate_id="spread:BTCUSDT:cheap:rich",
         symbol="BTCUSDT",
         long_venue="cheap",
         short_venue="rich",
@@ -30,7 +24,7 @@ def _candidate() -> SpreadReversionCandidate:
         rolling_std_bps=4.0,
         z_score=3.0,
         net_edge_bps=12.0,
-        sample_count=20,
+        sample_count=120,
         signal_ts_ms=1_000,
         long_quote_ts_ms=1_000,
         short_quote_ts_ms=1_000,
@@ -38,37 +32,146 @@ def _candidate() -> SpreadReversionCandidate:
         capacity_quote=100.0,
         signal_status="entry_ready",
         fair_price=100.05,
-        liquidity_evidence_status="top_book_size_available",
-        screening_reasons=[],
-        history_age_ms=300_000,
+        canonical_venue_a="cheap",
+        canonical_venue_b="rich",
+        current_signed_mid_spread_bps=-20.0,
+        current_executable_entry_spread_bps=-18.0,
+        equilibrium_spread_bps=-8.0,
+        target_exit_spread_bps=-10.0,
+        gross_reversion_edge_bps=8.0,
+        expected_net_edge_bps=4.0,
+        worst_case_edge_bps=1.0,
+        economics_complete=True,
+        fee_evidence_complete=True,
+        contract_normalization_status="complete",
     )
 
 
-def test_spread_snapshot_round_trips_without_funding_candidate_shape(tmp_path) -> None:
+def _sidecar_snapshot(*, observed_at_ms: int = 10_000) -> SidecarSnapshot:
+    return SidecarSnapshot(
+        published_at_ms=observed_at_ms,
+        market_observed_at_ms=observed_at_ms,
+        quotes={
+            "cheap:BTCUSDT": QuoteSnapshot(
+                venue="cheap",
+                symbol="BTCUSDT",
+                bid=99.9,
+                ask=100.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=observed_at_ms,
+            ),
+            "rich:BTCUSDT": QuoteSnapshot(
+                venue="rich",
+                symbol="BTCUSDT",
+                bid=101.0,
+                ask=101.1,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=observed_at_ms,
+            ),
+        },
+    )
+
+
+def test_spread_snapshot_v2_round_trips_signed_economics(tmp_path) -> None:
     path = tmp_path / "spread.json"
-    snapshot = SpreadSnapshot(
-        published_at_ms=2_000,
-        market_observed_at_ms=1_990,
-        source_mode="sidecar_snapshot",
-        candidates=[_candidate()],
+    publish_spread_snapshot(
+        SpreadSnapshot(
+            published_at_ms=2_000,
+            market_observed_at_ms=1_990,
+            source_mode="sidecar_snapshot",
+            candidates=[_candidate()],
+        ),
+        path,
     )
 
-    publish_spread_snapshot(snapshot, path)
+    loaded = load_spread_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.schema_version == 2
+    assert loaded.candidates[0].economics_complete is True
+    assert loaded.candidates[0].fee_evidence_complete is True
+    assert loaded.candidates[0].canonical_venue_a == "cheap"
+    assert loaded.candidates[0].gross_reversion_edge_bps == pytest.approx(8.0)
+    raw = json.loads(path.read_text())
+    assert raw["candidates"][0]["model_epoch"] == "v2_signed_reversion"
+    assert raw["candidates"][0]["expected_net_edge_bps"] == pytest.approx(4.0)
+
+
+def test_spread_snapshot_v1_stays_readable_but_is_legacy_epoch(tmp_path) -> None:
+    path = tmp_path / "spread-v1.json"
+    publish_spread_snapshot(
+        SpreadSnapshot(schema_version=1, published_at_ms=2_000, candidates=[_candidate()]),
+        path,
+    )
+
     loaded = load_spread_snapshot(path)
 
     assert loaded is not None
     assert loaded.schema_version == 1
-    assert loaded.source_mode == "sidecar_snapshot"
-    assert loaded.candidates[0].strategy_bucket == "spread_reversion"
+    assert loaded.candidates[0].economics_complete is False
+    assert loaded.candidates[0].model_epoch == "v1_legacy"
+
+
+def test_spread_snapshot_rejects_truthy_string_economics_evidence(tmp_path) -> None:
+    path = tmp_path / "spread-invalid-bool.json"
+    publish_spread_snapshot(
+        SpreadSnapshot(published_at_ms=2_000, candidates=[_candidate()]), path
+    )
     raw = json.loads(path.read_text())
-    assert raw["source_mode"] == "sidecar_snapshot"
-    assert raw["candidates"][0]["fair_price"] == pytest.approx(100.05)
-    assert raw["candidates"][0]["liquidity_evidence_status"] == "top_book_size_available"
-    assert raw["candidates"][0]["screening_reasons"] == []
-    assert raw["candidates"][0]["history_age_ms"] == 300_000
-    assert "fair_price_bps" not in raw["candidates"][0]
-    assert not hasattr(loaded.candidates[0], "opportunity_type")
-    assert loaded.candidates[0].liquidity_evidence_status == "top_book_size_available"
+    raw["candidates"][0]["economics_complete"] = "true"
+    raw["candidates"][0]["fee_evidence_complete"] = "false"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_spread_snapshot(path)
+
+    assert loaded is not None
+    candidate = loaded.candidates[0]
+    assert candidate.economics_complete is False
+    assert candidate.fee_evidence_complete is False
+
+
+def test_spread_snapshot_numeric_bool_becomes_diagnostic_only(tmp_path) -> None:
+    path = tmp_path / "spread-invalid-numeric-bool.json"
+    publish_spread_snapshot(
+        SpreadSnapshot(published_at_ms=2_000, candidates=[_candidate()]), path
+    )
+    raw = json.loads(path.read_text())
+    raw["candidates"][0]["expected_net_edge_bps"] = True
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_spread_snapshot(path)
+
+    assert loaded is not None
+    candidate = loaded.candidates[0]
+    assert candidate.economics_complete is False
+    assert candidate.expected_net_edge_bps == 0.0
+    assert "spread_snapshot_invalid_numeric:expected_net_edge_bps" in (
+        candidate.screening_reasons
+    )
+
+
+def test_spread_snapshot_boolean_economics_timestamp_becomes_diagnostic_only(
+    tmp_path,
+) -> None:
+    path = tmp_path / "spread-invalid-ts-bool.json"
+    publish_spread_snapshot(
+        SpreadSnapshot(published_at_ms=2_000, candidates=[_candidate()]), path
+    )
+    raw = json.loads(path.read_text())
+    raw["candidates"][0]["economics_observed_at_ms"] = True
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_spread_snapshot(path)
+
+    assert loaded is not None
+    candidate = loaded.candidates[0]
+    assert candidate.economics_complete is False
+    assert candidate.economics_observed_at_ms == 0
+    assert "spread_snapshot_invalid_numeric:economics_observed_at_ms" in (
+        candidate.screening_reasons
+    )
 
 
 @pytest.mark.asyncio
@@ -80,887 +183,165 @@ async def test_spread_sidecar_close_continues_after_cleanup_errors() -> None:
             closed.append("journal")
             raise RuntimeError("journal close failed")
 
-    class FakeSource:
-        def __init__(self, name: str, *, fail: bool = False) -> None:
-            self.name = name
-            self.fail = fail
-
-        async def close(self):
-            closed.append(self.name)
-            if self.fail:
-                raise RuntimeError(f"{self.name} close failed")
-
     service = object.__new__(SpreadSidecarService)
     service._paper_journal = FailingJournal()
-    service._exchange_sources = {
-        "bad": FakeSource("bad", fail=True),
-        "good": FakeSource("good"),
-    }
 
     await service.close()
 
-    assert closed == ["journal", "bad", "good"]
+    assert closed == ["journal"]
     assert service._paper_journal is None
 
 
 @pytest.mark.asyncio
-async def test_spread_sidecar_close_uses_source_snapshot_when_close_mutates_registry() -> None:
-    closed: list[str] = []
-    service = object.__new__(SpreadSidecarService)
-    service._paper_journal = None
-
-    class MutatingSource:
-        async def close(self):
-            closed.append("mutating")
-            service._exchange_sources.clear()
-
-    class Source:
-        async def close(self):
-            closed.append("good")
-
-    service._exchange_sources = {
-        "mutating": MutatingSource(),
-        "good": Source(),
-    }
-
-    await service.close()
-
-    assert closed == ["mutating", "good"]
-
-
-@pytest.mark.asyncio
-async def test_spread_sidecar_service_uses_main_sidecar_snapshot_by_default(tmp_path) -> None:
+async def test_spread_sidecar_reuses_main_snapshot_and_never_direct_fetches(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
     config = AppConfig(
         symbols=["BTCUSDT"],
         runtime=RuntimeConfig(
             sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            spread_sidecar_snapshot_path=str(spread_path),
         ),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
         venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
     )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
+    publish_snapshot(_sidecar_snapshot(), sidecar_path)
     service = SpreadSidecarService(config)
 
-    class FakeSource:
-        async def fetch_all(self, symbols):
-            raise AssertionError("spread sidecar must not direct-fetch when snapshot is present")
+    snapshot = await service.refresh_once(now_ms=10_000)
 
-        async def close(self):
-            pass
-
-    service._exchange_sources = {"cheap": FakeSource(), "rich": FakeSource()}
-    await service.refresh_once(now_ms=10_000)
-    snapshot = await service.refresh_once(now_ms=10_001)
-
-    assert snapshot.candidates
     assert snapshot.source_mode == "sidecar_snapshot"
-    assert snapshot.snapshot_path.endswith("spread-current.json")
-    assert (tmp_path / "spread-current.json").exists()
-    loaded = load_spread_snapshot(tmp_path / "spread-current.json")
-    assert loaded is not None
-    assert loaded.source_mode == "sidecar_snapshot"
-    assert loaded.candidates[0].long_venue == "cheap"
-    assert loaded.candidates[0].short_venue == "rich"
+    assert snapshot.snapshot_path == str(spread_path)
+    assert spread_path.exists()
+    assert load_spread_snapshot(spread_path) is not None
 
 
 @pytest.mark.asyncio
-async def test_spread_sidecar_service_writes_shadow_paper_to_dedicated_journal(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
+async def test_spread_sidecar_missing_main_snapshot_is_degraded_not_synthetic(tmp_path) -> None:
+    spread_path = tmp_path / "spread-current.json"
     config = AppConfig(
         symbols=["BTCUSDT"],
         runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            spread_paper_event_log_path=str(paper_path),
-        ),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_bot_ids=["tt_conservative"],
-            spread_paper_markout_secs=[0],
-            spread_paper_terminal_secs=0,
-            spread_paper_slippage_buffer_bps=2.0,
-        ),
-        venues=[
-            VenueConfig(venue="cheap", taker_fee_bps=1.0),
-            VenueConfig(venue="rich", taker_fee_bps=2.0),
-        ],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                    funding_rate_bps=8.0,
-                    funding_timestamp_ms=10_001,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                    funding_rate_bps=4.0,
-                    funding_timestamp_ms=10_001,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-
-    await service.refresh_once(now_ms=10_000)
-    snapshot = await service.refresh_once(now_ms=10_001)
-    await service.close()
-
-    assert snapshot.candidates
-    assert paper_path.exists()
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    assert [record["kind"] for record in records] == [
-        "opportunity.paper_registered",
-        "opportunity.paper_markout",
-        "opportunity.paper_closed",
-    ]
-    payload = records[1]["payload"]
-    assert payload["paper_id"].startswith("spread:")
-    assert payload["paper_fee_quote"] > 0.0
-    assert payload["paper_slippage_quote"] > 0.0
-    assert "long_leg" in payload
-    assert "short_leg" in payload
-    assert not (tmp_path / "events.jsonl").exists()
-
-
-@pytest.mark.asyncio
-async def test_spread_paper_can_close_from_last_good_quotes_when_sidecar_snapshot_missing(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_bot_ids=["tt_conservative"],
-            spread_paper_markout_secs=[],
-            spread_paper_terminal_secs=1,
-        ),
-        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-
-    await service.refresh_once(now_ms=10_000)
-    await service.refresh_once(now_ms=10_001)
-    sidecar_path.unlink()
-    snapshot = await service.refresh_once(now_ms=11_001)
-    await service.close()
-
-    assert snapshot.candidates == []
-    assert snapshot.source_mode == "sidecar_snapshot_unavailable"
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    kinds = [record["kind"] for record in records]
-    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
-    closed_payload = records[-1]["payload"]
-    assert closed_payload["paper_net_quote"] is not None
-    assert closed_payload["market_snapshot"]["snapshot_available"] is True
-    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
-        "spread_paper_last_good_quote"
-    )
-    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
-        "spread_paper_last_good_quote"
-    )
-
-
-@pytest.mark.asyncio
-async def test_spread_paper_actively_repairs_missing_terminal_quotes(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_bot_ids=["tt_conservative"],
-            spread_paper_markout_secs=[],
-            spread_paper_terminal_secs=1,
-            spread_paper_quote_repair_enabled=True,
-            spread_paper_quote_repair_timeout_s=1.0,
-        ),
-        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-
-    class FakeRepairSource:
-        def __init__(self, venue: str) -> None:
-            self.venue = venue
-            self.fetches: list[list[str]] = []
-
-        async def fetch_all(self, symbols):
-            self.fetches.append(list(symbols))
-            if self.venue == "cheap":
-                return {
-                    "cheap:BTCUSDT": QuoteSnapshot(
-                        venue="cheap",
-                        symbol="BTCUSDT",
-                        bid=100.4,
-                        ask=100.5,
-                        bid_size=12.0,
-                        ask_size=12.0,
-                        observed_at_ms=11_001,
-                    )
-                }
-            return {
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=100.6,
-                    ask=100.7,
-                    bid_size=12.0,
-                    ask_size=12.0,
-                    observed_at_ms=11_001,
-                )
-            }
-
-        async def close(self):
-            return None
-
-    cheap_source = FakeRepairSource("cheap")
-    rich_source = FakeRepairSource("rich")
-    service._exchange_sources = {"cheap": cheap_source, "rich": rich_source}
-
-    await service.refresh_once(now_ms=10_000)
-    await service.refresh_once(now_ms=10_001)
-    sidecar_path.unlink()
-    snapshot = await service.refresh_once(now_ms=11_001)
-    await service.close()
-
-    assert snapshot.candidates == []
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    kinds = [record["kind"] for record in records]
-    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
-    assert cheap_source.fetches[-1] == ["BTCUSDT"]
-    assert rich_source.fetches[-1] == ["BTCUSDT"]
-    closed_payload = records[-1]["payload"]
-    assert closed_payload["paper_net_quote"] is not None
-    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
-        "spread_paper_quote_repair"
-    )
-    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
-        "spread_paper_quote_repair"
-    )
-
-
-@pytest.mark.asyncio
-async def test_spread_paper_repairs_quotes_for_active_convergence_close_before_terminal(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "missing-sidecar.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_bot_ids=["tt_conservative"],
-            spread_paper_markout_secs=[],
-            spread_paper_terminal_secs=30,
-            spread_paper_last_good_quote_max_age_ms=0,
-            spread_paper_quote_repair_enabled=True,
-            spread_paper_quote_repair_timeout_s=1.0,
-            spread_exit_z=0.5,
-            spread_stop_z=3.5,
-            spread_max_hold_ms=30_000,
-        ),
-        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
-    )
-    service = SpreadSidecarService(config)
-    initial_quotes = {
-        "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap",
-            symbol="BTCUSDT",
-            bid=99.9,
-            ask=100.0,
-            bid_size=10.0,
-            ask_size=10.0,
-            observed_at_ms=1_000,
-        ),
-        "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich",
-            symbol="BTCUSDT",
-            bid=101.0,
-            ask=101.1,
-            bid_size=10.0,
-            ask_size=10.0,
-            observed_at_ms=1_000,
-        ),
-    }
-    registered = service._paper_tracker.register(
-        _candidate(),
-        initial_quotes,
-        finalist_rank=0,
-    )
-    assert registered is not None
-    assert service._paper_journal is not None
-    service._paper_journal.append(
-        str(registered["kind"]),
-        dict(registered["payload"]),
-        ts_ms=1_000,
-    )
-
-    class FakeRepairSource:
-        def __init__(self, venue: str) -> None:
-            self.venue = venue
-            self.fetches: list[list[str]] = []
-
-        async def fetch_all(self, symbols):
-            self.fetches.append(list(symbols))
-            if self.venue == "cheap":
-                return {
-                    "cheap:BTCUSDT": QuoteSnapshot(
-                        venue="cheap",
-                        symbol="BTCUSDT",
-                        bid=100.0,
-                        ask=100.1,
-                        bid_size=12.0,
-                        ask_size=12.0,
-                        observed_at_ms=2_000,
-                    )
-                }
-            return {
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=100.1,
-                    ask=100.2,
-                    bid_size=12.0,
-                    ask_size=12.0,
-                    observed_at_ms=2_000,
-                )
-            }
-
-        async def close(self):
-            return None
-
-    cheap_source = FakeRepairSource("cheap")
-    rich_source = FakeRepairSource("rich")
-    service._exchange_sources = {"cheap": cheap_source, "rich": rich_source}
-
-    snapshot = await service.refresh_once(now_ms=2_000)
-    await service.close()
-
-    assert snapshot.candidates == []
-    assert cheap_source.fetches[-1] == ["BTCUSDT"]
-    assert rich_source.fetches[-1] == ["BTCUSDT"]
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    kinds = [record["kind"] for record in records]
-    assert kinds == ["opportunity.paper_registered", "opportunity.paper_closed"]
-    closed_payload = records[-1]["payload"]
-    assert closed_payload["horizon_kind"] == "active_exit:spread_converged"
-    assert closed_payload["paper_close_reason"] == "spread_converged"
-    assert closed_payload["paper_net_quote"] is not None
-    assert closed_payload["exit_market_snapshot"]["long_quote"]["source"] == (
-        "spread_paper_quote_repair"
-    )
-    assert closed_payload["exit_market_snapshot"]["short_quote"]["source"] == (
-        "spread_paper_quote_repair"
-    )
-
-
-@pytest.mark.asyncio
-async def test_spread_sidecar_service_writes_default_paper_bots_to_journal(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_markout_secs=[2],
-            spread_paper_terminal_secs=2,
-        ),
-        venues=[
-            VenueConfig(venue="cheap", taker_fee_bps=1.0, maker_fee_bps=0.1),
-            VenueConfig(venue="rich", taker_fee_bps=2.0, maker_fee_bps=0.2),
-        ],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.8,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                    volume_24h_quote=10_000.0,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.2,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                    volume_24h_quote=10_000.0,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-
-    await service.refresh_once(now_ms=10_000)
-    await service.refresh_once(now_ms=11_000)
-    await service.refresh_once(now_ms=12_000)
-    await service.refresh_once(now_ms=13_000)
-    await service.close()
-
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    registered_bot_ids = [
-        record["payload"]["paper_bot_id"]
-        for record in records
-        if record["kind"] == "opportunity.paper_registered"
-    ]
-    assert "tt_conservative" in registered_bot_ids
-    assert "mt_selected_maker_delay_1000ms" in registered_bot_ids
-    assert "low_liquidity_control_bot" in registered_bot_ids
-    assert any(record["kind"] == "opportunity.paper_hedge_filled" for record in records)
-    assert any(
-        record["payload"].get("paper_cohort") == "maker_taker_delay_control"
-        and record["kind"] == "opportunity.paper_closed"
-        for record in records
-    )
-
-
-@pytest.mark.asyncio
-async def test_spread_sidecar_restores_open_paper_orders_from_dedicated_journal(
-    tmp_path,
-) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=True,
-            spread_paper_finalist_limit=5,
-            spread_paper_bot_ids=["tt_conservative"],
-            spread_paper_markout_secs=[1],
-            spread_paper_terminal_secs=2,
-        ),
-        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-    await service.refresh_once(now_ms=10_000)
-    await service.refresh_once(now_ms=10_001)
-    await service.close()
-
-    restarted = SpreadSidecarService(config)
-    await restarted.refresh_once(now_ms=12_001)
-    await restarted.close()
-
-    records = [json.loads(line) for line in paper_path.read_text().splitlines()]
-    kinds = [record["kind"] for record in records]
-    assert kinds.count("opportunity.paper_registered") == 1
-    assert kinds.count("opportunity.paper_markout") == 1
-    assert kinds.count("opportunity.paper_closed") == 1
-
-
-@pytest.mark.asyncio
-async def test_spread_sidecar_service_does_not_write_paper_when_disabled(tmp_path) -> None:
-    sidecar_path = tmp_path / "sidecar-current.json"
-    paper_path = tmp_path / "spread-paper-events.jsonl"
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(sidecar_path),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-        ),
-        persistence=PersistenceConfig(spread_paper_event_log_path=str(paper_path)),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-            spread_paper_enabled=False,
-            spread_paper_markout_secs=[0],
-            spread_paper_terminal_secs=0,
-        ),
-        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
-    )
-    publish_snapshot(
-        SidecarSnapshot(
-            published_at_ms=10_000,
-            market_observed_at_ms=10_000,
-            quotes={
-                "cheap:BTCUSDT": QuoteSnapshot(
-                    venue="cheap",
-                    symbol="BTCUSDT",
-                    bid=99.9,
-                    ask=100.0,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=10_000,
-                ),
-            },
-        ),
-        sidecar_path,
-    )
-    service = SpreadSidecarService(config)
-
-    await service.refresh_once(now_ms=10_000)
-    await service.refresh_once(now_ms=10_001)
-    await service.close()
-
-    assert not paper_path.exists()
-
-
-@pytest.mark.asyncio
-async def test_spread_sidecar_service_degrades_when_main_snapshot_missing_without_direct_fetch(
-    tmp_path,
-) -> None:
-    config = AppConfig(
-        symbols=["BTCUSDT"],
-        runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            sidecar_snapshot_path=str(tmp_path / "missing.json"),
+            spread_sidecar_snapshot_path=str(spread_path),
         ),
         strategy=StrategyConfig(spread_reversion_enabled=True),
         venues=[VenueConfig(venue="binance"), VenueConfig(venue="aster")],
     )
     service = SpreadSidecarService(config)
-
-    class FakeSource:
-        async def fetch_all(self, symbols):
-            raise AssertionError("missing main sidecar snapshot must not trigger direct fetch")
-
-    service._exchange_sources = {"binance": FakeSource(), "aster": FakeSource()}
     snapshot = await service.refresh_once(now_ms=20_000)
 
     assert snapshot.candidates == []
     assert snapshot.source_mode == "sidecar_snapshot_unavailable"
     assert snapshot.degraded_venues == ["aster", "binance"]
-    loaded = load_spread_snapshot(tmp_path / "spread-current.json")
-    assert loaded is not None
-    assert loaded.source_mode == "sidecar_snapshot_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_spread_sidecar_direct_market_fallback_requires_explicit_config(
-    tmp_path,
-) -> None:
+async def test_spread_sidecar_future_main_snapshot_is_degraded_not_fresh(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
     config = AppConfig(
         symbols=["BTCUSDT"],
         runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
-            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
-            spread_sidecar_source_mode="direct_market",
-            spread_sidecar_direct_fetch_enabled=True,
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
         ),
-        strategy=StrategyConfig(
-            spread_reversion_enabled=True,
-            spread_min_samples=2,
-            spread_min_history_ms=0,
-            spread_fair_price_min_venues=2,
-            spread_min_fair_price_confidence=0.0,
-            spread_min_liquidity_capacity_ratio=1.0,
-            spread_entry_z=0.0,
-            spread_min_net_edge_bps=0.0,
-        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
         venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
     )
+    publish_snapshot(_sidecar_snapshot(observed_at_ms=20_001), sidecar_path)
     service = SpreadSidecarService(config)
 
-    class FakeSource:
-        def __init__(self, venue: str) -> None:
-            self.venue = venue
+    snapshot = await service.refresh_once(now_ms=20_000)
 
-        async def fetch_all(self, symbols):
-            assert symbols == ["BTCUSDT"]
-            if self.venue == "cheap":
-                return {
-                    "cheap:BTCUSDT": QuoteSnapshot(
-                        venue="cheap",
-                        symbol="BTCUSDT",
-                        bid=99.9,
-                        ask=100.0,
-                        bid_size=10.0,
-                        ask_size=10.0,
-                        observed_at_ms=30_000,
-                    )
-                }
-            return {
-                "rich:BTCUSDT": QuoteSnapshot(
-                    venue="rich",
-                    symbol="BTCUSDT",
-                    bid=101.0,
-                    ask=101.1,
-                    bid_size=10.0,
-                    ask_size=10.0,
-                    observed_at_ms=30_000,
-                )
-            }
-
-    service._exchange_sources = {"cheap": FakeSource("cheap"), "rich": FakeSource("rich")}
-    await service.refresh_once(now_ms=30_000)
-    snapshot = await service.refresh_once(now_ms=30_001)
-
-    assert snapshot.candidates
-    assert snapshot.source_mode == "direct_market_fallback"
+    assert snapshot.candidates == []
+    assert snapshot.source_mode == "sidecar_snapshot_stale"
+    assert snapshot.degraded_venues == ["cheap", "rich"]
 
 
-def test_spread_sidecar_direct_exchange_sources_are_http_bounded(monkeypatch, tmp_path) -> None:
-    from lightfee.sidecar import service as sidecar_service
-    from lightfee.sidecar.sources import exchange as exchange_module
-
-    seen_limits: list[int | None] = []
-
-    class FakeExchangeSource:
-        def __init__(self, spec, rate_limiter=None, http_max_connections=None):
-            seen_limits.append(http_max_connections)
-            self.venue = spec.venue_id.value
-
-        async def close(self):
-            return None
-
-    monkeypatch.setattr(exchange_module, "ExchangeSource", FakeExchangeSource)
-
+@pytest.mark.asyncio
+async def test_spread_sidecar_drops_individually_stale_quotes(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
     config = AppConfig(
         symbols=["BTCUSDT"],
         runtime=RuntimeConfig(
-            sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+            sidecar_snapshot_max_age_ms=1_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    snapshot = _sidecar_snapshot(observed_at_ms=10_000)
+    snapshot.quotes["rich:BTCUSDT"].observed_at_ms = 8_500
+    publish_snapshot(snapshot, sidecar_path)
+    service = SpreadSidecarService(config)
+
+    spread_snapshot = await service.refresh_once(now_ms=10_000)
+
+    assert spread_snapshot.candidates == []
+    assert spread_snapshot.source_mode == "sidecar_snapshot_partial"
+    assert spread_snapshot.degraded_venues == ["rich"]
+
+
+@pytest.mark.asyncio
+async def test_spread_sidecar_rejects_when_all_quotes_are_individually_invalid(
+    tmp_path,
+) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+            sidecar_snapshot_max_age_ms=1_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    snapshot = _sidecar_snapshot(observed_at_ms=10_000)
+    snapshot.quotes["cheap:BTCUSDT"].observed_at_ms = 8_500
+    snapshot.quotes["rich:BTCUSDT"].bid = 101.2
+    snapshot.quotes["rich:BTCUSDT"].ask = 101.1
+    publish_snapshot(snapshot, sidecar_path)
+    service = SpreadSidecarService(config)
+
+    spread_snapshot = await service.refresh_once(now_ms=10_000)
+
+    assert spread_snapshot.candidates == []
+    assert spread_snapshot.source_mode == "sidecar_snapshot_quotes_stale"
+    assert spread_snapshot.degraded_venues == ["cheap", "rich"]
+
+
+def test_spread_sidecar_rejects_direct_market_fetching(tmp_path) -> None:
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(tmp_path / "missing.json"),
             spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
             spread_sidecar_source_mode="direct_market",
             spread_sidecar_direct_fetch_enabled=True,
         ),
         strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    with pytest.raises(ValueError, match="direct public market fetching"):
+        SpreadSidecarService(config)
+
+
+def test_spread_sidecar_rejects_direct_flag_even_without_direct_mode(tmp_path) -> None:
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(tmp_path / "missing.json"),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            spread_sidecar_source_mode="sidecar_snapshot",
+            spread_sidecar_direct_fetch_enabled=True,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
         venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
     )
-
-    SpreadSidecarService(config)
-
-    assert seen_limits == [
-        sidecar_service.SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-        sidecar_service.SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-    ]
+    with pytest.raises(ValueError, match="direct public market fetching"):
+        SpreadSidecarService(config)

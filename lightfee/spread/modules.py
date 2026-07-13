@@ -5,13 +5,11 @@ from __future__ import annotations
 import statistics
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from typing import Iterable
 
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.models import SpreadReversionCandidate
-
-
-_FUNDING_INTERVAL_MS = 8 * 60 * 60 * 1000
 
 
 class DegradationState(StrEnum):
@@ -40,16 +38,11 @@ class MeanReversionAssessment:
 
 @dataclass(frozen=True)
 class FundingAwarenessAssessment:
+    funding_edge_bps: float
     carry_cost_bps: float
     score_adjustment_bps: float
-
-
-@dataclass(frozen=True)
-class CostAssessment:
-    gross_edge_bps: float
-    fee_bps: float
-    funding_carry_bps: float
-    net_edge_bps: float
+    first_funding_timestamp_ms: int
+    economics_complete: bool
 
 
 class CandidateSource:
@@ -145,6 +138,8 @@ class MeanReversionQualityModel:
         z_score: float,
         sample_count: int,
         rolling_std_bps: float,
+        ar1_phi: float | None = None,
+        half_life_ms: int | None = None,
     ) -> MeanReversionAssessment:
         if sample_count <= 1 or rolling_std_bps < self.min_std_bps:
             return MeanReversionAssessment(
@@ -153,16 +148,40 @@ class MeanReversionQualityModel:
                 hold_time_hint_ms=self.max_half_life_ms,
                 entry_allowed=False,
             )
-        z_quality = min(max(abs(float(z_score or 0.0)) / 3.0, 0.0), 1.0)
-        stability_quality = min(max(float(rolling_std_bps) / 2.0, 0.0), 1.0)
-        quality = min(max((z_quality + stability_quality) / 2.0, 0.0), 1.0)
-        half_life_ms = int(self.max_half_life_ms * (1.25 - quality))
-        half_life_ms = max(min(half_life_ms, self.max_half_life_ms), 1)
+        if ar1_phi is not None and not 0.0 < float(ar1_phi) < 1.0:
+            return MeanReversionAssessment(
+                quality=0.0,
+                half_life_ms=self.max_half_life_ms * 2,
+                hold_time_hint_ms=self.max_half_life_ms,
+                entry_allowed=False,
+            )
+        resolved_half_life = int(half_life_ms or 0)
+        if resolved_half_life <= 0:
+            # Backward-compatible fallback for callers that do not yet provide
+            # a residual AR(1) fit. The v2 signal engine always does.
+            z_quality = min(max(abs(float(z_score or 0.0)) / 3.0, 0.0), 1.0)
+            stability_quality = min(max(float(rolling_std_bps) / 2.0, 0.0), 1.0)
+            quality = min(max((z_quality + stability_quality) / 2.0, 0.0), 1.0)
+            resolved_half_life = int(self.max_half_life_ms * (1.25 - quality))
+        else:
+            z_quality = min(max(abs(float(z_score or 0.0)) / 3.0, 0.0), 1.0)
+            speed_quality = min(
+                max(1.0 - resolved_half_life / self.max_half_life_ms, 0.0), 1.0
+            )
+            quality = (z_quality + speed_quality) / 2.0
+        if resolved_half_life > self.max_half_life_ms:
+            return MeanReversionAssessment(
+                quality=0.0,
+                half_life_ms=resolved_half_life,
+                hold_time_hint_ms=self.max_half_life_ms,
+                entry_allowed=False,
+            )
+        resolved_half_life = max(resolved_half_life, 1)
         return MeanReversionAssessment(
             quality=quality,
-            half_life_ms=half_life_ms,
-            hold_time_hint_ms=half_life_ms,
-            entry_allowed=quality > 0.0,
+            half_life_ms=resolved_half_life,
+            hold_time_hint_ms=resolved_half_life,
+            entry_allowed=quality > 0.0 and resolved_half_life <= self.max_half_life_ms,
         )
 
 
@@ -177,44 +196,82 @@ class FundingAwarenessModel:
         *,
         long_funding_rate_bps: float,
         short_funding_rate_bps: float,
+        now_ms: int,
+        long_funding_timestamp_ms: int,
+        short_funding_timestamp_ms: int,
+        long_funding_interval_ms: int,
+        short_funding_interval_ms: int,
     ) -> FundingAwarenessAssessment:
-        hold_ratio = float(self.expected_hold_ms) / _FUNDING_INTERVAL_MS
-        raw_carry_bps = (
-            float(long_funding_rate_bps or 0.0)
-            - float(short_funding_rate_bps or 0.0)
-        ) * hold_ratio
-        carry_cost_bps = max(raw_carry_bps, 0.0)
-        score_adjustment_bps = -raw_carry_bps
+        """Assess only funding settlements actually scheduled inside the hold.
+
+        There is no fixed eight-hour assumption.  If a hold would cross a
+        second settlement whose rate is not forecast, the economics are
+        incomplete and the signal path must fail closed rather than extending
+        today's rate into an unknown interval.
+        """
+
+        long_payment, long_complete = self._leg_payment(
+            rate_bps=long_funding_rate_bps,
+            next_timestamp_ms=long_funding_timestamp_ms,
+            interval_ms=long_funding_interval_ms,
+            now_ms=now_ms,
+            side="long",
+        )
+        short_payment, short_complete = self._leg_payment(
+            rate_bps=short_funding_rate_bps,
+            next_timestamp_ms=short_funding_timestamp_ms,
+            interval_ms=short_funding_interval_ms,
+            now_ms=now_ms,
+            side="short",
+        )
+        funding_edge_bps = long_payment + short_payment
+        known_timestamps = [
+            timestamp
+            for timestamp in (
+                max(int(long_funding_timestamp_ms or 0), 0),
+                max(int(short_funding_timestamp_ms or 0), 0),
+            )
+            if timestamp > 0
+        ]
+        first_timestamp = min(known_timestamps) if long_complete and short_complete and known_timestamps else 0
         return FundingAwarenessAssessment(
-            carry_cost_bps=carry_cost_bps,
-            score_adjustment_bps=score_adjustment_bps,
+            funding_edge_bps=funding_edge_bps,
+            carry_cost_bps=max(-funding_edge_bps, 0.0),
+            score_adjustment_bps=funding_edge_bps,
+            first_funding_timestamp_ms=first_timestamp,
+            economics_complete=long_complete and short_complete,
         )
 
-
-class CostModel:
-    def assess(
+    def _leg_payment(
         self,
         *,
-        executable_spread_bps: float,
-        fee_bps: float,
-        slippage_reserve_bps: float,
-        adverse_selection_buffer_bps: float,
-        funding_carry_bps: float,
-    ) -> CostAssessment:
-        gross_edge_bps = float(executable_spread_bps or 0.0)
-        net_edge_bps = (
-            gross_edge_bps
-            - float(fee_bps or 0.0)
-            - float(slippage_reserve_bps or 0.0)
-            - float(adverse_selection_buffer_bps or 0.0)
-            - float(funding_carry_bps or 0.0)
-        )
-        return CostAssessment(
-            gross_edge_bps=gross_edge_bps,
-            fee_bps=float(fee_bps or 0.0),
-            funding_carry_bps=float(funding_carry_bps or 0.0),
-            net_edge_bps=net_edge_bps,
-        )
+        rate_bps: float,
+        next_timestamp_ms: int,
+        interval_ms: int,
+        now_ms: int,
+        side: str,
+    ) -> tuple[float, bool]:
+        if self.expected_hold_ms <= 0:
+            return 0.0, True
+        now = max(int(now_ms or 0), 0)
+        next_timestamp = max(int(next_timestamp_ms or 0), 0)
+        interval = max(int(interval_ms or 0), 0)
+        if now <= 0 or next_timestamp <= now or interval <= 0:
+            return 0.0, False
+        hold = self.expected_hold_ms
+        delay = next_timestamp - now
+        if delay > hold:
+            return 0.0, True
+        settlement_count = 1 + max((hold - delay) // interval, 0)
+        if settlement_count > 1:
+            return 0.0, False
+        try:
+            rate = float(rate_bps or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, False
+        if not isfinite(rate):
+            return 0.0, False
+        return (-rate if side == "long" else rate), True
 
 
 class LiquidityAndVenueHealthGate:
@@ -227,9 +284,32 @@ class LiquidityAndVenueHealthGate:
         signal_ttl_ms: int,
         quote_skew_ms: int,
     ) -> bool:
-        long_ts = int(getattr(long_q, "observed_at_ms", 0) or 0)
-        short_ts = int(getattr(short_q, "observed_at_ms", 0) or 0)
+        for quote in (long_q, short_q):
+            try:
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                bid_size = float(getattr(quote, "bid_size", 0.0) or 0.0)
+                ask_size = float(getattr(quote, "ask_size", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return False
+            if (
+                not all(isfinite(value) for value in (bid, ask, bid_size, ask_size))
+                or bid <= 0.0
+                or ask <= 0.0
+                or bid_size < 0.0
+                or ask_size < 0.0
+            ):
+                return False
+        try:
+            long_ts = int(getattr(long_q, "observed_at_ms", 0) or 0)
+            short_ts = int(getattr(short_q, "observed_at_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
         if long_ts <= 0 or short_ts <= 0:
+            return False
+        # A source clock ahead of the signal clock cannot prove quote
+        # freshness.  Treat it as unknown instead of accepting a negative age.
+        if long_ts > now_ms or short_ts > now_ms:
             return False
         ttl = max(int(signal_ttl_ms or 0), 0)
         if ttl and (now_ms - long_ts > ttl or now_ms - short_ts > ttl):
@@ -301,12 +381,18 @@ class SpreadRanker:
         self,
         candidates: Iterable[SpreadReversionCandidate],
     ) -> list[SpreadReversionCandidate]:
+        # ``ranking_edge_bps`` is the single economics contract's conservative
+        # decision edge.  Statistical quality and liquidity are valuable only
+        # after two candidates have the same economic headroom; allowing an
+        # arbitrary quality score to outrank it would reintroduce a second,
+        # incompatible profit formula at the final selection boundary.
         ranked = sorted(
             candidates,
             key=lambda c: (
-                float(c.score),
-                float(c.net_edge_bps),
-                float(c.z_score),
+                _finite_rank_value(c.ranking_edge_bps),
+                _finite_rank_value(c.expected_net_edge_bps),
+                _finite_rank_value(c.score),
+                _finite_rank_value(abs(c.z_score)),
             ),
             reverse=True,
         )
@@ -322,8 +408,9 @@ class SpreadRanker:
                     **{
                         **candidate.__dict__,
                         "rank_reason": (
+                            f"ranking_edge_bps={candidate.ranking_edge_bps:.2f};"
+                            f"expected_net_edge_bps={candidate.expected_net_edge_bps:.2f};"
                             f"score={candidate.score:.2f};"
-                            f"net_edge_bps={candidate.net_edge_bps:.2f};"
                             f"z_score={candidate.z_score:.2f}"
                         ),
                     }
@@ -332,6 +419,15 @@ class SpreadRanker:
             if len(selected) >= self.max_candidates:
                 break
         return selected
+
+
+def _finite_rank_value(value: object) -> float:
+    """Keep malformed research payloads from winning a ranking by accident."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
+    return numeric if isfinite(numeric) else float("-inf")
 
 
 class ExecutionPolicy:
@@ -367,6 +463,6 @@ class ExitRiskClassifier:
 def _mid(q: QuoteSnapshot) -> float:
     bid = float(getattr(q, "bid", 0.0) or 0.0)
     ask = float(getattr(q, "ask", 0.0) or 0.0)
-    if bid <= 0.0 or ask <= 0.0:
+    if not isfinite(bid) or not isfinite(ask) or bid <= 0.0 or ask <= 0.0:
         return 0.0
     return (bid + ask) / 2.0

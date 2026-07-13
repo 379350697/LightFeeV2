@@ -453,27 +453,21 @@ class UnpairedLivePositionRecoveryRuntime:
             return None
 
     def _auto_enabled(self) -> bool:
-        strategy = getattr(self.ctx.config, "strategy", None)
-        return bool(
-            getattr(strategy, "unpaired_live_position_auto_recovery_enabled", False)
-        )
+        return bool(self.ctx.config.strategy.unpaired_live_position_auto_recovery_enabled)
 
     def _cap_quote(self) -> float:
-        strategy = getattr(self.ctx.config, "strategy", None)
-        explicit = float(
-            getattr(strategy, "unpaired_live_position_max_notional_quote", 0.0) or 0.0
-        )
+        strategy = self.ctx.config.strategy
+        explicit = float(strategy.unpaired_live_position_max_notional_quote or 0.0)
         if explicit > 0:
             return explicit
-        return float(getattr(strategy, "live_entry_notional_cap_quote", 0.0) or 0.0)
+        return float(strategy.live_entry_notional_cap_quote or 0.0)
 
     def _symbol_configured(self, symbol: str) -> bool:
-        symbols = [str(s).upper() for s in getattr(self.ctx.config, "symbols", []) or []]
+        symbols = [str(s).upper() for s in self.ctx.config.symbols]
         return bool(symbols) and symbol.upper() in symbols
 
     def _venue_configured(self, venue: Venue) -> bool:
-        venues = getattr(self.ctx.config, "venues", []) or []
-        configured = [str(getattr(v, "venue", v) or "").lower() for v in venues]
+        configured = [str(v.venue or "").lower() for v in self.ctx.config.venues]
         return bool(configured) and venue.value in configured
 
     @staticmethod
