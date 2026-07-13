@@ -23,7 +23,7 @@ def _model() -> FundingBasisExpectedShortfallModel:
         max_samples=128,
         max_pairs=8,
         horizon_ms=100,
-        min_samples=6,
+        min_samples=3,
         min_history_ms=500,
         confidence=0.8,
         quote_skew_ms=10,
@@ -82,9 +82,12 @@ def test_basis_expected_shortfall_is_directional_and_excludes_current_snapshot()
         now_ms=1_801,
     )
     assert long_a.evidence_complete is True
-    # At 80% confidence with seven historical returns the upper tail contains
-    # two observations: one 10 bps adverse move and one zero, so ES is 5 bps.
-    assert long_a.expected_shortfall_bps == pytest.approx(5.0)
+    # Four disjoint historical returns contain one 10 bps adverse move.  The
+    # 80% tail has one sample, so ES remains 10 bps rather than diluting it
+    # with overlapping dense-tick returns.
+    assert long_a.expected_shortfall_bps == pytest.approx(10.0)
+    assert long_a.sample_count == 8
+    assert long_a.return_count == 4
 
     # Reversing the paired legs turns the same downward move into a gain, not
     # a loss. A zero one-sided tail remains fail-closed.
@@ -96,6 +99,55 @@ def test_basis_expected_shortfall_is_directional_and_excludes_current_snapshot()
     )
     assert long_b.evidence_complete is False
     assert long_b.reason == "nonpositive_basis_expected_shortfall"
+
+
+def test_basis_expected_shortfall_counts_only_disjoint_horizon_returns() -> None:
+    model = _model()
+    for index in range(9):
+        _observe(model, at_ms=1_000 + index * 100, basis_bps=-float(index))
+
+    estimate = model.estimate(
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="bybit",
+        now_ms=1_901,
+    )
+
+    # Eight historical observations could form seven overlapping returns, but
+    # only four non-overlapping horizon pairs are independent enough to count.
+    assert estimate.sample_count == 8
+    assert estimate.return_count == 4
+    assert estimate.model_version == "funding_basis_es_v2"
+
+
+def test_basis_expected_shortfall_does_not_treat_dense_ticks_as_independent_samples() -> None:
+    model = FundingBasisExpectedShortfallModel(
+        window_ms=300_000,
+        max_samples=256,
+        max_pairs=8,
+        horizon_ms=60_000,
+        min_samples=2,
+        min_history_ms=60_000,
+        confidence=0.8,
+        quote_skew_ms=10,
+    )
+    # Ninety-nine usable one-second observations look plentiful at the raw
+    # tick level, but only one non-overlapping 60-second return is available.
+    # Admission must remain incomplete rather than manufacturing sample size.
+    for index in range(100):
+        _observe(model, at_ms=1_000 + index * 1_000, basis_bps=-float(index))
+
+    estimate = model.estimate(
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="bybit",
+        now_ms=101_000,
+    )
+
+    assert estimate.sample_count == 99
+    assert estimate.return_count == 1
+    assert estimate.evidence_complete is False
+    assert estimate.reason == "insufficient_basis_return_samples"
 
 
 def test_basis_expected_shortfall_refuses_missing_or_skewed_quote_evidence() -> None:
@@ -178,7 +230,7 @@ def test_basis_expected_shortfall_checkpoint_rejects_fractional_numeric_state(tm
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "saved_at_ms": 1_800,
                 "next_batch_id": 2,
                 "states": {
@@ -190,6 +242,25 @@ def test_basis_expected_shortfall_checkpoint_rejects_fractional_numeric_state(tm
                         }
                     ]
                 },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert not restore_funding_basis_risk_checkpoint(
+        _model(), path, now_ms=1_900, max_age_ms=2_000
+    )
+
+
+def test_basis_expected_shortfall_checkpoint_rejects_prior_model_epoch(tmp_path) -> None:
+    path = tmp_path / "risk.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "saved_at_ms": 1_800,
+                "next_batch_id": 2,
+                "states": {},
             }
         ),
         encoding="utf-8",

@@ -7884,6 +7884,114 @@ class VenueTransport(MarketDataClient):
             return next(iter(leverages))
         return 0
 
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence | None:
+        """Return conservative sizing evidence without setting leverage.
+
+        This must remain a GET-only path.  Portfolio admission and the final
+        post-only BBO gate are allowed to reject a candidate; neither outcome
+        may alter the account's symbol-leverage setting merely to size it.
+        """
+        if self._spec.venue_id not in (Venue.BINANCE, Venue.ASTER):
+            return None
+        target = int(leverage or 0)
+        if target <= 0 or self.mode != "live":
+            return None
+
+        venue_sym = self._venue_symbol(symbol)
+        payload: dict[str, Any] = {
+            "venue": self._spec.venue_id.value,
+            "symbol": venue_sym,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "position_endpoint": self._spec.position_path,
+            "bracket_endpoint": "/fapi/v1/leverageBracket",
+            "outcome": "inspect",
+        }
+        try:
+            position_raw = await self._request(
+                "GET",
+                self._spec.position_path,
+                params={"symbol": venue_sym},
+                private=True,
+            )
+            current_leverage = self._extract_fapi_position_leverage(
+                position_raw,
+                venue_sym,
+            )
+            payload["position_risk_leverage"] = current_leverage
+
+            bracket_raw = await self._request(
+                "GET",
+                "/fapi/v1/leverageBracket",
+                params={"symbol": venue_sym},
+                private=True,
+            )
+            bracket = self._extract_fapi_leverage_bracket(
+                bracket_raw,
+                venue_sym,
+                notional_quote,
+            )
+            bracket_initial = int(bracket.get("initial_leverage", 0) or 0)
+            bracket_verified = bool(bracket.get("bracket_verified", False))
+            allowed_leverage = (
+                min(target, bracket_initial) if bracket_initial > 0 else target
+            )
+            # Sizing may only rely on current account truth.  If the current
+            # setting cannot be read exactly, use 1x and leave the evidence
+            # incomplete; the final mutation gate decides whether to proceed.
+            current_verified = current_leverage > 0
+            conservative_effective = (
+                min(current_leverage, allowed_leverage)
+                if current_verified
+                else 1
+            )
+            payload.update(
+                {
+                    "allowed_leverage": allowed_leverage,
+                    "effective_leverage": conservative_effective,
+                    "bracket_initial_leverage": bracket_initial,
+                    "bracket_verified": bracket_verified,
+                    "bracket": bracket.get("bracket", 0),
+                    "notional_floor": bracket.get("notional_floor", 0.0),
+                    "notional_cap": bracket.get("notional_cap", 0.0),
+                    "account_verified": current_verified,
+                }
+            )
+            self._record_order_diagnostic("order.entry_leverage_inspected", payload)
+            return EntryLeverageEvidence(
+                venue=self._spec.venue_id,
+                symbol=venue_sym,
+                requested_leverage=target,
+                effective_leverage=max(int(conservative_effective), 1),
+                notional_quote=max(float(notional_quote or 0.0), 0.0),
+                bracket_verified=bracket_verified,
+                account_verified=current_verified,
+                source="venue_transport_position_risk_read_only",
+                observed_at_ms=int(time.time() * 1000),
+                account_leverage=current_leverage,
+            )
+        except TransportError as exc:
+            payload["outcome"] = "transport_error"
+            payload["error"] = str(exc)[:300]
+            payload["status_code"] = exc.status_code
+            payload["response_body"] = exc.body[:500]
+            self._record_order_diagnostic("order.entry_leverage_inspection_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"entry leverage inspection failed: {exc} {exc.body[:200]}",
+            ) from exc
+        except Exception as exc:
+            payload["outcome"] = "exception"
+            payload["error"] = str(exc)[:300]
+            self._record_order_diagnostic("order.entry_leverage_inspection_unavailable", payload)
+            raise
+
     async def ensure_entry_leverage(
         self,
         symbol: str,
@@ -7959,6 +8067,7 @@ class VenueTransport(MarketDataClient):
                     account_verified=True,
                     source="venue_transport_position_risk",
                     observed_at_ms=int(time.time() * 1000),
+                    account_leverage=current_leverage,
                 )
 
             response = await self._request(
@@ -8013,6 +8122,7 @@ class VenueTransport(MarketDataClient):
                 account_verified=True,
                 source="venue_transport_post_set_position_risk",
                 observed_at_ms=int(time.time() * 1000),
+                account_leverage=post_set_leverage,
             )
         except OrderSubmitError:
             payload["outcome"] = "rejected"

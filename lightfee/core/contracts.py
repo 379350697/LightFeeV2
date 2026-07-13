@@ -231,6 +231,22 @@ class VenueAdapter(ABC):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
 
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence | None:
+        """Read current leverage evidence without mutating venue settings.
+
+        Enhanced live sizing may use only the conservative intersection of
+        verified current account leverage and the applicable bracket.  The
+        matching ``ensure_entry_leverage`` call is deliberately deferred until
+        every non-mutating entry gate has admitted the candidate.
+        """
+        return None
+
     async def ensure_entry_leverage(
         self,
         symbol: str,

@@ -166,7 +166,7 @@ def analyze_spread_paper_events(
         if str(payload.get("model_epoch", "v1_legacy") or "v1_legacy") != report.model_epoch:
             report.excluded_legacy_count += 1
             continue
-        if str(payload.get("calculation_version", "") or "") != "spread_paper_v2":
+        if str(payload.get("calculation_version", "") or "") != "spread_paper_v3":
             report.calculation_version_mismatch_count += 1
             continue
         symbol = str(payload.get("symbol", "") or "").upper()

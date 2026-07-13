@@ -12,7 +12,14 @@ from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
-from lightfee.core.domain import AccountBalanceSnapshot, PositionSnapshot, Side, TimeInForce, Venue
+from lightfee.core.domain import (
+    AccountBalanceSnapshot,
+    EntryLeverageEvidence,
+    PositionSnapshot,
+    Side,
+    TimeInForce,
+    Venue,
+)
 from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.risk.modes import EngineLifecycle
@@ -246,8 +253,36 @@ class FakeAsterPrivateHeadroom:
         leverage: int,
         *,
         notional_quote: float | None = None,
-    ) -> None:
-        return None
+    ) -> EntryLeverageEvidence:
+        return self._leverage_evidence(symbol, leverage, notional_quote)
+
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence:
+        return self._leverage_evidence(symbol, leverage, notional_quote)
+
+    @staticmethod
+    def _leverage_evidence(
+        symbol: str,
+        leverage: int,
+        notional_quote: float | None,
+    ) -> EntryLeverageEvidence:
+        return EntryLeverageEvidence(
+            venue=Venue.ASTER,
+            symbol=symbol,
+            requested_leverage=leverage,
+            effective_leverage=leverage,
+            account_leverage=leverage,
+            notional_quote=float(notional_quote or 0.0),
+            bracket_verified=True,
+            account_verified=True,
+            source="fake_aster_private_leverage",
+            observed_at_ms=1_778_787_000_000,
+        )
 
 
 class FakeAsterRulesCache:

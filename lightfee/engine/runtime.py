@@ -4328,6 +4328,12 @@ class LiveRuntime:
                     raise
                 return stop_fn()
 
+        await _await_shutdown_task(
+            "close_network",
+            "funding_settlement_reconciliation_worker",
+            self.close_runtime.shutdown_pending_funding_settlement_reconciliation_worker(),
+        )
+
         logger.info("shutdown stage=close_network")
         _journal_shutdown_stage("close_network")
 
@@ -4563,7 +4569,7 @@ class LiveRuntime:
                 # exchange-truth work, but it leaves every new live entry
                 # fail-closed through the runtime's unhealthy risk state.
                 self.state.last_scan["funding_basis_risk"] = {
-                    "model_version": "funding_basis_es_v1",
+                    "model_version": "funding_basis_es_v2",
                     "checkpoint_healthy": False,
                     "error": type(exc).__name__,
                     "source": "fresh_sidecar_snapshot",
@@ -4575,7 +4581,7 @@ class LiveRuntime:
         else:
             self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
             self.state.last_scan["funding_basis_risk"] = {
-                "model_version": "funding_basis_es_v1",
+                "model_version": "funding_basis_es_v2",
                 "checkpoint_healthy": False,
                 "source": "fresh_snapshot_required",
             }
@@ -7311,7 +7317,7 @@ class LiveRuntime:
         self,
         now_ms: int,
     ) -> None:
-        return await self.close_runtime._process_pending_funding_settlement_reconciliations(
+        return await self.close_runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
             now_ms
         )
 

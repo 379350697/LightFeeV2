@@ -93,7 +93,7 @@ class FundingRiskRuntime:
                     rejected_pairs += 1
         self._maybe_publish_checkpoint(now_ms)
         return {
-            "model_version": "funding_basis_es_v1",
+            "model_version": "funding_basis_es_v2",
             "checkpoint_restored": self._checkpoint_restored,
             "checkpoint_healthy": self._checkpoint_healthy,
             "checkpoint_error": self._last_checkpoint_error or None,

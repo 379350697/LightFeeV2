@@ -26,7 +26,7 @@ def test_spread_paper_analysis_script_emits_strict_json_report(tmp_path: Path) -
                     "paper_slippage_quote": 0.01,
                     "paper_funding_quote": 0.0,
                     "model_epoch": "v2_signed_reversion",
-                    "calculation_version": "spread_paper_v2",
+                    "calculation_version": "spread_paper_v3",
                     "official_pnl": True,
                     "paper_unpriced": False,
                     "paper_order_status": "FILLED",

@@ -87,8 +87,10 @@ def build_edge_breakdown(
     """Construct the sole expected/worst-case economics formula.
 
     ``entry_cross_bps`` and ``expected_exit_cross_bps`` are signed realised
-    cash-flow terms.  The remaining bps inputs model costs and are therefore
-    always deducted.  ``worst_case_funding_edge_bps`` optionally replaces only
+    cash-flow terms.  Fee fields may also be signed because a verified maker
+    rebate is a real cash flow.  Every non-fee cost field is non-negative: a
+    malformed negative reserve must neither improve the displayed edge nor
+    obtain admission permission.  ``worst_case_funding_edge_bps`` optionally replaces only
     expected funding carry in the conservative calculation, keeping expected
     and worst values inside one immutable contract.  Execution buffer only
     belongs to the worst case.
@@ -110,6 +112,22 @@ def build_edge_breakdown(
         "transfer_or_inventory_bias_bps": transfer_or_inventory_bias_bps,
     }
     normalized = {name: _finite_or_zero(value) for name, value in components.items()}
+    nonnegative_cost_fields = (
+        "entry_slippage_bps",
+        "exit_slippage_bps",
+        "adverse_selection_bps",
+        "capital_buffer_bps",
+        "execution_buffer_bps",
+        "venue_risk_haircut_bps",
+    )
+    costs_valid = all(
+        _is_nonnegative_number(components[name]) for name in nonnegative_cost_fields
+    )
+    # Keep diagnostics conservative as well as admission fail-closed.  A bad
+    # negative reserve is rendered as zero rather than becoming fictitious
+    # alpha in a report, ranking, or shadow result.
+    for name in nonnegative_cost_fields:
+        normalized[name] = max(normalized[name], 0.0)
     worst_funding_input = (
         funding_edge_bps
         if worst_case_funding_edge_bps is None
@@ -155,7 +173,10 @@ def build_edge_breakdown(
         # and paper paths.  Do not let a truthy deserialisation artefact such
         # as ``"true"`` turn incomplete economics into live permission.
         economics_complete=(
-            economics_complete is True and values_complete and observed > 0
+            economics_complete is True
+            and values_complete
+            and costs_valid
+            and observed > 0
         ),
     )
 
@@ -167,6 +188,12 @@ def _is_finite_number(value: object) -> bool:
         return isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+
+def _is_nonnegative_number(value: object) -> bool:
+    if not _is_finite_number(value):
+        return False
+    return float(value) >= 0.0
 
 
 def _finite_or_zero(value: object) -> float:

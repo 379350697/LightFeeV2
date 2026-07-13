@@ -9,10 +9,11 @@ Provides controllable adapters that can simulate:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    EntryLeverageEvidence,
     OrderFill,
     OrderRequest,
     PositionSnapshot,
@@ -20,6 +21,9 @@ from lightfee.core.domain import (
     Venue,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+if TYPE_CHECKING:
+    from lightfee.marketdata.l2 import LocalL2Update
 
 
 @dataclass
@@ -42,6 +46,10 @@ class FakeVenueAdapter(VenueAdapter):
     default_fill_price: float = 0.0
     default_position_side: Side = Side.BUY
     default_position_qty: float = 0.0
+    entry_account_leverage: int = 4
+    # A venue bracket can cap executable leverage below the account setting.
+    # None means the effective value follows the account setting.
+    entry_effective_leverage: int | None = None
 
     # --- Spy fields ---
     last_request: Optional[OrderRequest] = None
@@ -136,6 +144,54 @@ class FakeVenueAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
+
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence:
+        """Return verified account truth for live-entry contract tests."""
+        return EntryLeverageEvidence(
+            venue=self._venue,
+            symbol=symbol,
+            requested_leverage=int(leverage),
+            effective_leverage=self._effective_entry_leverage(),
+            notional_quote=float(notional_quote or 0.0),
+            bracket_verified=True,
+            account_verified=True,
+            source="fake_account_leverage",
+            observed_at_ms=1000,
+            account_leverage=int(self.entry_account_leverage),
+        )
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence:
+        """Model a verified exchange-side leverage update for test adapters."""
+        self.entry_account_leverage = int(leverage)
+        return EntryLeverageEvidence(
+            venue=self._venue,
+            symbol=symbol,
+            requested_leverage=int(leverage),
+            effective_leverage=self._effective_entry_leverage(),
+            notional_quote=float(notional_quote or 0.0),
+            bracket_verified=True,
+            account_verified=True,
+            source="fake_ensure_leverage",
+            observed_at_ms=1000,
+            account_leverage=int(self.entry_account_leverage),
+        )
+
+    def _effective_entry_leverage(self) -> int:
+        if self.entry_effective_leverage is not None:
+            return int(self.entry_effective_leverage)
+        return int(self.entry_account_leverage)
 
     async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> "LocalL2Update":
         """Return a fake L2 snapshot for testing."""

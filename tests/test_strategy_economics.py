@@ -149,6 +149,32 @@ def test_edge_breakdown_rejects_boolean_numeric_components() -> None:
     assert edge.economics_complete is False
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "entry_slippage_bps",
+        "exit_slippage_bps",
+        "adverse_selection_bps",
+        "capital_buffer_bps",
+        "execution_buffer_bps",
+        "venue_risk_haircut_bps",
+    ],
+)
+def test_negative_nonfee_cost_never_becomes_edge_or_live_permission(
+    field_name: str,
+) -> None:
+    edge = build_edge_breakdown(
+        **{field_name: -50.0},
+        observed_at_ms=1,
+        economics_complete=True,
+    )
+
+    assert getattr(edge, field_name) == 0.0
+    assert edge.expected_net_edge_bps == 0.0
+    assert edge.worst_case_edge_bps == 0.0
+    assert edge.economics_complete is False
+
+
 @pytest.mark.parametrize("observed_at_ms", [0, True])
 def test_edge_breakdown_requires_positive_observation_time_for_complete_economics(
     observed_at_ms: object,

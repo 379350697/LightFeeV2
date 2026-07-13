@@ -141,6 +141,44 @@ class FundingSettlementReconciler:
             )
         return claims
 
+    @staticmethod
+    def _claims_for_statement_claim_ledger(
+        rows: Iterable[Mapping[str, Any]],
+    ) -> list[_FundingClaim]:
+        """Turn durable consumed-statement receipts into ownership claims."""
+        claims: list[_FundingClaim] = []
+        for row in rows:
+            owner_id = str(row.get("owner_id") or "")
+            symbol = str(row.get("symbol") or "")
+            venue = _venue_from_value(row.get("venue"))
+            timestamp = _int_positive(row.get("settlement_timestamp_ms"))
+            leg = str(row.get("leg") or "")
+            quote_currency = str(row.get("quote_currency") or "").upper()
+            if (
+                not owner_id
+                or not symbol
+                or venue is None
+                or timestamp <= 0
+                or leg not in {"long", "short"}
+                or not quote_currency
+            ):
+                continue
+            claims.append(
+                _FundingClaim(
+                    owner_id=owner_id,
+                    leg=leg,
+                    venue=venue,
+                    symbol=symbol,
+                    settlement_timestamp_ms=timestamp,
+                    quote_currency=quote_currency,
+                )
+            )
+        return claims
+
+    @staticmethod
+    def _pending_task_identity(task: Mapping[str, Any]) -> tuple[str, int]:
+        return str(task.get("position_id") or ""), _int_positive(task.get("closed_at_ms"))
+
     async def _fetch_statement_rows(
         self,
         claims: Iterable[_FundingClaim],
@@ -353,19 +391,124 @@ class FundingSettlementReconciler:
         *,
         now_ms: int,
     ) -> tuple[dict[str, Any], FundingSettlementReconciliationResult]:
-        """Refresh one durable, accounting-only post-close task."""
-        updated = dict(task)
-        claims = self._claims_for_task(updated)
-        position_id = str(updated.get("position_id") or "")
-        if not claims:
-            updated["status"] = "invalid_task"
-            return updated, FundingSettlementReconciliationResult(
-                position_id=position_id,
-                status="invalid_task",
-                reason="missing_or_invalid_required_settlements",
-                required_count=0,
-                observed_count=0,
+        """Refresh one durable, accounting-only post-close task.
+
+        Callers that have more than one task due must use
+        :meth:`reconcile_pending_tasks`.  A funding statement is an
+        account-level cash-flow record, so deciding its owner one task at a
+        time can allocate the same statement twice.
+        """
+        results = await self.reconcile_pending_tasks(
+            [task],
+            adapters,
+            now_ms=now_ms,
+        )
+        return results[0]
+
+    async def reconcile_pending_tasks(
+        self,
+        tasks: Iterable[Mapping[str, Any]],
+        adapters: Mapping[Venue, VenueAdapter],
+        *,
+        now_ms: int,
+        ownership_positions: Iterable[OpenPosition] = (),
+        ownership_tasks: Iterable[Mapping[str, Any]] = (),
+        ownership_statement_claims: Iterable[Mapping[str, Any]] = (),
+    ) -> list[tuple[dict[str, Any], FundingSettlementReconciliationResult]]:
+        """Reconcile a due batch under one global statement-ownership view.
+
+        Closed-position tasks and still-open positions may claim the same
+        venue/symbol/settlement timestamp.  They must be considered in the
+        same allocation pass: otherwise an account-level statement can become
+        official for two independent PnL records.  Open positions supplied
+        here are reservations only; their ordinary lifecycle attribution is
+        still owned by :meth:`reconcile_open_positions`.
+        """
+        updated_tasks = [dict(task) for task in tasks]
+        task_claims = [self._claims_for_task(task) for task in updated_tasks]
+        claim_keys = {
+            claim.key
+            for claims in task_claims
+            for claim in claims
+        }
+
+        reservation_claims = [
+            claim
+            for position in ownership_positions
+            for claim in self._claims_for_position(position)
+            if claim.key in claim_keys
+        ]
+        due_identities = {
+            self._pending_task_identity(task)
+            for task in updated_tasks
+        }
+        pending_task_reservations = [
+            claim
+            for task in ownership_tasks
+            if self._pending_task_identity(task) not in due_identities
+            for claim in self._claims_for_task(task)
+            if claim.key in claim_keys
+        ]
+        ledger_reservations = [
+            claim
+            for claim in self._claims_for_statement_claim_ledger(
+                ownership_statement_claims
             )
+            if claim.key in claim_keys
+        ]
+        all_claims = [
+            claim
+            for claims in task_claims
+            for claim in claims
+        ] + reservation_claims + pending_task_reservations + ledger_reservations
+        rows_by_target, errors = await self._fetch_statement_rows(all_claims, adapters)
+        allocations, problems = self._claim_allocation(
+            all_claims,
+            rows_by_target,
+            errors,
+        )
+
+        results: list[tuple[dict[str, Any], FundingSettlementReconciliationResult]] = []
+        for updated, claims in zip(updated_tasks, task_claims, strict=True):
+            position_id = str(updated.get("position_id") or "")
+            if not claims:
+                updated["status"] = "invalid_task"
+                results.append(
+                    (
+                        updated,
+                        FundingSettlementReconciliationResult(
+                            position_id=position_id,
+                            status="invalid_task",
+                            reason="missing_or_invalid_required_settlements",
+                            required_count=0,
+                            observed_count=0,
+                        ),
+                    )
+                )
+                continue
+
+            results.append(
+                self._reconcile_pending_task_from_allocation(
+                    updated,
+                    claims,
+                    allocations.get(position_id, []),
+                    problems.get(position_id, ""),
+                    now_ms=now_ms,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _reconcile_pending_task_from_allocation(
+        updated: dict[str, Any],
+        claims: list[_FundingClaim],
+        allocated_records: Iterable[FundingSettlementRecord],
+        problem: str,
+        *,
+        now_ms: int,
+    ) -> tuple[dict[str, Any], FundingSettlementReconciliationResult]:
+        """Apply one globally-decided allocation to a durable task."""
+        position_id = str(updated.get("position_id") or "")
 
         existing_records: list[FundingSettlementRecord] = []
         for raw in updated.get("funding_settlement_records", []) or []:
@@ -383,17 +526,15 @@ class FundingSettlementReconciler:
                     observed_count=0,
                 )
 
-        rows_by_target, errors = await self._fetch_statement_rows(claims, adapters)
-        allocations, problems = self._claim_allocation(claims, rows_by_target, errors)
         current_by_target = {
             (record.leg, record.venue, record.settlement_timestamp_ms): record
             for record in existing_records
         }
-        for record in allocations.get(position_id, []):
+        for record in allocated_records:
             target = (record.leg, record.venue, record.settlement_timestamp_ms)
             previous = current_by_target.get(target)
             if previous is not None and previous != record:
-                problems[position_id] = "conflicting_statement_reference"
+                problem = "conflicting_statement_reference"
                 continue
             current_by_target.setdefault(target, record)
 
@@ -404,7 +545,7 @@ class FundingSettlementReconciler:
         ]
         updated["last_checked_at_ms"] = int(now_ms)
         settled_funding_quote = sum(record.amount_quote for record in observed.values())
-        reason = problems.get(position_id, "")
+        reason = problem
         complete = len(observed) == len(required_targets) and not reason
         if complete:
             lifecycle_forecast = float(updated.get("lifecycle_forecast_funding_quote") or 0.0)

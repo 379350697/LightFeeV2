@@ -6623,6 +6623,48 @@ class TestV1PassiveBusinessFlowParity:
         assert refreshed_evidence.evidence_complete is True
 
     @pytest.mark.asyncio
+    async def test_binance_entry_leverage_inspection_is_get_only_and_conservative(self):
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="binance-key", api_secret="binance-secret"),
+        )
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def fake_request(method, path, *, params=None, body=None, private=False, **kwargs):
+            calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v2/positionRisk":
+                return [{"symbol": "HUSDT", "leverage": "20"}]
+            if path == "/fapi/v1/leverageBracket":
+                return [{
+                    "symbol": "HUSDT",
+                    "brackets": [{
+                        "bracket": 1,
+                        "initialLeverage": 5,
+                        "notionalFloor": 0,
+                        "notionalCap": 20_000,
+                    }],
+                }]
+            if path == "/fapi/v1/leverage":
+                raise AssertionError("GET-only inspection must never set leverage")
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        transport._request = fake_request
+
+        evidence = await transport.inspect_entry_leverage(
+            "HUSDT", 20, notional_quote=50.0
+        )
+
+        assert evidence is not None
+        assert evidence.evidence_complete is True
+        assert evidence.effective_leverage == 5
+        assert [(method, path) for method, path, _ in calls] == [
+            ("GET", "/fapi/v2/positionRisk"),
+            ("GET", "/fapi/v1/leverageBracket"),
+        ]
+        assert transport.order_diagnostics[-1]["kind"] == "order.entry_leverage_inspected"
+
+    @pytest.mark.asyncio
     async def test_binance_entry_leverage_post_set_position_mismatch_is_not_evidence(self):
         transport = VenueTransport(
             binance_spec(),

@@ -504,8 +504,19 @@ class TestRuntimePreflight:
                     super().__init__(venue)
                     self.leverage_requests = []
 
-                async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+                async def ensure_entry_leverage(
+                    self,
+                    symbol: str,
+                    leverage: int,
+                    *,
+                    notional_quote: float | None = None,
+                ):
                     self.leverage_requests.append((symbol, leverage))
+                    return await super().ensure_entry_leverage(
+                        symbol,
+                        leverage,
+                        notional_quote=notional_quote,
+                    )
 
             binance = LeverageAwareAdapter(Venue.BINANCE)
             aster = LeverageAwareAdapter(Venue.ASTER)

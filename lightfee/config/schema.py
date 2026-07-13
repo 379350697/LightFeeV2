@@ -261,6 +261,9 @@ class StrategyConfig:
     spread_paper_primary_fill_model: str = "taker_taker"
     spread_paper_require_taker_taker: bool = True
     spread_paper_finalist_limit: int = 10
+    # A signal snapshot is a decision input, not executable fill evidence.
+    # Paper entry requires a later coherent quote after this positive delay.
+    spread_paper_min_decision_latency_ms: int = 250
     # Symbol exclusions are an explicit research choice, never a hidden
     # hard-coded good/bad pair in the strategy or its reports.
     spread_paper_excluded_symbols: list[str] = field(default_factory=list)

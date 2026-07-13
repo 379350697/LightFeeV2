@@ -23,6 +23,7 @@ from lightfee.config.schema import (
     VenueConfig,
 )
 from lightfee.core.domain import (
+    EntryLeverageEvidence,
     OrderFill,
     OrderRequest,
     PassiveOrderState,
@@ -75,6 +76,8 @@ class FakeVenueAdapter(VenueAdapter):
     okx_base_quantity_step: float = 0.0
     passive_metadata_payload: Optional[dict] = None
     available_margin_quote: Optional[float] = None
+    entry_account_leverage: int = 4
+    entry_effective_leverage: int | None = None
     last_request: Optional[OrderRequest] = None
     place_order_call_count: int = 0
     fetch_position_call_count: int = 0
@@ -125,6 +128,54 @@ class FakeVenueAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol, quantity):
         return quantity
+
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence:
+        """Model the verified GET required by the live entry gate."""
+        return EntryLeverageEvidence(
+            venue=self._venue,
+            symbol=symbol,
+            requested_leverage=leverage,
+            effective_leverage=self._effective_entry_leverage(),
+            notional_quote=float(notional_quote or 0.0),
+            bracket_verified=True,
+            account_verified=True,
+            source="fake_inspect",
+            observed_at_ms=1_000,
+            account_leverage=self.entry_account_leverage,
+        )
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence:
+        """Model a successful exchange mutation with a verifiable receipt."""
+        self.entry_account_leverage = leverage
+        return EntryLeverageEvidence(
+            venue=self._venue,
+            symbol=symbol,
+            requested_leverage=leverage,
+            effective_leverage=self._effective_entry_leverage(),
+            notional_quote=float(notional_quote or 0.0),
+            bracket_verified=True,
+            account_verified=True,
+            source="fake_ensure",
+            observed_at_ms=1_000,
+            account_leverage=self.entry_account_leverage,
+        )
+
+    def _effective_entry_leverage(self) -> int:
+        if self.entry_effective_leverage is not None:
+            return self.entry_effective_leverage
+        return self.entry_account_leverage
 
     def passive_metadata(self, symbol: str) -> dict:
         if self.passive_metadata_payload is not None:
@@ -2155,6 +2206,20 @@ class TestPlannerDispatchIntegration:
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         binance.available_margin_quote = 1_000.0
         okx.available_margin_quote = 1_000.0
+        inspected = EntryLeverageEvidence(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            requested_leverage=4,
+            effective_leverage=4,
+            notional_quote=50.0,
+            bracket_verified=True,
+            account_verified=True,
+            source="test_get_only",
+            observed_at_ms=5_000,
+            account_leverage=4,
+        )
+        binance.inspect_entry_leverage = AsyncMock(return_value=inspected)
+        binance.ensure_entry_leverage = AsyncMock(return_value=inspected)
         runtime = LiveRuntime(
             config,
             venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
@@ -2204,6 +2269,10 @@ class TestPlannerDispatchIntegration:
 
         assert dispatched is False
         assert runtime.entry_executor.ctx is None
+        # Portfolio admission happens after GET-only sizing but before the
+        # first mutating leverage operation.
+        assert binance.inspect_entry_leverage.await_count == 1
+        assert binance.ensure_entry_leverage.await_count == 0
         payload = [
             record["payload"]
             for record in tmp_journal.read_all()
@@ -2212,6 +2281,575 @@ class TestPlannerDispatchIntegration:
         assert payload["reason"] == "max_symbol_exposure"
         assert payload["source"] == "strategy_risk_allocator"
         assert payload["projected_symbol_exposure_quote"] > 100.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "final_kind",
+        ["missing", "incomplete", "lower"],
+    )
+    async def test_enhanced_live_dispatch_rejects_weakened_final_leverage_evidence(
+        self,
+        config,
+        tmp_journal,
+        final_kind: str,
+    ) -> None:
+        """Sizing evidence may never survive a weaker post-set confirmation."""
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        binance.available_margin_quote = 1_000.0
+        okx.available_margin_quote = 1_000.0
+        inspected = EntryLeverageEvidence(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            requested_leverage=4,
+            effective_leverage=4,
+            notional_quote=50.0,
+            bracket_verified=True,
+            account_verified=True,
+            source="test_get_only",
+            observed_at_ms=5_000,
+            account_leverage=4,
+        )
+        if final_kind == "missing":
+            final_evidence = None
+        elif final_kind == "incomplete":
+            final_evidence = EntryLeverageEvidence(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=4,
+                notional_quote=50.0,
+                bracket_verified=False,
+                account_verified=True,
+                source="test_post_set_incomplete",
+                observed_at_ms=5_000,
+                account_leverage=4,
+            )
+        else:
+            final_evidence = EntryLeverageEvidence(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=2,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test_post_set_lower",
+                observed_at_ms=5_000,
+                account_leverage=2,
+            )
+        binance.inspect_entry_leverage = AsyncMock(return_value=inspected)
+        # A missing confirmation or lower effective leverage is treated as a
+        # potentially applied mutation and therefore receives a verified
+        # best-effort restore to the just-inspected account setting.
+        if final_kind in {"missing", "lower"}:
+            binance.ensure_entry_leverage = AsyncMock(
+                side_effect=[final_evidence, inspected]
+            )
+        else:
+            binance.ensure_entry_leverage = AsyncMock(return_value=final_evidence)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: SimpleNamespace(
+                expected_shortfall_bps=10.0,
+                sample_count=120,
+                return_count=119,
+                history_ms=300_000,
+                confidence=0.95,
+                evidence_complete=True,
+                reason="",
+                model_version="test",
+            )
+        )
+        self._install_hot_book(
+            runtime, "binance", "BTCUSDT",
+            bid=50_000.0, ask=50_010.0, observed_at_ms=5_000,
+        )
+        self._install_hot_book(
+            runtime, "okx", "BTCUSDT",
+            bid=49_990.0, ask=50_000.0, observed_at_ms=5_000,
+        )
+        candidate = self._candidate()
+        candidate.entry_notional_quote = 50.0
+        candidate.entry_target_quantity = 0.001
+        candidate.entry_max_executable_quantity = 0.001
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        assert runtime.entry_executor.ctx is None
+        assert binance.inspect_entry_leverage.await_count == 2
+        assert binance.ensure_entry_leverage.await_count == (
+            2 if final_kind in {"missing", "lower"} else 1
+        )
+        blocked = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+        ]
+        assert blocked[-1]["reason"] == "entry_leverage_weakened_after_sizing"
+        assert blocked[-1]["final_evidence_complete"] is (final_kind == "lower")
+        if final_kind in {"missing", "lower"}:
+            assert any(
+                record["kind"] == "execution.entry_leverage_compensated"
+                for record in tmp_journal.read_all()
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "prepare_error",
+        [OSError("injected aster prepare failure"), asyncio.CancelledError()],
+    )
+    async def test_final_leverage_prepare_restores_first_venue_after_second_fails(
+        self,
+        config,
+        tmp_journal,
+        prepare_error: BaseException,
+    ) -> None:
+        """A rejected pair must not retain a unilateral leverage mutation."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+
+        def evidence(venue: Venue, effective: int, account: int) -> EntryLeverageEvidence:
+            return EntryLeverageEvidence(
+                venue=venue,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=effective,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test",
+                observed_at_ms=5_000,
+                account_leverage=account,
+            )
+
+        binance.inspect_entry_leverage = AsyncMock(
+            return_value=evidence(Venue.BINANCE, 2, 2)
+        )
+        binance.ensure_entry_leverage = AsyncMock(
+            side_effect=[
+                # The venue accepts account leverage 4, but its active
+                # notional bracket still caps executable leverage at 2.
+                # Compensation must restore the account setting, not infer
+                # that no mutation occurred from the capped effective value.
+                evidence(Venue.BINANCE, 2, 4),
+                evidence(Venue.BINANCE, 2, 2),
+            ]
+        )
+        aster.inspect_entry_leverage = AsyncMock(
+            return_value=evidence(Venue.ASTER, 2, 2)
+        )
+        aster.ensure_entry_leverage = AsyncMock(
+            side_effect=prepare_error
+        )
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.ASTER: aster},
+        )
+        runtime.journal = tmp_journal
+
+        ready, evidence_by_venue = (
+            await runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.ASTER,
+                notional_quote=50.0,
+            )
+        )
+
+        assert ready is False
+        assert evidence_by_venue == {}
+        assert binance.ensure_entry_leverage.await_count == 2
+        first_call, restore_call = binance.ensure_entry_leverage.await_args_list
+        assert first_call.args[1] == 4
+        assert restore_call.args[1] == 2
+        assert restore_call.kwargs["notional_quote"] == 0.0
+        # An uncertain transport failure can still mean the exchange accepted
+        # the first mutation; restore is attempted on that venue as well.
+        assert aster.ensure_entry_leverage.await_count == 2
+        assert any(
+            record["kind"] == "execution.entry_leverage_compensated"
+            for record in tmp_journal.read_all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_final_leverage_prepare_timeout_restores_every_attempted_venue(
+        self,
+        config,
+        tmp_journal,
+    ) -> None:
+        """Caller cancellation waits for the compensating transaction."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+
+        def evidence(venue: Venue, leverage: int) -> EntryLeverageEvidence:
+            return EntryLeverageEvidence(
+                venue=venue,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=leverage,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test",
+                observed_at_ms=5_000,
+                account_leverage=leverage,
+            )
+
+        binance_calls: list[int] = []
+        aster_calls: list[int] = []
+
+        async def binance_ensure(symbol: str, leverage: int, **_kwargs) -> EntryLeverageEvidence:
+            binance_calls.append(leverage)
+            return evidence(Venue.BINANCE, leverage)
+
+        async def slow_aster_ensure(symbol: str, leverage: int, **_kwargs) -> EntryLeverageEvidence:
+            aster_calls.append(leverage)
+            if leverage == 4:
+                await asyncio.sleep(0.05)
+            return evidence(Venue.ASTER, leverage)
+
+        binance.inspect_entry_leverage = AsyncMock(
+            return_value=evidence(Venue.BINANCE, 2)
+        )
+        binance.ensure_entry_leverage = binance_ensure
+        aster.inspect_entry_leverage = AsyncMock(
+            return_value=evidence(Venue.ASTER, 2)
+        )
+        aster.ensure_entry_leverage = slow_aster_ensure
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.ASTER: aster},
+        )
+        runtime.journal = tmp_journal
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                    candidate=self._candidate(),
+                    now_ms=5_000,
+                    long_venue=Venue.BINANCE,
+                    short_venue=Venue.ASTER,
+                    notional_quote=50.0,
+                ),
+                timeout=0.01,
+            )
+
+        assert binance_calls == [4, 2]
+        assert aster_calls == [4, 2]
+        compensated = [
+            record
+            for record in tmp_journal.read_all()
+            if record["kind"] == "execution.entry_leverage_compensated"
+        ]
+        assert {record["payload"]["venue"] for record in compensated} == {
+            "binance",
+            "aster",
+        }
+
+    @pytest.mark.asyncio
+    async def test_leverage_prepare_non_live_path_completes_without_handoff_hang(
+        self,
+        config,
+        tmp_journal,
+    ) -> None:
+        """A no-mutation path must still complete the outer hand-off protocol."""
+        config.runtime.mode = "paper"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+
+        ready, evidence_by_venue = await asyncio.wait_for(
+            runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.ASTER,
+                notional_quote=50.0,
+            ),
+            timeout=0.05,
+        )
+
+        assert ready is True
+        assert evidence_by_venue == {}
+
+    @pytest.mark.asyncio
+    async def test_leverage_ready_receipt_exists_before_prepare_returns(
+        self,
+        config,
+        tmp_journal,
+    ) -> None:
+        """A successful prepare may not let dispatch submit before its receipt."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        original = EntryLeverageEvidence(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            requested_leverage=4,
+            effective_leverage=2,
+            notional_quote=50.0,
+            bracket_verified=True,
+            account_verified=True,
+            source="test",
+            observed_at_ms=5_000,
+            account_leverage=2,
+        )
+        prepared = EntryLeverageEvidence(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            requested_leverage=4,
+            effective_leverage=4,
+            notional_quote=50.0,
+            bracket_verified=True,
+            account_verified=True,
+            source="test",
+            observed_at_ms=5_000,
+            account_leverage=4,
+        )
+        binance.inspect_entry_leverage = AsyncMock(return_value=original)
+        binance.ensure_entry_leverage = AsyncMock(return_value=prepared)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance},
+        )
+        runtime.journal = tmp_journal
+
+        ready, evidence_by_venue = (
+            await runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.OKX,
+                notional_quote=50.0,
+            )
+        )
+
+        assert ready is True
+        assert evidence_by_venue == {Venue.BINANCE: prepared}
+        assert any(
+            record["kind"] == "execution.entry_leverage_ready"
+            for record in tmp_journal.read_all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_leverage_prepare_repeated_cancellation_waits_for_all_restores(
+        self,
+        config,
+        tmp_journal,
+    ) -> None:
+        """A second cancellation cannot detach the compensating child task."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+        aster_started = asyncio.Event()
+        binance_calls: list[int] = []
+        aster_calls: list[int] = []
+
+        def evidence(venue: Venue, leverage: int) -> EntryLeverageEvidence:
+            return EntryLeverageEvidence(
+                venue=venue,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=leverage,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test",
+                observed_at_ms=5_000,
+                account_leverage=leverage,
+            )
+
+        async def binance_ensure(_symbol: str, leverage: int, **_kwargs):
+            binance_calls.append(leverage)
+            return evidence(Venue.BINANCE, leverage)
+
+        async def aster_ensure(_symbol: str, leverage: int, **_kwargs):
+            aster_calls.append(leverage)
+            if leverage == 4:
+                aster_started.set()
+                await asyncio.sleep(0.02)
+            return evidence(Venue.ASTER, leverage)
+
+        binance.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.BINANCE, 2))
+        binance.ensure_entry_leverage = binance_ensure
+        aster.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.ASTER, 2))
+        aster.ensure_entry_leverage = aster_ensure
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.ASTER: aster},
+        )
+        runtime.journal = tmp_journal
+        task = asyncio.create_task(
+            runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.ASTER,
+                notional_quote=50.0,
+            )
+        )
+
+        await aster_started.wait()
+        task.cancel()
+        await asyncio.sleep(0.001)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert binance_calls == [4, 2]
+        assert aster_calls == [4, 2]
+
+    @pytest.mark.asyncio
+    async def test_leverage_compensation_continues_when_audit_append_fails(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ) -> None:
+        """Audit-sink failure must fail closed without skipping a venue restore."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+        binance_calls: list[int] = []
+        aster_calls: list[int] = []
+
+        def evidence(venue: Venue, leverage: int) -> EntryLeverageEvidence:
+            return EntryLeverageEvidence(
+                venue=venue,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=leverage,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test",
+                observed_at_ms=5_000,
+                account_leverage=leverage,
+            )
+
+        async def binance_ensure(_symbol: str, leverage: int, **_kwargs):
+            binance_calls.append(leverage)
+            return evidence(Venue.BINANCE, leverage)
+
+        async def failing_aster_ensure(_symbol: str, leverage: int, **_kwargs):
+            aster_calls.append(leverage)
+            if leverage == 4:
+                raise OSError("injected target leverage transport failure")
+            return evidence(Venue.ASTER, leverage)
+
+        binance.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.BINANCE, 2))
+        binance.ensure_entry_leverage = binance_ensure
+        aster.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.ASTER, 2))
+        aster.ensure_entry_leverage = failing_aster_ensure
+        original_append = tmp_journal.append
+        compensation_append_failed = False
+
+        def append_with_one_compensation_failure(kind, payload):
+            nonlocal compensation_append_failed
+            if kind == "execution.entry_leverage_compensated" and not compensation_append_failed:
+                compensation_append_failed = True
+                raise OSError("injected compensation receipt write failure")
+            return original_append(kind, payload)
+
+        monkeypatch.setattr(tmp_journal, "append", append_with_one_compensation_failure)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.ASTER: aster},
+        )
+        runtime.journal = tmp_journal
+
+        ready, evidence_by_venue = (
+            await runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.ASTER,
+                notional_quote=50.0,
+            )
+        )
+
+        assert ready is False
+        assert evidence_by_venue == {}
+        assert binance_calls == [4, 2]
+        assert aster_calls == [4, 2]
+        assert runtime.state.venue_entry_cooldowns["binance:BTCUSDT"]["reason"] == (
+            "entry_leverage_compensation_failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_leverage_weakened_receipt_uses_the_failing_venue_in_audit(
+        self,
+        config,
+        tmp_journal,
+    ) -> None:
+        """A semantic failure's durable event must not reuse another venue's data."""
+        config.runtime.mode = "live"
+        config.strategy.live_target_leverage = 4
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        aster = FakeVenueAdapter(Venue.ASTER)
+
+        def evidence(venue: Venue, effective: int, account: int) -> EntryLeverageEvidence:
+            return EntryLeverageEvidence(
+                venue=venue,
+                symbol="BTCUSDT",
+                requested_leverage=4,
+                effective_leverage=effective,
+                notional_quote=50.0,
+                bracket_verified=True,
+                account_verified=True,
+                source="test",
+                observed_at_ms=5_000,
+                account_leverage=account,
+            )
+
+        binance.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.BINANCE, 2, 2))
+        binance.ensure_entry_leverage = AsyncMock(
+            side_effect=[evidence(Venue.BINANCE, 1, 1), evidence(Venue.BINANCE, 2, 2)]
+        )
+        aster.inspect_entry_leverage = AsyncMock(return_value=evidence(Venue.ASTER, 2, 2))
+        aster.ensure_entry_leverage = AsyncMock(
+            side_effect=[evidence(Venue.ASTER, 4, 4), evidence(Venue.ASTER, 2, 2)]
+        )
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.ASTER: aster},
+        )
+        runtime.journal = tmp_journal
+
+        ready, _evidence_by_venue = (
+            await runtime.entry_dispatch_runtime._prepare_live_entry_leverage_for_candidate(
+                candidate=self._candidate(),
+                now_ms=5_000,
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.ASTER,
+                notional_quote=50.0,
+            )
+        )
+
+        assert ready is False
+        unavailable = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "execution.entry_leverage_unavailable"
+        ]
+        assert unavailable[-1]["venue"] == "binance"
+        assert "weaker than pre-set evidence" in unavailable[-1]["raw_error"]
 
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_does_not_require_local_l2_books(

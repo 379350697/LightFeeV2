@@ -33,7 +33,7 @@ def _closed(
             "paper_funding_quote": 0.0,
             "paper_net_bps": net_quote / 20.0 * 10_000.0,
             "model_epoch": "v2_signed_reversion",
-            "calculation_version": "spread_paper_v2",
+            "calculation_version": "spread_paper_v3",
             "official_pnl": True,
             "paper_unpriced": False,
             "paper_order_status": "FILLED",

@@ -53,6 +53,10 @@ class EntryLeverageEvidence:
     account_verified: bool
     source: str
     observed_at_ms: int
+    # Exact account setting read before an entry-preparation mutation.  This
+    # is distinct from ``effective_leverage``: sizing may cap the latter at
+    # the target/bracket, while compensation needs the original setting.
+    account_leverage: int = 0
 
     @property
     def evidence_complete(self) -> bool:

@@ -1,5 +1,7 @@
 """Tests for config loading, validation, and Chillybot removal."""
 
+import math
+
 import pytest
 
 from lightfee.config.validation import check_raw_toml_for_chillybot
@@ -39,6 +41,33 @@ def test_strategy_config_rejects_invalid_forecast_distribution_drift_limit():
     issues = validate_config(cfg)
 
     assert any("funding_forecast_stability_max_quantile_drift_bps" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "funding_forecast_uncertainty_haircut_bps",
+        "funding_forecast_stability_max_quantile_drift_bps",
+        "entry_exit_reserve_bps",
+        "execution_buffer_bps",
+        "capital_buffer_bps",
+        "spread_slippage_reserve_bps",
+        "spread_adverse_selection_buffer_bps",
+        "spread_paper_slippage_buffer_bps",
+        "exit_shadow_cost_buffer_bps",
+    ],
+)
+@pytest.mark.parametrize("value", [-0.1, "not-a-number"])
+def test_strategy_config_rejects_invalid_cost_and_haircut_values(
+    field_name: str,
+    value: object,
+):
+    cfg = AppConfig()
+    setattr(cfg.strategy, field_name, value)
+
+    issues = validate_config(cfg)
+
+    assert any(field_name in issue for issue in issues)
 
 
 @pytest.mark.parametrize(
@@ -395,6 +424,48 @@ class TestConfigValidation:
             "spread_paper_finalist_limit",
         ):
             assert any(field_name in issue for issue in issues)
+
+    @pytest.mark.parametrize(
+        ("finalist_limit", "terminal_secs", "markout_secs"),
+        [
+            (True, True, [True]),
+            (1.5, 1.5, [1.5]),
+            (math.nan, math.nan, [math.nan]),
+        ],
+    )
+    def test_spread_paper_schedule_fields_reject_bool_fraction_and_nonfinite_values(
+        self,
+        finalist_limit: object,
+        terminal_secs: object,
+        markout_secs: object,
+    ) -> None:
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.spread_paper_enabled = True
+        config.strategy.spread_paper_finalist_limit = finalist_limit
+        config.strategy.spread_paper_terminal_secs = terminal_secs
+        config.strategy.spread_paper_markout_secs = markout_secs
+
+        issues = validate_config(config)
+
+        for field_name in (
+            "spread_paper_finalist_limit",
+            "spread_paper_terminal_secs",
+            "spread_paper_markout_secs",
+        ):
+            assert any(field_name in issue for issue in issues)
+
+    @pytest.mark.parametrize("value", ["true", "false", 1])
+    def test_spread_paper_taker_baseline_requires_literal_true(
+        self,
+        value: object,
+    ) -> None:
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.spread_paper_enabled = True
+        config.strategy.spread_paper_require_taker_taker = value
+
+        issues = validate_config(config)
+
+        assert any("spread_paper_require_taker_taker" in issue for issue in issues)
 
     def test_strategy_defaults_keep_entry_window_valid(self):
         strategy = StrategyConfig()

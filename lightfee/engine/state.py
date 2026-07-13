@@ -1077,6 +1077,7 @@ class RecoveryWorkSnapshot:
 
 MAX_PENDING_CLOSE_RECONCILIATIONS = 256
 MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS = 256
+MAX_FUNDING_SETTLEMENT_STATEMENT_CLAIMS = 8_192
 
 
 def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
@@ -1164,6 +1165,46 @@ def normalize_pending_funding_settlement_reconciliations(raw: Any) -> list[dict[
     return normalized
 
 
+def normalize_funding_settlement_statement_claim_ledger(raw: Any) -> list[dict[str, Any]]:
+    """Keep only visible mapping rows for consumed private statements.
+
+    This ledger is deliberately separate from the pending accounting queue:
+    completed tasks leave that queue, but their account-level statement claim
+    must remain durable so a later duplicate task cannot recognize the same
+    cash flow as a second official PnL result.
+    """
+    if not isinstance(raw, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        owner_id = str(item.get("owner_id") or "")
+        venue = str(item.get("venue") or "").lower()
+        symbol = str(item.get("symbol") or "").upper()
+        try:
+            timestamp = int(item.get("settlement_timestamp_ms") or 0)
+        except (TypeError, ValueError):
+            timestamp = 0
+        quote_currency = str(item.get("quote_currency") or "").upper()
+        if not owner_id or not venue or not symbol or timestamp <= 0 or not quote_currency:
+            continue
+        normalized.append(
+            {
+                "owner_id": owner_id,
+                "position_id": str(item.get("position_id") or owner_id),
+                "leg": str(item.get("leg") or ""),
+                "venue": venue,
+                "symbol": symbol,
+                "settlement_timestamp_ms": timestamp,
+                "quote_currency": quote_currency,
+                "statement_reference": str(item.get("statement_reference") or ""),
+                "recorded_at_ms": int(item.get("recorded_at_ms") or 0),
+            }
+        )
+    return normalized
+
+
 @dataclass
 class EngineState:
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
@@ -1207,6 +1248,10 @@ class EngineState:
     pending_funding_settlement_reconciliations: list[dict[str, Any]] = field(
         default_factory=list
     )
+    # Durable ownership receipts for official private funding statements.
+    funding_settlement_statement_claim_ledger: list[dict[str, Any]] = field(
+        default_factory=list
+    )
     # --- Local-L2 state for persistence/recovery (V1 parity) ---
     retained_local_l2_books: list[dict] = field(default_factory=list)
     local_l2_books_snapshot: list[dict] = field(default_factory=list)
@@ -1231,6 +1276,241 @@ class EngineState:
             ]
         )
 
+    def set_funding_settlement_statement_claim_ledger(self, raw: Any) -> None:
+        # Never evict a consumed statement claim: doing so would eventually
+        # make an old exchange statement eligible for a second official close.
+        # ``record_funding_settlement_statement_claims`` enforces the capacity
+        # as a fail-closed operational boundary instead of silently weakening
+        # duplicate protection.
+        self.funding_settlement_statement_claim_ledger = (
+            normalize_funding_settlement_statement_claim_ledger(raw)
+        )
+
+    def record_funding_settlement_statement_claims(
+        self,
+        task: dict[str, Any],
+        *,
+        recorded_at_ms: int,
+    ) -> bool:
+        """Atomically reserve every statement target in an official task.
+
+        Returning false preserves fail-closed accounting: callers must leave
+        the task non-official rather than remove it without a durable claim.
+        """
+        self.set_funding_settlement_statement_claim_ledger(
+            self.funding_settlement_statement_claim_ledger
+        )
+        owner_id = str(task.get("position_id") or "")
+        symbol = str(task.get("symbol") or "").upper()
+        if not owner_id or not symbol:
+            return False
+        records_by_target = {
+            (
+                str(record.get("leg") or ""),
+                str(record.get("venue") or "").lower(),
+                int(record.get("settlement_timestamp_ms") or 0),
+            ): record
+            for record in task.get("funding_settlement_records", []) or []
+            if isinstance(record, dict)
+        }
+        pending_rows: list[dict[str, Any]] = []
+        existing_by_key = {
+            (
+                str(row.get("venue") or "").lower(),
+                str(row.get("symbol") or "").upper(),
+                int(row.get("settlement_timestamp_ms") or 0),
+            ): row
+            for row in self.funding_settlement_statement_claim_ledger
+        }
+        for required in task.get("required_settlements", []) or []:
+            if not isinstance(required, dict):
+                return False
+            leg = str(required.get("leg") or "")
+            venue = str(required.get("venue") or "").lower()
+            try:
+                timestamp = int(required.get("settlement_timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                return False
+            quote_currency = str(required.get("quote_currency") or "").upper()
+            if leg not in {"long", "short"} or not venue or timestamp <= 0 or not quote_currency:
+                return False
+            key = (venue, symbol, timestamp)
+            existing = existing_by_key.get(key)
+            if existing is not None:
+                # Even the same position may not mint a second accounting
+                # receipt for a consumed account-level statement.
+                return False
+            record = records_by_target.get((leg, venue, timestamp), {})
+            pending_rows.append(
+                {
+                    "owner_id": owner_id,
+                    "position_id": owner_id,
+                    "leg": leg,
+                    "venue": venue,
+                    "symbol": symbol,
+                    "settlement_timestamp_ms": timestamp,
+                    "quote_currency": quote_currency,
+                    "statement_reference": str(record.get("statement_reference") or ""),
+                    "recorded_at_ms": int(recorded_at_ms),
+                }
+            )
+        if not pending_rows or (
+            len(self.funding_settlement_statement_claim_ledger) + len(pending_rows)
+            > MAX_FUNDING_SETTLEMENT_STATEMENT_CLAIMS
+        ):
+            return False
+        self.funding_settlement_statement_claim_ledger.extend(pending_rows)
+        return True
+
+    def funding_settlement_statement_claims_for_task(
+        self,
+        task: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Return the exact durable claims reserved by one official task.
+
+        The critical settlement receipt carries these rows so replay can
+        reconstruct duplicate protection after a crash before the next state
+        snapshot.  Returning no partial result keeps receipt creation
+        fail-closed if in-memory reservation and ledger state diverge.
+        """
+        owner_id = str(task.get("position_id") or "")
+        symbol = str(task.get("symbol") or "").upper()
+        if not owner_id or not symbol:
+            return []
+        ledger_by_key = {
+            (
+                str(row.get("venue") or "").lower(),
+                str(row.get("symbol") or "").upper(),
+                int(row.get("settlement_timestamp_ms") or 0),
+            ): row
+            for row in self.funding_settlement_statement_claim_ledger
+            if isinstance(row, dict)
+        }
+        claims: list[dict[str, Any]] = []
+        for required in task.get("required_settlements", []) or []:
+            if not isinstance(required, dict):
+                return []
+            venue = str(required.get("venue") or "").lower()
+            try:
+                timestamp = int(required.get("settlement_timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                return []
+            row = ledger_by_key.get((venue, symbol, timestamp))
+            if (
+                row is None
+                or str(row.get("owner_id") or "") != owner_id
+                or not venue
+                or timestamp <= 0
+            ):
+                return []
+            claims.append(dict(row))
+        return claims
+
+    def replay_funding_settlement_reconciled_receipt(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Apply a durable settlement receipt without reissuing accounting.
+
+        A journal receipt is the crash-safe commit point for post-close funding
+        attribution.  Replaying its claim rows restores statement ownership
+        before removing the matching pending task, making repeated replays
+        idempotent and preventing a stale snapshot from minting a second PnL
+        receipt.  Pre-v3 receipts have no claim rows; their task is still
+        removed by durable identity for backward-compatible no-reissue
+        behavior, while future receipts always include the exact claims.
+        """
+        owner_id = str(payload.get("position_id") or "")
+        try:
+            closed_at_ms = int(payload.get("closed_at_ms") or 0)
+        except (TypeError, ValueError):
+            return
+        if not owner_id or closed_at_ms <= 0:
+            return
+
+        raw_claims = payload.get("statement_claims")
+        claims = normalize_funding_settlement_statement_claim_ledger(raw_claims)
+        if isinstance(raw_claims, list) and claims:
+            existing_by_key = {
+                (
+                    str(row.get("venue") or "").lower(),
+                    str(row.get("symbol") or "").upper(),
+                    int(row.get("settlement_timestamp_ms") or 0),
+                ): row
+                for row in self.funding_settlement_statement_claim_ledger
+                if isinstance(row, dict)
+            }
+            replayable_claims = [
+                claim
+                for claim in claims
+                if (
+                    (existing := existing_by_key.get(
+                        (
+                            claim["venue"],
+                            claim["symbol"],
+                            claim["settlement_timestamp_ms"],
+                        )
+                    )) is None
+                    or existing == claim
+                )
+            ]
+            self.set_funding_settlement_statement_claim_ledger(
+                self.funding_settlement_statement_claim_ledger + replayable_claims
+            )
+
+        self.set_pending_funding_settlement_reconciliations(
+            [
+                task
+                for task in self.pending_funding_settlement_reconciliations
+                if not (
+                    str(task.get("position_id") or "") == owner_id
+                    and int(task.get("closed_at_ms") or 0) == closed_at_ms
+                )
+            ]
+        )
+
+    def release_funding_settlement_statement_claims(
+        self,
+        task: dict[str, Any],
+    ) -> None:
+        """Undo a just-reserved statement claim when its receipt was not durable.
+
+        A claim only becomes consumed accounting truth together with the
+        corresponding critical journal receipt.  ``record_*`` refuses any
+        existing target, so a successful call owns every matching row and a
+        failed receipt can safely remove precisely those rows for retry.
+        """
+        owner_id = str(task.get("position_id") or "")
+        symbol = str(task.get("symbol") or "").upper()
+        if not owner_id or not symbol:
+            return
+        targets: set[tuple[str, int]] = set()
+        for required in task.get("required_settlements", []) or []:
+            if not isinstance(required, dict):
+                continue
+            venue = str(required.get("venue") or "").lower()
+            try:
+                timestamp = int(required.get("settlement_timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if venue and timestamp > 0:
+                targets.add((venue, timestamp))
+        if not targets:
+            return
+        self.funding_settlement_statement_claim_ledger = [
+            row
+            for row in self.funding_settlement_statement_claim_ledger
+            if not (
+                str(row.get("owner_id") or "") == owner_id
+                and str(row.get("symbol") or "").upper() == symbol
+                and (
+                    str(row.get("venue") or "").lower(),
+                    int(row.get("settlement_timestamp_ms") or 0),
+                )
+                in targets
+            )
+        ]
+
     def enqueue_pending_funding_settlement_reconciliation(self, item: dict[str, Any]) -> None:
         """Upsert an accounting task without merging it into exposure truth."""
         self.set_pending_funding_settlement_reconciliations(
@@ -1247,9 +1527,9 @@ class EngineState:
             ) != key:
                 continue
             merged = dict(existing)
-            for field, value in item.items():
+            for field_name, value in item.items():
                 if value not in (None, "", [], {}):
-                    merged[field] = value
+                    merged[field_name] = value
             existing.clear()
             existing.update(merged)
             return
@@ -1341,12 +1621,12 @@ class EngineState:
             if truth_gap_candidate_count:
                 existing["truth_gap_candidate_count"] = truth_gap_candidate_count
 
-            for field in ("symbol", "candidate_owner_id", "missing_leg"):
-                if not existing.get(field) and item.get(field):
-                    existing[field] = item[field]
-            for field in ("long_venue", "short_venue"):
-                if not existing.get(field) and item.get(field):
-                    existing[field] = item[field]
+            for field_name in ("symbol", "candidate_owner_id", "missing_leg"):
+                if not existing.get(field_name) and item.get(field_name):
+                    existing[field_name] = item[field_name]
+            for field_name in ("long_venue", "short_venue"):
+                if not existing.get(field_name) and item.get(field_name):
+                    existing[field_name] = item[field_name]
 
             incoming_snapshot = item.get("position_snapshot")
             if isinstance(incoming_snapshot, dict):
@@ -1371,9 +1651,12 @@ class EngineState:
             elif item.get("blocking_trading") is False and "blocking_trading" not in existing:
                 existing["blocking_trading"] = False
 
-            for field in ("component_evidence_status", "last_evidence_gap_reason"):
-                if item.get(field):
-                    existing[field] = item[field]
+            for field_name in (
+                "component_evidence_status",
+                "last_evidence_gap_reason",
+            ):
+                if item.get(field_name):
+                    existing[field_name] = item[field_name]
             incoming_state = str(item.get("close_reconciliation_state") or "")
             if incoming_state and existing.get("blocking_trading") is not True:
                 existing["close_reconciliation_state"] = incoming_state
@@ -1448,6 +1731,11 @@ class EngineState:
             "pending_funding_settlement_reconciliations": (
                 normalize_pending_funding_settlement_reconciliations(
                     self.pending_funding_settlement_reconciliations
+                )
+            ),
+            "funding_settlement_statement_claim_ledger": (
+                normalize_funding_settlement_statement_claim_ledger(
+                    self.funding_settlement_statement_claim_ledger
                 )
             ),
             "last_scan": self.last_scan,

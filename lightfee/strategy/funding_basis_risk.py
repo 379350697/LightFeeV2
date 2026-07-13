@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Deque
 
 
-FUNDING_BASIS_RISK_CHECKPOINT_SCHEMA_VERSION = 1
+FUNDING_BASIS_RISK_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +38,7 @@ class FundingBasisExpectedShortfallEstimate:
     confidence: float
     evidence_complete: bool
     reason: str
-    model_version: str = "funding_basis_es_v1"
+    model_version: str = "funding_basis_es_v2"
 
 
 class FundingBasisExpectedShortfallModel:
@@ -197,16 +197,6 @@ class FundingBasisExpectedShortfallModel:
             for item in state
             if item.batch_id != self._current_batch_id and item.observed_at_ms < current
         ]
-        if len(observations) < self.min_samples:
-            return FundingBasisExpectedShortfallEstimate(
-                0.0,
-                len(observations),
-                0,
-                _history_ms(observations),
-                self.confidence,
-                False,
-                "insufficient_basis_samples",
-            )
         history_ms = _history_ms(observations)
         if history_ms < self.min_history_ms:
             return FundingBasisExpectedShortfallEstimate(
@@ -220,30 +210,39 @@ class FundingBasisExpectedShortfallModel:
             )
 
         # Long canonical venue A / short B loses when signed basis falls;
-        # the opposite orientation loses when it rises.  We use the latest
-        # observation at or before t-horizon, and reject gaps exceeding two
-        # horizons so sparse outages cannot masquerade as regular returns.
+        # the opposite orientation loses when it rises.  Build disjoint
+        # horizon pairs rather than a rolling t-horizon return.  Reusing a
+        # dense stream's prior observations makes thousands of highly
+        # correlated ticks look like independent tail samples and can
+        # materially understate expected shortfall.
         long_is_canonical_a = _venue_key(long_venue) == key[1]
         losses: list[float] = []
         max_gap_ms = self.horizon_ms * 2
         prior_index = 0
-        for later_index, later in enumerate(observations):
-            target_ms = later.observed_at_ms - self.horizon_ms
-            while (
-                prior_index + 1 < later_index
-                and observations[prior_index + 1].observed_at_ms <= target_ms
-            ):
-                prior_index += 1
-            if prior_index >= later_index:
-                continue
+        while prior_index + 1 < len(observations):
             prior = observations[prior_index]
+            target_ms = prior.observed_at_ms + self.horizon_ms
+            later_index = prior_index + 1
+            while (
+                later_index < len(observations)
+                and observations[later_index].observed_at_ms < target_ms
+            ):
+                later_index += 1
+            if later_index >= len(observations):
+                break
+            later = observations[later_index]
             elapsed = later.observed_at_ms - prior.observed_at_ms
             if elapsed < self.horizon_ms or elapsed > max_gap_ms:
+                # A sparse outage cannot manufacture a regular return.  Skip
+                # this anchor and seek a later independently observable pair.
+                prior_index = later_index + 1
                 continue
             basis_change_bps = later.signed_basis_bps - prior.signed_basis_bps
             adverse_loss_bps = -basis_change_bps if long_is_canonical_a else basis_change_bps
             losses.append(max(adverse_loss_bps, 0.0))
-        if len(losses) < self.min_samples - 1:
+            # Do not reuse either endpoint in the next return sample.
+            prior_index = later_index + 1
+        if len(losses) < self.min_samples:
             return FundingBasisExpectedShortfallEstimate(
                 0.0,
                 len(observations),

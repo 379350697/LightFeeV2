@@ -122,6 +122,31 @@ def _v3_economics_contract_reason(
         )
     ):
         return "invalid_v3_unified_sizing"
+    # Fee fields remain signed: a passive maker leg can have a verified rebate
+    # and pairing records it as a real cash flow.  Reserves and execution-risk
+    # terms are not cash flows; a negative value there is untrusted alpha.
+    for name in (
+        "entry_slippage_bps",
+        "exit_slippage_bps",
+        "adverse_selection_bps",
+        "capital_buffer_bps",
+        "execution_buffer_bps",
+        "venue_risk_haircut_bps",
+    ):
+        if values[name] < 0.0:
+            return f"invalid_v3_economics_cost_sign:{name}"
+    # A negative fee is a maker rebate, not a generic discount.  The candidate
+    # must therefore retain the selected passive leg that makes the rebate
+    # executable.  Without that proof an untrusted V3 payload could turn a
+    # missing fee schedule into positive alpha simply by sending ``-x``.
+    for fee_field, maker_leg_field in (
+        ("entry_fee_bps", "entry_maker_leg"),
+        ("exit_fee_bps", "exit_maker_leg"),
+    ):
+        if values[fee_field] < 0.0 and str(
+            candidate.get(maker_leg_field, "") or ""
+        ).lower() not in {"long", "short"}:
+            return f"invalid_v3_signed_fee_proof:{maker_leg_field}"
     if isinstance(candidate["economics_observed_at_ms"], bool):
         return "invalid_v3_economics_observed_at_ms"
     try:
@@ -155,6 +180,8 @@ def _v3_economics_contract_reason(
         observed_at_ms=observed_at_ms,
         economics_complete=True,
     )
+    if not edge.economics_complete:
+        return "invalid_v3_economics_cost_sign"
     for field, computed in (
         ("expected_net_edge_bps", edge.expected_net_edge_bps),
         ("worst_case_edge_bps", edge.worst_case_edge_bps),

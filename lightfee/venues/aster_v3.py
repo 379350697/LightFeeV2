@@ -464,6 +464,83 @@ class AsterV3Client:
             return remaining
         return None
 
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence | None:
+        """Read Aster leverage evidence without posting a setting mutation."""
+        target = int(leverage or 0)
+        if target <= 0:
+            return None
+
+        position_raw = await self._request(
+            "GET",
+            ASTER_V3_POSITION_PATH,
+            params={"symbol": symbol},
+        )
+        current_leverages: set[int] = set()
+        for row in _extract_rows(position_raw):
+            row_symbol = str(row.get("symbol", symbol) or symbol)
+            if row_symbol != symbol:
+                continue
+            value = int(_safe_float(row.get("leverage"), default=0.0))
+            if value > 0:
+                current_leverages.add(value)
+        current = next(iter(current_leverages)) if len(current_leverages) == 1 else 0
+
+        allowed = target
+        bracket_verified = False
+        try:
+            bracket_raw = await self._request(
+                "GET",
+                ASTER_V3_LEVERAGE_BRACKET_PATH,
+                params={"symbol": symbol},
+            )
+            notional = max(float(notional_quote or 0.0), 0.0)
+            for row in _extract_rows(bracket_raw):
+                brackets = row.get("brackets") if isinstance(row, dict) else None
+                if not isinstance(brackets, list):
+                    continue
+                for bracket in brackets:
+                    if not isinstance(bracket, dict):
+                        continue
+                    floor = _safe_float(bracket.get("notionalFloor"), default=0.0)
+                    cap = _safe_float(bracket.get("notionalCap"), default=0.0)
+                    maximum = int(
+                        _safe_float(bracket.get("initialLeverage"), default=0.0)
+                    )
+                    if maximum <= 0:
+                        continue
+                    if cap <= 0 or (
+                        notional + 1e-12 >= floor and notional <= cap + 1e-12
+                    ):
+                        allowed = min(target, maximum)
+                        bracket_verified = True
+                        break
+                if bracket_verified:
+                    break
+        except TransportError:
+            # An unverified bracket cannot contribute to sizing evidence.
+            bracket_verified = False
+
+        current_verified = current > 0
+        conservative_effective = min(current, allowed) if current_verified else 1
+        return EntryLeverageEvidence(
+            venue=Venue.ASTER,
+            symbol=symbol,
+            requested_leverage=target,
+            effective_leverage=max(int(conservative_effective), 1),
+            notional_quote=max(float(notional_quote or 0.0), 0.0),
+            bracket_verified=bracket_verified,
+            account_verified=current_verified,
+            source="aster_v3_position_risk_read_only",
+            observed_at_ms=int(time.time() * 1000),
+            account_leverage=current,
+        )
+
     async def ensure_entry_leverage(
         self,
         symbol: str,
@@ -533,6 +610,7 @@ class AsterV3Client:
                 account_verified=bracket_verified,
                 source="aster_v3_position_risk",
                 observed_at_ms=int(time.time() * 1000),
+                account_leverage=current,
             )
         response = await self._request(
             "POST",
@@ -588,6 +666,7 @@ class AsterV3Client:
             account_verified=True,
             source="aster_v3_post_set_position_risk",
             observed_at_ms=int(time.time() * 1000),
+            account_leverage=post_set_leverage,
         )
 
     def _order_params(

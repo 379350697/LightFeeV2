@@ -112,24 +112,35 @@ def validate_config(config: AppConfig) -> list[str]:
 
     if config.strategy.funding_forecast_mode not in {"shadow", "live"}:
         issues.append("strategy.funding_forecast_mode must be 'shadow' or 'live'")
-    if (
-        not math.isfinite(float(config.strategy.funding_forecast_uncertainty_haircut_bps))
-        or config.strategy.funding_forecast_uncertainty_haircut_bps < 0
+    if not _is_finite_nonnegative(
+        config.strategy.funding_forecast_uncertainty_haircut_bps
     ):
         issues.append("strategy.funding_forecast_uncertainty_haircut_bps must be >= 0")
-    if config.strategy.funding_forecast_min_samples < 0:
+    if not _is_nonnegative_int(config.strategy.funding_forecast_min_samples):
         issues.append("strategy.funding_forecast_min_samples must be >= 0")
-    if config.strategy.funding_forecast_shadow_min_days < 0:
+    if not _is_nonnegative_int(config.strategy.funding_forecast_shadow_min_days):
         issues.append("strategy.funding_forecast_shadow_min_days must be >= 0")
-    if (
-        not math.isfinite(
-            float(config.strategy.funding_forecast_stability_max_quantile_drift_bps)
-        )
-        or config.strategy.funding_forecast_stability_max_quantile_drift_bps < 0
+    if not _is_finite_nonnegative(
+        config.strategy.funding_forecast_stability_max_quantile_drift_bps
     ):
         issues.append(
             "strategy.funding_forecast_stability_max_quantile_drift_bps must be >= 0"
         )
+    for field_name, value in {
+        "entry_exit_reserve_bps": config.strategy.entry_exit_reserve_bps,
+        "execution_buffer_bps": config.strategy.execution_buffer_bps,
+        "capital_buffer_bps": config.strategy.capital_buffer_bps,
+        "spread_slippage_reserve_bps": config.strategy.spread_slippage_reserve_bps,
+        "spread_adverse_selection_buffer_bps": (
+            config.strategy.spread_adverse_selection_buffer_bps
+        ),
+        "spread_paper_slippage_buffer_bps": (
+            config.strategy.spread_paper_slippage_buffer_bps
+        ),
+        "exit_shadow_cost_buffer_bps": config.strategy.exit_shadow_cost_buffer_bps,
+    }.items():
+        if not _is_finite_nonnegative(value):
+            issues.append(f"strategy.{field_name} must be finite and >= 0")
     for field_name, value in {
         "funding_missing_margin_fallback_notional_quote": (
             config.strategy.funding_missing_margin_fallback_notional_quote
@@ -174,16 +185,21 @@ def validate_config(config: AppConfig) -> list[str]:
     }.items():
         if not _is_positive_int(value):
             issues.append(f"strategy.{field_name} must be a positive integer")
+    dynamic_es_window_ms = config.strategy.funding_dynamic_expected_shortfall_window_ms
+    dynamic_es_horizon_ms = config.strategy.funding_dynamic_expected_shortfall_horizon_ms
+    dynamic_es_history_ms = config.strategy.funding_dynamic_expected_shortfall_min_history_ms
     if (
-        config.strategy.funding_dynamic_expected_shortfall_horizon_ms
-        > config.strategy.funding_dynamic_expected_shortfall_window_ms
+        _is_positive_int(dynamic_es_horizon_ms)
+        and _is_positive_int(dynamic_es_window_ms)
+        and dynamic_es_horizon_ms > dynamic_es_window_ms
     ):
         issues.append(
             "strategy.funding_dynamic_expected_shortfall_horizon_ms must not exceed window_ms"
         )
     if (
-        config.strategy.funding_dynamic_expected_shortfall_min_history_ms
-        > config.strategy.funding_dynamic_expected_shortfall_window_ms
+        _is_positive_int(dynamic_es_history_ms)
+        and _is_positive_int(dynamic_es_window_ms)
+        and dynamic_es_history_ms > dynamic_es_window_ms
     ):
         issues.append(
             "strategy.funding_dynamic_expected_shortfall_min_history_ms must not exceed window_ms"
@@ -206,7 +222,9 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append(
                 "strategy.funding_dynamic_expected_shortfall_enabled must be true when live funding entries are enabled"
             )
-        if config.strategy.funding_expected_shortfall_budget_quote <= 0.0:
+        if not _is_positive_finite(
+            config.strategy.funding_expected_shortfall_budget_quote
+        ):
             issues.append(
                 "strategy.funding_expected_shortfall_budget_quote must be > 0 when live funding entries are enabled"
             )
@@ -257,7 +275,7 @@ def validate_config(config: AppConfig) -> list[str]:
         )
     if (
         config.strategy.funding_economics_mode == "enhanced_live"
-        and config.strategy.funding_forecast_min_samples <= 0
+        and not _is_positive_int(config.strategy.funding_forecast_min_samples)
     ):
         issues.append(
             "strategy.funding_forecast_min_samples must be > 0 when funding_economics_mode is enhanced_live"
@@ -326,14 +344,33 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append(
                 "strategy.spread_paper_primary_fill_model must be taker_taker"
             )
-        if not config.strategy.spread_paper_require_taker_taker:
-            issues.append("strategy.spread_paper_require_taker_taker must be true")
-        if config.strategy.spread_paper_finalist_limit <= 0:
-            issues.append("strategy.spread_paper_finalist_limit must be > 0")
-        if config.strategy.spread_paper_terminal_secs <= 0:
-            issues.append("strategy.spread_paper_terminal_secs must be > 0")
-        if not any(int(value) > 0 for value in config.strategy.spread_paper_markout_secs):
-            issues.append("strategy.spread_paper_markout_secs must include a positive horizon")
+        if config.strategy.spread_paper_require_taker_taker is not True:
+            issues.append(
+                "strategy.spread_paper_require_taker_taker must be literal true"
+            )
+        if not _is_positive_int(config.strategy.spread_paper_finalist_limit):
+            issues.append(
+                "strategy.spread_paper_finalist_limit must be a positive integer"
+            )
+        if not _is_positive_int(
+            config.strategy.spread_paper_min_decision_latency_ms
+        ):
+            issues.append(
+                "strategy.spread_paper_min_decision_latency_ms must be a positive integer"
+            )
+        if not _is_positive_int(config.strategy.spread_paper_terminal_secs):
+            issues.append(
+                "strategy.spread_paper_terminal_secs must be a positive integer"
+            )
+        markout_secs = config.strategy.spread_paper_markout_secs
+        if (
+            not isinstance(markout_secs, list)
+            or not markout_secs
+            or not all(_is_positive_int(value) for value in markout_secs)
+        ):
+            issues.append(
+                "strategy.spread_paper_markout_secs must be a non-empty list of positive integers"
+            )
         manifest_path = str(
             config.strategy.spread_paper_research_manifest_path or ""
         ).strip()
@@ -456,6 +493,8 @@ def validate_config(config: AppConfig) -> list[str]:
 
 def _is_finite_nonnegative(value: object) -> bool:
     """Return true only for finite, non-negative numeric policy inputs."""
+    if isinstance(value, bool):
+        return False
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -465,6 +504,8 @@ def _is_finite_nonnegative(value: object) -> bool:
 
 def _is_finite_ratio(value: object) -> bool:
     """A usable margin-health ratio preserves some collateral and is bounded."""
+    if isinstance(value, bool):
+        return False
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -481,6 +522,22 @@ def _is_positive_int(value: object) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(numeric) and numeric > 0.0 and numeric.is_integer()
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    """Reject booleans, fractions and non-finite sample-count policy values."""
+    if isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0.0 and numeric.is_integer()
+
+
+def _is_positive_finite(value: object) -> bool:
+    """Strictly positive finite numeric policy value, never a boolean."""
+    return _is_finite_nonnegative(value) and float(value) > 0.0
 
 
 def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:

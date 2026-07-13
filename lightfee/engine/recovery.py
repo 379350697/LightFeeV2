@@ -40,6 +40,7 @@ from lightfee.engine.state import (
     RecoveryWorkSnapshot,
     normalize_pending_close_reconciliations,
     normalize_pending_funding_settlement_reconciliations,
+    normalize_funding_settlement_statement_claim_ledger,
 )
 from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.persistence.journal import Journal
@@ -571,6 +572,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.set_pending_funding_settlement_reconciliations(
         snap.get("pending_funding_settlement_reconciliations", [])
     )
+    state.set_funding_settlement_statement_claim_ledger(
+        snap.get("funding_settlement_statement_claim_ledger", [])
+    )
     state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
 
     # Restore operator control state
@@ -929,6 +933,12 @@ def _apply_journal_replay_to_state(
                     pos.short_quantity = max(pos.short_quantity - matched_closed, 0)
                     pos.matched_quantity = remaining
 
+        elif kind == "funding.settlement_reconciled" and isinstance(payload, dict):
+            # The critical accounting receipt is the commit point.  It can be
+            # newer than the last snapshot, so restore its statement claims
+            # and consume the exact pending task before any retry is allowed.
+            state.replay_funding_settlement_reconciled_receipt(payload)
+
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")
             if to_val:
@@ -1261,6 +1271,11 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     view["pending_funding_settlement_reconciliations"] = (
         normalize_pending_funding_settlement_reconciliations(
             state.pending_funding_settlement_reconciliations
+        )
+    )
+    view["funding_settlement_statement_claim_ledger"] = (
+        normalize_funding_settlement_statement_claim_ledger(
+            state.funding_settlement_statement_claim_ledger
         )
     )
 

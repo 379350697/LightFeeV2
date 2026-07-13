@@ -4,6 +4,8 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from lightfee.sidecar.pairing import check_stale_snapshot
 from lightfee.sidecar.publisher import _dict_to_snapshot, load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
@@ -151,6 +153,86 @@ class TestPublisher:
         assert candidate.economics_complete is False
         assert candidate.economics_incomplete_reason == (
             "v3_edge_formula_mismatch:expected_net_edge_bps"
+        )
+
+    def test_schema_v3_rejects_negative_taker_cost_as_untrusted_alpha(self):
+        raw = self._complete_v3_candidate()
+        raw["entry_slippage_bps"] = -1.0
+        raw["expected_net_edge_bps"] += 1.0
+        raw["worst_case_edge_bps"] += 1.0
+        raw["ranking_edge_bps"] += 1.0
+
+        snapshot = _dict_to_snapshot(
+            {
+                "schema_version": 3,
+                "quotes": self._complete_v3_contract_quotes(),
+                "candidates": [raw],
+            }
+        )
+
+        candidate = snapshot.candidates[0]
+        assert candidate.economics_complete is False
+        assert candidate.economics_incomplete_reason == (
+            "invalid_v3_economics_cost_sign:entry_slippage_bps"
+        )
+
+    def test_schema_v3_preserves_signed_passive_maker_rebate(self):
+        raw = self._complete_v3_candidate()
+        raw["entry_maker_leg"] = "long"
+        raw["exit_maker_leg"] = "short"
+        raw["entry_fee_bps"] = -0.2
+        raw["expected_edge_bps"] += 0.2
+        raw["expected_net_edge_bps"] += 0.2
+        raw["worst_case_edge_bps"] += 0.2
+        raw["ranking_edge_bps"] += 0.2
+
+        snapshot = _dict_to_snapshot(
+            {
+                "schema_version": 3,
+                "quotes": self._complete_v3_contract_quotes(),
+                "candidates": [raw],
+            }
+        )
+
+        candidate = snapshot.candidates[0]
+        assert candidate.economics_complete is True
+        assert candidate.entry_fee_bps == pytest.approx(-0.2)
+
+    @pytest.mark.parametrize(
+        ("fee_field", "maker_leg_field", "maker_leg"),
+        (
+            ("entry_fee_bps", "entry_maker_leg", ""),
+            ("entry_fee_bps", "entry_maker_leg", "invalid"),
+            ("exit_fee_bps", "exit_maker_leg", ""),
+            ("exit_fee_bps", "exit_maker_leg", "invalid"),
+        ),
+    )
+    def test_schema_v3_rejects_signed_fee_without_maker_leg_proof(
+        self,
+        fee_field: str,
+        maker_leg_field: str,
+        maker_leg: str,
+    ):
+        raw = self._complete_v3_candidate()
+        raw[fee_field] = -0.2
+        raw[maker_leg_field] = maker_leg
+        raw["expected_edge_bps"] += 0.2
+        raw["expected_net_edge_bps"] += 0.2
+        raw["worst_case_edge_bps"] += 0.2
+        raw["ranking_edge_bps"] += 0.2
+
+        snapshot = _dict_to_snapshot(
+            {
+                "schema_version": 3,
+                "quotes": self._complete_v3_contract_quotes(),
+                "candidates": [raw],
+            }
+        )
+
+        candidate = snapshot.candidates[0]
+        assert candidate.economics_complete is False
+        assert candidate.economics_incomplete_reason == (
+            f"invalid_v3_signed_fee_proof:{maker_leg_field}"
         )
 
     def test_schema_v3_rejects_unproved_transfer_or_inventory_bias(self):

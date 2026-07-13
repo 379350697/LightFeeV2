@@ -33,11 +33,45 @@ from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
+def _funding_settlement_receipt_payload(
+    state: Any,
+    task: dict[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    """Build the crash-replayable commit record for one official task."""
+    statement_claims = state.funding_settlement_statement_claims_for_task(task)
+    if not statement_claims:
+        raise RuntimeError("funding_settlement_claim_receipt_mismatch")
+    return {
+        "position_id": result.position_id,
+        "symbol": str(task.get("symbol") or ""),
+        "closed_at_ms": int(task.get("closed_at_ms") or 0),
+        "required_settlement_count": result.required_count,
+        "observed_settlement_count": result.observed_count,
+        "statement_claims": statement_claims,
+        "official_funding_quote": task.get("official_funding_quote"),
+        "official_net_quote": task.get("official_net_quote"),
+        "price_pnl_quote": task.get("price_pnl_quote"),
+        "entry_fee_quote": task.get("entry_fee_quote"),
+        "exit_fee_quote": task.get("exit_fee_quote"),
+        "lifecycle_forecast_funding_quote": task.get(
+            "lifecycle_forecast_funding_quote"
+        ),
+        "funding_forecast_error_quote": task.get(
+            "funding_forecast_error_quote"
+        ),
+        "calculation_version": task.get("calculation_version", ""),
+        "model_epoch": task.get("model_epoch", ""),
+        "economics_observed_at_ms": task.get("economics_observed_at_ms", 0),
+    }
+
+
 class CloseRuntime:
     # V1 reconciliation retry constants (Rust V1 recovery.rs)
     _RECONCILE_RETRY_BASE_MS = 30_000
     _RECONCILE_RETRY_MAX_MS = 300_000
     _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
+    _FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S = 15.0
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -45,6 +79,10 @@ class CloseRuntime:
         self._close_reconciliation_exchange_truth: dict[str, Any] | None = None
         self._close_reconciliation_truth_refresh_next_ms = 0
         self._exit_shadow_tracker: ExitShadowTracker | None = None
+        # Statement attribution is accounting-only, but its private HTTP
+        # request must never hold the main reconciliation/repair tick hostage.
+        self._funding_settlement_reconciliation_worker: asyncio.Task | None = None
+        self._funding_settlement_reconciliation_work: dict[str, Any] | None = None
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
         flush = getattr(self.ctx, "_flush_adapter_order_diagnostics", None)
@@ -2064,7 +2102,9 @@ class CloseRuntime:
             return
 
         reconciler = FundingSettlementReconciler()
-        retained: list[dict[str, Any]] = []
+        retained: list[dict[str, Any] | None] = []
+        due_tasks: list[dict[str, Any]] = []
+        due_indexes: list[int] = []
         for raw_task in tasks:
             if not isinstance(raw_task, dict):
                 retained.append({
@@ -2114,15 +2154,38 @@ class CloseRuntime:
                 retained.append(task)
                 continue
 
-            previous_status = str(task.get("status") or "")
-            previous_reason = str(task.get("last_reason") or "")
-            try:
-                updated, result = await reconciler.reconcile_pending_task(
-                    task,
-                    self.ctx.venue_adapters,
-                    now_ms=now_ms,
-                )
-            except Exception as error:
+            due_indexes.append(len(retained))
+            due_tasks.append(task)
+            retained.append(None)
+
+        if not due_tasks:
+            state.set_pending_funding_settlement_reconciliations(
+                [task for task in retained if task is not None]
+            )
+            return
+
+        try:
+            reconciled = await reconciler.reconcile_pending_tasks(
+                due_tasks,
+                self.ctx.venue_adapters,
+                now_ms=now_ms,
+                ownership_positions=getattr(state, "open_positions", {}).values(),
+                ownership_tasks=[
+                    task
+                    for task in tasks
+                    if isinstance(task, dict)
+                    and task.get("archived") is not True
+                    and task.get("official_pnl") is not True
+                ],
+                ownership_statement_claims=getattr(
+                    state,
+                    "funding_settlement_statement_claim_ledger",
+                    [],
+                ),
+            )
+        except Exception as error:
+            for index, task in zip(due_indexes, due_tasks, strict=True):
+                position_id = str(task.get("position_id") or "")
                 attempts = int(task.get("attempt_count") or 0) + 1
                 delay = min(
                     FUNDING_SETTLEMENT_RETRY_BASE_MS * (2 ** max(attempts - 1, 0)),
@@ -2146,57 +2209,468 @@ class CloseRuntime:
                         "next_attempt_ms": task["next_attempt_ms"],
                     },
                 )
-                retained.append(task)
-                continue
+                retained[index] = task
+            state.set_pending_funding_settlement_reconciliations(
+                [task for task in retained if task is not None]
+            )
+            return
 
+        # The synchronous test/maintenance path delegates result application
+        # to the production worker merger.  Both paths now share ownership
+        # conflicts, claim reservation, critical receipt, and retry semantics.
+        for index, task in zip(due_indexes, due_tasks, strict=True):
+            retained[index] = task
+        state.set_pending_funding_settlement_reconciliations(
+            [task for task in retained if task is not None]
+        )
+        self._apply_pending_funding_settlement_worker_results(
+            {"now_ms": int(now_ms), "due_tasks": due_tasks},
+            reconciled,
+        )
+
+    @staticmethod
+    def _pending_funding_settlement_task_identity(task: dict[str, Any]) -> tuple[str, int]:
+        try:
+            closed_at_ms = int(task.get("closed_at_ms") or 0)
+        except (TypeError, ValueError):
+            closed_at_ms = 0
+        return str(task.get("position_id") or ""), closed_at_ms
+
+    @staticmethod
+    def _pending_funding_settlement_task_next_attempt_ms(task: dict[str, Any]) -> int:
+        try:
+            value = int(task.get("next_attempt_ms") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(value, 0)
+
+    def _expire_pending_funding_settlement_tasks(self, *, now_ms: int) -> None:
+        """Apply local expiry transitions without waiting on private HTTP."""
+        state = self.ctx.state
+        for task in state.pending_funding_settlement_reconciliations:
+            if not isinstance(task, dict) or task.get("archived") is True:
+                continue
+            try:
+                deadline_ms = int(task.get("deadline_ms") or 0)
+            except (TypeError, ValueError):
+                deadline_ms = 0
+            if deadline_ms <= 0 or now_ms <= deadline_ms:
+                continue
+            task["status"] = "expired_statement_evidence"
+            task["official_pnl"] = False
+            task["archived"] = True
+            task["archive_reason"] = "statement_evidence_deadline_elapsed"
+            if task.get("expiry_event_emitted"):
+                continue
+            self.ctx.journal.append(
+                "funding.settlement_reconciliation_expired",
+                {
+                    "position_id": str(task.get("position_id") or ""),
+                    "symbol": str(task.get("symbol") or ""),
+                    "closed_at_ms": int(task.get("closed_at_ms") or 0),
+                    "deadline_ms": deadline_ms,
+                    "observed_settlement_count": len(
+                        task.get("funding_settlement_records") or []
+                    ),
+                },
+            )
+            task["expiry_event_emitted"] = True
+
+    async def _run_pending_funding_settlement_reconciliation_work(
+        self,
+        work: dict[str, Any],
+    ) -> list[tuple[dict[str, Any], Any]]:
+        """Perform only the blocking private-statement query off the tick lane."""
+        from lightfee.strategy.funding_settlement_reconciler import (
+            FundingSettlementReconciler,
+        )
+
+        return await asyncio.wait_for(
+            FundingSettlementReconciler().reconcile_pending_tasks(
+                work["due_tasks"],
+                self.ctx.venue_adapters,
+                now_ms=work["now_ms"],
+                ownership_positions=work["ownership_positions"],
+                ownership_tasks=work["ownership_tasks"],
+                ownership_statement_claims=work["ownership_statement_claims"],
+            ),
+            timeout=self._FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S,
+        )
+
+    @staticmethod
+    def _funding_settlement_claim_keys_for_task(
+        task: dict[str, Any],
+    ) -> set[tuple[str, str, int]]:
+        symbol = str(task.get("symbol") or "").upper()
+        if not symbol:
+            return set()
+        keys: set[tuple[str, str, int]] = set()
+        for required in task.get("required_settlements", []) or []:
+            if not isinstance(required, dict):
+                continue
+            venue = str(required.get("venue") or "").lower()
+            try:
+                timestamp = int(required.get("settlement_timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                timestamp = 0
+            if venue and timestamp > 0:
+                keys.add((venue, symbol, timestamp))
+        return keys
+
+    def _pending_funding_settlement_ownership_conflicts(
+        self,
+        identity: tuple[str, int],
+        task: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Find claims added after the worker snapshot before minting PnL."""
+        keys = self._funding_settlement_claim_keys_for_task(task)
+        if not keys:
+            return []
+        state = self.ctx.state
+        conflicts = [
+            other
+            for other in state.pending_funding_settlement_reconciliations
+            if isinstance(other, dict)
+            and self._pending_funding_settlement_task_identity(other) != identity
+            and other.get("archived") is not True
+            and other.get("official_pnl") is not True
+            and keys & self._funding_settlement_claim_keys_for_task(other)
+        ]
+        from lightfee.strategy.funding_settlement_reconciler import (
+            FundingSettlementReconciler,
+        )
+
+        for position in getattr(state, "open_positions", {}).values():
+            if any(claim.key in keys for claim in FundingSettlementReconciler._claims_for_position(position)):
+                conflicts.append({"position_id": getattr(position, "position_id", "")})
+        for claim in FundingSettlementReconciler._claims_for_statement_claim_ledger(
+            getattr(state, "funding_settlement_statement_claim_ledger", [])
+        ):
+            if claim.key in keys:
+                conflicts.append({"position_id": claim.owner_id})
+        return conflicts
+
+    def _apply_pending_funding_settlement_worker_failure(
+        self,
+        work: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        from lightfee.strategy.funding_settlement_reconciler import (
+            FUNDING_SETTLEMENT_RETRY_BASE_MS,
+            FUNDING_SETTLEMENT_RETRY_MAX_MS,
+        )
+
+        current_by_identity = {
+            self._pending_funding_settlement_task_identity(task): task
+            for task in self.ctx.state.pending_funding_settlement_reconciliations
+            if isinstance(task, dict)
+        }
+        now_ms = int(work["now_ms"])
+        for original in work["due_tasks"]:
+            task = current_by_identity.get(
+                self._pending_funding_settlement_task_identity(original)
+            )
+            if task is None or task.get("archived") is True:
+                continue
+            attempts = int(task.get("attempt_count") or 0) + 1
+            delay = min(
+                FUNDING_SETTLEMENT_RETRY_BASE_MS * (2 ** max(attempts - 1, 0)),
+                FUNDING_SETTLEMENT_RETRY_MAX_MS,
+            )
+            task.update(
+                {
+                    "attempt_count": attempts,
+                    "next_attempt_ms": now_ms + delay,
+                    "status": "unresolved_statement_evidence",
+                    "last_reason": f"reconciliation_error:{type(error).__name__}",
+                    "last_checked_at_ms": now_ms,
+                }
+            )
+            self._append_funding_settlement_reconciliation_diagnostic(
+                {
+                    "position_id": str(task.get("position_id") or ""),
+                    "reason": task["last_reason"],
+                    "attempt_count": attempts,
+                    "next_attempt_ms": task["next_attempt_ms"],
+                }
+            )
+
+    def _append_funding_settlement_reconciliation_diagnostic(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Best-effort telemetry that cannot undo a durable receipt commit."""
+        try:
+            self.ctx.journal.append(
+                "funding.settlement_reconciliation_deferred",
+                payload,
+            )
+        except Exception:
+            # ``append_critical`` is the accounting commit boundary.  A
+            # subsequent optional diagnostic write must not requeue a task
+            # whose receipt is already durable, or corrupt earlier entries in
+            # the same worker batch.
+            pass
+
+    def _apply_pending_funding_settlement_worker_results(
+        self,
+        work: dict[str, Any],
+        reconciled: list[tuple[dict[str, Any], Any]],
+    ) -> None:
+        """Merge completed work by durable identity, preserving new queue rows."""
+        from lightfee.strategy.funding_settlement_reconciler import (
+            FUNDING_SETTLEMENT_RETRY_BASE_MS,
+            FUNDING_SETTLEMENT_RETRY_MAX_MS,
+        )
+
+        state = self.ctx.state
+        current_by_identity = {
+            self._pending_funding_settlement_task_identity(task): task
+            for task in state.pending_funding_settlement_reconciliations
+            if isinstance(task, dict)
+        }
+        now_ms = int(work["now_ms"])
+        completed_identities: set[tuple[str, int]] = set()
+        for original, (updated, result) in zip(
+            work["due_tasks"],
+            reconciled,
+            strict=True,
+        ):
+            identity = self._pending_funding_settlement_task_identity(original)
+            current = current_by_identity.get(identity)
+            if current is None or current.get("archived") is True:
+                continue
+            previous_status = str(current.get("status") or "")
+            previous_reason = str(current.get("last_reason") or "")
+            merged = dict(current)
+            merged.update(updated)
             if result.official:
-                self.ctx.journal.append_critical(
-                    now_ms,
-                    "funding.settlement_reconciled",
-                    {
-                        "position_id": result.position_id,
-                        "symbol": str(updated.get("symbol") or ""),
-                        "closed_at_ms": int(updated.get("closed_at_ms") or 0),
-                        "required_settlement_count": result.required_count,
-                        "observed_settlement_count": result.observed_count,
-                        "official_funding_quote": updated.get("official_funding_quote"),
-                        "official_net_quote": updated.get("official_net_quote"),
-                        "price_pnl_quote": updated.get("price_pnl_quote"),
-                        "entry_fee_quote": updated.get("entry_fee_quote"),
-                        "exit_fee_quote": updated.get("exit_fee_quote"),
-                        "lifecycle_forecast_funding_quote": updated.get(
-                            "lifecycle_forecast_funding_quote"
-                        ),
-                        "funding_forecast_error_quote": updated.get(
-                            "funding_forecast_error_quote"
-                        ),
-                        "calculation_version": updated.get("calculation_version", ""),
-                        "model_epoch": updated.get("model_epoch", ""),
-                        "economics_observed_at_ms": updated.get(
-                            "economics_observed_at_ms", 0
-                        ),
-                    },
+                conflicts = self._pending_funding_settlement_ownership_conflicts(
+                    identity,
+                    merged,
                 )
+                if conflicts:
+                    merged.update(
+                        {
+                            "status": "unresolved_statement_evidence",
+                            "official_pnl": False,
+                            "last_reason": "ambiguous_position_ownership",
+                            "next_attempt_ms": now_ms + 300_000,
+                        }
+                    )
+                    current.clear()
+                    current.update(merged)
+                    for conflict in conflicts:
+                        if not isinstance(conflict, dict) or conflict not in state.pending_funding_settlement_reconciliations:
+                            continue
+                        conflict.update(
+                            {
+                                "status": "unresolved_statement_evidence",
+                                "official_pnl": False,
+                                "last_reason": "ambiguous_position_ownership",
+                                "next_attempt_ms": now_ms + 300_000,
+                            }
+                        )
+                    self._append_funding_settlement_reconciliation_diagnostic(
+                        {
+                            "position_id": result.position_id,
+                            "symbol": str(merged.get("symbol") or ""),
+                            "reason": merged["last_reason"],
+                            "attempt_count": int(merged.get("attempt_count") or 0),
+                            "next_attempt_ms": merged["next_attempt_ms"],
+                            "required_settlement_count": result.required_count,
+                            "observed_settlement_count": result.observed_count,
+                        }
+                    )
+                    continue
+                if not state.record_funding_settlement_statement_claims(
+                    merged,
+                    recorded_at_ms=now_ms,
+                ):
+                    merged.update(
+                        {
+                            "status": "unresolved_statement_evidence",
+                            "official_pnl": False,
+                            "last_reason": "statement_claim_ledger_conflict_or_capacity",
+                            "next_attempt_ms": now_ms + 300_000,
+                        }
+                    )
+                    current.clear()
+                    current.update(merged)
+                    self._append_funding_settlement_reconciliation_diagnostic(
+                        {
+                            "position_id": result.position_id,
+                            "symbol": str(merged.get("symbol") or ""),
+                            "reason": merged["last_reason"],
+                            "attempt_count": int(merged.get("attempt_count") or 0),
+                            "next_attempt_ms": merged["next_attempt_ms"],
+                            "required_settlement_count": result.required_count,
+                            "observed_settlement_count": result.observed_count,
+                        }
+                    )
+                    continue
+                try:
+                    self.ctx.journal.append_critical(
+                        now_ms,
+                        "funding.settlement_reconciled",
+                        _funding_settlement_receipt_payload(state, merged, result),
+                    )
+                except Exception as error:
+                    # Keep a batch's earlier durable receipts committed.  A
+                    # later receipt failure affects only its own task; rolling
+                    # back the entire worker result would retry an already
+                    # journaled accounting receipt after restart.
+                    state.release_funding_settlement_statement_claims(merged)
+                    attempts = int(merged.get("attempt_count") or 0) + 1
+                    delay = min(
+                        FUNDING_SETTLEMENT_RETRY_BASE_MS
+                        * (2 ** max(attempts - 1, 0)),
+                        FUNDING_SETTLEMENT_RETRY_MAX_MS,
+                    )
+                    merged.update(
+                        {
+                            "attempt_count": attempts,
+                            "next_attempt_ms": now_ms + delay,
+                            "status": "unresolved_statement_evidence",
+                            "official_pnl": False,
+                            "last_reason": (
+                                f"reconciliation_error:{type(error).__name__}"
+                            ),
+                            "last_checked_at_ms": now_ms,
+                        }
+                    )
+                    current.clear()
+                    current.update(merged)
+                    self._append_funding_settlement_reconciliation_diagnostic(
+                        {
+                            "position_id": result.position_id,
+                            "symbol": str(merged.get("symbol") or ""),
+                            "reason": merged["last_reason"],
+                            "attempt_count": attempts,
+                            "next_attempt_ms": merged["next_attempt_ms"],
+                        }
+                    )
+                    continue
+                # A critical receipt is the durable commit.  Remove this
+                # item immediately so a later unexpected failure in the same
+                # batch cannot feed it back into the retry path.
+                completed_identities.add(identity)
+                state.set_pending_funding_settlement_reconciliations(
+                    [
+                        task
+                        for task in state.pending_funding_settlement_reconciliations
+                        if not isinstance(task, dict)
+                        or self._pending_funding_settlement_task_identity(task)
+                        != identity
+                    ]
+                )
+                current_by_identity = {
+                    self._pending_funding_settlement_task_identity(task): task
+                    for task in state.pending_funding_settlement_reconciliations
+                    if isinstance(task, dict)
+                }
                 continue
-
-            updated_status = str(updated.get("status") or "")
-            updated_reason = str(updated.get("last_reason") or result.reason or "")
+            current.clear()
+            current.update(merged)
+            updated_status = str(merged.get("status") or "")
+            updated_reason = str(merged.get("last_reason") or result.reason or "")
             if previous_status != updated_status or previous_reason != updated_reason:
-                self.ctx.journal.append(
-                    "funding.settlement_reconciliation_deferred",
+                self._append_funding_settlement_reconciliation_diagnostic(
                     {
                         "position_id": result.position_id,
-                        "symbol": str(updated.get("symbol") or ""),
+                        "symbol": str(merged.get("symbol") or ""),
                         "reason": updated_reason or "statement_not_observed",
-                        "attempt_count": int(updated.get("attempt_count") or 0),
-                        "next_attempt_ms": int(updated.get("next_attempt_ms") or 0),
+                        "attempt_count": int(merged.get("attempt_count") or 0),
+                        "next_attempt_ms": int(merged.get("next_attempt_ms") or 0),
                         "required_settlement_count": result.required_count,
                         "observed_settlement_count": result.observed_count,
-                    },
+                    }
                 )
-            retained.append(updated)
+        if completed_identities:
+            state.set_pending_funding_settlement_reconciliations(
+                [
+                    task
+                    for task in state.pending_funding_settlement_reconciliations
+                    if not isinstance(task, dict)
+                    or self._pending_funding_settlement_task_identity(task)
+                    not in completed_identities
+                ]
+            )
 
-        state.set_pending_funding_settlement_reconciliations(retained)
+    async def drive_pending_funding_settlement_reconciliations_nonblocking(
+        self,
+        now_ms: int,
+    ) -> None:
+        """Advance post-close accounting without blocking repair/recovery work."""
+        state = self.ctx.state
+        state.set_pending_funding_settlement_reconciliations(
+            getattr(state, "pending_funding_settlement_reconciliations", [])
+        )
+        if self.ctx.config.runtime.mode != "live":
+            return
+        self._expire_pending_funding_settlement_tasks(now_ms=now_ms)
+
+        worker = self._funding_settlement_reconciliation_worker
+        if worker is not None:
+            if not worker.done():
+                return
+            work = self._funding_settlement_reconciliation_work or {}
+            self._funding_settlement_reconciliation_worker = None
+            self._funding_settlement_reconciliation_work = None
+            try:
+                self._apply_pending_funding_settlement_worker_results(
+                    work,
+                    worker.result(),
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as error:
+                self._apply_pending_funding_settlement_worker_failure(work, error)
+            return
+
+        due_tasks = [
+            dict(task)
+            for task in state.pending_funding_settlement_reconciliations
+            if isinstance(task, dict)
+            and task.get("archived") is not True
+            and task.get("official_pnl") is not True
+            and self._pending_funding_settlement_task_next_attempt_ms(task) <= now_ms
+        ]
+        if not due_tasks:
+            return
+        work = {
+            "now_ms": int(now_ms),
+            "due_tasks": due_tasks,
+            "ownership_positions": list(getattr(state, "open_positions", {}).values()),
+            "ownership_tasks": [
+                dict(task)
+                for task in state.pending_funding_settlement_reconciliations
+                if isinstance(task, dict)
+                and task.get("archived") is not True
+                and task.get("official_pnl") is not True
+            ],
+            "ownership_statement_claims": list(
+                getattr(state, "funding_settlement_statement_claim_ledger", [])
+            ),
+        }
+        self._funding_settlement_reconciliation_work = work
+        self._funding_settlement_reconciliation_worker = asyncio.create_task(
+            self._run_pending_funding_settlement_reconciliation_work(work),
+            name="funding-settlement-reconciliation",
+        )
+
+    async def shutdown_pending_funding_settlement_reconciliation_worker(self) -> None:
+        """Cancel accounting I/O before adapters and journals are shut down."""
+        worker = self._funding_settlement_reconciliation_worker
+        self._funding_settlement_reconciliation_worker = None
+        self._funding_settlement_reconciliation_work = None
+        if worker is None or worker.done():
+            return
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
 
     def _exit_shadow_config(self) -> ExitShadowConfig:
         strategy = self.ctx.config.strategy

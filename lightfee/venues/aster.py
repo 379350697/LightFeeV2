@@ -368,6 +368,27 @@ class AsterAdapter(VenueAdapter):
             raise self._private_unavailable()
         return await self._transport.fetch_account_risk_snapshot()
 
+    async def inspect_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> EntryLeverageEvidence | None:
+        if self._private is not None:
+            return await self._private.inspect_entry_leverage(
+                symbol,
+                leverage,
+                notional_quote=notional_quote,
+            )
+        if self._mode == "live":
+            raise self._private_unavailable()
+        return await self._transport.inspect_entry_leverage(
+            symbol,
+            leverage,
+            notional_quote=notional_quote,
+        )
+
     async def ensure_entry_leverage(
         self,
         symbol: str,

@@ -185,6 +185,7 @@ class SpreadSidecarService:
                 candidate,
                 quotes,
                 finalist_rank=rank,
+                decision_at_ms=observed_ms,
             ):
                 paper_events.append(
                     (
@@ -278,6 +279,9 @@ class SpreadSidecarService:
         return SpreadPaperConfig(
             enabled=strategy.spread_paper_enabled,
             finalist_limit=int(strategy.spread_paper_finalist_limit),
+            min_decision_latency_ms=int(
+                strategy.spread_paper_min_decision_latency_ms
+            ),
             markout_secs=list(strategy.spread_paper_markout_secs),
             terminal_secs=int(strategy.spread_paper_terminal_secs),
             active_exit_enabled=True,

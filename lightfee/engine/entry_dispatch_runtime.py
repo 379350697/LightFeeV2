@@ -69,6 +69,7 @@ def _entry_leverage_evidence_payload(
         "symbol": evidence.symbol,
         "requested_leverage": evidence.requested_leverage,
         "effective_leverage": evidence.effective_leverage,
+        "account_leverage": evidence.account_leverage,
         "notional_quote": evidence.notional_quote,
         "bracket_verified": evidence.bracket_verified,
         "account_verified": evidence.account_verified,
@@ -611,10 +612,144 @@ class EntryDispatchRuntime:
         long_venue: Venue,
         short_venue: Venue,
         notional_quote: float | None = None,
+        minimum_evidence_by_venue: dict[Venue, EntryLeverageEvidence] | None = None,
     ) -> tuple[bool, dict[Venue, EntryLeverageEvidence]]:
+        """Prepare both venues as one compensable transaction.
+
+        A caller timeout must not abandon a leverage POST after one venue has
+        accepted it.  The child task is shielded from caller cancellation,
+        publishes a prepared state, and waits for this caller to commit.  A
+        cancellation before that commit restores every attempted mutation.
+        """
+        cancellation_requested = asyncio.Event()
+        commit_requested = asyncio.Event()
+        finalize_requested = asyncio.Event()
+        prepared_result: asyncio.Future[
+            tuple[bool, dict[Venue, EntryLeverageEvidence]]
+        ] = asyncio.get_running_loop().create_future()
+        returnable_result: asyncio.Future[
+            tuple[bool, dict[Venue, EntryLeverageEvidence]]
+        ] = asyncio.get_running_loop().create_future()
+
+        async def _operation() -> tuple[bool, dict[Venue, EntryLeverageEvidence]]:
+            try:
+                return await self._prepare_live_entry_leverage_transaction(
+                    candidate=candidate,
+                    now_ms=now_ms,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                    notional_quote=notional_quote,
+                    minimum_evidence_by_venue=minimum_evidence_by_venue,
+                    cancellation_requested=cancellation_requested,
+                    commit_requested=commit_requested,
+                    prepared_result=prepared_result,
+                    finalize_requested=finalize_requested,
+                    returnable_result=returnable_result,
+                )
+            except BaseException as exc:
+                if not prepared_result.done():
+                    prepared_result.set_exception(exc)
+                elif not returnable_result.done():
+                    # Once the caller has observed a prepared state it waits
+                    # on this second future.  Do not leave it stranded if a
+                    # post-prepare operation (for example the durable ready
+                    # receipt) fails unexpectedly.
+                    returnable_result.set_exception(exc)
+                raise
+
+        operation = asyncio.create_task(
+            _operation()
+        )
+
+        def _consume_operation_exception(
+            task: asyncio.Task[tuple[bool, dict[Venue, EntryLeverageEvidence]]],
+        ) -> None:
+            with suppress(asyncio.CancelledError):
+                task.result()
+
+        operation.add_done_callback(_consume_operation_exception)
+        try:
+            ready, _prepared_evidence = await asyncio.shield(prepared_result)
+            if not ready:
+                return await asyncio.shield(operation)
+            # The caller has now observed the fully verified prepared state.
+            # Only this explicit hand-off permits the child to retain the
+            # exchange setting and publish its ready receipt.
+            commit_requested.set()
+            result = await asyncio.shield(returnable_result)
+            # No await follows this hand-off.  A cancellation can therefore
+            # only be observed before it (when rollback is still available)
+            # or after this method has returned the prepared state.
+            finalize_requested.set()
+            return result
+        except asyncio.CancelledError:
+            cancellation_requested.set()
+            commit_requested.set()
+            finalize_requested.set()
+            # ``shield`` leaves the child running.  Complete its verified
+            # rollback before propagating the cancellation to the caller.
+            # A second cancellation must not detach the compensating task.
+            # Consume only those subsequent cancellation requests and keep
+            # waiting; the original ``CancelledError`` below remains the
+            # caller-visible outcome once every attempted venue is settled.
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None:
+                        current_task.uncancel()
+                    continue
+                except BaseException:
+                    # The transaction journals its own venue failures; the
+                    # caller's cancellation remains authoritative.
+                    break
+            raise
+
+    async def _prepare_live_entry_leverage_transaction(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+        notional_quote: float | None = None,
+        minimum_evidence_by_venue: dict[Venue, EntryLeverageEvidence] | None = None,
+        cancellation_requested: asyncio.Event | None = None,
+        commit_requested: asyncio.Event | None = None,
+        prepared_result: asyncio.Future[
+            tuple[bool, dict[Venue, EntryLeverageEvidence]]
+        ] | None = None,
+        finalize_requested: asyncio.Event | None = None,
+        returnable_result: asyncio.Future[
+            tuple[bool, dict[Venue, EntryLeverageEvidence]]
+        ] | None = None,
+    ) -> tuple[bool, dict[Venue, EntryLeverageEvidence]]:
+        def _finish_without_mutation(
+            ready: bool,
+        ) -> tuple[bool, dict[Venue, EntryLeverageEvidence]]:
+            result = (ready, {})
+            if prepared_result is not None and not prepared_result.done():
+                prepared_result.set_result(result)
+            if returnable_result is not None and not returnable_result.done():
+                # Paper mode and adapters without an entry-leverage endpoint
+                # have no exchange mutation to commit.  They must still
+                # satisfy the outer two-stage protocol rather than leaving
+                # its returnable future unresolved.
+                returnable_result.set_result(result)
+            return result
+
+        def _append_journal_safely(kind: str, payload: dict[str, Any]) -> BaseException | None:
+            """Keep rollback progressing even when the audit sink is unavailable."""
+            try:
+                self.ctx.journal.append(kind, payload)
+            except BaseException as exc:
+                return exc
+            return None
+
         mode = str(self.ctx.config.runtime.mode or "").lower()
         if mode != "live":
-            return True, {}
+            return _finish_without_mutation(True)
         try:
             target_leverage = int(self.ctx.config.strategy.live_target_leverage or 0)
         except (TypeError, ValueError):
@@ -623,6 +758,445 @@ class EntryDispatchRuntime:
             # Live config validation should make this unreachable.  Leaving a
             # silent success here would let a degraded injected config bypass
             # the final account-preparation gate.
+            return _finish_without_mutation(False)
+
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        if notional_quote is None:
+            notional_quote = float(
+                getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+            )
+        else:
+            notional_quote = max(float(notional_quote or 0.0), 0.0)
+        pair_id = self._candidate_pair_id(candidate)
+        tasks: list[tuple[Venue, Any, Any]] = []
+        for venue in (long_venue, short_venue):
+            if venue not in (Venue.BINANCE, Venue.ASTER):
+                continue
+            adapter = self.ctx.venue_adapters.get(venue)
+            ensure = getattr(adapter, "ensure_entry_leverage", None) if adapter else None
+            if callable(ensure):
+                inspect = getattr(adapter, "inspect_entry_leverage", None)
+                tasks.append((venue, ensure, inspect))
+        if not tasks:
+            return _finish_without_mutation(True)
+
+        async def _call_operation(
+            operation: Any,
+            leverage: int,
+            operation_notional_quote: float,
+        ) -> Any:
+            try:
+                return await operation(
+                    symbol,
+                    leverage,
+                    notional_quote=operation_notional_quote,
+                )
+            except TypeError as exc:
+                if "notional_quote" not in str(exc):
+                    raise
+                return await operation(symbol, leverage)
+
+        async def _call(
+            venue: Venue,
+            ensure: Any,
+            inspect: Any,
+        ) -> tuple[
+            Venue,
+            EntryLeverageEvidence | None,
+            int,
+            EntryLeverageEvidence | None,
+            Any,
+            bool,
+            BaseException | None,
+        ]:
+            original_leverage = 0
+            inspected: EntryLeverageEvidence | None = None
+            ensure_attempted = False
+            try:
+                if callable(inspect):
+                    inspected = await _call_operation(
+                        inspect,
+                        target_leverage,
+                        notional_quote,
+                    )
+                    if not isinstance(inspected, EntryLeverageEvidence):
+                        raise ValueError("entry leverage pre-set inspection evidence missing")
+                    if inspected.venue != venue or inspected.symbol != symbol:
+                        raise ValueError(
+                            "entry leverage inspection venue/symbol mismatch"
+                        )
+                    # Legacy adapters did not expose the exact account
+                    # setting.  Their effective value is an acceptable
+                    # compatibility fallback only when account truth was
+                    # explicitly verified; first-party adapters always
+                    # return ``account_leverage``.
+                    original_leverage = int(inspected.account_leverage or 0)
+                    if original_leverage <= 0 and inspected.account_verified:
+                        original_leverage = int(inspected.effective_leverage or 0)
+                    if original_leverage <= 0:
+                        raise ValueError(
+                            "entry leverage original setting unverified"
+                        )
+                else:
+                    raise ValueError("entry leverage pre-set inspection unavailable")
+                ensure_attempted = True
+                result = await _call_operation(
+                    ensure,
+                    target_leverage,
+                    notional_quote,
+                )
+                if not isinstance(result, EntryLeverageEvidence):
+                    return (
+                        venue,
+                        None,
+                        original_leverage,
+                        inspected,
+                        ensure,
+                        ensure_attempted,
+                        None,
+                    )
+                if result.venue != venue or result.symbol != symbol:
+                    return (
+                        venue,
+                        None,
+                        original_leverage,
+                        inspected,
+                        ensure,
+                        ensure_attempted,
+                        ValueError("entry leverage evidence venue/symbol mismatch"),
+                    )
+                return (
+                    venue,
+                    result,
+                    original_leverage,
+                    inspected,
+                    ensure,
+                    ensure_attempted,
+                    None,
+                )
+            except BaseException as exc:
+                return (
+                    venue,
+                    None,
+                    original_leverage,
+                    inspected,
+                    ensure,
+                    ensure_attempted,
+                    exc,
+                )
+
+        results = await asyncio.gather(
+            *[_call(venue, ensure, inspect) for venue, ensure, inspect in tasks]
+        )
+        semantic_failures: list[tuple[Venue, str]] = []
+        for venue, evidence, _original, inspected, _ensure, _attempted, exc in results:
+            if exc is not None:
+                continue
+            requirements = [
+                item
+                for item in (
+                    inspected,
+                    (minimum_evidence_by_venue or {}).get(venue),
+                )
+                if isinstance(item, EntryLeverageEvidence) and item.evidence_complete
+            ]
+            for requirement in requirements:
+                if not isinstance(evidence, EntryLeverageEvidence):
+                    semantic_failures.append(
+                        (venue, "entry leverage final evidence missing")
+                    )
+                    break
+                if not evidence.evidence_complete:
+                    semantic_failures.append(
+                        (venue, "entry leverage final evidence incomplete")
+                    )
+                    break
+                if evidence.effective_leverage < requirement.effective_leverage:
+                    semantic_failures.append(
+                        (venue, "entry leverage final evidence weaker than pre-set evidence")
+                    )
+                    break
+        initially_ready = not semantic_failures and all(
+            exc is None
+            for _venue, _evidence, _original, _inspected, _ensure, _attempted, exc in results
+        )
+        prepared_evidence = {
+            venue: evidence
+            for venue, evidence, _original, _inspected, _ensure, _attempted, _exc in results
+            if isinstance(evidence, EntryLeverageEvidence)
+        }
+        if prepared_result is not None:
+            prepared_result.set_result(
+                (initially_ready, prepared_evidence if initially_ready else {})
+            )
+        if initially_ready and commit_requested is not None:
+            await commit_requested.wait()
+        evidence_by_venue: dict[Venue, EntryLeverageEvidence] = {}
+        if initially_ready and cancellation_requested is not None and not cancellation_requested.is_set():
+            # This receipt is part of successful preparation, not deferred
+            # bookkeeping.  The dispatcher must never submit a first leg
+            # before recovery can prove the verified leverage state.
+            for venue, evidence, _original, _inspected, _ensure, _attempted, _exc in results:
+                if evidence is not None:
+                    evidence_by_venue[venue] = evidence
+                try:
+                    self.ctx.journal.append(
+                        "execution.entry_leverage_ready",
+                        {
+                            "venue": venue.value,
+                            "symbol": symbol,
+                            "target_leverage": target_leverage,
+                            "entry_notional_quote": notional_quote,
+                            "candidate_pair_id": pair_id,
+                            "pair_id": pair_id,
+                            "leverage_evidence": _entry_leverage_evidence_payload(evidence),
+                            "ts_ms": now_ms,
+                        },
+                    )
+                except BaseException as exc:
+                    semantic_failures.append(
+                        (venue, f"entry leverage ready receipt failed: {exc}")
+                    )
+                    break
+            initially_ready = not semantic_failures
+        if (
+            initially_ready
+            and cancellation_requested is not None
+            and not cancellation_requested.is_set()
+            and returnable_result is not None
+        ):
+            returnable_result.set_result((True, prepared_evidence))
+            if finalize_requested is not None:
+                await finalize_requested.wait()
+        cancellation_failures: list[tuple[Venue, str]] = []
+        if cancellation_requested is not None and cancellation_requested.is_set():
+            cancellation_failures = [
+                (venue, "entry leverage preparation cancelled")
+                for venue, _evidence, _original, _inspected, _ensure, attempted, _exc in results
+                if attempted
+            ]
+        ok = not cancellation_failures and not semantic_failures and all(
+            exc is None
+            for _venue, _evidence, _original, _inspected, _ensure, _attempted, exc in results
+        )
+        if not ok:
+            compensation_failures: list[tuple[Venue, str]] = []
+            for (
+                venue,
+                evidence,
+                original_leverage,
+                _inspected,
+                ensure,
+                ensure_attempted,
+                _exc,
+            ) in results:
+                # A transport failure may arrive after the exchange has set
+                # leverage.  Any attempted mutation is therefore restored,
+                # not merely the calls that returned a success receipt.
+                if not ensure_attempted:
+                    continue
+                if original_leverage <= 0:
+                    compensation_failures.append(
+                        (venue, "original_leverage_not_verified")
+                    )
+                    continue
+                if (
+                    isinstance(evidence, EntryLeverageEvidence)
+                    and evidence.account_verified
+                    and evidence.account_leverage == original_leverage
+                ):
+                    continue
+                try:
+                    restored = await _call_operation(ensure, original_leverage, 0.0)
+                    if (
+                        not isinstance(restored, EntryLeverageEvidence)
+                        or restored.venue != venue
+                        or restored.symbol != symbol
+                        or not restored.account_verified
+                        or restored.account_leverage != original_leverage
+                    ):
+                        raise ValueError(
+                            "entry leverage compensation account setting not verified"
+                        )
+                except BaseException as restore_error:
+                    compensation_failures.append(
+                        (venue, f"{type(restore_error).__name__}: {restore_error}"))
+                    continue
+                receipt_error = _append_journal_safely(
+                    "execution.entry_leverage_compensated",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "target_leverage": target_leverage,
+                        "restored_leverage": original_leverage,
+                        "entry_notional_quote": notional_quote,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "leverage_evidence": _entry_leverage_evidence_payload(evidence),
+                        "restored_leverage_evidence": _entry_leverage_evidence_payload(
+                            restored
+                        ),
+                        "ts_ms": now_ms,
+                    },
+                )
+                if receipt_error is not None:
+                    # Exchange restoration succeeded but cannot be proved
+                    # durably.  Treat that as a fail-closed admission error,
+                    # while continuing to restore every remaining venue.
+                    compensation_failures.append(
+                        (
+                            venue,
+                            "entry_leverage_compensation_receipt_failed: "
+                            f"{type(receipt_error).__name__}: {receipt_error}",
+                        )
+                    )
+            for venue, restore_error in compensation_failures:
+                metadata = {
+                    "reason": "entry_leverage_compensation_failed",
+                    "official_doc_url": "",
+                    "evidence_gap": True,
+                }
+                # State is armed before its journal writes in the runtime;
+                # isolate a broken audit sink so one venue cannot prevent
+                # the remaining failures from being fail-closed in memory.
+                with suppress(BaseException):
+                    self._record_symbol_admission_block(
+                        venue=venue,
+                        symbol=symbol,
+                        reason=metadata["reason"],
+                        raw_error=restore_error,
+                        now_ms=now_ms,
+                        evidence=metadata,
+                        source="entry_leverage_compensation",
+                        candidate_pair_id=pair_id,
+                    )
+                _append_journal_safely(
+                    "execution.entry_leverage_compensation_failed",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "reason": restore_error[:500],
+                        "ts_ms": now_ms,
+                    },
+                )
+            failure_by_venue = {
+                venue: reason
+                for venue, reason in (*semantic_failures, *cancellation_failures)
+            }
+            for venue, _evidence, _original, _inspected, _ensure, _attempted, exc in results:
+                error_text = str(exc) if exc is not None else failure_by_venue.get(venue, "")
+                if not error_text:
+                    continue
+                metadata = self._entry_admission_reject_metadata(venue, error_text)
+                if metadata:
+                    reason = str(metadata["reason"])
+                else:
+                    reason = "entry_leverage_unavailable"
+                    metadata = {
+                        "reason": reason,
+                        "official_doc_url": "",
+                        "evidence_gap": True,
+                    }
+                with suppress(BaseException):
+                    self._record_symbol_admission_block(
+                        venue=venue,
+                        symbol=symbol,
+                        reason=reason,
+                        raw_error=error_text,
+                        now_ms=now_ms,
+                        evidence=metadata,
+                        source="entry_leverage_prepare",
+                        candidate_pair_id=pair_id,
+                    )
+                _append_journal_safely(
+                    "execution.entry_leverage_unavailable",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "target_leverage": target_leverage,
+                        "entry_notional_quote": notional_quote,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "reason": reason,
+                        "raw_error": error_text[:500],
+                        "official_doc_url": metadata.get("official_doc_url", ""),
+                        "evidence_gap": bool(metadata.get("evidence_gap", True)),
+                        "ts_ms": now_ms,
+                    },
+                )
+            if semantic_failures:
+                failed_venue, _failure_reason = semantic_failures[0]
+                final = next(
+                    (
+                        evidence
+                        for venue, evidence, _original, _inspected, _ensure, _attempted, _exc in results
+                        if venue == failed_venue
+                    ),
+                    None,
+                )
+                minimum = (minimum_evidence_by_venue or {}).get(failed_venue)
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason="entry_leverage_weakened_after_sizing",
+                    blocked_reasons=["entry_leverage_weakened_after_sizing"],
+                    source="entry_leverage_prepare",
+                    decision="skip_before_first_leg",
+                    extra={
+                        "venue": failed_venue.value,
+                        "inspected_leverage": _entry_leverage_evidence_payload(minimum),
+                        "final_leverage": _entry_leverage_evidence_payload(final),
+                        "final_evidence_complete": bool(
+                            isinstance(final, EntryLeverageEvidence)
+                            and final.evidence_complete
+                        ),
+                    },
+                )
+            _append_journal_safely(
+                "runtime.entry_blocked_gate",
+                {
+                    "symbol": symbol,
+                    "gate": "entry_leverage_prepare",
+                    "reason": "entry_leverage_unavailable",
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "ts_ms": now_ms,
+                },
+            )
+            if returnable_result is not None and not returnable_result.done():
+                # The caller has already observed the pre-commit prepared
+                # state, so complete its hand-off only after compensation.
+                returnable_result.set_result((False, {}))
+            return False, {}
+
+        return True, evidence_by_venue
+
+    async def _inspect_live_entry_leverage_for_candidate(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+        notional_quote: float | None = None,
+    ) -> tuple[bool, dict[Venue, EntryLeverageEvidence]]:
+        """Collect GET-only leverage evidence for conservative live sizing.
+
+        This phase is intentionally separate from ``_prepare...``.  A
+        candidate can still fail portfolio, duplicate, quote, or post-only
+        gates after sizing; none of those rejected candidates may change an
+        exchange leverage setting.
+        """
+        mode = str(self.ctx.config.runtime.mode or "").lower()
+        if mode != "live":
+            return True, {}
+        try:
+            target_leverage = int(self.ctx.config.strategy.live_target_leverage or 0)
+        except (TypeError, ValueError):
+            target_leverage = 0
+        if target_leverage <= 0:
             return False, {}
 
         symbol = str(getattr(candidate, "symbol", "") or "")
@@ -638,19 +1212,19 @@ class EntryDispatchRuntime:
             if venue not in (Venue.BINANCE, Venue.ASTER):
                 continue
             adapter = self.ctx.venue_adapters.get(venue)
-            ensure = getattr(adapter, "ensure_entry_leverage", None) if adapter else None
-            if callable(ensure):
-                tasks.append((venue, ensure))
+            inspect = getattr(adapter, "inspect_entry_leverage", None) if adapter else None
+            if callable(inspect):
+                tasks.append((venue, inspect))
         if not tasks:
             return True, {}
 
         async def _call(
             venue: Venue,
-            ensure: Any,
+            inspect: Any,
         ) -> tuple[Venue, EntryLeverageEvidence | None, BaseException | None]:
             try:
                 try:
-                    result = await ensure(
+                    result = await inspect(
                         symbol,
                         target_leverage,
                         notional_quote=notional_quote,
@@ -658,18 +1232,18 @@ class EntryDispatchRuntime:
                 except TypeError as exc:
                     if "notional_quote" not in str(exc):
                         raise
-                    result = await ensure(symbol, target_leverage)
+                    result = await inspect(symbol, target_leverage)
                 if not isinstance(result, EntryLeverageEvidence):
                     return venue, None, None
                 if result.venue != venue or result.symbol != symbol:
                     return venue, None, ValueError(
-                        "entry leverage evidence venue/symbol mismatch"
+                        "entry leverage inspection venue/symbol mismatch"
                     )
                 return venue, result, None
             except Exception as exc:
                 return venue, None, exc
 
-        results = await asyncio.gather(*[_call(venue, ensure) for venue, ensure in tasks])
+        results = await asyncio.gather(*[_call(venue, inspect) for venue, inspect in tasks])
         ok = True
         evidence_by_venue: dict[Venue, EntryLeverageEvidence] = {}
         for venue, evidence, exc in results:
@@ -677,7 +1251,7 @@ class EntryDispatchRuntime:
                 if evidence is not None:
                     evidence_by_venue[venue] = evidence
                 self.ctx.journal.append(
-                    "execution.entry_leverage_ready",
+                    "execution.entry_leverage_inspected",
                     {
                         "venue": venue.value,
                         "symbol": symbol,
@@ -694,15 +1268,12 @@ class EntryDispatchRuntime:
             ok = False
             error_text = str(exc)
             metadata = self._entry_admission_reject_metadata(venue, error_text)
-            if metadata:
-                reason = str(metadata["reason"])
-            else:
-                reason = "entry_leverage_unavailable"
-                metadata = {
-                    "reason": reason,
-                    "official_doc_url": "",
-                    "evidence_gap": True,
-                }
+            reason = str(metadata["reason"]) if metadata else "entry_leverage_unavailable"
+            metadata = metadata or {
+                "reason": reason,
+                "official_doc_url": "",
+                "evidence_gap": True,
+            }
             self._record_symbol_admission_block(
                 venue=venue,
                 symbol=symbol,
@@ -710,11 +1281,11 @@ class EntryDispatchRuntime:
                 raw_error=error_text,
                 now_ms=now_ms,
                 evidence=metadata,
-                source="entry_leverage_prepare",
+                source="entry_leverage_inspection",
                 candidate_pair_id=pair_id,
             )
             self.ctx.journal.append(
-                "execution.entry_leverage_unavailable",
+                "execution.entry_leverage_inspection_unavailable",
                 {
                     "venue": venue.value,
                     "symbol": symbol,
@@ -734,7 +1305,7 @@ class EntryDispatchRuntime:
                 "runtime.entry_blocked_gate",
                 {
                     "symbol": symbol,
-                    "gate": "entry_leverage_prepare",
+                    "gate": "entry_leverage_inspection",
                     "reason": "entry_leverage_unavailable",
                     "candidate_pair_id": pair_id,
                     "pair_id": pair_id,
@@ -3066,7 +3637,7 @@ class EntryDispatchRuntime:
             self.ctx.config.runtime.mode == "live"
             and float(getattr(candidate, "entry_target_quantity", 0.0) or 0.0) > 0.0
         )
-        leverage_prepared_for_sizing = False
+        leverage_evidence_for_sizing: dict[Venue, EntryLeverageEvidence] = {}
         expected_shortfall_bps_entry = 0.0
         if enhanced_live_candidate:
             strategy = self.ctx.config.strategy
@@ -3213,8 +3784,8 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            leverage_ready, leverage_evidence_by_venue = (
-                await self._prepare_live_entry_leverage_for_candidate(
+            leverage_ready, leverage_evidence_for_sizing = (
+                await self._inspect_live_entry_leverage_for_candidate(
                     candidate=candidate,
                     now_ms=now_ms,
                     long_venue=long_venue,
@@ -3228,7 +3799,6 @@ class EntryDispatchRuntime:
             )
             if not leverage_ready:
                 return False
-            leverage_prepared_for_sizing = True
             margin_resolution = await self._resolve_live_margin_quantity(
                 candidate=candidate,
                 now_ms=now_ms,
@@ -3240,7 +3810,7 @@ class EntryDispatchRuntime:
                 okx_base_step=okx_base_step,
                 long_quantity_step=long_quantity_step,
                 short_quantity_step=short_quantity_step,
-                leverage_evidence_by_venue=leverage_evidence_by_venue,
+                leverage_evidence_by_venue=leverage_evidence_for_sizing,
             )
             if margin_resolution is None:
                 return False
@@ -3675,18 +4245,6 @@ class EntryDispatchRuntime:
         ):
             return False
 
-        if not leverage_prepared_for_sizing:
-            leverage_ready, _leverage_evidence = (
-                await self._prepare_live_entry_leverage_for_candidate(
-                    candidate=candidate,
-                    now_ms=now_ms,
-                    long_venue=long_venue,
-                    short_venue=short_venue,
-                )
-            )
-            if not leverage_ready:
-                return False
-
         maker_bbo_evidence: dict = {}
         if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
             maker_order_price_hint = (
@@ -3742,6 +4300,55 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+
+        # This is the first potentially mutating leverage operation.  Every
+        # preceding rejection is venue-side-effect free; a partial two-venue
+        # prepare below is compensated back to its just-inspected setting
+        # before the candidate is rejected.  The successful post-set evidence
+        # must not be weaker than the GET-only evidence used for sizing.
+        leverage_ready, final_leverage_evidence = (
+            await self._prepare_live_entry_leverage_for_candidate(
+                candidate=candidate,
+                now_ms=now_ms,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                notional_quote=max(long_order_price_hint, short_order_price_hint)
+                * effective_quantity,
+                minimum_evidence_by_venue=leverage_evidence_for_sizing,
+            )
+        )
+        if not leverage_ready:
+            return False
+        for venue, inspected in leverage_evidence_for_sizing.items():
+            final = final_leverage_evidence.get(venue)
+            if (
+                inspected.evidence_complete
+                and (
+                    not isinstance(final, EntryLeverageEvidence)
+                    or not final.evidence_complete
+                    or final.effective_leverage < inspected.effective_leverage
+                )
+            ):
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason="entry_leverage_weakened_after_sizing",
+                    blocked_reasons=["entry_leverage_weakened_after_sizing"],
+                    source="entry_leverage_prepare",
+                    decision="skip_before_first_leg",
+                    extra={
+                        "venue": venue.value,
+                        "inspected_leverage": _entry_leverage_evidence_payload(
+                            inspected
+                        ),
+                        "final_leverage": _entry_leverage_evidence_payload(final),
+                        "final_evidence_complete": bool(
+                            isinstance(final, EntryLeverageEvidence)
+                            and final.evidence_complete
+                        ),
+                    },
+                )
+                return False
 
         ctx = self._build_entry_context(
             candidate=candidate,

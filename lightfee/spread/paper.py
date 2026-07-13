@@ -21,7 +21,7 @@ from lightfee.spread.research_manifest import (
 )
 
 
-SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 2
+SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 3
 
 
 class PaperOrderState(StrEnum):
@@ -54,6 +54,9 @@ class SpreadPaperBotSpec:
 class SpreadPaperConfig:
     enabled: bool = False
     finalist_limit: int = 0
+    # A paper signal cannot fill itself.  Only a later coherent public quote
+    # observed after this decision latency may create the simulated pair.
+    min_decision_latency_ms: int = 250
     markout_secs: list[int] = field(default_factory=lambda: [60, 300, 900, 1800])
     terminal_secs: int = 1800
     active_exit_enabled: bool = False
@@ -79,6 +82,17 @@ class SpreadPaperConfig:
     quote_skew_ms: int = 250
     research_manifest: SpreadResearchManifest = field(
         default_factory=lambda: DEFAULT_SPREAD_RESEARCH_MANIFEST
+    )
+
+
+def _is_strict_positive_int(value: object) -> bool:
+    """Accept scheduling counts only when they are literal positive integers."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _has_strict_positive_horizons(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(
+        _is_strict_positive_int(item) for item in value
     )
 
 
@@ -157,6 +171,7 @@ class SpreadPaperPosition:
     paper_fill_assumption: str
     finalist_rank: int
     registered_at_ms: int
+    entry_eligible_at_ms: int
     entry_notional_quote: float
     long_leg: SpreadPaperLeg
     short_leg: SpreadPaperLeg
@@ -210,7 +225,10 @@ class SpreadPaperTracker:
         # a maker control into the official result stream.
         return (
             self.config.enabled is True
-            and self.config.finalist_limit > 0
+            and _is_strict_positive_int(self.config.finalist_limit)
+            and _is_strict_positive_int(self.config.min_decision_latency_ms)
+            and _is_strict_positive_int(self.config.terminal_secs)
+            and _has_strict_positive_horizons(self.config.markout_secs)
             and str(self.config.primary_fill_model or "").lower() == "taker_taker"
             and self.config.require_taker_taker is True
             and self.config.research_manifest.model_epoch == self.config.model_epoch
@@ -245,8 +263,14 @@ class SpreadPaperTracker:
         quotes: dict[str, QuoteSnapshot],
         *,
         finalist_rank: int,
+        decision_at_ms: int | None = None,
     ) -> dict | None:
-        events = self.register_many(candidate, quotes, finalist_rank=finalist_rank)
+        events = self.register_many(
+            candidate,
+            quotes,
+            finalist_rank=finalist_rank,
+            decision_at_ms=decision_at_ms,
+        )
         return events[0] if events else None
 
     def register_many(
@@ -255,6 +279,7 @@ class SpreadPaperTracker:
         quotes: dict[str, QuoteSnapshot],
         *,
         finalist_rank: int,
+        decision_at_ms: int | None = None,
     ) -> list[dict]:
         if not self.enabled or finalist_rank >= self.config.finalist_limit:
             return []
@@ -278,6 +303,14 @@ class SpreadPaperTracker:
             return []
         if _allowed_labels(self.config) and candidate.opportunity_label not in _allowed_labels(self.config):
             return []
+        try:
+            decision_ms = int(
+                candidate.signal_ts_ms if decision_at_ms is None else decision_at_ms
+            )
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if decision_ms <= 0 or int(candidate.signal_ts_ms or 0) > decision_ms:
+            return []
         long_quote = _quote_for(quotes, candidate.long_venue, candidate.symbol)
         short_quote = _quote_for(quotes, candidate.short_venue, candidate.symbol)
         if long_quote is None or short_quote is None:
@@ -285,7 +318,7 @@ class SpreadPaperTracker:
         if not _quotes_fresh(
             long_quote,
             short_quote,
-            now_ms=candidate.signal_ts_ms,
+            now_ms=decision_ms,
             ttl_ms=self.config.quote_ttl_ms,
             quote_skew_ms=self.config.quote_skew_ms,
         ):
@@ -309,6 +342,7 @@ class SpreadPaperTracker:
                 short_quote=short_quote,
                 finalist_rank=finalist_rank,
                 bot=bot,
+                decision_at_ms=decision_ms,
             )
             if position is None:
                 continue
@@ -320,7 +354,7 @@ class SpreadPaperTracker:
         return events
 
     def restore_from_records(self, records: list[dict]) -> None:
-        """Restore v2 open positions; legacy records remain diagnostic-only."""
+        """Restore v3 open positions; legacy records remain diagnostic-only."""
         self._positions.clear()
         self._emitted_horizons.clear()
         self._known_paper_ids.clear()
@@ -337,13 +371,14 @@ class SpreadPaperTracker:
                 "opportunity.paper_registered",
                 "opportunity.paper_maker_fill_observed",
                 "opportunity.paper_hedge_filled",
+                "opportunity.paper_taker_pair_filled",
                 "opportunity.paper_funding_settlement_observed",
             }:
                 # A journal is an external restart boundary.  Older records
                 # remain readable on disk, but may not acquire current-model
                 # execution authority or official-PnL status by being loaded
                 # into a newer process.
-                if not _restorable_current_v2_record(payload, self.config):
+                if not _restorable_current_v3_record(payload, self.config):
                     self._known_paper_ids.add(paper_id)
                     continue
                 position = _position_from_payload(payload)
@@ -450,15 +485,11 @@ class SpreadPaperTracker:
         closed: set[str] = set()
         for position in list(self._positions.values()):
             if _position_has_pending_entry(position):
-                transition = self._advance_pending_entry(position, now_ms, quotes)
-                if transition is not None:
-                    position, transition_kind = transition
-                    self._positions[position.paper_id] = position
-                    if transition_kind == "maker_fill_observed":
-                        events.append(_maker_fill_observed_event(position))
-                    else:
-                        events.append(_hedge_filled_event(position))
-                elif self._terminal_due(position, now_ms):
+                # The pending-entry terminal is a strict admission boundary.
+                # Do this before inspecting executable quotes so a delayed
+                # evaluator cannot backdate an entry with a quote that first
+                # arrived after the paper order had already expired.
+                if self._terminal_due(position, now_ms):
                     events.append(
                         _expired_event(
                             position,
@@ -469,6 +500,24 @@ class SpreadPaperTracker:
                         )
                     )
                     closed.add(position.paper_id)
+                    continue
+
+                transition = self._advance_pending_entry(position, now_ms, quotes)
+                if transition is not None:
+                    position, transition_kind = transition
+                    self._positions[position.paper_id] = position
+                    # A maker-only delta observation belongs to the incomplete
+                    # exposure phase.  Once a later transition rebases the
+                    # lifecycle horizons (especially the delayed hedge fill),
+                    # it must not suppress the same named markout of the
+                    # fully matched pair.
+                    self._emitted_horizons[position.paper_id] = set()
+                    if transition_kind == "maker_fill_observed":
+                        events.append(_maker_fill_observed_event(position))
+                    elif transition_kind == "taker_pair_filled":
+                        events.append(_taker_pair_filled_event(position))
+                    else:
+                        events.append(_hedge_filled_event(position))
                 elif position.maker_fill_observed_at_ms > 0:
                     # A maker cross leaves a directional exposure until the
                     # delayed hedge is eligible.  Persist every scheduled
@@ -531,14 +580,16 @@ class SpreadPaperTracker:
         short_quote: QuoteSnapshot,
         finalist_rank: int,
         bot: SpreadPaperBotSpec,
+        decision_at_ms: int,
     ) -> SpreadPaperPosition | None:
-        # A BBO timestamp says when the market observation was made, not when
-        # the simulator entered the position.  Funding eligibility is a
-        # lifecycle fact, so use the signal/admission instant for a taker
-        # simulation and the later state-machine event instant for maker legs.
-        simulated_entry_at_ms = int(candidate.signal_ts_ms or 0)
-        if simulated_entry_at_ms <= 0:
+        # A signal observation is only a decision.  Register a pending entry
+        # now, then require a strictly newer, coherent quote after the
+        # configured latency before using any executable price or opening the
+        # markout/funding lifecycle.
+        registered_at_ms = int(decision_at_ms or 0)
+        if registered_at_ms <= 0:
             return None
+        entry_eligible_at_ms = registered_at_ms + self.config.min_decision_latency_ms
         target_notional = float(candidate.entry_notional_quote or 0.0)
         long_raw = _entry_raw_price(long_quote, "long", bot.entry_long_role)
         short_raw = _entry_raw_price(short_quote, "short", bot.entry_short_role)
@@ -549,66 +600,16 @@ class SpreadPaperTracker:
             return None
         if not _paper_bot_execution_supported(bot):
             return None
-        maker = _paper_bot_has_entry_maker(bot)
-        if maker:
-            long_leg = _pending_leg(
-                long_quote, candidate.long_venue, "long", bot.entry_long_role, long_raw, requested_qty, self.config
-            )
-            short_leg = _pending_leg(
-                short_quote, candidate.short_venue, "short", bot.entry_short_role, short_raw, requested_qty, self.config
-            )
-            filled_qty = 0.0
-            residual_qty = requested_qty
-        else:
-            long_execution = _entry_execution(
-                long_quote, "long", bot.entry_long_role, requested_qty
-            )
-            short_execution = _entry_execution(
-                short_quote, "short", bot.entry_short_role, requested_qty
-            )
-            if long_execution is None or short_execution is None:
-                return None
-            filled_qty = min(
-                requested_qty,
-                long_execution.capacity,
-                short_execution.capacity,
-            )
-            # A deeper ask ladder can make the BBO-derived requested quantity
-            # cost more than the candidate's per-leg notional cap.  Solve the
-            # common base quantity against actual cashflows before recording a
-            # fill; never let VWAP turn a conservative signal into a larger
-            # position.
-            filled_qty = min(
-                filled_qty,
-                _entry_quantity_under_notional_cap(
-                    long_quote, "long", bot.entry_long_role, filled_qty, target_notional
-                ),
-                _entry_quantity_under_notional_cap(
-                    short_quote, "short", bot.entry_short_role, filled_qty, target_notional
-                ),
-            )
-            if filled_qty <= 0.0:
-                return None
-            residual_qty = max(requested_qty - filled_qty, 0.0)
-            state = PaperOrderState.FILLED if residual_qty <= 1e-12 else PaperOrderState.PARTIAL
-            long_execution = _entry_execution(
-                long_quote, "long", bot.entry_long_role, filled_qty
-            )
-            short_execution = _entry_execution(
-                short_quote, "short", bot.entry_short_role, filled_qty
-            )
-            if long_execution is None or short_execution is None:
-                return None
-            long_leg = _filled_leg(
-                long_quote, candidate.long_venue, "long", bot.entry_long_role, long_execution.price, filled_qty, requested_qty, self.config, state,
-                filled_at_ms=simulated_entry_at_ms,
-                execution_source=long_execution.source,
-            )
-            short_leg = _filled_leg(
-                short_quote, candidate.short_venue, "short", bot.entry_short_role, short_execution.price, filled_qty, requested_qty, self.config, state,
-                filled_at_ms=simulated_entry_at_ms,
-                execution_source=short_execution.source,
-            )
+        long_leg = _pending_leg(
+            long_quote, candidate.long_venue, "long", bot.entry_long_role, long_raw,
+            requested_qty, self.config,
+        )
+        short_leg = _pending_leg(
+            short_quote, candidate.short_venue, "short", bot.entry_short_role, short_raw,
+            requested_qty, self.config,
+        )
+        filled_qty = 0.0
+        residual_qty = requested_qty
         entry_mode = f"long_{bot.entry_long_role}:short_{bot.entry_short_role}"
         exit_mode = f"long_{bot.exit_long_role}:short_{bot.exit_short_role}"
         acceptance_eligible = bot.acceptance_eligible is True
@@ -629,26 +630,22 @@ class SpreadPaperTracker:
             paper_control_group=control_group,
             paper_fill_assumption=_fill_assumption(bot),
             finalist_rank=finalist_rank,
-            registered_at_ms=simulated_entry_at_ms,
+            registered_at_ms=registered_at_ms,
+            entry_eligible_at_ms=entry_eligible_at_ms,
             entry_notional_quote=target_notional,
             long_leg=replace(long_leg, exit_liquidity_role=bot.exit_long_role),
             short_leg=replace(short_leg, exit_liquidity_role=bot.exit_short_role),
             candidate_snapshot=_candidate_snapshot(candidate),
             entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
-            due_horizons=_due_horizons(simulated_entry_at_ms, self.config),
+            # Pending entries can expire after the decision window; once
+            # filled, horizons are rebuilt from the actual fill timestamp.
+            due_horizons=_due_horizons(entry_eligible_at_ms, self.config),
             requested_base_qty=requested_qty,
             filled_base_qty=filled_qty,
             residual_base_qty=residual_qty,
             delta_exposure_base_qty=0.0,
             model_epoch=self.config.model_epoch,
-            # BBO crossing is not queue/trade-tape evidence.  Maker cohorts
-            # remain useful as experiments but never contaminate the baseline.
-            official_pnl=(
-                not maker
-                and residual_qty <= 1e-12
-                and acceptance_eligible
-                and not control_group
-            ),
+            official_pnl=False,
             research_manifest_version=bot.manifest_version,
             research_hypothesis=bot.hypothesis,
             acceptance_eligible=acceptance_eligible,
@@ -672,9 +669,31 @@ class SpreadPaperTracker:
             quote_skew_ms=self.config.quote_skew_ms,
         ):
             return None
+        # A refresh may carry the identical quote object/timestamp long after
+        # registration.  Time passing alone is not new execution evidence.
+        # Both legs must be observed no earlier than the modelled decision
+        # latency; otherwise a snapshot captured before the permitted order
+        # instant could be retroactively priced as a fill.
+        try:
+            quote_observed_at_ms = min(
+                int(long_quote.observed_at_ms or 0),
+                int(short_quote.observed_at_ms or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            now_ms < position.entry_eligible_at_ms
+            or quote_observed_at_ms < position.entry_eligible_at_ms
+        ):
+            return None
         maker_leg = position.paper_maker_leg
         if not maker_leg:
-            return None
+            return self._fill_pending_taker_pair(
+                position,
+                max(int(long_quote.observed_at_ms), int(short_quote.observed_at_ms)),
+                long_quote,
+                short_quote,
+            )
         if position.maker_fill_observed_at_ms <= 0:
             maker_position_leg = position.long_leg if maker_leg == "long" else position.short_leg
             maker_quote = long_quote if maker_leg == "long" else short_quote
@@ -696,7 +715,7 @@ class SpreadPaperTracker:
                 position.requested_base_qty,
                 self.config,
                 PaperOrderState.UNKNOWN,
-                filled_at_ms=now_ms,
+                filled_at_ms=int(maker_quote.observed_at_ms),
                 execution_source="maker_bbo_unknown",
             )
             if maker_leg == "long":
@@ -706,8 +725,19 @@ class SpreadPaperTracker:
                         filled_maker,
                         exit_liquidity_role=position.long_leg.exit_liquidity_role,
                     ),
-                    maker_fill_observed_at_ms=now_ms,
+                    maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=maker_qty,
+                    # Delay attribution begins at the maker fill, not at the
+                    # earlier signal/decision snapshot.  Preserve the
+                    # contemporaneous hedge-side BBO as the causal baseline.
+                    entry_market_snapshot=_market_snapshot_payload(
+                        long_quote,
+                        short_quote,
+                    ),
+                    due_horizons=_due_horizons(
+                        int(maker_quote.observed_at_ms),
+                        self.config,
+                    ),
                 )
             else:
                 next_position = replace(
@@ -716,17 +746,39 @@ class SpreadPaperTracker:
                         filled_maker,
                         exit_liquidity_role=position.short_leg.exit_liquidity_role,
                     ),
-                    maker_fill_observed_at_ms=now_ms,
+                    maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=-maker_qty,
+                    entry_market_snapshot=_market_snapshot_payload(
+                        long_quote,
+                        short_quote,
+                    ),
+                    due_horizons=_due_horizons(
+                        int(maker_quote.observed_at_ms),
+                        self.config,
+                    ),
                 )
             return next_position, "maker_fill_observed"
 
-        if now_ms < position.maker_fill_observed_at_ms + max(position.paper_hedge_delay_ms, 0):
+        hedge_eligible_at_ms = position.maker_fill_observed_at_ms + max(
+            position.paper_hedge_delay_ms,
+            0,
+        )
+        if now_ms < hedge_eligible_at_ms:
             return None
         maker_position_leg = position.long_leg if maker_leg == "long" else position.short_leg
         hedge_position_leg = position.short_leg if maker_leg == "long" else position.long_leg
         hedge_quote = short_quote if maker_leg == "long" else long_quote
         hedge_side = "short" if maker_leg == "long" else "long"
+        # The hedge delay is a market-data causality boundary, not merely a
+        # scheduler boundary.  A quote observed before that boundary cannot
+        # be reused after the clock reaches it: doing so would fabricate an
+        # executable hedge price during the unobserved delay interval.
+        try:
+            hedge_observed_at_ms = int(hedge_quote.observed_at_ms or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if hedge_observed_at_ms < hedge_eligible_at_ms:
+            return None
         hedge_execution = _entry_execution(
             hedge_quote,
             hedge_side,
@@ -767,7 +819,7 @@ class SpreadPaperTracker:
             position.requested_base_qty,
             self.config,
             PaperOrderState.UNKNOWN,
-            filled_at_ms=now_ms,
+            filled_at_ms=int(hedge_quote.observed_at_ms),
             execution_source=hedge_execution.source,
         )
         if maker_leg == "long":
@@ -780,6 +832,13 @@ class SpreadPaperTracker:
                 filled_base_qty=qty,
                 residual_base_qty=residual,
                 delta_exposure_base_qty=position.long_leg.qty - qty,
+                due_horizons=_due_horizons(
+                    max(
+                        int(position.long_leg.entry_filled_at_ms),
+                        int(filled_hedge.entry_filled_at_ms),
+                    ),
+                    self.config,
+                ),
             )
         else:
             next_position = replace(
@@ -791,12 +850,114 @@ class SpreadPaperTracker:
                 filled_base_qty=qty,
                 residual_base_qty=residual,
                 delta_exposure_base_qty=qty - position.short_leg.qty,
+                due_horizons=_due_horizons(
+                    max(
+                        int(position.short_leg.entry_filled_at_ms),
+                        int(filled_hedge.entry_filled_at_ms),
+                    ),
+                    self.config,
+                ),
             )
         return next_position, "hedge_filled"
 
+    def _fill_pending_taker_pair(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        long_quote: QuoteSnapshot,
+        short_quote: QuoteSnapshot,
+    ) -> tuple[SpreadPaperPosition, str] | None:
+        """Fill a taker/taker paper pair only from later executable quotes."""
+        requested_qty = position.requested_base_qty
+        if requested_qty <= 0.0:
+            return None
+        long_execution = _entry_execution(
+            long_quote, "long", position.long_leg.entry_liquidity_role, requested_qty
+        )
+        short_execution = _entry_execution(
+            short_quote, "short", position.short_leg.entry_liquidity_role, requested_qty
+        )
+        if long_execution is None or short_execution is None:
+            return None
+        quantity = min(requested_qty, long_execution.capacity, short_execution.capacity)
+        quantity = min(
+            quantity,
+            _entry_quantity_under_notional_cap(
+                long_quote,
+                "long",
+                position.long_leg.entry_liquidity_role,
+                quantity,
+                position.entry_notional_quote,
+            ),
+            _entry_quantity_under_notional_cap(
+                short_quote,
+                "short",
+                position.short_leg.entry_liquidity_role,
+                quantity,
+                position.entry_notional_quote,
+            ),
+        )
+        if quantity <= 0.0:
+            return None
+        residual = max(requested_qty - quantity, 0.0)
+        state = (
+            PaperOrderState.FILLED
+            if residual <= 1e-12
+            else PaperOrderState.PARTIAL
+        )
+        long_execution = _entry_execution(
+            long_quote, "long", position.long_leg.entry_liquidity_role, quantity
+        )
+        short_execution = _entry_execution(
+            short_quote, "short", position.short_leg.entry_liquidity_role, quantity
+        )
+        if long_execution is None or short_execution is None:
+            return None
+        long_leg = _filled_leg(
+            long_quote, position.long_venue, "long",
+            position.long_leg.entry_liquidity_role, long_execution.price, quantity,
+            requested_qty, self.config, state,
+            filled_at_ms=int(long_quote.observed_at_ms),
+            execution_source=long_execution.source,
+        )
+        short_leg = _filled_leg(
+            short_quote, position.short_venue, "short",
+            position.short_leg.entry_liquidity_role, short_execution.price, quantity,
+            requested_qty, self.config, state,
+            filled_at_ms=int(short_quote.observed_at_ms),
+            execution_source=short_execution.source,
+        )
+        official_pnl = bool(
+            residual <= 1e-12
+            and position.acceptance_eligible is True
+            and position.paper_control_group is False
+            and not position.paper_maker_leg
+        )
+        return (
+            replace(
+                position,
+                long_leg=replace(
+                    long_leg,
+                    exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                ),
+                short_leg=replace(
+                    short_leg,
+                    exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                ),
+                entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
+                due_horizons=_due_horizons(now_ms, self.config),
+                filled_base_qty=quantity,
+                residual_base_qty=residual,
+                delta_exposure_base_qty=0.0,
+                official_pnl=official_pnl,
+            ),
+            "taker_pair_filled",
+        )
+
     def _has_due_evaluation(self, position: SpreadPaperPosition, now_ms: int) -> bool:
         return self._next_horizon(position, now_ms) is not None or (
-            self.config.active_exit_enabled and now_ms > position.registered_at_ms
+            self.config.active_exit_enabled
+            and now_ms > _position_entry_filled_at_ms(position)
         )
 
     def _next_horizon(self, position: SpreadPaperPosition, now_ms: int) -> dict | None:
@@ -844,7 +1005,11 @@ class SpreadPaperTracker:
     def _active_exit_horizon(self, position: SpreadPaperPosition, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> dict | None:
         if not self.config.active_exit_enabled:
             return None
-        if self.config.max_hold_ms > 0 and now_ms - position.registered_at_ms >= self.config.max_hold_ms:
+        if (
+            self.config.max_hold_ms > 0
+            and now_ms - _position_entry_filled_at_ms(position)
+            >= self.config.max_hold_ms
+        ):
             return {"kind": "active_exit:max_hold", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_max_hold_elapsed"}
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
         short_quote = _quote_for(quotes, position.short_venue, position.symbol)
@@ -1197,6 +1362,24 @@ def _position_has_pending_entry(position: SpreadPaperPosition) -> bool:
     return position.long_leg.entry_pending or position.short_leg.entry_pending
 
 
+def _position_entry_filled_at_ms(position: SpreadPaperPosition) -> int:
+    """Return the actual common-entry instant, never the signal time."""
+    timestamps = (
+        int(position.long_leg.entry_filled_at_ms or 0),
+        int(position.short_leg.entry_filled_at_ms or 0),
+    )
+    return min(timestamps) if min(timestamps) > 0 else position.registered_at_ms
+
+
+def _position_entry_completed_at_ms(position: SpreadPaperPosition) -> int:
+    """Return the later leg fill time for a fully executable pair."""
+    timestamps = (
+        int(position.long_leg.entry_filled_at_ms or 0),
+        int(position.short_leg.entry_filled_at_ms or 0),
+    )
+    return max(timestamps) if min(timestamps) > 0 else position.registered_at_ms
+
+
 def _quotes_fresh(
     long_quote: QuoteSnapshot,
     short_quote: QuoteSnapshot,
@@ -1289,14 +1472,14 @@ def _payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long
 
 def _base_payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None) -> dict:
     return {
-        "journal_schema_version": SPREAD_PAPER_JOURNAL_SCHEMA_VERSION, "calculation_version": "spread_paper_v2", "model_epoch": position.model_epoch,
+        "journal_schema_version": SPREAD_PAPER_JOURNAL_SCHEMA_VERSION, "calculation_version": "spread_paper_v3", "model_epoch": position.model_epoch,
         "paper_id": position.paper_id, "candidate_id": position.candidate_id, "review_id": None, "symbol": position.symbol,
         "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}", "long_venue": position.long_venue, "short_venue": position.short_venue,
         "candidate_opportunity_label": position.candidate_opportunity_label, "paper_bot_id": position.paper_bot_id, "paper_cohort": position.paper_cohort,
         "research_manifest_version": position.research_manifest_version, "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
         "paper_entry_mode": position.paper_entry_mode, "paper_exit_mode": position.paper_exit_mode, "paper_execution_model": position.paper_entry_mode,
         "paper_maker_leg": position.paper_maker_leg, "paper_hedge_delay_ms": position.paper_hedge_delay_ms, "paper_control_group": position.paper_control_group,
-        "paper_fill_assumption": position.paper_fill_assumption, "horizon_kind": horizon_kind, "registered_at_ms": position.registered_at_ms, "evaluated_at_ms": now_ms,
+        "paper_fill_assumption": position.paper_fill_assumption, "horizon_kind": horizon_kind, "registered_at_ms": position.registered_at_ms, "entry_eligible_at_ms": position.entry_eligible_at_ms, "evaluated_at_ms": now_ms,
         "selected_real_trade": False, "not_selected_reason": "spread_shadow_paper", "paper_order_status": _position_order_state(position),
         "paper_entry_notional_quote": position.entry_notional_quote, "requested_base_qty": position.requested_base_qty, "filled_base_qty": position.filled_base_qty, "residual_base_qty": position.residual_base_qty,
         "delta_exposure_base_qty": position.delta_exposure_base_qty, "maker_fill_observed_at_ms": position.maker_fill_observed_at_ms,
@@ -1565,6 +1748,15 @@ def _hedge_filled_event(position: SpreadPaperPosition) -> dict:
     return {"kind": "opportunity.paper_hedge_filled", "payload": payload}
 
 
+def _taker_pair_filled_event(position: SpreadPaperPosition) -> dict:
+    """Persist the later quote that actually filled a delayed taker pair."""
+    payload = _registration_event(position)["payload"]
+    payload["evaluated_at_ms"] = _position_entry_completed_at_ms(position)
+    payload["paper_order_status"] = _position_order_state(position)
+    payload["paper_fill_evidence"] = "strictly_newer_coherent_quote_after_decision_latency"
+    return {"kind": "opportunity.paper_taker_pair_filled", "payload": payload}
+
+
 def _maker_fill_observed_event(position: SpreadPaperPosition) -> dict:
     """Persist naked maker exposure before its delayed hedge is eligible.
 
@@ -1617,7 +1809,7 @@ def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
         candidate_opportunity_label=str(payload.get("candidate_opportunity_label", "spread_reversion") or "spread_reversion"), paper_bot_id=str(payload.get("paper_bot_id", "tt_conservative") or "tt_conservative"),
         paper_cohort=str(payload.get("paper_cohort", "legacy") or "legacy"), paper_entry_mode=str(payload.get("paper_entry_mode", "") or ""), paper_exit_mode=str(payload.get("paper_exit_mode", "") or ""),
         paper_maker_leg=str(payload.get("paper_maker_leg", "") or ""), paper_hedge_delay_ms=int(payload.get("paper_hedge_delay_ms", 0) or 0), paper_control_group=paper_control_group,
-        paper_fill_assumption=str(payload.get("paper_fill_assumption", "") or ""), finalist_rank=int(payload.get("finalist_rank", 0) or 0), registered_at_ms=int(payload.get("registered_at_ms", 0) or 0),
+        paper_fill_assumption=str(payload.get("paper_fill_assumption", "") or ""), finalist_rank=int(payload.get("finalist_rank", 0) or 0), registered_at_ms=int(payload.get("registered_at_ms", 0) or 0), entry_eligible_at_ms=int(payload.get("entry_eligible_at_ms", 0) or 0),
         entry_notional_quote=float(payload.get("paper_entry_notional_quote", 0.0) or 0.0), long_leg=long_leg, short_leg=short_leg,
         candidate_snapshot=dict(payload.get("candidate_snapshot", {}) or {}), entry_market_snapshot=dict(payload.get("entry_market_snapshot", {}) or {}), due_horizons=horizons,
         requested_base_qty=float(payload.get("requested_base_qty", max(long_leg.requested_qty, short_leg.requested_qty)) or 0.0), filled_base_qty=float(payload.get("filled_base_qty", min(long_leg.qty, short_leg.qty)) or 0.0),
@@ -1680,17 +1872,18 @@ def _paper_position_numerics_valid(position: SpreadPaperPosition) -> bool:
         and position.short_venue
         and position.long_venue.lower() != position.short_venue.lower()
         and position.registered_at_ms > 0
+        and position.entry_eligible_at_ms > position.registered_at_ms
     )
 
 
-def _restorable_current_v2_record(payload: dict, config: SpreadPaperConfig) -> bool:
+def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> bool:
     try:
         journal_schema_version = int(payload.get("journal_schema_version", 0) or 0)
     except (TypeError, ValueError, OverflowError):
         return False
     if journal_schema_version != SPREAD_PAPER_JOURNAL_SCHEMA_VERSION:
         return False
-    if str(payload.get("calculation_version", "") or "") != "spread_paper_v2":
+    if str(payload.get("calculation_version", "") or "") != "spread_paper_v3":
         return False
     if str(payload.get("model_epoch", "") or "") != config.model_epoch:
         return False
