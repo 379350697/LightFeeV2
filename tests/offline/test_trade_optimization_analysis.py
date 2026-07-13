@@ -314,6 +314,59 @@ def test_current_reconciled_complete_sample_gets_real_accounting_label():
     assert report["aggregates"]["by_symbol"]["LABUSDT"]["net_pnl_quote"] == "-0.62"
 
 
+def test_derived_close_fill_event_id_duplicate_does_not_exclude_verified_sample():
+    position_id = "entry-derived-dup-LAB"
+    events = _complete_exchange_sample_events(position_id=position_id)
+    events.extend(
+        [
+            _event(
+                130_100,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "pending_close_reconciliation",
+                    "phase": "close",
+                    "venue": "bitget",
+                    "leg": "long",
+                    "order_id": f"{position_id}-long-close",
+                    "quantity": "10",
+                    "average_price": "99",
+                    "fee_quote": "0.75",
+                    "fill_event_id": "derived-long-close-event",
+                },
+            ),
+            _event(
+                130_200,
+                "order.filled",
+                {
+                    "position_id": position_id,
+                    "symbol": "LABUSDT",
+                    "source": "pending_close_reconciliation",
+                    "phase": "close",
+                    "venue": "okx",
+                    "leg": "short",
+                    "order_id": f"{position_id}-short-close",
+                    "quantity": "10",
+                    "average_price": "101",
+                    "fee_quote": "0.75",
+                    "fill_event_id": "derived-short-close-event",
+                },
+            ),
+        ]
+    )
+
+    report = build_trade_optimization_analysis(events, normal_only=True)
+
+    assert report["summary"]["normal_sample_count"] == 1
+    assert report["summary"]["overcoverage_excluded_count"] == 0
+    assert report["samples"][0]["verification_status"] == "verified_exchange_lifecycle"
+    assert not any(
+        str(gap).startswith("overcoverage_")
+        for gap in report["samples"][0]["coverage_gaps"]
+    )
+
+
 def test_verified_sample_exposes_real_cost_metrics_and_spread_bucket():
     events = _complete_exchange_sample_events(position_id="entry-cost-LAB")
 

@@ -927,6 +927,367 @@ def test_same_close_order_from_multiple_sources_counts_once_and_records_normaliz
     assert truth["overcoverage_gaps"] == []
 
 
+def test_close_reconciled_leg_and_derived_fill_event_id_count_once():
+    position_id = "entry-epic-derived-close-fill"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "quantity": 2,
+                "long_venue": "binance",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 2,
+                "price": 1.01,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 2,
+                "price": 1.02,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.reconciled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "accounting_status": "complete",
+                "evidence_gap": False,
+                "pending_backfill": False,
+                "long_legs": [
+                    {
+                        "venue": "binance",
+                        "order_id": "close-long",
+                        "client_order_id": "close-long-cid",
+                        "quantity": 2,
+                        "average_price": 1.03,
+                        "fee_quote": 0.01,
+                    }
+                ],
+                "short_legs": [
+                    {
+                        "venue": "bitget",
+                        "order_id": "close-short",
+                        "client_order_id": "close-short-cid",
+                        "quantity": 2,
+                        "average_price": 1.0,
+                        "fee_quote": 0.02,
+                    }
+                ],
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long",
+                "client_order_id": "close-long-cid",
+                "quantity": 2,
+                "price": 1.03,
+                "fee_quote": 0.01,
+                "fill_event_id": "derived-close-long-event",
+            },
+        ),
+        _event(
+            2_020,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "close-short",
+                "client_order_id": "close-short-cid",
+                "quantity": 2,
+                "price": 1.0,
+                "fee_quote": 0.02,
+                "fill_event_id": "derived-close-short-event",
+            },
+        ),
+    ]
+
+    truth = _truth(events, position_id)
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "2"
+    assert truth["close_coverage"]["short"]["filled_qty"] == "2"
+    assert truth["overcoverage_gaps"] == []
+
+
+def test_close_reconciled_without_trade_id_dedupes_derived_trade_fill_by_order_alias():
+    position_id = "entry-epic-close-fill-asymmetric-derived-trade"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "quantity": 1,
+                "long_venue": "binance",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 1,
+                "price": 1.01,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 1,
+                "price": 1.02,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.reconciled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "accounting_status": "complete",
+                "evidence_gap": False,
+                "pending_backfill": False,
+                "long_legs": [
+                    {
+                        "venue": "binance",
+                        "order_id": "close-long",
+                        "client_order_id": "close-long-cid",
+                        "quantity": 1,
+                        "average_price": 1.03,
+                        "fee_quote": 0.01,
+                    }
+                ],
+                "short_legs": [
+                    {
+                        "venue": "bitget",
+                        "order_id": "close-short",
+                        "client_order_id": "close-short-cid",
+                        "quantity": 1,
+                        "average_price": 1.0,
+                        "fee_quote": 0.02,
+                    }
+                ],
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long",
+                "client_order_id": "close-long-cid",
+                "trade_id": "trade-long",
+                "quantity": 1,
+                "price": 1.03,
+                "fee_quote": 0.01,
+                "fill_event_id": "derived-close-long-event",
+            },
+        ),
+        _event(
+            2_020,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "close-short",
+                "client_order_id": "close-short-cid",
+                "trade_id": "trade-short",
+                "quantity": 1,
+                "price": 1.0,
+                "fee_quote": 0.02,
+                "fill_event_id": "derived-close-short-event",
+            },
+        ),
+    ]
+
+    truth = _truth(events, position_id)
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "1"
+    assert truth["close_coverage"]["short"]["filled_qty"] == "1"
+    assert truth["overcoverage_gaps"] == []
+
+
+def test_close_reconciled_with_trade_id_dedupes_legacy_derived_fill_by_order_alias():
+    position_id = "entry-epic-close-fill-asymmetric-aggregate-trade"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "quantity": 1,
+                "long_venue": "binance",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 1,
+                "price": 1.01,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "phase": "open",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 1,
+                "price": 1.02,
+            },
+        ),
+        _event(
+            2_000,
+            "exit.reconciled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "accounting_status": "complete",
+                "evidence_gap": False,
+                "pending_backfill": False,
+                "long_legs": [
+                    {
+                        "venue": "binance",
+                        "order_id": "close-long",
+                        "client_order_id": "close-long-cid",
+                        "trade_id": "trade-long",
+                        "quantity": 1,
+                        "average_price": 1.03,
+                        "fee_quote": 0.01,
+                    }
+                ],
+                "short_legs": [
+                    {
+                        "venue": "bitget",
+                        "order_id": "close-short",
+                        "client_order_id": "close-short-cid",
+                        "trade_id": "trade-short",
+                        "quantity": 1,
+                        "average_price": 1.0,
+                        "fee_quote": 0.02,
+                    }
+                ],
+            },
+        ),
+        _event(
+            2_010,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "binance",
+                "leg": "long",
+                "order_id": "close-long",
+                "client_order_id": "close-long-cid",
+                "quantity": 1,
+                "price": 1.03,
+                "fee_quote": 0.01,
+                "fill_event_id": "legacy-derived-close-long-event",
+            },
+        ),
+        _event(
+            2_020,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "EPICUSDT",
+                "source": "pending_close_reconciliation",
+                "phase": "close",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "close-short",
+                "client_order_id": "close-short-cid",
+                "quantity": 1,
+                "price": 1.0,
+                "fee_quote": 0.02,
+                "fill_event_id": "legacy-derived-close-short-event",
+            },
+        ),
+    ]
+
+    truth = _truth(events, position_id)
+
+    assert truth["classification"] == LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
+    assert truth["close_coverage"]["long"]["filled_qty"] == "1"
+    assert truth["close_coverage"]["short"]["filled_qty"] == "1"
+    assert truth["overcoverage_gaps"] == []
+
+
 def test_rebuild_lifecycle_truth_cli_dry_run(tmp_path: Path):
     position_id = "entry-1782874583508-TAIKOUSDT"
     events_path = tmp_path / "live-events.jsonl"
