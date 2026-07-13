@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from lightfee.config.schema import StrategyConfig
 from lightfee.engine.pending_entry_lifecycle import ensure_pending_entry_phase_state
 
 
@@ -58,20 +59,6 @@ def _finite_positive(value: Any) -> float:
     if not math.isfinite(number) or number <= EPSILON:
         return 0.0
     return number
-
-
-def _strategy_int(strategy: Any, name: str, default: int = 0) -> int:
-    try:
-        return int(getattr(strategy, name, default) or default)
-    except (TypeError, ValueError):
-        return default
-
-
-def _strategy_float(strategy: Any, name: str, default: float = 0.0) -> float:
-    try:
-        return float(getattr(strategy, name, default) or default)
-    except (TypeError, ValueError):
-        return default
 
 
 def releasable_hedge_quantity(unmatched_quantity: float, min_hedgeable_chunk: float) -> float:
@@ -199,7 +186,7 @@ def _base_evidence(
 def decide_pending_entry_hedge_delta_pre_submit(
     pending: Any,
     *,
-    strategy: Any,
+    strategy: StrategyConfig,
     hedgeability_plan: PendingEntryHedgeabilityPlan,
     normalized_quantity: float | None,
     min_notional_violation: Any,
@@ -223,7 +210,7 @@ def decide_pending_entry_hedge_delta_pre_submit(
         )
 
     if releasable_delta <= EPSILON and can_accumulate and not terminal_or_canceling:
-        poll_ms = now + max(1, _strategy_int(strategy, "maker_entry_progress_poll_ms", 1))
+        poll_ms = now + max(1, int(strategy.maker_entry_progress_poll_ms or 1))
         pending.next_progress_poll_ms = poll_ms
         evidence = _base_evidence(pending, delta, releasable_delta, 0.0, terminal_or_canceling)
         evidence.update(
@@ -273,22 +260,17 @@ def decide_pending_entry_hedge_delta_pre_submit(
         evidence.update(
             {
                 "attempt": attempt,
-                "max_attempts": _strategy_int(
-                    strategy,
-                    "maker_min_notional_accumulation_attempts",
-                    0,
+                "max_attempts": int(
+                    strategy.maker_min_notional_accumulation_attempts or 0
                 ),
                 "leg_notional_quote": leg_notional_quote,
                 "venue_min_notional_quote": venue_min_notional_quote,
                 "should_count_small_fill": should_count_small_fill,
             }
         )
-        max_attempts = max(
-            0,
-            _strategy_int(strategy, "maker_min_notional_accumulation_attempts", 0),
-        )
+        max_attempts = max(0, int(strategy.maker_min_notional_accumulation_attempts or 0))
         if can_accumulate and attempt < max_attempts:
-            poll_ms = now + max(1, _strategy_int(strategy, "maker_entry_progress_poll_ms", 1))
+            poll_ms = now + max(1, int(strategy.maker_entry_progress_poll_ms or 1))
             pending.next_progress_poll_ms = poll_ms
             return PendingEntryHedgeDeltaDecision(
                 kind="wait_min_notional_accumulation",
@@ -311,11 +293,11 @@ def decide_pending_entry_hedge_delta_pre_submit(
     buffered_notional_quote = _maker_remainder_notional_quote(pending, delta)
     buffer_notional_quote = max(
         0.0,
-        _strategy_float(strategy, "passive_small_fill_buffer_notional_quote", 0.0),
+        float(strategy.passive_small_fill_buffer_notional_quote or 0.0),
     )
     buffer_wait_ms = max(
         1,
-        _strategy_int(strategy, "passive_small_fill_buffer_max_wait_ms", 1),
+        int(strategy.passive_small_fill_buffer_max_wait_ms or 1),
     )
     oldest_fill_at_ms = max(0, _oldest_unmatched_maker_fill_at_ms(pending, now))
     buffered_elapsed_ms = max(0, now - oldest_fill_at_ms)
@@ -344,7 +326,7 @@ def decide_pending_entry_hedge_delta_pre_submit(
     )
     if can_buffer_small_fill and buffered_elapsed_ms < buffer_wait_ms:
         remaining_wait_ms = max(1, buffer_wait_ms - buffered_elapsed_ms)
-        poll_interval_ms = max(1, _strategy_int(strategy, "maker_entry_progress_poll_ms", 1))
+        poll_interval_ms = max(1, int(strategy.maker_entry_progress_poll_ms or 1))
         poll_ms = now + min(poll_interval_ms, remaining_wait_ms)
         pending.next_progress_poll_ms = poll_ms
         return PendingEntryHedgeDeltaDecision(

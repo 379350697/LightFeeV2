@@ -7,6 +7,7 @@ from lightfee.spread.models import SpreadReversionCandidate
 from lightfee.spread.modules import (
     DegradationState,
     ExitRiskClassifier,
+    FairPriceModel,
     FundingAwarenessModel,
     LiquidityAndVenueHealthGate,
     MeanReversionQualityModel,
@@ -15,6 +16,7 @@ from lightfee.spread.modules import (
 from lightfee.spread.reversion import (
     SpreadReversionConfig,
     SpreadStatsTracker,
+    _contract_compatibility,
     build_spread_reversion_candidates,
 )
 
@@ -38,7 +40,14 @@ def _quote(
         ask_size=ask_size,
         observed_at_ms=observed_at_ms,
         funding_rate_bps=funding_rate_bps,
-        funding_timestamp_ms=0,
+        funding_timestamp_ms=observed_at_ms + 3_600_000,
+        funding_interval_ms=28_800_000,
+        underlying="BTC",
+        quote_currency="USDT",
+        contract_type="linear",
+        contract_multiplier=1.0,
+        mark_index_source="venue_mark",
+        contract_normalization_complete=True,
     )
 
 
@@ -63,42 +72,45 @@ def _candidate(**overrides) -> SpreadReversionCandidate:
         "signal_status": "entry_ready",
         "score": 10.0,
         "rank_reason": "score=10.00",
+        "economics_complete": True,
+        "fee_evidence_complete": True,
+        "contract_normalization_status": "complete",
     }
     data.update(overrides)
     return SpreadReversionCandidate(**data)
 
 
 def test_fair_price_model_filters_single_venue_outlier_before_pair_scoring() -> None:
-    tracker = SpreadStatsTracker()
-    cfg = SpreadReversionConfig(
-        min_samples=1,
-        min_history_ms=0,
-        min_fair_price_confidence=0.0,
-        min_liquidity_capacity_ratio=1.0,
-        entry_z=0.0,
-        min_net_edge_bps=0.0,
-        slippage_reserve_bps=0.0,
-        adverse_selection_buffer_bps=0.0,
-    )
     quotes = {
         "binance:BTCUSDT": _quote("binance", bid=99.99, ask=100.01),
         "okx:BTCUSDT": _quote("okx", bid=100.04, ask=100.06),
         "isolated:BTCUSDT": _quote("isolated", bid=109.90, ask=110.10),
     }
 
-    candidates = build_spread_reversion_candidates(
-        quotes,
-        ["BTCUSDT"],
-        tracker=tracker,
-        config=cfg,
-        now_ms=10_000,
+    assessments = FairPriceModel(
+        max_venue_premium_bps=150.0, min_venues_for_filter=3
+    ).assess(quotes.values())
+
+    assert assessments["isolated"].eligible is False
+    assert assessments["binance"].eligible is True
+    assert assessments["okx"].eligible is True
+    assert assessments["binance"].confidence > 0.0
+    assert assessments["binance"].fair_price == pytest.approx(100.05)
+
+
+def test_contract_normalization_requires_literal_boolean_true() -> None:
+    valid = _quote("binance", bid=99.9, ask=100.1)
+    malformed = QuoteSnapshot(
+        **{
+            **_quote("okx", bid=100.0, ask=100.2).__dict__,
+            "contract_normalization_complete": "false",
+        }
     )
 
-    assert candidates
-    assert all("isolated" not in {c.long_venue, c.short_venue} for c in candidates)
-    assert candidates[0].fair_price_confidence > 0.0
-    assert candidates[0].fair_price == pytest.approx(100.05)
-    assert candidates[0].rank_reason
+    compatibility = _contract_compatibility(valid, malformed)
+
+    assert compatibility.compatible is False
+    assert compatibility.reason == "contract_normalization_incomplete"
 
 
 def test_mean_reversion_quality_enhances_z_score_without_independent_entry() -> None:
@@ -115,13 +127,35 @@ def test_mean_reversion_quality_enhances_z_score_without_independent_entry() -> 
 
 def test_funding_awareness_scores_direction_without_flipping_spread_legs() -> None:
     model = FundingAwarenessModel(expected_hold_ms=3_600_000)
-    tailwind = model.assess(long_funding_rate_bps=-4.0, short_funding_rate_bps=8.0)
-    headwind = model.assess(long_funding_rate_bps=8.0, short_funding_rate_bps=-4.0)
+    kwargs = {
+        "now_ms": 1_000,
+        "long_funding_timestamp_ms": 2_000,
+        "short_funding_timestamp_ms": 2_000,
+        "long_funding_interval_ms": 28_800_000,
+        "short_funding_interval_ms": 28_800_000,
+    }
+    tailwind = model.assess(long_funding_rate_bps=-4.0, short_funding_rate_bps=8.0, **kwargs)
+    headwind = model.assess(long_funding_rate_bps=8.0, short_funding_rate_bps=-4.0, **kwargs)
 
     assert tailwind.score_adjustment_bps > 0.0
     assert tailwind.carry_cost_bps == 0.0
     assert headwind.score_adjustment_bps < 0.0
     assert headwind.carry_cost_bps > 0.0
+    assert tailwind.economics_complete is True
+
+
+def test_funding_awareness_fails_closed_when_a_second_unknown_settlement_is_crossed() -> None:
+    assessment = FundingAwarenessModel(expected_hold_ms=7_200_000).assess(
+        long_funding_rate_bps=-4.0,
+        short_funding_rate_bps=8.0,
+        now_ms=1_000,
+        long_funding_timestamp_ms=2_000,
+        short_funding_timestamp_ms=2_000,
+        long_funding_interval_ms=3_600_000,
+        short_funding_interval_ms=3_600_000,
+    )
+
+    assert assessment.economics_complete is False
 
 
 def test_liquidity_score_tiers_depth_instead_of_flat_pass() -> None:
@@ -152,6 +186,21 @@ def test_liquidity_score_tiers_depth_instead_of_flat_pass() -> None:
     )
 
 
+def test_quote_fresh_rejects_a_future_source_timestamp() -> None:
+    gate = LiquidityAndVenueHealthGate()
+    now_ms = 10_000
+    current = _quote("long", bid=99.9, ask=100.1, observed_at_ms=now_ms)
+    future = _quote("short", bid=100.1, ask=100.3, observed_at_ms=now_ms + 1)
+
+    assert gate.quote_fresh(
+        current,
+        future,
+        now_ms=now_ms,
+        signal_ttl_ms=1_000,
+        quote_skew_ms=1_000,
+    ) is False
+
+
 def test_spread_ranker_takes_top_candidates_without_symbol_conflicts() -> None:
     ranker = SpreadRanker(max_candidates=2)
     ranked = ranker.rank(
@@ -164,6 +213,29 @@ def test_spread_ranker_takes_top_candidates_without_symbol_conflicts() -> None:
 
     assert [c.candidate_id for c in ranked] == ["best-btc", "best-eth"]
     assert all(c.rank_reason for c in ranked)
+
+
+def test_spread_ranker_cannot_let_score_override_conservative_edge() -> None:
+    ranker = SpreadRanker(max_candidates=1)
+
+    ranked = ranker.rank(
+        [
+            _candidate(
+                candidate_id="high-score-low-edge",
+                score=1_000.0,
+                ranking_edge_bps=1.0,
+                expected_net_edge_bps=20.0,
+            ),
+            _candidate(
+                candidate_id="lower-score-safe-edge",
+                score=1.0,
+                ranking_edge_bps=2.0,
+                expected_net_edge_bps=2.0,
+            ),
+        ]
+    )
+
+    assert [candidate.candidate_id for candidate in ranked] == ["lower-score-safe-edge"]
 
 
 def test_spread_ranker_defaults_to_top_ten_with_symbol_dedup() -> None:

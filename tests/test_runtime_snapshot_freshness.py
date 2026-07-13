@@ -67,13 +67,30 @@ def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
         short_venue="bybit",
         symbol=symbol,
         funding_diff_bps=10.0,
-        funding_edge_bps=10.0,
+        funding_edge_bps=200.0,
         expected_edge_bps=5.0,
         worst_case_edge_bps=2.0,
         ranking_edge_bps=10.0,
         entry_notional_quote=50.0,
         first_funding_timestamp_ms=400000,
+        forecast_worst_funding_edge_bps=200.0,
+        economics_complete=True,
+        economics_observed_at_ms=1,
+        calculation_version="v1_exact",
+        model_epoch="v1_exact",
+        taker_fee_evidence_complete=True,
     )
+
+
+def _mark_final_economics_ready(candidate: CandidateInput, observed_at_ms: int) -> None:
+    """Make a synthetic quote-freshness fixture viable after final repricing."""
+    candidate.funding_edge_bps = 200.0
+    candidate.forecast_worst_funding_edge_bps = 200.0
+    candidate.economics_complete = True
+    candidate.economics_observed_at_ms = observed_at_ms
+    candidate.calculation_version = "v1_exact"
+    candidate.model_epoch = "v1_exact"
+    candidate.taker_fee_evidence_complete = True
 
 
 def _candidate_lease_snapshot(candidate: CandidateInput, now_ms: int) -> SidecarSnapshot:
@@ -113,6 +130,12 @@ def _sidecar_liquidity_required_candidate(symbol: str = "BTCUSDT") -> CandidateI
         entry_notional_quote=50.0,
         first_funding_timestamp_ms=400000,
         sizing_liquidity_source="sidecar_perp_liquidity",
+        forecast_worst_funding_edge_bps=10.0,
+        economics_complete=True,
+        economics_observed_at_ms=69_000,
+        calculation_version="v1_exact",
+        model_epoch="v1_exact",
+        taker_fee_evidence_complete=True,
     )
 
 
@@ -167,6 +190,10 @@ def _quote_with_liquidity(
 
 def _entry_flow_strategy_config(**kwargs) -> StrategyConfig:
     return StrategyConfig(
+        # Tests that exercise a successful first-leg dispatch must opt in
+        # explicitly: the production-safe default keeps new funding entries
+        # frozen until the canary gate is opened.
+        funding_new_entries_enabled=True,
         pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
         **kwargs,
     )
@@ -473,6 +500,8 @@ async def test_runtime_entry_quote_revalidate_prewarm_resolves_stale_top_candida
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _freshness_candidate()
+    # This test exercises BBO prewarm and stale-quote replacement, not alpha.
+    _mark_final_economics_ready(candidate, now_ms)
     snapshot = SidecarSnapshot(
         published_at_ms=now_ms,
         market_observed_at_ms=now_ms,
@@ -640,6 +669,7 @@ async def test_runtime_last_good_top_candidate_requires_entry_quote_truth(
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _freshness_candidate()
+    _mark_final_economics_ready(candidate, now_ms)
     snapshot = SidecarSnapshot(
         published_at_ms=now_ms - 20_000,
         market_observed_at_ms=now_ms - 20_000,
@@ -1162,6 +1192,7 @@ async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_ex
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -1672,6 +1703,7 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     config = AppConfig(
         runtime=RuntimeConfig(mode="live"),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             candidate_lease_ms=1_000,
             local_l2_enabled=False,
             entry_readiness_provider="quote_lease",
@@ -1744,6 +1776,7 @@ async def test_runtime_entry_quote_probe_diagnostics_are_disabled_by_default(
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -1848,6 +1881,7 @@ async def test_runtime_entry_quote_probe_diagnostics_can_be_enabled(
             debug_journal_diagnostics_enabled=True,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_quote_lease_ttl_ms=100,
@@ -2248,6 +2282,7 @@ async def test_runtime_snapshot_freshness_filter_uses_v1_primary_shadow_scope(
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             max_concurrent_positions=6,
@@ -2538,6 +2573,8 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
         ),
         strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -2575,6 +2612,10 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
                 ranking_edge_bps=10.0,
                 entry_notional_quote=50.0,
                 first_funding_timestamp_ms=400000,
+                economics_complete=True,
+                economics_observed_at_ms=60_000,
+                calculation_version="v1_exact",
+                model_epoch="v1_exact",
             )
         ],
     )
@@ -2776,10 +2817,14 @@ async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entr
         funding_edge_bps=10.0,
         expected_edge_bps=5.0,
         worst_case_edge_bps=2.0,
-        ranking_edge_bps=10.0,
-        entry_notional_quote=50.0,
-        first_funding_timestamp_ms=400000,
-    )
+            ranking_edge_bps=10.0,
+            entry_notional_quote=50.0,
+            first_funding_timestamp_ms=400000,
+            economics_complete=True,
+            economics_observed_at_ms=65_000,
+            calculation_version="v1_exact",
+            model_epoch="v1_exact",
+        )
     snapshot = SidecarSnapshot(
         published_at_ms=65000,
         market_observed_at_ms=65000,
@@ -2846,6 +2891,7 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_readiness_provider="ws_bbo_quote_lease",
             entry_window_secs=600,
@@ -2884,10 +2930,14 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
         funding_edge_bps=10.0,
         expected_edge_bps=5.0,
         worst_case_edge_bps=2.0,
-        ranking_edge_bps=10.0,
-        entry_notional_quote=50.0,
-        first_funding_timestamp_ms=400000,
-    )
+            ranking_edge_bps=10.0,
+            entry_notional_quote=50.0,
+            first_funding_timestamp_ms=400000,
+            economics_complete=True,
+            economics_observed_at_ms=65_000,
+            calculation_version="v1_exact",
+            model_epoch="v1_exact",
+        )
     snapshot = SidecarSnapshot(
         published_at_ms=65000,
         market_observed_at_ms=65000,
@@ -3026,6 +3076,8 @@ async def test_runtime_invalid_quote_decision_carries_sanitized_quote_evidence(t
 
 @pytest.mark.asyncio
 async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, monkeypatch):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -3038,6 +3090,8 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
         ),
         strategy=_entry_flow_strategy_config(
             local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -3058,6 +3112,12 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    # A last-good sidecar is admissible only after its executable BBO is
+    # refreshed.  Keep the candidate's economics timestamp current so this
+    # scenario isolates the stale liquidity advisory rather than the separate
+    # final-economics timestamp gate.
+    _mark_final_economics_ready(candidate, 70_000)
     snapshot = SidecarSnapshot(
         published_at_ms=65000,
         market_observed_at_ms=65000,
@@ -3082,11 +3142,36 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
                 coverage_usable=1,
             ),
         ],
-        candidates=[_freshness_candidate()],
+        candidates=[candidate],
     )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+
+    revalidation_calls = []
+
+    async def resolved_final_quotes(*_args, **_kwargs):
+        revalidation_calls.append(True)
+        overlay = {
+            ("okx", "BTCUSDT"): TopBookQuote(
+                venue="okx", symbol="BTCUSDT", bid=100.0, ask=101.0,
+                bid_size=50.0, ask_size=60.0, observed_at_ms=69_975,
+                received_at_ms=69_975, source="okx_bbo_ws",
+            ),
+            ("bybit", "BTCUSDT"): TopBookQuote(
+                venue="bybit", symbol="BTCUSDT", bid=100.2, ask=101.2,
+                bid_size=50.0, ask_size=60.0, observed_at_ms=69_975,
+                received_at_ms=69_975, source="bybit_bbo_ws",
+            ),
+        }
+        stats = runtime._entry_quote_truth_empty_stats()
+        stats.update({"target_count": 2, "resolved_count": 2, "ws_resolved_count": 2})
+        for quote in overlay.values():
+            runtime.ws_bbo_cache.update_quote(quote)
+        runtime._entry_quote_truth_record_last_scan(stats)
+        return overlay, stats
+
+    monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", resolved_final_quotes)
 
     runtime.journal.open()
     try:
@@ -3094,6 +3179,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
     finally:
         runtime.journal.close()
 
+    assert revalidation_calls
     assert len(executor.contexts) == 1
     assert runtime.state.last_scan["selected_candidate_count"] == 1
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
@@ -3103,24 +3189,18 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
         for line in (tmp_path / "events.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    decisions = [
+    degraded = next(
         record["payload"]
         for record in records
-        if record["kind"] == "runtime.snapshot_freshness_decision"
-    ]
-    assert any(
-        d["venue"] == "okx"
-        and d["symbol"] == "BTCUSDT"
-        and d["domain"] == "liquidity"
-        and d["decision"] == "continue"
-        and d["age_ms"] == 35000
-        and d["reason"] == "perp_liquidity_stale_advisory"
-        and d["fallback_source"] == "last_good_sidecar"
-        for d in decisions
+        if record["kind"] == "runtime.snapshot_degraded"
     )
-    assert "runtime.perp_liquidity_stale_advisory" in [
-        record["kind"] for record in records
-    ]
+    assert any(
+        item["venue"] == "okx"
+        and item["domain"] == "liquidity"
+        and item["source_age_ms"] == 35_000
+        and item["blocked"] is False
+        for item in degraded["candidate_freshness_scope"]
+    )
 
 
 def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_path):
@@ -3908,6 +3988,7 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -3930,6 +4011,8 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _sidecar_liquidity_required_candidate()
+    _mark_final_economics_ready(candidate, 70_000)
+    _install_l2_books(runtime, candidate, observed_at_ms=70_000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -4001,6 +4084,7 @@ async def test_runtime_blocks_required_sidecar_liquidity_when_current_row_has_no
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=False,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
@@ -4092,7 +4176,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -4114,6 +4198,8 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _sidecar_liquidity_required_candidate()
+    _mark_final_economics_ready(candidate, 70_000)
+    _install_l2_books(runtime, candidate, observed_at_ms=70_000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -4267,6 +4353,7 @@ async def test_runtime_blocks_only_when_execution_l2_needed_by_sizing_is_stale(t
     config = AppConfig(
         runtime=RuntimeConfig(mode="live"),
         strategy=StrategyConfig(
+            funding_new_entries_enabled=True,
             local_l2_enabled=True,
             max_liquidity_snapshot_age_ms=5000,
         ),
@@ -4326,7 +4413,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -4347,6 +4434,9 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    _mark_final_economics_ready(candidate, 70_000)
+    _install_l2_books(runtime, candidate, observed_at_ms=70_000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -4359,7 +4449,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             LiquidityLifecycle(venue="okx", observed_at_ms=69000, symbol_count=1, coverage_usable=1),
             LiquidityLifecycle(venue="bybit", observed_at_ms=69000, symbol_count=1, coverage_usable=1),
         ],
-        candidates=[_freshness_candidate()],
+        candidates=[candidate],
     )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)

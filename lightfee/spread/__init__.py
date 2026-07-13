@@ -14,7 +14,6 @@ from lightfee.spread.models import (
 )
 from lightfee.spread.modules import (
     CandidateSource,
-    CostModel,
     DegradationState,
     ExecutionPolicy,
     ExitRiskClassifier,
@@ -27,6 +26,7 @@ from lightfee.spread.modules import (
 )
 from lightfee.spread.reversion import (
     SpreadReversionConfig,
+    SpreadSignalEngine,
     SpreadStatsTracker,
     build_spread_reversion_candidates,
 )
@@ -39,12 +39,12 @@ __all__ = [
     "SpreadExecutionPlanner",
     "SpreadReversionCandidate",
     "SpreadReversionConfig",
+    "SpreadSignalEngine",
     "SpreadSnapshot",
     "SpreadStatsTracker",
     "SpreadTradingController",
     "SpreadTradingState",
     "CandidateSource",
-    "CostModel",
     "DegradationState",
     "ExecutionPolicy",
     "ExitRiskClassifier",

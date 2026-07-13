@@ -98,6 +98,15 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
     """
     edge = float(raw.get("funding_edge_bps", 0.0))
     penalty = float(raw.get("quality_penalty_bps", 0.0))
+    has_expected = raw.get("expected_edge_bps") is not None
+    has_worst = raw.get("worst_case_edge_bps") is not None
+    has_ranking = raw.get("ranking_edge_bps") is not None or raw.get("rank") is not None
+    # Schema-1 often contains only a funding headline. It must never be
+    # re-labelled as complete expected/worst economics for a live entry.
+    economics_complete = has_expected and has_worst and has_ranking
+    expected_edge = float(raw.get("expected_edge_bps", edge - penalty))
+    worst_edge = float(raw.get("worst_case_edge_bps", expected_edge))
+    ranking_edge = float(raw.get("ranking_edge_bps", raw.get("rank", worst_edge)))
     symbol = raw.get("symbol", "")
     long_venue = raw.get("long_venue", "")
     short_venue = raw.get("short_venue", "")
@@ -135,16 +144,24 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         "symbol": symbol,
         "funding_diff_bps": edge,  # V1 only emits edge, no separate diff field
         "funding_edge_bps": edge,
-        "expected_edge_bps": edge - penalty,
-        "worst_case_edge_bps": edge - penalty,
-        "ranking_edge_bps": edge - penalty,
+        "expected_edge_bps": expected_edge,
+        "worst_case_edge_bps": worst_edge,
+        "ranking_edge_bps": ranking_edge,
+        # Preserve true V1 staged fields when present.  A schema-1 snapshot
+        # lacking them is legacy/incomplete and is blocked by live admission.
+        "total_funding_edge_bps": float(raw.get("total_funding_edge_bps", edge)),
+        "first_stage_funding_edge_bps": float(raw.get("first_stage_funding_edge_bps", edge)),
+        "first_stage_expected_edge_bps": float(raw.get("first_stage_expected_edge_bps", expected_edge)),
+        "first_stage_worst_case_edge_bps": float(raw.get("first_stage_worst_case_edge_bps", worst_edge)),
+        "second_stage_incremental_funding_edge_bps": float(raw.get("second_stage_incremental_funding_edge_bps", 0.0)),
+        "stagger_gap_ms": int(raw.get("stagger_gap_ms", 0) or 0),
         "transfer_bias_bps": 0.0,
         "opportunity_type": "aligned",
         "blocked": False,
         "blocked_reasons": [],
         "long_venue_index": 0,
         "short_venue_index": 0,
-        "entry_notional_quote": 50.0,  # V1 fixed_live_entry_notional_quote — DELETE with this file
+        "entry_notional_quote": float(raw.get("entry_notional_quote", 0.0) or 0.0),
         # V1 parity: preserve candidate identity + prewarm fields
         "pair_id": pair_id,
         "funding_timestamp_ms": f_ts,
@@ -154,9 +171,13 @@ def _v1_candidate_to_v2(raw: dict) -> dict:
         "second_funding_timestamp_ms": max(long_fts, short_fts) if long_fts > 0 and short_fts > 0 else 0,
         "first_funding_leg": first_funding_leg,
         # V1 parity: preserve direction_consistent and interval_aligned (V1 computes both)
-        "direction_consistent": bool(raw.get("direction_consistent", False)),
-        "interval_aligned": bool(raw.get("interval_aligned", False)),
+        "direction_consistent": raw.get("direction_consistent") is True,
+        "interval_aligned": raw.get("interval_aligned") is True,
         "sizing_liquidity_source": str(raw.get("sizing_liquidity_source", "") or ""),
+        "expected_net_edge_bps": expected_edge,
+        "economics_complete": economics_complete,
+        "calculation_version": "v1_schema1_compat",
+        "model_epoch": "v1_legacy",
     }
 
 

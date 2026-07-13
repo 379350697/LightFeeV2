@@ -15,7 +15,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+from lightfee.config.schema import (
+    AppConfig,
+    PersistenceConfig,
+    RuntimeConfig,
+    StrategyConfig,
+    VenueConfig,
+)
 from lightfee.core.domain import (
     OrderFill,
     OrderRequest,
@@ -68,6 +74,7 @@ class FakeVenueAdapter(VenueAdapter):
     default_position_qty: float = 0.0
     okx_base_quantity_step: float = 0.0
     passive_metadata_payload: Optional[dict] = None
+    available_margin_quote: Optional[float] = None
     last_request: Optional[OrderRequest] = None
     place_order_call_count: int = 0
     fetch_position_call_count: int = 0
@@ -96,6 +103,14 @@ class FakeVenueAdapter(VenueAdapter):
             return self.position_snapshots.pop(0)
         return PositionSnapshot(venue=self._venue, symbol=symbol, side=self.default_position_side,
                                 quantity=self.default_position_qty, entry_price=0.0, observed_at_ms=1000)
+
+    async def fetch_account_risk_snapshot(self):
+        if self.available_margin_quote is None:
+            return None
+        return SimpleNamespace(
+            available_balance_quote=self.available_margin_quote,
+            observed_at_ms=1_000,
+        )
 
     async def submit_passive_order(self, request):
         from lightfee.core.domain import PassiveOrderAck
@@ -153,6 +168,7 @@ def config(tmp_path):
         strategy=StrategyConfig(
             local_l2_enabled=False,
             pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
+            funding_new_entries_enabled=True,
         ),
     )
 
@@ -239,6 +255,156 @@ def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_jour
         "source": "selection",
     }
     assert "readiness_evidence" not in payload
+
+
+def test_pending_first_fill_chooses_lower_loss_unwind_from_fresh_l2(
+    config, tmp_journal
+):
+    """A recovered maker fill must not blindly use its historical price hint."""
+    config.venues = [
+        VenueConfig(venue="binance", taker_fee_bps=0.5),
+        VenueConfig(venue="okx", taker_fee_bps=0.5),
+    ]
+    config.strategy.local_l2_enabled = True
+    config.strategy.entry_readiness_provider = "local_l2"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    for venue, bid, ask in (
+        ("binance", 99.0, 101.0),
+        ("okx", 95.0, 96.0),
+    ):
+        book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(bid, 10.0)]
+        book.asks = [PriceLevel(ask, 10.0)]
+        book.observed_at_ms = now_ms
+    pending = PendingEntry(
+        pending_id="pending-first-fill",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.1,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.1,
+        maker_fill_price=100.0,
+    )
+
+    decision = runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    )
+
+    assert decision["action"] == "unwind_first_leg"
+    assert decision["hedge_price"] == pytest.approx(95.0)
+    assert decision["unwind_price"] == pytest.approx(99.0)
+    assert decision["unwind_first_leg_loss_quote"] < decision["complete_hedge_loss_quote"]
+
+
+def test_pending_first_fill_compares_fee_inclusive_hedge_and_unwind_costs(
+    config, tmp_journal
+):
+    """Recovered residual handling uses the same all-in decision contract."""
+    config.strategy.local_l2_enabled = True
+    config.strategy.entry_readiness_provider = "local_l2"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    # Unwinding has the smaller raw price loss, but a much higher taker fee.
+    config.venues = [
+        VenueConfig(venue="binance", taker_fee_bps=100.0),
+        VenueConfig(venue="okx", taker_fee_bps=0.0),
+    ]
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    for venue, bid, ask in (
+        ("binance", 99.99, 101.0),
+        ("okx", 99.5, 100.0),
+    ):
+        book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(bid, 10.0)]
+        book.asks = [PriceLevel(ask, 10.0)]
+        book.observed_at_ms = now_ms
+    pending = PendingEntry(
+        pending_id="pending-fee-inclusive",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.1,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.1,
+        maker_fill_price=100.0,
+    )
+
+    decision = runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    )
+
+    assert decision["action"] == "complete_hedge"
+    assert decision["unwind_first_leg_price_loss_quote"] < decision[
+        "complete_hedge_price_loss_quote"
+    ]
+    assert decision["unwind_first_leg_fee_quote"] > decision[
+        "complete_hedge_fee_quote"
+    ]
+    assert decision["unwind_first_leg_loss_quote"] > decision[
+        "complete_hedge_loss_quote"
+    ]
+
+
+def test_pending_first_fill_rejects_future_ws_bbo_timestamp(config, tmp_journal):
+    """A future-dated top book cannot steer a post-fill hedge/unwind choice."""
+    config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    for venue, bid, ask in (("binance", 99.0, 101.0), ("okx", 95.0, 96.0)):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=now_ms + 1,
+            )
+        )
+    pending = PendingEntry(
+        pending_id="pending-future-ws-bbo",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.1,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.1,
+        maker_fill_price=100.0,
+    )
+
+    decision = runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    )
+
+    assert decision == {
+        "action": "complete_hedge",
+        "reason": "post_first_fill_market_data_unavailable_complete_hedge",
+        "hedge_price": 100.0,
+        "market_evidence": {},
+    }
 
 
 def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
@@ -1425,7 +1591,152 @@ class TestPlannerDispatchIntegration:
             entry_notional_quote=500.0,
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
-        )
+            economics_complete=True,
+            economics_observed_at_ms=1_000,
+            # This helper represents a complete v3 sidecar candidate.  An
+            # explicit zero is a valid configured fee tier; an omitted field
+            # is intentionally covered by the dedicated rejection test.
+            taker_fee_evidence_complete=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_live_dispatch_rejects_candidate_without_economics_timestamp(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.economics_observed_at_ms = 0
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        policy_events = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_entry_policy"
+        ]
+        assert policy_events[-1]["reason"] == "incomplete_economics"
+
+    @pytest.mark.asyncio
+    async def test_live_dispatch_rejects_candidate_from_prior_economics_epoch(
+        self,
+        config,
+        tmp_journal,
+    ):
+        """A shadow snapshot cannot retain permission after enhanced-live rollout."""
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.funding_economics_mode = "enhanced_live"
+        config.strategy.funding_forecast_mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.calculation_version = "enhanced_shadow"
+        candidate.model_epoch = "enhanced_shadow"
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        policy_events = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_entry_policy"
+        ]
+        assert policy_events[-1]["reason"] == "funding_calculation_version_mismatch"
+
+    @pytest.mark.asyncio
+    async def test_live_dispatch_rejects_candidate_without_taker_fee_evidence(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.taker_fee_evidence_complete = False
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        policy_events = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_entry_policy"
+        ]
+        assert policy_events[-1]["reason"] == "missing_taker_fee_evidence"
+
+    @pytest.mark.asyncio
+    async def test_live_dispatch_rebuilds_enhanced_forecast_readiness_from_evidence(
+        self,
+        config,
+        tmp_journal,
+    ):
+        """A hand-built v3 candidate cannot claim enhanced-live readiness."""
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.funding_economics_mode = "enhanced_live"
+        config.strategy.funding_forecast_mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.calculation_version = "enhanced_live"
+        candidate.model_epoch = "enhanced_live"
+        candidate.taker_fee_evidence_complete = True
+        candidate.forecast_ready = True
+        candidate.forecast_confidence = 1.0
+        candidate.forecast_sample_count = 0
+        candidate.forecast_shadow_age_ms = 0
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        policy_events = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_entry_policy"
+        ]
+        assert policy_events[-1]["reason"] == "funding_forecast_not_ready"
+
+    @pytest.mark.asyncio
+    async def test_live_dispatch_rejects_unstable_enhanced_forecast_distribution(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.funding_economics_mode = "enhanced_live"
+        config.strategy.funding_forecast_mode = "live"
+        config.strategy.funding_forecast_min_samples = 1
+        config.strategy.funding_forecast_shadow_min_days = 0
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.calculation_version = "enhanced_live"
+        candidate.model_epoch = "enhanced_live"
+        candidate.taker_fee_evidence_complete = True
+        candidate.forecast_ready = True
+        candidate.forecast_confidence = 1.0
+        candidate.forecast_sample_count = 1
+        candidate.forecast_shadow_age_ms = 0
+        candidate.forecast_distribution_stable = False
+        candidate.forecast_stability_reason = "p90_error_distribution_drift"
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        policy_events = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_entry_policy"
+        ]
+        assert policy_events[-1]["reason"] == "funding_forecast_distribution_unstable"
 
     @staticmethod
     def _binance_bybit_candidate(symbol: str = "BTCUSDT"):
@@ -1446,6 +1757,7 @@ class TestPlannerDispatchIntegration:
             entry_notional_quote=500.0,
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
+            economics_complete=True,
         )
 
     @staticmethod
@@ -1651,7 +1963,7 @@ class TestPlannerDispatchIntegration:
         monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
         monkeypatch.setattr(
             "lightfee.engine.runtime.discover_tradeable_candidates",
-            lambda candidates, _strategy, _now_ms: list(candidates),
+            lambda candidates, _strategy, _now_ms, **_kwargs: list(candidates),
         )
         monkeypatch.setattr(runtime, "_refresh_recovery_ledger_for_symbols", refresh)
         monkeypatch.setattr(runtime, "_dispatch_entry", dispatch)
@@ -1792,6 +2104,7 @@ class TestPlannerDispatchIntegration:
         self, config, tmp_journal,
     ):
         config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         config.strategy.entry_final_gate_max_skew_ms = 100
@@ -1828,6 +2141,77 @@ class TestPlannerDispatchIntegration:
         assert payload["max_skew_ms"] == 100
         assert payload["left_venue"] == "binance"
         assert payload["right_venue"] == "okx"
+
+    @pytest.mark.asyncio
+    async def test_enhanced_live_dispatch_blocks_projected_portfolio_symbol_limit(
+        self, config, tmp_journal,
+    ):
+        """The final L2-sized order must be admitted against live positions."""
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        binance.available_margin_quote = 1_000.0
+        okx.available_margin_quote = 1_000.0
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+        )
+        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: SimpleNamespace(
+                expected_shortfall_bps=10.0,
+                sample_count=120,
+                return_count=119,
+                history_ms=300_000,
+                confidence=0.95,
+                evidence_complete=True,
+                reason="",
+                model_version="test",
+            )
+        )
+        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        self._install_hot_book(
+            runtime, "binance", "BTCUSDT",
+            bid=50_000.0, ask=50_010.0, observed_at_ms=5_000,
+        )
+        self._install_hot_book(
+            runtime, "okx", "BTCUSDT",
+            bid=49_990.0, ask=50_000.0, observed_at_ms=5_000,
+        )
+        runtime.state.open_positions["open-btc"] = OpenPosition(
+            position_id="open-btc",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.0016,
+            short_quantity=0.0016,
+            long_entry_price=50_000.0,
+            short_entry_price=50_000.0,
+            opened_at_ms=1_000,
+            funding_timestamp_ms=605_000,
+            expected_shortfall_bps_entry=10.0,
+        )
+        candidate = self._candidate()
+        candidate.entry_notional_quote = 50.0
+        candidate.entry_target_quantity = 0.001
+        candidate.entry_max_executable_quantity = 0.001
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+
+        assert dispatched is False
+        assert runtime.entry_executor.ctx is None
+        payload = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+        ][-1]
+        assert payload["reason"] == "max_symbol_exposure"
+        assert payload["source"] == "strategy_risk_allocator"
+        assert payload["projected_symbol_exposure_quote"] > 100.0
 
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_does_not_require_local_l2_books(
@@ -1993,6 +2377,7 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
@@ -2042,6 +2427,7 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
@@ -2093,6 +2479,7 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
@@ -2205,6 +2592,7 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
         config.runtime.max_market_age_ms = 30_000
         config.strategy.local_l2_enabled = True
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -3106,7 +3494,7 @@ class TestPlannerDispatchIntegration:
             long_entry_vwap=50000.5,
             short_entry_vwap=50010.5,
             entry_capacity_constrained=True,
-            entry_target_quantity=0.2,
+            entry_target_quantity=0.16,
             long_max_executable_quantity=0.18,
             short_max_executable_quantity=0.16,
             entry_max_executable_quantity=0.16,
@@ -3116,7 +3504,7 @@ class TestPlannerDispatchIntegration:
             advisories=["thin_book"],
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 1780163908797, price_hint=0.275)
+        dispatched = await runtime._dispatch_entry(candidate, 1780163908797, price_hint=50000.0)
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -3146,7 +3534,7 @@ class TestPlannerDispatchIntegration:
         assert executor.ctx.long_entry_vwap == pytest.approx(50000.5)
         assert executor.ctx.short_entry_vwap == pytest.approx(50010.5)
         assert executor.ctx.entry_capacity_constrained is True
-        assert executor.ctx.entry_target_quantity == pytest.approx(0.2)
+        assert executor.ctx.entry_target_quantity == pytest.approx(0.16)
         assert executor.ctx.long_max_executable_quantity == pytest.approx(0.18)
         assert executor.ctx.short_max_executable_quantity == pytest.approx(0.16)
         assert executor.ctx.entry_max_executable_quantity == pytest.approx(0.16)
@@ -3172,6 +3560,60 @@ class TestPlannerDispatchIntegration:
         assert selected["payload"]["opportunity_type"] == "staggered"
         assert selected["payload"]["funding_timestamp_ms"] == first_funding_ms
         assert selected["payload"]["second_funding_timestamp_ms"] == second_funding_ms
+
+    def test_entry_context_records_only_dispatch_provided_es_for_live_sized_candidate(self, config, tmp_journal):
+        """Entry context persists the dispatch model evidence, never a config guess."""
+        from lightfee.engine.entry import EntryType
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="bybit",
+            symbol="BTCUSDT",
+            funding_diff_bps=8.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=5.0,
+            entry_target_quantity=0.01,
+        )
+
+        def build_context():
+            return runtime.entry_dispatch_runtime._build_entry_context(
+                candidate=candidate,
+                entry_id="es-entry",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.BYBIT,
+                effective_quantity=0.01,
+                long_order_price_hint=50_000.0,
+                short_order_price_hint=50_000.0,
+                maker_leg=Side.BUY,
+                entry_type=EntryType.STANDARD_DUAL_TAKER,
+                route=ExecutionRoute.FALLBACK_TO_STANDARD,
+                now_ms=1_000,
+            )
+
+        config.runtime.mode = "live"
+        assert build_context().expected_shortfall_bps_entry == 0.0
+        assert (
+            runtime.entry_dispatch_runtime._build_entry_context(
+                candidate=candidate,
+                entry_id="es-entry",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.BYBIT,
+                effective_quantity=0.01,
+                long_order_price_hint=50_000.0,
+                short_order_price_hint=50_000.0,
+                maker_leg=Side.BUY,
+                entry_type=EntryType.STANDARD_DUAL_TAKER,
+                route=ExecutionRoute.FALLBACK_TO_STANDARD,
+                now_ms=1_000,
+                expected_shortfall_bps_entry=12.5,
+            ).expected_shortfall_bps_entry
+            == pytest.approx(12.5)
+        )
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_sets_first_stage_exit_from_v1_config(self, config, tmp_journal):

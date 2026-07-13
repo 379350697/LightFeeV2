@@ -1,110 +1,824 @@
-"""Same-symbol venue pair building with V1 parity identity and timing fields."""
+"""Same-symbol funding pair construction with V1 economics compatibility."""
 
 from __future__ import annotations
 
+from math import isfinite
+
+from lightfee.config.schema import StrategyConfig
 from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
+from lightfee.strategy.economics import FundingForecast, build_edge_breakdown
+from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
-# V1: fixed live/paper entry notional — non-zero to avoid ZERO_ORDER_SIZE gate
-_DEFAULT_ENTRY_NOTIONAL_QUOTE = 50.0
 _INTERVAL_ALIGNED_THRESHOLD_MS = 60_000
+
+
+class FundingCandidateService:
+    """Reusable funding-shortlist builder owned by the sidecar service.
+
+    The public ``build_same_symbol_pairs`` function remains a compatibility
+    boundary for tests and tooling.  A running sidecar instead keeps the
+    typed strategy, venue-fee evidence and risk allocator together, so a
+    refresh does not rebuild configuration-derived maps.
+    """
+
+    def __init__(
+        self,
+        *,
+        strategy: StrategyConfig,
+        venue_fee_bps: dict[str, float],
+        venue_maker_fee_bps: dict[str, float],
+        venue_notional_caps: dict[str, float],
+        passive_execution_enabled: bool,
+    ) -> None:
+        self._strategy = strategy
+        self._fee_by_venue = _normalise_venue_bps(venue_fee_bps)
+        self._maker_fee_by_venue = _normalise_venue_bps(venue_maker_fee_bps)
+        self._caps_by_venue = _normalise_venue_bps(venue_notional_caps)
+        self._passive_execution_enabled = passive_execution_enabled is True
+        self._allocator = StrategyRiskAllocator()
+
+    def build(
+        self,
+        quotes: dict[str, QuoteSnapshot],
+        symbols: list[str],
+        *,
+        observed_at_ms: int = 0,
+    ) -> list[CandidateInput]:
+        return _build_same_symbol_pairs(
+            quotes,
+            symbols,
+            config=self._strategy,
+            fee_by_venue=self._fee_by_venue,
+            maker_fee_by_venue=self._maker_fee_by_venue,
+            caps_by_venue=self._caps_by_venue,
+            allocator=self._allocator,
+            passive_execution_enabled=self._passive_execution_enabled,
+            observed_at_ms=observed_at_ms,
+        )
 
 
 def build_same_symbol_pairs(
     quotes: dict[str, QuoteSnapshot],
     symbols: list[str],
+    *,
+    strategy: StrategyConfig | None = None,
+    venue_fee_bps: dict[str, float] | None = None,
+    venue_maker_fee_bps: dict[str, float] | None = None,
+    venue_notional_caps: dict[str, float] | None = None,
+    passive_execution_enabled: bool = False,
+    observed_at_ms: int = 0,
 ) -> list[CandidateInput]:
-    """Build directed (long, short) pairs for each symbol across venues.
+    """Build directed funding pairs using a common base quantity.
 
-    V2 fixes:
-    - direction_consistent uses long/short mid prices, not ask
-    - interval_aligned = abs(long_ts - short_ts) <= 60_000
-    - pair_id, first_funding_leg, second_funding_timestamp_ms always populated
-    - entry_notional_quote always non-zero
+    This is the conservative sidecar shortlist only.  The live entry path must
+    revalidate the same contract against current L2 immediately before it
+    submits the first leg.  Direction consistency is diagnostic evidence, not
+    an alpha gate: executable cross is part of the economics formula.
     """
+
+    return _build_same_symbol_pairs(
+        quotes,
+        symbols,
+        config=strategy if strategy is not None else StrategyConfig(),
+        fee_by_venue=_normalise_venue_bps(venue_fee_bps or {}),
+        maker_fee_by_venue=_normalise_venue_bps(venue_maker_fee_bps or {}),
+        caps_by_venue=_normalise_venue_bps(venue_notional_caps or {}),
+        allocator=StrategyRiskAllocator(),
+        passive_execution_enabled=passive_execution_enabled is True,
+        observed_at_ms=observed_at_ms,
+    )
+
+
+def _build_same_symbol_pairs(
+    quotes: dict[str, QuoteSnapshot],
+    symbols: list[str],
+    *,
+    config: StrategyConfig,
+    fee_by_venue: dict[str, float],
+    maker_fee_by_venue: dict[str, float],
+    caps_by_venue: dict[str, float],
+    allocator: StrategyRiskAllocator,
+    passive_execution_enabled: bool,
+    observed_at_ms: int,
+) -> list[CandidateInput]:
     candidates: list[CandidateInput] = []
 
-    for symbol in symbols:
-        venue_quotes: list[QuoteSnapshot] = []
-        for q in quotes.values():
-            if q.symbol.upper() == symbol.upper():
-                venue_quotes.append(q)
+    quotes_by_symbol: dict[str, list[QuoteSnapshot]] = {}
+    for quote in quotes.values():
+        quotes_by_symbol.setdefault(str(quote.symbol).upper(), []).append(quote)
 
+    for symbol in symbols:
+        venue_quotes = quotes_by_symbol.get(str(symbol).upper(), [])
         if len(venue_quotes) < 2:
             continue
-
-        for i, long_q in enumerate(venue_quotes):
-            for j, short_q in enumerate(venue_quotes):
-                if i == j:
+        economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
+        for long_q in venue_quotes:
+            for short_q in venue_quotes:
+                if long_q is short_q:
                     continue
-                if short_q.funding_rate_bps <= long_q.funding_rate_bps:
+                # V1 and the shadow comparison must preserve the legacy
+                # quoted-rate discovery universe exactly.  Once calibrated
+                # enhanced-live is explicitly selected, however, the
+                # prediction may reverse the quoted ordering.  Enumerate both
+                # directions there so the actual forecast gate can evaluate
+                # the positive direction instead of silently omitting it.
+                if (
+                    economics_mode != "enhanced_live"
+                    and short_q.funding_rate_bps <= long_q.funding_rate_bps
+                ):
                     continue
-
-                funding_diff = short_q.funding_rate_bps - long_q.funding_rate_bps
-
-                # V2 fix: use mid prices for reference_mid and direction_consistent
-                long_mid = (long_q.bid + long_q.ask) / 2.0
-                short_mid = (short_q.bid + short_q.ask) / 2.0
-                reference_mid = (long_mid + short_mid) / 2.0 if long_mid > 0 and short_mid > 0 else 1.0
-
-                raw_cross_bps = 0.0
-                if reference_mid > 0 and long_q.ask > 0 and short_q.bid > 0:
-                    raw_cross_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10000.0
-
-                # V2 fix: direction_consistent using mid prices
-                direction_consistent = (
-                    funding_diff > 0
-                    and short_mid >= long_mid
-                    and long_mid > 0
-                    and short_mid > 0
+                candidate = _candidate_for_pair(
+                    long_q=long_q,
+                    short_q=short_q,
+                    config=config,
+                    fee_by_venue=fee_by_venue,
+                    maker_fee_by_venue=maker_fee_by_venue,
+                    caps_by_venue=caps_by_venue,
+                    allocator=allocator,
+                    passive_execution_enabled=passive_execution_enabled,
+                    observed_at_ms=observed_at_ms,
                 )
-
-                long_ts = long_q.funding_timestamp_ms
-                short_ts = short_q.funding_timestamp_ms
-
-                # Timing fields
-                interval_aligned = abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS if long_ts > 0 and short_ts > 0 else False
-                first_ts = min(long_ts, short_ts)
-                second_ts = max(long_ts, short_ts)
-                first_leg = "long" if long_ts <= short_ts else "short" if long_ts > 0 and short_ts > 0 else ""
-                opportunity_type = "aligned" if interval_aligned else "staggered"
-
-                pair_id = make_candidate_pair_id(symbol, long_q.venue, short_q.venue)
-
-                candidates.append(
-                    CandidateInput(
-                        long_venue=long_q.venue,
-                        short_venue=short_q.venue,
-                        symbol=symbol,
-                        funding_diff_bps=funding_diff,
-                        funding_edge_bps=funding_diff,
-                        # V1 parity: sidecar emits pure funding edge without cross-spread deduction.
-                        # Entry/exit cross costs are computed in the engine from live L2 order books.
-                        expected_edge_bps=funding_diff,
-                        worst_case_edge_bps=funding_diff,
-                        ranking_edge_bps=funding_diff + raw_cross_bps,  # cross-spread used for ranking only
-                        pair_id=pair_id,
-                        funding_timestamp_ms=first_ts,
-                        first_funding_timestamp_ms=first_ts,
-                        long_funding_timestamp_ms=long_ts,
-                        short_funding_timestamp_ms=short_ts,
-                        second_funding_timestamp_ms=second_ts,
-                        first_funding_leg=first_leg,
-                        direction_consistent=direction_consistent,
-                        interval_aligned=interval_aligned,
-                        opportunity_type=opportunity_type,
-                        entry_notional_quote=_DEFAULT_ENTRY_NOTIONAL_QUOTE,
-                    )
-                )
+                if candidate is not None:
+                    candidates.append(candidate)
 
     return sorted(candidates, key=lambda c: c.ranking_edge_bps, reverse=True)
 
 
+def _candidate_for_pair(
+    *,
+    long_q: QuoteSnapshot,
+    short_q: QuoteSnapshot,
+    config: StrategyConfig,
+    fee_by_venue: dict[str, float],
+    maker_fee_by_venue: dict[str, float],
+    caps_by_venue: dict[str, float],
+    allocator: StrategyRiskAllocator,
+    passive_execution_enabled: bool,
+    observed_at_ms: int,
+) -> CandidateInput | None:
+    # A snapshot is only a coherent cross-venue observation when no source
+    # quote claims to have arrived after the refresh that is building it.
+    # Keep zero/absent timestamps compatible with schema-1/V1 fixtures, but
+    # fail closed on a future source timestamp rather than treating negative
+    # age as a fresh executable market.
+    now_ms = max(int(observed_at_ms or 0), 0)
+    if now_ms > 0 and (
+        _quote_observed_after(long_q, now_ms)
+        or _quote_observed_after(short_q, now_ms)
+    ):
+        return None
+    if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
+        return None
+    long_mid = _mid(long_q)
+    short_mid = _mid(short_q)
+    if long_mid <= 0.0 or short_mid <= 0.0 or long_q.ask <= 0.0 or short_q.bid <= 0.0:
+        return None
+    contract_block_reasons = _funding_contract_block_reasons(long_q, short_q)
+    # V1 prices a directed entry against the actual executable long ask and
+    # short bid, rather than an unrelated midpoint.  This is the denominator
+    # used by its cross, sizing and passive-spread recovery terms.
+    reference_mid = (float(long_q.ask) + float(short_q.bid)) / 2.0
+    raw_entry_cross_bps = ((short_q.bid - long_q.ask) / reference_mid) * 10_000.0
+    long_ts = int(long_q.funding_timestamp_ms or 0)
+    short_ts = int(short_q.funding_timestamp_ms or 0)
+    interval_aligned = (
+        abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS
+        if long_ts > 0 and short_ts > 0
+        else False
+    )
+    first_ts = min(long_ts, short_ts) if long_ts > 0 and short_ts > 0 else 0
+    second_ts = max(long_ts, short_ts) if long_ts > 0 and short_ts > 0 else 0
+    first_leg = "long" if long_ts <= short_ts else "short" if long_ts and short_ts else ""
+    now_ms = int(observed_at_ms or long_q.observed_at_ms or short_q.observed_at_ms or 0)
+
+    configured_uncertainty = max(
+        float(config.funding_forecast_uncertainty_haircut_bps or 0.0), 0.0
+    )
+    long_forecast = FundingForecast.from_quote(
+        venue=long_q.venue,
+        symbol=long_q.symbol,
+        quoted_rate_bps=long_q.funding_rate_bps,
+        predicted_settled_rate_bps=long_q.predicted_funding_rate_bps,
+        next_funding_timestamp_ms=long_ts,
+        funding_interval_ms=long_q.funding_interval_ms,
+        observed_at_ms=now_ms,
+        uncertainty_haircut_bps=max(
+            configured_uncertainty,
+            float(long_q.funding_forecast_uncertainty_bps or 0.0),
+        ),
+        sample_count=long_q.funding_forecast_sample_count,
+        min_samples=config.funding_forecast_min_samples,
+        source=long_q.funding_forecast_source,
+    )
+    short_forecast = FundingForecast.from_quote(
+        venue=short_q.venue,
+        symbol=short_q.symbol,
+        quoted_rate_bps=short_q.funding_rate_bps,
+        predicted_settled_rate_bps=short_q.predicted_funding_rate_bps,
+        next_funding_timestamp_ms=short_ts,
+        funding_interval_ms=short_q.funding_interval_ms,
+        observed_at_ms=now_ms,
+        uncertainty_haircut_bps=max(
+            configured_uncertainty,
+            float(short_q.funding_forecast_uncertainty_bps or 0.0),
+        ),
+        sample_count=short_q.funding_forecast_sample_count,
+        min_samples=config.funding_forecast_min_samples,
+        source=short_q.funding_forecast_source,
+    )
+    # Keep the two legs explicit.  For staggered timestamps the first
+    # settlement contains only one of these components; crediting the total
+    # carry at stage one is an economically invalid look-ahead.
+    quoted_long_component = -float(long_q.funding_rate_bps)
+    quoted_short_component = float(short_q.funding_rate_bps)
+    forecast_long_component = -float(long_forecast.predicted_settled_rate_bps)
+    forecast_short_component = float(short_forecast.predicted_settled_rate_bps)
+    worst_long_component = -float(long_forecast.upper_bound_bps)
+    worst_short_component = float(short_forecast.lower_bound_bps)
+    required_shadow_age_ms = max(
+        int(config.funding_forecast_shadow_min_days or 0), 0
+    ) * 24 * 60 * 60 * 1000
+    long_shadow_age_ms = _forecast_shadow_age_ms(long_q, now_ms)
+    short_shadow_age_ms = _forecast_shadow_age_ms(short_q, now_ms)
+    forecast_shadow_age_ms = min(long_shadow_age_ms, short_shadow_age_ms)
+    forecast_ready = (
+        long_forecast.confidence > 0.0
+        and short_forecast.confidence > 0.0
+        and forecast_shadow_age_ms >= required_shadow_age_ms
+    )
+    forecast_distribution_stable = (
+        long_q.funding_forecast_distribution_stable is True
+        and short_q.funding_forecast_distribution_stable is True
+    )
+    forecast_stability_reason = "|".join(
+        f"{leg}:{str(getattr(quote, 'funding_forecast_stability_reason', '') or 'unknown')}"
+        for leg, quote in (("long", long_q), ("short", short_q))
+        if getattr(quote, "funding_forecast_distribution_stable", False) is not True
+    ) or "stable"
+    forecast_median_drift_bps = max(
+        _finite_nonnegative(long_q.funding_forecast_median_drift_bps),
+        _finite_nonnegative(short_q.funding_forecast_median_drift_bps),
+    )
+    forecast_p90_drift_bps = max(
+        _finite_nonnegative(long_q.funding_forecast_p90_drift_bps),
+        _finite_nonnegative(short_q.funding_forecast_p90_drift_bps),
+    )
+    economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
+    use_forecast_for_live_gate = (
+        economics_mode == "enhanced_live"
+        and forecast_ready
+        and forecast_distribution_stable
+    )
+    # V1 exact and enhanced shadow keep the same entry gate.  Shadow records
+    # the calibrated forecast without allowing an unproven model to alter a
+    # live decision.  Enhanced live fails closed below when calibration is not
+    # ready instead of silently using an optimistic prediction.
+    if use_forecast_for_live_gate:
+        gate_long_component = forecast_long_component
+        gate_short_component = forecast_short_component
+        gate_worst_long_component = worst_long_component
+        gate_worst_short_component = worst_short_component
+    else:
+        # `enhanced_shadow` records the forecast but deliberately retains the
+        # V1 quoted-rate entry contract until calibration has been proven.
+        gate_long_component = quoted_long_component
+        gate_short_component = quoted_short_component
+        gate_worst_long_component = quoted_long_component
+        gate_worst_short_component = quoted_short_component
+    gate_funding = gate_long_component + gate_short_component
+    gate_worst_funding = gate_worst_long_component + gate_worst_short_component
+    calculation_version = economics_mode
+    long_fee = fee_by_venue.get(str(long_q.venue).lower(), 0.0)
+    short_fee = fee_by_venue.get(str(short_q.venue).lower(), 0.0)
+    taker_fee_evidence_complete = _taker_fee_evidence_complete(
+        fee_by_venue,
+        long_q.venue,
+        short_q.venue,
+    )
+    long_maker_fee = maker_fee_by_venue.get(str(long_q.venue).lower(), long_fee)
+    short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
+    venue_haircut = (
+        float(config.funding_venue_risk_haircut_bps_by_venue.get(str(long_q.venue).lower(), 0.0) or 0.0)
+        + float(config.funding_venue_risk_haircut_bps_by_venue.get(str(short_q.venue).lower(), 0.0) or 0.0)
+    )
+    opportunity_type = "aligned" if interval_aligned else "staggered"
+    stagger_gap_ms = max(second_ts - first_ts, 0) if first_ts > 0 else 0
+    if opportunity_type == "aligned":
+        first_stage_funding = gate_funding
+        first_stage_worst_funding = gate_worst_funding
+        second_stage_funding = 0.0
+        second_stage_worst_funding = 0.0
+    elif first_leg == "long":
+        first_stage_funding = gate_long_component
+        first_stage_worst_funding = gate_worst_long_component
+        second_stage_funding = gate_short_component
+        second_stage_worst_funding = gate_worst_short_component
+    elif first_leg == "short":
+        first_stage_funding = gate_short_component
+        first_stage_worst_funding = gate_worst_short_component
+        second_stage_funding = gate_long_component
+        second_stage_worst_funding = gate_worst_long_component
+    else:
+        # Timestamp-less candidates are incomplete and must not manufacture a
+        # stage value that could later be mistaken for an executable edge.
+        first_stage_funding = 0.0
+        first_stage_worst_funding = 0.0
+        second_stage_funding = 0.0
+        second_stage_worst_funding = 0.0
+
+    # Admission and first-stage stop/hold economics use only the carry that
+    # settles before the planned first exit.  The total remains separately
+    # attributable for a later evaluate-second-stage decision.
+    configured_cap = min(
+        max(float(config.entry_notional_cap_quote or 0.0), 0.0),
+        max(float(config.live_entry_notional_cap_quote or 0.0), 0.0),
+    )
+    conservative_depth_quantity = configured_cap / reference_mid if configured_cap > 0.0 else 0.0
+    long_depth = float(long_q.ask_size or 0.0) * max(float(config.max_top_book_usage_ratio or 0.0), 0.0)
+    short_depth = float(short_q.bid_size or 0.0) * max(float(config.max_top_book_usage_ratio or 0.0), 0.0)
+    venue_cap = _minimum_positive(
+        caps_by_venue.get(str(long_q.venue).lower(), 0.0),
+        caps_by_venue.get(str(short_q.venue).lower(), 0.0),
+        config.max_single_venue_exposure_quote,
+    )
+    global_reference_cap = _minimum_positive(
+        (
+            float(config.funding_max_global_gross_exposure_quote or 0.0) / 2.0
+            if float(config.funding_max_global_gross_exposure_quote or 0.0) > 0.0
+            else 0.0
+        ),
+        config.funding_max_correlation_group_exposure_quote,
+        (
+            float(config.funding_expected_shortfall_budget_quote or 0.0)
+            * 10_000.0
+            / float(config.funding_expected_shortfall_bps or 0.0)
+            if float(config.funding_expected_shortfall_bps or 0.0) > 0.0
+            else 0.0
+        ),
+    )
+    allocation = allocator.allocate(
+        long_entry_price=long_q.ask,
+        short_entry_price=short_q.bid,
+        long_max_quantity=long_depth if long_depth > 0.0 else conservative_depth_quantity,
+        short_max_quantity=short_depth if short_depth > 0.0 else conservative_depth_quantity,
+        configured_notional_cap_quote=configured_cap,
+        venue_notional_cap_quote=venue_cap,
+        symbol_risk_budget_quote=float(config.max_symbol_exposure_quote or 0.0),
+        venue_pair_risk_budget_quote=float(
+            config.funding_max_venue_pair_exposure_quote or 0.0
+        ),
+        global_risk_budget_quote=global_reference_cap,
+        fallback_notional_quote=float(config.funding_missing_margin_fallback_notional_quote or 0.0),
+        health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
+    )
+    candidate_block_reasons = list(contract_block_reasons)
+    if not taker_fee_evidence_complete:
+        # A zero fee can be a valid explicitly configured VIP tier, but an
+        # omitted, non-finite, or negative taker fee is not evidence.  The
+        # shortlist may remain observable for diagnostics, never complete
+        # enough for a live first-leg decision.
+        candidate_block_reasons.append("missing_taker_fee_evidence")
+    if economics_mode == "enhanced_live" and not forecast_ready:
+        candidate_block_reasons.append("funding_forecast_not_ready")
+    if economics_mode == "enhanced_live" and not forecast_distribution_stable:
+        candidate_block_reasons.append("funding_forecast_distribution_unstable")
+    candidate_blocked = bool(candidate_block_reasons)
+    # Preserve the V1 discovery economics precisely.  Candidate construction
+    # has only BBO size, so it uses V1's deliberately conservative depth
+    # heuristic; live admission replaces the entry part with current L2 VWAP
+    # immediately before leg one.  Crucially, passive mode gives the maker
+    # leg both its spread recovery and maker fee, while it removes that leg's
+    # taker-impact estimate.  This cannot be reconstructed from aggregate
+    # four-leg fee fields after the fact.
+    quantity = float(allocation.base_quantity or 0.0)
+    long_entry_slippage_bps = _heuristic_slippage_bps(
+        long_q, quantity, taking_ask=True
+    )
+    short_entry_slippage_bps = _heuristic_slippage_bps(
+        short_q, quantity, taking_ask=False
+    )
+    entry_maker_leg = _select_maker_leg(
+        long_entry_slippage_bps, short_entry_slippage_bps
+    )
+    entry_cross_bps = raw_entry_cross_bps
+    if passive_execution_enabled:
+        entry_cross_bps += _pair_spread_bps(
+            long_q, short_q, reference_mid, entry_maker_leg
+        )
+    entry_fee_bps = _effective_fee_bps(
+        long_taker_fee_bps=long_fee,
+        long_maker_fee_bps=long_maker_fee,
+        short_taker_fee_bps=short_fee,
+        short_maker_fee_bps=short_maker_fee,
+        maker_leg=entry_maker_leg,
+        passive_execution_enabled=passive_execution_enabled,
+    )
+    entry_slippage_bps = _effective_slippage_bps(
+        long_entry_slippage_bps,
+        short_entry_slippage_bps,
+        entry_maker_leg,
+        passive_execution_enabled,
+    )
+    long_exit_slippage_bps = _heuristic_slippage_bps(
+        long_q, quantity, taking_ask=False
+    )
+    short_exit_slippage_bps = _heuristic_slippage_bps(
+        short_q, quantity, taking_ask=True
+    )
+    exit_maker_leg = _select_maker_leg(
+        long_exit_slippage_bps, short_exit_slippage_bps
+    )
+    exit_fee_bps = _effective_fee_bps(
+        long_taker_fee_bps=long_fee,
+        long_maker_fee_bps=long_maker_fee,
+        short_taker_fee_bps=short_fee,
+        short_maker_fee_bps=short_maker_fee,
+        maker_leg=exit_maker_leg,
+        passive_execution_enabled=passive_execution_enabled,
+    )
+    exit_slippage_bps = _effective_slippage_bps(
+        long_exit_slippage_bps,
+        short_exit_slippage_bps,
+        exit_maker_leg,
+        passive_execution_enabled,
+    )
+    expected = build_edge_breakdown(
+        funding_edge_bps=first_stage_funding,
+        worst_case_funding_edge_bps=first_stage_worst_funding,
+        entry_cross_bps=entry_cross_bps,
+        entry_fee_bps=entry_fee_bps,
+        exit_fee_bps=exit_fee_bps,
+        entry_slippage_bps=entry_slippage_bps,
+        exit_slippage_bps=exit_slippage_bps,
+        adverse_selection_bps=float(config.entry_exit_reserve_bps or 0.0),
+        capital_buffer_bps=float(config.capital_buffer_bps or 0.0),
+        execution_buffer_bps=float(config.execution_buffer_bps or 0.0),
+        venue_risk_haircut_bps=venue_haircut,
+        calculation_version=calculation_version,
+        model_epoch=calculation_version,
+        observed_at_ms=now_ms,
+        economics_complete=(
+            quantity > 0.0 and bool(first_ts) and not candidate_block_reasons
+        ),
+    )
+    # A common-base hedge cannot be claimed for an unnormalised, inverse,
+    # quanto, mismatched-underlying, or otherwise incompatible pair.  This is
+    # a contract-safety fact, not a model preference: V1-compatible scoring
+    # may remain visible in the sidecar, but no mode may label the candidate
+    # complete or send it to live admission.
+    return CandidateInput(
+        long_venue=long_q.venue,
+        short_venue=short_q.venue,
+        symbol=str(long_q.symbol).upper(),
+        funding_diff_bps=gate_funding,
+        funding_edge_bps=first_stage_funding,
+        expected_edge_bps=expected.expected_net_edge_bps,
+        worst_case_edge_bps=expected.worst_case_edge_bps,
+        ranking_edge_bps=expected.ranking_edge_bps,
+        total_funding_edge_bps=gate_funding,
+        first_stage_funding_edge_bps=first_stage_funding,
+        first_stage_expected_edge_bps=expected.expected_net_edge_bps,
+        first_stage_worst_case_edge_bps=expected.worst_case_edge_bps,
+        second_stage_incremental_funding_edge_bps=second_stage_funding,
+        second_stage_worst_case_funding_edge_bps=second_stage_worst_funding,
+        stagger_gap_ms=stagger_gap_ms,
+        entry_cross_bps=entry_cross_bps,
+        fee_bps=entry_fee_bps + exit_fee_bps,
+        entry_slippage_bps=entry_slippage_bps,
+        long_entry_slippage_bps=long_entry_slippage_bps,
+        short_entry_slippage_bps=short_entry_slippage_bps,
+        long_exit_slippage_bps=long_exit_slippage_bps,
+        short_exit_slippage_bps=short_exit_slippage_bps,
+        long_taker_fee_bps=long_fee,
+        short_taker_fee_bps=short_fee,
+        taker_fee_evidence_complete=taker_fee_evidence_complete,
+        pair_id=make_candidate_pair_id(long_q.symbol, long_q.venue, short_q.venue),
+        funding_timestamp_ms=first_ts,
+        first_funding_timestamp_ms=first_ts,
+        long_funding_timestamp_ms=long_ts,
+        short_funding_timestamp_ms=short_ts,
+        second_funding_timestamp_ms=second_ts,
+        first_funding_leg=first_leg,
+        entry_maker_leg=entry_maker_leg if passive_execution_enabled else "",
+        exit_maker_leg=exit_maker_leg if passive_execution_enabled else "",
+        direction_consistent=gate_funding > 0.0 and short_mid >= long_mid,
+        interval_aligned=interval_aligned,
+        opportunity_type=opportunity_type,
+        entry_notional_quote=allocation.reference_notional_quote,
+        entry_target_quantity=allocation.base_quantity,
+        long_max_executable_quantity=long_depth,
+        short_max_executable_quantity=short_depth,
+        entry_max_executable_quantity=min(long_depth, short_depth) if long_depth and short_depth else allocation.base_quantity,
+        entry_max_executable_notional_quote=allocation.reference_notional_quote,
+        entry_capacity_constrained=bool(long_depth > 0.0 or short_depth > 0.0),
+        entry_depth_capped_at_entry=bool(long_depth > 0.0 or short_depth > 0.0),
+        gross_signal_edge_bps=expected.gross_signal_edge_bps,
+        expected_exit_cross_bps=expected.expected_exit_cross_bps,
+        entry_fee_bps=expected.entry_fee_bps,
+        exit_fee_bps=expected.exit_fee_bps,
+        exit_slippage_bps=expected.exit_slippage_bps,
+        adverse_selection_bps=expected.adverse_selection_bps,
+        capital_buffer_bps=expected.capital_buffer_bps,
+        execution_buffer_bps=expected.execution_buffer_bps,
+        venue_risk_haircut_bps=expected.venue_risk_haircut_bps,
+        transfer_or_inventory_bias_bps=expected.transfer_or_inventory_bias_bps,
+        expected_net_edge_bps=expected.expected_net_edge_bps,
+        economics_observed_at_ms=expected.observed_at_ms,
+        economics_complete=(
+            expected.economics_complete
+            and allocation.base_quantity > 0.0
+            and (
+                economics_mode != "enhanced_live"
+                or (forecast_ready and forecast_distribution_stable)
+            )
+            and not contract_block_reasons
+        ),
+        calculation_version=expected.calculation_version,
+        model_epoch=calculation_version,
+        forecast_long_rate_bps=long_forecast.predicted_settled_rate_bps,
+        forecast_short_rate_bps=short_forecast.predicted_settled_rate_bps,
+        # The final first-leg revalidator must use the same lifecycle horizon
+        # as admission.  A staggered candidate cannot substitute total carry
+        # (which includes the later settlement) for a first-stage worst case.
+        forecast_worst_funding_edge_bps=first_stage_worst_funding,
+        forecast_confidence=min(long_forecast.confidence, short_forecast.confidence),
+        forecast_sample_count=min(
+            long_forecast.sample_count, short_forecast.sample_count
+        ),
+        forecast_shadow_age_ms=forecast_shadow_age_ms,
+        forecast_ready=forecast_ready,
+        forecast_distribution_stable=forecast_distribution_stable,
+        forecast_stability_reason=forecast_stability_reason,
+        forecast_median_drift_bps=forecast_median_drift_bps,
+        forecast_p90_drift_bps=forecast_p90_drift_bps,
+        forecast_source=f"{long_forecast.source}|{short_forecast.source}",
+        advisories=[
+            f"first_stage_funding_bps={first_stage_funding:.6f}",
+            f"first_stage_worst_funding_bps={first_stage_worst_funding:.6f}",
+            f"second_stage_funding_bps={second_stage_funding:.6f}",
+            f"second_stage_worst_funding_bps={second_stage_worst_funding:.6f}",
+            f"forecast_stability={forecast_stability_reason}",
+            f"forecast_median_drift_bps={forecast_median_drift_bps:.6f}",
+            f"forecast_p90_drift_bps={forecast_p90_drift_bps:.6f}",
+            *[f"contract_validation_blocked:{reason}" for reason in contract_block_reasons],
+            *([] if allocation.evidence_complete else ["sizing_missing_margin_fallback"]),
+        ],
+        blocked=candidate_blocked,
+        blocked_reasons=candidate_block_reasons,
+    )
+
+
 def check_stale_snapshot(snapshot_published_at_ms: int, max_age_ms: int, now_ms: int) -> bool:
-    """Return True if the snapshot is too old to use."""
-    return (now_ms - snapshot_published_at_ms) > max_age_ms
+    """Return True unless the snapshot timestamp is within the usable range."""
+    published_at_ms = int(snapshot_published_at_ms or 0)
+    now_ms = int(now_ms or 0)
+    if published_at_ms <= 0 or published_at_ms > now_ms:
+        return True
+    return (now_ms - published_at_ms) > max(int(max_age_ms or 0), 0)
 
 
 def reference_mid_valid(long_q: QuoteSnapshot, short_q: QuoteSnapshot) -> bool:
-    return long_q.ask > 0 and short_q.bid > 0
+    return (
+        isfinite(float(long_q.ask or 0.0))
+        and isfinite(float(short_q.bid or 0.0))
+        and long_q.ask > 0
+        and short_q.bid > 0
+    )
+
+
+def _mid(quote: QuoteSnapshot) -> float:
+    bid = float(quote.bid or 0.0)
+    ask = float(quote.ask or 0.0)
+    return (
+        (bid + ask) / 2.0
+        if isfinite(bid) and isfinite(ask) and bid > 0.0 and ask > 0.0
+        else 0.0
+    )
+
+
+def _valid_trade_quote(quote: QuoteSnapshot) -> bool:
+    """Reject corrupted BBO/funding values before they enter ranking.
+
+    ``nan`` has false ordering semantics, which otherwise lets a malformed
+    source bypass simple positive-value guards and contaminate the shortlist.
+    Top-book size intentionally remains optional here: the V1 conservative
+    slippage branch prices missing depth as a large penalty rather than
+    pretending the pair has no price.
+    """
+    try:
+        bid = float(quote.bid or 0.0)
+        ask = float(quote.ask or 0.0)
+        funding = float(quote.funding_rate_bps or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(isfinite(value) for value in (bid, ask, funding))
+        and bid > 0.0
+        and ask > 0.0
+        and bid <= ask
+    )
+
+
+def _quote_observed_after(quote: QuoteSnapshot, now_ms: int) -> bool:
+    """Whether a non-legacy source timestamp would be from the future."""
+    raw_observed_at_ms = getattr(quote, "observed_at_ms", 0)
+    if raw_observed_at_ms in (None, "", 0):
+        return False
+    try:
+        observed_at_ms = int(raw_observed_at_ms)
+    except (TypeError, ValueError, OverflowError):
+        return True
+    return observed_at_ms > now_ms
+
+
+def _minimum_positive(*values: float) -> float:
+    positive = [float(value) for value in values if float(value or 0.0) > 0.0]
+    return min(positive) if positive else 0.0
+
+
+def _finite_nonnegative(value: object) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return parsed if isfinite(parsed) and parsed >= 0.0 else 0.0
+
+
+def _quote_spread_bps(quote: QuoteSnapshot, reference_mid: float) -> float:
+    if reference_mid <= 0.0:
+        return 0.0
+    return max(float(quote.ask) - float(quote.bid), 0.0) / reference_mid * 10_000.0
+
+
+def _pair_spread_bps(
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+    reference_mid: float,
+    maker_leg: str,
+) -> float:
+    quote = long_quote if maker_leg == "long" else short_quote
+    return _quote_spread_bps(quote, reference_mid)
+
+
+def _heuristic_slippage_bps(
+    quote: QuoteSnapshot,
+    quantity: float,
+    *,
+    taking_ask: bool,
+) -> float:
+    """V1 BBO-only impact heuristic for a specific taker leg."""
+    top_size = float((quote.ask_size if taking_ask else quote.bid_size) or 0.0)
+    if top_size <= 0.0 or quantity <= 0.0:
+        return 500.0
+    mid = _mid(quote)
+    if mid <= 0.0:
+        return 500.0
+    half_spread_bps = max(
+        max(float(quote.ask) - float(quote.bid), 0.0) / mid * 10_000.0 / 2.0,
+        0.1,
+    )
+    depth_ratio = quantity / top_size
+    if depth_ratio <= 1.0:
+        return depth_ratio * half_spread_bps
+    return half_spread_bps + (depth_ratio - 1.0) * half_spread_bps * 2.0
+
+
+def _select_maker_leg(long_slippage_bps: float, short_slippage_bps: float) -> str:
+    """Match V1 tie breaking: the long leg wins equal estimated impact."""
+    return "long" if long_slippage_bps >= short_slippage_bps - 1e-9 else "short"
+
+
+def _effective_fee_bps(
+    *,
+    long_taker_fee_bps: float,
+    long_maker_fee_bps: float,
+    short_taker_fee_bps: float,
+    short_maker_fee_bps: float,
+    maker_leg: str,
+    passive_execution_enabled: bool,
+) -> float:
+    if not passive_execution_enabled:
+        return float(long_taker_fee_bps) + float(short_taker_fee_bps)
+    if maker_leg == "long":
+        return float(long_maker_fee_bps) + float(short_taker_fee_bps)
+    return float(long_taker_fee_bps) + float(short_maker_fee_bps)
+
+
+def _taker_fee_evidence_complete(
+    fee_by_venue: dict[str, float],
+    long_venue: object,
+    short_venue: object,
+) -> bool:
+    """Require explicit, finite, non-negative taker fees for both legs."""
+    for venue in (long_venue, short_venue):
+        key = str(venue or "").lower()
+        if key not in fee_by_venue:
+            return False
+        try:
+            fee_bps = float(fee_by_venue[key])
+        except (TypeError, ValueError):
+            return False
+        if not isfinite(fee_bps) or fee_bps < 0.0:
+            return False
+    return True
+
+
+def _effective_slippage_bps(
+    long_slippage_bps: float,
+    short_slippage_bps: float,
+    maker_leg: str,
+    passive_execution_enabled: bool,
+) -> float:
+    if not passive_execution_enabled:
+        return max(float(long_slippage_bps), 0.0) + max(float(short_slippage_bps), 0.0)
+    return max(
+        float(short_slippage_bps) if maker_leg == "long" else float(long_slippage_bps),
+        0.0,
+    )
+
+
+def _funding_contract_block_reasons(
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+) -> tuple[str, ...]:
+    """Return proof gaps that make a common-base funding hedge unsafe.
+
+    Every funding mode requires this proof before a common-base hedge may be
+    admitted: a pair cannot use one quantity if contract units, underlying,
+    quote currency or price/quantity precision are unknown or incompatible.
+    """
+    reasons: list[str] = []
+    if long_quote.contract_normalization_complete is not True:
+        reasons.append("long_contract_normalization_incomplete")
+    if short_quote.contract_normalization_complete is not True:
+        reasons.append("short_contract_normalization_incomplete")
+    if not _same_text(long_quote.underlying, short_quote.underlying):
+        reasons.append("underlying_mismatch")
+    if not _same_text(long_quote.quote_currency, short_quote.quote_currency):
+        reasons.append("quote_currency_mismatch")
+    if str(long_quote.contract_type or "").lower() != "linear":
+        reasons.append("long_contract_type_incompatible")
+    if str(short_quote.contract_type or "").lower() != "linear":
+        reasons.append("short_contract_type_incompatible")
+    long_multiplier = float(long_quote.contract_multiplier or 0.0)
+    short_multiplier = float(short_quote.contract_multiplier or 0.0)
+    if (
+        long_multiplier <= 0.0
+        or short_multiplier <= 0.0
+        or abs(long_multiplier - short_multiplier) > 1e-12
+    ):
+        reasons.append("contract_multiplier_mismatch")
+    if not str(long_quote.mark_index_source or "").strip():
+        reasons.append("long_mark_index_source_missing")
+    if not str(short_quote.mark_index_source or "").strip():
+        reasons.append("short_mark_index_source_missing")
+    if int(long_quote.price_precision or 0) <= 0 or int(long_quote.quantity_precision or 0) <= 0:
+        reasons.append("long_precision_missing")
+    if int(short_quote.price_precision or 0) <= 0 or int(short_quote.quantity_precision or 0) <= 0:
+        reasons.append("short_precision_missing")
+    if str(long_quote.venue_status or "").lower() != "active":
+        reasons.append("long_venue_inactive")
+    if str(short_quote.venue_status or "").lower() != "active":
+        reasons.append("short_venue_inactive")
+    if int(long_quote.funding_interval_ms or 0) <= 0:
+        reasons.append("long_funding_interval_unknown")
+    if int(short_quote.funding_interval_ms or 0) <= 0:
+        reasons.append("short_funding_interval_unknown")
+    return tuple(reasons)
+
+
+def _normalise_venue_bps(values: dict[str, float]) -> dict[str, float]:
+    """Normalise static venue evidence once at the service boundary.
+
+    JSON booleans are integers in Python.  Treat them as malformed evidence,
+    not as a 0/1 bps fee or cap, so a config/parser artefact cannot manufacture
+    complete live economics.
+    """
+    normalized: dict[str, float] = {}
+    for key, value in values.items():
+        if isinstance(value, bool):
+            normalized[str(key).lower()] = float("nan")
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            parsed = float("nan")
+        normalized[str(key).lower()] = parsed
+    return normalized
+
+
+def _same_text(left: object, right: object) -> bool:
+    first = str(left or "").strip().upper()
+    second = str(right or "").strip().upper()
+    return bool(first and second and first == second)
+
+
+def _forecast_shadow_age_ms(quote: QuoteSnapshot, now_ms: int) -> int:
+    started_at_ms = int(
+        getattr(quote, "funding_forecast_started_at_ms", 0) or 0
+    )
+    if started_at_ms <= 0:
+        return 0
+    return max(int(now_ms or 0) - started_at_ms, 0)

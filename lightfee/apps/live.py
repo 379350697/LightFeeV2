@@ -16,7 +16,7 @@ logger = logging.getLogger("lightfee.live")
 
 
 def _shutdown_timeout_s(config) -> float:
-    timeout_ms = int(getattr(config.runtime, "shutdown_grace_period_ms", 3000) or 3000)
+    timeout_ms = config.runtime.shutdown_grace_period_ms
     return max(timeout_ms, 1) / 1000.0
 
 
@@ -132,7 +132,13 @@ def _wire_production_executors(runtime, venue_adapters) -> bool:
     from lightfee.engine.reconciliation import OrderReconciler
 
     runtime.entry_executor = EntrySyncExecutor(
-        adapters=venue_adapters, journal=journal,
+        adapters=venue_adapters,
+        journal=journal,
+        config_overrides={
+            "post_first_fill_decider": (
+                runtime.entry_dispatch_runtime.decide_after_first_fill
+            ),
+        },
     )
     runtime.close_executor = CloseExecutor(
         adapters=venue_adapters, journal=journal,

@@ -7,6 +7,7 @@ Do not change entry selection, admission, or no-entry diagnostic semantics while
 from __future__ import annotations
 
 from collections import Counter
+from math import isfinite
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -432,12 +433,7 @@ class EntryGateRuntime:
         spot_usdc_available: float | None = None,
     ) -> dict:
         evidence = self._entry_admission_evidence(reason)
-        try:
-            live_target_leverage = float(
-                getattr(self.ctx.config.strategy, "live_target_leverage", 1.0) or 1.0
-            )
-        except (TypeError, ValueError):
-            live_target_leverage = 1.0
+        live_target_leverage = float(self.ctx.config.strategy.live_target_leverage)
         candidate_pair_id = (
             self._candidate_pair_id(candidate)
             if candidate is not None
@@ -1359,20 +1355,10 @@ class EntryGateRuntime:
         )
 
     def _entry_liquidity_volume_floor_quote(self, venue: str) -> float:
-        from lightfee.config.schema import V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
-
-        getter = getattr(self.ctx.config.strategy, "entry_volume_floor_quote", None)
-        if callable(getter):
-            return float(getter(venue))
-        return float(V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE)
+        return float(self.ctx.config.strategy.entry_volume_floor_quote(venue))
 
     def _entry_liquidity_open_interest_floor_quote(self, venue: str) -> float:
-        from lightfee.config.schema import V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE
-
-        getter = getattr(self.ctx.config.strategy, "entry_open_interest_floor_quote", None)
-        if callable(getter):
-            return float(getter(venue))
-        return float(V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE)
+        return float(self.ctx.config.strategy.entry_open_interest_floor_quote(venue))
 
     def _entry_liquidity_decision_payload(
         self,
@@ -1463,9 +1449,9 @@ class EntryGateRuntime:
         fallback_source: str,
         record_result: bool = False,
     ) -> list[dict]:
-        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
+        if self.ctx.config.runtime.mode != "live":
             return []
-        if not bool(getattr(self.ctx.config.strategy, "execution_liquidity_enabled", True)):
+        if not self.ctx.config.strategy.execution_liquidity_enabled:
             return []
 
         from lightfee.engine.entry_liquidity_qualification import (
@@ -1867,10 +1853,7 @@ class EntryGateRuntime:
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
         }
-        max_concurrent_positions = max(
-            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
-            1,
-        )
+        max_concurrent_positions = max(self.ctx.config.strategy.max_concurrent_positions, 1)
         open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
         blocked_candidate_samples = [
@@ -2134,10 +2117,7 @@ class EntryGateRuntime:
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
         }
-        max_concurrent_positions = max(
-            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
-            1,
-        )
+        max_concurrent_positions = max(self.ctx.config.strategy.max_concurrent_positions, 1)
         open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
         last_scan = self.ctx.state.last_scan if isinstance(self.ctx.state.last_scan, dict) else {}
@@ -2493,8 +2473,29 @@ class EntryGateRuntime:
         candidate,
         quote_lookup: dict[tuple[str, str], object] | None = None,
     ) -> float:
-        ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
-        risk_score = self._runtime_candidate_risk_score(candidate, quote_lookup or {})
+        """Return the V1 risk-adjusted *priority*, not a second PnL value.
+
+        ``ranking_edge_bps`` stays the single economic value produced by
+        :class:`EdgeBreakdown`.  V1 then divides that priority by current
+        executable depth risk before it deduplicates symbols.  Preserving this
+        separate, execution-risk ordering avoids selecting a nominally better
+        edge whose common quantity cannot be hedged safely.
+        """
+        try:
+            ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return float("-inf")
+        if not isfinite(ranking_edge):
+            return float("-inf")
+        try:
+            risk_score = self._runtime_candidate_risk_score(
+                candidate,
+                quote_lookup or {},
+            )
+        except (TypeError, ValueError):
+            return float("-inf")
+        if not isfinite(risk_score):
+            return float("-inf")
         return ranking_edge / (1.0 + max(risk_score, 0.0))
 
     def _candidate_final_selection_sort_key(
@@ -2502,10 +2503,25 @@ class EntryGateRuntime:
         candidate,
         quote_lookup: dict[tuple[str, str], object] | None = None,
     ) -> tuple[float, float, float, str]:
+        selection_score = self._runtime_candidate_selection_score(candidate, quote_lookup)
+        try:
+            ranking_edge = float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            ranking_edge = float("-inf")
+        if not isfinite(ranking_edge):
+            ranking_edge = float("-inf")
+        try:
+            worst_case_edge = float(
+                getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            worst_case_edge = float("-inf")
+        if not isfinite(worst_case_edge):
+            worst_case_edge = float("-inf")
         return (
-            -self._runtime_candidate_selection_score(candidate, quote_lookup),
-            -float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
-            -float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0),
+            -selection_score,
+            -ranking_edge,
+            -worst_case_edge,
             self._candidate_pair_id(candidate),
         )
 

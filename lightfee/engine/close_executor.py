@@ -1279,15 +1279,28 @@ class CloseExecutor:
                 short_legs=short_legs,
             )
 
-        pnl_attr = build_exit_pnl_attribution(position, close)
+        # A partial close has its own ``exit.partial_closed`` event inside
+        # writeback.  Emitting ``exit.closed`` for every chunk double-counts
+        # entry fees/funding in offline PnL and makes a partial fill look like
+        # a complete lifecycle.  The terminal event uses cumulative position
+        # cash flows; state-less callers keep the old single-execution shape.
+        terminal_close = state is None or position.matched_quantity < 1e-12
+        pnl_attr = (
+            build_exit_pnl_attribution(position, close)
+            if state is None
+            else build_position_pnl_attribution(position)
+        )
 
-        if long_closed > 1e-12 or short_closed > 1e-12:
-            # V1: exit.closed is a critical event — synchronous durability
+        if terminal_close and (long_closed > 1e-12 or short_closed > 1e-12):
+            # V1: terminal exit.closed is synchronously durable.
             self.journal.append_critical(
                 now_ms,
                 "exit.closed",
                 {
                     "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
                     "reason": reason,
                     "long_closed_qty": long_closed,
                     "short_closed_qty": short_closed,
@@ -1298,6 +1311,22 @@ class CloseExecutor:
                     "entry_fee_quote": pnl_attr["entry_fee_quote"],
                     "exit_fee_quote": pnl_attr["exit_fee_quote"],
                     "net_quote": pnl_attr["net_quote"],
+                    "lifecycle_forecast_funding_quote": pnl_attr[
+                        "lifecycle_forecast_funding_quote"
+                    ],
+                    "settled_funding_quote": pnl_attr["settled_funding_quote"],
+                    "funding_settlement_evidence_status": pnl_attr[
+                        "funding_settlement_evidence_status"
+                    ],
+                    "official_pnl": pnl_attr["official_pnl"],
+                    "official_funding_quote": pnl_attr["official_funding_quote"],
+                    "official_net_quote": pnl_attr["official_net_quote"],
+                    "funding_forecast_error_quote": pnl_attr[
+                        "funding_forecast_error_quote"
+                    ],
+                    "calculation_version": position.calculation_version,
+                    "model_epoch": position.model_epoch,
+                    "economics_observed_at_ms": position.economics_observed_at_ms,
                     "close_id": close_id,
                     "chunk_count": total_chunks,
                     "long_client_order_id": ", ".join(chunk_long_cids),
@@ -1418,17 +1447,34 @@ class CloseExecutor:
         # Fully closed → remove from open positions
         # V1: exit.closed is a critical event
         if position.matched_quantity < 1e-12:
-            state.open_positions.pop(position.position_id, None)
-            self.journal.append_critical(
-                now_ms,
-                "exit.closed",
-                {
-                    "position_id": position.position_id,
-                    "reason": reason,
-                    "price_pnl": close.realized_price_pnl_quote,
-                    "net_quote": close.net_quote,
-                },
+            # Private funding statements settle asynchronously.  Persist an
+            # accounting-only task before dropping the position; never make the
+            # V1 close lifecycle wait for a private-account request.
+            from lightfee.strategy.funding_settlement_reconciler import (
+                FundingSettlementReconciler,
             )
+
+            funding_task = FundingSettlementReconciler.register_closed_position_task(
+                state,
+                position,
+                closed_at_ms=now_ms,
+                price_pnl_quote=position.realized_price_pnl_quote,
+                exit_fee_quote=position.realized_exit_fee_quote,
+            )
+            state.open_positions.pop(position.position_id, None)
+            if funding_task is not None:
+                self.journal.append(
+                    "funding.settlement_reconciliation_registered",
+                    {
+                        "position_id": position.position_id,
+                        "closed_at_ms": now_ms,
+                        "required_settlement_count": len(
+                            funding_task["required_settlements"]
+                        ),
+                        "calculation_version": funding_task["calculation_version"],
+                        "model_epoch": funding_task["model_epoch"],
+                    },
+                )
         else:
             # V1: dust pause — when remaining is below dust, mark last_risk_action
             # to prevent immediate re-close (exit.rs:3093-3171)
@@ -2451,22 +2497,74 @@ class CloseExecutor:
 def build_exit_pnl_attribution(
     position: OpenPosition,
     close: CloseExecution,
-) -> dict[str, float]:
+) -> dict[str, object]:
     """V1 build_exit_pnl_attribution (exit.rs line 5960): separate PnL components.
 
-    Returns dict with funding, price_pnl, entry_fee, exit_fee, net_quote.
+    ``funding_quote`` and ``net_quote`` retain the exact V1 lifecycle
+    accounting contract.  The separate official fields deliberately remain
+    unavailable until position-allocated exchange settlement evidence exists.
     """
     funding_quote = position.captured_funding_quote + position.second_stage_funding_quote
     entry_fee = position.long_entry_fee_quote + position.short_entry_fee_quote
     exit_fee = close.long_fee_quote + close.short_fee_quote
     net = close.realized_price_pnl_quote + funding_quote - entry_fee - exit_fee
 
+    official = position.funding_settlement_evidence_status == "complete"
+    official_net = (
+        close.realized_price_pnl_quote
+        + position.settled_funding_quote
+        - entry_fee
+        - exit_fee
+        if official
+        else None
+    )
     return {
         "funding_quote": funding_quote,
+        "lifecycle_forecast_funding_quote": funding_quote,
+        "settled_funding_quote": position.settled_funding_quote,
+        "funding_settlement_evidence_status": position.funding_settlement_evidence_status,
+        "official_pnl": official,
+        "official_funding_quote": position.settled_funding_quote if official else None,
+        "official_net_quote": official_net,
+        "funding_forecast_error_quote": position.funding_forecast_error_quote,
         "price_pnl_quote": close.realized_price_pnl_quote,
         "entry_fee_quote": entry_fee,
         "exit_fee_quote": exit_fee,
         "net_quote": net,
+    }
+
+
+def build_position_pnl_attribution(position: OpenPosition) -> dict[str, object]:
+    """Return cumulative terminal economics from the persisted position.
+
+    Close attempts may be chunked or partially filled.  Terminal reporting
+    must use the accumulated price PnL and exit fees, otherwise the final
+    chunk is incorrectly reported as the full trade while entry fees and
+    funding are repeated across multiple journal records.
+    """
+    funding_quote = position.captured_funding_quote + position.second_stage_funding_quote
+    entry_fee = position.long_entry_fee_quote + position.short_entry_fee_quote
+    exit_fee = position.realized_exit_fee_quote
+    price_pnl = position.realized_price_pnl_quote
+    official = position.funding_settlement_evidence_status == "complete"
+    official_net = (
+        price_pnl + position.settled_funding_quote - entry_fee - exit_fee
+        if official
+        else None
+    )
+    return {
+        "funding_quote": funding_quote,
+        "lifecycle_forecast_funding_quote": funding_quote,
+        "settled_funding_quote": position.settled_funding_quote,
+        "funding_settlement_evidence_status": position.funding_settlement_evidence_status,
+        "official_pnl": official,
+        "official_funding_quote": position.settled_funding_quote if official else None,
+        "official_net_quote": official_net,
+        "funding_forecast_error_quote": position.funding_forecast_error_quote,
+        "price_pnl_quote": price_pnl,
+        "entry_fee_quote": entry_fee,
+        "exit_fee_quote": exit_fee,
+        "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
     }
 
 

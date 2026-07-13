@@ -1,48 +1,80 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from math import isfinite
+
 import pytest
 
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.models import SpreadReversionCandidate
-from lightfee.spread.paper import SpreadPaperConfig, SpreadPaperTracker
+from lightfee.spread.paper import (
+    SPREAD_PAPER_JOURNAL_SCHEMA_VERSION,
+    FundingSettlement,
+    PaperOrderState,
+    SpreadPaperConfig,
+    SpreadPaperBotSpec,
+    SpreadPaperTracker,
+    _paper_bot_execution_supported,
+)
+from lightfee.spread.research_manifest import DEFAULT_SPREAD_RESEARCH_MANIFEST
 
 
 def _candidate(
     *,
-    symbol: str = "BTCUSDT",
     signal_ts_ms: int = 1_000,
-    entry_notional_quote: float = 20.0,
-    opportunity_label: str = "spread_reversion",
     long_venue: str = "cheap",
     short_venue: str = "rich",
-    executable_spread_bps: float = 40.0,
-    net_edge_bps: float = 20.0,
-    z_score: float = 3.0,
-    capacity_quote: float = 100.0,
+    entry_notional_quote: float = 20.0,
 ) -> SpreadReversionCandidate:
     return SpreadReversionCandidate(
-        candidate_id=f"spread:{symbol}:{long_venue}->{short_venue}",
-        symbol=symbol,
+        candidate_id=f"spread:BTCUSDT:{long_venue}->{short_venue}",
+        symbol="BTCUSDT",
         long_venue=long_venue,
         short_venue=short_venue,
-        spread_mid_bps=50.0,
-        executable_spread_bps=executable_spread_bps,
-        rolling_mean_bps=10.0,
-        rolling_std_bps=5.0,
-        z_score=z_score,
-        net_edge_bps=net_edge_bps,
+        spread_mid_bps=-50.0,
+        executable_spread_bps=-60.0,
+        rolling_mean_bps=0.0,
+        rolling_std_bps=10.0,
+        z_score=-5.0,
+        net_edge_bps=25.0,
         sample_count=120,
         signal_ts_ms=signal_ts_ms,
         long_quote_ts_ms=signal_ts_ms,
         short_quote_ts_ms=signal_ts_ms,
         entry_notional_quote=entry_notional_quote,
-        capacity_quote=capacity_quote,
+        capacity_quote=100.0,
         signal_status="entry_ready",
-        fair_price=100.5,
-        venue_premium_bps=25.0,
-        liquidity_evidence_status="top_book_size_available",
-        opportunity_label=opportunity_label,
+        canonical_venue_a=min(long_venue, short_venue),
+        canonical_venue_b=max(long_venue, short_venue),
+        current_signed_mid_spread_bps=-50.0,
+        current_executable_entry_spread_bps=-60.0,
+        equilibrium_spread_bps=0.0,
+        target_exit_spread_bps=-5.0,
+        gross_reversion_edge_bps=55.0,
+        expected_net_edge_bps=25.0,
+        worst_case_edge_bps=20.0,
+        economics_complete=True,
+        fee_evidence_complete=True,
+        contract_normalization_status="complete",
     )
+
+
+def test_paper_bot_gate_rejects_truthy_non_boolean_cohort_evidence() -> None:
+    assert _paper_bot_execution_supported(
+        SpreadPaperBotSpec("bad-acceptance", "test", acceptance_eligible="false")
+    ) is False
+    assert _paper_bot_execution_supported(
+        SpreadPaperBotSpec("int-acceptance", "test", acceptance_eligible=1)  # type: ignore[arg-type]
+    ) is False
+    assert _paper_bot_execution_supported(
+        SpreadPaperBotSpec(
+            "bad-control",
+            "test",
+            entry_long_role="maker",
+            maker_leg="long",
+            control_group="false",
+        )
+    ) is False
 
 
 def _quote(
@@ -51,591 +83,1247 @@ def _quote(
     bid: float,
     ask: float,
     observed_at_ms: int,
-    funding_rate_bps: float = 0.0,
-    funding_timestamp_ms: int = 0,
     bid_size: float = 10.0,
     ask_size: float = 10.0,
+    funding_rate_bps: float = 0.0,
+    funding_timestamp_ms: int = 0,
+    funding_interval_ms: int = 0,
+    settled_funding_rate_bps: float | None = None,
     mark_price: float = 0.0,
-    index_price: float = 0.0,
-    volume_24h_quote: float = 0.0,
-    open_interest: float = 0.0,
+    bid_depth: tuple[tuple[float, float], ...] = (),
+    ask_depth: tuple[tuple[float, float], ...] = (),
 ) -> QuoteSnapshot:
     return QuoteSnapshot(
         venue=venue,
         symbol="BTCUSDT",
         bid=bid,
         ask=ask,
-        observed_at_ms=observed_at_ms,
         bid_size=bid_size,
         ask_size=ask_size,
+        observed_at_ms=observed_at_ms,
         funding_rate_bps=funding_rate_bps,
         funding_timestamp_ms=funding_timestamp_ms,
+        funding_interval_ms=funding_interval_ms,
+        settled_funding_rate_bps=settled_funding_rate_bps,
         mark_price=mark_price,
-        index_price=index_price,
-        volume_24h_quote=volume_24h_quote,
-        open_interest=open_interest,
+        bid_depth=bid_depth,
+        ask_depth=ask_depth,
     )
 
 
 def _quotes(
     *,
     now_ms: int,
-    long_bid: float = 100.0,
-    long_ask: float = 100.1,
+    long_bid: float = 99.9,
+    long_ask: float = 100.0,
     short_bid: float = 101.0,
     short_ask: float = 101.1,
+    bid_size: float = 10.0,
+    ask_size: float = 10.0,
     long_funding_bps: float = 8.0,
     short_funding_bps: float = 4.0,
-    long_funding_ts_ms: int = 3_000,
-    short_funding_ts_ms: int = 4_000,
+    long_funding_ts_ms: int = 0,
+    short_funding_ts_ms: int = 0,
+    funding_interval_ms: int = 0,
+    long_settled_funding_bps: float | None = None,
+    short_settled_funding_bps: float | None = None,
+    long_mark_price: float = 0.0,
+    short_mark_price: float = 0.0,
 ) -> dict[str, QuoteSnapshot]:
     return {
         "cheap:BTCUSDT": _quote(
             "cheap",
             bid=long_bid,
             ask=long_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
             observed_at_ms=now_ms,
             funding_rate_bps=long_funding_bps,
             funding_timestamp_ms=long_funding_ts_ms,
-            mark_price=100.2,
-            index_price=100.1,
-            volume_24h_quote=1_000_000.0,
-            open_interest=50_000.0,
+            funding_interval_ms=funding_interval_ms,
+            settled_funding_rate_bps=long_settled_funding_bps,
+            mark_price=long_mark_price,
         ),
         "rich:BTCUSDT": _quote(
             "rich",
             bid=short_bid,
             ask=short_ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
             observed_at_ms=now_ms,
             funding_rate_bps=short_funding_bps,
             funding_timestamp_ms=short_funding_ts_ms,
-            mark_price=101.2,
-            index_price=101.1,
-            volume_24h_quote=2_000_000.0,
-            open_interest=60_000.0,
+            funding_interval_ms=funding_interval_ms,
+            settled_funding_rate_bps=short_settled_funding_bps,
+            mark_price=short_mark_price,
         ),
     }
 
 
-def test_spread_paper_defaults_are_disabled() -> None:
-    cfg = SpreadPaperConfig()
-    tracker = SpreadPaperTracker(cfg)
+def _tracker(**overrides: object) -> SpreadPaperTracker:
+    values: dict[str, object] = {
+        "enabled": True,
+        "finalist_limit": 1,
+        "markout_secs": [1],
+        "terminal_secs": 2,
+        "quote_ttl_ms": 1_000,
+        "taker_fee_bps_by_venue": {"cheap": 0.0, "rich": 0.0},
+    }
+    values.update(overrides)
+    return SpreadPaperTracker(SpreadPaperConfig(**values))
 
-    assert tracker.enabled is False
+
+def test_paper_is_disabled_by_default() -> None:
+    tracker = SpreadPaperTracker(SpreadPaperConfig())
+
+    assert not tracker.enabled
     assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is None
-    assert tracker.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
 
 
-def test_register_deduplicates_and_respects_finalist_limit() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(enabled=True, finalist_limit=1, markout_secs=[1])
-    )
-    candidate = _candidate()
-    quotes = _quotes(now_ms=1_000)
+@pytest.mark.parametrize("field", ["enabled", "require_taker_taker"])
+def test_paper_tracker_rejects_truthy_non_boolean_enablement(field: str) -> None:
+    tracker = _tracker(**{field: "false"})
+
+    assert not tracker.enabled
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"primary_fill_model": "maker_taker"},
+        {"require_taker_taker": False},
+        {
+            "model_epoch": "v3_other_model",
+        },
+    ],
+)
+def test_paper_acceptance_fails_closed_when_baseline_contract_is_not_taker_taker(
+    overrides: dict[str, object],
+) -> None:
+    tracker = _tracker(**overrides)
+
+    assert not tracker.enabled
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is None
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        replace(_candidate(), contract_normalization_status="unknown"),
+        replace(_candidate(), calculation_version="spread_v1_legacy"),
+    ],
+)
+def test_paper_admission_requires_normalized_v2_candidate(
+    candidate: SpreadReversionCandidate,
+) -> None:
+    tracker = _tracker()
+
+    assert tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0) is None
+
+
+def test_paper_admission_requires_candidate_and_execution_fee_evidence() -> None:
+    tracker = _tracker()
+
+    assert tracker.register(
+        replace(_candidate(), fee_evidence_complete=False),
+        _quotes(now_ms=1_000),
+        finalist_rank=0,
+    ) is None
+    assert _tracker(taker_fee_bps_by_venue={}).register(
+        _candidate(),
+        _quotes(now_ms=1_000),
+        finalist_rank=0,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["economics_complete", "fee_evidence_complete"],
+)
+def test_paper_admission_rejects_truthy_non_boolean_evidence(field: str) -> None:
+    tracker = _tracker()
+
+    candidate = replace(_candidate(), **{field: "true"})
+
+    assert tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0) is None
+
+
+def test_taker_registration_records_schema_v2_and_common_base_quantity() -> None:
+    tracker = _tracker()
+    event = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    assert event is not None
+    payload = event["payload"]
+    assert payload["journal_schema_version"] == SPREAD_PAPER_JOURNAL_SCHEMA_VERSION
+    assert payload["model_epoch"] == "v2_signed_reversion"
+    assert payload["paper_order_status"] == PaperOrderState.FILLED.value
+    assert payload["paper_fill_assumption"] == "taker_l2_vwap_or_top_book_size_only"
+    assert payload["paper_fill_capacity_source"] == "top_book_only"
+    assert payload["official_pnl"] is True
+    assert payload["long_leg"]["qty"] == pytest.approx(payload["short_leg"]["qty"])
+    assert payload["long_leg"]["entry_filled_at_ms"] == 1_000
+    assert payload["short_leg"]["entry_filled_at_ms"] == 1_000
+    assert payload["residual_base_qty"] == 0.0
+
+
+def test_taker_uses_coherent_l2_vwap_and_can_close_beyond_top_book_size() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    candidate = _candidate(entry_notional_quote=1_000.0)
+    quotes = {
+        "cheap:BTCUSDT": _quote(
+            "cheap",
+            bid=99.9,
+            ask=100.0,
+            bid_size=1.0,
+            ask_size=1.0,
+            ask_depth=((100.0, 5.0), (101.0, 5.0)),
+            bid_depth=((99.9, 5.0), (99.0, 5.0)),
+            observed_at_ms=1_000,
+        ),
+        "rich:BTCUSDT": _quote(
+            "rich",
+            bid=101.0,
+            ask=101.1,
+            bid_size=1.0,
+            ask_size=1.0,
+            bid_depth=((101.0, 5.0), (100.0, 5.0)),
+            ask_depth=((101.1, 5.0), (102.0, 5.0)),
+            observed_at_ms=1_000,
+        ),
+    }
 
     registered = tracker.register(candidate, quotes, finalist_rank=0)
 
     assert registered is not None
-    assert registered["kind"] == "opportunity.paper_registered"
-    assert registered["payload"]["paper_id"] == "spread:spread:BTCUSDT:cheap->rich:1000"
-    assert registered["payload"]["paper_order_status"] == "open"
-    assert registered["payload"]["long_leg"]["entry_price"] > 0.0
-    assert registered["payload"]["short_leg"]["entry_price"] > 0.0
-    assert tracker.register(candidate, quotes, finalist_rank=0) is None
-    assert tracker.register(_candidate(signal_ts_ms=1_001), quotes, finalist_rank=1) is None
-    assert tracker.tracked_count == 1
+    payload = registered["payload"]
+    assert payload["paper_fill_capacity_source"] == "l2_vwap"
+    assert payload["paper_order_status"] == PaperOrderState.FILLED.value
+    assert payload["long_leg"]["entry_execution_source"] == "l2_vwap"
+    assert payload["short_leg"]["entry_execution_source"] == "l2_vwap"
+    # Buying about 9.9 units consumes both ask levels, so the entry is not
+    # incorrectly priced at the one-unit best ask.
+    assert payload["long_leg"]["entry_raw_price"] > 100.4
 
-
-def test_register_many_creates_independent_bot_positions() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(
-            enabled=True,
-            finalist_limit=10,
-            markout_secs=[1],
-            paper_bot_ids=[
-                "tt_conservative",
-                "mt_long_maker",
-                "mt_short_maker",
-                "mt_selected_maker",
-                "core_v1_bot",
-                "core_v1_z10_bot",
-            ],
-            taker_fee_bps_by_venue={"binance": 1.0, "gate": 2.0},
-            maker_fee_bps_by_venue={"binance": 0.1, "gate": 0.2},
-        )
-    )
-    candidate = _candidate(
-        long_venue="binance",
-        short_venue="gate",
-        executable_spread_bps=120.0,
-        net_edge_bps=90.0,
-        z_score=12.0,
-    )
-    quotes = {
-        "binance:BTCUSDT": _quote(
-            "binance",
-            bid=99.8,
-            ask=100.0,
-            observed_at_ms=1_000,
-            volume_24h_quote=2_000_000.0,
-        ),
-        "gate:BTCUSDT": _quote(
-            "gate",
-            bid=101.0,
-            ask=101.2,
-            observed_at_ms=1_000,
-            volume_24h_quote=2_000_000.0,
-        ),
-    }
-
-    events = tracker.register_many(candidate, quotes, finalist_rank=0)
-
-    bot_ids = [event["payload"]["paper_bot_id"] for event in events]
-    assert bot_ids == [
-        "tt_conservative",
-        "mt_long_maker",
-        "mt_short_maker",
-        "mt_selected_maker",
-        "core_v1_bot",
-        "core_v1_z10_bot",
-    ]
-    assert len({event["payload"]["paper_id"] for event in events}) == len(events)
-    by_bot = {event["payload"]["paper_bot_id"]: event["payload"] for event in events}
-    assert by_bot["tt_conservative"]["paper_cohort"] == "baseline_current"
-    assert by_bot["core_v1_bot"]["paper_cohort"] == "core_v1"
-    assert by_bot["core_v1_z10_bot"]["paper_cohort"] == "core_v1_z10"
-    assert by_bot["mt_long_maker"]["long_leg"]["entry_liquidity_role"] == "maker"
-    assert by_bot["mt_long_maker"]["long_leg"]["entry_raw_price"] == pytest.approx(99.8)
-    assert by_bot["mt_long_maker"]["long_leg"]["entry_fee_bps"] == pytest.approx(0.1)
-    assert by_bot["mt_short_maker"]["short_leg"]["entry_liquidity_role"] == "maker"
-    assert by_bot["mt_short_maker"]["short_leg"]["entry_raw_price"] == pytest.approx(101.2)
-    assert by_bot["mt_selected_maker"]["paper_maker_leg"] == "long"
-    assert tracker.tracked_count == 6
-
-
-def test_core_and_control_bots_filter_candidates_by_factor() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(
-            enabled=True,
-            finalist_limit=10,
-            markout_secs=[1],
-            paper_bot_ids=[
-                "core_v1_bot",
-                "core_v1_exec100_bot",
-                "core_v1_z10_bot",
-                "bad_pair_control_bot",
-                "low_liquidity_control_bot",
-                "low_edge_control_bot",
-            ],
-        )
-    )
-    quotes = {
-        "binance:BTCUSDT": _quote(
-            "binance",
-            bid=99.8,
-            ask=100.0,
-            observed_at_ms=1_000,
-            volume_24h_quote=20_000.0,
-        ),
-        "gate:BTCUSDT": _quote(
-            "gate",
-            bid=101.0,
-            ask=101.2,
-            observed_at_ms=1_000,
-            volume_24h_quote=20_000.0,
-        ),
-    }
-    low_edge = _candidate(
-        long_venue="binance",
-        short_venue="gate",
-        executable_spread_bps=55.0,
-        net_edge_bps=30.0,
-        z_score=4.0,
-        capacity_quote=30.0,
-    )
-
-    low_edge_events = tracker.register_many(low_edge, quotes, finalist_rank=0)
-
-    assert [event["payload"]["paper_bot_id"] for event in low_edge_events] == [
-        "low_liquidity_control_bot",
-        "low_edge_control_bot",
-    ]
-
-    bad_pair = _candidate(
-        signal_ts_ms=2_000,
-        long_venue="binance",
-        short_venue="bybit",
-        executable_spread_bps=120.0,
-        net_edge_bps=90.0,
-        z_score=12.0,
-    )
-    bad_quotes = {
-        "binance:BTCUSDT": _quote(
-            "binance",
-            bid=99.8,
-            ask=100.0,
+    exit_quotes = {
+        "cheap:BTCUSDT": _quote(
+            "cheap",
+            bid=100.0,
+            ask=100.1,
+            bid_size=1.0,
+            ask_size=1.0,
+            bid_depth=((100.0, 5.0), (99.5, 5.0)),
+            ask_depth=((100.1, 10.0),),
             observed_at_ms=2_000,
-            volume_24h_quote=2_000_000.0,
         ),
-        "bybit:BTCUSDT": _quote(
-            "bybit",
-            bid=101.0,
-            ask=101.2,
+        "rich:BTCUSDT": _quote(
+            "rich",
+            bid=100.4,
+            ask=100.5,
+            bid_size=1.0,
+            ask_size=1.0,
+            bid_depth=((100.4, 10.0),),
+            ask_depth=((100.5, 5.0), (101.0, 5.0)),
             observed_at_ms=2_000,
-            volume_24h_quote=2_000_000.0,
         ),
     }
+    closed = tracker.evaluate_due(2_000, exit_quotes)
 
-    bad_pair_events = tracker.register_many(bad_pair, bad_quotes, finalist_rank=0)
-
-    assert [event["payload"]["paper_bot_id"] for event in bad_pair_events] == [
-        "bad_pair_control_bot"
-    ]
+    assert closed[0]["payload"]["paper_unpriced"] is False
+    assert closed[0]["payload"]["paper_exit_capacity_source"] == "l2_vwap"
 
 
-def test_delayed_maker_hedge_bot_fills_hedge_from_later_quote() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(
-            enabled=True,
-            finalist_limit=10,
-            markout_secs=[2],
-            terminal_secs=2,
-            paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+def test_incoherent_l2_ladder_falls_back_to_conservative_bbo_capacity() -> None:
+    tracker = _tracker()
+    quotes = _quotes(now_ms=1_000, bid_size=0.1, ask_size=0.1)
+    quotes["cheap:BTCUSDT"] = replace(
+        quotes["cheap:BTCUSDT"],
+        ask_depth=((99.0, 100.0),),  # Cannot be the same book as ask=100.
+    )
+
+    event = tracker.register(_candidate(), quotes, finalist_rank=0)
+
+    assert event is not None
+    assert event["payload"]["paper_fill_capacity_source"] == "top_book_only"
+    assert event["payload"]["filled_base_qty"] == pytest.approx(0.1)
+
+
+def test_taker_capacity_creates_matched_partial_fill_and_residual() -> None:
+    tracker = _tracker()
+    # Requested quantity is about 0.2 BTC; top-book capacity allows 0.1.
+    event = tracker.register(
+        _candidate(), _quotes(now_ms=1_000, bid_size=0.1, ask_size=0.1), finalist_rank=0
+    )
+
+    assert event is not None
+    payload = event["payload"]
+    assert payload["paper_order_status"] == PaperOrderState.PARTIAL.value
+    assert payload["filled_base_qty"] == pytest.approx(0.1)
+    assert payload["residual_base_qty"] > 0.0
+    assert payload["long_leg"]["qty"] == pytest.approx(payload["short_leg"]["qty"])
+    assert payload["official_pnl"] is False
+
+
+def test_maker_touch_is_not_a_fill_but_strict_cross_fills_with_later_hedge_quote() -> None:
+    control_manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        cohorts=tuple(
+            replace(cohort, enabled=True)
+            if cohort.bot_id == "mt_selected_maker_delay_1000ms"
+            else cohort
+            for cohort in DEFAULT_SPREAD_RESEARCH_MANIFEST.cohorts
+        ),
+    )
+    tracker = _tracker(
+        paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        terminal_secs=5,
+        research_manifest=control_manifest,
+    )
+    event = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    assert event is not None
+    assert event["payload"]["paper_order_status"] == PaperOrderState.WORKING.value
+    # Original maker bid is 99.9; a touch at 99.9 is explicitly non-fill.
+    assert tracker.evaluate_due(2_000, _quotes(now_ms=2_000, long_bid=99.9, long_ask=99.9)) == []
+
+    observed = tracker.evaluate_due(
+        2_001,
+        _quotes(now_ms=2_001, long_bid=99.7, long_ask=99.8, short_bid=100.5, short_ask=100.6),
+    )
+    assert [item["kind"] for item in observed] == ["opportunity.paper_maker_fill_observed"]
+    assert observed[0]["payload"]["paper_order_status"] == PaperOrderState.UNKNOWN.value
+    # The hedge cannot use the same instant as evidence of the maker fill;
+    # the interval is recorded as non-official naked delta markout instead.
+    delayed = tracker.evaluate_due(3_000, _quotes(now_ms=3_000))
+    assert [item["kind"] for item in delayed] == ["opportunity.paper_delta_markout"]
+    assert delayed[0]["payload"]["official_pnl"] is False
+
+    filled = tracker.evaluate_due(
+        3_001,
+        _quotes(now_ms=3_001, long_bid=99.7, long_ask=99.8, short_bid=100.5, short_ask=100.6),
+    )
+    assert [item["kind"] for item in filled] == ["opportunity.paper_hedge_filled"]
+    payload = filled[0]["payload"]
+    assert payload["paper_order_status"] == PaperOrderState.UNKNOWN.value
+    assert payload["official_pnl"] is False
+    assert payload["short_leg"]["entry_raw_price"] == pytest.approx(100.5)
+    assert payload["short_leg"]["entry_observed_at_ms"] == 3_001
+    assert payload["long_leg"]["entry_filled_at_ms"] == 2_001
+    assert payload["short_leg"]["entry_filled_at_ms"] == 3_001
+
+
+def test_funding_before_simulated_entry_cannot_be_allocated_to_paper_position() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=2, quote_ttl_ms=10)
+    candidate = _candidate(signal_ts_ms=1_001)
+    # The quote is still fresh but was published before the known settlement.
+    # The simulated fill happens at the signal/admission instant, not at the
+    # quote timestamp, so this funding debit belongs to an earlier position.
+    quotes = _quotes(
+        now_ms=999,
+        long_funding_ts_ms=1_000,
+        short_funding_ts_ms=1_000,
+        funding_interval_ms=10_000,
+    )
+    registered = tracker.register(candidate, quotes, finalist_rank=0)
+
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+    assert registered["payload"]["long_leg"]["entry_observed_at_ms"] == 999
+    assert registered["payload"]["long_leg"]["entry_filled_at_ms"] == 1_001
+    assert tracker.record_funding_settlements([
+        FundingSettlement(
+            paper_id=paper_id,
+            leg_side="long",
+            settlement_timestamp_ms=1_000,
+            amount_quote=-0.02,
+            observed_at_ms=1_002,
+            source="exchange_funding_ledger",
+        ),
+    ]) == []
+
+
+def test_future_quote_timestamp_is_not_fresh_for_official_paper_execution() -> None:
+    tracker = _tracker()
+
+    assert tracker.register(_candidate(), _quotes(now_ms=1_001), finalist_rank=0) is None
+
+
+def test_unhedged_maker_expiry_records_fresh_residual_markout_as_nonofficial() -> None:
+    control_manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        cohorts=tuple(
+            replace(cohort, enabled=True, hedge_delay_ms=10_000)
+            if cohort.bot_id == "mt_selected_maker_delay_1000ms"
+            else cohort
+            for cohort in DEFAULT_SPREAD_RESEARCH_MANIFEST.cohorts
+        ),
+    )
+    tracker = _tracker(
+        paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        terminal_secs=2,
+        research_manifest=control_manifest,
+    )
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert tracker.evaluate_due(
+        1_500,
+        _quotes(now_ms=1_500, long_bid=99.7, long_ask=99.8),
+    )[0]["kind"] == "opportunity.paper_maker_fill_observed"
+
+    expired = tracker.evaluate_due(
+        3_000,
+        _quotes(now_ms=3_000, long_bid=99.0, long_ask=99.1),
+    )
+
+    assert [item["kind"] for item in expired] == ["opportunity.paper_expired"]
+    payload = expired[0]["payload"]
+    assert payload["paper_unpriced"] is False
+    assert payload["official_pnl"] is False
+    assert payload["delta_exposure_base_qty"] > 0.0
+    assert payload["paper_residual_quote"] != 0.0
+
+
+def test_non_finite_exit_bbo_is_unpriced_and_never_official() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    quotes = _quotes(now_ms=2_000)
+    quotes["rich:BTCUSDT"] = replace(
+        quotes["rich:BTCUSDT"], ask=float("nan")
+    )
+
+    payload = tracker.evaluate_due(2_000, quotes)[0]["payload"]
+
+    assert payload["paper_unpriced"] is True
+    assert payload["paper_net_quote"] is None
+    assert payload["official_pnl"] is False
+
+
+def test_pending_maker_emits_nonofficial_delta_markout_before_delayed_hedge() -> None:
+    control_manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        cohorts=tuple(
+            replace(cohort, enabled=True, hedge_delay_ms=10_000)
+            if cohort.bot_id == "mt_selected_maker_delay_1000ms"
+            else cohort
+            for cohort in DEFAULT_SPREAD_RESEARCH_MANIFEST.cohorts
+        ),
+    )
+    tracker = _tracker(
+        paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        terminal_secs=5,
+        research_manifest=control_manifest,
+    )
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert tracker.evaluate_due(
+        1_500,
+        _quotes(now_ms=1_500, long_bid=99.7, long_ask=99.8),
+    )[0]["kind"] == "opportunity.paper_maker_fill_observed"
+
+    events = tracker.evaluate_due(
+        2_000,
+        _quotes(now_ms=2_000, long_bid=99.0, long_ask=99.1),
+    )
+
+    assert [item["kind"] for item in events] == ["opportunity.paper_delta_markout"]
+    payload = events[0]["payload"]
+    assert payload["paper_unpriced"] is False
+    assert payload["official_pnl"] is False
+    assert payload["delta_exposure_base_qty"] > 0.0
+    assert payload["paper_delta_markout_quote"] != 0.0
+    assert payload["paper_net_quote"] is None
+
+
+def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
+    tracker = _tracker(
+        markout_secs=[1],
+        terminal_secs=2,
+        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
+        slippage_buffer_bps=5.0,
+    )
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=5_000,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+
+    # A quoted rate is an estimate, not a settlement debit. Without an actual
+    # position-allocated ledger entry the markout remains diagnostic-only.
+    first = tracker.evaluate_due(3_000, _quotes(now_ms=3_000, long_funding_ts_ms=1_500, short_funding_ts_ms=5_000, funding_interval_ms=10_000))
+    payload = first[0]["payload"]
+    assert payload["paper_funding_quote"] == 0.0
+    assert payload["funding_settlement_evidence_complete"] is False
+    assert payload["official_pnl"] is False
+
+    # Re-open the case and attach the exchange-account fact to the exact paper
+    # position/leg. The known short settlement has not happened yet.
+    tracker = _tracker(
+        markout_secs=[1],
+        terminal_secs=2,
+        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
+        slippage_buffer_bps=5.0,
+    )
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=5_000,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    observed = tracker.record_funding_settlements([
+        FundingSettlement(
+            paper_id=registered["payload"]["paper_id"],
+            leg_side="long",
+            settlement_timestamp_ms=1_500,
+            amount_quote=-0.02,
+            observed_at_ms=1_600,
+            source="exchange_funding_ledger",
         )
+    ])
+    assert [item["kind"] for item in observed] == ["opportunity.paper_funding_settlement_observed"]
+
+    events = tracker.evaluate_due(
+        3_000,
+        _quotes(
+            now_ms=3_000,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=5_000,
+            funding_interval_ms=10_000,
+        ),
     )
-    candidate = _candidate(
-        long_venue="binance",
-        short_venue="gate",
-        executable_spread_bps=120.0,
-        net_edge_bps=90.0,
-        z_score=12.0,
-    )
-    entry_quotes = {
-        "binance:BTCUSDT": _quote("binance", bid=99.8, ask=100.0, observed_at_ms=1_000),
-        "gate:BTCUSDT": _quote("gate", bid=101.0, ask=101.2, observed_at_ms=1_000),
-    }
-
-    registered = tracker.register_many(candidate, entry_quotes, finalist_rank=0)
-
-    assert len(registered) == 1
-    payload = registered[0]["payload"]
-    assert payload["paper_bot_id"] == "mt_selected_maker_delay_1000ms"
-    assert payload["paper_hedge_delay_ms"] == 1000
-    assert payload["paper_maker_leg"] == "long"
-    assert payload["short_leg"]["entry_pending"] is True
-    assert payload["short_leg"]["entry_price"] is None
-
-    later_quotes = {
-        "binance:BTCUSDT": _quote("binance", bid=100.2, ask=100.4, observed_at_ms=2_000),
-        "gate:BTCUSDT": _quote("gate", bid=100.5, ask=100.7, observed_at_ms=2_000),
-    }
-    hedge_events = tracker.evaluate_due(2_000, later_quotes)
-
-    assert [event["kind"] for event in hedge_events] == ["opportunity.paper_hedge_filled"]
-    hedge_payload = hedge_events[0]["payload"]
-    assert hedge_payload["short_leg"]["entry_pending"] is False
-    assert hedge_payload["short_leg"]["entry_raw_price"] == pytest.approx(100.5)
-    assert hedge_payload["short_leg"]["entry_observed_at_ms"] == 2_000
-
-    closed_events = tracker.evaluate_due(3_000, later_quotes)
-
-    assert [event["kind"] for event in closed_events] == [
-        "opportunity.paper_markout",
-        "opportunity.paper_closed",
-    ]
-    assert closed_events[-1]["payload"]["paper_net_quote"] is not None
-
-
-def test_register_excludes_default_symbols_and_non_allowed_labels() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(enabled=True, finalist_limit=10, markout_secs=[1])
-    )
-
-    assert (
-        tracker.register(_candidate(symbol="BBUSDT"), _quotes(now_ms=1_000), finalist_rank=0)
-        is None
-    )
-    assert (
-        tracker.register(_candidate(symbol="QNTUSDT"), _quotes(now_ms=1_000), finalist_rank=0)
-        is None
-    )
-    assert (
-        tracker.register(
-            _candidate(opportunity_label="single_venue_dislocation"),
-            _quotes(now_ms=1_000),
-            finalist_rank=0,
-        )
-        is None
-    )
-    assert tracker.tracked_count == 0
-
-
-def test_markout_uses_taker_fees_slippage_and_funding_breakdown() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(
-            enabled=True,
-            finalist_limit=10,
-            markout_secs=[1],
-            terminal_secs=1,
-            taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
-            slippage_buffer_bps=5.0,
-            default_funding_interval_ms=8_000,
-        )
-    )
-    candidate = _candidate(entry_notional_quote=20.0)
-    entry_quotes = _quotes(
-        now_ms=1_000,
-        long_bid=99.9,
-        long_ask=100.0,
-        short_bid=101.0,
-        short_ask=101.1,
-        long_funding_bps=8.0,
-        short_funding_bps=4.0,
-        long_funding_ts_ms=1_500,
-        short_funding_ts_ms=5_000,
-    )
-    assert tracker.register(candidate, entry_quotes, finalist_rank=0) is not None
-
-    exit_quotes = _quotes(
-        now_ms=2_000,
-        long_bid=100.4,
-        long_ask=100.5,
-        short_bid=100.6,
-        short_ask=100.7,
-        long_funding_bps=8.0,
-        short_funding_bps=4.0,
-        long_funding_ts_ms=1_500,
-        short_funding_ts_ms=5_000,
-    )
-    events = tracker.evaluate_due(2_000, exit_quotes)
-
-    assert [event["kind"] for event in events] == [
+    assert [item["kind"] for item in events] == [
         "opportunity.paper_markout",
         "opportunity.paper_closed",
     ]
     payload = events[0]["payload"]
-    assert payload["paper_id"] == "spread:spread:BTCUSDT:cheap->rich:1000"
-    assert payload["candidate_id"] == candidate.candidate_id
-    assert payload["paper_entry_notional_quote"] == pytest.approx(20.0)
-    assert payload["paper_entry_fee_quote"] == pytest.approx(20.0 * (1.0 + 2.0) / 10_000.0)
-    assert payload["paper_exit_fee_quote"] > 0.0
-    assert payload["paper_fee_quote"] == pytest.approx(
-        payload["paper_entry_fee_quote"] + payload["paper_exit_fee_quote"]
-    )
-    assert payload["paper_entry_slippage_quote"] > 0.0
-    assert payload["paper_exit_slippage_quote"] > 0.0
-    assert payload["paper_slippage_quote"] == pytest.approx(
-        payload["paper_entry_slippage_quote"] + payload["paper_exit_slippage_quote"]
-    )
-    assert payload["accrued_funding_estimate_quote"] == pytest.approx(-0.001)
-    assert payload["settlement_realized_funding_quote"] == pytest.approx(-0.016)
-    assert payload["paper_funding_quote"] == pytest.approx(
-        payload["accrued_funding_estimate_quote"]
-    )
+    assert payload["paper_funding_quote"] == pytest.approx(-0.02)
+    assert payload["settlement_realized_funding_quote"] == payload["paper_funding_quote"]
+    assert payload["paper_funding_quote"] != payload["accrued_funding_estimate_quote"]
+    assert payload["funding_settlement_evidence_complete"] is True
+    assert payload["settlement_funding_rate_evidence"] == "actual_position_allocated_funding_ledger"
+    assert payload["official_pnl"] is True
     assert payload["paper_net_quote"] == pytest.approx(
         payload["paper_gross_quote"]
         + payload["paper_funding_quote"]
         - payload["paper_fee_quote"]
         - payload["paper_slippage_quote"]
     )
-    assert payload["long_leg"]["entry_price"] > 100.0
-    assert payload["long_leg"]["exit_price"] < 100.4
-    assert payload["short_leg"]["entry_price"] < 101.0
-    assert payload["short_leg"]["exit_price"] > 100.7
-    assert payload["entry_market_snapshot"]["long_quote"]["ask_size"] == pytest.approx(10.0)
-    assert payload["entry_market_snapshot"]["short_quote"]["bid_size"] == pytest.approx(10.0)
-    assert payload["exit_market_snapshot"]["long_quote"]["bid"] == pytest.approx(100.4)
-    assert payload["exit_market_snapshot"]["short_quote"]["ask"] == pytest.approx(100.7)
-    assert payload["candidate_snapshot"]["executable_spread_bps"] == pytest.approx(40.0)
-    assert payload["candidate_snapshot"]["fair_price"] == pytest.approx(100.5)
-    assert payload["funding_advantage_bps"] == pytest.approx(-4.0)
-    assert payload["long_leg"]["mark_price"] == pytest.approx(100.2)
-    assert payload["short_leg"]["open_interest"] == pytest.approx(60_000.0)
-    assert payload["opportunity_label"] in {
-        "good_trade_missed",
-        "bad_trade_correctly_rejected",
-    }
     assert tracker.tracked_count == 0
 
 
-def test_episode_cooldown_blocks_repeated_pair_until_window_expires() -> None:
-    cfg = SpreadPaperConfig(
-        enabled=True,
-        finalist_limit=10,
-        markout_secs=[],
-        terminal_secs=1,
-        episode_cooldown_ms=1_800_000,
-    )
-    tracker = SpreadPaperTracker(cfg)
-    assert tracker.register(_candidate(signal_ts_ms=1_000), _quotes(now_ms=1_000), finalist_rank=0)
-    assert [event["kind"] for event in tracker.evaluate_due(2_000, _quotes(now_ms=2_000))] == [
-        "opportunity.paper_closed"
-    ]
-
-    assert (
-        tracker.register(_candidate(signal_ts_ms=60_000), _quotes(now_ms=60_000), finalist_rank=0)
-        is None
-    )
-    assert (
-        tracker.register(
-            _candidate(signal_ts_ms=1_801_001),
-            _quotes(now_ms=1_801_001),
-            finalist_rank=0,
-        )
-        is not None
-    )
-
-
-def test_episode_cooldown_restores_from_journal_records() -> None:
-    cfg = SpreadPaperConfig(
-        enabled=True,
-        finalist_limit=10,
-        markout_secs=[],
-        terminal_secs=1,
-        episode_cooldown_ms=1_800_000,
-    )
-    tracker = SpreadPaperTracker(cfg)
+def test_later_paper_entry_requires_only_post_entry_funding_settlements() -> None:
+    tracker = _tracker(markout_secs=[1], terminal_secs=3, quote_ttl_ms=1_000)
     registered = tracker.register(
-        _candidate(signal_ts_ms=1_000),
-        _quotes(now_ms=1_000),
+        _candidate(signal_ts_ms=1_001),
+        _quotes(
+            now_ms=1_001,
+            long_funding_ts_ms=1_000,
+            short_funding_ts_ms=1_000,
+            funding_interval_ms=1_000,
+        ),
         finalist_rank=0,
     )
     assert registered is not None
-    closed = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))
+    paper_id = registered["payload"]["paper_id"]
 
-    restored = SpreadPaperTracker(cfg)
-    restored.restore_from_records([registered, *closed])
+    observed = tracker.record_funding_settlements([
+        FundingSettlement(
+            paper_id=paper_id,
+            leg_side="long",
+            settlement_timestamp_ms=2_000,
+            amount_quote=-0.02,
+            observed_at_ms=2_001,
+            source="exchange_funding_ledger",
+        ),
+        FundingSettlement(
+            paper_id=paper_id,
+            leg_side="short",
+            settlement_timestamp_ms=2_000,
+            amount_quote=0.01,
+            observed_at_ms=2_001,
+            source="exchange_funding_ledger",
+        ),
+    ])
+    assert len(observed) == 2
 
-    assert (
-        restored.register(_candidate(signal_ts_ms=60_000), _quotes(now_ms=60_000), finalist_rank=0)
-        is None
-    )
-
-
-def test_terminal_missing_exit_quote_keeps_position_open_until_quotes_recover() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(enabled=True, finalist_limit=10, markout_secs=[], terminal_secs=1)
-    )
-    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is not None
-
-    events = tracker.evaluate_due(2_000, {})
-
-    assert [event["kind"] for event in events] == [
-        "opportunity.paper_evaluation_skipped"
-    ]
-    payload = events[0]["payload"]
-    assert payload["paper_net_quote"] is None
-    assert payload["opportunity_label"] == "unknown_due_to_missing_snapshot"
-    assert payload["market_snapshot"]["snapshot_available"] is False
-    assert payload["paper_skip_reason"] == "missing_exit_quotes"
-    assert payload["paper_skip_terminal"] is True
-    assert payload["paper_fee_quote"] == pytest.approx(payload["paper_entry_fee_quote"])
-    assert tracker.tracked_count == 1
-
-    closed = tracker.evaluate_due(3_000, _quotes(now_ms=3_000))
-
-    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
-    assert closed[0]["payload"]["paper_net_quote"] is not None
-    assert tracker.tracked_count == 0
-
-
-def test_active_exit_convergence_closes_before_terminal() -> None:
-    tracker = SpreadPaperTracker(
-        SpreadPaperConfig(
-            enabled=True,
-            finalist_limit=10,
-            markout_secs=[],
-            terminal_secs=30,
-            active_exit_enabled=True,
-            exit_z=0.5,
-            stop_z=3.5,
-            max_hold_ms=30_000,
-        )
-    )
-    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
-
-    closed = tracker.evaluate_due(
-        2_000,
+    events = tracker.evaluate_due(
+        2_001,
         _quotes(
-            now_ms=2_000,
-            long_bid=100.0,
-            long_ask=100.1,
-            short_bid=100.1,
-            short_ask=100.2,
+            now_ms=2_001,
+            long_funding_ts_ms=3_000,
+            short_funding_ts_ms=3_000,
+            funding_interval_ms=1_000,
         ),
     )
 
-    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
-    payload = closed[0]["payload"]
-    assert payload["horizon_kind"] == "active_exit:spread_converged"
-    assert payload["paper_close_reason"] == "spread_converged"
-    assert payload["paper_net_quote"] is not None
-    assert tracker.tracked_count == 0
+    payload = events[0]["payload"]
+    assert payload["funding_settlement_evidence_complete"] is True
+    assert payload["paper_funding_quote"] == pytest.approx(-0.01)
+    assert payload["official_pnl"] is True
 
 
-def test_tracker_restores_open_orders_from_local_journal_records() -> None:
-    cfg = SpreadPaperConfig(enabled=True, finalist_limit=10, markout_secs=[1], terminal_secs=2)
-    tracker = SpreadPaperTracker(cfg)
-    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
-    assert registered is not None
-
-    restored = SpreadPaperTracker(cfg)
-    restored.restore_from_records([registered])
-
-    assert restored.tracked_count == 1
-    markouts = restored.evaluate_due(2_000, _quotes(now_ms=2_000))
-    assert [event["kind"] for event in markouts] == ["opportunity.paper_markout"]
-    assert restored.tracked_count == 1
-
-    restarted = SpreadPaperTracker(cfg)
-    restarted.restore_from_records([registered, *markouts])
-    closed = restarted.evaluate_due(3_000, _quotes(now_ms=3_000))
-
-    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
-    assert restarted.tracked_count == 0
-
-
-def test_tracker_does_not_restore_closed_orders() -> None:
-    cfg = SpreadPaperConfig(
-        enabled=True,
-        finalist_limit=10,
-        markout_secs=[1],
-        terminal_secs=1,
-        episode_cooldown_ms=0,
+def test_public_settled_rate_near_settlement_is_allocated_to_paper_legs() -> None:
+    tracker = _tracker(markout_secs=[1], terminal_secs=3, quote_ttl_ms=1_000)
+    registered = tracker.register(
+        _candidate(signal_ts_ms=1_000),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
     )
-    tracker = SpreadPaperTracker(cfg)
+    assert registered is not None
+
+    observed = tracker.record_observed_public_funding_settlements(
+        1_501,
+        _quotes(
+            now_ms=1_501,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+            long_settled_funding_bps=4.0,
+            short_settled_funding_bps=2.0,
+            long_mark_price=100.0,
+            short_mark_price=101.0,
+        ),
+    )
+    assert [item["kind"] for item in observed] == [
+        "opportunity.paper_funding_settlement_observed",
+        "opportunity.paper_funding_settlement_observed",
+    ]
+    assert tracker.record_observed_public_funding_settlements(
+        1_501,
+        _quotes(
+            now_ms=1_501,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+            long_settled_funding_bps=4.0,
+            short_settled_funding_bps=2.0,
+            long_mark_price=100.0,
+            short_mark_price=101.0,
+        ),
+    ) == []
+
+    events = tracker.evaluate_due(
+        2_000,
+        _quotes(
+            now_ms=2_000,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+        ),
+    )
+    payload = events[0]["payload"]
+    assert payload["funding_settlement_evidence_complete"] is True
+    assert payload["official_pnl"] is True
+    shared_base_qty = float(registered["payload"]["long_leg"]["qty"])
+    assert shared_base_qty == pytest.approx(
+        float(registered["payload"]["short_leg"]["qty"])
+    )
+    expected_funding = (
+        -4.0 * shared_base_qty * 100.0 / 10_000.0
+        + 2.0 * shared_base_qty * 101.0 / 10_000.0
+    )
+    assert payload["paper_funding_quote"] == pytest.approx(expected_funding)
+
+
+def test_late_public_settled_rate_never_backfills_official_paper_funding() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=3, quote_ttl_ms=1_000)
+    assert tracker.register(
+        _candidate(signal_ts_ms=1_000),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    ) is not None
+
+    assert tracker.record_observed_public_funding_settlements(
+        3_000,
+        _quotes(
+            now_ms=3_000,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+            long_settled_funding_bps=4.0,
+            short_settled_funding_bps=2.0,
+            long_mark_price=100.0,
+            short_mark_price=101.0,
+        ),
+    ) == []
+
+
+def test_funding_interval_change_fails_closed_before_legacy_schedule() -> None:
+    """A changed venue cadence can hide an earlier settlement from old plans."""
+    tracker = _tracker(markout_secs=[4], terminal_secs=10, quote_ttl_ms=1_000)
+    registered = tracker.register(
+        _candidate(signal_ts_ms=1_000),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=9_000,
+            short_funding_ts_ms=9_000,
+            funding_interval_ms=8_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+
+    events = tracker.evaluate_due(
+        5_000,
+        _quotes(
+            now_ms=5_000,
+            long_funding_ts_ms=5_000,
+            short_funding_ts_ms=5_000,
+            funding_interval_ms=4_000,
+        ),
+    )
+
+    payload = events[0]["payload"]
+    assert payload["funding_settlement_evidence_complete"] is False
+    assert payload["settlement_funding_rate_evidence"] == "funding_schedule_changed"
+    assert payload["paper_funding_quote"] == 0.0
+    assert payload["official_pnl"] is False
+
+
+def test_funding_timestamp_shift_fails_closed_with_unchanged_interval() -> None:
+    tracker = _tracker(markout_secs=[4], terminal_secs=10, quote_ttl_ms=1_000)
+    registered = tracker.register(
+        _candidate(signal_ts_ms=1_000),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=9_000,
+            short_funding_ts_ms=9_000,
+            funding_interval_ms=8_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+
+    # The venue moves the next settlement time but retains the same interval.
+    # There may have been an unobserved cash event, so official PnL must stop.
+    events = tracker.evaluate_due(
+        5_000,
+        _quotes(
+            now_ms=5_000,
+            long_funding_ts_ms=10_000,
+            short_funding_ts_ms=10_000,
+            funding_interval_ms=8_000,
+        ),
+    )
+
+    payload = events[0]["payload"]
+    assert payload["funding_settlement_evidence_complete"] is False
+    assert payload["settlement_funding_rate_evidence"] == "funding_schedule_changed"
+    assert payload["official_pnl"] is False
+
+
+def test_truthy_non_boolean_in_memory_official_flag_never_enters_acceptance_pnl() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
     registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
     assert registered is not None
-    closed_events = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))
+    paper_id = registered["payload"]["paper_id"]
+    tracker._positions[paper_id] = replace(
+        tracker._positions[paper_id],
+        official_pnl="false",
+    )
 
-    restored = SpreadPaperTracker(cfg)
-    restored.restore_from_records([registered, *closed_events])
+    payload = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))[0]["payload"]
+
+    assert payload["official_pnl"] is False
+
+
+def test_unknown_later_funding_settlement_never_becomes_official_pnl() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=3)
+    assert tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=1_000,
+        ),
+        finalist_rank=0,
+    )
+
+    registration = next(iter(tracker._positions.values()))
+    tracker.record_funding_settlements([
+        FundingSettlement(
+            paper_id=registration.paper_id,
+            leg_side="long",
+            settlement_timestamp_ms=1_500,
+            amount_quote=-0.01,
+            observed_at_ms=1_600,
+            source="exchange_funding_ledger",
+        ),
+        FundingSettlement(
+            paper_id=registration.paper_id,
+            leg_side="short",
+            settlement_timestamp_ms=1_500,
+            amount_quote=0.01,
+            observed_at_ms=1_600,
+            source="exchange_funding_ledger",
+        ),
+    ])
+
+    events = tracker.evaluate_due(
+        4_000,
+        _quotes(
+            now_ms=4_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=1_000,
+        ),
+    )
+
+    payload = events[0]["payload"]
+    assert payload["paper_funding_quote"] == pytest.approx(0.0)
+    assert payload["funding_settlement_evidence_complete"] is False
+    assert payload["official_pnl"] is False
+
+
+def test_funding_after_terminal_close_boundary_is_not_allocated() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=2)
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=1_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+
+    # The terminal horizon is 3,000ms.  A delayed refresh must not let the
+    # 3,500ms cash event enter PnL before it notices that the paper position
+    # already reached that simulated close boundary.
+    assert tracker.record_funding_settlements(
+        [
+            FundingSettlement(
+                paper_id, "long", 3_500, -0.02, 3_600, "exchange_funding_ledger"
+            ),
+            FundingSettlement(
+                paper_id, "short", 3_500, 0.01, 3_600, "exchange_funding_ledger"
+            ),
+        ]
+    ) == []
+    position = tracker._positions[paper_id]
+    assert position.long_leg.funding_settlements == ()
+    assert position.short_leg.funding_settlements == ()
+
+
+def test_future_observed_funding_ledger_cannot_time_travel_into_paper_pnl() -> None:
+    tracker = _tracker(markout_secs=[1, 3], terminal_secs=10)
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+    tracker.record_funding_settlements([
+        FundingSettlement(paper_id, "long", 1_500, -0.02, 4_000, "exchange_funding_ledger"),
+        FundingSettlement(paper_id, "short", 1_500, 0.01, 4_000, "exchange_funding_ledger"),
+    ])
+
+    before_observation = tracker.evaluate_due(
+        3_000,
+        _quotes(
+            now_ms=3_000,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+        ),
+    )[0]["payload"]
+    assert before_observation["paper_funding_quote"] == 0.0
+    assert before_observation["settlement_funding_rate_evidence"] == "missing_actual_funding_ledger"
+    assert before_observation["official_pnl"] is False
+
+    after_observation = tracker.evaluate_due(
+        4_000,
+        _quotes(
+            now_ms=4_000,
+            long_funding_ts_ms=11_500,
+            short_funding_ts_ms=11_500,
+            funding_interval_ms=10_000,
+        ),
+    )[0]["payload"]
+    assert after_observation["paper_funding_quote"] == pytest.approx(-0.01)
+    assert after_observation["settlement_funding_rate_evidence"] == "actual_position_allocated_funding_ledger"
+    assert after_observation["official_pnl"] is True
+
+
+def test_conflicting_funding_ledger_amount_fails_closed_without_overwriting_first_fact() -> None:
+    tracker = _tracker(markout_secs=[1], terminal_secs=10)
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+    tracker.record_funding_settlements([
+        FundingSettlement(paper_id, "long", 1_500, -0.02, 1_600, "exchange_funding_ledger"),
+        FundingSettlement(paper_id, "short", 1_500, 0.01, 1_600, "exchange_funding_ledger"),
+    ])
+    tracker.record_funding_settlements([
+        FundingSettlement(paper_id, "long", 1_500, -9.99, 1_700, "exchange_funding_ledger"),
+    ])
+
+    payload = tracker.evaluate_due(
+        2_000,
+        _quotes(now_ms=2_000, long_funding_ts_ms=1_500, short_funding_ts_ms=1_500, funding_interval_ms=10_000),
+    )[0]["payload"]
+    assert payload["paper_funding_quote"] == pytest.approx(-0.01)
+    assert payload["long_leg"]["funding_settlement_conflict"] is True
+    assert payload["settlement_funding_rate_evidence"] == "conflicting_actual_funding_ledger"
+    assert payload["funding_settlement_evidence_complete"] is False
+    assert payload["official_pnl"] is False
+
+
+def test_nonfinite_funding_ledger_amount_is_rejected_before_it_can_poison_pnl() -> None:
+    tracker = _tracker(markout_secs=[1], terminal_secs=10)
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+
+    assert tracker.record_funding_settlements([
+        FundingSettlement(paper_id, "long", 1_500, float("nan"), 1_600, "exchange_funding_ledger"),
+        FundingSettlement(paper_id, "short", 1_500, float("inf"), 1_600, "exchange_funding_ledger"),
+    ]) == []
+
+    payload = tracker.evaluate_due(
+        2_000,
+        _quotes(
+            now_ms=2_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+    )[0]["payload"]
+    assert payload["paper_funding_quote"] == 0.0
+    assert payload["official_pnl"] is False
+    assert isfinite(float(payload["paper_net_quote"]))
+
+
+def test_restore_skips_nonfinite_persisted_leg_quantity() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    record = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "long_leg": {
+                **registered["payload"]["long_leg"],
+                "qty": float("nan"),
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[], terminal_secs=10)
+    restored.restore_from_records([record])
+    assert restored.tracked_count == 0
+
+
+def test_restore_requires_current_journal_and_candidate_economics_proof() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+
+    legacy_schema = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "journal_schema_version": 1,
+        },
+    }
+    missing_fee_proof = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "candidate_snapshot": {
+                **registered["payload"]["candidate_snapshot"],
+                "fee_evidence_complete": False,
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[], terminal_secs=1)
+    restored.restore_from_records([legacy_schema, missing_fee_proof])
 
     assert restored.tracked_count == 0
-    assert restored.evaluate_due(3_000, _quotes(now_ms=3_000)) == []
-    assert restored.register(_candidate(), _quotes(now_ms=3_000), finalist_rank=0) is None
+    assert restored.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
 
 
-def test_tracker_does_not_reregister_same_signal_after_terminal_close() -> None:
-    cfg = SpreadPaperConfig(
-        enabled=True,
-        finalist_limit=10,
+def test_restore_rejects_truthy_string_booleans_at_journal_boundary() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+
+    forged = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "official_pnl": "false",
+            "candidate_snapshot": {
+                **registered["payload"]["candidate_snapshot"],
+                "fee_evidence_complete": "false",
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[], terminal_secs=1)
+    restored.restore_from_records([forged])
+
+    assert restored.tracked_count == 0
+    assert restored.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
+
+
+def test_restore_deduplicates_settlement_replay_and_marks_amount_conflict() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    payload = registered["payload"]
+    paper_id = payload["paper_id"]
+    long_settlement = {
+        "paper_id": paper_id,
+        "leg_side": "long",
+        "settlement_timestamp_ms": 1_500,
+        "amount_quote": 1.0,
+        "observed_at_ms": 1_600,
+        "source": "exchange_funding_ledger",
+    }
+    forged = {
+        "kind": registered["kind"],
+        "payload": {
+            **payload,
+            "long_leg": {
+                **payload["long_leg"],
+                "funding_settlements": [
+                    long_settlement,
+                    {**long_settlement, "amount_quote": 9.0},
+                ],
+            },
+            "short_leg": {
+                **payload["short_leg"],
+                "funding_settlements": [
+                    {
+                        **long_settlement,
+                        "leg_side": "short",
+                        "amount_quote": 0.0,
+                    }
+                ],
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[], terminal_secs=1)
+    restored.restore_from_records([forged])
+    events = restored.evaluate_due(
+        2_000,
+        _quotes(
+            now_ms=2_000,
+            long_funding_ts_ms=1_500,
+            short_funding_ts_ms=1_500,
+            funding_interval_ms=10_000,
+        ),
+    )
+
+    assert len(events) == 1
+    assert events[0]["payload"]["paper_funding_quote"] == pytest.approx(1.0)
+    assert events[0]["payload"]["official_pnl"] is False
+
+
+def test_restore_preserves_official_status_only_for_current_complete_baseline() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    entry_quotes = _quotes(
+        now_ms=1_000,
+        long_funding_ts_ms=10_000,
+        short_funding_ts_ms=10_000,
+        funding_interval_ms=10_000,
+    )
+    registered = tracker.register(_candidate(), entry_quotes, finalist_rank=0)
+    assert registered is not None
+
+    restored = _tracker(markout_secs=[], terminal_secs=1)
+    restored.restore_from_records([registered])
+    events = restored.evaluate_due(
+        2_000,
+        _quotes(
+            now_ms=2_000,
+            long_funding_ts_ms=10_000,
+            short_funding_ts_ms=10_000,
+            funding_interval_ms=10_000,
+        ),
+    )
+
+    assert restored.tracked_count == 0
+    assert len(events) == 1
+    assert events[0]["payload"]["official_pnl"] is True
+
+
+def test_restore_maker_leg_cannot_forge_taker_baseline_mode() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+
+    payload = registered["payload"]
+    forged = {
+        "kind": registered["kind"],
+        "payload": {
+            **payload,
+            # The reporting mode is intentionally left untouched.  The
+            # restore boundary must inspect leg-level execution evidence.
+            "long_leg": {
+                **payload["long_leg"],
+                "entry_liquidity_role": "maker",
+                "entry_execution_source": "maker_bbo_unknown",
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[], terminal_secs=1)
+    restored.restore_from_records([forged])
+    events = restored.evaluate_due(2_000, _quotes(now_ms=2_000))
+
+    assert len(events) == 1
+    assert events[0]["payload"]["official_pnl"] is False
+
+
+def test_exit_fee_uses_actual_slipped_exit_cash_price() -> None:
+    tracker = _tracker(
         markout_secs=[1],
-        terminal_secs=1,
-        episode_cooldown_ms=0,
+        terminal_secs=10,
+        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
+        slippage_buffer_bps=5.0,
     )
-    tracker = SpreadPaperTracker(cfg)
-    candidate = _candidate()
-    assert tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0) is not None
-    closed_events = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
 
-    assert [event["kind"] for event in closed_events] == [
-        "opportunity.paper_markout",
-        "opportunity.paper_closed",
-    ]
-    assert tracker.tracked_count == 0
-    assert tracker.register(candidate, _quotes(now_ms=3_000), finalist_rank=0) is None
-    assert (
-        tracker.register(_candidate(signal_ts_ms=1_001), _quotes(now_ms=3_000), finalist_rank=0)
-        is not None
+    payload = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))[0]["payload"]
+    long_leg = payload["long_leg"]
+    short_leg = payload["short_leg"]
+    expected = (
+        long_leg["qty"] * long_leg["exit_price"] * 1.0 / 10_000.0
+        + short_leg["qty"] * short_leg["exit_price"] * 2.0 / 10_000.0
     )
+    assert payload["paper_exit_fee_quote"] == pytest.approx(expected)
+
+
+def test_stale_or_missing_exit_quote_is_unpriced_and_never_official() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    events = tracker.evaluate_due(2_000, {})
+    assert [item["kind"] for item in events] == ["opportunity.paper_closed"]
+    payload = events[0]["payload"]
+    assert payload["paper_unpriced"] is True
+    assert payload["paper_net_quote"] is None
+    assert payload["official_pnl"] is False
+    assert tracker.tracked_count == 0
+
+
+def test_exit_top_book_capacity_cannot_price_an_entire_paper_close() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1)
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    # Entry filled roughly 0.2 base units.  A fresh exit BBO with only 0.1
+    # visible on either consuming side must not pretend it filled the whole
+    # pair at that price.
+    payload = tracker.evaluate_due(
+        2_000,
+        _quotes(now_ms=2_000, bid_size=0.1, ask_size=0.1),
+    )[0]["payload"]
+
+    assert payload["paper_unpriced"] is True
+    assert payload["paper_skip_reason"] == "exit_top_book_capacity_insufficient"
+    assert payload["paper_net_quote"] is None
+    assert payload["official_pnl"] is False
+
+
+def test_exit_quotes_within_ttl_but_outside_cross_venue_skew_are_unpriced() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1, quote_ttl_ms=1_000, quote_skew_ms=250)
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    quotes = _quotes(now_ms=2_000)
+    quotes["rich:BTCUSDT"] = replace(
+        quotes["rich:BTCUSDT"], observed_at_ms=1_500
+    )
+
+    payload = tracker.evaluate_due(2_000, quotes)[0]["payload"]
+    assert payload["paper_unpriced"] is True
+    assert payload["official_pnl"] is False
+
+
+def test_active_exit_uses_fresh_quotes_and_closes_before_terminal() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=30, active_exit_enabled=True, exit_z=0.5)
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+
+    events = tracker.evaluate_due(
+        2_000,
+        _quotes(now_ms=2_000, long_bid=100.0, long_ask=100.1, short_bid=100.0, short_ask=100.1),
+    )
+    assert [item["kind"] for item in events] == ["opportunity.paper_closed"]
+    assert events[0]["payload"]["paper_close_reason"] == "spread_converged"
+    assert events[0]["payload"]["paper_unpriced"] is False
+
+
+def test_unsupported_legacy_bot_ids_do_not_create_hidden_cohorts() -> None:
+    tracker = _tracker(paper_bot_ids=["core_v1_bot", "bad_pair_control_bot"])
+
+    assert tracker.register_many(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) == []
+
+
+def test_episode_is_deduplicated_and_restores_from_journal() -> None:
+    tracker = _tracker(markout_secs=[], terminal_secs=1, episode_cooldown_ms=10_000)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    closed = tracker.evaluate_due(2_000, _quotes(now_ms=2_000))
+
+    restored = _tracker(markout_secs=[], terminal_secs=1, episode_cooldown_ms=10_000)
+    restored.restore_from_records([registered, *closed])
+    assert restored.tracked_count == 0
+    assert restored.register(_candidate(signal_ts_ms=5_000), _quotes(now_ms=5_000), finalist_rank=0) is None
+    assert restored.register(_candidate(signal_ts_ms=11_001), _quotes(now_ms=11_001), finalist_rank=0) is not None

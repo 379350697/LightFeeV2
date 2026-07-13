@@ -454,6 +454,7 @@ class TestOpenPositionFieldCompleteness:
             short_entry_price=50010.0,
             opened_at_ms=1000,
             worst_case_edge_bps_entry=4.0,
+            expected_shortfall_bps_entry=12.5,
             first_funding_leg="long",
             entry_maker_leg="long",
             exit_maker_leg="short",
@@ -483,6 +484,7 @@ class TestOpenPositionFieldCompleteness:
         pos = restored.open_positions["entry-meta"]
 
         assert pos.worst_case_edge_bps_entry == pytest.approx(4.0)
+        assert pos.expected_shortfall_bps_entry == pytest.approx(12.5)
         assert pos.first_funding_leg == "long"
         assert pos.entry_maker_leg == "long"
         assert pos.exit_maker_leg == "short"
@@ -624,6 +626,7 @@ class TestPendingEntryFieldCompleteness:
             total_funding_edge_bps_entry=7.45,
             expected_edge_bps_entry=6.9,
             worst_case_edge_bps_entry=4.0,
+            expected_shortfall_bps_entry=12.5,
             entry_maker_leg="long",
             exit_maker_leg="short",
             entry_cross_bps_entry=1.25,
@@ -716,6 +719,7 @@ class TestPendingEntryFieldCompleteness:
         assert pending["lifetime_exhausted_logged_final_reason"] == "passive_entry_lifetime_exhausted"
         assert pending["frozen_candidate"]["pair_id"] == "magmausdt:aster->bybit"
         assert pending["worst_case_edge_bps_entry"] == pytest.approx(4.0)
+        assert pending["expected_shortfall_bps_entry"] == pytest.approx(12.5)
         assert pending["entry_maker_leg"] == "long"
         assert pending["exit_maker_leg"] == "short"
         assert pending["entry_cross_bps_entry"] == pytest.approx(1.25)
@@ -753,6 +757,7 @@ class TestPendingEntryFieldCompleteness:
         assert restored_pending.funding_edge_bps_entry == pytest.approx(7.45)
         assert restored_pending.total_funding_edge_bps_entry == pytest.approx(7.45)
         assert restored_pending.expected_edge_bps_entry == pytest.approx(6.9)
+        assert restored_pending.expected_shortfall_bps_entry == pytest.approx(12.5)
         assert restored_pending.phase_state is not None
         assert restored_pending.phase_state.execution_kind == "entry"
         assert restored_pending.phase_state.active_maker_leg == "short"

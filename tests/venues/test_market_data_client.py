@@ -107,6 +107,57 @@ class TestFundingTickerType:
             ft.bid = 3  # type: ignore
 
 
+class TestFundingTickerEnrichment:
+    def test_contract_evidence_is_normalized_from_the_shared_venue_spec(self):
+        client = MarketDataClient(binance_spec())
+        raw = FundingTicker(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            mark_price=100.5,
+            index_price=100.4,
+            funding_timestamp_ms=9_000_000,
+        )
+
+        ticker = client._enrich_tickers({"binance:BTCUSDT": raw}, observed_at_ms=1)[
+            "binance:BTCUSDT"
+        ]
+
+        assert ticker.underlying == "BTC"
+        assert ticker.quote_currency == "USDT"
+        assert ticker.contract_type == "linear"
+        assert ticker.contract_multiplier == 1.0
+        assert ticker.price_precision > 0
+        assert ticker.quantity_precision > 0
+        assert ticker.contract_normalization_complete is True
+        assert ticker.funding_interval_ms == 0
+
+    def test_interval_is_measured_from_a_venue_timestamp_transition(self):
+        client = MarketDataClient(binance_spec())
+        first = FundingTicker(venue="binance", symbol="BTCUSDT", bid=1, ask=2, funding_timestamp_ms=8_000)
+        second = FundingTicker(venue="binance", symbol="BTCUSDT", bid=1, ask=2, funding_timestamp_ms=3_608_000)
+
+        assert client._enrich_tickers({"binance:BTCUSDT": first}, observed_at_ms=1)["binance:BTCUSDT"].funding_interval_ms == 0
+        assert client._enrich_tickers({"binance:BTCUSDT": second}, observed_at_ms=2)["binance:BTCUSDT"].funding_interval_ms == 3_600_000
+
+    def test_unknown_contract_quantity_is_not_promoted_by_a_static_spec(self):
+        client = MarketDataClient(okx_spec())
+        raw = FundingTicker(
+            venue="okx",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            mark_price=100.5,
+            index_price=100.4,
+        )
+
+        ticker = client._enrich_tickers({"okx:BTCUSDT": raw}, observed_at_ms=1)["okx:BTCUSDT"]
+
+        assert ticker.contract_normalization_complete is False
+        assert ticker.venue_status == "unknown"
+
+
 class TestPerpLiquidityType:
     """PerpLiquidity dataclass."""
 

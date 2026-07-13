@@ -6,12 +6,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.domain import PerpLiquiditySnapshot, Venue
-from lightfee.sidecar.pairing import build_same_symbol_pairs
-from lightfee.sidecar.publisher import publish_snapshot
+from lightfee.sidecar.pairing import FundingCandidateService
+from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
     FundingLifecycle,
@@ -23,13 +24,12 @@ from lightfee.sidecar.snapshot import (
 )
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
-from lightfee.sidecar.sources.transfer import TransferSource
+from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.venues.specs import get_spec
 
 # V1 parity: per-domain timeout defaults (matching V1 sidecar_budget_ms configs)
 DEFAULT_FUNDING_TIMEOUT_S = 30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
 DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
-DEFAULT_TRANSFER_TIMEOUT_S = 5.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
 
@@ -48,14 +48,22 @@ class SidecarService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.snapshot_path = config.runtime.sidecar_snapshot_path
+        self._forecast_calibrator = FundingForecastCalibrator(
+            Path(self.snapshot_path).with_name(
+                f"{Path(self.snapshot_path).name}.funding-forecast-calibration.json"
+            ),
+            min_samples=config.strategy.funding_forecast_min_samples,
+            max_quantile_drift_bps=(
+                config.strategy.funding_forecast_stability_max_quantile_drift_bps
+            ),
+        )
         runtime = config.runtime
-        self._funding_timeout_s = getattr(runtime, "sidecar_funding_timeout_s", DEFAULT_FUNDING_TIMEOUT_S)
-        self._liquidity_timeout_s = getattr(runtime, "sidecar_liquidity_timeout_s", DEFAULT_LIQUIDITY_TIMEOUT_S)
-        self._transfer_timeout_s = getattr(runtime, "sidecar_transfer_timeout_s", DEFAULT_TRANSFER_TIMEOUT_S)
+        self._funding_timeout_s = runtime.sidecar_funding_timeout_s
+        self._liquidity_timeout_s = runtime.sidecar_liquidity_timeout_s
+        self._candidate_service = self._new_candidate_service()
 
         self._exchange_sources: dict[str, ExchangeSource] = {}
         self._liquidity_sources: dict[str, LiquiditySource] = {}
-        self._transfer_sources: list[TransferSource] = []
         from lightfee.venues.transport import EndpointRateLimiter
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
@@ -76,18 +84,23 @@ class SidecarService:
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
 
-        venue_names = [vc.venue for vc in config.venues]
-        for i, from_name in enumerate(venue_names):
-            for to_name in venue_names[i + 1:]:
-                from_v = Venue.from_str(from_name)
-                to_v = Venue.from_str(to_name)
-                self._transfer_sources.append(
-                    TransferSource.for_venue_pair(
-                        from_v,
-                        to_v,
-                        http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-                    )
-                )
+        # A restart must not erase a cadence that the exchange has already
+        # demonstrated.  This is a local snapshot read only; it adds no public
+        # REST request and leaves unknown schedules unknown.
+        try:
+            prior_snapshot = load_snapshot(self.snapshot_path)
+        except (KeyError, TypeError, ValueError):
+            # A malformed or legacy snapshot must not turn a safe restart into
+            # an outage.  It merely leaves funding cadence cold/unknown.
+            logger.warning("sidecar funding schedule restore skipped: malformed snapshot")
+            prior_snapshot = None
+        if prior_snapshot is not None:
+            self._forecast_calibrator.prime(prior_snapshot.quotes)
+            quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
+            for quote in prior_snapshot.quotes.values():
+                quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
+            for venue_name, source in self._exchange_sources.items():
+                source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
 
         # V1 parity: last-good fallback cache
         self._last_good_quotes: dict[str, QuoteSnapshot] = {}
@@ -99,7 +112,6 @@ class SidecarService:
         for group_name, sources in (
             ("exchange", list(self._exchange_sources.values())),
             ("liquidity", list(self._liquidity_sources.values())),
-            ("transfer", list(self._transfer_sources)),
         ):
             for src in sources:
                 try:
@@ -213,18 +225,24 @@ class SidecarService:
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in liq_failed_symbols) if liq_failed_symbols else "",
             ))
 
-        # --- Transfer lifecycle (empty-compatible, independent) ---
+        # Transfer/inventory preference is live-admission evidence, not a
+        # public-sidecar resource.  No synthetic pairwise clients or inferred
+        # balances exist on this path.
         transfer_lifecycle: list[TransferLifecycle] = []
-        for ts in self._transfer_sources:
-            transfer_lifecycle.append(TransferLifecycle(
-                from_venue=ts.from_venue, to_venue=ts.to_venue,
-                observed_at_ms=observed_ms, coverage_usable=0, degraded_reason="",
-            ))
+
+        # This consumes only the already-fetched public payload: no extra REST
+        # requests, and no sample is created unless the exchange advanced its
+        # next settlement while exposing a confirmed previous settled rate.
+        self._ensure_forecast_calibrator().apply(quotes, now_ms=observed_ms)
 
         last_good_for_acquisition = self._last_good_quotes if had_last_good_before_refresh else {}
 
         # --- Build candidates ---
-        candidates = build_same_symbol_pairs(quotes, symbols)
+        candidates = self._ensure_candidate_service().build(
+            quotes,
+            symbols,
+            observed_at_ms=observed_ms,
+        )
         published_ms = int(time.time() * 1000)
         legacy_liquidity_publish_ms = int(getattr(self, "_last_liquidity_publish_at_ms", 0) or 0)
         liquidity_publish_by_key = getattr(self, "_last_liquidity_publish_at_ms_by_key", None)
@@ -258,6 +276,8 @@ class SidecarService:
         if liquidity_successful_publish:
             self._last_liquidity_publish_at_ms = published_ms
 
+        self._attach_local_l2_depth_bridge(quotes, observed_ms)
+
         # --- Cache last-good quotes ---
         if quotes:
             self._last_good_quotes = dict(quotes)
@@ -281,6 +301,38 @@ class SidecarService:
 
         publish_snapshot(snapshot, self.snapshot_path)
         return snapshot
+
+    def _attach_local_l2_depth_bridge(
+        self,
+        quotes: dict[str, QuoteSnapshot],
+        observed_ms: int,
+    ) -> None:
+        """Merge only fresh Local-L2 evidence without another public request."""
+        runtime = self.config.runtime
+        if not runtime.local_l2_depth_bridge_enabled or not quotes:
+            return
+        from lightfee.marketdata.l2_depth_bridge import (
+            attach_local_l2_depth,
+            load_local_l2_depth_bridge,
+        )
+
+        bridge = load_local_l2_depth_bridge(
+            runtime.local_l2_depth_bridge_path,
+            now_ms=observed_ms,
+            # Spread paper already requires fresh market quotes.  Keeping the
+            # bridge no older than that domain prevents an otherwise current
+            # sidecar refresh from carrying an old executable ladder.
+            max_age_ms=runtime.max_market_age_ms,
+        )
+        # The bridge book must be contemporaneous with the BBO snapshot.  A
+        # matching top price alone cannot prove that its lower levels remain
+        # executable, so use the same cross-venue skew budget as the spread
+        # signal.  Rejected depth simply falls back to BBO-only capacity.
+        attach_local_l2_depth(
+            quotes,
+            bridge,
+            max_quote_skew_ms=self.config.strategy.spread_quote_skew_ms,
+        )
 
     # ------------------------------------------------------------------
     # Per-venue concurrent fetch with per-symbol error tracking
@@ -309,6 +361,64 @@ class SidecarService:
             return_exceptions=False,
         )
         return list(results)
+
+    def _ensure_forecast_calibrator(self) -> FundingForecastCalibrator:
+        """Keep direct test/recovery construction compatible with the service."""
+        calibrator = getattr(self, "_forecast_calibrator", None)
+        if calibrator is None:
+            snapshot_path = Path(self.snapshot_path)
+            strategy = self.config.strategy
+            calibrator = FundingForecastCalibrator(
+                snapshot_path.with_name(
+                    f"{snapshot_path.name}.funding-forecast-calibration.json"
+                ),
+                min_samples=strategy.funding_forecast_min_samples,
+                max_quantile_drift_bps=(
+                    strategy.funding_forecast_stability_max_quantile_drift_bps
+                ),
+            )
+            self._forecast_calibrator = calibrator
+        return calibrator
+
+    def _new_candidate_service(self) -> FundingCandidateService:
+        """Build the configuration-derived shortlist service once per runtime."""
+        config = self.config
+        return FundingCandidateService(
+            strategy=config.strategy,
+            venue_fee_bps={
+                str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0)
+                for venue in config.venues
+            },
+            venue_maker_fee_bps={
+                str(venue.venue).lower(): float(
+                    venue.maker_fee_bps
+                    if venue.maker_fee_bps is not None
+                    else venue.taker_fee_bps or 0.0
+                )
+                for venue in config.venues
+            },
+            venue_notional_caps={
+                str(venue.venue).lower(): float(venue.max_notional or 0.0)
+                for venue in config.venues
+            },
+            passive_execution_enabled=(
+                str(config.runtime.mode or "").lower() == "live"
+            ),
+        )
+
+    def _ensure_candidate_service(self) -> FundingCandidateService:
+        """Retain direct test and recovery construction compatibility.
+
+        Normal startup eagerly creates the service to reuse immutable fee and
+        sizing context.  V1 lifecycle tests and recovery tooling may construct
+        this class directly without ``__init__``; their first refresh must use
+        the same service, rather than a simplified candidate path.
+        """
+        candidate_service = getattr(self, "_candidate_service", None)
+        if candidate_service is None:
+            candidate_service = self._new_candidate_service()
+            self._candidate_service = candidate_service
+        return candidate_service
 
     # ------------------------------------------------------------------
     # Per-venue liquidity fetch (independent timeout, independent source)

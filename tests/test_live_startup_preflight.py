@@ -37,6 +37,7 @@ from lightfee.engine.state import (
     PersistedCloseExecutionLeg,
 )
 from lightfee.engine.entry import EntryState
+from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -60,6 +61,7 @@ def make_test_config(temp_dir: str) -> AppConfig:
             local_l2_enabled=False,
             local_l2_ws_enabled=False,
             pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
+            funding_new_entries_enabled=True,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(Path(temp_dir) / "events.jsonl"),
@@ -68,6 +70,38 @@ def make_test_config(temp_dir: str) -> AppConfig:
         venues=[],
         symbols=["BTCUSDT"],
     )
+
+
+@pytest.mark.asyncio
+async def test_startup_policy_uses_strict_boolean_feature_flags(tmp_path, monkeypatch):
+    """Health evidence cannot report a truthy malformed flag as enabled."""
+    config = make_test_config(str(tmp_path))
+    config.strategy.funding_new_entries_enabled = "false"  # type: ignore[assignment]
+    config.strategy.spread_live_enabled = "false"  # type: ignore[assignment]
+    config.strategy.spread_paper_enabled = "false"  # type: ignore[assignment]
+    runtime = LiveRuntime(config)
+
+    async def _preflight() -> None:
+        return None
+
+    async def _stop_after_policy(_config: AppConfig):
+        raise RuntimeError("stop_after_startup_policy")
+
+    monkeypatch.setattr(runtime, "_emit_startup_order_path_preflight", lambda: None)
+    monkeypatch.setattr(runtime, "_verify_live_trading_preflights", _preflight)
+    monkeypatch.setattr("lightfee.engine.runtime.prepare_runtime_symbols", _stop_after_policy)
+
+    with pytest.raises(RuntimeError, match="stop_after_startup_policy"):
+        await runtime.start()
+
+    policy = next(
+        record["payload"]
+        for record in runtime.journal.read_all()
+        if record["kind"] == "startup.strategy_entry_policy"
+    )
+    assert policy["funding_new_entries_enabled"] is False
+    assert policy["spread_live_enabled"] is False
+    assert policy["spread_paper_enabled"] is False
 
 
 _ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
@@ -123,9 +157,61 @@ def _admissible_dispatch_candidate(
         expected_edge_bps=10.0,
         funding_edge_bps=0.0,
         worst_case_edge_bps=8.0,
+        gross_signal_edge_bps=10.0,
+        expected_exit_cross_bps=0.0,
+        entry_fee_bps=0.0,
+        exit_fee_bps=0.0,
+        entry_slippage_bps=0.0,
+        exit_slippage_bps=0.0,
+        adverse_selection_bps=0.0,
+        capital_buffer_bps=0.0,
+        execution_buffer_bps=0.0,
+        venue_risk_haircut_bps=0.0,
+        transfer_or_inventory_bias_bps=0.0,
+        calculation_version="v1_exact",
+        model_epoch="v1_exact",
+        forecast_worst_funding_edge_bps=0.0,
+        # This helper represents a complete V3 all-taker candidate used to
+        # exercise venue-admission failures after economics has been admitted.
+        taker_fee_evidence_complete=True,
+        economics_complete=True,
+        economics_observed_at_ms=1778786999000,
         blocked=False,
         blocked_reasons=[],
     )
+
+
+class _StaticFinalQuoteLeaseProvider:
+    """Fresh BBO evidence for tests that exercise post-economics admission."""
+
+    def get_lease(self, pair_id: str) -> QuoteLease | None:
+        try:
+            symbol, venues = str(pair_id).split(":", 1)
+            long_venue, short_venue = venues.split("->", 1)
+        except ValueError:
+            return None
+        return QuoteLease(
+            pair_id=str(pair_id),
+            symbol=symbol.upper(),
+            long_venue=long_venue,
+            short_venue=short_venue,
+            long_bid=99.9,
+            long_ask=100.0,
+            short_bid=100.1,
+            short_ask=100.2,
+            long_observed_at_ms=1778787000000,
+            short_observed_at_ms=1778787000000,
+            created_at_ms=1778787000000,
+            expires_at_ms=1778787005000,
+            provider="quote_lease",
+        )
+
+
+def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
+    runtime.config.strategy.entry_readiness_provider = "quote_lease"
+    runtime.config.strategy.entry_quote_lease_ttl_ms = 5_000
+    runtime.entry_readiness_provider = _StaticFinalQuoteLeaseProvider()
+    return runtime
 
 
 def _fake_adapters_for_venues(
@@ -233,10 +319,10 @@ class TestRuntimePreflight:
     async def test_bybit_trading_terms_reject_blocks_symbol_admission(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues("bybit", "binance"),
-            )
+            ))
             runtime.journal.open()
 
             class RejectingExecutor:
@@ -300,14 +386,14 @@ class TestRuntimePreflight:
                     raise AssertionError("maker dispatch must be blocked by Bybit precheck")
 
             bybit = PrecheckRejectingBybit()
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues(
                     "binance",
                     "bybit",
                     overrides={Venue.BYBIT: bybit},
                 ),
-            )
+            ))
             executor = RecordingExecutor()
             runtime.entry_executor = executor
             runtime.journal.open()
@@ -378,14 +464,14 @@ class TestRuntimePreflight:
                     )
 
             bybit = PrecheckOkBybit()
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues(
                     "binance",
                     "bybit",
                     overrides={Venue.BYBIT: bybit},
                 ),
-            )
+            ))
             executor = RecordingExecutor()
             runtime.entry_executor = executor
             runtime.journal.open()
@@ -435,14 +521,14 @@ class TestRuntimePreflight:
                         reject_reason="planner test terminal",
                     )
 
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues(
                     "binance",
                     "aster",
                     overrides={Venue.BINANCE: binance, Venue.ASTER: aster},
                 ),
-            )
+            ))
             executor = RecordingExecutor()
             runtime.entry_executor = executor
             runtime.journal.open()
@@ -492,14 +578,14 @@ class TestRuntimePreflight:
                     self.calls += 1
                     raise AssertionError("entry must be blocked before order dispatch")
 
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues(
                     "binance",
                     "aster",
                     overrides={Venue.BINANCE: FailingLeverageAdapter(Venue.BINANCE)},
                 ),
-            )
+            ))
             runtime.entry_executor = RecordingExecutor()
             runtime.journal.open()
             candidate = _admissible_dispatch_candidate(
@@ -536,10 +622,10 @@ class TestRuntimePreflight:
     async def test_aster_max_leverage_reject_blocks_symbol_admission(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues("aster", "bybit"),
-            )
+            ))
             runtime.journal.open()
 
             class RejectingExecutor:
@@ -634,10 +720,10 @@ class TestRuntimePreflight:
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             short_venue = "bybit" if venue != "bybit" else "binance"
-            runtime = LiveRuntime(
+            runtime = _with_final_quote_lease(LiveRuntime(
                 config,
                 venue_adapters=_fake_adapters_for_venues(venue, short_venue),
-            )
+            ))
             runtime.journal.open()
 
             class RejectingExecutor:

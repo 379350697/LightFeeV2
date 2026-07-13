@@ -78,10 +78,19 @@ class RuntimeConfig:
     sidecar_perp_liquidity_budget_ms: int = 30000
     sidecar_funding_timeout_s: float = 30.0
     sidecar_liquidity_timeout_s: float = 10.0
-    sidecar_transfer_timeout_s: float = 5.0
     sidecar_hint_budget_ms: int = 500
-    sidecar_transfer_budget_ms: int = 1000
     spread_sidecar_snapshot_path: str = "runtime/spread-opportunities-current.json"
+    # Bounded signed-basis state survives a process restart.  A missing,
+    # malformed, stale or wrong-epoch checkpoint deliberately cold-starts
+    # instead of borrowing statistics from another model.
+    spread_stats_checkpoint_path: str = "runtime/spread-stats-v2-checkpoint.json"
+    # Dynamic funding basis-risk evidence is persisted independently from the
+    # sidecar snapshot.  It is an entry-admission input, so a missing or stale
+    # checkpoint cold-starts rather than silently reusing an arbitrary price
+    # history after a restart.
+    funding_basis_risk_checkpoint_path: str = (
+        "runtime/funding-basis-risk-v1-checkpoint.json"
+    )
     spread_sidecar_refresh_ms: int = 1000
     spread_sidecar_fetch_timeout_s: float = 10.0
     spread_sidecar_source_mode: str = "sidecar_snapshot"
@@ -94,6 +103,13 @@ class RuntimeConfig:
     private_position_max_age_ms: int = 15000
     live_recovery_rest_probe_timeout_ms: int = 2000
     max_order_quote_age_ms: int = 6000
+    # One-way, bounded IPC from the live Local-L2 runtime to the public
+    # sidecar.  It reuses already-held books and never creates a second public
+    # depth-fetch path for spread paper execution.
+    local_l2_depth_bridge_enabled: bool = True
+    local_l2_depth_bridge_path: str = "runtime/local-l2-depth-current.json"
+    local_l2_depth_bridge_max_levels: int = 20
+    local_l2_depth_bridge_publish_interval_ms: int = 500
     uncertain_order_cooldown_ms: int = 30000
     transfer_outage_warn_ms: int = 120000
     transfer_backup_source_after_ms: int = 180000
@@ -143,7 +159,63 @@ class StrategyConfig:
     small_test_expected_edge_relaxation_bps: float = 0.5
     small_test_worst_case_edge_relaxation_bps: float = 0.5
     small_test_max_entry_slippage_relaxation_bps: float = 5.0
+    # Funding entry safety and economics. Existing positions, pending hedges,
+    # residual repair and close/recovery paths intentionally ignore this flag.
+    # New funding positions are opt-in.  Existing positions, pending hedges,
+    # recovery and close/reconciliation paths are deliberately independent of
+    # this switch, so a missing config key can never strand an existing leg.
+    funding_new_entries_enabled: bool = False
+    funding_economics_mode: str = "v1_exact"
+    funding_forecast_mode: str = "shadow"
+    funding_forecast_uncertainty_haircut_bps: float = 2.0
+    # A 7-day calibration window holds at most 21 independent settlement
+    # errors for a conventional 8-hour perp.  Keep the default below that
+    # physical ceiling; the separate 7-day shadow gate still prevents an
+    # early enhanced-live rollout.
+    funding_forecast_min_samples: int = 18
+    funding_forecast_shadow_min_days: int = 7
+    # A calibrated forecast must have a stable realised-error distribution,
+    # not merely enough observations.  We compare the median and p90 absolute
+    # error in the older and newer halves of the bounded calibration window.
+    funding_forecast_stability_max_quantile_drift_bps: float = 2.0
+    funding_venue_risk_haircut_bps_by_venue: dict[str, float] = field(
+        default_factory=dict
+    )
+    funding_missing_margin_fallback_notional_quote: float = 15.0
+    funding_risk_health_buffer_ratio: float = 0.5
+    # Portfolio limits apply to a common-base paired position. Zero keeps the
+    # optional enhanced limit disabled; the existing venue/symbol caps remain
+    # mandatory admission limits in live mode.
+    funding_max_venue_pair_exposure_quote: float = 0.0
+    funding_max_global_gross_exposure_quote: float = 0.0
+    funding_max_settlement_bucket_exposure_quote: float = 0.0
+    funding_settlement_crowding_bucket_ms: int = 300_000
+    funding_max_correlation_group_exposure_quote: float = 0.0
+    funding_correlation_group_by_symbol: dict[str, str] = field(
+        default_factory=dict
+    )
+    funding_expected_shortfall_bps: float = 0.0
+    funding_expected_shortfall_budget_quote: float = 0.0
+    # Historical Expected Shortfall of the *paired basis*, not outright asset
+    # volatility.  These defaults collect bounded shadow evidence while the
+    # entry freeze is in force.  A live funding entry may only be enabled once
+    # this model and its positive capital budget are explicitly configured.
+    funding_dynamic_expected_shortfall_enabled: bool = True
+    funding_dynamic_expected_shortfall_window_ms: int = 21_600_000
+    funding_dynamic_expected_shortfall_max_samples: int = 7_200
+    funding_dynamic_expected_shortfall_max_pairs: int = 1_024
+    funding_dynamic_expected_shortfall_horizon_ms: int = 60_000
+    funding_dynamic_expected_shortfall_min_samples: int = 120
+    funding_dynamic_expected_shortfall_min_history_ms: int = 300_000
+    funding_dynamic_expected_shortfall_confidence: float = 0.95
+    funding_dynamic_expected_shortfall_quote_skew_ms: int = 250
+    funding_dynamic_expected_shortfall_checkpoint_max_age_ms: int = 21_600_000
+    funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms: int = 60_000
     spread_reversion_enabled: bool = False
+    # This remains an independent paper-only strategy. The explicit live gate
+    # stays false even when signal generation or paper execution is enabled.
+    spread_live_enabled: bool = False
+    spread_model_epoch: str = "v2_signed_reversion"
     spread_live_notional_quote: float = 20.0
     spread_max_gross_quote: float = 50.0
     spread_max_concurrent_positions: int = 1
@@ -169,6 +241,12 @@ class StrategyConfig:
     spread_max_executable_spread_bps: float = 300.0
     spread_mean_reversion_min_std_bps: float = 0.05
     spread_mean_reversion_max_half_life_ms: int = 1800000
+    spread_stats_window_ms: int = 21600000
+    spread_stats_max_samples: int = 7200
+    spread_stats_short_window_ms: int = 900000
+    spread_structural_break_sigma: float = 3.0
+    spread_structural_break_consecutive: int = 5
+    spread_structural_break_cooldown_ms: int = 1800000
     spread_ranker_max_candidates: int = 10
     spread_score_liquidity_weight: float = 8.0
     spread_score_z_cap: float = 5.0
@@ -179,38 +257,28 @@ class StrategyConfig:
     spread_liquidity_medium_penalty_bps: float = 30.0
     spread_liquidity_sublarge_penalty_bps: float = 10.0
     spread_paper_enabled: bool = False
+    spread_paper_model_epoch: str = "v2_signed_reversion"
+    spread_paper_primary_fill_model: str = "taker_taker"
+    spread_paper_require_taker_taker: bool = True
     spread_paper_finalist_limit: int = 10
-    spread_paper_excluded_symbols: list[str] = field(
-        default_factory=lambda: ["BBUSDT", "QNTUSDT"]
-    )
+    # Symbol exclusions are an explicit research choice, never a hidden
+    # hard-coded good/bad pair in the strategy or its reports.
+    spread_paper_excluded_symbols: list[str] = field(default_factory=list)
     spread_paper_allowed_opportunity_labels: list[str] = field(
         default_factory=lambda: ["spread_reversion"]
     )
     spread_paper_episode_cooldown_ms: int = 1_800_000
     spread_paper_bot_ids: list[str] = field(
-        default_factory=lambda: [
-            "tt_conservative",
-            "mt_long_maker",
-            "mt_short_maker",
-            "mt_selected_maker",
-            "mt_selected_maker_delay_1000ms",
-            "core_v1_bot",
-            "core_v1_exec100_bot",
-            "core_v1_z10_bot",
-            "bad_pair_control_bot",
-            "low_liquidity_control_bot",
-            "low_edge_control_bot",
-        ]
+        default_factory=lambda: ["tt_conservative"]
+    )
+    spread_paper_research_manifest_path: str = (
+        "config/research/spread_v2_signed_reversion.json"
     )
     spread_paper_markout_secs: list[int] = field(
         default_factory=lambda: [60, 300, 900, 1800]
     )
     spread_paper_terminal_secs: int = 1800
     spread_paper_slippage_buffer_bps: float = 0.0
-    spread_paper_default_funding_interval_ms: int = 28_800_000
-    spread_paper_last_good_quote_max_age_ms: int = 60_000
-    spread_paper_quote_repair_enabled: bool = True
-    spread_paper_quote_repair_timeout_s: float = 3.0
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     exit_shadow_enabled: bool = False
@@ -226,9 +294,6 @@ class StrategyConfig:
     exit_shadow_cost_buffer_bps: float = 3.0
     execution_buffer_bps: float = 2.0
     capital_buffer_bps: float = 1.0
-    transfer_healthy_bias_bps: float = 0.25
-    transfer_unknown_bias_bps: float = 0.0
-    transfer_degraded_bias_bps: float = -0.5
     profit_take_quote: float = 30.0
     net_stop_loss_quote: float = 20.0
     mark_price_delta_hard_stop_quote: float = 20.0
@@ -258,6 +323,7 @@ class StrategyConfig:
     entry_local_l2_primary_count: int = 6  # V1 default (V2 was 8 — misaligned)
     shadow_entry_opportunity_count: int = 2  # V1 default
     maker_entry_max_reposts: int = 2
+    maker_entry_reconcile_backoff_ms: int = 1000
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False
     delever_vwap_required: bool = False
@@ -287,6 +353,7 @@ class StrategyConfig:
     maker_inventory_bias_max_bps: float = 25.0
     maker_phase_max_zero_fill_cycles: int = 3
     maker_cycle_retry_delays_ms: list[int] = field(default_factory=lambda: [500, 1000, 1000])
+    maker_hedge_soft_deadline_ms: int = 800
     maker_hedge_deadline_ms: int = 800
     maker_min_notional_accumulation_attempts: int = 3
     pending_entry_max_lifetime_ms: int = 30000

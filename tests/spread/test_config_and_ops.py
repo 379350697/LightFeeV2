@@ -29,29 +29,20 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_single_venue_dislocation_min_anchor_venues == 3
     assert strategy.spread_paper_enabled is False
     assert strategy.spread_paper_finalist_limit == 10
-    assert strategy.spread_paper_excluded_symbols == ["BBUSDT", "QNTUSDT"]
+    assert strategy.spread_paper_excluded_symbols == []
     assert strategy.spread_paper_allowed_opportunity_labels == ["spread_reversion"]
     assert strategy.spread_paper_episode_cooldown_ms == 1_800_000
-    assert strategy.spread_paper_bot_ids == [
-        "tt_conservative",
-        "mt_long_maker",
-        "mt_short_maker",
-        "mt_selected_maker",
-        "mt_selected_maker_delay_1000ms",
-        "core_v1_bot",
-        "core_v1_exec100_bot",
-        "core_v1_z10_bot",
-        "bad_pair_control_bot",
-        "low_liquidity_control_bot",
-        "low_edge_control_bot",
-    ]
+    assert strategy.spread_live_enabled is False
+    assert strategy.spread_model_epoch == "v2_signed_reversion"
+    assert strategy.spread_stats_window_ms == 21_600_000
+    assert strategy.spread_stats_max_samples == 7_200
+    assert strategy.spread_paper_bot_ids == ["tt_conservative"]
+    assert strategy.spread_paper_research_manifest_path == "config/research/spread_v2_signed_reversion.json"
+    assert strategy.spread_paper_primary_fill_model == "taker_taker"
+    assert strategy.spread_paper_require_taker_taker is True
     assert strategy.spread_paper_markout_secs == [60, 300, 900, 1800]
     assert strategy.spread_paper_terminal_secs == 1800
     assert strategy.spread_paper_slippage_buffer_bps == 0.0
-    assert strategy.spread_paper_default_funding_interval_ms == 28_800_000
-    assert strategy.spread_paper_last_good_quote_max_age_ms == 60_000
-    assert strategy.spread_paper_quote_repair_enabled is True
-    assert strategy.spread_paper_quote_repair_timeout_s == 3.0
     assert PersistenceConfig().spread_paper_event_log_path == "runtime/spread-paper-events.jsonl"
 
 
@@ -70,6 +61,9 @@ spread_sidecar_direct_fetch_enabled = true
 
 [strategy]
 spread_reversion_enabled = true
+risk_monitor_enabled = true
+spread_live_enabled = false
+spread_model_epoch = "v2_signed_reversion"
 spread_live_notional_quote = 25.0
 spread_entry_z = 2.25
 spread_min_fair_price_confidence = 0.5
@@ -85,14 +79,12 @@ spread_paper_finalist_limit = 2
 spread_paper_excluded_symbols = ["BBUSDT", "QNTUSDT", "EDGEUSDT"]
 spread_paper_allowed_opportunity_labels = ["spread_reversion", "single_venue_dislocation"]
 spread_paper_episode_cooldown_ms = 900000
-spread_paper_bot_ids = ["tt_conservative", "core_v1_bot"]
+spread_paper_bot_ids = ["tt_conservative"]
+spread_paper_primary_fill_model = "taker_taker"
+spread_paper_require_taker_taker = true
 spread_paper_markout_secs = [10, 20]
 spread_paper_terminal_secs = 20
 spread_paper_slippage_buffer_bps = 4.0
-spread_paper_default_funding_interval_ms = 14400000
-spread_paper_last_good_quote_max_age_ms = 30000
-spread_paper_quote_repair_enabled = false
-spread_paper_quote_repair_timeout_s = 1.5
 
 [persistence]
 spread_paper_event_log_path = "runtime/custom-spread-paper.jsonl"
@@ -137,14 +129,15 @@ venue = "okx"
         "single_venue_dislocation",
     ]
     assert config.strategy.spread_paper_episode_cooldown_ms == 900_000
-    assert config.strategy.spread_paper_bot_ids == ["tt_conservative", "core_v1_bot"]
+    assert config.strategy.spread_live_enabled is False
+    assert config.strategy.spread_model_epoch == "v2_signed_reversion"
+    assert config.strategy.spread_paper_bot_ids == ["tt_conservative"]
+    assert config.strategy.spread_paper_research_manifest_path == "config/research/spread_v2_signed_reversion.json"
+    assert config.strategy.spread_paper_primary_fill_model == "taker_taker"
+    assert config.strategy.spread_paper_require_taker_taker is True
     assert config.strategy.spread_paper_markout_secs == [10, 20]
     assert config.strategy.spread_paper_terminal_secs == 20
     assert config.strategy.spread_paper_slippage_buffer_bps == 4.0
-    assert config.strategy.spread_paper_default_funding_interval_ms == 14_400_000
-    assert config.strategy.spread_paper_last_good_quote_max_age_ms == 30_000
-    assert config.strategy.spread_paper_quote_repair_enabled is False
-    assert config.strategy.spread_paper_quote_repair_timeout_s == 1.5
     assert config.persistence.spread_paper_event_log_path == "runtime/custom-spread-paper.jsonl"
     assert config.venues[0].taker_fee_bps == 0.6
     assert config.venues[0].maker_fee_bps == 0.2

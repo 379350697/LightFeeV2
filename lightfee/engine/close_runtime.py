@@ -615,7 +615,7 @@ class CloseRuntime:
         )
         return True
     def _venue_private_position_confirmed(self, venue: Venue, symbol: str) -> bool:
-        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
+        if self.ctx.config.runtime.mode != "live":
             return True
         adapter = self.ctx.venue_adapters.get(venue)
         if adapter is None:
@@ -1426,7 +1426,7 @@ class CloseRuntime:
         pending_reconciliations = self.ctx.state.pending_close_reconciliations
         if not pending_reconciliations:
             return
-        if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
+        if self.ctx.config.runtime.mode != "live":
             return
 
         current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
@@ -2001,34 +2001,187 @@ class CloseRuntime:
                 set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
                 self.ctx.state.last_error = "pending_close_reconciliations_active"
 
+    async def _process_pending_funding_settlement_reconciliations(
+        self,
+        now_ms: int,
+    ) -> None:
+        """Resolve post-close funding evidence without changing risk state.
+
+        This accounting queue is intentionally distinct from V1 pending-close
+        reconciliation: it proves cash-flow attribution only and never keeps a
+        closed position in the exposure lifecycle or reopens an entry gate.
+        """
+        from lightfee.strategy.funding_settlement_reconciler import (
+            FUNDING_SETTLEMENT_RETRY_BASE_MS,
+            FUNDING_SETTLEMENT_RETRY_MAX_MS,
+            FundingSettlementReconciler,
+        )
+
+        state = self.ctx.state
+        state.set_pending_funding_settlement_reconciliations(
+            getattr(state, "pending_funding_settlement_reconciliations", [])
+        )
+        tasks = state.pending_funding_settlement_reconciliations
+        if not tasks:
+            return
+        if self.ctx.config.runtime.mode != "live":
+            return
+
+        reconciler = FundingSettlementReconciler()
+        retained: list[dict[str, Any]] = []
+        for raw_task in tasks:
+            if not isinstance(raw_task, dict):
+                retained.append({
+                    "invalid_pending_funding_settlement_reconciliation": True,
+                    "reason": "invalid_item",
+                    "raw_type": type(raw_task).__name__,
+                })
+                continue
+            task = dict(raw_task)
+            position_id = str(task.get("position_id") or "")
+            if task.get("invalid_pending_funding_settlement_reconciliation") is True:
+                if not task.get("diagnostic_emitted"):
+                    self.ctx.journal.append(
+                        "funding.settlement_reconciliation_invalid",
+                        {
+                            "position_id": position_id,
+                            "reason": str(task.get("reason") or "invalid_task"),
+                        },
+                    )
+                    task["diagnostic_emitted"] = True
+                retained.append(task)
+                continue
+
+            deadline_ms = int(task.get("deadline_ms") or 0)
+            if deadline_ms > 0 and now_ms > deadline_ms:
+                task["status"] = "expired_statement_evidence"
+                task["official_pnl"] = False
+                task["archived"] = True
+                task["archive_reason"] = "statement_evidence_deadline_elapsed"
+                if not task.get("expiry_event_emitted"):
+                    self.ctx.journal.append(
+                        "funding.settlement_reconciliation_expired",
+                        {
+                            "position_id": position_id,
+                            "symbol": str(task.get("symbol") or ""),
+                            "closed_at_ms": int(task.get("closed_at_ms") or 0),
+                            "deadline_ms": deadline_ms,
+                            "observed_settlement_count": len(
+                                task.get("funding_settlement_records") or []
+                            ),
+                        },
+                    )
+                    task["expiry_event_emitted"] = True
+                retained.append(task)
+                continue
+            if int(task.get("next_attempt_ms") or 0) > now_ms:
+                retained.append(task)
+                continue
+
+            previous_status = str(task.get("status") or "")
+            previous_reason = str(task.get("last_reason") or "")
+            try:
+                updated, result = await reconciler.reconcile_pending_task(
+                    task,
+                    self.ctx.venue_adapters,
+                    now_ms=now_ms,
+                )
+            except Exception as error:
+                attempts = int(task.get("attempt_count") or 0) + 1
+                delay = min(
+                    FUNDING_SETTLEMENT_RETRY_BASE_MS * (2 ** max(attempts - 1, 0)),
+                    FUNDING_SETTLEMENT_RETRY_MAX_MS,
+                )
+                task.update(
+                    {
+                        "attempt_count": attempts,
+                        "next_attempt_ms": now_ms + delay,
+                        "status": "unresolved_statement_evidence",
+                        "last_reason": f"reconciliation_error:{type(error).__name__}",
+                        "last_checked_at_ms": now_ms,
+                    }
+                )
+                self.ctx.journal.append(
+                    "funding.settlement_reconciliation_deferred",
+                    {
+                        "position_id": position_id,
+                        "reason": task["last_reason"],
+                        "attempt_count": attempts,
+                        "next_attempt_ms": task["next_attempt_ms"],
+                    },
+                )
+                retained.append(task)
+                continue
+
+            if result.official:
+                self.ctx.journal.append_critical(
+                    now_ms,
+                    "funding.settlement_reconciled",
+                    {
+                        "position_id": result.position_id,
+                        "symbol": str(updated.get("symbol") or ""),
+                        "closed_at_ms": int(updated.get("closed_at_ms") or 0),
+                        "required_settlement_count": result.required_count,
+                        "observed_settlement_count": result.observed_count,
+                        "official_funding_quote": updated.get("official_funding_quote"),
+                        "official_net_quote": updated.get("official_net_quote"),
+                        "price_pnl_quote": updated.get("price_pnl_quote"),
+                        "entry_fee_quote": updated.get("entry_fee_quote"),
+                        "exit_fee_quote": updated.get("exit_fee_quote"),
+                        "lifecycle_forecast_funding_quote": updated.get(
+                            "lifecycle_forecast_funding_quote"
+                        ),
+                        "funding_forecast_error_quote": updated.get(
+                            "funding_forecast_error_quote"
+                        ),
+                        "calculation_version": updated.get("calculation_version", ""),
+                        "model_epoch": updated.get("model_epoch", ""),
+                        "economics_observed_at_ms": updated.get(
+                            "economics_observed_at_ms", 0
+                        ),
+                    },
+                )
+                continue
+
+            updated_status = str(updated.get("status") or "")
+            updated_reason = str(updated.get("last_reason") or result.reason or "")
+            if previous_status != updated_status or previous_reason != updated_reason:
+                self.ctx.journal.append(
+                    "funding.settlement_reconciliation_deferred",
+                    {
+                        "position_id": result.position_id,
+                        "symbol": str(updated.get("symbol") or ""),
+                        "reason": updated_reason or "statement_not_observed",
+                        "attempt_count": int(updated.get("attempt_count") or 0),
+                        "next_attempt_ms": int(updated.get("next_attempt_ms") or 0),
+                        "required_settlement_count": result.required_count,
+                        "observed_settlement_count": result.observed_count,
+                    },
+                )
+            retained.append(updated)
+
+        state.set_pending_funding_settlement_reconciliations(retained)
+
     def _exit_shadow_config(self) -> ExitShadowConfig:
         strategy = self.ctx.config.strategy
         horizons = tuple(
             int(value)
-            for value in getattr(strategy, "exit_shadow_markout_horizons_ms", []) or []
+            for value in strategy.exit_shadow_markout_horizons_ms
             if int(value) > 0
         )
         take_profit_bps = tuple(
             float(value)
-            for value in getattr(strategy, "exit_shadow_take_profit_bps", []) or []
+            for value in strategy.exit_shadow_take_profit_bps
             if float(value) > 0.0
         )
         return ExitShadowConfig(
-            enabled=bool(getattr(strategy, "exit_shadow_enabled", False)),
+            enabled=bool(strategy.exit_shadow_enabled),
             markout_horizons_ms=horizons or (1000, 2000, 5000),
             take_profit_bps=take_profit_bps or (10.0, 20.0),
-            adverse_stop_bps=float(
-                getattr(strategy, "exit_shadow_adverse_stop_bps", 3.0) or 3.0
-            ),
-            max_quote_age_ms=int(
-                getattr(strategy, "exit_shadow_max_quote_age_ms", 1000) or 1000
-            ),
-            max_l2_age_ms=int(
-                getattr(strategy, "exit_shadow_max_l2_age_ms", 1000) or 1000
-            ),
-            cost_buffer_bps=float(
-                getattr(strategy, "exit_shadow_cost_buffer_bps", 3.0) or 3.0
-            ),
+            adverse_stop_bps=float(strategy.exit_shadow_adverse_stop_bps),
+            max_quote_age_ms=int(strategy.exit_shadow_max_quote_age_ms),
+            max_l2_age_ms=int(strategy.exit_shadow_max_l2_age_ms),
+            cost_buffer_bps=float(strategy.exit_shadow_cost_buffer_bps),
         )
 
     def _exit_shadow_tracker_for_config(
@@ -2177,9 +2330,7 @@ class CloseRuntime:
             if position.position_id in self.ctx.state.pending_passive_closes:
                 continue
 
-            staggered_exit_mode = str(
-                getattr(self.ctx.config.strategy, "staggered_exit_mode", "") or ""
-            ).lower()
+            staggered_exit_mode = self.ctx.config.strategy.staggered_exit_mode.lower()
             if (
                 position.opportunity_type == "staggered"
                 and staggered_exit_mode == "after_first_stage"
@@ -2201,9 +2352,7 @@ class CloseRuntime:
 
             funding_captured_before = position.funding_captured
             second_stage_before = position.second_stage_funding_captured
-            post_funding_hold_ms = int(
-                getattr(self.ctx.config.strategy, "post_funding_hold_secs", 0) or 0
-            ) * 1000
+            post_funding_hold_ms = self.ctx.config.strategy.post_funding_hold_secs * 1000
             update_position_funding_capture_state(
                 position,
                 now_ms,
@@ -2213,6 +2362,9 @@ class CloseRuntime:
                 position.funding_captured != funding_captured_before
                 or position.second_stage_funding_captured != second_stage_before
             ):
+                from lightfee.strategy.attribution import StrategyAttributionService
+
+                funding_attribution = StrategyAttributionService.refresh(position)
                 self.ctx.journal.append(
                     "runtime.funding_capture_state_updated",
                     {
@@ -2228,6 +2380,12 @@ class CloseRuntime:
                         "second_stage_funding_captured_after": (
                             position.second_stage_funding_captured
                         ),
+                        "lifecycle_forecast_funding_quote": (
+                            funding_attribution.lifecycle_forecast_quote
+                        ),
+                        "settled_funding_quote": funding_attribution.settled_funding_quote,
+                        "funding_settlement_evidence_status": funding_attribution.evidence_status,
+                        "official_funding": funding_attribution.official,
                         "exit_after_first_stage": position.exit_after_first_stage,
                         "ts_ms": now_ms,
                     },
