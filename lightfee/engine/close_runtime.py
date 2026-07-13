@@ -666,7 +666,28 @@ class CloseRuntime:
             qty += leg_qty
             notional += leg_qty * price
             fee_quote += fee
-            leg_payloads.append({
+            metadata = getattr(fill, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+            trade_id = str(
+                getattr(fill, "trade_id", "")
+                or metadata.get("trade_id")
+                or metadata.get("tradeId")
+                or ""
+            )
+            exec_id = str(
+                getattr(fill, "exec_id", "")
+                or metadata.get("exec_id")
+                or metadata.get("execId")
+                or ""
+            )
+            fill_event_anchor_id = str(
+                getattr(fill, "fill_event_anchor_id", "")
+                or metadata.get("fill_event_anchor_id")
+                or metadata.get("fillEventAnchorId")
+                or ""
+            )
+            leg_payload = {
                 "venue": getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", "")),
                 "order_id": getattr(fill, "order_id", "") or "",
                 "client_order_id": getattr(fill, "client_order_id", None) or "",
@@ -674,7 +695,14 @@ class CloseRuntime:
                 "average_price": price,
                 "fee_quote": fee,
                 "filled_at_ms": int(getattr(fill, "filled_at_ms", 0) or 0),
-            })
+            }
+            if trade_id:
+                leg_payload["trade_id"] = trade_id
+            if exec_id:
+                leg_payload["exec_id"] = exec_id
+            if fill_event_anchor_id:
+                leg_payload["fill_event_anchor_id"] = fill_event_anchor_id
+            leg_payloads.append(leg_payload)
         average_price = notional / qty if qty > 1e-12 else 0.0
         first = fills[0] if fills else None
         return {
@@ -1282,26 +1310,34 @@ class CloseRuntime:
                     filled_at_ms = int(leg_payload.get("filled_at_ms") or 0)
                 except (TypeError, ValueError):
                     filled_at_ms = 0
-                fill_event_anchor_id = CloseRuntime._deterministic_fill_event_anchor_id(
-                    position_id=position_id,
-                    leg=leg,
-                    venue=str(leg_payload.get("venue") or "").lower(),
-                    order_id=str(leg_payload.get("order_id") or ""),
-                    client_order_id=str(leg_payload.get("client_order_id") or ""),
-                    trade_id=str(leg_payload.get("trade_id") or ""),
-                    exec_id=str(leg_payload.get("exec_id") or ""),
+                venue = str(leg_payload.get("venue") or "").lower()
+                order_id = str(leg_payload.get("order_id") or "")
+                client_order_id = str(leg_payload.get("client_order_id") or "")
+                trade_id = str(leg_payload.get("trade_id") or "")
+                exec_id = str(leg_payload.get("exec_id") or "")
+                fill_event_anchor_id = str(
+                    leg_payload.get("fill_event_anchor_id")
+                    or CloseRuntime._deterministic_fill_event_anchor_id(
+                        position_id=position_id,
+                        leg=leg,
+                        venue=venue,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        trade_id=trade_id,
+                        exec_id=exec_id,
+                    )
                 )
                 events.append({
                     "fill_event_anchor_id": fill_event_anchor_id,
                     "position_id": position_id,
                     "leg": leg,
-                    "venue": str(leg_payload.get("venue") or "").lower(),
+                    "venue": venue,
                     "symbol": symbol,
                     "side": side.value,
-                    "order_id": str(leg_payload.get("order_id") or ""),
-                    "client_order_id": str(leg_payload.get("client_order_id") or ""),
-                    "trade_id": str(leg_payload.get("trade_id") or ""),
-                    "exec_id": str(leg_payload.get("exec_id") or ""),
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "trade_id": trade_id,
+                    "exec_id": exec_id,
                     "quantity": quantity,
                     "cumulative_quantity": quantity,
                     "price": price,

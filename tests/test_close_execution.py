@@ -371,6 +371,54 @@ def test_close_reconciliation_order_filled_events_anchor_each_confirmed_leg():
     ]
 
 
+def test_close_reconciliation_aggregate_preserves_metadata_identity_fields():
+    fill = OrderFillReconciliation(
+        venue=Venue.BITGET,
+        symbol="EPICUSDT",
+        side=Side.BUY,
+        quantity=2.0,
+        average_price=1.03,
+        order_id="close-short",
+        client_order_id="close-short-cid",
+        fee_quote=0.02,
+        filled_at_ms=1781531700100,
+        metadata={
+            "trade_id": "trade-123",
+            "exec_id": "exec-456",
+            "fill_event_anchor_id": "anchor-789",
+        },
+    )
+
+    aggregate = CloseRuntime._aggregate_close_reconciliation_fills([fill])
+
+    assert aggregate["legs"] == [
+        {
+            "venue": Venue.BITGET.value,
+            "order_id": "close-short",
+            "client_order_id": "close-short-cid",
+            "trade_id": "trade-123",
+            "exec_id": "exec-456",
+            "fill_event_anchor_id": "anchor-789",
+            "quantity": 2.0,
+            "average_price": 1.03,
+            "fee_quote": 0.02,
+            "filled_at_ms": 1781531700100,
+        }
+    ]
+    events = CloseRuntime._order_filled_events_from_close_reconciliation_payload(
+        {
+            "position_id": "entry-epic",
+            "symbol": "EPICUSDT",
+            "long_legs": [],
+            "short_legs": aggregate["legs"],
+        },
+        source="pending_close_reconciliation",
+    )
+    assert events[0]["trade_id"] == "trade-123"
+    assert events[0]["exec_id"] == "exec-456"
+    assert events[0]["fill_event_anchor_id"] == "anchor-789"
+
+
 def test_close_reconciliation_order_filled_events_are_idempotent(tmp_path):
     journal = Journal(tmp_path / "journal.jsonl")
     journal.open()

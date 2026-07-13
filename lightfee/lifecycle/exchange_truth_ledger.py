@@ -1553,6 +1553,7 @@ def _source_coverage_gaps(
 def _dedupe_fills(fills: list[_FillFact]) -> list[_FillFact]:
     out: list[_FillFact] = []
     seen: set[tuple[str, ...]] = set()
+    aggregate_close_fills = [fill for fill in fills if _is_aggregate_close_fill(fill)]
     open_order_identities = {
         identity
         for fill in fills
@@ -1572,6 +1573,12 @@ def _dedupe_fills(fills: list[_FillFact]) -> list[_FillFact]:
             fill.phase == "close"
             and _fill_order_identity_key(fill) in open_order_identities
             and not _fill_has_strong_close_evidence(fill)
+        ):
+            continue
+        if (
+            fill.phase == "close"
+            and not _is_aggregate_close_fill(fill)
+            and any(_close_fills_alias_match(aggregate, fill) for aggregate in aggregate_close_fills)
         ):
             continue
         key = _fill_dedupe_key(fill)
@@ -1618,6 +1625,61 @@ def _fill_order_identity_key(fill: _FillFact) -> tuple[str, str, str] | None:
     if fill.client_order_id:
         return (fill.venue.lower(), "client_order_id", fill.client_order_id)
     return None
+
+
+def _is_aggregate_close_fill(fill: _FillFact) -> bool:
+    if fill.phase != "close":
+        return False
+    return fill.source in {
+        "exit.reconciled",
+        "accounting.close_statement_backfill_corrected",
+        "accounting.lifecycle_truth_rebuilt",
+    }
+
+
+def _close_fill_alias_scope(fill: _FillFact) -> tuple[str, str, str, str, str]:
+    return (
+        fill.phase,
+        fill.leg,
+        fill.venue.lower(),
+        _decimal_str(fill.qty),
+        _decimal_str(fill.price),
+    )
+
+
+def _close_fill_strong_aliases(fill: _FillFact) -> set[tuple[str, str]]:
+    aliases: set[tuple[str, str]] = set()
+    for identity_type, identity in (
+        ("trade_id", fill.trade_id),
+        ("exec_id", fill.exec_id),
+        ("fill_event_anchor_id", fill.fill_event_anchor_id),
+    ):
+        if identity:
+            aliases.add((identity_type, identity))
+    return aliases
+
+
+def _close_fill_order_aliases(fill: _FillFact) -> set[tuple[str, str]]:
+    aliases: set[tuple[str, str]] = set()
+    for identity_type, identity in (
+        ("order_id", fill.order_id),
+        ("client_order_id", fill.client_order_id),
+    ):
+        if identity:
+            aliases.add((identity_type, identity))
+    return aliases
+
+
+def _close_fills_alias_match(aggregate: _FillFact, fill: _FillFact) -> bool:
+    if aggregate.phase != "close" or fill.phase != "close":
+        return False
+    if _close_fill_alias_scope(aggregate) != _close_fill_alias_scope(fill):
+        return False
+    aggregate_strong = _close_fill_strong_aliases(aggregate)
+    fill_strong = _close_fill_strong_aliases(fill)
+    if aggregate_strong and fill_strong:
+        return bool(aggregate_strong.intersection(fill_strong))
+    return bool(_close_fill_order_aliases(aggregate).intersection(_close_fill_order_aliases(fill)))
 
 
 def _fill_has_strong_close_evidence(fill: _FillFact) -> bool:
