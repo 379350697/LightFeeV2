@@ -262,6 +262,22 @@ def test_close_registration_survives_snapshot_before_position_is_removed() -> No
     assert restored.pending_funding_settlement_reconciliations == [task]
 
 
+def test_funding_settlement_accounting_tasks_are_never_evicted_by_queue_capacity() -> None:
+    state = EngineState()
+    for index in range(300):
+        state.enqueue_pending_funding_settlement_reconciliation(
+            {"position_id": f"position-{index}", "closed_at_ms": index + 1}
+        )
+
+    snapshot = build_persistent_state_view(state)
+    restored = _restore_state_from_snapshot_dict(snapshot)
+
+    assert len(state.pending_funding_settlement_reconciliations) == 300
+    assert [
+        task["position_id"] for task in restored.pending_funding_settlement_reconciliations
+    ] == [f"position-{index}" for index in range(300)]
+
+
 def test_aggressive_close_registers_funding_statement_task_before_removing_position() -> None:
     state = EngineState()
     position = _position(
@@ -367,6 +383,51 @@ class _FailNthCriticalJournal(_RuntimeJournal):
         if self.critical_calls == self.fail_on_call:
             raise OSError("injected later critical journal failure")
         super().append_critical(now_ms, kind, payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+async def test_worker_failure_preserves_retry_when_deferred_telemetry_fails(
+    monkeypatch,
+    path: str,
+) -> None:
+    async def fail_reconciliation(*_args, **_kwargs):
+        raise RuntimeError("injected reconciliation failure")
+
+    monkeypatch.setattr(
+        FundingSettlementReconciler,
+        "reconcile_pending_tasks",
+        fail_reconciliation,
+    )
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [{"position_id": "retry", "symbol": "BTCUSDT", "closed_at_ms": 1}]
+    )
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=_FailNthCriticalJournal(99, fail_deferred_diagnostic=True),
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    [retained] = state.pending_funding_settlement_reconciliations
+    assert retained["attempt_count"] == 1
+    assert retained["status"] == "unresolved_statement_evidence"
+    assert retained["last_reason"] == "reconciliation_error:RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -830,6 +891,60 @@ async def test_nonblocking_runtime_reconciliation_preserves_task_enqueued_while_
 
 
 @pytest.mark.asyncio
+async def test_nonblocking_runtime_merges_inflight_result_before_deadline_expiry() -> None:
+    state = EngineState()
+    task = FundingSettlementReconciler.new_pending_task(
+        _position(),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert task is not None
+    task["deadline_ms"] = 3_001
+    state.enqueue_pending_funding_settlement_reconciliation(task)
+    binance = _BlockingStatementsAdapter([_statement(Venue.BINANCE, -0.1)])
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={
+                Venue.BINANCE: binance,
+                Venue.OKX: _StatementsAdapter([_statement(Venue.OKX, 0.5)]),
+            },
+            journal=journal,
+        )
+    )
+
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+    await asyncio.wait_for(binance.started.wait(), timeout=0.1)
+
+    # The request began before the deadline.  While it is in flight, expiry
+    # cannot remove its state and thereby discard a later official response.
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_002)
+    assert len(state.pending_funding_settlement_reconciliations) == 1
+    assert not any(
+        kind == "funding.settlement_reconciliations_finalized"
+        for kind, _ in journal.records
+    )
+
+    binance.release.set()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_002)
+
+    assert state.pending_funding_settlement_reconciliations == []
+    assert [kind for kind, _ in journal.records].count(
+        "funding.settlement_reconciled"
+    ) == 1
+    assert not any(
+        kind == "funding.settlement_reconciliations_finalized"
+        for kind, _ in journal.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_nonblocking_runtime_marks_enqueue_during_io_with_same_claim_ambiguous() -> None:
     state = EngineState()
     first = FundingSettlementReconciler.new_pending_task(
@@ -917,7 +1032,452 @@ async def test_nonblocking_runtime_timeout_releases_singleflight_for_retry() -> 
 
 
 @pytest.mark.asyncio
-async def test_runtime_expiry_keeps_unofficial_accounting_evidence_visible() -> None:
+async def test_nonblocking_runtime_batches_accounting_io_without_evicting_due_tasks() -> None:
+    state = EngineState()
+    for index in range(257):
+        state.enqueue_pending_funding_settlement_reconciliation(
+            {"position_id": f"position-{index}", "closed_at_ms": index + 1}
+        )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+    release = asyncio.Event()
+
+    async def block_worker(_work: dict[str, object]) -> list[tuple[dict, object]]:
+        await release.wait()
+        return []
+
+    runtime._run_pending_funding_settlement_reconciliation_work = block_worker
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+
+    assert runtime._funding_settlement_reconciliation_work is not None
+    assert [
+        task["position_id"]
+        for task in runtime._funding_settlement_reconciliation_work["due_tasks"]
+    ] == [f"position-{index}" for index in range(256)]
+    assert [
+        task["position_id"] for task in state.pending_funding_settlement_reconciliations
+    ] == [f"position-{index}" for index in range(257)]
+
+    await runtime.shutdown_pending_funding_settlement_reconciliation_worker()
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_runtime_does_not_let_invalid_evidence_block_valid_io() -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(["invalid"] * 256)
+    state.enqueue_pending_funding_settlement_reconciliation(
+        {"position_id": "valid", "closed_at_ms": 1}
+    )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+    release = asyncio.Event()
+
+    async def block_worker(_work: dict[str, object]) -> list[tuple[dict, object]]:
+        await release.wait()
+        return []
+
+    runtime._run_pending_funding_settlement_reconciliation_work = block_worker
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+
+    assert runtime._funding_settlement_reconciliation_work is not None
+    assert [
+        task["position_id"]
+        for task in runtime._funding_settlement_reconciliation_work["due_tasks"]
+    ] == ["valid"]
+    assert state.pending_funding_settlement_reconciliations == [
+        {"position_id": "valid", "closed_at_ms": 1}
+    ]
+    terminal = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    assert len(terminal["tasks"]) == 256
+    assert {
+        row["status"] for row in terminal["tasks"]
+    } == {"invalid_task"}
+
+    await runtime.shutdown_pending_funding_settlement_reconciliation_worker()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["invalid_task", "conflict"])
+async def test_nonblocking_runtime_does_not_let_terminal_diagnostics_starve_valid_io(
+    status: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "position_id": f"invalid-{index}",
+                "closed_at_ms": index + 1,
+                "status": status,
+            }
+            for index in range(256)
+        ]
+    )
+    state.enqueue_pending_funding_settlement_reconciliation(
+        {"position_id": "valid", "closed_at_ms": 257}
+    )
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=_RuntimeJournal(),
+        )
+    )
+    release = asyncio.Event()
+
+    async def block_worker(_work: dict[str, object]) -> list[tuple[dict, object]]:
+        await release.wait()
+        return []
+
+    runtime._run_pending_funding_settlement_reconciliation_work = block_worker
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+
+    assert runtime._funding_settlement_reconciliation_work is not None
+    assert [
+        task["position_id"]
+        for task in runtime._funding_settlement_reconciliation_work["due_tasks"]
+    ] == ["valid"]
+    if status == "invalid_task":
+        assert state.pending_funding_settlement_reconciliations == [
+            {"position_id": "valid", "closed_at_ms": 257}
+        ]
+    else:
+        assert len(state.pending_funding_settlement_reconciliations) == 257
+
+    await runtime.shutdown_pending_funding_settlement_reconciliation_worker()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["invalid_task", "conflict"])
+async def test_synchronous_runtime_skips_terminal_diagnostics_before_valid_io(
+    status: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "position_id": f"invalid-{index}",
+                "closed_at_ms": index + 1,
+                "status": status,
+            }
+            for index in range(256)
+        ]
+    )
+    valid = FundingSettlementReconciler.new_pending_task(
+        _position(position_id="valid"),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert valid is not None
+    state.enqueue_pending_funding_settlement_reconciliation(valid)
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={
+                Venue.BINANCE: _StatementsAdapter([_statement(Venue.BINANCE, -0.1)]),
+                Venue.OKX: _StatementsAdapter([_statement(Venue.OKX, 0.5)]),
+            },
+            journal=journal,
+        )
+    )
+
+    await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+
+    if status == "invalid_task":
+        assert state.pending_funding_settlement_reconciliations == []
+        terminal = next(
+            payload
+            for kind, payload in journal.records
+            if kind == "funding.settlement_reconciliations_finalized"
+        )
+        assert len(terminal["tasks"]) == 256
+    else:
+        assert len(state.pending_funding_settlement_reconciliations) == 256
+        assert all(
+            task["status"] == status
+            for task in state.pending_funding_settlement_reconciliations
+        )
+    assert any(kind == "funding.settlement_reconciled" for kind, _ in journal.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+@pytest.mark.parametrize("status", ["invalid_task", "conflict"])
+async def test_terminal_diagnostics_are_finalized_equivalently_in_both_runtime_paths(
+    path: str,
+    status: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "position_id": "invalid",
+                "closed_at_ms": 1,
+                "deadline_ms": 2_500,
+                "status": status,
+            }
+        ]
+    )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    assert state.pending_funding_settlement_reconciliations == []
+    terminal = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    [row] = terminal["tasks"]
+    assert row["position_id"] == "invalid"
+    assert row["closed_at_ms"] == 1
+    assert row["deadline_ms"] == 2_500
+    if status == "invalid_task":
+        assert row["status"] == "invalid_task"
+        assert row["event_kind"] == "funding.settlement_reconciliation_invalid"
+        assert any(
+            kind == "funding.settlement_reconciliation_invalid"
+            for kind, _ in journal.records
+        )
+    else:
+        assert row["status"] == "expired_statement_evidence"
+        assert row["reason"] == "statement_evidence_deadline_elapsed"
+        assert row["event_kind"] == "funding.settlement_reconciliation_expired"
+        assert any(
+            kind == "funding.settlement_reconciliation_expired"
+            for kind, _ in journal.records
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+async def test_invalid_worker_result_is_finalized_in_both_runtime_paths(
+    path: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "position_id": "invalid-after-worker",
+                "symbol": "BTCUSDT",
+                "closed_at_ms": 1,
+                "required_settlements": [],
+            }
+        ]
+    )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    assert state.pending_funding_settlement_reconciliations == []
+    terminal = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    assert terminal["tasks"][0]["status"] == "invalid_task"
+
+
+def test_single_normalized_malformed_task_remains_one_diagnostic_row() -> None:
+    malformed = {
+        "invalid_pending_funding_settlement_reconciliation": True,
+        "reason": "invalid_item",
+        "raw_type": "str",
+        "raw_repr": "'invalid'",
+    }
+    state = EngineState()
+
+    state.set_pending_funding_settlement_reconciliations(malformed)
+
+    assert state.pending_funding_settlement_reconciliations == [malformed]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+async def test_malformed_expired_row_has_one_terminal_semantic_in_both_paths(
+    path: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "invalid_pending_funding_settlement_reconciliation": True,
+                "reason": "invalid_item",
+                "deadline_ms": 2_500,
+                "closed_at_ms": "not-a-timestamp",
+            }
+        ]
+    )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    assert state.pending_funding_settlement_reconciliations == []
+    terminal = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    assert terminal["tasks"][0]["status"] == "invalid_task"
+    assert terminal["tasks"][0]["closed_at_ms"] == 0
+    assert terminal["tasks"][0]["event_kind"] == (
+        "funding.settlement_reconciliation_invalid"
+    )
+    assert not any(
+        kind == "funding.settlement_reconciliation_expired"
+        for kind, _ in journal.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+async def test_terminal_receipt_failure_keeps_task_non_schedulable_until_retry(
+    path: str,
+) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(["invalid"])
+    journal = _FailOnceCriticalJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    [retained] = state.pending_funding_settlement_reconciliations
+    assert retained["terminal_receipt_pending"] is True
+    assert runtime._funding_settlement_reconciliation_work is None
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_001)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_001
+        )
+
+    assert state.pending_funding_settlement_reconciliations == []
+    assert [kind for kind, _ in journal.records] == [
+        "funding.settlement_reconciliations_finalized",
+        "funding.settlement_reconciliation_invalid",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["synchronous", "nonblocking"])
+async def test_expiry_never_revokes_persisted_official_accounting(path: str) -> None:
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations(
+        [
+            {
+                "position_id": "official",
+                "closed_at_ms": 1,
+                "deadline_ms": 2_500,
+                "status": "complete",
+                "official_pnl": True,
+            }
+        ]
+    )
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    if path == "synchronous":
+        await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    else:
+        await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(
+            3_000
+        )
+
+    [retained] = state.pending_funding_settlement_reconciliations
+    assert retained["status"] == "complete"
+    assert retained["official_pnl"] is True
+    assert retained.get("archived") is not True
+    assert journal.records == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_expiry_writes_a_receipt_before_retiring_unofficial_evidence() -> None:
     state = EngineState()
     task = FundingSettlementReconciler.new_pending_task(
         _position(),
@@ -941,11 +1501,189 @@ async def test_runtime_expiry_keeps_unofficial_accounting_evidence_visible() -> 
 
     await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
 
-    assert len(state.pending_funding_settlement_reconciliations) == 1
-    retained = state.pending_funding_settlement_reconciliations[0]
-    assert retained["status"] == "expired_statement_evidence"
-    assert retained["official_pnl"] is False
-    assert "official_net_quote" not in retained
-    assert [kind for kind, _ in journal.records] == [
-        "funding.settlement_reconciliation_expired"
-    ]
+    assert state.pending_funding_settlement_reconciliations == []
+    terminal = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    [row] = terminal["tasks"]
+    assert row["status"] == "expired_statement_evidence"
+    assert row["position_id"] == "position-1"
+    assert row["observed_settlement_count"] == 0
+    assert "official_net_quote" not in row
+
+
+@pytest.mark.asyncio
+async def test_recovery_replays_terminal_receipt_before_a_stale_snapshot_can_retry(
+    tmp_path,
+) -> None:
+    task = FundingSettlementReconciler.new_pending_task(
+        _position(),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert task is not None
+    task["deadline_ms"] = 2_500
+
+    stale_state = EngineState()
+    stale_state.enqueue_pending_funding_settlement_reconciliation(task)
+    snapshot = SnapshotStore(tmp_path / "state.json")
+    snapshot.write(build_persistent_state_view(stale_state))
+
+    terminal_state = EngineState()
+    terminal_state.enqueue_pending_funding_settlement_reconciliation(dict(task))
+    receipt_journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=terminal_state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=receipt_journal,
+        )
+    )
+    await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    receipt = next(
+        payload
+        for kind, payload in receipt_journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+
+    journal = Journal(tmp_path / "journal.jsonl")
+    journal.open()
+    try:
+        journal.append_critical(
+            3_000,
+            "funding.settlement_reconciliations_finalized",
+            receipt,
+        )
+    finally:
+        journal.close()
+
+    restored = recover_from_snapshot(snapshot, Journal(tmp_path / "journal.jsonl"))
+    assert restored.pending_funding_settlement_reconciliations == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_consumes_malformed_terminal_receipt_from_stale_snapshot(
+    tmp_path,
+) -> None:
+    stale_state = EngineState()
+    stale_state.set_pending_funding_settlement_reconciliations(["invalid"])
+    snapshot = SnapshotStore(tmp_path / "state.json")
+    snapshot.write(build_persistent_state_view(stale_state))
+
+    terminal_state = EngineState()
+    terminal_state.set_pending_funding_settlement_reconciliations(["invalid"])
+    receipt_journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=terminal_state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=receipt_journal,
+        )
+    )
+    await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+    receipt = next(
+        payload
+        for kind, payload in receipt_journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+
+    journal = Journal(tmp_path / "journal.jsonl")
+    journal.open()
+    try:
+        journal.append_critical(
+            3_000,
+            "funding.settlement_reconciliations_finalized",
+            receipt,
+        )
+    finally:
+        journal.close()
+
+    restored = recover_from_snapshot(snapshot, Journal(tmp_path / "journal.jsonl"))
+    assert restored.pending_funding_settlement_reconciliations == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_receipt_cannot_consume_valid_task_with_same_natural_identity() -> None:
+    malformed = {
+        "invalid_pending_funding_settlement_reconciliation": True,
+        "reason": "invalid_item",
+        "position_id": "shared",
+        "closed_at_ms": 2_000,
+    }
+    valid = FundingSettlementReconciler.new_pending_task(
+        _position(position_id="shared"),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert valid is not None
+
+    state = EngineState()
+    state.set_pending_funding_settlement_reconciliations([malformed, valid])
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    runtime._retire_terminal_pending_funding_settlement_tasks(now_ms=3_000)
+
+    assert state.pending_funding_settlement_reconciliations == [valid]
+    receipt = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    [row] = receipt["tasks"]
+    assert row["task_key"].startswith("diagnostic:")
+
+    stale_state = EngineState()
+    stale_state.set_pending_funding_settlement_reconciliations([malformed, valid])
+    stale_state.replay_funding_settlement_terminal_receipt(receipt)
+    assert stale_state.pending_funding_settlement_reconciliations == [valid]
+
+
+@pytest.mark.asyncio
+async def test_invalid_worker_receipt_consumes_pre_worker_stale_snapshot() -> None:
+    pre_worker_task = {
+        "position_id": "invalid-after-worker",
+        "symbol": "BTCUSDT",
+        "closed_at_ms": 1,
+        "required_settlements": [],
+    }
+    terminal_state = EngineState()
+    terminal_state.set_pending_funding_settlement_reconciliations([pre_worker_task])
+    journal = _RuntimeJournal()
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=terminal_state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={},
+            journal=journal,
+        )
+    )
+
+    await runtime._process_pending_funding_settlement_reconciliations(now_ms=3_000)
+
+    receipt = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciliations_finalized"
+    )
+    assert receipt["tasks"][0]["task_key"] == "position:invalid-after-worker:1"
+
+    stale_state = EngineState()
+    stale_state.set_pending_funding_settlement_reconciliations([pre_worker_task])
+    stale_state.replay_funding_settlement_terminal_receipt(receipt)
+    assert stale_state.pending_funding_settlement_reconciliations == []

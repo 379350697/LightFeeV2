@@ -56,6 +56,31 @@ def test_report_counts_only_statement_proven_net_pnl_as_official() -> None:
     assert report.by_symbol["BTCUSDT"].official_position_count == 1
 
 
+def test_report_recognizes_expiry_from_critical_terminal_receipt() -> None:
+    """A crash after critical append may lose the best-effort legacy event."""
+    report = analyze_funding_attribution_events(
+        [
+            _record("exit.closed", _terminal()),
+            _record(
+                "funding.settlement_reconciliations_finalized",
+                {
+                    "schema_version": 1,
+                    "tasks": [
+                        {
+                            "position_id": "p-1",
+                            "status": "expired_statement_evidence",
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+
+    assert report.position_count == 1
+    assert report.expired_statement_count == 1
+    assert report.awaiting_statement_count == 0
+
+
 def test_report_deduplicates_terminal_events_and_detects_epoch_mismatch() -> None:
     stale_terminal = _terminal()
     latest_terminal = _terminal()

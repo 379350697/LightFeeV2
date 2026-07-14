@@ -715,6 +715,43 @@ class TestBinanceAsterPostSigning:
         assert position_reads == 2
 
     @pytest.mark.asyncio
+    async def test_aster_v3_entry_leverage_inspection_is_get_only_and_conservative(self):
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+        client = AsterV3Client(credential=LiveCredential(api_secret=private_key))
+        calls: list[tuple[str, str]] = []
+
+        async def fake_request(method, path, *, params=None, **kwargs):
+            calls.append((method, path))
+            if path == "/fapi/v3/positionRisk":
+                return [{"symbol": "ASTERUSDT", "leverage": "20"}]
+            if path == "/fapi/v3/leverageBracket":
+                return [{
+                    "symbol": "ASTERUSDT",
+                    "brackets": [{
+                        "notionalFloor": 0,
+                        "notionalCap": 20_000,
+                        "initialLeverage": 5,
+                    }],
+                }]
+            raise AssertionError(f"unexpected request {method} {path}")
+
+        client._request = fake_request
+        try:
+            evidence = await client.inspect_entry_leverage(
+                "ASTERUSDT", 20, notional_quote=50.0
+            )
+        finally:
+            await client.close()
+
+        assert evidence is not None
+        assert evidence.evidence_complete is True
+        assert evidence.effective_leverage == 5
+        assert calls == [
+            ("GET", "/fapi/v3/positionRisk"),
+            ("GET", "/fapi/v3/leverageBracket"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_aster_v3_account_risk_uses_account_with_join_margin(self):
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 

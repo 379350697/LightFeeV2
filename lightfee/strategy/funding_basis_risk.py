@@ -234,8 +234,10 @@ class FundingBasisExpectedShortfallModel:
             elapsed = later.observed_at_ms - prior.observed_at_ms
             if elapsed < self.horizon_ms or elapsed > max_gap_ms:
                 # A sparse outage cannot manufacture a regular return.  Skip
-                # this anchor and seek a later independently observable pair.
-                prior_index = later_index + 1
+                # this pre-gap anchor, but retain the first post-gap
+                # observation as the next anchor. No return crosses the
+                # outage, while a later regular post-gap pair remains usable.
+                prior_index = later_index
                 continue
             basis_change_bps = later.signed_basis_bps - prior.signed_basis_bps
             adverse_loss_bps = -basis_change_bps if long_is_canonical_a else basis_change_bps

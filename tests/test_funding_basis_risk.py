@@ -120,6 +120,34 @@ def test_basis_expected_shortfall_counts_only_disjoint_horizon_returns() -> None
     assert estimate.model_version == "funding_basis_es_v2"
 
 
+def test_basis_expected_shortfall_restarts_pairing_after_a_sparse_gap() -> None:
+    model = FundingBasisExpectedShortfallModel(
+        window_ms=10_000,
+        max_samples=128,
+        max_pairs=8,
+        horizon_ms=100,
+        min_samples=1,
+        min_history_ms=500,
+        confidence=0.8,
+        quote_skew_ms=10,
+    )
+    # The 1_000 -> 1_400 outage is invalid, but the regular 1_400 -> 1_500
+    # post-outage move is an independent observable return and must be kept.
+    for at_ms, basis_bps in ((1_000, 0.0), (1_400, 0.0), (1_500, -10.0), (1_600, -10.0)):
+        _observe(model, at_ms=at_ms, basis_bps=basis_bps)
+
+    estimate = model.estimate(
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="bybit",
+        now_ms=1_601,
+    )
+
+    assert estimate.evidence_complete is True
+    assert estimate.return_count == 1
+    assert estimate.expected_shortfall_bps == pytest.approx(10.0)
+
+
 def test_basis_expected_shortfall_does_not_treat_dense_ticks_as_independent_samples() -> None:
     model = FundingBasisExpectedShortfallModel(
         window_ms=300_000,

@@ -17,6 +17,7 @@ from typing import Iterable, Mapping
 _TERMINAL_KINDS = frozenset({"exit.closed", "exit.passive_close_resolved"})
 _RECONCILED_KIND = "funding.settlement_reconciled"
 _EXPIRED_KIND = "funding.settlement_reconciliation_expired"
+_TERMINAL_RECEIPT_KIND = "funding.settlement_reconciliations_finalized"
 
 
 @dataclass
@@ -90,6 +91,24 @@ def analyze_funding_attribution_events(
         kind = str(record.get("kind") or "")
         payload = record.get("payload")
         if not isinstance(payload, Mapping):
+            continue
+        if kind == _TERMINAL_RECEIPT_KIND:
+            # The critical batch receipt is authoritative when a crash occurs
+            # after active-state compaction but before best-effort per-task
+            # diagnostic events are appended.
+            rows = payload.get("tasks")
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                terminal_position_id = str(row.get("position_id") or "")
+                if (
+                    terminal_position_id
+                    and str(row.get("status") or "")
+                    == "expired_statement_evidence"
+                ):
+                    expired.add(terminal_position_id)
             continue
         position_id = str(payload.get("position_id") or "")
         if not position_id:

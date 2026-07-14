@@ -537,6 +537,29 @@ def test_taker_pair_preserves_each_quote_timestamp_and_uses_later_pair_completio
     assert payload["evaluated_at_ms"] == 1_200
 
 
+def test_active_max_hold_starts_when_the_taker_pair_is_complete() -> None:
+    tracker = _tracker(
+        markout_secs=[99],
+        terminal_secs=30,
+        active_exit_enabled=True,
+        exit_z=0.0,
+        stop_z=100.0,
+        max_hold_ms=500,
+    )
+    assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    quotes = _quotes(now_ms=1_200)
+    quotes["cheap:BTCUSDT"] = replace(
+        quotes["cheap:BTCUSDT"], observed_at_ms=1_100
+    )
+    _fill_taker(tracker, now_ms=1_200, quotes=quotes)
+
+    assert tracker.evaluate_due(1_699, _quotes(now_ms=1_699)) == []
+    closed = tracker.evaluate_due(1_700, _quotes(now_ms=1_700))
+
+    assert [item["kind"] for item in closed] == ["opportunity.paper_closed"]
+    assert closed[0]["payload"]["paper_close_reason"] == "spread_max_hold_elapsed"
+
+
 def test_funding_before_simulated_entry_cannot_be_allocated_to_paper_position() -> None:
     tracker = _tracker(markout_secs=[99], terminal_secs=2, quote_ttl_ms=10)
     candidate = _candidate(signal_ts_ms=1_001)

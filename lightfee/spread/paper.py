@@ -957,7 +957,7 @@ class SpreadPaperTracker:
     def _has_due_evaluation(self, position: SpreadPaperPosition, now_ms: int) -> bool:
         return self._next_horizon(position, now_ms) is not None or (
             self.config.active_exit_enabled
-            and now_ms > _position_entry_filled_at_ms(position)
+            and now_ms > _position_entry_completed_at_ms(position)
         )
 
     def _next_horizon(self, position: SpreadPaperPosition, now_ms: int) -> dict | None:
@@ -1007,7 +1007,7 @@ class SpreadPaperTracker:
             return None
         if (
             self.config.max_hold_ms > 0
-            and now_ms - _position_entry_filled_at_ms(position)
+            and now_ms - _position_entry_completed_at_ms(position)
             >= self.config.max_hold_ms
         ):
             return {"kind": "active_exit:max_hold", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_max_hold_elapsed"}
@@ -1362,17 +1362,8 @@ def _position_has_pending_entry(position: SpreadPaperPosition) -> bool:
     return position.long_leg.entry_pending or position.short_leg.entry_pending
 
 
-def _position_entry_filled_at_ms(position: SpreadPaperPosition) -> int:
-    """Return the actual common-entry instant, never the signal time."""
-    timestamps = (
-        int(position.long_leg.entry_filled_at_ms or 0),
-        int(position.short_leg.entry_filled_at_ms or 0),
-    )
-    return min(timestamps) if min(timestamps) > 0 else position.registered_at_ms
-
-
 def _position_entry_completed_at_ms(position: SpreadPaperPosition) -> int:
-    """Return the later leg fill time for a fully executable pair."""
+    """Return the pair-level lifecycle start: the later leg fill time."""
     timestamps = (
         int(position.long_leg.entry_filled_at_ms or 0),
         int(position.short_leg.entry_filled_at_ms or 0),

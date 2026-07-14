@@ -939,6 +939,15 @@ def _apply_journal_replay_to_state(
             # and consume the exact pending task before any retry is allowed.
             state.replay_funding_settlement_reconciled_receipt(payload)
 
+        elif (
+            kind == "funding.settlement_reconciliations_finalized"
+            and isinstance(payload, dict)
+        ):
+            # Expired/malformed rows have no official PnL, but their critical
+            # terminal receipt still prevents a stale snapshot from sending
+            # them back through private-statement I/O after restart.
+            state.replay_funding_settlement_terminal_receipt(payload)
+
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")
             if to_val:

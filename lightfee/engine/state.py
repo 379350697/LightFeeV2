@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 
 from dataclasses import dataclass, field
@@ -1076,7 +1078,6 @@ class RecoveryWorkSnapshot:
 
 
 MAX_PENDING_CLOSE_RECONCILIATIONS = 256
-MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS = 256
 MAX_FUNDING_SETTLEMENT_STATEMENT_CLAIMS = 8_192
 
 
@@ -1133,8 +1134,8 @@ def normalize_pending_funding_settlement_reconciliations(raw: Any) -> list[dict[
 
     These tasks never represent exchange exposure and therefore must remain
     separate from V1 pending-close truth reconciliation.  A malformed task is
-    retained visibly for diagnosis rather than being coerced into a funding
-    zero or a trading gate.
+    retained visibly until its critical terminal diagnostic is durable, rather
+    than being coerced into a funding zero or a trading gate.
     """
     if raw is None:
         return []
@@ -1142,7 +1143,13 @@ def normalize_pending_funding_settlement_reconciliations(raw: Any) -> list[dict[
         items = raw
     elif isinstance(raw, dict):
         items = [raw] if any(
-            key in raw for key in ("position_id", "required_settlements", "kind")
+            key in raw
+            for key in (
+                "position_id",
+                "required_settlements",
+                "kind",
+                "invalid_pending_funding_settlement_reconciliation",
+            )
         ) else list(raw.values())
     else:
         return [{
@@ -1163,6 +1170,54 @@ def normalize_pending_funding_settlement_reconciliations(raw: Any) -> list[dict[
                 "raw_repr": repr(item)[:240],
             })
     return normalized
+
+
+def funding_settlement_task_recovery_key(task: dict[str, Any]) -> str:
+    """Return a stable identity for terminal-receipt replay.
+
+    Well-formed accounting tasks retain their V1-compatible natural identity.
+    A malformed task has no such identity, so use a fingerprint over its
+    immutable diagnostic content.  Explicitly exclude mutable retry/runtime
+    fields: a receipt written after a failed retry must still consume an older
+    snapshot of the same malformed row.
+    """
+    # ``status`` is intentionally excluded: a valid task can become
+    # ``invalid_task`` only after a worker validates it.  That transition must
+    # not change the durable key needed to consume a pre-worker snapshot.
+    is_invalid = task.get("invalid_pending_funding_settlement_reconciliation") is True
+    owner_id = str(task.get("position_id") or "")
+    try:
+        closed_at_ms = int(task.get("closed_at_ms") or 0)
+    except (TypeError, ValueError):
+        closed_at_ms = 0
+    if not is_invalid and owner_id and closed_at_ms > 0:
+        return f"position:{owner_id}:{closed_at_ms}"
+
+    mutable_fields = {
+        "archived",
+        "archive_reason",
+        "attempt_count",
+        "last_attempt_ms",
+        "last_reason",
+        "next_attempt_ms",
+        "status",
+        "terminal_receipt_pending",
+    }
+    fingerprint = {
+        str(key): value
+        for key, value in task.items()
+        if str(key) not in mutable_fields
+    }
+    try:
+        encoded = json.dumps(
+            fingerprint,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=repr,
+        )
+    except (TypeError, ValueError):
+        encoded = repr(sorted((str(key), repr(value)) for key, value in fingerprint.items()))
+    return "diagnostic:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def normalize_funding_settlement_statement_claim_ledger(raw: Any) -> list[dict[str, Any]]:
@@ -1270,10 +1325,13 @@ class EngineState:
         ]
 
     def set_pending_funding_settlement_reconciliations(self, raw: Any) -> None:
+        # This is the durable *active* accounting ledger, not a best-effort
+        # queue.  Silently truncating an active row can permanently lose the
+        # only task that reconciles a closed position's official PnL.  Terminal
+        # rows leave only after CloseRuntime writes a critical terminal receipt;
+        # worker I/O is bounded separately by its batch limit.
         self.pending_funding_settlement_reconciliations = (
-            normalize_pending_funding_settlement_reconciliations(raw)[
-                -MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS:
-            ]
+            normalize_pending_funding_settlement_reconciliations(raw)
         )
 
     def set_funding_settlement_statement_claim_ledger(self, raw: Any) -> None:
@@ -1469,6 +1527,62 @@ class EngineState:
             ]
         )
 
+    def replay_funding_settlement_terminal_receipt(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Consume tasks finalized without official funding PnL.
+
+        Expired or malformed accounting rows are not exchange exposure and can
+        never be retried into official PnL.  Their critical terminal receipt is
+        therefore the restart-safe commit point, just as the reconciled receipt
+        is for official tasks.  Valid tasks use their V1 natural identity;
+        malformed rows use a durable diagnostic fingerprint so a stale
+        snapshot cannot emit their terminal conclusion twice.
+        """
+        raw_rows = payload.get("tasks")
+        rows = raw_rows if isinstance(raw_rows, list) else [payload]
+        identities: set[tuple[str, int]] = set()
+        task_keys: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            task_key = str(row.get("task_key") or "")
+            if task_key:
+                task_keys.add(task_key)
+                # New receipts always carry a task key.  Do not also use the
+                # natural identity: a malformed diagnostic row can share
+                # position_id/closed_at_ms with a valid task that still owns
+                # the only route to official PnL.
+                continue
+            owner_id = str(row.get("position_id") or "")
+            try:
+                closed_at_ms = int(row.get("closed_at_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            if owner_id and closed_at_ms > 0:
+                identities.add((owner_id, closed_at_ms))
+        if not identities and not task_keys:
+            return
+
+        def _task_identity(task: dict[str, Any]) -> tuple[str, int]:
+            try:
+                closed_at_ms = int(task.get("closed_at_ms") or 0)
+            except (TypeError, ValueError):
+                closed_at_ms = 0
+            return str(task.get("position_id") or ""), closed_at_ms
+
+        self.set_pending_funding_settlement_reconciliations(
+            [
+                task
+                for task in self.pending_funding_settlement_reconciliations
+                if (
+                    funding_settlement_task_recovery_key(task) not in task_keys
+                    and _task_identity(task) not in identities
+                )
+            ]
+        )
+
     def release_funding_settlement_statement_claims(
         self,
         task: dict[str, Any],
@@ -1534,14 +1648,6 @@ class EngineState:
             existing.update(merged)
             return
         self.pending_funding_settlement_reconciliations.append(dict(item))
-        if len(self.pending_funding_settlement_reconciliations) > (
-            MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS
-        ):
-            self.pending_funding_settlement_reconciliations = (
-                self.pending_funding_settlement_reconciliations[
-                    -MAX_PENDING_FUNDING_SETTLEMENT_RECONCILIATIONS:
-                ]
-            )
 
     def enqueue_pending_close_reconciliation(self, item: dict[str, Any]) -> None:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)

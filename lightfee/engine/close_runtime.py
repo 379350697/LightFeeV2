@@ -30,6 +30,7 @@ from lightfee.engine.exit_shadow import (
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
+from lightfee.engine.state import funding_settlement_task_recovery_key
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -66,12 +67,66 @@ def _funding_settlement_receipt_payload(
     }
 
 
+def _funding_settlement_terminal_receipt_row(
+    task: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    deadline_ms: int = 0,
+) -> dict[str, Any]:
+    """Build one durable, non-official terminal accounting conclusion.
+
+    A terminal row is deliberately distinct from an official funding receipt:
+    it proves that this task may no longer consume private-statement I/O, but
+    never asserts a funding PnL.  The live queue may then discard it without
+    losing the diagnostic/audit fact or allowing restart to retry it.
+    """
+    try:
+        closed_at_ms = int(task.get("closed_at_ms") or 0)
+    except (TypeError, ValueError):
+        # A malformed task is terminal diagnostic data; receipt construction
+        # must not make that task immortal by raising before the durable write.
+        closed_at_ms = 0
+
+    required_settlements = task.get("required_settlements")
+    observed_settlements = task.get("funding_settlement_records")
+    return {
+        "task_key": funding_settlement_task_recovery_key(task),
+        "position_id": str(task.get("position_id") or ""),
+        "symbol": str(task.get("symbol") or ""),
+        "closed_at_ms": closed_at_ms,
+        "status": status,
+        "reason": reason,
+        "deadline_ms": int(deadline_ms or 0),
+        "required_settlement_count": (
+            len(required_settlements) if isinstance(required_settlements, list) else 0
+        ),
+        "observed_settlement_count": (
+            len(observed_settlements) if isinstance(observed_settlements, list) else 0
+        ),
+        "calculation_version": str(task.get("calculation_version") or ""),
+        "model_epoch": str(task.get("model_epoch") or ""),
+    }
+
+
 class CloseRuntime:
     # V1 reconciliation retry constants (Rust V1 recovery.rs)
     _RECONCILE_RETRY_BASE_MS = 30_000
     _RECONCILE_RETRY_MAX_MS = 300_000
     _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
     _FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S = 15.0
+    # Limit one private-statement I/O pass, never the durable accounting task
+    # ledger. Unselected due tasks remain queued for the next tick.
+    _FUNDING_SETTLEMENT_RECONCILIATION_BATCH_SIZE = 256
+    # Invalid tasks are terminalized through the shared critical receipt.
+    # Conflicting tasks keep their claim reservation until deadline, but neither
+    # state can monopolize a private-statement I/O batch.
+    _FUNDING_SETTLEMENT_NON_RETRYABLE_STATUSES = frozenset(
+        {"invalid_task", "conflict"}
+    )
+    _FUNDING_SETTLEMENT_TERMINAL_RECEIPT_KIND = (
+        "funding.settlement_reconciliations_finalized"
+    )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -2095,10 +2150,11 @@ class CloseRuntime:
         state.set_pending_funding_settlement_reconciliations(
             getattr(state, "pending_funding_settlement_reconciliations", [])
         )
+        if self.ctx.config.runtime.mode != "live":
+            return
+        self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
         tasks = state.pending_funding_settlement_reconciliations
         if not tasks:
-            return
-        if self.ctx.config.runtime.mode != "live":
             return
 
         reconciler = FundingSettlementReconciler()
@@ -2107,50 +2163,19 @@ class CloseRuntime:
         due_indexes: list[int] = []
         for raw_task in tasks:
             if not isinstance(raw_task, dict):
-                retained.append({
-                    "invalid_pending_funding_settlement_reconciliation": True,
-                    "reason": "invalid_item",
-                    "raw_type": type(raw_task).__name__,
-                })
+                # State normalization should make this unreachable.  Retain
+                # rather than coercing it into a private-statement request if
+                # a concurrent caller replaced the list after normalization.
+                retained.append(raw_task)
                 continue
             task = dict(raw_task)
-            position_id = str(task.get("position_id") or "")
-            if task.get("invalid_pending_funding_settlement_reconciliation") is True:
-                if not task.get("diagnostic_emitted"):
-                    self.ctx.journal.append(
-                        "funding.settlement_reconciliation_invalid",
-                        {
-                            "position_id": position_id,
-                            "reason": str(task.get("reason") or "invalid_task"),
-                        },
-                    )
-                    task["diagnostic_emitted"] = True
+            if not self._pending_funding_settlement_task_is_schedulable(
+                task,
+                now_ms=now_ms,
+            ):
                 retained.append(task)
                 continue
-
-            deadline_ms = int(task.get("deadline_ms") or 0)
-            if deadline_ms > 0 and now_ms > deadline_ms:
-                task["status"] = "expired_statement_evidence"
-                task["official_pnl"] = False
-                task["archived"] = True
-                task["archive_reason"] = "statement_evidence_deadline_elapsed"
-                if not task.get("expiry_event_emitted"):
-                    self.ctx.journal.append(
-                        "funding.settlement_reconciliation_expired",
-                        {
-                            "position_id": position_id,
-                            "symbol": str(task.get("symbol") or ""),
-                            "closed_at_ms": int(task.get("closed_at_ms") or 0),
-                            "deadline_ms": deadline_ms,
-                            "observed_settlement_count": len(
-                                task.get("funding_settlement_records") or []
-                            ),
-                        },
-                    )
-                    task["expiry_event_emitted"] = True
-                retained.append(task)
-                continue
-            if int(task.get("next_attempt_ms") or 0) > now_ms:
+            if len(due_tasks) >= self._FUNDING_SETTLEMENT_RECONCILIATION_BATCH_SIZE:
                 retained.append(task)
                 continue
 
@@ -2200,19 +2225,19 @@ class CloseRuntime:
                         "last_checked_at_ms": now_ms,
                     }
                 )
-                self.ctx.journal.append(
-                    "funding.settlement_reconciliation_deferred",
+                self._append_funding_settlement_reconciliation_diagnostic(
                     {
                         "position_id": position_id,
                         "reason": task["last_reason"],
                         "attempt_count": attempts,
                         "next_attempt_ms": task["next_attempt_ms"],
-                    },
+                    }
                 )
                 retained[index] = task
             state.set_pending_funding_settlement_reconciliations(
                 [task for task in retained if task is not None]
             )
+            self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
             return
 
         # The synchronous test/maintenance path delegates result application
@@ -2227,6 +2252,7 @@ class CloseRuntime:
             {"now_ms": int(now_ms), "due_tasks": due_tasks},
             reconciled,
         )
+        self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
 
     @staticmethod
     def _pending_funding_settlement_task_identity(task: dict[str, Any]) -> tuple[str, int]:
@@ -2244,37 +2270,141 @@ class CloseRuntime:
             return 0
         return max(value, 0)
 
-    def _expire_pending_funding_settlement_tasks(self, *, now_ms: int) -> None:
-        """Apply local expiry transitions without waiting on private HTTP."""
+    @classmethod
+    def _pending_funding_settlement_task_is_schedulable(
+        cls,
+        task: Any,
+        *,
+        now_ms: int,
+    ) -> bool:
+        """Return whether a durable accounting row may consume private I/O."""
+        return bool(
+            isinstance(task, dict)
+            and task.get("invalid_pending_funding_settlement_reconciliation") is not True
+            and str(task.get("status") or "")
+            not in cls._FUNDING_SETTLEMENT_NON_RETRYABLE_STATUSES
+            and task.get("archived") is not True
+            and task.get("official_pnl") is not True
+            and task.get("terminal_receipt_pending") is not True
+            and cls._pending_funding_settlement_task_next_attempt_ms(task) <= now_ms
+        )
+
+    @staticmethod
+    def _pending_funding_settlement_task_deadline_ms(task: dict[str, Any]) -> int:
+        try:
+            deadline_ms = int(task.get("deadline_ms") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(deadline_ms, 0)
+
+    def _retire_terminal_pending_funding_settlement_tasks(
+        self,
+        *,
+        now_ms: int,
+        protected_task_keys: set[str] | None = None,
+    ) -> None:
+        """Durably retire terminal accounting rows before either execution path.
+
+        The synchronous test/recovery path and the non-blocking live path used
+        to order invalid and expired checks differently.  That made a malformed
+        persisted row resolve to two distinct states.  This is the only
+        transition authority: it writes one critical batch receipt, removes
+        only successfully recorded terminal rows, and leaves a failed receipt
+        pending but non-schedulable for a later retry.
+        """
         state = self.ctx.state
-        for task in state.pending_funding_settlement_reconciliations:
-            if not isinstance(task, dict) or task.get("archived") is True:
+        protected_task_keys = protected_task_keys or set()
+        retained: list[dict[str, Any]] = []
+        terminal_rows: list[dict[str, Any]] = []
+        terminal_tasks: list[dict[str, Any]] = []
+        for raw_task in state.pending_funding_settlement_reconciliations:
+            if not isinstance(raw_task, dict):
+                # The state setter normally converts this into the explicit
+                # malformed form.  If a concurrent mutation bypassed it, do
+                # not issue a private request against opaque data.
+                task = {
+                    "invalid_pending_funding_settlement_reconciliation": True,
+                    "reason": "invalid_item",
+                    "raw_type": type(raw_task).__name__,
+                }
+            else:
+                task = dict(raw_task)
+            if task.get("official_pnl") is True:
+                # Official PnL is removed by its own critical receipt replay;
+                # never rewrite or revoke that fact here.
+                retained.append(task)
                 continue
-            try:
-                deadline_ms = int(task.get("deadline_ms") or 0)
-            except (TypeError, ValueError):
-                deadline_ms = 0
-            if deadline_ms <= 0 or now_ms <= deadline_ms:
+
+            if funding_settlement_task_recovery_key(task) in protected_task_keys:
+                # The private request began before this tick's deadline.  Its
+                # result must merge before any expiry decision; otherwise an
+                # official response could be discarded merely because I/O
+                # crossed the deadline between ticks.
+                retained.append(task)
                 continue
-            task["status"] = "expired_statement_evidence"
-            task["official_pnl"] = False
-            task["archived"] = True
-            task["archive_reason"] = "statement_evidence_deadline_elapsed"
-            if task.get("expiry_event_emitted"):
+
+            status = str(task.get("status") or "")
+            deadline_ms = self._pending_funding_settlement_task_deadline_ms(task)
+            if task.get("invalid_pending_funding_settlement_reconciliation") is True:
+                terminal_status = "invalid_task"
+                terminal_reason = str(task.get("reason") or "invalid_task")
+                event_kind = "funding.settlement_reconciliation_invalid"
+            elif status == "invalid_task":
+                terminal_status = "invalid_task"
+                terminal_reason = str(
+                    task.get("last_reason") or "missing_or_invalid_required_settlements"
+                )
+                event_kind = "funding.settlement_reconciliation_invalid"
+            elif task.get("archived") is True or (
+                deadline_ms > 0 and now_ms > deadline_ms
+            ):
+                terminal_status = "expired_statement_evidence"
+                terminal_reason = str(
+                    task.get("archive_reason")
+                    or "statement_evidence_deadline_elapsed"
+                )
+                event_kind = "funding.settlement_reconciliation_expired"
+            else:
+                retained.append(task)
                 continue
-            self.ctx.journal.append(
-                "funding.settlement_reconciliation_expired",
-                {
-                    "position_id": str(task.get("position_id") or ""),
-                    "symbol": str(task.get("symbol") or ""),
-                    "closed_at_ms": int(task.get("closed_at_ms") or 0),
-                    "deadline_ms": deadline_ms,
-                    "observed_settlement_count": len(
-                        task.get("funding_settlement_records") or []
-                    ),
-                },
+
+            row = _funding_settlement_terminal_receipt_row(
+                task,
+                status=terminal_status,
+                reason=terminal_reason,
+                deadline_ms=deadline_ms,
             )
-            task["expiry_event_emitted"] = True
+            row["event_kind"] = event_kind
+            terminal_rows.append(row)
+            terminal_tasks.append(task)
+
+        if terminal_rows:
+            try:
+                self.ctx.journal.append_critical(
+                    now_ms,
+                    self._FUNDING_SETTLEMENT_TERMINAL_RECEIPT_KIND,
+                    {"schema_version": 1, "tasks": terminal_rows},
+                )
+            except Exception:
+                # A terminal conclusion is authoritative only after the
+                # receipt is durable.  Keep the original row but ensure that
+                # it cannot return to private I/O while the receipt retries.
+                for task in terminal_tasks:
+                    task["terminal_receipt_pending"] = True
+                    retained.append(task)
+            else:
+                # Preserve existing per-task event contracts for reports and
+                # operators.  The critical batch above is the recovery source;
+                # a telemetry failure here cannot resurrect an active task.
+                for row in terminal_rows:
+                    payload = dict(row)
+                    event_kind = str(payload.pop("event_kind"))
+                    try:
+                        self.ctx.journal.append(event_kind, payload)
+                    except Exception:
+                        pass
+
+        state.set_pending_funding_settlement_reconciliations(retained)
 
     async def _run_pending_funding_settlement_reconciliation_work(
         self,
@@ -2608,11 +2738,20 @@ class CloseRuntime:
         )
         if self.ctx.config.runtime.mode != "live":
             return
-        self._expire_pending_funding_settlement_tasks(now_ms=now_ms)
-
         worker = self._funding_settlement_reconciliation_worker
         if worker is not None:
             if not worker.done():
+                work = self._funding_settlement_reconciliation_work or {}
+                due_tasks = work.get("due_tasks", [])
+                protected_task_keys = {
+                    funding_settlement_task_recovery_key(task)
+                    for task in due_tasks
+                    if isinstance(task, dict)
+                }
+                self._retire_terminal_pending_funding_settlement_tasks(
+                    now_ms=now_ms,
+                    protected_task_keys=protected_task_keys,
+                )
                 return
             work = self._funding_settlement_reconciliation_work or {}
             self._funding_settlement_reconciliation_worker = None
@@ -2626,16 +2765,19 @@ class CloseRuntime:
                 return
             except Exception as error:
                 self._apply_pending_funding_settlement_worker_failure(work, error)
+            self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
             return
+
+        self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
 
         due_tasks = [
             dict(task)
             for task in state.pending_funding_settlement_reconciliations
-            if isinstance(task, dict)
-            and task.get("archived") is not True
-            and task.get("official_pnl") is not True
-            and self._pending_funding_settlement_task_next_attempt_ms(task) <= now_ms
-        ]
+            if self._pending_funding_settlement_task_is_schedulable(
+                task,
+                now_ms=now_ms,
+            )
+        ][: self._FUNDING_SETTLEMENT_RECONCILIATION_BATCH_SIZE]
         if not due_tasks:
             return
         work = {
