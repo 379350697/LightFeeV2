@@ -74,7 +74,7 @@ def _sidecar_snapshot(*, observed_at_ms: int = 10_000) -> SidecarSnapshot:
     )
 
 
-def test_spread_snapshot_v2_round_trips_signed_economics(tmp_path) -> None:
+def test_spread_snapshot_v3_round_trips_signed_economics(tmp_path) -> None:
     path = tmp_path / "spread.json"
     publish_spread_snapshot(
         SpreadSnapshot(
@@ -89,7 +89,7 @@ def test_spread_snapshot_v2_round_trips_signed_economics(tmp_path) -> None:
     loaded = load_spread_snapshot(path)
 
     assert loaded is not None
-    assert loaded.schema_version == 2
+    assert loaded.schema_version == 3
     assert loaded.candidates[0].economics_complete is True
     assert loaded.candidates[0].fee_evidence_complete is True
     assert loaded.candidates[0].canonical_venue_a == "cheap"

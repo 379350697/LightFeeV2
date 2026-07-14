@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-SPREAD_SNAPSHOT_SCHEMA_VERSION = 2
+SPREAD_SNAPSHOT_SCHEMA_VERSION = 3
 SPREAD_STRATEGY_BUCKET = "spread_reversion"
 
 
@@ -93,6 +93,27 @@ class SpreadReversionCandidate:
     # Four-leg economics must be backed by explicit fee inputs.  An explicit
     # zero is valid (for example a VIP tier); a missing key never is.
     fee_evidence_complete: bool = False
+    # ``fee_evidence_complete`` means the four-leg formula had explicit fee
+    # values.  The following fields distinguish a static configuration floor
+    # from contemporaneous account-scoped evidence used for official paper
+    # acceptance.
+    account_fee_evidence_complete: bool = False
+    account_fee_evidence_observed_at_ms: int = 0
+    account_fee_evidence_source: str = ""
+    account_fee_evidence_fingerprint: str = ""
+    account_fee_evidence_provenance: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    # P1 research attribution: an immutable model epoch must not mix tuned
+    # and holdout observations, and capital efficiency must be auditable.
+    research_sample_split: str = "in_sample"
+    volatility_regime: str = "unknown"
+    net_edge_per_capital_hour_bps: float = 0.0
+    # Capital efficiency is ranked from downside edge and confidence-adjusted
+    # holding time; the legacy expected-edge rate stays diagnostic only.
+    risk_adjusted_edge_per_capital_hour_bps: float = 0.0
+    hold_time_confidence: float = 0.0
+    dynamic_min_gross_edge_bps: float = 0.0
     contract_normalization_status: str = "unknown"
     contract_normalization_reason: str = ""
 

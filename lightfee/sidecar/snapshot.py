@@ -185,6 +185,19 @@ class CandidateInput:
     long_taker_fee_bps: float = 0.0
     short_taker_fee_bps: float = 0.0
     taker_fee_evidence_complete: bool = False
+    # Static configured fee maps establish a conservative pricing floor.
+    # Account-scoped evidence is separate provenance required by the live
+    # funding canary; older snapshots remain diagnostic but cannot inherit it.
+    account_fee_evidence_complete: bool = False
+    account_fee_evidence_observed_at_ms: int = 0
+    account_fee_evidence_source: str = ""
+    # The exact signed document and per-venue records that priced this
+    # candidate.  These are frozen into entry evidence; source/time alone are
+    # not sufficient to detect a substituted private-account export.
+    account_fee_evidence_fingerprint: str = ""
+    account_fee_evidence_provenance: list[dict[str, object]] = field(
+        default_factory=list
+    )
     opportunity_type: str = "aligned"
     blocked: bool = False
     blocked_reasons: list[str] = field(default_factory=list)

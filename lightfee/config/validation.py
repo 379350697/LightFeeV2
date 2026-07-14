@@ -14,6 +14,15 @@ from lightfee.config.schema import (
 )
 from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
+from lightfee.strategy.fee_evidence import TRUSTED_FEE_EVIDENCE_HMAC_ENV
+
+
+_CANARY_HARD_MAX_CONCURRENT_POSITIONS = 1
+_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
+_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
+_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
+_LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+_CANARY_STATEMENT_RECONCILABLE_VENUES = frozenset({"binance", "bybit", "okx", "gate"})
 
 
 def validate_config(config: AppConfig) -> list[str]:
@@ -70,6 +79,10 @@ def validate_config(config: AppConfig) -> list[str]:
         )
     if not str(config.runtime.funding_basis_risk_checkpoint_path or "").strip():
         issues.append("runtime.funding_basis_risk_checkpoint_path must be non-empty")
+    if not str(config.runtime.fee_evidence_path or "").strip():
+        issues.append("runtime.fee_evidence_path must be non-empty")
+    if not _is_positive_int(config.runtime.fee_evidence_max_age_ms):
+        issues.append("runtime.fee_evidence_max_age_ms must be a positive integer")
     if config.runtime.local_l2_depth_bridge_enabled:
         if not str(config.runtime.local_l2_depth_bridge_path or "").strip():
             issues.append("runtime.local_l2_depth_bridge_path must be set when enabled")
@@ -95,10 +108,18 @@ def validate_config(config: AppConfig) -> list[str]:
     # keeps entry freeze, risk monitoring and paper-only intent fail-closed.
     for field_name in (
         "funding_new_entries_enabled",
+        "funding_canary_enabled",
+        "funding_canary_require_account_fee_evidence",
         "funding_dynamic_expected_shortfall_enabled",
         "risk_monitor_enabled",
         "spread_live_enabled",
         "spread_paper_enabled",
+        "spread_dynamic_net_edge_enabled",
+        "spread_rank_by_capital_efficiency",
+        "spread_paper_require_l2_vwap",
+        "spread_paper_require_account_fee_evidence",
+        "spread_allow_verified_maker_rebates",
+        "spread_paper_require_out_of_sample",
     ):
         value = getattr(config.strategy, field_name)
         if value is not True and value is not False:
@@ -228,6 +249,172 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append(
                 "strategy.funding_expected_shortfall_budget_quote must be > 0 when live funding entries are enabled"
             )
+    if config.strategy.funding_canary_enabled is True:
+        if config.strategy.funding_canary_require_account_fee_evidence is not True:
+            issues.append(
+                "strategy.funding_canary_require_account_fee_evidence must be true during the canary release"
+            )
+        allowed_venues = config.strategy.funding_canary_allowed_venues
+        if (
+            not isinstance(allowed_venues, list)
+            or len({str(venue or "").strip().lower() for venue in allowed_venues if str(venue or "").strip()})
+            < 2
+        ):
+            issues.append(
+                "strategy.funding_canary_allowed_venues must contain at least two venues"
+            )
+        else:
+            normalized_venues = {
+                str(venue or "").strip().lower()
+                for venue in allowed_venues
+                if str(venue or "").strip()
+            }
+            unsupported = sorted(
+                normalized_venues - _CANARY_STATEMENT_RECONCILABLE_VENUES
+            )
+            if unsupported:
+                issues.append(
+                    "strategy.funding_canary_allowed_venues must support private "
+                    "funding-statement reconciliation: " + ", ".join(unsupported)
+                )
+        if not _is_positive_int(config.strategy.funding_canary_max_concurrent_positions):
+            issues.append(
+                "strategy.funding_canary_max_concurrent_positions must be a positive integer"
+            )
+        elif (
+            int(config.strategy.funding_canary_max_concurrent_positions)
+            != _CANARY_HARD_MAX_CONCURRENT_POSITIONS
+        ):
+            issues.append(
+                "strategy.funding_canary_max_concurrent_positions must equal 1 during the canary release"
+            )
+        for field_name, value in {
+            "funding_canary_max_entry_notional_quote": (
+                config.strategy.funding_canary_max_entry_notional_quote
+            ),
+            "funding_canary_min_expected_net_edge_bps": (
+                config.strategy.funding_canary_min_expected_net_edge_bps
+            ),
+            "funding_canary_min_worst_case_edge_bps": (
+                config.strategy.funding_canary_min_worst_case_edge_bps
+            ),
+        }.items():
+            if not _is_finite_nonnegative(value) or (
+                field_name == "funding_canary_max_entry_notional_quote" and float(value) <= 0.0
+            ):
+                comparator = "> 0" if field_name == "funding_canary_max_entry_notional_quote" else ">= 0"
+                issues.append(f"strategy.{field_name} must be finite and {comparator}")
+        if (
+            _is_finite_nonnegative(
+                config.strategy.funding_canary_max_entry_notional_quote
+            )
+            and float(config.strategy.funding_canary_max_entry_notional_quote)
+            > _CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE
+        ):
+            issues.append(
+                "strategy.funding_canary_max_entry_notional_quote must be <= 30.0 during the canary release"
+            )
+        if (
+            _is_finite_nonnegative(
+                config.strategy.funding_canary_min_expected_net_edge_bps
+            )
+            and float(config.strategy.funding_canary_min_expected_net_edge_bps)
+            < _CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS
+        ):
+            issues.append(
+                "strategy.funding_canary_min_expected_net_edge_bps must be >= 8.0 during the canary release"
+            )
+        if (
+            _is_finite_nonnegative(
+                config.strategy.funding_canary_min_worst_case_edge_bps
+            )
+            and float(config.strategy.funding_canary_min_worst_case_edge_bps)
+            < _CANARY_HARD_MIN_WORST_CASE_EDGE_BPS
+        ):
+            issues.append(
+                "strategy.funding_canary_min_worst_case_edge_bps must be >= 3.0 during the canary release"
+            )
+    # Any live new funding entry is necessarily a canary at this release
+    # stage.  Leaving the old master switch independently enable-able would
+    # make it possible to bypass the notional, concurrency and account-fee
+    # proof gates merely by omitting the canary flag.  Existing positions,
+    # recovery and close paths are not affected by this startup contract.
+    if (
+        config.runtime.mode == "live"
+        and config.strategy.funding_new_entries_enabled is True
+        and config.strategy.funding_canary_enabled is not True
+    ):
+        issues.append(
+            "strategy.funding_canary_enabled must be true when live funding new entries are enabled"
+        )
+    if (
+        config.runtime.mode == "live"
+        and config.strategy.funding_new_entries_enabled is True
+        and config.strategy.funding_canary_require_account_fee_evidence is True
+    ):
+        if (
+            _is_positive_int(config.runtime.fee_evidence_max_age_ms)
+            and int(config.runtime.fee_evidence_max_age_ms)
+            > _LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS
+        ):
+            issues.append(
+                "runtime.fee_evidence_max_age_ms must be <= 86400000 for a live funding canary"
+            )
+        configured_key_env = str(
+            config.runtime.fee_evidence_integrity_key_env or ""
+        ).strip()
+        if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
+            issues.append(
+                "runtime.fee_evidence_integrity_key_env must be blank or the fixed "
+                "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY for a live funding canary"
+            )
+        identities = config.runtime.fee_evidence_account_identity_hashes
+        if not isinstance(identities, dict):
+            issues.append(
+                "runtime.fee_evidence_account_identity_hashes must be a mapping"
+            )
+        else:
+            required_venues = {
+                str(venue or "").strip().lower()
+                for venue in config.strategy.funding_canary_allowed_venues
+                if str(venue or "").strip()
+            }
+            for venue in sorted(required_venues):
+                if not _is_sha256_hex(identities.get(venue)):
+                    issues.append(
+                        "runtime.fee_evidence_account_identity_hashes must contain "
+                        f"a SHA256 identity hash for canary venue {venue}"
+                    )
+    if (
+        config.strategy.spread_paper_enabled is True
+        and str(config.strategy.spread_paper_model_epoch or "").startswith("v3_")
+        and config.strategy.spread_paper_require_account_fee_evidence is True
+    ):
+        configured_key_env = str(
+            config.runtime.fee_evidence_integrity_key_env or ""
+        ).strip()
+        if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
+            issues.append(
+                "runtime.fee_evidence_integrity_key_env must be blank or the fixed "
+                "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY for v3 spread paper"
+            )
+        identities = config.runtime.fee_evidence_account_identity_hashes
+        if not isinstance(identities, dict):
+            issues.append(
+                "runtime.fee_evidence_account_identity_hashes must be a mapping"
+            )
+        else:
+            required_venues = {
+                str(venue.venue or "").strip().lower()
+                for venue in config.venues
+                if str(venue.venue or "").strip()
+            }
+            for venue in sorted(required_venues):
+                if not _is_sha256_hex(identities.get(venue)):
+                    issues.append(
+                        "runtime.fee_evidence_account_identity_hashes must contain "
+                        f"a SHA256 identity hash for v3 spread paper venue {venue}"
+                    )
     if not _is_finite_ratio(config.strategy.funding_risk_health_buffer_ratio):
         issues.append(
             "strategy.funding_risk_health_buffer_ratio must be finite and within (0, 1]"
@@ -332,6 +519,29 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             "strategy.spread_structural_break_cooldown_ms must be >= 1800000"
         )
+    if not _is_finite_nonnegative(config.strategy.spread_min_profit_buffer_bps):
+        issues.append("strategy.spread_min_profit_buffer_bps must be finite and >= 0")
+    if not _is_positive_finite(config.strategy.spread_volatility_high_std_bps):
+        issues.append("strategy.spread_volatility_high_std_bps must be finite and > 0")
+    try:
+        gross_profit_multiple = float(config.strategy.spread_min_gross_profit_multiple)
+    except (TypeError, ValueError):
+        gross_profit_multiple = 0.0
+    if not math.isfinite(gross_profit_multiple) or gross_profit_multiple < 1.0:
+        issues.append("strategy.spread_min_gross_profit_multiple must be finite and >= 1")
+    spread_epoch = str(config.strategy.spread_model_epoch or "")
+    if config.strategy.spread_dynamic_net_edge_enabled is True and not spread_epoch.startswith(
+        "v3_"
+    ):
+        issues.append(
+            "strategy.spread_model_epoch must be a v3 epoch when dynamic net edge is enabled"
+        )
+    if config.strategy.spread_dynamic_net_edge_enabled is not True and spread_epoch.startswith(
+        "v3_"
+    ):
+        issues.append(
+            "strategy.spread_dynamic_net_edge_enabled must be true for a v3 spread epoch"
+        )
     if config.strategy.spread_paper_enabled:
         if (
             config.strategy.spread_paper_model_epoch
@@ -357,6 +567,18 @@ def validate_config(config: AppConfig) -> list[str]:
         ):
             issues.append(
                 "strategy.spread_paper_min_decision_latency_ms must be a positive integer"
+            )
+        if not _is_finite_nonnegative(
+            config.strategy.spread_paper_latency_buffer_bps
+        ):
+            issues.append(
+                "strategy.spread_paper_latency_buffer_bps must be finite and >= 0"
+            )
+        if config.strategy.spread_paper_require_out_of_sample is True and not _is_positive_int(
+            config.strategy.spread_paper_oos_start_ms
+        ):
+            issues.append(
+                "strategy.spread_paper_oos_start_ms must be a positive integer when out-of-sample is required"
             )
         if not _is_positive_int(config.strategy.spread_paper_terminal_secs):
             issues.append(
@@ -538,6 +760,17 @@ def _is_nonnegative_int(value: object) -> bool:
 def _is_positive_finite(value: object) -> bool:
     """Strictly positive finite numeric policy value, never a boolean."""
     return _is_finite_nonnegative(value) and float(value) > 0.0
+
+
+def _is_sha256_hex(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    if len(text) != 64:
+        return False
+    try:
+        int(text, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:

@@ -23,6 +23,132 @@ def test_strategy_config_forecast_default_is_reachable_in_a_seven_day_8h_window(
     assert StrategyConfig().funding_forecast_min_samples <= 21
 
 
+def test_funding_canary_rejects_relaxed_edge_floors_and_requires_positive_notional():
+    cfg = AppConfig()
+    cfg.strategy.funding_canary_enabled = True
+    cfg.strategy.funding_canary_min_expected_net_edge_bps = 0.0
+    cfg.strategy.funding_canary_min_worst_case_edge_bps = 0.0
+
+    issues = validate_config(cfg)
+    assert (
+        "strategy.funding_canary_min_expected_net_edge_bps must be >= 8.0 during the canary release"
+        in issues
+    )
+    assert (
+        "strategy.funding_canary_min_worst_case_edge_bps must be >= 3.0 during the canary release"
+        in issues
+    )
+
+    cfg.strategy.funding_canary_max_entry_notional_quote = 0.0
+    assert (
+        "strategy.funding_canary_max_entry_notional_quote must be finite and > 0"
+        in validate_config(cfg)
+    )
+
+
+def test_funding_canary_release_caps_cannot_be_scaled_by_configuration():
+    cfg = AppConfig()
+    cfg.strategy.funding_canary_enabled = True
+    cfg.strategy.funding_canary_max_concurrent_positions = 2
+    cfg.strategy.funding_canary_max_entry_notional_quote = 31.0
+
+    issues = validate_config(cfg)
+
+    assert (
+        "strategy.funding_canary_max_concurrent_positions must equal 1 during the canary release"
+        in issues
+    )
+    assert (
+        "strategy.funding_canary_max_entry_notional_quote must be <= 30.0 during the canary release"
+        in issues
+    )
+
+
+def test_funding_canary_cannot_bypass_account_fee_evidence():
+    cfg = AppConfig()
+    cfg.strategy.funding_canary_enabled = True
+    cfg.strategy.funding_canary_require_account_fee_evidence = False
+
+    issues = validate_config(cfg)
+
+    assert (
+        "strategy.funding_canary_require_account_fee_evidence must be true during the canary release"
+        in issues
+    )
+
+
+def test_funding_canary_requires_statement_reconcilable_venues():
+    cfg = AppConfig()
+    cfg.strategy.funding_canary_enabled = True
+    cfg.strategy.funding_canary_allowed_venues = ["binance", "hyperliquid"]
+
+    assert (
+        "strategy.funding_canary_allowed_venues must support private "
+        "funding-statement reconciliation: hyperliquid"
+        in validate_config(cfg)
+    )
+
+
+def test_v3_spread_paper_requires_fee_account_identity_for_each_venue():
+    cfg = AppConfig(symbols=["BTCUSDT"], venues=[VenueConfig(venue="binance")])
+    cfg.strategy.spread_paper_enabled = True
+    cfg.strategy.spread_dynamic_net_edge_enabled = True
+    cfg.strategy.spread_model_epoch = "v3_cost_normalized_reversion"
+    cfg.strategy.spread_paper_model_epoch = "v3_cost_normalized_reversion"
+    cfg.strategy.spread_paper_research_manifest_path = (
+        "config/research/spread_v3_cost_normalized_reversion.json"
+    )
+
+    assert (
+        "runtime.fee_evidence_account_identity_hashes must contain a SHA256 "
+        "identity hash for v3 spread paper venue binance"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.fee_evidence_account_identity_hashes = {"binance": "a" * 64}
+    assert not any(
+        "identity hash for v3 spread paper venue binance" in issue
+        for issue in validate_config(cfg)
+    )
+
+
+def test_live_funding_entries_require_the_canary_gate():
+    cfg = AppConfig()
+    cfg.runtime.mode = "live"
+    cfg.strategy.risk_monitor_enabled = True
+    cfg.strategy.funding_new_entries_enabled = True
+
+    assert (
+        "strategy.funding_canary_enabled must be true when live funding new entries are enabled"
+        in validate_config(cfg)
+    )
+
+    cfg.strategy.funding_canary_enabled = True
+    assert not any(
+        "funding_canary_enabled must be true" in issue
+        for issue in validate_config(cfg)
+    )
+
+
+def test_dynamic_spread_cost_gate_and_model_epoch_are_indivisible():
+    cfg = AppConfig()
+    cfg.strategy.spread_dynamic_net_edge_enabled = True
+
+    assert (
+        "strategy.spread_model_epoch must be a v3 epoch when dynamic net edge is enabled"
+        in validate_config(cfg)
+    )
+
+    cfg.strategy.spread_model_epoch = "v3_cost_normalized_reversion"
+    assert not any("spread_model_epoch" in issue for issue in validate_config(cfg))
+
+    cfg.strategy.spread_dynamic_net_edge_enabled = False
+    assert (
+        "strategy.spread_dynamic_net_edge_enabled must be true for a v3 spread epoch"
+        in validate_config(cfg)
+    )
+
+
 def test_enhanced_live_requires_a_positive_forecast_sample_threshold():
     cfg = AppConfig()
     cfg.strategy.funding_economics_mode = "enhanced_live"

@@ -26,6 +26,7 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
 from lightfee.engine.state import (
     ActiveMakerLeg,
@@ -43,6 +44,21 @@ from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
+
+
+@pytest.fixture(autouse=True)
+def _isolate_non_canary_preflight_stages(monkeypatch):
+    """The preflight suite does not test the separate signed-canary contract."""
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_admission_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_submission_reason",
+        lambda *_args, **_kwargs: "",
+    )
 
 
 def make_test_config(temp_dir: str) -> AppConfig:

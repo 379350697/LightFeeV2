@@ -439,6 +439,45 @@ class TestEntryExecutionIdempotency:
         assert pos.peak_net_quote == pytest.approx(-2.0)
         assert pos.entry_quality_completed_at_ms == 0
 
+    def test_build_open_position_records_independent_adverse_entry_shortfall(self):
+        ctx = EntryContext(
+            entry_id="pos-shortfall",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_price_hint=100.0,
+            short_price_hint=100.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        # The long buy fills one quote above its benchmark and the short sell
+        # one quote below its benchmark.  Both are adverse execution; their
+        # total must remain independent of entry fees and price PnL.
+        long_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTC-USDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=101.0,
+            order_id="long",
+        )
+        short_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTC-USDT",
+            side=Side.SELL,
+            quantity=1.0,
+            price=99.0,
+            order_id="short",
+        )
+
+        position = build_open_position(ctx, long_fill, short_fill, now_ms=1_000)
+
+        assert position.execution_benchmark_complete is True
+        assert position.entry_implementation_shortfall_quote == pytest.approx(2.0)
+        assert position.current_net_quote == pytest.approx(0.0)
+
     def test_build_open_position_preserves_funding_semantics(self):
         """Entry-selected funding timestamps must survive into close decisions."""
         from lightfee.config.schema import StrategyConfig

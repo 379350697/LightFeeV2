@@ -26,6 +26,11 @@ from lightfee.spread.stats_checkpoint import (
     publish_spread_stats_checkpoint,
     restore_spread_stats_checkpoint,
 )
+from lightfee.strategy.fee_evidence import (
+    FeeEvidenceBook,
+    effective_fee_maps,
+    load_fee_evidence,
+)
 
 
 logger = logging.getLogger("lightfee.spread.service")
@@ -87,7 +92,11 @@ class SpreadSidecarService:
                 "spread sidecar must use runtime.sidecar_snapshot_path; "
                 "direct public market fetching is not supported"
             )
-        self.signal_config = SpreadReversionConfig.from_app_config(config)
+        self._fee_evidence = self._load_fee_evidence(int(time.time() * 1000))
+        self.signal_config = SpreadReversionConfig.from_app_config(
+            config,
+            fee_evidence=self._fee_evidence,
+        )
         self.stats = SpreadStatsTracker()
         self.signal_engine = SpreadSignalEngine(
             tracker=self.stats,
@@ -97,7 +106,9 @@ class SpreadSidecarService:
         self._stats_checkpoint_loaded = False
         self._stats_checkpoint_restored = False
         self._paper_journal: Journal | None = None
-        self._paper_tracker = SpreadPaperTracker(self._paper_config(config))
+        self._paper_tracker = SpreadPaperTracker(
+            self._paper_config(config, fee_evidence=self._fee_evidence)
+        )
         if self._paper_tracker.enabled:
             persistence = config.persistence
             self._paper_journal = Journal(
@@ -122,6 +133,7 @@ class SpreadSidecarService:
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
         observed_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        self._refresh_fee_evidence(observed_ms)
         self._restore_stats_checkpoint_once(observed_ms)
         quotes, degraded_venues, source_mode = await self._fetch_quotes(observed_ms)
         rejection_counts: dict[str, int] = {}
@@ -261,7 +273,34 @@ class SpreadSidecarService:
         source_mode = "sidecar_snapshot_partial" if dropped_count else "sidecar_snapshot"
         return quotes, degraded_venues, source_mode
 
-    def _paper_config(self, config: AppConfig) -> SpreadPaperConfig:
+    def _load_fee_evidence(self, now_ms: int) -> FeeEvidenceBook:
+        return load_fee_evidence(
+            self.config.runtime.fee_evidence_path,
+            now_ms=now_ms,
+            max_age_ms=int(self.config.runtime.fee_evidence_max_age_ms),
+        )
+
+    def _refresh_fee_evidence(self, now_ms: int) -> None:
+        evidence = self._load_fee_evidence(now_ms)
+        self._fee_evidence = evidence
+        self.signal_config = SpreadReversionConfig.from_app_config(
+            self.config,
+            fee_evidence=evidence,
+        )
+        self.signal_engine.reconfigure(self.signal_config)
+        # Open paper positions retain their per-leg fee snapshots; only later
+        # registrations consume a refreshed account fee schedule.
+        self._paper_tracker.config = self._paper_config(
+            self.config,
+            fee_evidence=evidence,
+        )
+
+    def _paper_config(
+        self,
+        config: AppConfig,
+        *,
+        fee_evidence: FeeEvidenceBook | None = None,
+    ) -> SpreadPaperConfig:
         strategy = config.strategy
         manifest = DEFAULT_SPREAD_RESEARCH_MANIFEST
         if strategy.spread_paper_enabled:
@@ -276,6 +315,24 @@ class SpreadSidecarService:
         slippage_bps = float(strategy.spread_paper_slippage_buffer_bps)
         if slippage_bps <= 0.0:
             slippage_bps = float(strategy.spread_slippage_reserve_bps)
+        configured_taker = {
+            str(venue.venue or "").lower(): float(venue.taker_fee_bps)
+            for venue in config.venues
+            if str(venue.venue or "").strip()
+        }
+        configured_maker = {
+            str(venue.venue or "").lower(): _venue_maker_fee_bps(venue)
+            for venue in config.venues
+            if str(venue.venue or "").strip()
+        }
+        taker_fees, maker_fees = effective_fee_maps(
+            configured_taker,
+            configured_maker,
+            fee_evidence,
+            allow_verified_maker_rebates=(
+                strategy.spread_allow_verified_maker_rebates is True
+            ),
+        )
         return SpreadPaperConfig(
             enabled=strategy.spread_paper_enabled,
             finalist_limit=int(strategy.spread_paper_finalist_limit),
@@ -288,16 +345,8 @@ class SpreadSidecarService:
             exit_z=float(strategy.spread_exit_z),
             stop_z=float(strategy.spread_stop_z),
             max_hold_ms=int(strategy.spread_max_hold_ms),
-            taker_fee_bps_by_venue={
-                str(venue.venue or "").lower(): float(venue.taker_fee_bps)
-                for venue in config.venues
-                if str(venue.venue or "").strip()
-            },
-            maker_fee_bps_by_venue={
-                str(venue.venue or "").lower(): _venue_maker_fee_bps(venue)
-                for venue in config.venues
-                if str(venue.venue or "").strip()
-            },
+            taker_fee_bps_by_venue=taker_fees,
+            maker_fee_bps_by_venue=maker_fees,
             slippage_buffer_bps=slippage_bps,
             excluded_symbols=list(strategy.spread_paper_excluded_symbols),
             allowed_opportunity_labels=list(strategy.spread_paper_allowed_opportunity_labels),
@@ -308,5 +357,19 @@ class SpreadSidecarService:
             require_taker_taker=strategy.spread_paper_require_taker_taker,
             quote_ttl_ms=strategy.spread_signal_ttl_ms,
             quote_skew_ms=strategy.spread_quote_skew_ms,
+            latency_buffer_bps=float(strategy.spread_paper_latency_buffer_bps),
+            require_l2_vwap=strategy.spread_paper_require_l2_vwap,
+            require_account_fee_evidence=(
+                strategy.spread_paper_require_account_fee_evidence
+            ),
+            account_fee_evidence=fee_evidence,
+            fee_evidence_account_identity_hashes=dict(
+                config.runtime.fee_evidence_account_identity_hashes
+            ),
+            allow_verified_maker_rebates=(
+                strategy.spread_allow_verified_maker_rebates is True
+            ),
+            oos_start_ms=int(strategy.spread_paper_oos_start_ms),
+            require_out_of_sample=strategy.spread_paper_require_out_of_sample,
             research_manifest=manifest,
         )

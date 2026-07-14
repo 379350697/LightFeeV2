@@ -377,10 +377,12 @@ def test_verified_sample_exposes_real_cost_metrics_and_spread_bucket():
     assert sample["features"]["close_markout_bps"] == "-200"
     assert sample["features"]["funding_pnl_bps"] == "120"
     assert sample["features"]["realized_edge_after_cost_bps"] == "-105"
+    assert sample["features"]["realized_net_per_capital_hour_bps"] == "-12600"
     assert sample["features"]["funding_capture_ratio"] == "0.8"
     assert sample["features"]["entry_spread_bucket"] == "15_50bps"
     assert report["aggregates"]["by_entry_spread_bucket"]["15_50bps"]["count"] == 1
     assert report["aggregates"]["by_entry_spread_bucket"]["15_50bps"]["avg_fee_drag_bps"] == "25"
+    assert report["aggregates"]["by_capital_hour_bucket"]["nonpositive"]["count"] == 1
 
 
 def test_recommendations_are_observe_only_and_evidence_tiered():

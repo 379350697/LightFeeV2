@@ -9,6 +9,7 @@ from lightfee.core.domain import Venue
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
 from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -20,6 +21,21 @@ from lightfee.sidecar.snapshot import (
     SnapshotFreshness,
     TransferLifecycle,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_non_canary_snapshot_stages(monkeypatch):
+    """Exercise snapshot freshness after the independent canary policy gate."""
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_admission_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_submission_reason",
+        lambda *_args, **_kwargs: "",
+    )
 
 
 class CapturingEntryExecutor:

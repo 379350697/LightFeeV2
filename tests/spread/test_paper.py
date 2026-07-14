@@ -17,6 +17,7 @@ from lightfee.spread.paper import (
     _paper_bot_execution_supported,
 )
 from lightfee.spread.research_manifest import DEFAULT_SPREAD_RESEARCH_MANIFEST
+from lightfee.strategy.fee_evidence import FeeEvidenceBook, FeeScheduleEvidence
 
 
 def _candidate(
@@ -199,11 +200,312 @@ def _quotes_at(
     }
 
 
+def _account_fee_evidence(*, schema_v3: bool = False) -> FeeEvidenceBook:
+    cheap_identity = "a" * 64 if schema_v3 else ""
+    rich_identity = "b" * 64 if schema_v3 else ""
+    return FeeEvidenceBook(
+        schedules={
+            "cheap": FeeScheduleEvidence(
+                venue="cheap",
+                taker_fee_bps=1.0,
+                maker_fee_bps=0.2,
+                observed_at_ms=1_000,
+                source="account_fee_api",
+                evidence_ref="fee-proof-1",
+                account_identity_hash=cheap_identity,
+            ),
+            "rich": FeeScheduleEvidence(
+                venue="rich",
+                taker_fee_bps=2.0,
+                maker_fee_bps=0.2,
+                observed_at_ms=1_000,
+                source="account_fee_api",
+                evidence_ref="fee-proof-1",
+                account_identity_hash=rich_identity,
+            ),
+        },
+        reason="",
+        document_sha256="c" * 64 if schema_v3 else "unit-test-account-fee-document",
+        integrity_verified=True,
+        integrity_key_id=(
+            "lightfee-fee-evidence-v3" if schema_v3 else "unit-test-key-v1"
+        ),
+        schema_version=3 if schema_v3 else 0,
+    )
+
+
+def test_v3_paper_admission_requires_configured_account_identity_binding() -> None:
+    evidence = _account_fee_evidence(schema_v3=True)
+    candidate = replace(
+        _candidate(),
+        calculation_version="spread_v3_cost_normalized_reversion",
+        model_epoch="v3_cost_normalized_reversion",
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    v3_manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        model_epoch="v3_cost_normalized_reversion",
+    )
+    strict = {
+        "require_account_fee_evidence": True,
+        "account_fee_evidence": evidence,
+        "fee_evidence_account_identity_hashes": {
+            "cheap": "a" * 64,
+            "rich": "b" * 64,
+        },
+        "model_epoch": "v3_cost_normalized_reversion",
+        "research_manifest": v3_manifest,
+    }
+
+    assert _tracker(**strict).register(
+        candidate, _quotes(now_ms=1_000), finalist_rank=0
+    )
+    assert not _tracker(
+        **{
+            **strict,
+            "fee_evidence_account_identity_hashes": {
+                "cheap": "a" * 64,
+                "rich": "d" * 64,
+            },
+        }
+    ).register(candidate, _quotes(now_ms=1_000), finalist_rank=0)
+
+
+def test_paper_maker_rebate_requires_exact_verified_account_schedule() -> None:
+    from lightfee.spread.paper import _execution_fee_evidence_complete, _fee_bps
+
+    evidence = FeeEvidenceBook(
+        schedules={
+            "cheap": FeeScheduleEvidence(
+                venue="cheap",
+                taker_fee_bps=1.0,
+                maker_fee_bps=-0.2,
+                observed_at_ms=1_000,
+                source="account_fee_api",
+                evidence_ref="rebate-proof",
+            )
+        },
+        reason="",
+        document_sha256="test",
+        integrity_verified=True,
+        integrity_key_id="unit-test-key-v1",
+    )
+    config = SpreadPaperConfig(
+        taker_fee_bps_by_venue={"cheap": 1.0},
+        maker_fee_bps_by_venue={"cheap": -0.2},
+        account_fee_evidence=evidence,
+    )
+
+    assert _fee_bps(config, "cheap", "maker") == 1.0
+    assert not _execution_fee_evidence_complete(
+        config,
+        long_venue="cheap",
+        short_venue="cheap",
+        entry_long_role="maker",
+        entry_short_role="taker",
+        exit_long_role="taker",
+        exit_short_role="taker",
+    )
+    verified = replace(config, allow_verified_maker_rebates=True)
+    assert _fee_bps(
+        verified, "cheap", "maker"
+    ) == -0.2
+    assert _execution_fee_evidence_complete(
+        verified,
+        long_venue="cheap",
+        short_venue="cheap",
+        entry_long_role="maker",
+        entry_short_role="taker",
+        exit_long_role="taker",
+        exit_short_role="taker",
+    )
+
+
+def _with_l2(quotes: dict[str, QuoteSnapshot]) -> dict[str, QuoteSnapshot]:
+    return {
+        key: replace(
+            quote,
+            bid_depth=((quote.bid, quote.bid_size),),
+            ask_depth=((quote.ask, quote.ask_size),),
+        )
+        for key, quote in quotes.items()
+    }
+
+
 def test_paper_is_disabled_by_default() -> None:
     tracker = SpreadPaperTracker(SpreadPaperConfig())
 
     assert not tracker.enabled
     assert tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) is None
+
+
+def test_strict_paper_requires_same_epoch_account_fees_and_l2_then_freezes_exit_fee() -> None:
+    evidence = _account_fee_evidence()
+    tracker = _tracker(
+        require_l2_vwap=True,
+        require_account_fee_evidence=True,
+        account_fee_evidence=evidence,
+        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
+        markout_secs=[1],
+        terminal_secs=3,
+    )
+    candidate = replace(
+        _candidate(),
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    quotes = _quotes(now_ms=1_000)
+
+    registered = tracker.register(candidate, quotes, finalist_rank=0)
+    assert registered is not None
+    # A later BBO-only quote is not an executable official fill.
+    assert tracker.evaluate_due(1_001, _quotes_at(quotes, now_ms=1_001)) == []
+
+    fill_quotes = _with_l2(_quotes_at(quotes, now_ms=1_002))
+    filled = _fill_taker(tracker, now_ms=1_002, quotes=fill_quotes)
+    assert filled["official_pnl"] is True
+    # A later config/evidence refresh cannot rewrite a registered position's
+    # four-leg fee schedule.
+    tracker.config = replace(
+        tracker.config,
+        taker_fee_bps_by_venue={"cheap": 99.0, "rich": 99.0},
+    )
+    events = tracker.evaluate_due(2_002, _with_l2(_quotes_at(quotes, now_ms=2_002)))
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["paper_unpriced"] is False
+    assert payload["long_leg"]["exit_fee_bps"] == pytest.approx(1.0)
+    assert payload["short_leg"]["exit_fee_bps"] == pytest.approx(2.0)
+    assert payload["paper_latency_buffer_quote"] == pytest.approx(0.0)
+
+
+def test_diagnostic_paper_never_labels_bbo_or_unsigned_fees_as_official() -> None:
+    tracker = _tracker(
+        require_l2_vwap=False,
+        require_account_fee_evidence=False,
+    )
+    quotes = _quotes(now_ms=1_000)
+
+    assert tracker.register(_candidate(), quotes, finalist_rank=0) is not None
+    filled = _fill_taker(tracker, now_ms=1_001, quotes=_quotes_at(quotes, now_ms=1_001))
+
+    assert filled["paper_fill_capacity_source"] == "top_book_only"
+    assert filled["official_pnl"] is False
+
+
+def test_official_entry_cannot_be_relabelled_official_after_bbo_exit_config_reload() -> None:
+    evidence = _account_fee_evidence()
+    tracker = _tracker(
+        require_l2_vwap=True,
+        require_account_fee_evidence=True,
+        account_fee_evidence=evidence,
+        markout_secs=[1],
+        terminal_secs=3,
+    )
+    candidate = replace(
+        _candidate(),
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    quotes = _quotes(now_ms=1_000)
+
+    assert tracker.register(candidate, quotes, finalist_rank=0) is not None
+    assert _fill_taker(
+        tracker,
+        now_ms=1_001,
+        quotes=_with_l2(_quotes_at(quotes, now_ms=1_001)),
+    )["official_pnl"] is True
+
+    # A relaxed config may retain diagnostic output, but cannot relabel a
+    # BBO-only exit as an official acceptance observation.
+    tracker.config = replace(
+        tracker.config,
+        require_l2_vwap=False,
+        require_account_fee_evidence=False,
+    )
+    events = tracker.evaluate_due(2_001, _quotes_at(quotes, now_ms=2_001))
+
+    assert len(events) == 1
+    assert events[0]["payload"]["paper_unpriced"] is False
+    assert events[0]["payload"]["official_pnl"] is False
+
+
+def test_strict_paper_rejects_fee_provenance_mismatch_and_enforces_oos_cutoff() -> None:
+    evidence = _account_fee_evidence()
+    strict = _tracker(
+        require_account_fee_evidence=True,
+        account_fee_evidence=evidence,
+        oos_start_ms=2_000,
+        require_out_of_sample=True,
+    )
+    matching = replace(
+        _candidate(signal_ts_ms=1_000),
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    assert strict.register(matching, _quotes(now_ms=1_000), finalist_rank=0) is None
+
+    mismatched = replace(
+        matching,
+        signal_ts_ms=2_000,
+        account_fee_evidence_observed_at_ms=999,
+    )
+    assert strict.register(mismatched, _quotes(now_ms=2_000), finalist_rank=0) is None
+
+    out_of_sample = replace(
+        matching,
+        signal_ts_ms=2_000,
+        candidate_id="spread:BTCUSDT:cheap->rich:oos",
+    )
+    event = strict.register(out_of_sample, _quotes(now_ms=2_000), finalist_rank=0)
+    assert event is not None
+    assert event["payload"]["research_sample_split"] == "out_of_sample"
+
+
+def test_restore_rejects_position_fee_receipt_mismatched_to_candidate_snapshot() -> None:
+    evidence = _account_fee_evidence()
+    config = {
+        "require_account_fee_evidence": True,
+        "account_fee_evidence": evidence,
+        "markout_secs": [99],
+        "terminal_secs": 10,
+    }
+    tracker = _tracker(**config)
+    candidate = replace(
+        _candidate(),
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    registered = tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    forged = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "account_fee_evidence_fingerprint": "mismatched",
+        },
+    }
+
+    restored = _tracker(**config)
+    restored.restore_from_records([forged])
+
+    assert restored.tracked_count == 0
 
 
 @pytest.mark.parametrize(
@@ -303,7 +605,7 @@ def test_taker_registration_requires_later_quote_before_official_fill() -> None:
     assert payload["paper_order_status"] == PaperOrderState.FILLED.value
     assert payload["paper_fill_assumption"] == "taker_l2_vwap_or_top_book_size_only"
     assert payload["paper_fill_capacity_source"] == "top_book_only"
-    assert payload["official_pnl"] is True
+    assert payload["official_pnl"] is False
     assert payload["long_leg"]["qty"] == pytest.approx(payload["short_leg"]["qty"])
     assert payload["long_leg"]["entry_filled_at_ms"] == 1_001
     assert payload["short_leg"]["entry_filled_at_ms"] == 1_001
@@ -735,14 +1037,27 @@ def test_pending_maker_emits_nonofficial_delta_markout_before_delayed_hedge() ->
 
 
 def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
-    tracker = _tracker(
-        markout_secs=[1],
-        terminal_secs=2,
-        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
-        slippage_buffer_bps=5.0,
-    )
-    registered = tracker.register(
+    evidence = _account_fee_evidence()
+    strict = {
+        "require_l2_vwap": True,
+        "require_account_fee_evidence": True,
+        "account_fee_evidence": evidence,
+        "markout_secs": [1],
+        "terminal_secs": 2,
+        "taker_fee_bps_by_venue": {"cheap": 1.0, "rich": 2.0},
+        "slippage_buffer_bps": 5.0,
+    }
+    candidate = replace(
         _candidate(),
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    tracker = _tracker(**strict)
+    registered = tracker.register(
+        candidate,
         _quotes(
             now_ms=1_000,
             long_funding_ts_ms=1_500,
@@ -755,17 +1070,29 @@ def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
     _fill_taker(
         tracker,
         now_ms=1_001,
-        quotes=_quotes(
-            now_ms=1_001,
-            long_funding_ts_ms=1_500,
-            short_funding_ts_ms=5_000,
-            funding_interval_ms=10_000,
+        quotes=_with_l2(
+            _quotes(
+                now_ms=1_001,
+                long_funding_ts_ms=1_500,
+                short_funding_ts_ms=5_000,
+                funding_interval_ms=10_000,
+            )
         ),
     )
 
     # A quoted rate is an estimate, not a settlement debit. Without an actual
     # position-allocated ledger entry the markout remains diagnostic-only.
-    first = tracker.evaluate_due(3_001, _quotes(now_ms=3_001, long_funding_ts_ms=1_500, short_funding_ts_ms=5_000, funding_interval_ms=10_000))
+    first = tracker.evaluate_due(
+        3_001,
+        _with_l2(
+            _quotes(
+                now_ms=3_001,
+                long_funding_ts_ms=1_500,
+                short_funding_ts_ms=5_000,
+                funding_interval_ms=10_000,
+            )
+        ),
+    )
     payload = first[0]["payload"]
     assert payload["paper_funding_quote"] == 0.0
     assert payload["funding_settlement_evidence_complete"] is False
@@ -773,14 +1100,9 @@ def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
 
     # Re-open the case and attach the exchange-account fact to the exact paper
     # position/leg. The known short settlement has not happened yet.
-    tracker = _tracker(
-        markout_secs=[1],
-        terminal_secs=2,
-        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
-        slippage_buffer_bps=5.0,
-    )
+    tracker = _tracker(**strict)
     registered = tracker.register(
-        _candidate(),
+        candidate,
         _quotes(
             now_ms=1_000,
             long_funding_ts_ms=1_500,
@@ -793,11 +1115,13 @@ def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
     _fill_taker(
         tracker,
         now_ms=1_001,
-        quotes=_quotes(
-            now_ms=1_001,
-            long_funding_ts_ms=1_500,
-            short_funding_ts_ms=5_000,
-            funding_interval_ms=10_000,
+        quotes=_with_l2(
+            _quotes(
+                now_ms=1_001,
+                long_funding_ts_ms=1_500,
+                short_funding_ts_ms=5_000,
+                funding_interval_ms=10_000,
+            )
         ),
     )
     observed = tracker.record_funding_settlements([
@@ -814,11 +1138,13 @@ def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
 
     events = tracker.evaluate_due(
         3_001,
-        _quotes(
-            now_ms=3_001,
-            long_funding_ts_ms=11_500,
-            short_funding_ts_ms=5_000,
-            funding_interval_ms=10_000,
+        _with_l2(
+            _quotes(
+                now_ms=3_001,
+                long_funding_ts_ms=11_500,
+                short_funding_ts_ms=5_000,
+                funding_interval_ms=10_000,
+            )
         ),
     )
     assert [item["kind"] for item in events] == [
@@ -837,8 +1163,29 @@ def test_official_pnl_requires_actual_allocated_settlement_records() -> None:
         + payload["paper_funding_quote"]
         - payload["paper_fee_quote"]
         - payload["paper_slippage_quote"]
+        - payload["paper_adverse_selection_assumption_quote"]
     )
     assert tracker.tracked_count == 0
+
+
+def test_paper_net_includes_frozen_adverse_selection_assumption() -> None:
+    tracker = _tracker(markout_secs=[1], terminal_secs=2)
+    candidate = replace(_candidate(), adverse_selection_bps=100.0)
+    registered = tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    _fill_taker(tracker, now_ms=1_001, quotes=_quotes(now_ms=1_001))
+
+    events = tracker.evaluate_due(3_001, _quotes(now_ms=3_001))
+    closed = next(event["payload"] for event in events if event["kind"] == "opportunity.paper_closed")
+
+    assert closed["paper_adverse_selection_assumption_quote"] > 0.0
+    assert closed["paper_net_quote"] == pytest.approx(
+        closed["paper_gross_quote"]
+        + closed["paper_funding_quote"]
+        - closed["paper_fee_quote"]
+        - closed["paper_slippage_quote"]
+        - closed["paper_adverse_selection_assumption_quote"]
+    )
 
 
 def test_later_paper_entry_requires_only_post_entry_funding_settlements() -> None:
@@ -899,7 +1246,7 @@ def test_later_paper_entry_requires_only_post_entry_funding_settlements() -> Non
     payload = events[0]["payload"]
     assert payload["funding_settlement_evidence_complete"] is True
     assert payload["paper_funding_quote"] == pytest.approx(-0.01)
-    assert payload["official_pnl"] is True
+    assert payload["official_pnl"] is False
 
 
 def test_public_settled_rate_near_settlement_is_allocated_to_paper_legs() -> None:
@@ -968,7 +1315,7 @@ def test_public_settled_rate_near_settlement_is_allocated_to_paper_legs() -> Non
     )
     payload = events[0]["payload"]
     assert payload["funding_settlement_evidence_complete"] is True
-    assert payload["official_pnl"] is True
+    assert payload["official_pnl"] is False
     shared_base_qty = float(filled["long_leg"]["qty"])
     assert shared_base_qty == pytest.approx(
         float(filled["short_leg"]["qty"])
@@ -1273,7 +1620,7 @@ def test_future_observed_funding_ledger_cannot_time_travel_into_paper_pnl() -> N
     )[0]["payload"]
     assert after_observation["paper_funding_quote"] == pytest.approx(-0.01)
     assert after_observation["settlement_funding_rate_evidence"] == "actual_position_allocated_funding_ledger"
-    assert after_observation["official_pnl"] is True
+    assert after_observation["official_pnl"] is False
 
 
 def test_conflicting_funding_ledger_amount_fails_closed_without_overwriting_first_fact() -> None:
@@ -1381,6 +1728,63 @@ def test_restore_skips_nonfinite_persisted_leg_quantity() -> None:
     restored = _tracker(markout_secs=[99], terminal_secs=10)
     restored.restore_from_records([record])
     assert restored.tracked_count == 0
+
+
+def test_restore_rejects_missing_or_negative_frozen_exit_cost() -> None:
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+
+    missing_exit_fee = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "long_leg": {
+                key: value
+                for key, value in registered["payload"]["long_leg"].items()
+                if key != "exit_fee_bps"
+            },
+        },
+    }
+    negative_exit_fee = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "short_leg": {
+                **registered["payload"]["short_leg"],
+                "exit_fee_bps": -0.1,
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records([missing_exit_fee, negative_exit_fee])
+
+    assert restored.tracked_count == 0
+
+
+def test_restore_uses_frozen_fees_instead_of_the_current_service_schedule() -> None:
+    tracker = _tracker(
+        markout_secs=[99],
+        terminal_secs=10,
+        taker_fee_bps_by_venue={"cheap": 1.0, "rich": 2.0},
+    )
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    filled = _fill_taker(tracker, now_ms=1_001, quotes=_quotes(now_ms=1_001))
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.config = replace(
+        restored.config,
+        taker_fee_bps_by_venue={},
+        maker_fee_bps_by_venue={},
+    )
+    restored.restore_from_records([
+        registered,
+        {"kind": "opportunity.paper_taker_pair_filled", "payload": filled},
+    ])
+
+    assert restored.tracked_count == 1
 
 
 def test_restore_requires_current_journal_and_candidate_economics_proof() -> None:
@@ -1511,7 +1915,7 @@ def test_restore_deduplicates_settlement_replay_and_marks_amount_conflict() -> N
     assert events[0]["payload"]["official_pnl"] is False
 
 
-def test_restore_preserves_official_status_only_for_current_complete_baseline() -> None:
+def test_restore_diagnostic_position_never_upgrades_to_official_status() -> None:
     tracker = _tracker(markout_secs=[99], terminal_secs=1)
     entry_quotes = _quotes(
         now_ms=1_000,
@@ -1549,7 +1953,7 @@ def test_restore_preserves_official_status_only_for_current_complete_baseline() 
 
     assert restored.tracked_count == 0
     assert len(events) == 1
-    assert events[0]["payload"]["official_pnl"] is True
+    assert events[0]["payload"]["official_pnl"] is False
 
 
 def test_restore_maker_leg_cannot_forge_taker_baseline_mode() -> None:

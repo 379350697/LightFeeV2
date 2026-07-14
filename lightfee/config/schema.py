@@ -91,6 +91,22 @@ class RuntimeConfig:
     funding_basis_risk_checkpoint_path: str = (
         "runtime/funding-basis-risk-v1-checkpoint.json"
     )
+    # Account-scoped maker/taker schedules are short-lived evidence, distinct
+    # from static configuration defaults.  Live canaries and official paper
+    # cohorts consume this file fail-closed; shadow diagnostics may still use
+    # the static conservative fee floor when it is absent.
+    fee_evidence_path: str = "runtime/account-fee-evidence.json"
+    # A seven-day fee snapshot cannot safely authorize a small live canary.
+    # Schema-v3 evidence uses a code-owned fixed HMAC environment name.  This
+    # legacy field is retained only to parse old TOML and must be blank (or
+    # the exact fixed name) for live canary validation.
+    fee_evidence_max_age_ms: int = 24 * 60 * 60 * 1000
+    fee_evidence_integrity_key_env: str = ""
+    # Non-sensitive SHA256(account/subaccount UID) binding per venue.  The
+    # signed fee schedule must match this configured trading-account identity.
+    fee_evidence_account_identity_hashes: dict[str, str] = field(
+        default_factory=dict
+    )
     spread_sidecar_refresh_ms: int = 1000
     spread_sidecar_fetch_timeout_s: float = 10.0
     spread_sidecar_source_mode: str = "sidecar_snapshot"
@@ -165,6 +181,18 @@ class StrategyConfig:
     # recovery and close/reconciliation paths are deliberately independent of
     # this switch, so a missing config key can never strand an existing leg.
     funding_new_entries_enabled: bool = False
+    # A funding canary is an additional admission layer for new positions
+    # only.  It cannot interfere with pending hedges, recovery or closing an
+    # existing live position.
+    funding_canary_enabled: bool = False
+    funding_canary_allowed_venues: list[str] = field(
+        default_factory=lambda: ["binance", "bybit", "okx", "gate"]
+    )
+    funding_canary_max_concurrent_positions: int = 1
+    funding_canary_max_entry_notional_quote: float = 30.0
+    funding_canary_min_expected_net_edge_bps: float = 8.0
+    funding_canary_min_worst_case_edge_bps: float = 3.0
+    funding_canary_require_account_fee_evidence: bool = True
     funding_economics_mode: str = "v1_exact"
     funding_forecast_mode: str = "shadow"
     funding_forecast_uncertainty_haircut_bps: float = 2.0
@@ -239,6 +267,14 @@ class StrategyConfig:
     spread_min_history_ms: int = 300000
     spread_min_executable_spread_bps: float = 50.0
     spread_max_executable_spread_bps: float = 300.0
+    # The v3 research epoch may replace the absolute spread floor with a
+    # cost-normalized threshold.  Disabled by default so the historical v2
+    # cohort remains comparable.
+    spread_dynamic_net_edge_enabled: bool = False
+    spread_min_gross_profit_multiple: float = 1.0
+    spread_min_profit_buffer_bps: float = 5.0
+    spread_rank_by_capital_efficiency: bool = False
+    spread_volatility_high_std_bps: float = 10.0
     spread_mean_reversion_min_std_bps: float = 0.05
     spread_mean_reversion_max_half_life_ms: int = 1800000
     spread_stats_window_ms: int = 21600000
@@ -282,6 +318,23 @@ class StrategyConfig:
     )
     spread_paper_terminal_secs: int = 1800
     spread_paper_slippage_buffer_bps: float = 0.0
+    # Apply an explicit latency/adverse-selection reserve in addition to the
+    # later-quote execution model.  It is charged on every paper entry/exit
+    # leg and is journalled separately from raw book VWAP.
+    spread_paper_latency_buffer_bps: float = 0.5
+    # Official paper results require executable L2 on both entry and exit
+    # legs as well as account-scoped fee evidence.  Turning either off keeps
+    # the tracker useful for diagnostics but suppresses official PnL.
+    spread_paper_require_l2_vwap: bool = True
+    spread_paper_require_account_fee_evidence: bool = True
+    # Maker rebates can improve paper economics but are admitted only when a
+    # signed private-account evidence document explicitly records them.
+    spread_allow_verified_maker_rebates: bool = False
+    # A deterministic cutover labels every paper observation.  Zero preserves
+    # current in-sample diagnostics; non-zero is required for an OOS-only
+    # acceptance run.
+    spread_paper_oos_start_ms: int = 0
+    spread_paper_require_out_of_sample: bool = False
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     exit_shadow_enabled: bool = False

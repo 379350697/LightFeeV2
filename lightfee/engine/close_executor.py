@@ -1231,6 +1231,15 @@ class CloseExecutor:
             position, total_chunks, short_legs, long_legs,
         )
         close.reason = reason
+        close.implementation_shortfall_quote = (
+            _close_implementation_shortfall_quote(
+                position,
+                long_legs=long_legs,
+                short_legs=short_legs,
+                long_benchmark_price=long_price_hint,
+                short_benchmark_price=short_price_hint,
+            )
+        )
 
         # Detect residual from total closed quantities
         long_closed = sum(leg.fill.quantity for leg in long_legs)
@@ -1324,6 +1333,12 @@ class CloseExecutor:
                     "funding_forecast_error_quote": pnl_attr[
                         "funding_forecast_error_quote"
                     ],
+                    "implementation_shortfall_quote": pnl_attr[
+                        "implementation_shortfall_quote"
+                    ],
+                    "execution_benchmark_complete": pnl_attr[
+                        "execution_benchmark_complete"
+                    ],
                     "calculation_version": position.calculation_version,
                     "model_epoch": position.model_epoch,
                     "economics_observed_at_ms": position.economics_observed_at_ms,
@@ -1370,6 +1385,18 @@ class CloseExecutor:
         position.short_quantity = max(position.short_quantity - short_closed, 0.0)
         position.realized_price_pnl_quote += close.realized_price_pnl_quote
         position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+        if (
+            position.execution_benchmark_complete is True
+            and close.implementation_shortfall_quote is not None
+        ):
+            position.exit_implementation_shortfall_quote += (
+                close.implementation_shortfall_quote
+            )
+        else:
+            # Missing quote evidence may not be silently converted to a zero
+            # execution cost.  It only suppresses acceptance eligibility;
+            # V1 lifecycle accounting and close behavior are unchanged.
+            position.execution_benchmark_complete = False
         if reason.startswith("risk_delever"):
             position.risk_delever_realized_price_pnl_quote += close.realized_price_pnl_quote
             position.risk_delever_realized_exit_fee_quote += (
@@ -2530,6 +2557,19 @@ def build_exit_pnl_attribution(
         "price_pnl_quote": close.realized_price_pnl_quote,
         "entry_fee_quote": entry_fee,
         "exit_fee_quote": exit_fee,
+        "implementation_shortfall_quote": (
+            position.entry_implementation_shortfall_quote
+            + close.implementation_shortfall_quote
+            if (
+                position.execution_benchmark_complete is True
+                and close.implementation_shortfall_quote is not None
+            )
+            else None
+        ),
+        "execution_benchmark_complete": (
+            position.execution_benchmark_complete is True
+            and close.implementation_shortfall_quote is not None
+        ),
         "net_quote": net,
     }
 
@@ -2564,8 +2604,61 @@ def build_position_pnl_attribution(position: OpenPosition) -> dict[str, object]:
         "price_pnl_quote": price_pnl,
         "entry_fee_quote": entry_fee,
         "exit_fee_quote": exit_fee,
+        "implementation_shortfall_quote": (
+            position.entry_implementation_shortfall_quote
+            + position.exit_implementation_shortfall_quote
+            if position.execution_benchmark_complete is True
+            else None
+        ),
+        "execution_benchmark_complete": position.execution_benchmark_complete is True,
         "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
     }
+
+
+def _close_implementation_shortfall_quote(
+    position: OpenPosition,
+    *,
+    long_legs: list[CloseExecutionLeg],
+    short_legs: list[CloseExecutionLeg],
+    long_benchmark_price: object,
+    short_benchmark_price: object,
+) -> float | None:
+    """Measure adverse close fills without conflating them with holding PnL."""
+    try:
+        long_benchmark = float(long_benchmark_price)
+        short_benchmark = float(short_benchmark_price)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        position.execution_benchmark_complete is not True
+        or not all(
+            math.isfinite(value) and value > 0.0
+            for value in (long_benchmark, short_benchmark)
+        )
+    ):
+        return None
+    shortfall = 0.0
+    for leg in long_legs:
+        fill = leg.fill
+        if not (
+            math.isfinite(fill.price)
+            and math.isfinite(fill.quantity)
+            and fill.price > 0.0
+            and fill.quantity > 0.0
+        ):
+            return None
+        shortfall += max(long_benchmark - fill.price, 0.0) * fill.quantity
+    for leg in short_legs:
+        fill = leg.fill
+        if not (
+            math.isfinite(fill.price)
+            and math.isfinite(fill.quantity)
+            and fill.price > 0.0
+            and fill.quantity > 0.0
+        ):
+            return None
+        shortfall += max(fill.price - short_benchmark, 0.0) * fill.quantity
+    return shortfall if math.isfinite(shortfall) else None
 
 
 def _residual_task_to_dict(task: ResidualExposureTask) -> dict[str, Any]:

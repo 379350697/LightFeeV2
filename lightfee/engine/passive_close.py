@@ -5014,6 +5014,14 @@ class PassiveCloseExecutor:
         )
         close.reason = pending.reason
 
+        # A passive-close fill records its realised price but this V1 path does
+        # not retain the contemporaneous executable two-leg benchmark needed
+        # for an implementation-shortfall measurement.  Do not let an entry
+        # benchmark make the later exit look measured at zero cost.  This is
+        # acceptance metadata only: passive-close routing, PnL, recovery and
+        # residual-repair semantics remain unchanged.
+        position.execution_benchmark_complete = False
+
         # Apply close to position state
         long_closed = sum(leg.fill.quantity for leg in long_legs if leg.fill)
         short_closed = sum(leg.fill.quantity for leg in short_legs if leg.fill)
@@ -5363,6 +5371,11 @@ class PassiveCloseExecutor:
             long_open_orders_evidence=long_open_orders_evidence,
             short_open_orders_evidence=short_open_orders_evidence,
         )
+        # This recovery/flat-truth branch proves that exposure is gone, not
+        # the executable benchmark at which it disappeared.  Keep the V1
+        # state transition intact but make any later canary receipt fail
+        # closed instead of carrying a stale entry-side benchmark forward.
+        position.execution_benchmark_complete = False
         if extra is not None:
             extra.setdefault("exchange_truth", dict(exchange_truth))
         self._clear_live_flat_state(

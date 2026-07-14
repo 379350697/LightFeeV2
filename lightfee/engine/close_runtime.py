@@ -50,11 +50,21 @@ def _funding_settlement_receipt_payload(
         "required_settlement_count": result.required_count,
         "observed_settlement_count": result.observed_count,
         "statement_claims": statement_claims,
+        # Keep the promotion permission itself in the durable receipt.  A
+        # complete-looking number/claim payload is not official accounting
+        # unless the reconciler explicitly granted the literal boolean.
+        "official_pnl": task.get("official_pnl") is True,
         "official_funding_quote": task.get("official_funding_quote"),
         "official_net_quote": task.get("official_net_quote"),
         "price_pnl_quote": task.get("price_pnl_quote"),
         "entry_fee_quote": task.get("entry_fee_quote"),
         "exit_fee_quote": task.get("exit_fee_quote"),
+        "implementation_shortfall_quote": task.get(
+            "implementation_shortfall_quote"
+        ),
+        "execution_benchmark_complete": task.get(
+            "execution_benchmark_complete"
+        ) is True,
         "lifecycle_forecast_funding_quote": task.get(
             "lifecycle_forecast_funding_quote"
         ),
@@ -65,6 +75,59 @@ def _funding_settlement_receipt_payload(
         "model_epoch": task.get("model_epoch", ""),
         "economics_observed_at_ms": task.get("economics_observed_at_ms", 0),
     }
+
+
+def _terminal_account_truth_for_funding_receipt(
+    exchange_truth: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Derive terminal-flat flags from the fresh account probe, never a claim.
+
+    The recovery-ledger account probe intentionally records raw position and
+    order rows instead of duplicating summary flags.  Funding-canary analysis
+    consumes a durable receipt, however, and must not infer flatness from a
+    missing field or from an old caller-provided boolean.  These flags are
+    therefore derived here from the exact fresh probe captured by the worker.
+    Any unavailable, malformed, non-finite, non-zero, or open row fails
+    closed.
+    """
+    if not isinstance(exchange_truth, dict):
+        return None
+    normalized = dict(exchange_truth)
+    positions = normalized.get("positions")
+    open_orders = normalized.get("open_orders")
+    truth_available = normalized.get("truth_available") is True
+    truth_supported = normalized.get("truth_supported") is not False
+
+    positions_flat = truth_available and truth_supported and isinstance(positions, list)
+    if positions_flat:
+        for row in positions:
+            if not isinstance(row, dict):
+                positions_flat = False
+                break
+            quantity = row.get("quantity", row.get("position_qty"))
+            if isinstance(quantity, bool):
+                positions_flat = False
+                break
+            try:
+                parsed_quantity = float(quantity)
+            except (TypeError, ValueError):
+                positions_flat = False
+                break
+            if not math.isfinite(parsed_quantity) or abs(parsed_quantity) > 1e-9:
+                positions_flat = False
+                break
+
+    # A successful account-level open-order endpoint returns only live rows;
+    # any row, including a malformed one, is incompatible with a flat claim.
+    open_orders_flat = (
+        truth_available
+        and truth_supported
+        and isinstance(open_orders, list)
+        and not open_orders
+    )
+    normalized["positions_flat"] = positions_flat
+    normalized["open_orders_flat"] = open_orders_flat
+    return normalized
 
 
 def _funding_settlement_terminal_receipt_row(
@@ -2409,13 +2472,13 @@ class CloseRuntime:
     async def _run_pending_funding_settlement_reconciliation_work(
         self,
         work: dict[str, Any],
-    ) -> list[tuple[dict[str, Any], Any]]:
-        """Perform only the blocking private-statement query off the tick lane."""
+    ) -> tuple[list[tuple[dict[str, Any], Any]], dict[str, Any] | None]:
+        """Perform accounting queries and one fresh terminal-truth probe off tick."""
         from lightfee.strategy.funding_settlement_reconciler import (
             FundingSettlementReconciler,
         )
 
-        return await asyncio.wait_for(
+        reconciled = await asyncio.wait_for(
             FundingSettlementReconciler().reconcile_pending_tasks(
                 work["due_tasks"],
                 self.ctx.venue_adapters,
@@ -2426,6 +2489,20 @@ class CloseRuntime:
             ),
             timeout=self._FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S,
         )
+        # A funding receipt is accounting evidence, not proof that both venue
+        # legs and their open orders are flat.  Capture that proof separately,
+        # after reconciliation and without ever delaying the close path.
+        collector = getattr(self.ctx, "_collect_recovery_ledger_account_truth", None)
+        if not callable(collector):
+            return reconciled, None
+        try:
+            exchange_truth = await asyncio.wait_for(
+                collector(int(work["now_ms"])),
+                timeout=self._FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S,
+            )
+        except Exception:
+            return reconciled, None
+        return reconciled, _terminal_account_truth_for_funding_receipt(exchange_truth)
 
     @staticmethod
     def _funding_settlement_claim_keys_for_task(
@@ -2546,6 +2623,7 @@ class CloseRuntime:
         self,
         work: dict[str, Any],
         reconciled: list[tuple[dict[str, Any], Any]],
+        exchange_truth: dict[str, Any] | None = None,
     ) -> None:
         """Merge completed work by durable identity, preserving new queue rows."""
         from lightfee.strategy.funding_settlement_reconciler import (
@@ -2640,10 +2718,22 @@ class CloseRuntime:
                     )
                     continue
                 try:
+                    receipt = _funding_settlement_receipt_payload(state, merged, result)
+                    terminal_account_truth = _terminal_account_truth_for_funding_receipt(
+                        exchange_truth
+                    )
+                    if (
+                        isinstance(terminal_account_truth, dict)
+                        and close_reconciliation_exchange_truth_clean(
+                            merged,
+                            current_exchange_truth=terminal_account_truth,
+                        )
+                    ):
+                        receipt["exchange_truth"] = terminal_account_truth
                     self.ctx.journal.append_critical(
                         now_ms,
                         "funding.settlement_reconciled",
-                        _funding_settlement_receipt_payload(state, merged, result),
+                        receipt,
                     )
                 except Exception as error:
                     # Keep a batch's earlier durable receipts committed.  A
@@ -2757,9 +2847,11 @@ class CloseRuntime:
             self._funding_settlement_reconciliation_worker = None
             self._funding_settlement_reconciliation_work = None
             try:
+                reconciled, exchange_truth = worker.result()
                 self._apply_pending_funding_settlement_worker_results(
                     work,
-                    worker.result(),
+                    reconciled,
+                    exchange_truth,
                 )
             except asyncio.CancelledError:
                 return

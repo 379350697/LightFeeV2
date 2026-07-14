@@ -19,9 +19,19 @@ from lightfee.spread.research_manifest import (
     DEFAULT_SPREAD_RESEARCH_MANIFEST,
     SpreadResearchManifest,
 )
+from lightfee.strategy.fee_evidence import (
+    FEE_EVIDENCE_SCHEMA_VERSION,
+    TRUSTED_FEE_EVIDENCE_KEY_ID,
+    FeeEvidenceBook,
+)
 
 
-SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 3
+# v6 persists the fee schedule, signed account-evidence provenance, manifest
+# digest and latency reserve captured at entry.  Older
+# rows remain historical diagnostics but cannot be resumed as official paper
+# positions because re-pricing their exit fee under today's schedule would
+# rewrite their economics.
+SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 6
 
 
 class PaperOrderState(StrEnum):
@@ -40,6 +50,7 @@ class SpreadPaperBotSpec:
     cohort: str
     hypothesis: str = ""
     manifest_version: str = "spread_research_manifest_v2"
+    manifest_digest: str = ""
     acceptance_eligible: bool = False
     entry_long_role: str = "taker"
     entry_short_role: str = "taker"
@@ -66,6 +77,27 @@ class SpreadPaperConfig:
     taker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     maker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
     slippage_buffer_bps: float = 0.0
+    # This is an additional, explicit adverse execution allowance.  It is
+    # applied on every entry and exit in addition to the book/VWAP price.
+    latency_buffer_bps: float = 0.0
+    # Library callers can retain diagnostic BBO paper by default.  The live
+    # service sets both gates to True from StrategyConfig for official cohorts.
+    require_l2_vwap: bool = False
+    require_account_fee_evidence: bool = False
+    account_fee_evidence: FeeEvidenceBook | None = None
+    # Schema-v3 paper records bind the fee schedule to the configured trading
+    # account for each venue.  Keeping the expected hashes in config makes a
+    # copied valid document from a different sub-account fail closed.
+    fee_evidence_account_identity_hashes: dict[str, str] = field(
+        default_factory=dict
+    )
+    # A caller-provided negative maker map is not a rebate unless it exactly
+    # matches a signed account-fee schedule.
+    allow_verified_maker_rebates: bool = False
+    # A non-zero cutoff labels registrations after it as out-of-sample.  When
+    # strict, pre-cutoff observations are not registered at all.
+    oos_start_ms: int = 0
+    require_out_of_sample: bool = False
     excluded_symbols: list[str] = field(default_factory=list)
     allowed_opportunity_labels: list[str] = field(
         default_factory=lambda: ["spread_reversion"]
@@ -140,6 +172,10 @@ class SpreadPaperLeg:
     entry_slippage_quote: float
     funding_rate_bps: float
     funding_timestamp_ms: int
+    # Fees and latency are immutable entry-time assumptions.  They must not
+    # silently change if a service refreshes its account-fee evidence later.
+    exit_fee_bps: float = 0.0
+    entry_latency_buffer_quote: float = 0.0
     funding_interval_ms: int = 0
     entry_filled_at_ms: int = 0
     order_state: str = PaperOrderState.NEW.value
@@ -190,8 +226,18 @@ class SpreadPaperPosition:
     # taker/taker fill, and markout additionally requires settlement proof.
     official_pnl: bool = False
     research_manifest_version: str = "spread_research_manifest_v2"
+    research_manifest_digest: str = ""
     research_hypothesis: str = ""
     acceptance_eligible: bool = False
+    account_fee_evidence_complete: bool = False
+    account_fee_evidence_observed_at_ms: int = 0
+    account_fee_evidence_source: str = ""
+    account_fee_evidence_fingerprint: str = ""
+    account_fee_evidence_provenance: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    research_sample_split: str = "in_sample"
+    volatility_regime: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -295,9 +341,11 @@ class SpreadPaperTracker:
         # only until the signed-basis builder proves the two legs compatible.
         if str(candidate.contract_normalization_status or "").lower() != "complete":
             return []
-        if candidate.calculation_version != "spread_v2_signed_reversion":
+        if candidate.calculation_version != _candidate_calculation_version(self.config):
             return []
         if str(candidate.model_epoch or "") != self.config.model_epoch:
+            return []
+        if not _candidate_account_fee_evidence_complete(self.config, candidate):
             return []
         if candidate.symbol.upper() in _excluded_symbols(self.config):
             return []
@@ -354,7 +402,7 @@ class SpreadPaperTracker:
         return events
 
     def restore_from_records(self, records: list[dict]) -> None:
-        """Restore v3 open positions; legacy records remain diagnostic-only."""
+        """Restore v5 open positions; prior journal schemas stay diagnostic-only."""
         self._positions.clear()
         self._emitted_horizons.clear()
         self._known_paper_ids.clear()
@@ -387,7 +435,7 @@ class SpreadPaperTracker:
                 if not _restored_position_has_fee_evidence(position, self.config):
                     self._known_paper_ids.add(paper_id)
                     continue
-                if not _restored_position_is_official_eligible(position):
+                if not _restored_position_is_official_eligible(position, self.config):
                     position = replace(position, official_pnl=False)
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
@@ -589,6 +637,9 @@ class SpreadPaperTracker:
         registered_at_ms = int(decision_at_ms or 0)
         if registered_at_ms <= 0:
             return None
+        sample_split = _research_sample_split(candidate, self.config, registered_at_ms)
+        if self.config.require_out_of_sample and sample_split != "out_of_sample":
+            return None
         entry_eligible_at_ms = registered_at_ms + self.config.min_decision_latency_ms
         target_notional = float(candidate.entry_notional_quote or 0.0)
         long_raw = _entry_raw_price(long_quote, "long", bot.entry_long_role)
@@ -633,8 +684,8 @@ class SpreadPaperTracker:
             registered_at_ms=registered_at_ms,
             entry_eligible_at_ms=entry_eligible_at_ms,
             entry_notional_quote=target_notional,
-            long_leg=replace(long_leg, exit_liquidity_role=bot.exit_long_role),
-            short_leg=replace(short_leg, exit_liquidity_role=bot.exit_short_role),
+            long_leg=_with_exit_terms(long_leg, bot.exit_long_role, self.config),
+            short_leg=_with_exit_terms(short_leg, bot.exit_short_role, self.config),
             candidate_snapshot=_candidate_snapshot(candidate),
             entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
             # Pending entries can expire after the decision window; once
@@ -647,8 +698,24 @@ class SpreadPaperTracker:
             model_epoch=self.config.model_epoch,
             official_pnl=False,
             research_manifest_version=bot.manifest_version,
+            research_manifest_digest=bot.manifest_digest,
             research_hypothesis=bot.hypothesis,
             acceptance_eligible=acceptance_eligible,
+            account_fee_evidence_complete=(
+                candidate.account_fee_evidence_complete is True
+            ),
+            account_fee_evidence_observed_at_ms=int(
+                candidate.account_fee_evidence_observed_at_ms or 0
+            ),
+            account_fee_evidence_source=str(candidate.account_fee_evidence_source or ""),
+            account_fee_evidence_fingerprint=str(
+                candidate.account_fee_evidence_fingerprint or ""
+            ),
+            account_fee_evidence_provenance=list(
+                candidate.account_fee_evidence_provenance or []
+            ),
+            research_sample_split=sample_split,
+            volatility_regime=str(candidate.volatility_regime or "unknown"),
         )
 
     def _advance_pending_entry(
@@ -721,9 +788,10 @@ class SpreadPaperTracker:
             if maker_leg == "long":
                 next_position = replace(
                     position,
-                    long_leg=replace(
+                    long_leg=_with_exit_terms(
                         filled_maker,
-                        exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                        position.long_leg.exit_liquidity_role,
+                        self.config,
                     ),
                     maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=maker_qty,
@@ -742,9 +810,10 @@ class SpreadPaperTracker:
             else:
                 next_position = replace(
                     position,
-                    short_leg=replace(
+                    short_leg=_with_exit_terms(
                         filled_maker,
-                        exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                        position.short_leg.exit_liquidity_role,
+                        self.config,
                     ),
                     maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=-maker_qty,
@@ -825,9 +894,10 @@ class SpreadPaperTracker:
         if maker_leg == "long":
             next_position = replace(
                 position,
-                short_leg=replace(
+                short_leg=_with_exit_terms(
                     filled_hedge,
-                    exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                    position.short_leg.exit_liquidity_role,
+                    self.config,
                 ),
                 filled_base_qty=qty,
                 residual_base_qty=residual,
@@ -843,9 +913,10 @@ class SpreadPaperTracker:
         else:
             next_position = replace(
                 position,
-                long_leg=replace(
+                long_leg=_with_exit_terms(
                     filled_hedge,
-                    exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                    position.long_leg.exit_liquidity_role,
+                    self.config,
                 ),
                 filled_base_qty=qty,
                 residual_base_qty=residual,
@@ -878,6 +949,13 @@ class SpreadPaperTracker:
             short_quote, "short", position.short_leg.entry_liquidity_role, requested_qty
         )
         if long_execution is None or short_execution is None:
+            return None
+        if self.config.require_l2_vwap and not _executions_have_l2(
+            long_execution,
+            short_execution,
+        ):
+            # Do not turn a BBO fallback into a claimed executable paper fill.
+            # Keeping it pending makes the terminal journal state explicit.
             return None
         quantity = min(requested_qty, long_execution.capacity, short_execution.capacity)
         quantity = min(
@@ -932,17 +1010,26 @@ class SpreadPaperTracker:
             and position.acceptance_eligible is True
             and position.paper_control_group is False
             and not position.paper_maker_leg
+            # Disabling either strict gate retains diagnostic paper lifecycle
+            # events, but must never relabel a BBO/unauthenticated simulation
+            # as an official acceptance observation.
+            and self.config.require_l2_vwap is True
+            and self.config.require_account_fee_evidence is True
+            and _position_account_fee_evidence_complete(position, self.config)
+            and _executions_have_l2(long_execution, short_execution)
         )
         return (
             replace(
                 position,
-                long_leg=replace(
+                long_leg=_with_exit_terms(
                     long_leg,
-                    exit_liquidity_role=position.long_leg.exit_liquidity_role,
+                    position.long_leg.exit_liquidity_role,
+                    self.config,
                 ),
-                short_leg=replace(
+                short_leg=_with_exit_terms(
                     short_leg,
-                    exit_liquidity_role=position.short_leg.exit_liquidity_role,
+                    position.short_leg.exit_liquidity_role,
+                    self.config,
                 ),
                 entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
                 due_horizons=_due_horizons(now_ms, self.config),
@@ -998,6 +1085,10 @@ class SpreadPaperTracker:
         return bool(
             long_execution is not None
             and short_execution is not None
+            and (
+                not self.config.require_l2_vwap
+                or _executions_have_l2(long_execution, short_execution)
+            )
             and long_execution.capacity + 1e-12 >= position.long_leg.qty
             and short_execution.capacity + 1e-12 >= position.short_leg.qty
         )
@@ -1057,6 +1148,7 @@ def _paper_bot_specs(config: SpreadPaperConfig) -> list[SpreadPaperBotSpec]:
             cohort=cohort.cohort,
             hypothesis=cohort.hypothesis,
             manifest_version=manifest.version,
+            manifest_digest=manifest.digest,
             acceptance_eligible=cohort.acceptance_eligible,
             entry_long_role=cohort.entry_long_role,
             entry_short_role=cohort.entry_short_role,
@@ -1167,18 +1259,66 @@ def _leg(
     filled_at_ms: int = 0,
     execution_source: str = "top_book_only",
 ) -> SpreadPaperLeg:
-    entry_price = None if pending else _apply_slippage(raw_price, bps=config.slippage_buffer_bps, action="buy" if side == "long" else "sell")
+    entry_price = None
+    entry_slippage = 0.0
+    entry_latency = 0.0
+    if not pending:
+        entry_price, entry_slippage, entry_latency = _slippage_terms(
+            raw_price,
+            qty,
+            config,
+            "buy" if side == "long" else "sell",
+        )
     notional = 0.0 if entry_price is None else qty * entry_price
     fee_bps = _fee_bps(config, venue, role)
-    slippage = 0.0 if entry_price is None else abs(entry_price - raw_price) * qty
     return SpreadPaperLeg(
         venue=str(venue).lower(), side=side, entry_liquidity_role=_liquidity_role(role), exit_liquidity_role="taker", entry_pending=pending,
         entry_bid=float(quote.bid or 0.0), entry_ask=float(quote.ask or 0.0), entry_bid_size=float(quote.bid_size or 0.0), entry_ask_size=float(quote.ask_size or 0.0), entry_observed_at_ms=int(quote.observed_at_ms or 0),
         mark_price=float(quote.mark_price or 0.0), index_price=float(quote.index_price or 0.0), volume_24h_quote=float(quote.volume_24h_quote or 0.0), open_interest=float(quote.open_interest or 0.0),
-        entry_raw_price=raw_price, entry_price=entry_price, qty=qty, entry_notional_quote=notional, entry_fee_bps=fee_bps, entry_fee_quote=notional * fee_bps / 10_000.0, entry_slippage_quote=slippage,
+        entry_raw_price=raw_price, entry_price=entry_price, qty=qty, entry_notional_quote=notional, entry_fee_bps=fee_bps, entry_fee_quote=notional * fee_bps / 10_000.0, entry_slippage_quote=entry_slippage,
+        entry_latency_buffer_quote=entry_latency,
         funding_rate_bps=float(quote.funding_rate_bps or 0.0), funding_timestamp_ms=int(quote.funding_timestamp_ms or 0), funding_interval_ms=int(quote.funding_interval_ms or 0),
         entry_filled_at_ms=0 if pending else max(int(filled_at_ms or 0), 0), order_state=state.value, requested_qty=requested_qty, residual_qty=max(requested_qty - qty, 0.0),
         entry_execution_source=execution_source,
+    )
+
+
+def _with_exit_terms(
+    leg: SpreadPaperLeg,
+    exit_role: str,
+    config: SpreadPaperConfig,
+) -> SpreadPaperLeg:
+    """Freeze exit role/fee when a paper position is registered or filled."""
+    normalized_role = _liquidity_role(exit_role)
+    return replace(
+        leg,
+        exit_liquidity_role=normalized_role,
+        exit_fee_bps=_fee_bps(config, leg.venue, normalized_role),
+    )
+
+
+def _slippage_terms(
+    raw_price: float,
+    quantity: float,
+    config: SpreadPaperConfig,
+    action: str,
+) -> tuple[float, float, float]:
+    """Price total execution reserve and expose its latency component."""
+    base_price = _apply_slippage(
+        raw_price,
+        bps=config.slippage_buffer_bps,
+        action=action,
+    )
+    total_price = _apply_slippage(
+        raw_price,
+        bps=(config.slippage_buffer_bps + config.latency_buffer_bps),
+        action=action,
+    )
+    quantity = max(float(quantity or 0.0), 0.0)
+    return (
+        total_price,
+        abs(total_price - raw_price) * quantity,
+        abs(total_price - base_price) * quantity,
     )
 
 
@@ -1467,10 +1607,17 @@ def _base_payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int,
         "paper_id": position.paper_id, "candidate_id": position.candidate_id, "review_id": None, "symbol": position.symbol,
         "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}", "long_venue": position.long_venue, "short_venue": position.short_venue,
         "candidate_opportunity_label": position.candidate_opportunity_label, "paper_bot_id": position.paper_bot_id, "paper_cohort": position.paper_cohort,
-        "research_manifest_version": position.research_manifest_version, "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
+        "research_manifest_version": position.research_manifest_version, "research_manifest_digest": position.research_manifest_digest, "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
         "paper_entry_mode": position.paper_entry_mode, "paper_exit_mode": position.paper_exit_mode, "paper_execution_model": position.paper_entry_mode,
         "paper_maker_leg": position.paper_maker_leg, "paper_hedge_delay_ms": position.paper_hedge_delay_ms, "paper_control_group": position.paper_control_group,
         "paper_fill_assumption": position.paper_fill_assumption, "horizon_kind": horizon_kind, "registered_at_ms": position.registered_at_ms, "entry_eligible_at_ms": position.entry_eligible_at_ms, "evaluated_at_ms": now_ms,
+        "account_fee_evidence_complete": position.account_fee_evidence_complete,
+        "account_fee_evidence_observed_at_ms": position.account_fee_evidence_observed_at_ms,
+        "account_fee_evidence_source": position.account_fee_evidence_source,
+        "account_fee_evidence_fingerprint": position.account_fee_evidence_fingerprint,
+        "account_fee_evidence_provenance": list(position.account_fee_evidence_provenance),
+        "research_sample_split": position.research_sample_split,
+        "volatility_regime": position.volatility_regime,
         "selected_real_trade": False, "not_selected_reason": "spread_shadow_paper", "paper_order_status": _position_order_state(position),
         "paper_entry_notional_quote": position.entry_notional_quote, "requested_base_qty": position.requested_base_qty, "filled_base_qty": position.filled_base_qty, "residual_base_qty": position.residual_base_qty,
         "delta_exposure_base_qty": position.delta_exposure_base_qty, "maker_fill_observed_at_ms": position.maker_fill_observed_at_ms,
@@ -1500,6 +1647,11 @@ def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, lon
         or position.short_leg.entry_raw_price is None
     ):
         return _unpriced_payload(base, position, "invalid_exit_prices")
+    if config.require_l2_vwap and not _executions_have_l2(
+        long_execution,
+        short_execution,
+    ):
+        return _unpriced_payload(base, position, "missing_l2_exit_depth")
     if (
         (position.long_leg.qty > 0.0 and long_execution.capacity + 1e-12 < position.long_leg.qty)
         or (position.short_leg.qty > 0.0 and short_execution.capacity + 1e-12 < position.short_leg.qty)
@@ -1511,25 +1663,51 @@ def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, lon
         )
     long_raw = long_execution.price
     short_raw = short_execution.price
-    long_exit = _apply_slippage(long_raw, bps=config.slippage_buffer_bps, action="sell")
-    short_exit = _apply_slippage(short_raw, bps=config.slippage_buffer_bps, action="buy")
+    long_exit, long_exit_slippage, long_exit_latency = _slippage_terms(
+        long_raw,
+        position.long_leg.qty,
+        config,
+        "sell",
+    )
+    short_exit, short_exit_slippage, short_exit_latency = _slippage_terms(
+        short_raw,
+        position.short_leg.qty,
+        config,
+        "buy",
+    )
     long_gross = position.long_leg.qty * (long_raw - position.long_leg.entry_raw_price)
     short_gross = position.short_leg.qty * (position.short_leg.entry_raw_price - short_raw)
-    long_exit_fee = position.long_leg.qty * long_exit * _fee_bps(config, position.long_venue, position.long_leg.exit_liquidity_role) / 10_000.0
-    short_exit_fee = position.short_leg.qty * short_exit * _fee_bps(config, position.short_venue, position.short_leg.exit_liquidity_role) / 10_000.0
+    long_exit_fee = position.long_leg.qty * long_exit * position.long_leg.exit_fee_bps / 10_000.0
+    short_exit_fee = position.short_leg.qty * short_exit * position.short_leg.exit_fee_bps / 10_000.0
     entry_fee = position.long_leg.entry_fee_quote + position.short_leg.entry_fee_quote
     entry_slippage = position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote
-    exit_slippage = abs(long_exit - long_raw) * position.long_leg.qty + abs(short_exit - short_raw) * position.short_leg.qty
+    exit_slippage = long_exit_slippage + short_exit_slippage
+    entry_latency = (
+        position.long_leg.entry_latency_buffer_quote
+        + position.short_leg.entry_latency_buffer_quote
+    )
+    exit_latency = long_exit_latency + short_exit_latency
     settled = _settlement_funding_quote(position, now_ms)
     accrued = _accrued_funding_quote(position, now_ms)
     gross = long_gross + short_gross
     fee = entry_fee + long_exit_fee + short_exit_fee
     slippage = entry_slippage + exit_slippage
-    net = gross + settled - fee - slippage
     matched_notional = max(
         (position.long_leg.entry_notional_quote + position.short_leg.entry_notional_quote) / 2.0,
         1e-12,
     )
+    adverse_selection_assumption = (
+        matched_notional
+        * max(
+            float(position.candidate_snapshot.get("adverse_selection_bps", 0.0) or 0.0),
+            0.0,
+        )
+        / 10_000.0
+    )
+    # This is a baseline cost promised by the paper economics contract, not
+    # only a stress-display field.  Excluding it here would overstate every
+    # headline and make the 1x statistic incomparable with stress outcomes.
+    net = gross + settled - fee - slippage - adverse_selection_assumption
     funding_evidence_complete = _funding_settlement_evidence_complete(
         position,
         now_ms,
@@ -1540,6 +1718,11 @@ def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, lon
         position.official_pnl is True
         and abs(position.delta_exposure_base_qty) <= 1e-12
         and position.residual_base_qty <= 1e-12
+        # Entry was permissioned only with L2, but an in-process config reload
+        # must not let a later diagnostic BBO exit inherit that permission.
+        # Official acceptance therefore requires executable L2 on this exit
+        # as an immutable per-observation fact, independent of today's gate.
+        and _executions_have_l2(long_execution, short_execution)
         and funding_evidence_complete
     )
     base.update({
@@ -1553,9 +1736,12 @@ def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, lon
         ),
         "funding_settlement_evidence_complete": funding_evidence_complete,
         "paper_slippage_quote": slippage, "paper_entry_slippage_quote": entry_slippage, "paper_exit_slippage_quote": exit_slippage,
+        "paper_latency_buffer_quote": entry_latency + exit_latency,
+        "paper_entry_latency_buffer_quote": entry_latency,
+        "paper_exit_latency_buffer_quote": exit_latency,
         "paper_hedge_delay_quote": _hedge_delay_quote(position), "paper_residual_quote": _residual_gross_quote(position, long_gross, short_gross),
         "paper_adverse_selection_quote": 0.0,
-        "paper_adverse_selection_assumption_quote": matched_notional * max(float(position.candidate_snapshot.get("adverse_selection_bps", 0.0) or 0.0), 0.0) / 10_000.0,
+        "paper_adverse_selection_assumption_quote": adverse_selection_assumption,
         "paper_matched_entry_notional_quote": matched_notional,
         "paper_net_quote": net, "paper_net_bps": net / matched_notional * 10_000.0,
         "paper_unpriced": False, "official_pnl": official_pnl, "opportunity_label": classify_paper_outcome(False, net, None),
@@ -1573,6 +1759,9 @@ def _unpriced_payload(base: dict, position: SpreadPaperPosition, reason: str) ->
         "paper_funding_quote": 0.0, "accrued_funding_estimate_quote": 0.0, "settlement_realized_funding_quote": 0.0,
         "paper_slippage_quote": position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote,
         "paper_entry_slippage_quote": position.long_leg.entry_slippage_quote + position.short_leg.entry_slippage_quote, "paper_exit_slippage_quote": 0.0,
+        "paper_latency_buffer_quote": position.long_leg.entry_latency_buffer_quote + position.short_leg.entry_latency_buffer_quote,
+        "paper_entry_latency_buffer_quote": position.long_leg.entry_latency_buffer_quote + position.short_leg.entry_latency_buffer_quote,
+        "paper_exit_latency_buffer_quote": 0.0,
         "paper_hedge_delay_quote": None, "paper_residual_quote": None, "paper_adverse_selection_quote": None,
         "paper_adverse_selection_assumption_quote": None, "paper_matched_entry_notional_quote": None,
         "paper_net_quote": None, "paper_net_bps": None, "paper_unpriced": True, "paper_skip_reason": reason, "official_pnl": False,
@@ -1616,6 +1805,11 @@ def _unpriced_event(
         )
         if long_execution is None or short_execution is None:
             reason = "invalid_exit_prices"
+        elif config.require_l2_vwap and not _executions_have_l2(
+            long_execution,
+            short_execution,
+        ):
+            reason = "missing_l2_exit_depth"
         elif (
             long_execution.capacity + 1e-12 < position.long_leg.qty
             or short_execution.capacity + 1e-12 < position.short_leg.qty
@@ -1788,10 +1982,14 @@ def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
     paper_control_group = _strict_json_bool(payload.get("paper_control_group"))
     official_pnl = _strict_json_bool(payload.get("official_pnl"))
     acceptance_eligible = _strict_json_bool(payload.get("acceptance_eligible"))
+    account_fee_evidence_complete = _strict_json_bool(
+        payload.get("account_fee_evidence_complete")
+    )
     if (
         paper_control_group is None
         or official_pnl is None
         or acceptance_eligible is None
+        or account_fee_evidence_complete is None
     ):
         return None
     try:
@@ -1809,12 +2007,41 @@ def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
         maker_fill_observed_at_ms=int(payload.get("maker_fill_observed_at_ms", 0) or 0), model_epoch=str(payload.get("model_epoch", "v1_legacy") or "v1_legacy"),
         official_pnl=official_pnl,
         research_manifest_version=str(payload.get("research_manifest_version", "legacy") or "legacy"),
+        research_manifest_digest=str(payload.get("research_manifest_digest", "") or ""),
         research_hypothesis=str(payload.get("research_hypothesis", "") or ""),
         acceptance_eligible=acceptance_eligible,
+        account_fee_evidence_complete=account_fee_evidence_complete,
+        account_fee_evidence_observed_at_ms=int(
+            payload.get("account_fee_evidence_observed_at_ms", 0) or 0
+        ),
+        account_fee_evidence_source=str(
+            payload.get("account_fee_evidence_source", "") or ""
+        ),
+        account_fee_evidence_fingerprint=str(
+            payload.get("account_fee_evidence_fingerprint", "") or ""
+        ),
+        account_fee_evidence_provenance=_provenance_payload(
+            payload.get("account_fee_evidence_provenance")
+        ),
+        research_sample_split=str(
+            payload.get("research_sample_split", "in_sample") or "in_sample"
+        ),
+        volatility_regime=str(
+            payload.get("volatility_regime", "unknown") or "unknown"
+        ),
     )
     except (TypeError, ValueError, OverflowError):
         return None
     return position if _paper_position_numerics_valid(position) else None
+
+
+def _provenance_payload(value: object) -> list[dict[str, object]]:
+    """Accept only JSON-object provenance rows at the restart boundary."""
+    if not isinstance(value, list) or not value:
+        return []
+    if any(not isinstance(item, dict) for item in value):
+        return []
+    return [dict(item) for item in value]
 
 
 def _valid_restored_horizons(value: object) -> list[dict] | None:
@@ -1878,17 +2105,82 @@ def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> b
         return False
     if str(payload.get("model_epoch", "") or "") != config.model_epoch:
         return False
+    if (
+        str(payload.get("research_manifest_digest", "") or "").lower()
+        != config.research_manifest.digest
+    ):
+        return False
     candidate = payload.get("candidate_snapshot")
     if not isinstance(candidate, dict):
         return False
+    # Journal v6 cannot infer a missing exit cost, account-evidence identity,
+    # or manifest digest from today's schedule.  A partial row would otherwise
+    # silently become a zero-fee record or altered research contract on
+    # restore, which is exactly the economic rewrite this schema prevents.
+    frozen_leg_fields = {
+        "entry_fee_bps",
+        "exit_fee_bps",
+        "entry_fee_quote",
+        "entry_slippage_quote",
+        "entry_latency_buffer_quote",
+        "entry_execution_source",
+    }
+    for leg_name in ("long_leg", "short_leg"):
+        leg = payload.get(leg_name)
+        if not isinstance(leg, dict) or not frozen_leg_fields.issubset(leg):
+            return False
+    account_evidence_matches = (
+        not config.require_account_fee_evidence
+        or _restored_account_fee_evidence_matches_candidate(payload, candidate)
+    )
     return (
         candidate.get("economics_complete") is True
         and candidate.get("fee_evidence_complete") is True
         and str(candidate.get("contract_normalization_status", "") or "").lower()
         == "complete"
         and str(candidate.get("calculation_version", "") or "")
-        == "spread_v2_signed_reversion"
+        == _candidate_calculation_version(config)
         and str(candidate.get("model_epoch", "") or "") == config.model_epoch
+        and account_evidence_matches
+    )
+
+
+def _restored_account_fee_evidence_matches_candidate(
+    payload: dict, candidate: dict
+) -> bool:
+    """Keep the position-level fee receipt bound to its admission snapshot.
+
+    A schema-v5 row freezes both locations of this evidence.  Accepting either
+    one in isolation would allow a malformed restart record to carry the
+    candidate economics from one account-fee observation and the reported
+    provenance from another.
+    """
+    provenance = candidate.get("account_fee_evidence_provenance")
+    if (
+        candidate.get("account_fee_evidence_complete") is not True
+        or not isinstance(provenance, list)
+        or not provenance
+        or any(not isinstance(row, dict) for row in provenance)
+        or not str(candidate.get("account_fee_evidence_fingerprint") or "")
+        or not str(candidate.get("account_fee_evidence_source") or "")
+    ):
+        return False
+    try:
+        observed_at_ms = int(candidate.get("account_fee_evidence_observed_at_ms") or 0)
+        payload_observed_at_ms = int(
+            payload.get("account_fee_evidence_observed_at_ms") or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        observed_at_ms > 0
+        and payload.get("account_fee_evidence_complete") is True
+        and payload_observed_at_ms == observed_at_ms
+        and str(payload.get("account_fee_evidence_source") or "")
+        == str(candidate.get("account_fee_evidence_source") or "")
+        and str(payload.get("account_fee_evidence_fingerprint") or "")
+        == str(candidate.get("account_fee_evidence_fingerprint") or "")
+        and payload.get("account_fee_evidence_provenance") == provenance
     )
 
 
@@ -1896,19 +2188,28 @@ def _restored_position_has_fee_evidence(
     position: SpreadPaperPosition,
     config: SpreadPaperConfig,
 ) -> bool:
-    return _execution_fee_evidence_complete(
-        config,
-        long_venue=position.long_venue,
-        short_venue=position.short_venue,
-        entry_long_role=position.long_leg.entry_liquidity_role,
-        entry_short_role=position.short_leg.entry_liquidity_role,
-        exit_long_role=position.long_leg.exit_liquidity_role,
-        exit_short_role=position.short_leg.exit_liquidity_role,
+    # A schema-v5 record is intentionally self-contained: the four pricing
+    # terms were frozen at entry, so a later service refresh must not either
+    # rewrite its economics or make a valid in-flight position un-restorable.
+    # Strict account-fee mode still requires the persisted admission proof.
+    return _frozen_fee_terms_valid(position) and _position_account_fee_evidence_complete(
+        position, config
     )
 
 
-def _restored_position_is_official_eligible(position: SpreadPaperPosition) -> bool:
-    baseline_entry_sources = {"l2_vwap", "top_book_only"}
+def _restored_position_is_official_eligible(
+    position: SpreadPaperPosition,
+    config: SpreadPaperConfig,
+) -> bool:
+    # The runtime gate above is deliberately repeated during recovery.  A
+    # journal row produced by an earlier diagnostic configuration cannot be
+    # promoted merely because its boolean flag survived serialization.
+    if (
+        config.require_l2_vwap is not True
+        or config.require_account_fee_evidence is not True
+    ):
+        return False
+    baseline_entry_sources = {"l2_vwap"}
     return bool(
         position.official_pnl is True
         and position.paper_entry_mode == "long_taker:short_taker"
@@ -1916,6 +2217,7 @@ def _restored_position_is_official_eligible(position: SpreadPaperPosition) -> bo
         and not position.paper_maker_leg
         and position.paper_control_group is False
         and position.acceptance_eligible is True
+        and _position_account_fee_evidence_complete(position, config)
         and not position.long_leg.entry_pending
         and not position.short_leg.entry_pending
         # The mode strings are reporting fields; on restart they cannot be
@@ -1956,7 +2258,7 @@ def _leg_from_payload(value: object) -> SpreadPaperLeg | None:
             entry_bid=float(value.get("entry_bid", 0.0) or 0.0), entry_ask=float(value.get("entry_ask", 0.0) or 0.0), entry_bid_size=float(value.get("entry_bid_size", 0.0) or 0.0), entry_ask_size=float(value.get("entry_ask_size", 0.0) or 0.0), entry_observed_at_ms=int(value.get("entry_observed_at_ms", 0) or 0),
             mark_price=float(value.get("mark_price", 0.0) or 0.0), index_price=float(value.get("index_price", 0.0) or 0.0), volume_24h_quote=float(value.get("volume_24h_quote", 0.0) or 0.0), open_interest=float(value.get("open_interest", 0.0) or 0.0),
             entry_raw_price=_optional_float(value.get("entry_raw_price")), entry_price=_optional_float(value.get("entry_price")), qty=float(value.get("qty", 0.0) or 0.0), entry_notional_quote=float(value.get("entry_notional_quote", 0.0) or 0.0),
-            entry_fee_bps=float(value.get("entry_fee_bps", 0.0) or 0.0), entry_fee_quote=float(value.get("entry_fee_quote", 0.0) or 0.0), entry_slippage_quote=float(value.get("entry_slippage_quote", 0.0) or 0.0), funding_rate_bps=float(value.get("funding_rate_bps", 0.0) or 0.0), funding_timestamp_ms=int(value.get("funding_timestamp_ms", 0) or 0), funding_interval_ms=int(value.get("funding_interval_ms", 0) or 0), entry_filled_at_ms=int(value.get("entry_filled_at_ms", 0) or 0),
+            entry_fee_bps=float(value.get("entry_fee_bps", 0.0) or 0.0), entry_fee_quote=float(value.get("entry_fee_quote", 0.0) or 0.0), entry_slippage_quote=float(value.get("entry_slippage_quote", 0.0) or 0.0), exit_fee_bps=float(value.get("exit_fee_bps", 0.0) or 0.0), entry_latency_buffer_quote=float(value.get("entry_latency_buffer_quote", 0.0) or 0.0), funding_rate_bps=float(value.get("funding_rate_bps", 0.0) or 0.0), funding_timestamp_ms=int(value.get("funding_timestamp_ms", 0) or 0), funding_interval_ms=int(value.get("funding_interval_ms", 0) or 0), entry_filled_at_ms=int(value.get("entry_filled_at_ms", 0) or 0),
             order_state=str(value.get("order_state", PaperOrderState.FILLED.value) or PaperOrderState.FILLED.value), requested_qty=float(value.get("requested_qty", value.get("qty", 0.0)) or 0.0), residual_qty=float(value.get("residual_qty", 0.0) or 0.0),
             funding_settlements=settlements, funding_settlement_conflict=(
                 funding_settlement_conflict or restored_settlement_conflict
@@ -1992,25 +2294,101 @@ def _paper_leg_numerics_valid(leg: SpreadPaperLeg) -> bool:
         leg.qty,
         leg.entry_notional_quote,
         leg.entry_fee_bps,
+        leg.exit_fee_bps,
         leg.entry_fee_quote,
         leg.entry_slippage_quote,
+        leg.entry_latency_buffer_quote,
         leg.funding_rate_bps,
         leg.requested_qty,
         leg.residual_qty,
     )
-    return all(isfinite(float(number)) for number in numbers) and all(
-        value >= 0.0
-        for value in (
-            leg.qty,
-            leg.entry_notional_quote,
-            leg.requested_qty,
-            leg.residual_qty,
+    # A signed maker rebate can legitimately make fee bps/quote negative;
+    # a taker leg cannot claim that credit.  Notional, quantity and execution
+    # buffers may never be negative.
+    return (
+        all(isfinite(float(number)) for number in numbers)
+        and all(
+            value >= 0.0
+            for value in (
+                leg.qty,
+                leg.entry_notional_quote,
+                leg.requested_qty,
+                leg.residual_qty,
+                leg.entry_slippage_quote,
+                leg.entry_latency_buffer_quote,
+            )
+        )
+        and (
+            _liquidity_role(leg.entry_liquidity_role) == "maker"
+            or (leg.entry_fee_bps >= 0.0 and leg.entry_fee_quote >= 0.0)
+        )
+        and (
+            _liquidity_role(leg.exit_liquidity_role) == "maker"
+            or leg.exit_fee_bps >= 0.0
         )
     )
 
 
+def _frozen_fee_terms_valid(position: SpreadPaperPosition) -> bool:
+    """Check immutable four-leg pricing terms stored in a v5 journal row."""
+    return _paper_leg_numerics_valid(position.long_leg) and _paper_leg_numerics_valid(
+        position.short_leg
+    )
+
+
 def _candidate_snapshot(candidate: SpreadReversionCandidate) -> dict:
-    return {"canonical_venue_a": candidate.canonical_venue_a, "canonical_venue_b": candidate.canonical_venue_b, "current_signed_mid_spread_bps": candidate.current_signed_mid_spread_bps, "current_executable_entry_spread_bps": candidate.current_executable_entry_spread_bps, "equilibrium_spread_bps": candidate.equilibrium_spread_bps, "target_exit_spread_bps": candidate.target_exit_spread_bps, "gross_reversion_edge_bps": candidate.gross_reversion_edge_bps, "expected_net_edge_bps": candidate.expected_net_edge_bps, "worst_case_edge_bps": candidate.worst_case_edge_bps, "gross_signal_edge_bps": candidate.gross_signal_edge_bps, "funding_edge_bps": candidate.funding_edge_bps, "entry_cross_bps": candidate.entry_cross_bps, "expected_exit_cross_bps": candidate.expected_exit_cross_bps, "entry_fee_bps": candidate.entry_fee_bps, "exit_fee_bps": candidate.exit_fee_bps, "entry_slippage_bps": candidate.entry_slippage_bps, "exit_slippage_bps": candidate.exit_slippage_bps, "adverse_selection_bps": candidate.adverse_selection_bps, "capital_buffer_bps": candidate.capital_buffer_bps, "execution_buffer_bps": candidate.execution_buffer_bps, "venue_risk_haircut_bps": candidate.venue_risk_haircut_bps, "rolling_mean_bps": candidate.rolling_mean_bps, "rolling_std_bps": candidate.rolling_std_bps, "z_score": candidate.z_score, "calculation_version": candidate.calculation_version, "model_epoch": candidate.model_epoch, "economics_complete": candidate.economics_complete, "fee_evidence_complete": candidate.fee_evidence_complete, "contract_normalization_status": candidate.contract_normalization_status}
+    """Freeze every admission and economics fact needed for paper replay."""
+    return {
+        "canonical_venue_a": candidate.canonical_venue_a,
+        "canonical_venue_b": candidate.canonical_venue_b,
+        "current_signed_mid_spread_bps": candidate.current_signed_mid_spread_bps,
+        "current_executable_entry_spread_bps": (
+            candidate.current_executable_entry_spread_bps
+        ),
+        "equilibrium_spread_bps": candidate.equilibrium_spread_bps,
+        "target_exit_spread_bps": candidate.target_exit_spread_bps,
+        "gross_reversion_edge_bps": candidate.gross_reversion_edge_bps,
+        "expected_net_edge_bps": candidate.expected_net_edge_bps,
+        "worst_case_edge_bps": candidate.worst_case_edge_bps,
+        "gross_signal_edge_bps": candidate.gross_signal_edge_bps,
+        "funding_edge_bps": candidate.funding_edge_bps,
+        "entry_cross_bps": candidate.entry_cross_bps,
+        "expected_exit_cross_bps": candidate.expected_exit_cross_bps,
+        "entry_fee_bps": candidate.entry_fee_bps,
+        "exit_fee_bps": candidate.exit_fee_bps,
+        "entry_slippage_bps": candidate.entry_slippage_bps,
+        "exit_slippage_bps": candidate.exit_slippage_bps,
+        "adverse_selection_bps": candidate.adverse_selection_bps,
+        "capital_buffer_bps": candidate.capital_buffer_bps,
+        "execution_buffer_bps": candidate.execution_buffer_bps,
+        "venue_risk_haircut_bps": candidate.venue_risk_haircut_bps,
+        "rolling_mean_bps": candidate.rolling_mean_bps,
+        "rolling_std_bps": candidate.rolling_std_bps,
+        "z_score": candidate.z_score,
+        "calculation_version": candidate.calculation_version,
+        "model_epoch": candidate.model_epoch,
+        "economics_complete": candidate.economics_complete,
+        "fee_evidence_complete": candidate.fee_evidence_complete,
+        "account_fee_evidence_complete": candidate.account_fee_evidence_complete,
+        "account_fee_evidence_observed_at_ms": (
+            candidate.account_fee_evidence_observed_at_ms
+        ),
+        "account_fee_evidence_source": candidate.account_fee_evidence_source,
+        "account_fee_evidence_fingerprint": candidate.account_fee_evidence_fingerprint,
+        "account_fee_evidence_provenance": list(
+            candidate.account_fee_evidence_provenance
+        ),
+        "research_sample_split": candidate.research_sample_split,
+        "volatility_regime": candidate.volatility_regime,
+        "net_edge_per_capital_hour_bps": candidate.net_edge_per_capital_hour_bps,
+        "risk_adjusted_edge_per_capital_hour_bps": (
+            candidate.risk_adjusted_edge_per_capital_hour_bps
+        ),
+        "hold_time_confidence": candidate.hold_time_confidence,
+        "dynamic_min_gross_edge_bps": candidate.dynamic_min_gross_edge_bps,
+        "contract_normalization_status": candidate.contract_normalization_status,
+        "contract_normalization_reason": candidate.contract_normalization_reason,
+    }
 
 
 def _market_snapshot_payload(long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None) -> dict:
@@ -2053,9 +2431,11 @@ def _leg_payload(leg: SpreadPaperLeg, exit_raw_price: float | None = None, exit_
         "order_state": leg.order_state,
         "entry_notional_quote": leg.entry_notional_quote,
         "entry_fee_bps": leg.entry_fee_bps,
+        "exit_fee_bps": leg.exit_fee_bps,
         "entry_fee_quote": leg.entry_fee_quote,
         "exit_fee_quote": exit_fee_quote,
         "entry_slippage_quote": leg.entry_slippage_quote,
+        "entry_latency_buffer_quote": leg.entry_latency_buffer_quote,
         "gross_quote": gross_quote,
         "funding_rate_bps": leg.funding_rate_bps,
         "funding_timestamp_ms": leg.funding_timestamp_ms,
@@ -2153,7 +2533,180 @@ def _fee_bps(config: SpreadPaperConfig, venue: str, role: str) -> float:
         )
     except (TypeError, ValueError):
         return 0.0
-    return fee_bps if isfinite(fee_bps) and fee_bps >= 0.0 else 0.0
+    if not isfinite(fee_bps):
+        return 0.0
+    if _liquidity_role(role) != "maker":
+        return fee_bps if fee_bps >= 0.0 else 0.0
+    if fee_bps >= 0.0:
+        return fee_bps
+    if _verified_maker_rebate(config, venue, fee_bps):
+        return fee_bps
+    # A negative static value cannot improve a paper result. Price the maker
+    # leg at its explicit taker fallback instead of inventing zero cost.
+    try:
+        fallback = float(config.taker_fee_bps_by_venue.get(str(venue).lower(), 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return fallback if isfinite(fallback) and fallback >= 0.0 else 0.0
+
+
+def _candidate_calculation_version(config: SpreadPaperConfig) -> str:
+    return (
+        "spread_v3_cost_normalized_reversion"
+        if str(config.model_epoch or "").startswith("v3_")
+        else "spread_v2_signed_reversion"
+    )
+
+
+def _verified_maker_rebate(
+    config: SpreadPaperConfig, venue: str, fee_bps: float
+) -> bool:
+    evidence = config.account_fee_evidence
+    if (
+        config.allow_verified_maker_rebates is not True
+        or evidence is None
+        or evidence.integrity_verified is not True
+    ):
+        return False
+    schedule = evidence.schedule_for(venue)
+    return bool(
+        schedule is not None
+        and schedule.maker_fee_bps < 0.0
+        and abs(schedule.maker_fee_bps - fee_bps) <= 1e-12
+    )
+
+
+def _executions_have_l2(*executions: _ExecutionEstimate | None) -> bool:
+    return all(
+        execution is not None and execution.source == "l2_vwap"
+        for execution in executions
+    )
+
+
+def _candidate_account_fee_evidence_complete(
+    config: SpreadPaperConfig,
+    candidate: SpreadReversionCandidate,
+) -> bool:
+    """Require same-epoch account-fee proof for strict paper admission."""
+    if not config.require_account_fee_evidence:
+        return True
+    evidence = config.account_fee_evidence
+    if (
+        evidence is None
+        or not evidence.complete_for(candidate.long_venue, candidate.short_venue)
+        or evidence.integrity_verified is not True
+        or candidate.account_fee_evidence_complete is not True
+    ):
+        return False
+    if _v3_fee_identity_binding_required(config) and not (
+        evidence.schema_version == FEE_EVIDENCE_SCHEMA_VERSION
+        and evidence.integrity_key_id == TRUSTED_FEE_EVIDENCE_KEY_ID
+        and evidence.identity_matches(
+            config.fee_evidence_account_identity_hashes,
+            candidate.long_venue,
+            candidate.short_venue,
+        )
+    ):
+        return False
+    return (
+        int(candidate.account_fee_evidence_observed_at_ms or 0)
+        == evidence.observed_at_ms_for(candidate.long_venue, candidate.short_venue)
+        and str(candidate.account_fee_evidence_source or "")
+        == evidence.source_for(candidate.long_venue, candidate.short_venue)
+        and str(candidate.account_fee_evidence_fingerprint or "")
+        == evidence.fingerprint_for(candidate.long_venue, candidate.short_venue)
+        and candidate.account_fee_evidence_provenance
+        == evidence.provenance_for(candidate.long_venue, candidate.short_venue)
+    )
+
+
+def _position_account_fee_evidence_complete(
+    position: SpreadPaperPosition,
+    config: SpreadPaperConfig,
+) -> bool:
+    if not config.require_account_fee_evidence:
+        return True
+    # The entry position retains its timestamp/source even when a later fee
+    # refresh changes the service's active schedule.  The schedule is already
+    # frozen in each leg, so this proves the admission state rather than
+    # restating it using a future account tier.
+    base_complete = bool(
+        position.account_fee_evidence_complete is True
+        and position.account_fee_evidence_observed_at_ms > 0
+        and position.account_fee_evidence_source
+        and position.account_fee_evidence_fingerprint
+        and position.account_fee_evidence_provenance
+    )
+    if not base_complete:
+        return False
+    if not _v3_fee_identity_binding_required(config):
+        return True
+    return _persisted_v3_fee_identity_binding_matches(
+        position.account_fee_evidence_provenance,
+        config.fee_evidence_account_identity_hashes,
+        position.long_venue,
+        position.short_venue,
+    )
+
+
+def _v3_fee_identity_binding_required(config: SpreadPaperConfig) -> bool:
+    return str(config.model_epoch or "").startswith("v3_")
+
+
+def _persisted_v3_fee_identity_binding_matches(
+    provenance: object,
+    expected_by_venue: dict[str, str],
+    *venues: str,
+) -> bool:
+    """Validate the immutable account binding retained in a v3 journal row."""
+    if not isinstance(provenance, list):
+        return False
+    rows_by_venue: dict[str, dict[str, object]] = {}
+    for row in provenance:
+        if not isinstance(row, dict):
+            return False
+        venue = str(row.get("venue") or "").strip().lower()
+        if not venue or venue in rows_by_venue:
+            return False
+        rows_by_venue[venue] = row
+    for venue in venues:
+        venue_key = str(venue or "").strip().lower()
+        expected_identity = str(expected_by_venue.get(venue_key) or "").strip().lower()
+        row = rows_by_venue.get(venue_key)
+        if (
+            row is None
+            or not _is_sha256_hex(expected_identity)
+            or str(row.get("account_identity_hash") or "").lower()
+            != expected_identity
+            or not _is_sha256_hex(str(row.get("document_sha256") or "").lower())
+            or row.get("integrity_verified") is not True
+            or str(row.get("integrity_key_id") or "")
+            != TRUSTED_FEE_EVIDENCE_KEY_ID
+        ):
+            return False
+    return True
+
+
+def _is_sha256_hex(value: str) -> bool:
+    if len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _research_sample_split(
+    candidate: SpreadReversionCandidate,
+    config: SpreadPaperConfig,
+    registered_at_ms: int,
+) -> str:
+    cutoff = max(int(config.oos_start_ms or 0), 0)
+    if cutoff > 0:
+        return "out_of_sample" if registered_at_ms >= cutoff else "in_sample"
+    declared = str(candidate.research_sample_split or "").strip().lower()
+    return declared if declared in {"in_sample", "out_of_sample"} else "in_sample"
 
 
 def _paper_fee_evidence_complete(
@@ -2208,7 +2761,12 @@ def _execution_fee_evidence_complete(
             fee_bps = float(source[key])
         except (TypeError, ValueError):
             return False
-        if not isfinite(fee_bps) or fee_bps < 0.0:
+        if not isfinite(fee_bps):
+            return False
+        if fee_bps < 0.0 and (
+            _liquidity_role(role) != "maker"
+            or not _verified_maker_rebate(config, key, fee_bps)
+        ):
             return False
     return True
 

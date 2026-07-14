@@ -11,6 +11,23 @@ runtime、journal 与诊断工具读取。
 
 - `funding_new_entries_enabled=false` 只冻结新开仓。平仓、恢复、残腿修复和
   exchange truth 同步不受影响。生产配置必须先保持这个值为 `false`。
+- 资金费 canary 是第二道、默认关闭的 new-entry gate：只允许白名单 venue、最多
+  一笔 open/pending pair、每腿名义上限 30 quote，并要求 expected/worst edge 分别
+  不低于 8/3 bps。它在 shortlist 与 first-leg submit 前各校验一次；后一次不重计
+  并发，以免影响已进入 V1 hedge/recovery 的仓位。
+- `runtime/account-fee-evidence.json` 只接受私有账户费率 API 或已核对的 private-fill
+  导出，必须包含 source、evidence_ref、observed_at_ms、maker/taker bps 与每个 venue 的
+  `account_identity_hash`。只有 schema-v3、固定 HMAC 环境变量
+  `LIGHTFEE_FEE_EVIDENCE_HMAC_KEY`、固定 key id `lightfee-fee-evidence-v3` 的完整性
+  验证才可授权；每个 hash 还必须与
+  `runtime.fee_evidence_account_identity_hashes` 的实际交易账户绑定一致。journal 会冻结
+  每个 venue 的 provenance 与 fingerprint；缺失、超过 24 小时、签名/账户绑定无效或候选
+  fingerprint 不一致时 canary fail-closed，`funding_canary_require_account_fee_evidence`
+  在 canary 期间必须为 true。
+  静态费率仍是默认保守地板；仅经签名验证的 maker rebate 可在显式 paper
+  配置中计入。可用 `scripts/validate_fee_evidence.py ... --require-integrity
+  --require-venue binance --require-account-identity binance=<sha256>` 离线验证，
+  不会访问交易所。
 - sidecar schema v3 承载完整经济学和 funding forecast。解析时同时将 candidate
   的 venue/symbol 回查到两条原始 quote，要求二者均为已标准化的 linear 合约、
   underlying/quote/multiplier 一致且精度、interval、index 与 venue 状态完整；
@@ -67,7 +84,11 @@ Binance、Bybit、OKX 与 Gate 已有私有账单解析；Bitget、Aster、Hyper
   entry。普通跨所均值回归与单所 dislocation 标签严格分开。
 - 毛收益是当前可执行价差到目标退出价差的可回归部分，不是完整跨所价差；
   随后统一扣除四腿费用、滑点、funding、adverse selection 与 buffer。
-- paper journal schema v2 记录状态机、共同 base quantity、残余敞口与 epoch。
+- paper journal schema v6 记录状态机、共同 base quantity、残余敞口、entry-time
+  四腿费率、latency reserve 与完整 research manifest SHA256 digest。费率/退出 role
+  在注册或成交时冻结，之后刷新账户 fee schedule 与 signed account-fee provenance
+  不会重写历史/在途 paper PnL；manifest version 相同但 digest 不同也不能混合或恢复为
+  official position。旧 journal 仅保留诊断，不会被 v6 恢复成 official position。
   maker 只有穿价才成交；没有 queue/trade-tape 证据的 maker 结果不进入主
   验收组。official funding 仅在真实跨越 settlement 时间后、且注入已分配的
   settlement record 时计入。当前/预测 funding rate 或估算值不能计入；只有在
@@ -76,12 +97,27 @@ Binance、Bybit、OKX 与 Gate 已有私有账单解析；Bitget、Aster、Hyper
   迟到、缺失或换期的观察仍 fail-closed。
   `official_pnl` 还是 literal boolean permission，任何字符串或其他真值对象均
   fail-closed，不能污染验收 cohort。
-- `config/research/spread_v2_signed_reversion.json` 是 cohort 的唯一研究清单；
+- `config/research/spread_v2_signed_reversion.json` 是 v2 cohort 的唯一研究清单；
   它记录假设、启用状态、control 属性和 acceptance eligibility。变更任一
   研究参数都必须新建 manifest/version 与 model epoch，不能回写历史。
-- 离线分析默认只接纳该 epoch 的 official taker/taker 闭环，legacy、control、
-  stale/unpriced 与 expired 都单独计数；报告提供独立 episode、fill 状态、
-  各成本分解、venue pair/regime 分组以及 deterministic block-bootstrap 95% CI。
+- v3 `spread_v3_cost_normalized_reversion` 取消固定可执行价差 floor，改为
+  `gross_reversion >= 完整负向成本 × multiple + profit_buffer`；完整成本包含四腿
+  fee、滑点、adverse/execution/capital/venue buffer 和负向 funding/cross。
+  候选同时记录 capital-hour net edge、波动 regime 与动态阈值，方便按资本效率和
+  OOS cohort 归因。启用 dynamic gate 必须使用 v3 epoch；反向组合在配置校验阶段
+  即失败。
+- official paper 启用时默认要求双腿 entry/exit 都有 coherent L2 VWAP、同 epoch
+  account-fee evidence，并将额外 latency buffer 分项记账。v3 还要求每个 fee
+  provenance 的账户身份 hash 与 runtime 配置绑定相同，切换账户后旧 journal 只能审计、
+  不能恢复为 official。BBO fallback 可留作
+  diagnostic，但不会成为 official fill/PnL。`spread_paper_oos_start_ms` 把之后的
+  注册标为 out_of_sample；设置 `spread_paper_require_out_of_sample=true` 会拒绝
+  截点前候选。
+- 离线分析只接纳显式选择 epoch、journal schema v6 的 official taker/taker 闭环；v3
+  必须只有一个 manifest digest、完整八项经济字段且满足净值等式，重复 episode、缺失或
+  混合 digest、无效 fee provenance 一律阻断 acceptance。legacy schema、control、
+  stale/unpriced 与 expired 都单独计数；报告提供独立 episode、fill 状态、各成本分解、
+  venue pair/regime 分组以及 deterministic block-bootstrap 95% CI。
 - spread sidecar 只能读取主 sidecar snapshot（并可附加上述本地 L2 bridge）；任何
   `spread_sidecar_direct_fetch_enabled` 或非 `sidecar_snapshot` source mode 都会在
   服务构造时 fail-closed，防止 paper 路径暗中新增市场数据请求。
@@ -110,13 +146,47 @@ Binance、Bybit、OKX 与 Gate 已有私有账单解析；Bitget、Aster、Hyper
    orders、无 pending entry/close/residual。存在仓位时仅走既有安全关闭路径。
 3. 资金费 `v1_exact` 与 `enhanced_shadow` 并行至少 7 天或 500 候选，保存
    candidate/block/ranking/sizing 及 forecast error 对比。
-4. 仅在 shadow 无语义差异后，才可单仓 30 quote canary；至少完成 30 个完整
+4. 仅在 shadow 无语义差异后，才可单仓 30 quote canary；live 模式下
+   `funding_new_entries_enabled=true` 必须同时设置 `funding_canary_enabled=true`，
+   否则启动校验失败。至少完成 30 个完整
    闭环、所有成本归因完整、无未收口订单或残腿、每次关闭后 truth flat，且
-   p95 实际成本不突破 worst-case buffer，才可另行审批最多两仓。
+   p95 实际成本不突破 worst-case buffer，才可另行审批最多两仓。该判定必须由
+   `scripts/analyze_funding_canary.py` 的 immutable selected cohort 生成；每个闭环
+   同时要求私有 funding reconciliation 和 positions/open-orders 均 flat 的 exchange
+   truth，任一缺失即不可晋级。报告输入必须先用
+   `scripts/sign_acceptance_evidence.py --report-kind funding_canary` 生成 HMAC
+   source manifest，再以 `--evidence-manifest` 运行分析；固定的
+   `LIGHTFEE_ACCEPTANCE_EVIDENCE_HMAC_KEY` 不可由 CLI/TOML 改写。分析器拒绝坏 JSONL、
+   重复路径或重复内容，且
+   source manifest 不匹配时不得产出晋级结论。`actual_execution_cost` 是四腿实际费用加上
+   entry/exit 时相对于不可变成交基准的 implementation shortfall；price PnL、markout
+   或 funding 均不能冲减任何真实成本。
+   当前被动平仓与恢复后的 exchange-flat 收口没有冻结可执行的双腿退出基准，因此会明确标记
+   `execution_benchmark_complete=false`：这类 loop 可以用于运行安全观察，但不能以“零执行成本”
+   进入资金费 canary 晋级样本。若要晋级该路径，必须先持久化与成交同时采集的双边 L2 可执行
+   退出基准，不能用挂单价或事后中间价替代。
 5. spread 永远保持 paper-only。本轮不允许自动开启 `spread_live_enabled`。
-   `v2_signed_reversion` 至少运行 30 天、200 个去重 taker/taker 闭环、覆盖
-   3 个主要 venue pair 与 2 类波动 regime，并通过 95% block-bootstrap 和
-   2×成本压力门槛后，才有资格另行提出小仓 live 方案。
+   `v2_signed_reversion` 记录只可作为历史 baseline，不能与 v3 合并验收；启用
+   `v3_cost_normalized_reversion` 时必须同时切换 `spread_model_epoch`、
+   `spread_paper_model_epoch`、research manifest 和 dynamic gate。v3 至少运行
+   30 天、200 个去重的 out-of-sample taker/taker 闭环、覆盖 3 个主要 venue pair
+   与 2 类波动 regime，并通过 95% block-bootstrap、2×成本压力门槛和 fee-evidence
+   完整性检查后，才有资格另行提出小仓 live 方案。
+   v3 的正式验收也必须使用同一 signed source-manifest 流程；基础
+   `paper_net_quote` 已扣除冻结的 adverse-selection assumption，不能仅在 1.5×/2×
+   stress 展示中才扣除。
+
+示例（密钥只存在于环境变量，不进入 TOML、manifest 或日志）：
+
+```text
+LIGHTFEE_ACCEPTANCE_EVIDENCE_HMAC_KEY=... scripts/sign_acceptance_evidence.py \
+  --events runtime/events.jsonl --report-kind funding_canary \
+  --output runtime/funding-canary.manifest.json
+
+LIGHTFEE_ACCEPTANCE_EVIDENCE_HMAC_KEY=... scripts/analyze_funding_canary.py \
+  --events runtime/events.jsonl --evidence-manifest runtime/funding-canary.manifest.json \
+  --output runtime/funding-canary-report.json
+```
 
 每次生产发布须保存以下结构化证据；本地 pytest 不能替代这些证明：
 

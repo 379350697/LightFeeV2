@@ -10,6 +10,7 @@ multi-position ownership ambiguity.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Iterable, Mapping
 
 from lightfee.core.contracts import VenueAdapter
@@ -86,6 +87,41 @@ def _int_positive(value: object) -> int:
     except (TypeError, ValueError):
         return 0
     return converted if converted > 0 else 0
+
+
+def _execution_benchmark_receipt_complete(position: OpenPosition) -> bool:
+    """Return whether persisted fill-quality facts can support promotion.
+
+    Recovery snapshots are a persistence boundary, so a truthy string such as
+    ``"false"`` must not revive this permission.  The benchmark flag also
+    needs its immutable entry benchmarks and non-negative accumulated
+    shortfall values; otherwise a missing measurement could masquerade as a
+    zero-cost receipt.
+    """
+    if position.execution_benchmark_complete is not True:
+        return False
+    values = (
+        position.entry_benchmark_long_price,
+        position.entry_benchmark_short_price,
+        position.entry_implementation_shortfall_quote,
+        position.exit_implementation_shortfall_quote,
+    )
+    try:
+        long_benchmark, short_benchmark, entry_shortfall, exit_shortfall = (
+            float(value) for value in values
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return (
+        isfinite(long_benchmark)
+        and isfinite(short_benchmark)
+        and isfinite(entry_shortfall)
+        and isfinite(exit_shortfall)
+        and long_benchmark > 0.0
+        and short_benchmark > 0.0
+        and entry_shortfall >= 0.0
+        and exit_shortfall >= 0.0
+    )
 
 
 class FundingSettlementReconciler:
@@ -317,11 +353,14 @@ class FundingSettlementReconciler:
             (record.leg, record.venue, record.settlement_timestamp_ms): record
             for record in position.funding_settlement_records
         }
+        benchmark_complete = _execution_benchmark_receipt_complete(position)
         return {
             "schema_version": FUNDING_SETTLEMENT_SCHEMA_VERSION,
             "kind": "funding_statement_attribution",
             "position_id": position.position_id,
             "symbol": position.symbol,
+            "long_venue": position.long_venue.value,
+            "short_venue": position.short_venue.value,
             "calculation_version": position.calculation_version,
             "model_epoch": position.model_epoch,
             "economics_observed_at_ms": int(position.economics_observed_at_ms or 0),
@@ -351,6 +390,18 @@ class FundingSettlementReconciler:
             "price_pnl_quote": float(price_pnl_quote),
             "entry_fee_quote": float(entry_fee_quote),
             "exit_fee_quote": float(exit_fee_quote),
+            # These are immutable fill-quality facts.  ``None`` means the
+            # executable benchmark was unavailable and must fail closed for
+            # canary promotion; it is never replaced with price PnL.
+            "implementation_shortfall_quote": (
+                float(
+                    position.entry_implementation_shortfall_quote
+                    + position.exit_implementation_shortfall_quote
+                )
+                if benchmark_complete
+                else None
+            ),
+            "execution_benchmark_complete": benchmark_complete,
         }
 
     @classmethod

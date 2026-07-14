@@ -100,8 +100,15 @@ def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
 
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
     adapter = TrustedVenueAdapter()
+    config = make_harness_config(tmp_path)
+    # This helper is only used by venue-admission normalization tests, several
+    # of which cover venues forbidden to a live funding canary.  Their input is
+    # intentionally paper-scoped so a new live canary prerequisite cannot mask
+    # the exchange error being asserted.  Pending-hedge/recovery tests use the
+    # live harness config directly and retain V1 risk-reduction semantics.
+    config.runtime.mode = "paper"
     return _with_final_quote_lease(LiveRuntime(
-        make_harness_config(tmp_path),
+        config,
         venue_adapters={
             Venue.ASTER: adapter,
             Venue.BINANCE: adapter,
@@ -543,8 +550,10 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
         bybit = RejectingBybitPrecheckAdapter(
             "bybit order precheck failed: bybit retCode=33004 retMsg=Your api key has expired"
         )
+        config = make_harness_config(td)
+        config.runtime.mode = "paper"
         runtime = _with_final_quote_lease(LiveRuntime(
-            make_harness_config(td),
+            config,
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.BYBIT: bybit,
@@ -611,8 +620,10 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
             "max_notional_admission_blocked: requested_notional=23.90043 "
             "remaining_openable_notional=0.0"
         )
+        config = make_harness_config(td)
+        config.runtime.mode = "paper"
         runtime = _with_final_quote_lease(LiveRuntime(
-            make_harness_config(td),
+            config,
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,
@@ -706,8 +717,10 @@ async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth
             "get_symbol_rules_cache",
             lambda: FakeAsterRulesCache(),
         )
+        config = make_harness_config(td)
+        config.runtime.mode = "paper"
         runtime = _with_final_quote_lease(LiveRuntime(
-            make_harness_config(td),
+            config,
             venue_adapters={
                 Venue.BINANCE: TrustedVenueAdapter(),
                 Venue.ASTER: aster,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from math import isfinite
 from typing import Optional
 
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
@@ -126,6 +127,14 @@ def _positive_int(value: object) -> int:
     except (TypeError, ValueError):
         return 0
     return parsed if parsed > 0 else 0
+
+
+def _finite_positive_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if isfinite(parsed) and parsed > 0.0 else None
 
 
 def _first_positive(values: list[object]) -> int:
@@ -256,6 +265,24 @@ def build_open_position(
         if matched_qty > 0.0 and long_entry_price > 0.0 and short_entry_price > 0.0
         else 0.0
     )
+    long_benchmark_price = _finite_positive_float(ctx.long_price_hint)
+    short_benchmark_price = _finite_positive_float(ctx.short_price_hint)
+    entry_benchmark_complete = (
+        all(
+            isfinite(value) and value > 0.0
+            for value in (matched_qty, long_entry_price, short_entry_price)
+        )
+        and long_benchmark_price is not None
+        and short_benchmark_price is not None
+    )
+    entry_implementation_shortfall_quote = 0.0
+    if entry_benchmark_complete:
+        # Long entry buys and short entry sells.  Favourable fills are zeroed;
+        # this is a fill-quality receipt, not a price-PnL substitute.
+        entry_implementation_shortfall_quote = (
+            max(long_entry_price - long_benchmark_price, 0.0) * matched_qty
+            + max(short_benchmark_price - short_entry_price, 0.0) * matched_qty
+        )
 
     long_funding_timestamp_ms = _positive_int(ctx.long_funding_timestamp_ms)
     short_funding_timestamp_ms = _positive_int(ctx.short_funding_timestamp_ms)
@@ -310,6 +337,14 @@ def build_open_position(
         long_entry_fee_quote=long_entry_fee_quote,
         short_entry_fee_quote=short_entry_fee_quote,
         total_entry_fee_quote=total_entry_fee_quote,
+        entry_benchmark_long_price=(
+            long_benchmark_price if entry_benchmark_complete else 0.0
+        ),
+        entry_benchmark_short_price=(
+            short_benchmark_price if entry_benchmark_complete else 0.0
+        ),
+        entry_implementation_shortfall_quote=entry_implementation_shortfall_quote,
+        execution_benchmark_complete=entry_benchmark_complete,
         current_net_quote=-total_entry_fee_quote,
         peak_net_quote=-total_entry_fee_quote,
         funding_timestamp_ms=inferred_first_funding_ms,

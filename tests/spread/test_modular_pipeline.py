@@ -14,10 +14,7 @@ from lightfee.spread.modules import (
     SpreadRanker,
 )
 from lightfee.spread.reversion import (
-    SpreadReversionConfig,
-    SpreadStatsTracker,
     _contract_compatibility,
-    build_spread_reversion_candidates,
 )
 
 
@@ -236,6 +233,27 @@ def test_spread_ranker_cannot_let_score_override_conservative_edge() -> None:
     )
 
     assert [candidate.candidate_id for candidate in ranked] == ["lower-score-safe-edge"]
+
+
+def test_capital_efficiency_ranking_uses_downside_confidence_adjusted_rate() -> None:
+    ranker = SpreadRanker(max_candidates=1, rank_by_capital_efficiency=True)
+
+    ranked = ranker.rank(
+        [
+            _candidate(
+                candidate_id="thin-fast-looking",
+                net_edge_per_capital_hour_bps=1_000.0,
+                risk_adjusted_edge_per_capital_hour_bps=20.0,
+            ),
+            _candidate(
+                candidate_id="robust-slower",
+                net_edge_per_capital_hour_bps=100.0,
+                risk_adjusted_edge_per_capital_hour_bps=40.0,
+            ),
+        ]
+    )
+
+    assert [candidate.candidate_id for candidate in ranked] == ["robust-slower"]
 
 
 def test_spread_ranker_defaults_to_top_ten_with_symbol_dedup() -> None:

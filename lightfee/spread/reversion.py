@@ -23,6 +23,7 @@ from lightfee.spread.modules import (
     ZScoreSignalModel,
 )
 from lightfee.strategy.economics import build_edge_breakdown
+from lightfee.strategy.fee_evidence import FeeEvidenceBook, effective_fee_maps
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,12 @@ class SpreadReversionConfig:
     min_history_ms: int = 300_000
     min_executable_spread_bps: float = 0.0
     max_executable_spread_bps: float = 0.0
+    dynamic_net_edge_enabled: bool = False
+    min_gross_profit_multiple: float = 1.0
+    min_profit_buffer_bps: float = 0.0
+    rank_by_capital_efficiency: bool = False
+    volatility_high_std_bps: float = 10.0
+    account_fee_evidence: FeeEvidenceBook | None = None
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
     ranker_max_candidates: int = 10
@@ -68,8 +75,18 @@ class SpreadReversionConfig:
     model_epoch: str = "v2_signed_reversion"
 
     @classmethod
-    def from_app_config(cls, config: AppConfig) -> "SpreadReversionConfig":
+    def from_app_config(
+        cls,
+        config: AppConfig,
+        *,
+        fee_evidence: FeeEvidenceBook | None = None,
+    ) -> "SpreadReversionConfig":
         s = config.strategy
+        taker_fees, _ = effective_fee_maps(
+            _fee_map(config.venues),
+            _maker_fee_map(config.venues),
+            fee_evidence,
+        )
         return cls(
             min_samples=s.spread_min_samples,
             entry_z=s.spread_entry_z,
@@ -79,7 +96,7 @@ class SpreadReversionConfig:
             quote_skew_ms=s.spread_quote_skew_ms,
             live_notional_quote=s.spread_live_notional_quote,
             max_gross_quote=s.spread_max_gross_quote,
-            taker_fee_bps_by_venue=_fee_map(config.venues),
+            taker_fee_bps_by_venue=taker_fees,
             slippage_reserve_bps=s.spread_slippage_reserve_bps,
             adverse_selection_buffer_bps=s.spread_adverse_selection_buffer_bps,
             expected_hold_ms=s.spread_expected_hold_ms,
@@ -92,6 +109,12 @@ class SpreadReversionConfig:
             min_history_ms=s.spread_min_history_ms,
             min_executable_spread_bps=s.spread_min_executable_spread_bps,
             max_executable_spread_bps=s.spread_max_executable_spread_bps,
+            dynamic_net_edge_enabled=s.spread_dynamic_net_edge_enabled,
+            min_gross_profit_multiple=s.spread_min_gross_profit_multiple,
+            min_profit_buffer_bps=s.spread_min_profit_buffer_bps,
+            rank_by_capital_efficiency=s.spread_rank_by_capital_efficiency,
+            volatility_high_std_bps=s.spread_volatility_high_std_bps,
+            account_fee_evidence=fee_evidence,
             mean_reversion_min_std_bps=s.spread_mean_reversion_min_std_bps,
             mean_reversion_max_half_life_ms=s.spread_mean_reversion_max_half_life_ms,
             ranker_max_candidates=s.spread_ranker_max_candidates,
@@ -422,7 +445,10 @@ def _build_signal_models(config: SpreadReversionConfig) -> _SpreadSignalModels:
         ),
         funding=FundingAwarenessModel(expected_hold_ms=config.expected_hold_ms),
         liquidity=LiquidityAndVenueHealthGate(),
-        ranker=SpreadRanker(max_candidates=config.ranker_max_candidates),
+        ranker=SpreadRanker(
+            max_candidates=config.ranker_max_candidates,
+            rank_by_capital_efficiency=config.rank_by_capital_efficiency,
+        ),
     )
 
 
@@ -431,6 +457,10 @@ class SpreadSignalEngine:
 
     def __init__(self, *, tracker: SpreadStatsTracker, config: SpreadReversionConfig) -> None:
         self.tracker = tracker
+        self.reconfigure(config)
+
+    def reconfigure(self, config: SpreadReversionConfig) -> None:
+        """Refresh non-market evidence without resetting the rolling history."""
         self.config = config
         self.tracker.configure(config)
         self._models = _build_signal_models(config)
@@ -619,7 +649,7 @@ def _candidate_for_pair(
     ):
         return None
     absolute_executable = abs(current_executable)
-    if not is_dislocation:
+    if not is_dislocation and not config.dynamic_net_edge_enabled:
         minimum = max(float(config.min_executable_spread_bps or 0.0), 0.0)
         maximum = max(float(config.max_executable_spread_bps or 0.0), 0.0)
         if minimum > 0.0 and absolute_executable < minimum:
@@ -654,13 +684,47 @@ def _candidate_for_pair(
         exit_slippage_bps=slippage_bps / 2.0,
         adverse_selection_bps=config.adverse_selection_buffer_bps,
         execution_buffer_bps=config.adverse_selection_buffer_bps,
-        calculation_version="spread_v2_signed_reversion",
+        calculation_version=(
+            "spread_v3_cost_normalized_reversion"
+            if config.dynamic_net_edge_enabled
+            else "spread_v2_signed_reversion"
+        ),
         model_epoch=config.model_epoch,
         observed_at_ms=now_ms,
         economics_complete=funding.economics_complete and fee_evidence_complete,
     )
     if edge.expected_net_edge_bps < config.min_net_edge_bps:
         return None
+    # Absolute entry-spread floors are not portable across fee tiers or
+    # symbols.  The v3 epoch instead requires reversion headroom to exceed
+    # the complete adverse execution burden by a configured multiple, plus a
+    # separately visible minimum profit buffer.  Positive funding/cross terms
+    # are deliberately not allowed to subsidise this threshold.
+    execution_burden_bps = (
+        edge.entry_fee_bps
+        + edge.exit_fee_bps
+        + edge.entry_slippage_bps
+        + edge.exit_slippage_bps
+        + edge.adverse_selection_bps
+        + edge.execution_buffer_bps
+        + edge.capital_buffer_bps
+        + edge.venue_risk_haircut_bps
+        + max(-edge.funding_edge_bps, 0.0)
+        + max(-edge.entry_cross_bps, 0.0)
+        + max(-edge.expected_exit_cross_bps, 0.0)
+    )
+    dynamic_min_gross_edge_bps = 0.0
+    if config.dynamic_net_edge_enabled:
+        dynamic_min_gross_edge_bps = (
+            execution_burden_bps * max(float(config.min_gross_profit_multiple), 1.0)
+            + max(float(config.min_profit_buffer_bps), 0.0)
+        )
+        if gross_reversion + 1e-12 < dynamic_min_gross_edge_bps:
+            if rejection_counts is not None:
+                rejection_counts["dynamic_min_gross_edge"] = (
+                    rejection_counts.get("dynamic_min_gross_edge", 0) + 1
+                )
+            return None
 
     # ``max_gross_quote`` is the sum of absolute notionals across both legs.
     # The candidate amount is therefore a *per-leg* quote cap.  Treating the
@@ -686,7 +750,42 @@ def _candidate_for_pair(
     # Funding is already a signed component of `edge.ranking_edge_bps`.
     # Adding `score_adjustment_bps` here would rank a favourable funding leg
     # twice, while a headwind was already deducted by the same edge contract.
-    score = edge.ranking_edge_bps + effective_z * 2.0 + quality.quality * 5.0 + liquidity_score * config.score_liquidity_weight - penalty
+    hold_time_ms = max(int(quality.hold_time_hint_ms or 0), 60_000)
+    net_edge_per_capital_hour_bps = (
+        edge.expected_net_edge_bps * 3_600_000.0 / hold_time_ms
+    )
+    # A short observed half-life from a thin/noisy sample must not outrank a
+    # slower but robust opportunity solely because it inflates expected edge
+    # per capital-hour.  Scale holding-time confidence by both sample depth
+    # and the independently computed reversion-quality score, then rank on
+    # downside edge over the confidence-expanded holding-time estimate.
+    sample_confidence = min(
+        1.0,
+        math.sqrt(
+            max(float(stats.sample_count), 0.0)
+            / max(float(config.min_samples) * 4.0, 1.0)
+        ),
+    )
+    hold_time_confidence = max(
+        0.25,
+        min(1.0, sample_confidence * max(min(float(quality.quality), 1.0), 0.0)),
+    )
+    risk_adjusted_edge_per_capital_hour_bps = (
+        max(edge.worst_case_edge_bps, 0.0)
+        * 3_600_000.0
+        / (hold_time_ms / hold_time_confidence)
+    )
+    statistical_score = edge.ranking_edge_bps + effective_z * 2.0 + quality.quality * 5.0 + liquidity_score * config.score_liquidity_weight - penalty
+    score = (
+        risk_adjusted_edge_per_capital_hour_bps
+        if config.rank_by_capital_efficiency
+        else statistical_score
+    )
+    account_fee_evidence_complete = bool(
+        config.account_fee_evidence is not None
+        and config.account_fee_evidence.complete_for(long_q.venue, short_q.venue)
+    )
+    calculation_version = edge.calculation_version
 
     return SpreadReversionCandidate(
         candidate_id=_candidate_id(a.symbol, a.venue, b.venue),
@@ -724,7 +823,13 @@ def _candidate_for_pair(
         liquidity_score=liquidity_score,
         venue_health_score=1.0,
         score=score,
-        rank_reason=f"score={score:.2f};expected_net_edge_bps={edge.expected_net_edge_bps:.2f};z_score={z_score:.2f};phi={stats.ar1_phi}",
+        rank_reason=(
+            f"score={score:.2f};expected_net_edge_bps={edge.expected_net_edge_bps:.2f};"
+            f"net_edge_per_capital_hour_bps={net_edge_per_capital_hour_bps:.2f};"
+            f"risk_adjusted_edge_per_capital_hour_bps={risk_adjusted_edge_per_capital_hour_bps:.2f};"
+            f"hold_time_confidence={hold_time_confidence:.3f};"
+            f"z_score={z_score:.2f};phi={stats.ar1_phi}"
+        ),
         degradation_state=DegradationState.HEALTHY.value,
         liquidity_evidence_status=liquidity_gate.liquidity_evidence_status(long_q, short_q),
         screening_reasons=screening_reasons,
@@ -754,10 +859,40 @@ def _candidate_for_pair(
         economics_observed_at_ms=edge.observed_at_ms,
         expected_net_edge_bps=edge.expected_net_edge_bps,
         worst_case_edge_bps=edge.worst_case_edge_bps,
-        calculation_version=edge.calculation_version,
+        calculation_version=calculation_version,
         model_epoch=config.model_epoch,
         economics_complete=edge.economics_complete,
         fee_evidence_complete=fee_evidence_complete,
+        account_fee_evidence_complete=account_fee_evidence_complete,
+        account_fee_evidence_observed_at_ms=(
+            config.account_fee_evidence.observed_at_ms_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and config.account_fee_evidence is not None
+            else 0
+        ),
+        account_fee_evidence_source=(
+            config.account_fee_evidence.source_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and config.account_fee_evidence is not None
+            else ""
+        ),
+        account_fee_evidence_fingerprint=(
+            config.account_fee_evidence.fingerprint_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and config.account_fee_evidence is not None
+            else ""
+        ),
+        account_fee_evidence_provenance=(
+            config.account_fee_evidence.provenance_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and config.account_fee_evidence is not None
+            else []
+        ),
+        volatility_regime=(
+            "high" if stats.std_bps >= float(config.volatility_high_std_bps) else "low"
+        ),
+        net_edge_per_capital_hour_bps=net_edge_per_capital_hour_bps,
+        risk_adjusted_edge_per_capital_hour_bps=(
+            risk_adjusted_edge_per_capital_hour_bps
+        ),
+        hold_time_confidence=hold_time_confidence,
+        dynamic_min_gross_edge_bps=dynamic_min_gross_edge_bps,
         contract_normalization_status="complete",
     )
 
@@ -874,6 +1009,18 @@ def _canonical_quotes(left: QuoteSnapshot, right: QuoteSnapshot) -> tuple[QuoteS
 
 def _fee_map(venues: list[VenueConfig]) -> dict[str, float]:
     return {str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0) for venue in venues if str(venue.venue or "")}
+
+
+def _maker_fee_map(venues: list[VenueConfig]) -> dict[str, float]:
+    return {
+        str(venue.venue).lower(): float(
+            venue.maker_fee_bps
+            if venue.maker_fee_bps is not None
+            else venue.taker_fee_bps or 0.0
+        )
+        for venue in venues
+        if str(venue.venue or "")
+    }
 
 
 def _single_venue_dislocation_allowed(*, long_outlier: bool, short_outlier: bool, fair_price: dict[str, FairPriceAssessment], config: SpreadReversionConfig) -> bool:

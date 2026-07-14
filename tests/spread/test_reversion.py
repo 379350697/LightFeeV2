@@ -202,6 +202,53 @@ def test_gross_edge_is_reversion_space_not_the_full_observed_cross_venue_spread(
     assert candidate.expected_exit_cross_bps == pytest.approx(-2.0)
 
 
+def test_v3_dynamic_threshold_uses_cost_headroom_and_exposes_capital_efficiency() -> None:
+    blocked_tracker = SpreadStatsTracker()
+    _prewarm(blocked_tracker)
+    rejections: dict[str, int] = {}
+
+    blocked = build_spread_reversion_candidates(
+        _quotes_for_signed_basis(20.0, now_ms=31_000),
+        ["BTCUSDT"],
+        tracker=blocked_tracker,
+        config=_config(
+            dynamic_net_edge_enabled=True,
+            model_epoch="v3_cost_normalized_reversion",
+            min_profit_buffer_bps=100.0,
+            min_net_edge_bps=-100.0,
+        ),
+        now_ms=31_000,
+        rejection_counts=rejections,
+    )
+    assert blocked == []
+    assert rejections == {"dynamic_min_gross_edge": 1}
+
+    ready_tracker = SpreadStatsTracker()
+    _prewarm(ready_tracker)
+    ready = build_spread_reversion_candidates(
+        _quotes_for_signed_basis(20.0, now_ms=31_000),
+        ["BTCUSDT"],
+        tracker=ready_tracker,
+        config=_config(
+            dynamic_net_edge_enabled=True,
+            model_epoch="v3_cost_normalized_reversion",
+            min_profit_buffer_bps=0.0,
+            min_net_edge_bps=-100.0,
+            rank_by_capital_efficiency=True,
+        ),
+        now_ms=31_000,
+    )
+
+    assert len(ready) == 1
+    candidate = ready[0]
+    assert candidate.calculation_version == "spread_v3_cost_normalized_reversion"
+    assert candidate.dynamic_min_gross_edge_bps >= 0.0
+    assert candidate.risk_adjusted_edge_per_capital_hour_bps == pytest.approx(
+        candidate.score
+    )
+    assert candidate.score < candidate.net_edge_per_capital_hour_bps
+
+
 def test_spread_candidate_notional_is_per_leg_and_cannot_exceed_total_gross_cap() -> None:
     tracker = SpreadStatsTracker()
     _prewarm(tracker)

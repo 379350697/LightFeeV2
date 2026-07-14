@@ -277,6 +277,19 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         long_entry_fee_quote=float(data.get("long_entry_fee_quote", 0)),
         short_entry_fee_quote=float(data.get("short_entry_fee_quote", 0)),
         total_entry_fee_quote=float(data.get("total_entry_fee_quote", 0)),
+        entry_benchmark_long_price=float(data.get("entry_benchmark_long_price", 0)),
+        entry_benchmark_short_price=float(data.get("entry_benchmark_short_price", 0)),
+        entry_implementation_shortfall_quote=float(
+            data.get("entry_implementation_shortfall_quote", 0)
+        ),
+        exit_implementation_shortfall_quote=float(
+            data.get("exit_implementation_shortfall_quote", 0)
+        ),
+        # This is an acceptance-evidence fact, not a permissive configuration
+        # flag: only a JSON boolean ``true`` can certify the benchmark.
+        execution_benchmark_complete=(
+            data.get("execution_benchmark_complete") is True
+        ),
         funding_edge_bps_entry=float(data.get("funding_edge_bps_entry", 0)),
         total_funding_edge_bps_entry=float(data.get("total_funding_edge_bps_entry", 0)),
         expected_edge_bps_entry=float(data.get("expected_edge_bps_entry", 0)),
@@ -428,6 +441,15 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "long_entry_fee_quote": pos.long_entry_fee_quote,
         "short_entry_fee_quote": pos.short_entry_fee_quote,
         "total_entry_fee_quote": pos.total_entry_fee_quote,
+        "entry_benchmark_long_price": pos.entry_benchmark_long_price,
+        "entry_benchmark_short_price": pos.entry_benchmark_short_price,
+        "entry_implementation_shortfall_quote": (
+            pos.entry_implementation_shortfall_quote
+        ),
+        "exit_implementation_shortfall_quote": (
+            pos.exit_implementation_shortfall_quote
+        ),
+        "execution_benchmark_complete": pos.execution_benchmark_complete,
         "funding_edge_bps_entry": pos.funding_edge_bps_entry,
         "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
         "expected_edge_bps_entry": pos.expected_edge_bps_entry,

@@ -89,6 +89,14 @@ class OpenPosition:
     long_entry_fee_quote: float = 0.0
     short_entry_fee_quote: float = 0.0
     total_entry_fee_quote: float = 0.0
+    # Immutable executable benchmarks are distinct from holding PnL.  They
+    # measure only adverse fill quality for an acceptance cohort and never
+    # participate in V1 risk, close, or realised-PnL decisions.
+    entry_benchmark_long_price: float = 0.0
+    entry_benchmark_short_price: float = 0.0
+    entry_implementation_shortfall_quote: float = 0.0
+    exit_implementation_shortfall_quote: float = 0.0
+    execution_benchmark_complete: bool = False
     # --- PnL attribution (matches Rust V1 realized_* fields) ---
     realized_price_pnl_quote: float = 0.0
     realized_exit_fee_quote: float = 0.0
@@ -1898,6 +1906,15 @@ class EngineState:
                     "long_entry_fee_quote": pos.long_entry_fee_quote,
                     "short_entry_fee_quote": pos.short_entry_fee_quote,
                     "total_entry_fee_quote": pos.total_entry_fee_quote,
+                    "entry_benchmark_long_price": pos.entry_benchmark_long_price,
+                    "entry_benchmark_short_price": pos.entry_benchmark_short_price,
+                    "entry_implementation_shortfall_quote": (
+                        pos.entry_implementation_shortfall_quote
+                    ),
+                    "exit_implementation_shortfall_quote": (
+                        pos.exit_implementation_shortfall_quote
+                    ),
+                    "execution_benchmark_complete": pos.execution_benchmark_complete,
                     "funding_edge_bps_entry": pos.funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": pos.expected_edge_bps_entry,

@@ -8,6 +8,7 @@ from lightfee.config.schema import StrategyConfig
 from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
 from lightfee.strategy.economics import FundingForecast, build_edge_breakdown
+from lightfee.strategy.fee_evidence import FeeEvidenceBook
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -31,10 +32,17 @@ class FundingCandidateService:
         venue_maker_fee_bps: dict[str, float],
         venue_notional_caps: dict[str, float],
         passive_execution_enabled: bool,
+        fee_evidence: FeeEvidenceBook | None = None,
     ) -> None:
         self._strategy = strategy
         self._fee_by_venue = _normalise_venue_bps(venue_fee_bps)
-        self._maker_fee_by_venue = _normalise_venue_bps(venue_maker_fee_bps)
+        self._fee_evidence = fee_evidence
+        self._maker_fee_by_venue = _normalise_venue_bps(
+            venue_maker_fee_bps,
+            allow_negative=bool(
+                fee_evidence is not None and fee_evidence.integrity_verified is True
+            ),
+        )
         self._caps_by_venue = _normalise_venue_bps(venue_notional_caps)
         self._passive_execution_enabled = passive_execution_enabled is True
         self._allocator = StrategyRiskAllocator()
@@ -55,6 +63,7 @@ class FundingCandidateService:
             caps_by_venue=self._caps_by_venue,
             allocator=self._allocator,
             passive_execution_enabled=self._passive_execution_enabled,
+            fee_evidence=self._fee_evidence,
             observed_at_ms=observed_at_ms,
         )
 
@@ -68,6 +77,7 @@ def build_same_symbol_pairs(
     venue_maker_fee_bps: dict[str, float] | None = None,
     venue_notional_caps: dict[str, float] | None = None,
     passive_execution_enabled: bool = False,
+    fee_evidence: FeeEvidenceBook | None = None,
     observed_at_ms: int = 0,
 ) -> list[CandidateInput]:
     """Build directed funding pairs using a common base quantity.
@@ -83,10 +93,16 @@ def build_same_symbol_pairs(
         symbols,
         config=strategy if strategy is not None else StrategyConfig(),
         fee_by_venue=_normalise_venue_bps(venue_fee_bps or {}),
-        maker_fee_by_venue=_normalise_venue_bps(venue_maker_fee_bps or {}),
+        maker_fee_by_venue=_normalise_venue_bps(
+            venue_maker_fee_bps or {},
+            allow_negative=bool(
+                fee_evidence is not None and fee_evidence.integrity_verified is True
+            ),
+        ),
         caps_by_venue=_normalise_venue_bps(venue_notional_caps or {}),
         allocator=StrategyRiskAllocator(),
         passive_execution_enabled=passive_execution_enabled is True,
+        fee_evidence=fee_evidence,
         observed_at_ms=observed_at_ms,
     )
 
@@ -101,6 +117,7 @@ def _build_same_symbol_pairs(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
+    fee_evidence: FeeEvidenceBook | None,
     observed_at_ms: int,
 ) -> list[CandidateInput]:
     candidates: list[CandidateInput] = []
@@ -138,6 +155,7 @@ def _build_same_symbol_pairs(
                     caps_by_venue=caps_by_venue,
                     allocator=allocator,
                     passive_execution_enabled=passive_execution_enabled,
+                    fee_evidence=fee_evidence,
                     observed_at_ms=observed_at_ms,
                 )
                 if candidate is not None:
@@ -156,6 +174,7 @@ def _candidate_for_pair(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
+    fee_evidence: FeeEvidenceBook | None,
     observed_at_ms: int,
 ) -> CandidateInput | None:
     # A snapshot is only a coherent cross-venue observation when no source
@@ -296,6 +315,10 @@ def _candidate_for_pair(
         fee_by_venue,
         long_q.venue,
         short_q.venue,
+    )
+    account_fee_evidence_complete = bool(
+        fee_evidence is not None
+        and fee_evidence.complete_for(long_q.venue, short_q.venue)
     )
     long_maker_fee = maker_fee_by_venue.get(str(long_q.venue).lower(), long_fee)
     short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
@@ -494,6 +517,27 @@ def _candidate_for_pair(
         long_taker_fee_bps=long_fee,
         short_taker_fee_bps=short_fee,
         taker_fee_evidence_complete=taker_fee_evidence_complete,
+        account_fee_evidence_complete=account_fee_evidence_complete,
+        account_fee_evidence_observed_at_ms=(
+            fee_evidence.observed_at_ms_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and fee_evidence is not None
+            else 0
+        ),
+        account_fee_evidence_source=(
+            fee_evidence.source_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and fee_evidence is not None
+            else ""
+        ),
+        account_fee_evidence_fingerprint=(
+            fee_evidence.fingerprint_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and fee_evidence is not None
+            else ""
+        ),
+        account_fee_evidence_provenance=(
+            fee_evidence.provenance_for(long_q.venue, short_q.venue)
+            if account_fee_evidence_complete and fee_evidence is not None
+            else []
+        ),
         pair_id=make_candidate_pair_id(long_q.symbol, long_q.venue, short_q.venue),
         funding_timestamp_ms=first_ts,
         first_funding_timestamp_ms=first_ts,
@@ -789,7 +833,9 @@ def _funding_contract_block_reasons(
     return tuple(reasons)
 
 
-def _normalise_venue_bps(values: dict[str, float]) -> dict[str, float]:
+def _normalise_venue_bps(
+    values: dict[str, float], *, allow_negative: bool = False
+) -> dict[str, float]:
     """Normalise static venue evidence once at the service boundary.
 
     JSON booleans are integers in Python.  Treat them as malformed evidence,
@@ -805,7 +851,9 @@ def _normalise_venue_bps(values: dict[str, float]) -> dict[str, float]:
             parsed = float(value)
         except (TypeError, ValueError, OverflowError):
             parsed = float("nan")
-        normalized[str(key).lower()] = parsed
+        normalized[str(key).lower()] = (
+            parsed if allow_negative or not isfinite(parsed) or parsed >= 0.0 else float("nan")
+        )
     return normalized
 
 

@@ -44,6 +44,9 @@ class CloseExecution:
     realized_price_pnl_quote: float = 0.0
     funding_pnl_quote: float = 0.0
     net_quote: float = 0.0
+    # None means the benchmark is unavailable; zero is a verified
+    # no-adverse-fill result.  Keep this separate from price PnL.
+    implementation_shortfall_quote: float | None = None
 
 
 def build_reduce_only_close_orders(

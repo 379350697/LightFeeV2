@@ -184,6 +184,36 @@ async def test_post_close_task_remains_non_official_until_all_private_statements
     assert complete["funding_forecast_error_quote"] == pytest.approx(0.0)
 
 
+def test_pending_task_requires_persisted_execution_benchmark_facts() -> None:
+    missing_benchmarks = FundingSettlementReconciler.new_pending_task(
+        _position(execution_benchmark_complete=True),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    complete_benchmarks = FundingSettlementReconciler.new_pending_task(
+        _position(
+            execution_benchmark_complete=True,
+            entry_benchmark_long_price=100.0,
+            entry_benchmark_short_price=100.0,
+            entry_implementation_shortfall_quote=0.0,
+            exit_implementation_shortfall_quote=0.0,
+        ),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+
+    assert missing_benchmarks is not None
+    assert missing_benchmarks["execution_benchmark_complete"] is False
+    assert missing_benchmarks["implementation_shortfall_quote"] is None
+    assert complete_benchmarks is not None
+    assert complete_benchmarks["execution_benchmark_complete"] is True
+    assert complete_benchmarks["implementation_shortfall_quote"] == pytest.approx(0.0)
+
+
 @pytest.mark.asyncio
 async def test_pending_batch_rejects_a_statement_claimed_by_two_closed_positions() -> None:
     first = FundingSettlementReconciler.new_pending_task(
@@ -464,6 +494,7 @@ async def test_runtime_reconciles_complete_task_without_reopening_exposure_lifec
     assert state.open_positions == {}
     assert state.pending_funding_settlement_reconciliations == []
     record = next(payload for kind, payload in journal.records if kind == "funding.settlement_reconciled")
+    assert record["official_pnl"] is True
     assert record["official_funding_quote"] == pytest.approx(0.4)
     assert record["official_net_quote"] == pytest.approx(0.9)
     assert record["price_pnl_quote"] == pytest.approx(1.0)
@@ -471,6 +502,77 @@ async def test_runtime_reconciles_complete_task_without_reopening_exposure_lifec
     assert record["exit_fee_quote"] == pytest.approx(0.3)
     assert record["lifecycle_forecast_funding_quote"] == pytest.approx(0.4)
     assert len(record["statement_claims"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_nonblocking_receipt_derives_flat_truth_from_fresh_account_probe() -> None:
+    """A canary receipt needs probe-derived flatness, not a caller assertion."""
+    state = EngineState()
+    task = FundingSettlementReconciler.new_pending_task(
+        _position(),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert task is not None
+    state.enqueue_pending_funding_settlement_reconciliation(task)
+    journal = _RuntimeJournal()
+
+    async def collect_account_truth(_now_ms: int) -> dict[str, object]:
+        evidence = []
+        for venue in ("binance", "okx"):
+            evidence.extend(
+                [
+                    {
+                        "venue": venue,
+                        "symbol": "*",
+                        "endpoint": "fetch_all_positions",
+                        "classification": "position_probe_unfiltered_succeeded",
+                    },
+                    {
+                        "venue": venue,
+                        "symbol": "*",
+                        "endpoint": "fetch_open_orders",
+                        "classification": "open_order_probe_unfiltered_succeeded",
+                    },
+                ]
+            )
+        return {
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": evidence,
+            "errors": [],
+        }
+
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={
+                Venue.BINANCE: _StatementsAdapter([_statement(Venue.BINANCE, -0.1)]),
+                Venue.OKX: _StatementsAdapter([_statement(Venue.OKX, 0.5)]),
+            },
+            journal=journal,
+            _collect_recovery_ledger_account_truth=collect_account_truth,
+        )
+    )
+
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+
+    receipt = next(
+        payload
+        for kind, payload in journal.records
+        if kind == "funding.settlement_reconciled"
+    )
+    assert receipt["exchange_truth"]["truth_available"] is True
+    assert receipt["exchange_truth"]["positions_flat"] is True
+    assert receipt["exchange_truth"]["open_orders_flat"] is True
 
 
 @pytest.mark.asyncio

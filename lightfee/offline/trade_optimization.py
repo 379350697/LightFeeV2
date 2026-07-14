@@ -334,6 +334,9 @@ def sample_rows_for_csv(report: JsonDict) -> list[JsonDict]:
                 "realized_edge_after_cost_bps": features.get(
                     "realized_edge_after_cost_bps"
                 ),
+                "realized_net_per_capital_hour_bps": features.get(
+                    "realized_net_per_capital_hour_bps"
+                ),
                 "price_pnl_quote": pnl.get("price_pnl_quote"),
                 "funding_pnl_quote": pnl.get("funding_pnl_quote"),
                 "entry_fee_quote": pnl.get("entry_fee_quote"),
@@ -378,6 +381,8 @@ def render_markdown_report(report: JsonDict) -> str:
     lines.extend(_markdown_aggregate_table(aggregates.get("by_route") or {}))
     lines.extend(["", "## By Close Path", ""])
     lines.extend(_markdown_aggregate_table(aggregates.get("by_close_path") or {}))
+    lines.extend(["", "## By Capital-hour Net Edge", ""])
+    lines.extend(_markdown_aggregate_table(aggregates.get("by_capital_hour_bucket") or {}))
     lines.extend(["", "## By Entry Spread Bucket", ""])
     lines.extend(_markdown_aggregate_table(aggregates.get("by_entry_spread_bucket") or {}))
     lines.extend(["", "## Recommendations", ""])
@@ -761,10 +766,19 @@ def _features(
     price_pnl_quote = _decimal(pnl.get("price_pnl_quote"))
     funding_pnl_quote = _decimal(pnl.get("funding_pnl_quote"))
     net_pnl_quote = _decimal(pnl.get("net_pnl_quote"))
+    hold_duration_ms = (
+        close_ts_ms - open_ts_ms if open_ts_ms and close_ts_ms else None
+    )
+    realized_edge_bps = _bps(net_pnl_quote, notional)
+    realized_per_capital_hour_bps: Decimal | None = None
+    if hold_duration_ms is not None and hold_duration_ms > 0:
+        realized_per_capital_hour_bps = (
+            realized_edge_bps * Decimal("3600000") / Decimal(hold_duration_ms)
+        )
     return {
         "quantity": _decimal_str(quantity),
         "notional_quote": _decimal_str(notional),
-        "hold_duration_ms": close_ts_ms - open_ts_ms if open_ts_ms and close_ts_ms else None,
+        "hold_duration_ms": hold_duration_ms,
         "selected_edge_bps": _maybe_decimal_str(entry.get("selected_edge_bps")),
         "selected_total_funding_edge_bps": _maybe_decimal_str(
             entry.get("selected_total_funding_edge_bps")
@@ -774,7 +788,12 @@ def _features(
         "fee_drag_bps": _decimal_str(_bps(fee_drag_quote, notional)),
         "close_markout_bps": _decimal_str(_bps(price_pnl_quote, notional)),
         "funding_pnl_bps": _decimal_str(_bps(funding_pnl_quote, notional)),
-        "realized_edge_after_cost_bps": _decimal_str(_bps(net_pnl_quote, notional)),
+        "realized_edge_after_cost_bps": _decimal_str(realized_edge_bps),
+        "realized_net_per_capital_hour_bps": (
+            _decimal_str(realized_per_capital_hour_bps)
+            if realized_per_capital_hour_bps is not None
+            else None
+        ),
     }
 
 
@@ -1090,6 +1109,14 @@ def _build_aggregates(samples: list[JsonDict]) -> JsonDict:
             samples,
             lambda sample: _time_to_funding_bucket(
                 (sample.get("features") or {}).get("time_to_funding_ms")
+            ),
+        ),
+        "by_capital_hour_bucket": _aggregate_samples(
+            samples,
+            lambda sample: _capital_hour_bucket(
+                (sample.get("features") or {}).get(
+                    "realized_net_per_capital_hour_bps"
+                )
             ),
         ),
         "by_entry_spread_bucket": _aggregate_samples(
@@ -1414,6 +1441,21 @@ def _time_to_funding_bucket(value: Any) -> str:
     if ms <= 60 * 60_000:
         return "15_60m"
     return "60m_plus"
+
+
+def _capital_hour_bucket(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    numeric = _decimal(value)
+    if numeric <= 0:
+        return "nonpositive"
+    if numeric <= 5:
+        return "0_5bps_per_hour"
+    if numeric <= 15:
+        return "5_15bps_per_hour"
+    if numeric <= 30:
+        return "15_30bps_per_hour"
+    return "30bps_per_hour_plus"
 
 
 def _entry_spread_bucket(value: Any) -> str:

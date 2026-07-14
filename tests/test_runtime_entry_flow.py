@@ -37,6 +37,7 @@ from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.state import (
     ActiveMakerLeg,
     OpenPosition,
@@ -61,6 +62,27 @@ from typing import Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_non_canary_entry_stages(monkeypatch):
+    """Keep these legacy stage tests focused on their named admission stage.
+
+    Live production now rejects every new funding entry until the signed canary
+    contract is configured.  This module intentionally tests L2, leverage and
+    planner stages, while canary policy itself is covered by strategy-economics
+    tests; bypassing only the canary predicate here preserves that separation.
+    """
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_admission_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_submission_reason",
+        lambda *_args, **_kwargs: "",
+    )
 
 
 @dataclass

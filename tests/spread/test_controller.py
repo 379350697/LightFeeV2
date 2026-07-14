@@ -163,6 +163,31 @@ def test_spread_controller_suppresses_live_entry_intent_but_reports_hypothetical
     assert decision.evidence["hypothetical_entry_notional_quote"] == 20.0
 
 
+def test_spread_controller_accepts_current_v3_diagnostics_but_still_suppresses_intent() -> None:
+    controller = SpreadTradingController(
+        StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_live_enabled=True,
+            spread_dynamic_net_edge_enabled=True,
+            spread_model_epoch="v3_cost_normalized_reversion",
+            spread_signal_ttl_ms=1_000,
+        )
+    )
+
+    decision = controller.evaluate_entry(
+        _candidate(
+            calculation_version="spread_v3_cost_normalized_reversion",
+            model_epoch="v3_cost_normalized_reversion",
+        ),
+        state=SpreadTradingState(),
+        now_ms=1_000,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "spread_live_not_supported"
+    assert decision.intent is None
+
+
 def test_spread_controller_treats_gross_limit_as_both_legs_not_one_leg() -> None:
     controller = SpreadTradingController(
         StrategyConfig(

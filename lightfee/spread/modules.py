@@ -373,9 +373,15 @@ class LiquidityAndVenueHealthGate:
 
 
 class SpreadRanker:
-    def __init__(self, *, max_candidates: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        max_candidates: int = 0,
+        rank_by_capital_efficiency: bool = False,
+    ) -> None:
         configured = int(max_candidates or 0)
         self.max_candidates = configured if configured > 0 else 10
+        self.rank_by_capital_efficiency = rank_by_capital_efficiency is True
 
     def rank(
         self,
@@ -386,10 +392,19 @@ class SpreadRanker:
         # after two candidates have the same economic headroom; allowing an
         # arbitrary quality score to outrank it would reintroduce a second,
         # incompatible profit formula at the final selection boundary.
+        primary_edge = (
+            (
+                lambda c: _finite_rank_value(
+                    c.risk_adjusted_edge_per_capital_hour_bps
+                )
+            )
+            if self.rank_by_capital_efficiency
+            else (lambda c: _finite_rank_value(c.ranking_edge_bps))
+        )
         ranked = sorted(
             candidates,
             key=lambda c: (
-                _finite_rank_value(c.ranking_edge_bps),
+                primary_edge(c),
                 _finite_rank_value(c.expected_net_edge_bps),
                 _finite_rank_value(c.score),
                 _finite_rank_value(abs(c.z_score)),

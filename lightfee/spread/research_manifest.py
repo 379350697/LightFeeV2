@@ -7,6 +7,7 @@ or acceptance eligibility therefore creates a traceable new research epoch.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,47 @@ class SpreadResearchManifest:
     @property
     def enabled_bot_ids(self) -> tuple[str, ...]:
         return tuple(cohort.bot_id for cohort in self.cohorts if cohort.enabled)
+
+    @property
+    def digest(self) -> str:
+        """Return the canonical identity of the full research contract.
+
+        A manifest version is an operator label and may be reused.  This
+        digest covers every execution and admission field, so a persisted
+        paper episode cannot be mixed with or restored under a changed
+        manifest that happens to have the same version string.
+        """
+        payload = {
+            "version": self.version,
+            "model_epoch": self.model_epoch,
+            "hypothesis": self.hypothesis,
+            "cohorts": [
+                {
+                    "bot_id": cohort.bot_id,
+                    "cohort": cohort.cohort,
+                    "hypothesis": cohort.hypothesis,
+                    "enabled": cohort.enabled,
+                    "control_group": cohort.control_group,
+                    "acceptance_eligible": cohort.acceptance_eligible,
+                    "entry_long_role": cohort.entry_long_role,
+                    "entry_short_role": cohort.entry_short_role,
+                    "exit_long_role": cohort.exit_long_role,
+                    "exit_short_role": cohort.exit_short_role,
+                    "maker_leg": cohort.maker_leg,
+                    "hedge_delay_ms": cohort.hedge_delay_ms,
+                }
+                for cohort in self.cohorts
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
 
 
 DEFAULT_SPREAD_RESEARCH_MANIFEST = SpreadResearchManifest(

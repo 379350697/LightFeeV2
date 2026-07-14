@@ -54,6 +54,10 @@ _SPREAD_FLOAT_CANDIDATE_FIELDS = {
     "ranking_edge_bps",
     "expected_net_edge_bps",
     "worst_case_edge_bps",
+    "net_edge_per_capital_hour_bps",
+    "risk_adjusted_edge_per_capital_hour_bps",
+    "hold_time_confidence",
+    "dynamic_min_gross_edge_bps",
 }
 
 _SPREAD_INT_CANDIDATE_FIELDS = {
@@ -68,6 +72,7 @@ _SPREAD_INT_CANDIDATE_FIELDS = {
     "hold_time_hint_ms",
     "history_age_ms",
     "economics_observed_at_ms",
+    "account_fee_evidence_observed_at_ms",
 }
 
 
@@ -101,7 +106,7 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
     if not isinstance(data, dict):
         return None
     schema_version = int(data.get("schema_version", 0) or 0)
-    if schema_version not in {1, 2}:
+    if schema_version not in {1, 2, 3}:
         return None
     candidates = []
     for raw in data.get("candidates", []) or []:
@@ -116,9 +121,18 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
             # promote a malformed payload into a paper or live-ready candidate.
             # Missing fields retain the model defaults (False); only literal
             # JSON ``true`` is admissible as positive evidence.
-            for field in ("economics_complete", "fee_evidence_complete"):
+            for field in (
+                "economics_complete",
+                "fee_evidence_complete",
+                "account_fee_evidence_complete",
+            ):
                 if field in candidate_data and candidate_data[field] is not True:
                     candidate_data[field] = False
+            provenance = candidate_data.get("account_fee_evidence_provenance")
+            if not isinstance(provenance, list) or any(
+                not isinstance(row, dict) for row in provenance
+            ):
+                candidate_data["account_fee_evidence_provenance"] = []
             # Schema v1 predates signed-basis economics.  It remains readable
             # for diagnostics, but is explicitly separated from the v2 paper
             # cohort and cannot be mistaken for complete reversion economics.
@@ -232,6 +246,23 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
                 "model_epoch": c.model_epoch,
                 "economics_complete": c.economics_complete,
                 "fee_evidence_complete": c.fee_evidence_complete,
+                "account_fee_evidence_complete": c.account_fee_evidence_complete,
+                "account_fee_evidence_observed_at_ms": (
+                    c.account_fee_evidence_observed_at_ms
+                ),
+                "account_fee_evidence_source": c.account_fee_evidence_source,
+                "account_fee_evidence_fingerprint": c.account_fee_evidence_fingerprint,
+                "account_fee_evidence_provenance": list(
+                    c.account_fee_evidence_provenance
+                ),
+                "research_sample_split": c.research_sample_split,
+                "volatility_regime": c.volatility_regime,
+                "net_edge_per_capital_hour_bps": c.net_edge_per_capital_hour_bps,
+                "risk_adjusted_edge_per_capital_hour_bps": (
+                    c.risk_adjusted_edge_per_capital_hour_bps
+                ),
+                "hold_time_confidence": c.hold_time_confidence,
+                "dynamic_min_gross_edge_bps": c.dynamic_min_gross_edge_bps,
                 "contract_normalization_status": c.contract_normalization_status,
                 "contract_normalization_reason": c.contract_normalization_reason,
             }

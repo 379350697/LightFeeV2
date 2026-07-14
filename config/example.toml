@@ -10,6 +10,16 @@ sidecar_perp_liquidity_budget_ms = 30000
 sidecar_hint_budget_ms = 500
 spread_sidecar_snapshot_path = "runtime/spread-opportunities-current.json"
 spread_stats_checkpoint_path = "runtime/spread-stats-v2-checkpoint.json"
+# Private account-fee evidence is required before enabling a funding canary or
+# accepting official spread-paper results.  The example file is deliberately
+# invalid until it is replaced with a fresh private-account observation.
+fee_evidence_path = "runtime/account-fee-evidence.json"
+fee_evidence_max_age_ms = 86400000
+# Environment variable name only; never place the HMAC secret in TOML.
+fee_evidence_integrity_key_env = "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY"
+# Bind each canary/v3-paper venue to SHA256(account-or-subaccount UID).  Keep
+# this empty until real values are supplied; strict admission then fails closed.
+fee_evidence_account_identity_hashes = {}
 spread_sidecar_refresh_ms = 1000
 spread_sidecar_fetch_timeout_s = 10.0
 # Reuse validated Local-L2 books from the live process for spread-paper VWAP;
@@ -70,6 +80,13 @@ small_test_max_entry_slippage_relaxation_bps = 5.0
 # Release safety: no new funding entry until V1-parity shadow checks and the
 # explicit canary approval are complete. Existing close/recovery paths remain on.
 funding_new_entries_enabled = false
+funding_canary_enabled = false
+funding_canary_allowed_venues = ["binance", "bybit", "okx", "gate"]
+funding_canary_max_concurrent_positions = 1
+funding_canary_max_entry_notional_quote = 30.0
+funding_canary_min_expected_net_edge_bps = 8.0
+funding_canary_min_worst_case_edge_bps = 3.0
+funding_canary_require_account_fee_evidence = true
 funding_economics_mode = "v1_exact"
 funding_forecast_mode = "shadow"
 funding_forecast_uncertainty_haircut_bps = 2.0
@@ -112,6 +129,13 @@ spread_min_liquidity_capacity_ratio = 1.25
 spread_min_history_ms = 300000
 spread_min_executable_spread_bps = 50.0
 spread_max_executable_spread_bps = 300.0
+# v3 replaces the fixed floor with gross headroom over complete executable
+# costs.  Enable it only with a v3 model epoch and a new research manifest.
+spread_dynamic_net_edge_enabled = false
+spread_min_gross_profit_multiple = 1.0
+spread_min_profit_buffer_bps = 5.0
+spread_rank_by_capital_efficiency = false
+spread_volatility_high_std_bps = 10.0
 spread_mean_reversion_min_std_bps = 0.05
 spread_mean_reversion_max_half_life_ms = 1800000
 spread_stats_window_ms = 21600000
@@ -142,6 +166,13 @@ spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversio
 spread_paper_markout_secs = [60, 300, 900, 1800]
 spread_paper_terminal_secs = 1800
 spread_paper_slippage_buffer_bps = 0.0
+spread_paper_latency_buffer_bps = 0.5
+spread_paper_require_l2_vwap = true
+spread_paper_require_account_fee_evidence = true
+# Keep rebate credit disabled until signed account-fee exports are observed.
+spread_allow_verified_maker_rebates = false
+spread_paper_oos_start_ms = 0
+spread_paper_require_out_of_sample = false
 entry_exit_reserve_bps = 3.0
 normal_close_slippage_limit_bps = 3.0
 execution_buffer_bps = 2.0

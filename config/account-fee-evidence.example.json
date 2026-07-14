@@ -1,0 +1,26 @@
+{
+  "schema_version": 3,
+  "venues": {
+    "binance": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "account_identity_hash": "REPLACE_WITH_SHA256_OF_BINANCE_ACCOUNT_OR_SUBACCOUNT_UID"
+    },
+    "okx": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "account_identity_hash": "REPLACE_WITH_SHA256_OF_OKX_ACCOUNT_OR_SUBACCOUNT_UID"
+    }
+  },
+  "integrity": {
+    "algorithm": "hmac-sha256",
+    "key_id": "lightfee-fee-evidence-v3",
+    "signature": "REPLACE_WITH_HMAC_SHA256_OF_DOCUMENT_WITH_ONLY_SIGNATURE_REMOVED"
+  }
+}

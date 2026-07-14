@@ -7,6 +7,7 @@ import pytest
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import Venue
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -14,6 +15,21 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_non_canary_snapshot_incident(monkeypatch):
+    """This incident suite verifies snapshot semantics, not canary admission."""
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_admission_reason",
+        lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_funding_canary_submission_reason",
+        lambda *_args, **_kwargs: "",
+    )
 
 
 class CapturingEntryExecutor:

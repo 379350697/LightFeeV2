@@ -14,7 +14,6 @@ from lightfee.core.domain import PerpLiquiditySnapshot, Venue
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
-    CandidateInput,
     FundingLifecycle,
     LiquidityLifecycle,
     MarketLifecycle,
@@ -22,6 +21,7 @@ from lightfee.sidecar.snapshot import (
     SidecarSnapshot,
     TransferLifecycle,
 )
+from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
@@ -238,6 +238,10 @@ class SidecarService:
         last_good_for_acquisition = self._last_good_quotes if had_last_good_before_refresh else {}
 
         # --- Build candidates ---
+        # Fee schedules may be refreshed independently of market data.  Build
+        # a new immutable candidate service for this snapshot so a verified
+        # account tier is never silently retained past its evidence TTL.
+        self._candidate_service = self._new_candidate_service(now_ms=observed_ms)
         candidates = self._ensure_candidate_service().build(
             quotes,
             symbols,
@@ -380,23 +384,40 @@ class SidecarService:
             self._forecast_calibrator = calibrator
         return calibrator
 
-    def _new_candidate_service(self) -> FundingCandidateService:
+    def _new_candidate_service(
+        self,
+        *,
+        now_ms: int | None = None,
+    ) -> FundingCandidateService:
         """Build the configuration-derived shortlist service once per runtime."""
         config = self.config
+        evidence = load_fee_evidence(
+            config.runtime.fee_evidence_path,
+            now_ms=int(now_ms if now_ms is not None else time.time() * 1000),
+            max_age_ms=int(config.runtime.fee_evidence_max_age_ms),
+        )
+        configured_taker = {
+            str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0)
+            for venue in config.venues
+        }
+        configured_maker = {
+            str(venue.venue).lower(): float(
+                venue.maker_fee_bps
+                if venue.maker_fee_bps is not None
+                else venue.taker_fee_bps or 0.0
+            )
+            for venue in config.venues
+        }
+        taker_fees, maker_fees = effective_fee_maps(
+            configured_taker,
+            configured_maker,
+            evidence,
+            allow_verified_maker_rebates=True,
+        )
         return FundingCandidateService(
             strategy=config.strategy,
-            venue_fee_bps={
-                str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0)
-                for venue in config.venues
-            },
-            venue_maker_fee_bps={
-                str(venue.venue).lower(): float(
-                    venue.maker_fee_bps
-                    if venue.maker_fee_bps is not None
-                    else venue.taker_fee_bps or 0.0
-                )
-                for venue in config.venues
-            },
+            venue_fee_bps=taker_fees,
+            venue_maker_fee_bps=maker_fees,
             venue_notional_caps={
                 str(venue.venue).lower(): float(venue.max_notional or 0.0)
                 for venue in config.venues
@@ -404,6 +425,7 @@ class SidecarService:
             passive_execution_enabled=(
                 str(config.runtime.mode or "").lower() == "live"
             ),
+            fee_evidence=evidence,
         )
 
     def _ensure_candidate_service(self) -> FundingCandidateService:

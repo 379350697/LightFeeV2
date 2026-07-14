@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,10 @@ from lightfee.strategy.economics import (
 )
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
+from lightfee.strategy.fee_evidence import (
+    load_fee_evidence,
+    sign_fee_evidence_payload,
+)
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -1800,4 +1806,192 @@ def test_v1_final_revalidation_does_not_apply_shadow_forecast_to_first_stage_wor
     assert decision.allowed is True
     assert decision.edge.worst_case_edge_bps == pytest.approx(
         decision.edge.expected_net_edge_bps - candidate.execution_buffer_bps
+    )
+
+
+def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monkeypatch) -> None:
+    evidence_path = tmp_path / "account-fees.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "venues": {
+                    "cheap": {
+                        "taker_fee_bps": 0.8,
+                        "maker_fee_bps": 0.2,
+                        "observed_at_ms": 1_000,
+                        "source": "account_fee_api",
+                        "evidence_ref": "fee-snapshot-1",
+                        "account_identity_hash": "a" * 64,
+                    },
+                    "rich": {
+                        "taker_fee_bps": 0.7,
+                        "maker_fee_bps": 0.2,
+                        "observed_at_ms": 1_000,
+                        "source": "account_fee_api",
+                        "evidence_ref": "fee-snapshot-1",
+                        "account_identity_hash": "b" * 64,
+                    },
+                },
+                "integrity": {
+                    "algorithm": "hmac-sha256",
+                    "key_id": "lightfee-fee-evidence-v3",
+                    "signature": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LIGHTFEE_FEE_EVIDENCE_HMAC_KEY", "secret")
+    raw_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence_path.write_text(
+        json.dumps(sign_fee_evidence_payload(raw_evidence, "secret")),
+        encoding="utf-8",
+    )
+    evidence = load_fee_evidence(
+        evidence_path,
+        now_ms=1_100,
+        max_age_ms=10_000,
+    )
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_canary_enabled=True,
+                funding_canary_allowed_venues=["cheap", "rich"],
+                funding_canary_max_concurrent_positions=1,
+                funding_canary_max_entry_notional_quote=30.0,
+                funding_canary_min_expected_net_edge_bps=8.0,
+                funding_canary_min_worst_case_edge_bps=3.0,
+                funding_canary_require_account_fee_evidence=True,
+            ),
+            runtime=SimpleNamespace(
+                mode="paper",
+                fee_evidence_path=str(evidence_path),
+                fee_evidence_max_age_ms=10_000,
+                fee_evidence_integrity_key_env="",
+                fee_evidence_account_identity_hashes={
+                    "cheap": "a" * 64,
+                    "rich": "b" * 64,
+                },
+            ),
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+    candidate = _candidate(
+        entry_notional_quote=30.0,
+        expected_net_edge_bps=8.0,
+        worst_case_edge_bps=3.0,
+        long_taker_fee_bps=0.8,
+        short_taker_fee_bps=0.7,
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+
+    assert dispatch._funding_canary_admission_reason(candidate, 1_100) == ""
+    stale_candidate = replace(candidate, account_fee_evidence_observed_at_ms=999)
+    assert (
+        dispatch._funding_canary_admission_reason(stale_candidate, 1_100)
+        == "funding_canary_fee_evidence_epoch_mismatch"
+    )
+    understated_passive_candidate = replace(
+        candidate,
+        entry_maker_leg="long",
+        entry_fee_bps=0.1,
+        exit_fee_bps=0.1,
+    )
+    assert (
+        dispatch._funding_canary_admission_reason(
+            understated_passive_candidate, 1_100
+        )
+        == "funding_canary_fee_cost_understated"
+    )
+
+
+def test_funding_canary_runtime_defense_rejects_programmatic_scale_bypass() -> None:
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_canary_enabled=True,
+                funding_canary_allowed_venues=["cheap", "rich"],
+                funding_canary_max_concurrent_positions=2,
+                funding_canary_max_entry_notional_quote=1_000.0,
+            ),
+            runtime=SimpleNamespace(mode="paper"),
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+
+    assert (
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        == "funding_canary_hard_concurrency_cap_invalid"
+    )
+    dispatch.ctx.config.strategy.funding_canary_max_concurrent_positions = 1
+    assert (
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        == "funding_canary_hard_notional_cap_invalid"
+    )
+
+
+def test_funding_canary_runtime_defense_cannot_relax_economics_floors() -> None:
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_canary_enabled=True,
+                funding_canary_allowed_venues=["cheap", "rich"],
+                funding_canary_min_expected_net_edge_bps=0.0,
+                funding_canary_min_worst_case_edge_bps=0.0,
+            ),
+            runtime=SimpleNamespace(mode="paper"),
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+
+    assert (
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        == "funding_canary_expected_edge_below_floor"
+    )
+
+
+def test_funding_canary_runtime_defense_requires_private_statement_venue() -> None:
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_new_entries_enabled=True,
+                funding_canary_enabled=True,
+                funding_canary_allowed_venues=["cheap", "rich"],
+            ),
+            runtime=SimpleNamespace(mode="live"),
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+
+    assert (
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        == "funding_canary_venue_not_statement_reconcilable"
+    )
+
+
+def test_funding_canary_runtime_defense_blocks_live_bypass_before_economics() -> None:
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_new_entries_enabled=True,
+                funding_canary_enabled=False,
+            ),
+            runtime=SimpleNamespace(mode="live"),
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+
+    assert (
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        == "funding_canary_required"
     )

@@ -46,6 +46,20 @@ def test_research_manifest_records_cohort_controls_and_acceptance(tmp_path) -> N
     assert manifest.enabled_bot_ids == ("tt_baseline",)
     assert manifest.cohort_for("maker_control").control_group is True
     assert manifest.cohort_for("maker_control").hedge_delay_ms == 1_000
+    assert len(manifest.digest) == 64
+
+
+def test_research_manifest_digest_changes_when_execution_contract_changes(tmp_path) -> None:
+    first_path = tmp_path / "first.json"
+    first_path.write_text(json.dumps(_manifest()), encoding="utf-8")
+    second = _manifest()
+    second["cohorts"][0]["hypothesis"] = "changed execution contract"
+    second_path = tmp_path / "second.json"
+    second_path.write_text(json.dumps(second), encoding="utf-8")
+
+    assert load_spread_research_manifest(first_path).digest != load_spread_research_manifest(
+        second_path
+    ).digest
 
 
 def test_research_manifest_fails_closed_for_duplicate_or_unacceptable_cohorts(tmp_path) -> None:

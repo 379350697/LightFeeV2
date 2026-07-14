@@ -73,6 +73,44 @@ def test_lifecycle_estimate_is_never_reported_as_official_without_statement_fact
     assert pnl["official_net_quote"] is None
 
 
+def test_execution_shortfall_is_an_audit_cost_not_a_v1_net_pnl_rewrite() -> None:
+    position = _position(
+        execution_benchmark_complete=True,
+        entry_implementation_shortfall_quote=1.25,
+    )
+    close = CloseExecution(
+        position_id=position.position_id,
+        reason="funding_capture",
+        long_close_price=100.0,
+        short_close_price=100.0,
+        long_close_qty=1.0,
+        short_close_qty=1.0,
+        long_fee_quote=0.0,
+        short_fee_quote=0.0,
+        realized_price_pnl_quote=0.0,
+        funding_pnl_quote=2.0,
+        net_quote=2.0,
+        implementation_shortfall_quote=0.75,
+    )
+
+    attribution = build_exit_pnl_attribution(position, close)
+
+    assert attribution["implementation_shortfall_quote"] == pytest.approx(2.0)
+    assert attribution["execution_benchmark_complete"] is True
+    # V1 realised/funding PnL remains the unchanged accounting series.
+    assert attribution["net_quote"] == pytest.approx(2.0)
+
+
+def test_recovery_does_not_coerce_execution_benchmark_evidence() -> None:
+    position = _position(execution_benchmark_complete=True)
+    persisted = _serialize_open_position(position)
+    persisted["execution_benchmark_complete"] = "false"
+
+    restored = _deserialize_open_position(persisted)
+
+    assert restored.execution_benchmark_complete is False
+
+
 def test_complete_two_leg_statement_settlement_makes_official_pnl_and_roundtrips() -> None:
     position = _position()
     attribution = StrategyAttributionService.record_settlements(

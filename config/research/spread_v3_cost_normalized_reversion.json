@@ -1,0 +1,35 @@
+{
+  "version": "spread_research_manifest_v3",
+  "model_epoch": "v3_cost_normalized_reversion",
+  "hypothesis": "signed-basis mean reversion whose gross headroom exceeds complete executable costs",
+  "cohorts": [
+    {
+      "bot_id": "tt_cost_normalized_baseline",
+      "cohort": "taker_taker_cost_normalized",
+      "hypothesis": "L2 VWAP taker/taker reversion with account-fee and latency cost evidence",
+      "enabled": true,
+      "control_group": false,
+      "acceptance_eligible": true,
+      "entry_long_role": "taker",
+      "entry_short_role": "taker",
+      "exit_long_role": "taker",
+      "exit_short_role": "taker",
+      "maker_leg": "",
+      "hedge_delay_ms": 0
+    },
+    {
+      "bot_id": "mt_cost_normalized_delay_1000ms",
+      "cohort": "maker_taker_cost_control",
+      "hypothesis": "queue-unknown maker fill with delayed hedge is diagnostic-only",
+      "enabled": false,
+      "control_group": true,
+      "acceptance_eligible": false,
+      "entry_long_role": "maker",
+      "entry_short_role": "taker",
+      "exit_long_role": "taker",
+      "exit_short_role": "taker",
+      "maker_leg": "long",
+      "hedge_delay_ms": 1000
+    }
+  ]
+}

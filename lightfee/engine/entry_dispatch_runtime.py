@@ -7,6 +7,8 @@ Do not change entry dispatch, order admission, or journal payload semantics whil
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import re
 from contextlib import suppress
@@ -43,6 +45,12 @@ from lightfee.engine.venue_private_health import (
 )
 from lightfee.engine.v1_lifecycle import V1TradingLifecycle
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
+from lightfee.strategy.fee_evidence import (
+    FEE_EVIDENCE_SCHEMA_VERSION,
+    TRUSTED_FEE_EVIDENCE_HMAC_ENV,
+    TRUSTED_FEE_EVIDENCE_KEY_ID,
+    load_fee_evidence,
+)
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 from lightfee.venues.cid import generate_exchange_cid
 from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
@@ -52,6 +60,110 @@ _ASTER_HEADROOM_NUMBER_RE = re.compile(
     r"\b(?P<key>requested_notional|remaining_openable_notional)="
     r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 )
+_FUNDING_CANARY_HARD_MAX_CONCURRENT_POSITIONS = 1
+_FUNDING_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
+_FUNDING_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
+_FUNDING_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
+_FUNDING_CANARY_POLICY_VERSION = "funding-canary-v1"
+_FUNDING_CANARY_STATEMENT_RECONCILABLE_VENUES = frozenset(
+    {"binance", "bybit", "okx", "gate"}
+)
+
+
+def _funding_canary_cohort_id(candidate: object, strategy: object) -> str:
+    """Hash the immutable policy identity required for canary promotion.
+
+    Venue-pair data is intentionally excluded so a single release cohort may
+    test multiple approved pairs.  Economics version, forecast mode, fee
+    document identity, route and hard release limits are included; mixing any
+    of them would make a 30-loop acceptance sample non-comparable.
+    """
+
+    raw_provenance = getattr(candidate, "account_fee_evidence_provenance", []) or []
+    document_digests = sorted(
+        {
+            str(item.get("document_sha256") or "")
+            for item in raw_provenance
+            if isinstance(item, dict) and str(item.get("document_sha256") or "")
+        }
+    )
+    account_identity_hashes = sorted(
+        {
+            str(item.get("account_identity_hash") or "").lower()
+            for item in raw_provenance
+            if isinstance(item, dict)
+            and _is_sha256_hex(str(item.get("account_identity_hash") or ""))
+        }
+    )
+    execution_budget = _funding_canary_execution_budget(candidate)
+    material = {
+        "policy_version": _FUNDING_CANARY_POLICY_VERSION,
+        "calculation_version": str(
+            getattr(candidate, "calculation_version", "") or ""
+        ).lower(),
+        "model_epoch": str(getattr(candidate, "model_epoch", "") or "").lower(),
+        "funding_economics_mode": str(
+            getattr(strategy, "funding_economics_mode", "") or ""
+        ).lower(),
+        "funding_forecast_mode": str(
+            getattr(strategy, "funding_forecast_mode", "") or ""
+        ).lower(),
+        "entry_maker_leg": str(getattr(candidate, "entry_maker_leg", "") or "").lower(),
+        "exit_maker_leg": str(getattr(candidate, "exit_maker_leg", "") or "").lower(),
+        "fee_document_sha256": document_digests,
+        "fee_account_identity_hashes": account_identity_hashes,
+        "budgeted_execution_cost_bps": (
+            execution_budget[0] if execution_budget is not None else None
+        ),
+        "execution_reserve_bps": (
+            execution_budget[1] if execution_budget is not None else None
+        ),
+        "forecast_uncertainty_haircut_bps": getattr(
+            strategy, "funding_forecast_uncertainty_haircut_bps", None
+        ),
+        "hard_max_entry_notional_quote": _FUNDING_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE,
+        "hard_min_expected_net_edge_bps": _FUNDING_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS,
+        "hard_min_worst_case_edge_bps": _FUNDING_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS,
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _is_sha256_hex(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    if len(text) != 64:
+        return False
+    try:
+        int(text, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _funding_canary_execution_budget(candidate: object) -> tuple[float, float] | None:
+    """Return the immutable execution-cost budget and reserve in bps.
+
+    The release gate must compare like with like: realised fees plus measured
+    implementation shortfall are execution costs, while forecast/funding or
+    holding-period PnL are not.  A canary therefore persists the pre-trade
+    cost budget separately from its edge floors.
+    """
+
+    cost_fields = (
+        "entry_fee_bps",
+        "exit_fee_bps",
+        "entry_slippage_bps",
+        "exit_slippage_bps",
+        "adverse_selection_bps",
+    )
+    try:
+        costs = [float(getattr(candidate, field, 0.0) or 0.0) for field in cost_fields]
+        reserve = float(getattr(candidate, "execution_buffer_bps", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(value) and value >= 0.0 for value in (*costs, reserve)):
+        return None
+    return sum(costs), reserve
 
 
 def _entry_leverage_evidence_payload(
@@ -2132,6 +2244,11 @@ class EntryDispatchRuntime:
                 # calibrated forecast gate.  Keep this check at the first
                 # live boundary and repeat it in final revalidation below.
                 policy_reason = self._live_economics_contract_reason(candidate)
+                if not policy_reason:
+                    policy_reason = self._funding_canary_admission_reason(
+                        candidate,
+                        now_ms,
+                    )
             if policy_reason:
                 self._emit_entry_dispatch_viability_blocked(
                     candidate,
@@ -2292,6 +2409,268 @@ class EntryDispatchRuntime:
                 )
                 return True
         return False
+
+    def _funding_canary_admission_reason(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        check_concurrency: bool = True,
+    ) -> str:
+        """Return a canary-only block reason for a *new* funding entry.
+
+        It runs at initial admission and again immediately before the first
+        submit after final economics/size repricing.  It must not gate a
+        pending hedge, residual repair, recovery or close; once a leg exists,
+        V1 safety semantics require completing or reducing risk irrespective
+        of later experimental configuration changes.
+        """
+
+        strategy = self.ctx.config.strategy
+        runtime = self.ctx.config.runtime
+        runtime_mode = str(runtime.mode or "paper").lower()
+        if (
+            runtime_mode == "live"
+            and strategy.funding_new_entries_enabled is True
+            and strategy.funding_canary_enabled is not True
+        ):
+            # Config validation normally prevents this, but the final runtime
+            # boundary must also fail closed for programmatically assembled
+            # configs and stale process state.
+            return "funding_canary_required"
+        if strategy.funding_canary_enabled is not True:
+            return ""
+        allowed_venues = {
+            str(venue or "").strip().lower()
+            for venue in strategy.funding_canary_allowed_venues
+            if str(venue or "").strip()
+        }
+        long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
+        short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
+        if long_venue not in allowed_venues or short_venue not in allowed_venues:
+            return "funding_canary_venue_not_statement_reconcilable"
+        if (
+            runtime_mode == "live"
+            and strategy.funding_new_entries_enabled is True
+            and (
+                long_venue not in _FUNDING_CANARY_STATEMENT_RECONCILABLE_VENUES
+                or short_venue not in _FUNDING_CANARY_STATEMENT_RECONCILABLE_VENUES
+            )
+        ):
+            return "funding_canary_venue_not_statement_reconcilable"
+        try:
+            notional = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
+            expected_net = float(getattr(candidate, "expected_net_edge_bps", 0.0) or 0.0)
+            worst_case = float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0)
+            max_notional = float(strategy.funding_canary_max_entry_notional_quote)
+            configured_concurrency = int(
+                strategy.funding_canary_max_concurrent_positions
+            )
+            min_expected = float(strategy.funding_canary_min_expected_net_edge_bps)
+            min_worst_case = float(strategy.funding_canary_min_worst_case_edge_bps)
+        except (TypeError, ValueError, OverflowError):
+            return "funding_canary_invalid_economics"
+        if not all(
+            math.isfinite(value)
+            for value in (notional, expected_net, worst_case, max_notional)
+        ):
+            return "funding_canary_invalid_economics"
+        # Configuration validation normally enforces these release limits, but
+        # direct/programmatic runtime construction must not be able to bypass
+        # the P0 small-cap contract.
+        if configured_concurrency != _FUNDING_CANARY_HARD_MAX_CONCURRENT_POSITIONS:
+            return "funding_canary_hard_concurrency_cap_invalid"
+        if max_notional > _FUNDING_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE + 1e-9:
+            return "funding_canary_hard_notional_cap_invalid"
+        max_notional = min(
+            max_notional, _FUNDING_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE
+        )
+        if notional <= 0.0 or notional > max_notional + 1e-9:
+            return "funding_canary_notional_cap_exceeded"
+        # The configuration may make the release gate stricter, but cannot
+        # weaken the immutable 8/3 bps canary economics contract.  Keep this
+        # runtime guard because programmatic AppConfig construction bypasses
+        # TOML validation in some test and embedding paths.
+        min_expected = max(min_expected, _FUNDING_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS)
+        min_worst_case = max(
+            min_worst_case,
+            _FUNDING_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS,
+        )
+        if expected_net < min_expected:
+            return "funding_canary_expected_edge_below_floor"
+        if worst_case < min_worst_case:
+            return "funding_canary_worst_case_edge_below_floor"
+
+        # Count both paired positions and pre-first-fill work.  A canary must
+        # not race a second candidate through while the first pair is still
+        # waiting for its hedge acknowledgement.
+        if check_concurrency:
+            active_count = len(self.ctx.state.open_positions) + len(
+                self.ctx.state.pending_entries
+            )
+            if active_count >= _FUNDING_CANARY_HARD_MAX_CONCURRENT_POSITIONS:
+                return "funding_canary_concurrency_cap_reached"
+
+        # The final-price rebinding is part of the canary contract itself.  A
+        # real live funding entry without the canary is rejected by the
+        # admission gate below; keeping this branch conditional also lets
+        # focused non-canary execution tests exercise their own concern
+        # without manufacturing canary cost inputs.
+        if (
+            runtime_mode == "live"
+            and strategy.funding_new_entries_enabled is True
+            and strategy.funding_canary_enabled is True
+        ):
+            try:
+                evidence_max_age_ms = int(runtime.fee_evidence_max_age_ms)
+            except (TypeError, ValueError, OverflowError):
+                return "funding_canary_fee_evidence_age_invalid"
+            if not (0 < evidence_max_age_ms <= _LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS):
+                return "funding_canary_fee_evidence_age_invalid"
+            if strategy.funding_canary_require_account_fee_evidence is not True:
+                return "funding_canary_account_fee_evidence_required"
+            configured_key_env = str(runtime.fee_evidence_integrity_key_env or "").strip()
+            if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
+                return "funding_canary_fee_evidence_integrity_key_policy_mismatch"
+
+        evidence = load_fee_evidence(
+            runtime.fee_evidence_path,
+            now_ms=now_ms,
+            max_age_ms=int(runtime.fee_evidence_max_age_ms),
+        )
+        if not evidence.complete_for(long_venue, short_venue):
+            return "funding_canary_account_fee_evidence_unavailable"
+        if evidence.integrity_verified is not True:
+            return "funding_canary_account_fee_evidence_unverified"
+        if evidence.schema_version != FEE_EVIDENCE_SCHEMA_VERSION:
+            return "funding_canary_account_fee_evidence_schema_not_authoritative"
+        expected_identity_hashes = getattr(
+            runtime, "fee_evidence_account_identity_hashes", {}
+        )
+        if not isinstance(expected_identity_hashes, dict) or not evidence.identity_matches(
+            expected_identity_hashes,
+            long_venue,
+            short_venue,
+        ):
+            return "funding_canary_account_identity_mismatch"
+        if getattr(candidate, "account_fee_evidence_complete", False) is not True:
+            return "funding_canary_candidate_fee_provenance_missing"
+        if (
+            int(getattr(candidate, "account_fee_evidence_observed_at_ms", 0) or 0)
+            != evidence.observed_at_ms_for(long_venue, short_venue)
+            or str(getattr(candidate, "account_fee_evidence_source", "") or "")
+            != evidence.source_for(long_venue, short_venue)
+        ):
+            return "funding_canary_fee_evidence_epoch_mismatch"
+        expected_fingerprint = evidence.fingerprint_for(long_venue, short_venue)
+        expected_provenance = evidence.provenance_for(long_venue, short_venue)
+        if (
+            not expected_fingerprint
+            or str(
+                getattr(candidate, "account_fee_evidence_fingerprint", "") or ""
+            )
+            != expected_fingerprint
+            or getattr(candidate, "account_fee_evidence_provenance", None)
+            != expected_provenance
+        ):
+            return "funding_canary_fee_evidence_provenance_mismatch"
+        try:
+            long_fee = float(getattr(candidate, "long_taker_fee_bps", 0.0) or 0.0)
+            short_fee = float(getattr(candidate, "short_taker_fee_bps", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return "funding_canary_invalid_fee_economics"
+        long_schedule = evidence.schedule_for(long_venue)
+        short_schedule = evidence.schedule_for(short_venue)
+        if (
+            long_schedule is None
+            or short_schedule is None
+            or long_fee + 1e-12 < long_schedule.taker_fee_bps
+            or short_fee + 1e-12 < short_schedule.taker_fee_bps
+        ):
+            return "funding_canary_fee_cost_understated"
+        # The candidate may price a V1 passive maker leg.  Checking only the
+        # two taker fields would then leave its aggregate entry/exit economics
+        # free to understate the account's maker schedule.  Reconstruct the
+        # same two-leg role contract and require the frozen aggregate costs to
+        # cover it before any first leg can be submitted.
+        try:
+            entry_fee = float(getattr(candidate, "entry_fee_bps", 0.0) or 0.0)
+            exit_fee = float(getattr(candidate, "exit_fee_bps", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return "funding_canary_invalid_fee_economics"
+        if not math.isfinite(entry_fee) or not math.isfinite(exit_fee):
+            return "funding_canary_invalid_fee_economics"
+
+        def fee_for_roles(maker_leg: object) -> float | None:
+            selected = str(maker_leg or "").strip().lower()
+            if selected not in {"", "long", "short"}:
+                return None
+            long_cost = (
+                long_schedule.maker_fee_bps
+                if selected == "long"
+                else long_schedule.taker_fee_bps
+            )
+            short_cost = (
+                short_schedule.maker_fee_bps
+                if selected == "short"
+                else short_schedule.taker_fee_bps
+            )
+            return long_cost + short_cost
+
+        required_entry_fee = fee_for_roles(
+            getattr(candidate, "entry_maker_leg", "")
+        )
+        required_exit_fee = fee_for_roles(getattr(candidate, "exit_maker_leg", ""))
+        if (
+            required_entry_fee is None
+            or required_exit_fee is None
+            or entry_fee + 1e-12 < required_entry_fee
+            or exit_fee + 1e-12 < required_exit_fee
+        ):
+            return "funding_canary_fee_cost_understated"
+        return ""
+
+    def _funding_canary_submission_reason(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        quantity: float,
+        long_price: float,
+        short_price: float,
+    ) -> str:
+        """Rebind canary limits to final executable economics and size.
+
+        ``entry_notional_quote`` is only shortlist input.  The cap is per leg,
+        so the more expensive final executable leg is used after L2 repricing,
+        allocator rounding and route selection.  Legacy V1-compatible paths
+        without a final quantity retain their pre-existing candidate notional;
+        typed v3 paths always provide final quantity and fail closed if invalid.
+        """
+
+        strategy = self.ctx.config.strategy
+        runtime_mode = str(self.ctx.config.runtime.mode or "paper").lower()
+        if runtime_mode == "live" and strategy.funding_new_entries_enabled is True:
+            try:
+                final_quantity = float(quantity or 0.0)
+                final_long_price = float(long_price)
+                final_short_price = float(short_price)
+            except (TypeError, ValueError, OverflowError):
+                return "funding_canary_final_notional_invalid"
+            if final_quantity > 0.0:
+                executable_notional = max(final_long_price, final_short_price) * final_quantity
+            else:
+                executable_notional = 0.0
+            if not math.isfinite(executable_notional) or executable_notional <= 0.0:
+                return "funding_canary_final_notional_invalid"
+            candidate.entry_notional_quote = executable_notional
+            if _funding_canary_execution_budget(candidate) is None:
+                return "funding_canary_execution_cost_budget_invalid"
+        return self._funding_canary_admission_reason(
+            candidate,
+            now_ms,
+            check_concurrency=False,
+        )
 
     def _live_economics_contract_reason(self, candidate) -> str:
         """Return the fail-closed reason when a live candidate is stale by contract.
@@ -2739,6 +3118,29 @@ class EntryDispatchRuntime:
             final_economics.edge.entry_fee_bps
             + final_economics.edge.exit_fee_bps
         )
+
+        # The shortlist may have passed the 8/3 bps canary floors while fresh
+        # executable BBO/VWAP repricing puts the actual first leg below them.
+        # Re-run the same admission contract only after the immutable final
+        # edge has replaced the candidate view and bind its cap to final price.
+        canary_reason = self._funding_canary_submission_reason(
+            candidate,
+            now_ms,
+            quantity=required_base_quantity,
+            long_price=final_economics.long_entry_price,
+            short_price=final_economics.short_entry_price,
+        )
+        if canary_reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=canary_reason,
+                blocked_reasons=[canary_reason],
+                source=source,
+                decision="skip_before_first_leg",
+                extra={"canary_final_revalidation": True},
+            )
+            return False
         return True
 
     async def _resolve_entry_quantity_steps(
@@ -3391,6 +3793,25 @@ class EntryDispatchRuntime:
         try:
             # V1: execution.entry_selected — engine decided to open this candidate
             candidate_pair_id = self._candidate_pair_id(candidate)
+            canary_budget = _funding_canary_execution_budget(candidate)
+            planned_entry_notional_quote = max(
+                float(ctx.long_price_hint), float(ctx.short_price_hint)
+            ) * float(effective_quantity)
+            fee_provenance = list(
+                getattr(candidate, "account_fee_evidence_provenance", []) or []
+            )
+            fee_evidence_integrity_verified = bool(fee_provenance) and all(
+                isinstance(item, dict) and item.get("integrity_verified") is True
+                for item in fee_provenance
+            )
+            fee_evidence_identity_bound = bool(fee_provenance) and all(
+                isinstance(item, dict)
+                and _is_sha256_hex(item.get("account_identity_hash"))
+                and _is_sha256_hex(item.get("document_sha256"))
+                and item.get("integrity_key_id") == TRUSTED_FEE_EVIDENCE_KEY_ID
+                for item in fee_provenance
+            )
+            strategy = self.ctx.config.strategy
             selected_seq = self.ctx.journal.append(
                 "execution.entry_selected",
                 {
@@ -3420,6 +3841,74 @@ class EntryDispatchRuntime:
                     "calculation_version": ctx.calculation_version,
                     "model_epoch": ctx.model_epoch,
                     "economics_observed_at_ms": ctx.economics_observed_at_ms,
+                    # This marker makes a selected live canary an immutable
+                    # audit cohort.  No closure may be promoted merely by
+                    # matching pair/symbol after the fact.
+                    "funding_canary": (
+                        self.ctx.config.strategy.funding_canary_enabled is True
+                    ),
+                    # A paper dispatch may legitimately exercise the same
+                    # canary policy.  Persist its mode so the promotion report
+                    # can never count a simulated closure as live evidence.
+                    "runtime_mode": str(
+                        self.ctx.config.runtime.mode or ""
+                    ).lower(),
+                    "entry_notional_quote": float(
+                        getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+                    ),
+                    # The candidate shortlist amount is not a submission
+                    # contract.  Persist the final rounded size and IOC price
+                    # basis so offline promotion can independently prove the
+                    # per-leg 30-quote release cap.
+                    "planned_entry_notional_quote": planned_entry_notional_quote,
+                    "planned_entry_quantity": float(effective_quantity),
+                    "planned_long_entry_price": float(ctx.long_price_hint),
+                    "planned_short_entry_price": float(ctx.short_price_hint),
+                    "expected_net_edge_bps": float(
+                        getattr(candidate, "expected_net_edge_bps", 0.0) or 0.0
+                    ),
+                    "worst_case_edge_bps": float(
+                        getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0
+                    ),
+                    "account_fee_evidence_fingerprint": str(
+                        getattr(
+                            candidate, "account_fee_evidence_fingerprint", ""
+                        )
+                        or ""
+                    ),
+                    "account_fee_evidence_provenance": list(
+                        getattr(
+                            candidate, "account_fee_evidence_provenance", []
+                        )
+                        or []
+                    ),
+                    "economics_complete": getattr(candidate, "economics_complete", False)
+                    is True,
+                    "account_fee_evidence_complete": getattr(
+                        candidate, "account_fee_evidence_complete", False
+                    )
+                    is True,
+                    "account_fee_evidence_integrity_verified": fee_evidence_integrity_verified,
+                    "account_fee_evidence_identity_bound": fee_evidence_identity_bound,
+                    "funding_canary_policy_version": _FUNDING_CANARY_POLICY_VERSION,
+                    "funding_canary_cohort_id": _funding_canary_cohort_id(
+                        candidate, strategy
+                    ),
+                    "funding_canary_hard_max_entry_notional_quote": (
+                        _FUNDING_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE
+                    ),
+                    "funding_canary_hard_min_expected_net_edge_bps": (
+                        _FUNDING_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS
+                    ),
+                    "funding_canary_hard_min_worst_case_edge_bps": (
+                        _FUNDING_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS
+                    ),
+                    "canary_budgeted_execution_cost_bps": (
+                        canary_budget[0] if canary_budget is not None else None
+                    ),
+                    "canary_execution_reserve_bps": (
+                        canary_budget[1] if canary_budget is not None else None
+                    ),
                     "ts_ms": now_ms,
                 },
             )
@@ -4047,6 +4536,33 @@ class EntryDispatchRuntime:
                     float(getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0)
                     + float(getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0)
                 ) / 2.0
+
+        # The actual first-leg quantity can differ from the shortlist through
+        # venue rounding, risk allocation and route planning.  Bind the hard
+        # USD cap to those final order prices/quantity before an entry context
+        # or order id is created.
+        canary_submission_reason = self._funding_canary_submission_reason(
+            candidate,
+            now_ms,
+            quantity=effective_quantity,
+            long_price=long_order_price_hint,
+            short_price=short_order_price_hint,
+        )
+        if canary_submission_reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=canary_submission_reason,
+                blocked_reasons=[canary_submission_reason],
+                source="final_submit_canary",
+                decision="skip_before_first_leg",
+                extra={
+                    "effective_quantity": effective_quantity,
+                    "long_order_price_hint": long_order_price_hint,
+                    "short_order_price_hint": short_order_price_hint,
+                },
+            )
+            return False
 
         entry_id = f"entry-{now_ms}-{candidate.symbol}"
 

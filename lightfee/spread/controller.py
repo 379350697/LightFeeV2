@@ -49,7 +49,12 @@ class SpreadTradingController:
         # compatibility proof produced by the signed-basis builder.
         if str(candidate.contract_normalization_status or "").lower() != "complete":
             return SpreadDecision(False, "spread_contract_normalization_incomplete")
-        if candidate.calculation_version != "spread_v2_signed_reversion":
+        expected_calculation_version = (
+            "spread_v3_cost_normalized_reversion"
+            if str(self.strategy.spread_model_epoch or "").startswith("v3_")
+            else "spread_v2_signed_reversion"
+        )
+        if candidate.calculation_version != expected_calculation_version:
             return SpreadDecision(False, "spread_candidate_calculation_version_mismatch")
         if candidate.model_epoch != self.strategy.spread_model_epoch:
             return SpreadDecision(False, "spread_candidate_model_epoch_mismatch")
@@ -88,7 +93,7 @@ class SpreadTradingController:
         if candidate.capacity_quote > 0.0 and candidate.capacity_quote < notional:
             return SpreadDecision(False, "spread_capacity_below_notional")
         # This controller deliberately stops short of producing a live entry
-        # intent in the v2_signed_reversion epoch.  It still runs the full
+        # intent in any current model epoch.  It still runs the full
         # admission calculation above so paper/research can see the exact
         # hypothetical notional and block reasons, but spread can only become
         # live after a separate executor/recovery/truth design is approved.

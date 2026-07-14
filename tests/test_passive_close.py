@@ -4843,6 +4843,9 @@ class TestFallbackResidualReal:
             short_quantity=425.0,
             matched_quantity=425.0,
         )
+        # An entry-side benchmark cannot certify an exit executed through the
+        # passive-close path, which has no frozen executable exit benchmark.
+        position.execution_benchmark_complete = True
         pending = PendingPassiveClose(
             position_id=position.position_id,
             reason="funding_capture",
@@ -4880,6 +4883,7 @@ class TestFallbackResidualReal:
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
         assert pending.position_snapshot is position
+        assert position.execution_benchmark_complete is False
         records = journal.read_all()
         kinds = [record["kind"] for record in records]
         assert "exit.passive_close_waiting_exchange_flat_truth" not in kinds
