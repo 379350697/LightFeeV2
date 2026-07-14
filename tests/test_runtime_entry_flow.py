@@ -379,6 +379,51 @@ def test_pending_first_fill_chooses_lower_loss_unwind_from_fresh_l2(
     assert decision["unwind_first_leg_loss_quote"] < decision["complete_hedge_loss_quote"]
 
 
+def test_pending_first_fill_corrupt_l2_uses_conservative_hedge_fallback(
+    config, tmp_journal
+):
+    """A HOT lifecycle state cannot override whole-book integrity for hedging."""
+    config.strategy.local_l2_enabled = True
+    config.strategy.entry_readiness_provider = "local_l2"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    for venue, bid, asks in (
+        ("binance", 99.0, [101.0, 101.0]),
+        ("okx", 95.0, [96.0]),
+    ):
+        book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(bid, 10.0)]
+        book.asks = [PriceLevel(price, 10.0) for price in asks]
+        book.observed_at_ms = now_ms
+    pending = PendingEntry(
+        pending_id="pending-corrupt-l2",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.1,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.1,
+        maker_fill_price=100.0,
+    )
+
+    assert runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    ) == {
+        "action": "complete_hedge",
+        "reason": "post_first_fill_market_data_unavailable_complete_hedge",
+        "hedge_price": 100.0,
+        "market_evidence": {},
+    }
+
+
 def test_pending_first_fill_compares_fee_inclusive_hedge_and_unwind_costs(
     config, tmp_journal
 ):

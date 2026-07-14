@@ -123,6 +123,25 @@ class Journal:
     def _archive_path(self, index: int) -> Path:
         return self.path.with_name(f"{self.path.name}.{index}")
 
+    def has_archives(self) -> bool:
+        """Return whether rotated segments exist for this journal path.
+
+        Stateful consumers cannot infer whether an older segment was already
+        pruned, so their recovery code must treat any historical rotation as a
+        separate fail-closed migration boundary rather than replay a partial
+        event history.
+        """
+        prefix = f"{self.path.name}."
+        try:
+            return any(
+                candidate.is_file()
+                and candidate.name[len(prefix):].isdigit()
+                for candidate in self.path.parent.glob(f"{self.path.name}.*")
+                if candidate.name.startswith(prefix)
+            )
+        except OSError:
+            return True
+
     def _prune_expired_archives(self) -> None:
         if self._retention_hours <= 0:
             return
@@ -212,6 +231,34 @@ class Journal:
                     except json.JSONDecodeError:
                         pass
         return records
+
+    def read_all_with_integrity(self) -> tuple[list[dict[str, Any]], bool]:
+        """Read records and report whether every non-empty line was a dict.
+
+        Generic replay callers retain the legacy best-effort ``read_all``
+        behaviour.  State machines that could revive executable work after a
+        restart must instead use this method and fail closed on a truncated or
+        malformed JSONL row.
+        """
+        if not self.path.exists():
+            return [], True
+        records: list[dict[str, Any]] = []
+        intact = True
+        with open(self.path, encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    intact = False
+                    continue
+                if not isinstance(record, dict):
+                    intact = False
+                    continue
+                records.append(record)
+        return records, intact
 
     # ------------------------------------------------------------------
     # Streaming read primitives (V2 projection/backfill)

@@ -266,6 +266,47 @@ class TestLocalL2RuntimeFaults:
         )
         assert rt.metrics.rebuild_total == 1
 
+    def test_invalid_snapshot_is_data_integrity_not_sequence_gap(self):
+        rt = LocalL2Runtime()
+        result = rt.record_update_result(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(price=float("nan"), quantity=1.0)],
+                asks=[PriceLevel(price=50100.0, quantity=1.0)],
+                sequence=1,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=10_000,
+        )
+
+        assert result.rebuild_required is True
+        assert rt.metrics.data_integrity_rebuild_total == 1
+        assert rt.get_book("binance", "BTCUSDT").fault_reason.startswith(
+            "data_integrity: invalid_bid_snapshot_level"
+        )
+
+    def test_nonnumeric_snapshot_is_data_integrity_not_runtime_exception(self):
+        rt = LocalL2Runtime()
+
+        result = rt.record_update_result(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(price="50_000", quantity=1.0)],  # type: ignore[arg-type]
+                asks=[PriceLevel(price=50_100.0, quantity=1.0)],
+                sequence=1,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=10_000,
+        )
+
+        assert result.rebuild_required is True
+        assert rt.metrics.data_integrity_rebuild_total == 1
+        assert rt.get_book("binance", "BTCUSDT").fault_reason.startswith(
+            "data_integrity: invalid_bid_snapshot_level"
+        )
+
     def test_handle_runtime_suspended(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")

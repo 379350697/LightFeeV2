@@ -6,6 +6,7 @@ from math import isfinite
 import pytest
 
 from lightfee.sidecar.snapshot import QuoteSnapshot
+from lightfee.offline.spread_paper_analysis import analyze_spread_paper_events
 from lightfee.spread.models import SpreadReversionCandidate
 from lightfee.spread.paper import (
     SPREAD_PAPER_JOURNAL_SCHEMA_VERSION,
@@ -14,6 +15,7 @@ from lightfee.spread.paper import (
     SpreadPaperConfig,
     SpreadPaperBotSpec,
     SpreadPaperTracker,
+    _execution_contract_from_payload,
     _paper_bot_execution_supported,
 )
 from lightfee.spread.research_manifest import DEFAULT_SPREAD_RESEARCH_MANIFEST
@@ -400,7 +402,7 @@ def test_diagnostic_paper_never_labels_bbo_or_unsigned_fees_as_official() -> Non
     assert filled["official_pnl"] is False
 
 
-def test_official_entry_cannot_be_relabelled_official_after_bbo_exit_config_reload() -> None:
+def test_open_position_keeps_its_strict_l2_contract_after_config_reload() -> None:
     evidence = _account_fee_evidence()
     tracker = _tracker(
         require_l2_vwap=True,
@@ -426,8 +428,8 @@ def test_official_entry_cannot_be_relabelled_official_after_bbo_exit_config_relo
         quotes=_with_l2(_quotes_at(quotes, now_ms=1_001)),
     )["official_pnl"] is True
 
-    # A relaxed config may retain diagnostic output, but cannot relabel a
-    # BBO-only exit as an official acceptance observation.
+    # A later relaxed admission config must not re-price this observation:
+    # its frozen contract still rejects BBO-only exits.
     tracker.config = replace(
         tracker.config,
         require_l2_vwap=False,
@@ -436,7 +438,7 @@ def test_official_entry_cannot_be_relabelled_official_after_bbo_exit_config_relo
     events = tracker.evaluate_due(2_001, _quotes_at(quotes, now_ms=2_001))
 
     assert len(events) == 1
-    assert events[0]["payload"]["paper_unpriced"] is False
+    assert events[0]["payload"]["paper_unpriced"] is True
     assert events[0]["payload"]["official_pnl"] is False
 
 
@@ -1763,7 +1765,7 @@ def test_restore_rejects_missing_or_negative_frozen_exit_cost() -> None:
     assert restored.tracked_count == 0
 
 
-def test_restore_uses_frozen_fees_instead_of_the_current_service_schedule() -> None:
+def test_restore_keeps_frozen_fee_schedule_after_active_config_changes() -> None:
     tracker = _tracker(
         markout_secs=[99],
         terminal_secs=10,
@@ -1784,7 +1786,399 @@ def test_restore_uses_frozen_fees_instead_of_the_current_service_schedule() -> N
         {"kind": "opportunity.paper_taker_pair_filled", "payload": filled},
     ])
 
+    # A refresh changes only future admissions.  A v8 journal row carries its
+    # complete contract, so recovery continues it under the original costs.
     assert restored.tracked_count == 1
+
+
+def _v3_official_replay_records() -> tuple[list[dict], dict[str, object]]:
+    """Build one official v3 fill plus the exact active cohort contract."""
+    evidence = _account_fee_evidence(schema_v3=True)
+    manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        model_epoch="v3_cost_normalized_reversion",
+    )
+    strict: dict[str, object] = {
+        "require_l2_vwap": True,
+        "require_account_fee_evidence": True,
+        "account_fee_evidence": evidence,
+        "fee_evidence_account_identity_hashes": {
+            "cheap": "a" * 64,
+            "rich": "b" * 64,
+        },
+        "model_epoch": "v3_cost_normalized_reversion",
+        "research_manifest": manifest,
+        "markout_secs": [1],
+        "terminal_secs": 3,
+        "oos_start_ms": 1_000,
+        "require_out_of_sample": True,
+        "taker_fee_bps_by_venue": {"cheap": 1.0, "rich": 2.0},
+    }
+    candidate = replace(
+        _candidate(),
+        calculation_version="spread_v3_cost_normalized_reversion",
+        model_epoch="v3_cost_normalized_reversion",
+        account_fee_evidence_complete=True,
+        account_fee_evidence_observed_at_ms=1_000,
+        account_fee_evidence_source="account_fee_api",
+        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
+        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
+    )
+    tracker = _tracker(**strict)
+    registered = tracker.register(candidate, _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    filled = _fill_taker(
+        tracker,
+        now_ms=1_001,
+        quotes=_with_l2(_quotes(now_ms=1_001)),
+    )
+    assert filled["official_pnl"] is True
+    return [registered, {"kind": "opportunity.paper_taker_pair_filled", "payload": filled}], strict
+
+
+@pytest.mark.parametrize("cohort_change", ["manifest", "account_identity"])
+def test_restore_downgrades_v3_official_position_after_active_cohort_change(
+    cohort_change: str,
+) -> None:
+    records, strict = _v3_official_replay_records()
+    if cohort_change == "manifest":
+        strict["research_manifest"] = replace(
+            strict["research_manifest"],  # type: ignore[arg-type]
+            hypothesis="changed hypothesis with the same manifest version",
+        )
+    else:
+        strict["fee_evidence_account_identity_hashes"] = {
+            "cheap": "a" * 64,
+            "rich": "d" * 64,
+        }
+
+    restored = _tracker(**strict)
+    restored.restore_from_records(records)
+
+    # Keep reproducible frozen economics for diagnostics, but a restart under
+    # another research contract or account must never emit an official sample.
+    assert restored.tracked_count == 1
+    restored_position = next(iter(restored._positions.values()))
+    assert restored_position.official_pnl is False
+
+
+def test_restore_keeps_v3_official_position_only_for_exact_active_cohort() -> None:
+    records, strict = _v3_official_replay_records()
+    restored = _tracker(**strict)
+    restored.restore_from_records(records)
+
+    restored_position = next(iter(restored._positions.values()))
+    assert restored_position.official_pnl is True
+
+
+def test_restore_keeps_nonterminal_evaluation_skip_and_its_horizon() -> None:
+    records, strict = _v3_official_replay_records()
+    tracker = _tracker(**strict)
+    tracker.restore_from_records(records)
+    quotes = _with_l2(_quotes(now_ms=2_001))
+    quotes["rich:BTCUSDT"] = replace(
+        quotes["rich:BTCUSDT"],
+        observed_at_ms=1_000,
+    )
+
+    skipped = tracker.evaluate_due(2_001, quotes)
+
+    assert [event["kind"] for event in skipped] == [
+        "opportunity.paper_evaluation_skipped"
+    ]
+    restored = _tracker(**strict)
+    restored.restore_from_records(records + skipped)
+
+    # A normal, nonterminal inability to price must survive restart without
+    # disabling new admission or re-emitting the same scheduled horizon.
+    assert restored.enabled is True
+    assert restored.tracked_count == 1
+    assert restored.evaluate_due(2_001, _with_l2(_quotes(now_ms=2_001))) == []
+
+
+def test_restore_keeps_maker_leg_funding_before_delayed_hedge() -> None:
+    control_manifest = replace(
+        DEFAULT_SPREAD_RESEARCH_MANIFEST,
+        cohorts=tuple(
+            replace(cohort, enabled=True)
+            if cohort.bot_id == "mt_selected_maker_delay_1000ms"
+            else cohort
+            for cohort in DEFAULT_SPREAD_RESEARCH_MANIFEST.cohorts
+        ),
+    )
+    tracker = _tracker(
+        paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        terminal_secs=5,
+        research_manifest=control_manifest,
+    )
+    registered = tracker.register(
+        _candidate(),
+        _quotes(
+            now_ms=1_000,
+            long_funding_ts_ms=2_500,
+            short_funding_ts_ms=2_500,
+            funding_interval_ms=10_000,
+        ),
+        finalist_rank=0,
+    )
+    assert registered is not None
+    maker_fill = tracker.evaluate_due(
+        2_001,
+        _quotes(
+            now_ms=2_001,
+            long_bid=99.7,
+            long_ask=99.8,
+            short_bid=100.5,
+            short_ask=100.6,
+            long_funding_ts_ms=2_500,
+            short_funding_ts_ms=2_500,
+            funding_interval_ms=10_000,
+        ),
+    )
+    assert [event["kind"] for event in maker_fill] == [
+        "opportunity.paper_maker_fill_observed"
+    ]
+    funding = tracker.record_funding_settlements(
+        [
+            FundingSettlement(
+                paper_id=registered["payload"]["paper_id"],
+                leg_side="long",
+                settlement_timestamp_ms=2_500,
+                amount_quote=-0.01,
+                observed_at_ms=2_501,
+                source="exchange_funding_ledger",
+            )
+        ]
+    )
+    assert [event["kind"] for event in funding] == [
+        "opportunity.paper_funding_settlement_observed"
+    ]
+
+    restored = _tracker(
+        paper_bot_ids=["mt_selected_maker_delay_1000ms"],
+        terminal_secs=5,
+        research_manifest=control_manifest,
+    )
+    restored.restore_from_records([registered, *maker_fill, *funding])
+
+    assert restored.enabled is True
+    assert restored.tracked_count == 1
+
+
+def test_restore_rejects_active_max_hold_before_frozen_holding_boundary() -> None:
+    tracker = _tracker(
+        markout_secs=[99],
+        terminal_secs=5,
+        active_exit_enabled=True,
+        max_hold_ms=500,
+    )
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    filled = _fill_taker(tracker, now_ms=1_001, quotes=_quotes(now_ms=1_001))
+    closed = tracker.evaluate_due(1_501, _quotes(now_ms=1_501))
+    assert [event["kind"] for event in closed] == ["opportunity.paper_closed"]
+    assert closed[0]["payload"]["horizon_kind"] == "active_exit:max_hold"
+
+    restored = _tracker(
+        markout_secs=[99],
+        terminal_secs=5,
+        active_exit_enabled=True,
+        max_hold_ms=500,
+    )
+    restored.restore_from_records(
+        [
+            registered,
+            {"kind": "opportunity.paper_taker_pair_filled", "payload": filled},
+            closed[0],
+        ]
+    )
+    assert restored.enabled is True
+
+    early_close = {
+        **closed[0],
+        "payload": {**closed[0]["payload"], "evaluated_at_ms": 1_002},
+    }
+    restored = _tracker(
+        markout_secs=[99],
+        terminal_secs=5,
+        active_exit_enabled=True,
+        max_hold_ms=500,
+    )
+    restored.restore_from_records(
+        [
+            registered,
+            {"kind": "opportunity.paper_taker_pair_filled", "payload": filled},
+            early_close,
+        ]
+    )
+    assert restored.enabled is False
+
+
+def test_v3_offline_acceptance_replays_real_frozen_lifecycle() -> None:
+    records, strict = _v3_official_replay_records()
+    tracker = _tracker(**strict)
+    tracker.restore_from_records(records)
+    closed = tracker.evaluate_due(4_001, _with_l2(_quotes(now_ms=4_001)))
+    assert [event["kind"] for event in closed] == [
+        "opportunity.paper_markout",
+        "opportunity.paper_closed",
+    ]
+
+    journal: list[dict] = []
+    for sequence, event in enumerate(
+        [records[0], records[1], *closed],
+        start=1,
+    ):
+        journal.append(
+            {
+                **event,
+                "run_id": "v3-offline-replay",
+                "seq": sequence,
+                "ts_ms": 1_000 + sequence,
+            }
+        )
+    report = analyze_spread_paper_events(
+        journal,
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    assert report.journal_replay_integrity_count == 0
+    assert report.excluded_nonofficial_count == 1
+
+    spliced_terminal = {
+        **journal[-1],
+        "payload": {
+            **journal[-1]["payload"],
+            "candidate_id": "spread:OTHERUSDT:cheap->rich",
+        },
+    }
+    spliced = analyze_spread_paper_events(
+        [*journal[:-1], spliced_terminal],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+    assert spliced.journal_replay_integrity_count >= 1
+    replay = _tracker(**strict)
+    replay.restore_from_records([records[0], records[1], closed[0], spliced_terminal])
+    assert replay.enabled is False
+
+    malformed_markout = {
+        **journal[2],
+        # A fill snapshot is a valid position record but not a valid horizon
+        # observation: it has no due-horizon owner to mark as emitted.
+        "payload": dict(journal[1]["payload"]),
+    }
+    malformed_horizon = analyze_spread_paper_events(
+        [journal[0], journal[1], malformed_markout, journal[-1]],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+    assert malformed_horizon.journal_replay_integrity_count >= 1
+    replay = _tracker(**strict)
+    replay.restore_from_records([records[0], records[1], malformed_markout])
+    assert replay.enabled is False
+
+    early_markout = {
+        **journal[2],
+        "payload": {**journal[2]["payload"], "evaluated_at_ms": 2_000},
+    }
+    early_horizon = analyze_spread_paper_events(
+        [journal[0], journal[1], early_markout, journal[-1]],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+    assert early_horizon.journal_replay_integrity_count >= 1
+
+    malformed_fill = {
+        **journal[1],
+        "payload": {
+            **journal[1]["payload"],
+            "execution_contract": {
+                **journal[1]["payload"]["execution_contract"],
+                # JSON bool must not coerce to the strict integer contract.
+                "terminal_secs": True,
+            },
+        },
+    }
+    malformed = analyze_spread_paper_events(
+        [journal[0], malformed_fill, *journal[2:]],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    assert malformed.journal_replay_integrity_count >= 1
+    assert malformed.acceptance_ready is False
+
+
+@pytest.mark.parametrize("cohort_change", ["manifest", "account_identity"])
+def test_restored_pending_v3_position_cannot_repromote_after_active_cohort_change(
+    cohort_change: str,
+) -> None:
+    records, strict = _v3_official_replay_records()
+    if cohort_change == "manifest":
+        strict["research_manifest"] = replace(
+            strict["research_manifest"],  # type: ignore[arg-type]
+            hypothesis="changed hypothesis with the same manifest version",
+        )
+    else:
+        strict["fee_evidence_account_identity_hashes"] = {
+            "cheap": "a" * 64,
+            "rich": "d" * 64,
+        }
+
+    restored = _tracker(**strict)
+    # Replay only registration: the old cohort is still pending at restart.
+    restored.restore_from_records(records[:1])
+    events = restored.evaluate_due(
+        1_001,
+        _with_l2(_quotes(now_ms=1_001)),
+    )
+
+    assert len(events) == 1
+    assert events[0]["kind"] == "opportunity.paper_taker_pair_filled"
+    assert events[0]["payload"]["official_pnl"] is False
+    assert next(iter(restored._positions.values())).official_pnl is False
+
+
+@pytest.mark.parametrize("cohort_change", ["manifest", "account_identity"])
+def test_active_v3_position_is_downgraded_at_same_cohort_boundary_as_restart(
+    cohort_change: str,
+) -> None:
+    records, strict = _v3_official_replay_records()
+    tracker = _tracker(**strict)
+    tracker.restore_from_records(records)
+    assert next(iter(tracker._positions.values())).official_pnl is True
+    if cohort_change == "manifest":
+        tracker.config = replace(
+            tracker.config,
+            research_manifest=replace(
+                tracker.config.research_manifest,
+                hypothesis="changed hypothesis with the same manifest version",
+            ),
+        )
+    else:
+        tracker.config = replace(
+            tracker.config,
+            fee_evidence_account_identity_hashes={
+                "cheap": "a" * 64,
+                "rich": "d" * 64,
+            },
+        )
+
+    events = tracker.evaluate_due(
+        2_001,
+        _with_l2(_quotes(now_ms=2_001)),
+    )
+
+    assert len(events) == 1
+    assert events[0]["payload"]["official_pnl"] is False
+    assert next(iter(tracker._positions.values())).official_pnl is False
 
 
 def test_restore_requires_current_journal_and_candidate_economics_proof() -> None:
@@ -1839,6 +2233,158 @@ def test_restore_rejects_truthy_string_booleans_at_journal_boundary() -> None:
 
     assert restored.tracked_count == 0
     assert restored.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
+
+
+def test_restore_rejects_coercible_execution_contract_values() -> None:
+    tracker = _tracker(markout_secs=[99], terminal_secs=1)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    contract = registered["payload"]["execution_contract"]
+    assert _execution_contract_from_payload(contract) is not None
+
+    bool_as_int = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "execution_contract": {**contract, "terminal_secs": True},
+        },
+    }
+    int_as_float = {
+        "kind": registered["kind"],
+        "payload": {
+            **registered["payload"],
+            "execution_contract": {
+                **contract,
+                "taker_fee_bps_by_venue": {
+                    **contract["taker_fee_bps_by_venue"],
+                    "cheap": 1,
+                },
+            },
+        },
+    }
+
+    assert _execution_contract_from_payload(
+        bool_as_int["payload"]["execution_contract"]
+    ) is None
+    assert _execution_contract_from_payload(
+        int_as_float["payload"]["execution_contract"]
+    ) is None
+    restored = _tracker(markout_secs=[99], terminal_secs=1)
+    restored.restore_from_records([bool_as_int, int_as_float])
+
+    assert restored.tracked_count == 0
+    assert restored.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
+
+
+def test_restore_poisoned_later_state_record_cannot_revive_prior_pending_position() -> None:
+    """A damaged replay update must remove, not retain, its old registration."""
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    filled = _fill_taker(tracker, now_ms=1_001, quotes=_quotes(now_ms=1_001))
+    corrupted_filled = {
+        "kind": "opportunity.paper_taker_pair_filled",
+        "payload": {
+            **filled,
+            "execution_contract": {
+                **filled["execution_contract"],
+                "terminal_secs": True,
+            },
+        },
+    }
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records([registered, corrupted_filled])
+
+    assert restored.tracked_count == 0
+    assert restored.evaluate_due(2_001, _quotes(now_ms=2_001)) == []
+
+
+@pytest.mark.parametrize("payload", ["truncated", {}])
+def test_restore_rejects_unscoped_corrupt_state_event(
+    payload: object,
+) -> None:
+    """A malformed state transition cannot safely be assigned to one paper id."""
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    corrupt = {
+        "kind": "opportunity.paper_taker_pair_filled",
+        "payload": payload,
+    }
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records([registered, corrupt])
+
+    assert restored.tracked_count == 0
+    assert restored.evaluate_due(2_000, _quotes(now_ms=2_000)) == []
+
+
+def test_restore_rejects_unknown_paper_namespace_event_and_disables_admission() -> None:
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    unknown = {
+        "kind": "opportunity.paper_closed_corrupt",
+        "payload": {"paper_id": registered["payload"]["paper_id"]},
+    }
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records([registered, unknown])
+
+    assert restored.enabled is False
+    assert restored.tracked_count == 0
+    assert restored.register(_candidate(), _quotes(now_ms=2_000), finalist_rank=0) is None
+
+
+def test_strict_restore_rejects_reversed_journal_sequence_before_state_replay() -> None:
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+    records = [
+        {
+            "run_id": "paper-run",
+            "seq": 2,
+            "ts_ms": 1_002,
+            "kind": "opportunity.paper_closed",
+            "payload": {"paper_id": paper_id, "horizon_kind": "terminal_10s"},
+        },
+        {
+            "run_id": "paper-run",
+            "seq": 1,
+            "ts_ms": 1_001,
+            "kind": registered["kind"],
+            "payload": registered["payload"],
+        },
+    ]
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records(records, require_journal_envelope=True)
+
+    assert restored.enabled is False
+    assert restored.tracked_count == 0
+
+
+def test_restore_rejects_terminal_then_reregistered_paper_id() -> None:
+    tracker = _tracker(markout_secs=[99], terminal_secs=10)
+    registered = tracker.register(_candidate(), _quotes(now_ms=1_000), finalist_rank=0)
+    assert registered is not None
+    paper_id = registered["payload"]["paper_id"]
+    records = [
+        registered,
+        {
+            "kind": "opportunity.paper_closed",
+            "payload": {"paper_id": paper_id, "horizon_kind": "terminal_10s"},
+        },
+        registered,
+    ]
+
+    restored = _tracker(markout_secs=[99], terminal_secs=10)
+    restored.restore_from_records(records)
+
+    assert restored.enabled is False
+    assert restored.tracked_count == 0
 
 
 def test_restore_deduplicates_settlement_replay_and_marks_amount_conflict() -> None:

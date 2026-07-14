@@ -26,6 +26,11 @@ from lightfee.marketdata.l2 import (
     PriceLevel,
     promote_warm_to_hot,
 )
+from lightfee.marketdata.local_book import (
+    get_active_books,
+    get_ready_books,
+    hot_exec_ready_count,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +329,61 @@ class TestSnapshotApplication:
         assert book.last_snapshot_ms == 10000
         assert book.observed_at_ms == 10000
 
+    def test_snapshot_detaches_validated_levels_from_mutable_producer_objects(self):
+        book = LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+        )
+        bid = PriceLevel(price=50_000.0, quantity=1.0)
+        ask = PriceLevel(price=50_100.0, quantity=1.0)
+
+        result = book.apply_snapshot([bid], [ask], now_ms=10_000)
+
+        assert result.applied is True
+        assert book.bids[0] is not bid
+        assert book.asks[0] is not ask
+        # Producer-side objects can be reused or mutated after ingest.  That
+        # must not retroactively corrupt the accepted HOT book.
+        bid.quantity = float("nan")
+        ask.price = 1.0
+        assert book.is_ready(max_age_ms=5_000, now_ms=12_000) is True
+        assert book.bids[0].quantity == pytest.approx(1.0)
+        assert book.asks[0].price == pytest.approx(50_100.0)
+
+    def test_snapshot_rejects_non_numeric_level_without_raising(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+
+        result = book.apply_snapshot(
+            [PriceLevel(price="50_000", quantity=1.0)],  # type: ignore[arg-type]
+            [PriceLevel(price=50_100.0, quantity=1.0)],
+            now_ms=10_000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert result.fault_reason == "invalid_bid_snapshot_level index=0"
+
+    def test_snapshot_rejects_duplicate_prices_before_depth_can_hide_them(self):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+
+        result = book.apply_snapshot(
+            [
+                PriceLevel(price=50_000.0, quantity=1.0),
+                PriceLevel(price=49_900.0, quantity=1.0),
+            ],
+            [
+                PriceLevel(price=50_100.0, quantity=1.0),
+                PriceLevel(price=50_100.0, quantity=1.0),
+            ],
+            now_ms=10_000,
+            max_depth=1,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert result.fault_reason == "duplicate_ask_snapshot_price index=1"
+
     def test_snapshot_emits_best_bid_ask_events(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         result = book.apply_snapshot(
@@ -352,6 +412,47 @@ class TestSnapshotApplication:
         assert "book_empty_side" in result.fault_reason
         assert len(book.bids) == 0
         assert len(book.asks) == 0
+
+    @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("field", ["price", "quantity"])
+    def test_snapshot_rejects_nonfinite_level_at_any_depth(
+        self,
+        nonfinite: float,
+        field: str,
+    ) -> None:
+        invalid = {"price": 49_900.0, "quantity": 1.0}
+        invalid[field] = nonfinite
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+
+        result = book.apply_snapshot(
+            [PriceLevel(price=50_000.0, quantity=1.0), PriceLevel(**invalid)],
+            [PriceLevel(price=50_100.0, quantity=1.0)],
+            sequence=1,
+            now_ms=1_000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert "invalid_bid_snapshot_level" in result.fault_reason
+        assert book.bids == []
+        assert book.asks == []
+
+    def test_snapshot_validates_deep_levels_before_max_depth_trimming(self) -> None:
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT", max_depth=1)
+
+        result = book.apply_snapshot(
+            [PriceLevel(price=100.0, quantity=1.0)],
+            [
+                PriceLevel(price=101.0, quantity=1.0),
+                PriceLevel(price=float("inf"), quantity=1.0),
+            ],
+            sequence=1,
+            now_ms=1_000,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert result.fault_reason == "invalid_ask_snapshot_level index=1"
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +579,65 @@ class TestDeltaApplication:
         )
         assert len(book.bids) == 3
         assert book.bids[0].price == 50050
+
+    @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+    def test_delta_rejects_nonfinite_level_without_mutating_book(
+        self,
+        nonfinite: float,
+    ) -> None:
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50_000.0, quantity=1.0)],
+            [PriceLevel(price=50_100.0, quantity=1.0)],
+            sequence=1,
+            now_ms=1_000,
+        )
+
+        result = book.apply_delta(
+            [PriceLevel(price=49_900.0, quantity=nonfinite)],
+            [],
+            sequence=2,
+            previous_sequence=1,
+            now_ms=1_001,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert book.sequence == 1
+        assert book.best_bid() == 50_000.0
+
+    @pytest.mark.parametrize(
+        "level",
+        [
+            PriceLevel(price=0.0, quantity=1.0),
+            PriceLevel(price=-1.0, quantity=1.0),
+            PriceLevel(price=49_900.0, quantity=-1.0),
+        ],
+    )
+    def test_delta_rejects_nonpositive_nondelete_level_without_mutating_book(
+        self,
+        level: PriceLevel,
+    ) -> None:
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.apply_snapshot(
+            [PriceLevel(price=50_000.0, quantity=1.0)],
+            [PriceLevel(price=50_100.0, quantity=1.0)],
+            sequence=1,
+            now_ms=1_000,
+        )
+
+        result = book.apply_delta(
+            [level],
+            [],
+            sequence=2,
+            previous_sequence=1,
+            now_ms=1_001,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert book.sequence == 1
+        assert book.best_bid() == 50_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -679,8 +839,9 @@ class TestBookQueries:
         )
         filled, avg = book.vwap_buy(30000)  # target 30000 quote
         # 50100*0.5=25050, need 4950 more from 50200*1=50200 → take 4950/50200=0.0986...
-        assert filled > 0
-        assert avg > 50100
+        expected_quantity = 0.5 + (4_950.0 / 50_200.0)
+        assert filled == pytest.approx(30_000.0)
+        assert avg == pytest.approx(30_000.0 / expected_quantity)
 
     def test_vwap_sell_estimates_correctly(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
@@ -689,8 +850,19 @@ class TestBookQueries:
             [PriceLevel(price=50200, quantity=1.0)],
         )
         filled, avg = book.vwap_sell(55000)
-        assert filled > 0
-        assert avg < 50100
+        expected_quantity = 1.0 + (4_900.0 / 50_000.0)
+        assert filled == pytest.approx(55_000.0)
+        assert avg == pytest.approx(55_000.0 / expected_quantity)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_vwap_rejects_nonfinite_target_or_level(self, bad: float):
+        book = LocalL2Book(venue="binance", symbol="BTCUSDT")
+        book.bids = [PriceLevel(price=50_000.0, quantity=1.0)]
+        book.asks = [PriceLevel(price=50_100.0, quantity=1.0)]
+
+        assert book.vwap_buy(bad) == (0.0, 0.0)
+        book.asks = [PriceLevel(price=bad, quantity=1.0)]
+        assert book.vwap_buy(10_000.0) == (0.0, 0.0)
 
     def test_depth_bid(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
@@ -745,6 +917,8 @@ class TestBookQueries:
 class TestBookReadiness:
     def test_hot_and_fresh_is_ready(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT", status=L2BookStatus.HOT, observed_at_ms=10000)
+        book.bids = [PriceLevel(price=50_000.0, quantity=1.0)]
+        book.asks = [PriceLevel(price=50_100.0, quantity=1.0)]
         assert book.is_ready(max_age_ms=5000, now_ms=12000)
 
     def test_stale_is_not_ready(self):
@@ -973,6 +1147,129 @@ class TestExecutionLiquidityFromBook:
         snap = execution_liquidity_from_local_l2(book, max_depth=3, max_age_ms=5000, now_ms=12000)
         assert len(snap.bids) == 3
         assert len(snap.asks) == 3
+
+    def test_corrupt_ready_book_never_becomes_true_l2_execution_evidence(self):
+        from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
+
+        book = LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=10_000,
+        )
+        book.bids = [PriceLevel(price=50_000.0, quantity=1.0)]
+        # Simulate a direct in-memory corruption that bypasses ingest guards.
+        book.asks = [PriceLevel(price=float("nan"), quantity=1.0)]
+        book.pool = L2PoolAssignment.HOT_EXEC
+        books = {book.key: book}
+
+        snapshot = execution_liquidity_from_local_l2(
+            book,
+            max_age_ms=5_000,
+            now_ms=12_000,
+        )
+
+        assert snapshot.source == "none"
+        assert snapshot.book_ready is False
+        assert snapshot.fallback_reason == "book_invalid_for_execution_liquidity"
+        assert book.is_ready(max_age_ms=5_000, now_ms=12_000) is False
+        # ``active`` is a lifecycle/coverage view; it must retain the HOT book
+        # for diagnostics.  Only readiness/execution may treat it as unusable.
+        assert get_active_books(books, max_age_ms=5_000, now_ms=12_000) == [book]
+        assert get_ready_books(books, max_age_ms=5_000, now_ms=12_000) == []
+        assert hot_exec_ready_count(books, max_age_ms=5_000, now_ms=12_000) == 0
+
+    @pytest.mark.parametrize(
+        ("bids", "asks"),
+        [
+            (
+                [
+                    PriceLevel(price=50_000.0, quantity=1.0),
+                    PriceLevel(price=50_100.0, quantity=1.0),
+                ],
+                [PriceLevel(price=50_200.0, quantity=1.0)],
+            ),
+            (
+                [PriceLevel(price=50_000.0, quantity=1.0)],
+                [
+                    PriceLevel(price=50_100.0, quantity=1.0),
+                    PriceLevel(price=50_100.0, quantity=1.0),
+                ],
+            ),
+        ],
+        ids=["nonmonotonic_bids", "duplicate_asks"],
+    )
+    def test_structurally_corrupt_hot_book_is_never_execution_evidence(
+        self,
+        bids: list[PriceLevel],
+        asks: list[PriceLevel],
+    ) -> None:
+        from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
+
+        book = LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=10_000,
+            bids=bids,
+            asks=asks,
+        )
+
+        snapshot = execution_liquidity_from_local_l2(
+            book,
+            max_depth=1,
+            max_age_ms=5_000,
+            now_ms=12_000,
+        )
+        diagnostic_snapshot = execution_liquidity_from_local_l2(
+            book,
+            max_depth=1,
+            max_age_ms=5_000,
+            now_ms=12_000,
+            require_ready=False,
+        )
+
+        assert book.is_ready(max_age_ms=5_000, now_ms=12_000) is False
+        assert snapshot.source == "none"
+        assert snapshot.book_ready is False
+        assert snapshot.fallback_reason == "book_invalid_for_execution_liquidity"
+        assert diagnostic_snapshot.source == "none"
+        assert diagnostic_snapshot.book_ready is False
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_raw_checksum_parser_rejects_nonfinite_wire_levels(value: str) -> None:
+    from lightfee.marketdata.l2 import _raw_checksum_level
+
+    assert _raw_checksum_level((value, "1")) is None
+    assert _raw_checksum_level(("50000", value)) is None
+
+
+@pytest.mark.parametrize("malformed", [None, "not-a-level", {"price": "1"}])
+def test_raw_checksum_parser_rejects_nonsequence_wire_level(malformed: object) -> None:
+    from lightfee.marketdata.l2 import _raw_checksum_level
+
+    assert _raw_checksum_level(malformed) is None
+
+
+@pytest.mark.parametrize("quantity", ["-1", "0"])
+def test_raw_checksum_snapshot_parser_rejects_nonpositive_quantity(
+    quantity: str,
+) -> None:
+    from lightfee.marketdata.l2 import _raw_checksum_level
+
+    assert _raw_checksum_level(
+        ("50000", quantity),
+        allow_zero_quantity=False,
+    ) is None
+    parsed = _raw_checksum_level(
+        ("50000", quantity),
+        allow_zero_quantity=True,
+    )
+    if quantity == "0":
+        assert parsed == (50_000.0, 0.0, "50000", "0")
+    else:
+        assert parsed is None
 
 
 # ===========================================================================

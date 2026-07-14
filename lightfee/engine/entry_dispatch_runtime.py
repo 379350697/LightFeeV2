@@ -11,7 +11,9 @@ import hashlib
 import json
 import math
 import re
+import time
 from contextlib import suppress
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from math import gcd
 from typing import Any
@@ -27,6 +29,7 @@ from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
 from lightfee.engine.business_contract import classify_entry_quantity_contract
 from lightfee.engine.entry_readiness import QuoteLease
+from lightfee.engine.exit import EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
 from lightfee.engine.execution_planner import (
     ExecutionRoute,
     plan_incremental_entry_execution,
@@ -44,9 +47,14 @@ from lightfee.engine.venue_private_health import (
     private_health_status_for_admission_reason,
 )
 from lightfee.engine.v1_lifecycle import V1TradingLifecycle
+from lightfee.marketdata.liquidity import (
+    ExecutionLiquiditySnapshot,
+    execution_liquidity_from_local_l2,
+)
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.fee_evidence import (
     FEE_EVIDENCE_SCHEMA_VERSION,
+    LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
     TRUSTED_FEE_EVIDENCE_HMAC_ENV,
     TRUSTED_FEE_EVIDENCE_KEY_ID,
     load_fee_evidence,
@@ -215,7 +223,10 @@ def _l2_vwap_and_sweep_limit_for_base_quantity(
     sweep_limit = 0.0
     for level in levels:
         price = float(getattr(level, "price", 0.0) or 0.0)
-        available = max(float(getattr(level, "quantity", 0.0) or 0.0), 0.0)
+        raw_quantity = getattr(level, "quantity", None)
+        if raw_quantity is None:
+            raw_quantity = getattr(level, "size", 0.0)
+        available = max(float(raw_quantity or 0.0), 0.0)
         if price <= 0.0 or available <= 0.0:
             continue
         take = min(available, target - filled)
@@ -267,11 +278,16 @@ def _standard_ioc_price_hints(quote_lease: QuoteLease | None) -> tuple[float, fl
 def _l2_base_capacity(levels: object) -> float:
     if not isinstance(levels, list):
         return 0.0
-    return sum(
-        max(float(getattr(level, "quantity", 0.0) or 0.0), 0.0)
-        for level in levels
-        if float(getattr(level, "price", 0.0) or 0.0) > 0.0
-    )
+    capacity = 0.0
+    for level in levels:
+        raw_quantity = getattr(level, "quantity", None)
+        if raw_quantity is None:
+            raw_quantity = getattr(level, "size", 0.0)
+        price = float(getattr(level, "price", 0.0) or 0.0)
+        quantity = max(float(raw_quantity or 0.0), 0.0)
+        if price > 0.0:
+            capacity += quantity
+    return capacity
 
 
 def _common_base_quantity_step(*steps: float | None) -> float:
@@ -459,6 +475,45 @@ class EntryDispatchRuntime:
     def __init__(self, ctx: EntryDispatchRuntimeContext) -> None:
         self.ctx = ctx
 
+    def _local_l2_execution_snapshots(
+        self,
+        *,
+        symbol: str,
+        long_venue: str,
+        short_venue: str,
+        now_ms: int,
+        max_age_ms: int,
+    ) -> tuple[ExecutionLiquiditySnapshot, ExecutionLiquiditySnapshot] | None:
+        """Return detached, execution-ready L2 snapshots for both entry legs.
+
+        This is the sole raw-local-book bridge for entry decisions that can
+        produce a price, submit limit, or immutable execution-quality
+        evidence.  It deliberately relies on the market-data canonical gate:
+        HOT lifecycle, non-future freshness, and whole-book structure must
+        all pass before any top-of-book or depth value is consumed.
+        """
+        if max_age_ms <= 0:
+            return None
+        long_book = self.ctx.local_l2_runtime.get_book(long_venue, symbol)
+        short_book = self.ctx.local_l2_runtime.get_book(short_venue, symbol)
+        if long_book is None or short_book is None:
+            return None
+        long_snapshot = execution_liquidity_from_local_l2(
+            long_book,
+            max_age_ms=max_age_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        short_snapshot = execution_liquidity_from_local_l2(
+            short_book,
+            max_age_ms=max_age_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        if not long_snapshot.book_ready or not short_snapshot.book_ready:
+            return None
+        return long_snapshot, short_snapshot
+
     async def decide_after_first_fill(
         self,
         *,
@@ -486,34 +541,22 @@ class EntryDispatchRuntime:
         max_age_ms = max(self.ctx.config.strategy.max_liquidity_snapshot_age_ms, 0)
         if max_age_ms <= 0:
             return default
-        long_book = self.ctx.local_l2_runtime.get_book(
-            ctx.long_venue.value,
-            ctx.symbol,
+        snapshots = self._local_l2_execution_snapshots(
+            symbol=ctx.symbol,
+            long_venue=ctx.long_venue.value,
+            short_venue=ctx.short_venue.value,
+            now_ms=now_ms,
+            max_age_ms=max_age_ms,
         )
-        short_book = self.ctx.local_l2_runtime.get_book(
-            ctx.short_venue.value,
-            ctx.symbol,
-        )
-        if long_book is None or short_book is None:
+        if snapshots is None:
             return default
-        long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
-        short_observed_at_ms = int(getattr(short_book, "observed_at_ms", 0) or 0)
-        if (
-            long_observed_at_ms <= 0
-            or short_observed_at_ms <= 0
-            or long_observed_at_ms > now_ms
-            or short_observed_at_ms > now_ms
-            or now_ms - long_observed_at_ms > max_age_ms
-            or now_ms - short_observed_at_ms > max_age_ms
-        ):
-            return default
-        try:
-            long_bid = float(long_book.best_bid() or 0.0)
-            long_ask = float(long_book.best_ask() or 0.0)
-            short_bid = float(short_book.best_bid() or 0.0)
-            short_ask = float(short_book.best_ask() or 0.0)
-        except Exception:
-            return default
+        long_snapshot, short_snapshot = snapshots
+        long_observed_at_ms = long_snapshot.observed_at_ms
+        short_observed_at_ms = short_snapshot.observed_at_ms
+        long_bid = long_snapshot.bids[0].price
+        long_ask = long_snapshot.asks[0].price
+        short_bid = short_snapshot.bids[0].price
+        short_ask = short_snapshot.asks[0].price
         if (
             long_bid <= 0.0
             or long_ask <= long_bid
@@ -2525,7 +2568,7 @@ class EntryDispatchRuntime:
                 evidence_max_age_ms = int(runtime.fee_evidence_max_age_ms)
             except (TypeError, ValueError, OverflowError):
                 return "funding_canary_fee_evidence_age_invalid"
-            if not (0 < evidence_max_age_ms <= _LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS):
+            if not (0 < evidence_max_age_ms <= LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS):
                 return "funding_canary_fee_evidence_age_invalid"
             if strategy.funding_canary_require_account_fee_evidence is not True:
                 return "funding_canary_account_fee_evidence_required"
@@ -2896,33 +2939,23 @@ class EntryDispatchRuntime:
         short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
         if not symbol or not long_venue or not short_venue:
             return None
-        long_book = self.ctx.local_l2_runtime.get_book(long_venue, symbol)
-        short_book = self.ctx.local_l2_runtime.get_book(short_venue, symbol)
-        if long_book is None or short_book is None:
-            return None
-
-        long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
-        short_observed_at_ms = int(getattr(short_book, "observed_at_ms", 0) or 0)
         max_age_ms = max(self.ctx.config.strategy.max_liquidity_snapshot_age_ms, 0)
-        if (
-            long_observed_at_ms <= 0
-            or short_observed_at_ms <= 0
-            or max_age_ms <= 0
-            or long_observed_at_ms > now_ms
-            or short_observed_at_ms > now_ms
-            or now_ms - long_observed_at_ms > max_age_ms
-            or now_ms - short_observed_at_ms > max_age_ms
-        ):
+        snapshots = self._local_l2_execution_snapshots(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            now_ms=now_ms,
+            max_age_ms=max_age_ms,
+        )
+        if snapshots is None:
             return None
-
-        long_bid = float(long_book.best_bid() or 0.0)
-        long_ask = float(long_book.best_ask() or 0.0)
-        short_bid = float(short_book.best_bid() or 0.0)
-        short_ask = float(short_book.best_ask() or 0.0)
-        if long_bid <= 0.0 or long_ask <= long_bid:
-            return None
-        if short_bid <= 0.0 or short_ask <= short_bid:
-            return None
+        long_snapshot, short_snapshot = snapshots
+        long_observed_at_ms = long_snapshot.observed_at_ms
+        short_observed_at_ms = short_snapshot.observed_at_ms
+        long_bid = long_snapshot.bids[0].price
+        long_ask = long_snapshot.asks[0].price
+        short_bid = short_snapshot.bids[0].price
+        short_ask = short_snapshot.asks[0].price
 
         requested_quantity = max(
             float(
@@ -2938,14 +2971,14 @@ class EntryDispatchRuntime:
             long_vwap_filled,
             long_buy_sweep_limit,
         ) = _l2_vwap_and_sweep_limit_for_base_quantity(
-            getattr(long_book, "asks", []), requested_quantity
+            long_snapshot.asks, requested_quantity
         )
         (
             short_sell_vwap,
             short_vwap_filled,
             short_sell_sweep_limit,
         ) = _l2_vwap_and_sweep_limit_for_base_quantity(
-            getattr(short_book, "bids", []), requested_quantity
+            short_snapshot.bids, requested_quantity
         )
         l2_vwap_complete = (
             requested_quantity > 0.0
@@ -2971,14 +3004,98 @@ class EntryDispatchRuntime:
             long_buy_sweep_limit=long_buy_sweep_limit,
             short_sell_sweep_limit=short_sell_sweep_limit,
             long_l2_capacity_quantity=_l2_base_capacity(
-                getattr(long_book, "asks", [])
+                long_snapshot.asks
             ),
             short_l2_capacity_quantity=_l2_base_capacity(
-                getattr(short_book, "bids", [])
+                short_snapshot.bids
             ),
             l2_vwap_quantity=requested_quantity,
             l2_vwap_complete=l2_vwap_complete,
         )
+
+    def _capture_entry_execution_benchmark_receipt(
+        self,
+        ctx: EntryContext,
+    ) -> dict[str, object] | None:
+        """Capture the raw L2 observation that may later qualify entry fills.
+
+        This capture sits immediately before the executor is scheduled, after
+        every live admission/revalidation gate.  It deliberately does not
+        alter the selected route or order prices.  The executor will discard
+        it unless both IOC fills are exact, timely, and side/venue-consistent.
+        """
+        if (
+            self.ctx.config.runtime.mode != "live"
+            or ctx.entry_type != EntryType.STANDARD_DUAL_TAKER
+            or not self._local_l2_effective_enabled()
+        ):
+            return None
+        requested_quantity = max(float(ctx.long_quantity or 0.0), 0.0)
+        if requested_quantity <= 0.0 or abs(ctx.short_quantity - requested_quantity) > 1e-10:
+            return None
+        captured_at_ms = int(time.time() * 1000)
+        configured_max_age_ms = max(
+            self.ctx.config.strategy.max_liquidity_snapshot_age_ms,
+            0,
+        )
+        benchmark_max_age_ms = min(
+            configured_max_age_ms,
+            EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS,
+        )
+        snapshots = self._local_l2_execution_snapshots(
+            symbol=ctx.symbol,
+            long_venue=ctx.long_venue.value,
+            short_venue=ctx.short_venue.value,
+            now_ms=captured_at_ms,
+            max_age_ms=benchmark_max_age_ms,
+        )
+        if snapshots is None:
+            return None
+        long_snapshot, short_snapshot = snapshots
+        long_observed_at_ms = long_snapshot.observed_at_ms
+        short_observed_at_ms = short_snapshot.observed_at_ms
+        long_vwap, long_filled, _long_limit = _l2_vwap_and_sweep_limit_for_base_quantity(
+            long_snapshot.asks, requested_quantity
+        )
+        short_vwap, short_filled, _short_limit = _l2_vwap_and_sweep_limit_for_base_quantity(
+            short_snapshot.bids, requested_quantity
+        )
+        quantity_tolerance = max(1e-10, requested_quantity * 1e-8)
+        long_capacity = _l2_base_capacity(long_snapshot.asks)
+        short_capacity = _l2_base_capacity(short_snapshot.bids)
+        if (
+            long_vwap <= 0.0
+            or short_vwap <= 0.0
+            or long_filled + quantity_tolerance < requested_quantity
+            or short_filled + quantity_tolerance < requested_quantity
+            or long_capacity + quantity_tolerance < requested_quantity
+            or short_capacity + quantity_tolerance < requested_quantity
+        ):
+            return None
+        return {
+            "source": "local_l2_vwap",
+            "position_id": ctx.entry_id,
+            "symbol": ctx.symbol,
+            "captured_at_ms": captured_at_ms,
+            "max_observation_to_submit_ms": EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS,
+            "requested_base_quantity": requested_quantity,
+            "long": {
+                "venue": ctx.long_venue.value,
+                "side": Side.BUY.value,
+                "vwap_price": long_vwap,
+                "available_base_quantity": long_capacity,
+                "observed_at_ms": long_observed_at_ms,
+                "age_ms": captured_at_ms - long_observed_at_ms,
+            },
+            "short": {
+                "venue": ctx.short_venue.value,
+                "side": Side.SELL.value,
+                "vwap_price": short_vwap,
+                "available_base_quantity": short_capacity,
+                "observed_at_ms": short_observed_at_ms,
+                "age_ms": captured_at_ms - short_observed_at_ms,
+            },
+        }
 
     def _revalidate_final_entry_economics(
         self,
@@ -3912,6 +4029,12 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            raw_entry_benchmark = self._capture_entry_execution_benchmark_receipt(ctx)
+            if raw_entry_benchmark is not None:
+                ctx = replace(
+                    ctx,
+                    entry_execution_benchmark_receipt=raw_entry_benchmark,
+                )
             result = await self._execute_entry_with_selected_deadline(
                 ctx=ctx,
                 candidate=candidate,

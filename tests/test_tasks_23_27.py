@@ -1,6 +1,5 @@
 """Tests for Tasks 23-27: daily universe, market data, sidecar lifecycle, CLI, config compat."""
 
-import json
 import os
 import tempfile
 
@@ -11,7 +10,6 @@ from lightfee.marketdata.l2 import (
     L2BookStatus,
     L2PoolAssignment,
     LocalL2Book,
-    PriceLevel,
     promote_warm_to_hot,
 )
 from lightfee.marketdata.liquidity import (
@@ -159,9 +157,21 @@ class TestMarketDataLiquidity:
         filled, avg = snap.estimate_vwap_buy(target_quote=6000)
         # Level 1: 50000*0.1=5000 filled, remaining 1000
         # Level 2: take 1000/50100≈0.02 → cost=1000
-        # total=6000, avg=(5000*50000+1000*50100)/6000 ≈ 50016.67
-        assert filled > 0
-        assert avg > 50000
+        # total base=0.1 + 1000/50100; VWAP=6000/base ≈ 50016.64.
+        assert filled == 6000
+        assert avg == pytest.approx(6000 / (0.1 + 1000 / 50100))
+
+    def test_liquidity_vwap_and_capacity_fail_closed_on_nonfinite_level(self):
+        snap = ExecutionLiquiditySnapshot(
+            symbol="BTCUSDT",
+            venue="binance",
+            asks=[LiquidityLevel(price=float("nan"), size=1.0)],
+            bids=[LiquidityLevel(price=50_000.0, size=float("inf"))],
+        )
+
+        assert snap.estimate_vwap_buy(10_000.0) == (0.0, 0.0)
+        assert snap.estimate_vwap_sell(10_000.0) == (0.0, 0.0)
+        assert chunked_l2_close_capacity(snap, float("nan"), 5.0, "buy") == 0.0
 
     def test_slippage_positive_for_buy_above_ref(self):
         snap = ExecutionLiquiditySnapshot(

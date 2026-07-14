@@ -9,12 +9,13 @@ when local-L2 is enabled and the book is ready.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from math import isfinite
 
 from lightfee.marketdata.l2 import (
     ExecutionLiquiditySource,
+    L2BookStatus,
     LocalL2Book,
-    PriceLevel,
+    _book_structure_fault,
 )
 
 
@@ -50,25 +51,41 @@ class ExecutionLiquiditySnapshot:
     def _walk_levels(
         self, levels: list[LiquidityLevel], target_quote: float
     ) -> tuple[float, float]:
-        if not levels or target_quote <= 0:
+        if not levels or not isfinite(target_quote) or target_quote <= 0:
             return (0.0, 0.0)
         filled_quote = 0.0
-        cost_basis = 0.0
+        filled_base = 0.0
         for lvl in levels:
+            if (
+                not isfinite(lvl.price)
+                or not isfinite(lvl.size)
+                or lvl.price <= 0.0
+                or lvl.size <= 0.0
+            ):
+                return (0.0, 0.0)
             level_quote = lvl.price * lvl.size
-            if level_quote <= 0:
-                continue
+            if not isfinite(level_quote) or level_quote <= 0.0:
+                return (0.0, 0.0)
             take = min(level_quote, target_quote - filled_quote)
             filled_quote += take
-            cost_basis += take * lvl.price
+            # ``take`` is quote notional.  Reconstruct VWAP as quote/base;
+            # quote-weighting the price again would scale it by price and
+            # grossly overstate slippage on multi-level fills.
+            filled_base += take / lvl.price
             if filled_quote >= target_quote:
                 break
-        if filled_quote <= 0:
+        if (
+            not isfinite(filled_quote)
+            or not isfinite(filled_base)
+            or filled_quote <= 0
+            or filled_base <= 0
+        ):
             return (0.0, 0.0)
-        return (filled_quote, cost_basis / filled_quote)
+        vwap = filled_quote / filled_base
+        return (filled_quote, vwap) if isfinite(vwap) and vwap > 0.0 else (0.0, 0.0)
 
     def buy_slippage_bps(self, target_quote: float, reference_price: float) -> float:
-        if reference_price <= 0:
+        if not isfinite(reference_price) or reference_price <= 0:
             return 0.0
         filled, avg_price = self.estimate_vwap_buy(target_quote)
         if filled <= 0 or avg_price <= 0:
@@ -76,7 +93,7 @@ class ExecutionLiquiditySnapshot:
         return (avg_price / reference_price - 1.0) * 10000.0
 
     def sell_slippage_bps(self, target_quote: float, reference_price: float) -> float:
-        if reference_price <= 0:
+        if not isfinite(reference_price) or reference_price <= 0:
             return 0.0
         filled, avg_price = self.estimate_vwap_sell(target_quote)
         if filled <= 0 or avg_price <= 0:
@@ -92,18 +109,25 @@ class ExecutionLiquiditySnapshot:
     def _max_fillable(
         self, levels: list[LiquidityLevel], slippage_limit_bps: float
     ) -> float:
-        if not levels:
+        if not levels or not isfinite(slippage_limit_bps) or slippage_limit_bps < 0.0:
             return 0.0
         ref = levels[0].price
-        if ref <= 0:
+        if not isfinite(ref) or ref <= 0:
             return 0.0
         filled = 0.0
         for lvl in levels:
+            if (
+                not isfinite(lvl.price)
+                or not isfinite(lvl.size)
+                or lvl.price <= 0.0
+                or lvl.size <= 0.0
+            ):
+                return 0.0
             slippage = abs(lvl.price / ref - 1.0) * 10000.0
-            if slippage > slippage_limit_bps:
+            if not isfinite(slippage) or slippage > slippage_limit_bps:
                 break
             filled += lvl.price * lvl.size
-        return filled
+        return filled if isfinite(filled) and filled > 0.0 else 0.0
 
 
 def chunked_l2_close_capacity(
@@ -113,6 +137,13 @@ def chunked_l2_close_capacity(
     side: str,
 ) -> float:
     """How much of target_quantity can be filled within slippage budget."""
+    if (
+        not isfinite(target_quantity)
+        or not isfinite(max_slippage_bps)
+        or target_quantity <= 0.0
+        or max_slippage_bps < 0.0
+    ):
+        return 0.0
     if side == "buy":
         return min(target_quantity, snapshot.max_fillable_buy(max_slippage_bps))
     else:
@@ -138,9 +169,16 @@ def execution_liquidity_from_local_l2(
     """
     depth = max_depth or book.max_depth or 50
 
-    # Check readiness
+    # Check lifecycle/freshness separately from book structure.  ``is_ready``
+    # also validates the stored levels, but preserving the invalid-book reason
+    # below keeps a corrupt HOT book distinguishable from an ordinary stale or
+    # not-yet-HOT one in entry gates and incident diagnostics.
     if require_ready:
-        if not book.is_ready(max_age_ms, now_ms):
+        if (
+            book.status != L2BookStatus.HOT
+            or book.observed_at_ms > now_ms
+            or book.is_stale(max_age_ms, now_ms)
+        ):
             return ExecutionLiquiditySnapshot(
                 symbol=book.symbol,
                 venue=book.venue,
@@ -150,8 +188,46 @@ def execution_liquidity_from_local_l2(
                 book_ready=False,
             )
 
-    bids = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in book.bids[:depth]]
-    asks = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in book.asks[:depth]]
+    # Always use the canonical whole-book structure gate before slicing to the
+    # requested depth.  ``require_ready=False`` relaxes only lifecycle and
+    # freshness for diagnostic callers; it must never relax execution-data
+    # integrity.  Validating the whole stored book also prevents duplicate or
+    # non-monotonic levels beyond ``max_depth`` from being hidden by slicing.
+    if _book_structure_fault(book.bids, book.asks):
+        return ExecutionLiquiditySnapshot(
+            symbol=book.symbol,
+            venue=book.venue,
+            observed_at_ms=book.observed_at_ms,
+            source=ExecutionLiquiditySource.NONE.value,
+            fallback_reason="book_invalid_for_execution_liquidity",
+            book_ready=False,
+        )
+
+    selected_bids = book.bids[:depth]
+    selected_asks = book.asks[:depth]
+    if (
+        not selected_bids
+        or not selected_asks
+        or any(
+            not isfinite(level.price)
+            or not isfinite(level.quantity)
+            or level.price <= 0.0
+            or level.quantity <= 0.0
+            for level in [*selected_bids, *selected_asks]
+        )
+        or selected_bids[0].price >= selected_asks[0].price
+    ):
+        return ExecutionLiquiditySnapshot(
+            symbol=book.symbol,
+            venue=book.venue,
+            observed_at_ms=book.observed_at_ms,
+            source=ExecutionLiquiditySource.NONE.value,
+            fallback_reason="book_invalid_for_execution_liquidity",
+            book_ready=False,
+        )
+
+    bids = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in selected_bids]
+    asks = [LiquidityLevel(price=lvl.price, size=lvl.quantity) for lvl in selected_asks]
 
     return ExecutionLiquiditySnapshot(
         symbol=book.symbol,
@@ -178,4 +254,3 @@ def execution_liquidity_fallback(
         fallback_reason=reason,
         book_ready=False,
     )
-

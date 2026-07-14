@@ -29,6 +29,7 @@ from lightfee.marketdata.l2 import (
     LocalL2Update,
     LocalL2UpdateKind,
     LocalL2UpdateResult,
+    raw_checksum_levels_valid,
 )
 
 
@@ -70,10 +71,21 @@ class RuntimeFaultKind(Enum):
     RATE_LIMITED = auto()
     CHECKSUM_MISMATCH = auto()
     SEQUENCE_GAP = auto()
+    DATA_INTEGRITY = auto()
     QUOTE_AGE_TRIGGERED = auto()
     RESUME_EXPIRED = auto()
     BUDGET_SUSPENDED = auto()
     RUNTIME_SUSPENDED = auto()
+
+
+def _runtime_fault_for_rebuild_reason(reason: str) -> RuntimeFaultKind:
+    """Classify invalid market-data content separately from transport gaps."""
+    normalized = str(reason or "").lower()
+    if "checksum" in normalized:
+        return RuntimeFaultKind.CHECKSUM_MISMATCH
+    if normalized.startswith(("invalid_", "nonfinite_", "book_")):
+        return RuntimeFaultKind.DATA_INTEGRITY
+    return RuntimeFaultKind.SEQUENCE_GAP
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +102,7 @@ class LocalL2RuntimeMetrics:
     runtime_suspended_total: int = 0
     runtime_rate_limited_total: int = 0
     runtime_transport_failure_total: int = 0
+    data_integrity_rebuild_total: int = 0
     assignment_empty_total: int = 0
     assignment_lease_preserved_total: int = 0
     assignment_lease_expired_total: int = 0
@@ -158,6 +171,21 @@ class LocalL2Runtime:
         applied from the per-venue rules profile.
         """
         book = self.ensure_book(update.venue, update.symbol)
+        if (
+            (update.raw_bids or update.raw_asks)
+            and not raw_checksum_levels_valid(
+                update.raw_bids,
+                update.raw_asks,
+                allow_zero_quantity=update.update_kind == LocalL2UpdateKind.DELTA,
+            )
+        ):
+            return self._mark_sequence_boundary_rebuild(
+                book,
+                update,
+                now_ms,
+                "invalid_raw_checksum_level",
+                fault=RuntimeFaultKind.DATA_INTEGRITY,
+            )
         preflight = self._preflight_venue_update(book, update, now_ms)
         if preflight is not None:
             for event in preflight.events:
@@ -196,11 +224,11 @@ class LocalL2Runtime:
         # Trigger rebuild on sequence gap or checksum mismatch
         if result.rebuild_required:
             book.transition_to_rebuilding(now_ms)
+            reason = result.fault_reason or "rebuild_required"
             self.handle_runtime_failure(
                 update.venue, update.symbol,
-                RuntimeFaultKind.CHECKSUM_MISMATCH if "checksum" in (result.fault_reason or "")
-                else RuntimeFaultKind.SEQUENCE_GAP,
-                result.fault_reason or "rebuild_required", now_ms,
+                _runtime_fault_for_rebuild_reason(reason),
+                reason, now_ms,
             )
 
         return result
@@ -274,11 +302,12 @@ class LocalL2Runtime:
         candidate = LocalL2Book(venue=book.venue, symbol=book.symbol)
         candidate.raw_checksum_bids = list(book.raw_checksum_bids)
         candidate.raw_checksum_asks = list(book.raw_checksum_asks)
-        candidate.apply_raw_checksum_update(
+        if not candidate.apply_raw_checksum_update(
             update.raw_bids,
             update.raw_asks,
             LocalL2UpdateKind.DELTA,
-        )
+        ):
+            return False
         return candidate.compute_raw_checksum() == update.checksum
 
     def _mark_sequence_boundary_rebuild(
@@ -287,6 +316,8 @@ class LocalL2Runtime:
         update: LocalL2Update,
         now_ms: int,
         reason: str,
+        *,
+        fault: RuntimeFaultKind = RuntimeFaultKind.SEQUENCE_GAP,
     ) -> LocalL2UpdateResult:
         book.bids.clear()
         book.asks.clear()
@@ -300,7 +331,7 @@ class LocalL2Runtime:
         self.handle_runtime_failure(
             update.venue,
             update.symbol,
-            RuntimeFaultKind.SEQUENCE_GAP,
+            fault,
             reason,
             now_ms,
         )
@@ -312,13 +343,14 @@ class LocalL2Runtime:
         )
 
     @staticmethod
-    def _update_raw_checksum_book(book: LocalL2Book, update: LocalL2Update) -> None:
+    def _update_raw_checksum_book(book: LocalL2Book, update: LocalL2Update) -> bool:
         if update.raw_bids or update.raw_asks:
-            book.apply_raw_checksum_update(
+            return book.apply_raw_checksum_update(
                 update.raw_bids,
                 update.raw_asks,
                 update.update_kind,
             )
+        return True
 
     def _apply_update(
         self, book: LocalL2Book, update: LocalL2Update, now_ms: int
@@ -522,6 +554,10 @@ class LocalL2Runtime:
         elif fault == RuntimeFaultKind.SEQUENCE_GAP:
             self.metrics.rebuild_total += 1
             book.fault_reason = f"sequence_gap: {detail}"
+        elif fault == RuntimeFaultKind.DATA_INTEGRITY:
+            self.metrics.rebuild_total += 1
+            self.metrics.data_integrity_rebuild_total += 1
+            book.fault_reason = f"data_integrity: {detail}"
         elif fault == RuntimeFaultKind.QUOTE_AGE_TRIGGERED:
             book.transition_to_degraded(f"quote_age: {detail}")
         elif fault == RuntimeFaultKind.RESUME_EXPIRED:
@@ -622,5 +658,6 @@ class LocalL2Runtime:
             "runtime_suspended_books": self.metrics.runtime_suspended_books,
             "hot_exec_not_ready_books": self.metrics.hot_exec_not_ready_books,
             "rebuild_total": self.metrics.rebuild_total,
+            "data_integrity_rebuild_total": self.metrics.data_integrity_rebuild_total,
             "fallback_total": self.metrics.fallback_total,
         }

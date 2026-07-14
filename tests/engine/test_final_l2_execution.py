@@ -16,7 +16,7 @@ from lightfee.engine.entry_dispatch_runtime import (
 )
 from lightfee.engine.entry import EntryContext, EntryType
 from lightfee.engine.entry_readiness import QuoteLease
-from lightfee.marketdata.l2 import PriceLevel
+from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
 
 
 def _lease(**overrides: object) -> QuoteLease:
@@ -150,25 +150,105 @@ def test_truthy_quote_refresh_decision_cannot_bypass_the_stale_lease_gate() -> N
     assert evidence["execution_refresh_block_reason"] == ""
 
 
+def test_structurally_corrupt_l2_cannot_steer_any_entry_execution_consumer(
+    monkeypatch,
+) -> None:
+    """A post-gate mutation cannot create a final price or benchmark receipt."""
+    now_ms = 1_000
+    books = {
+        "binance": LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=now_ms,
+            bids=[PriceLevel(price=99.0, quantity=2.0)],
+            asks=[
+                PriceLevel(price=100.0, quantity=1.0),
+                PriceLevel(price=100.0, quantity=1.0),
+            ],
+        ),
+        "bybit": LocalL2Book(
+            venue="bybit",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=now_ms,
+            bids=[PriceLevel(price=101.0, quantity=2.0)],
+            asks=[PriceLevel(price=102.0, quantity=2.0)],
+        ),
+    }
+    runtime = object.__new__(EntryDispatchRuntime)
+    runtime.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            runtime=SimpleNamespace(mode="live"),
+            strategy=SimpleNamespace(max_liquidity_snapshot_age_ms=1_000),
+            venues=[
+                VenueConfig(venue="binance", taker_fee_bps=1.0),
+                VenueConfig(venue="bybit", taker_fee_bps=1.0),
+            ],
+        ),
+        local_l2_runtime=SimpleNamespace(get_book=lambda venue, _symbol: books[venue]),
+        _local_l2_effective_enabled=lambda: True,
+        _candidate_pair_id=lambda _candidate: "BTCUSDT:binance:bybit",
+    )
+    candidate = SimpleNamespace(
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="bybit",
+        entry_target_quantity=1.5,
+    )
+    entry = EntryContext(
+        entry_id="corrupt-l2-entry",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.5,
+        short_quantity=1.5,
+        long_price_hint=100.0,
+        short_price_hint=101.0,
+        maker_leg=Side.BUY,
+        entry_type=EntryType.STANDARD_DUAL_TAKER,
+    )
+
+    assert runtime._local_l2_final_quote_lease(candidate, now_ms) is None
+    monkeypatch.setattr(
+        "lightfee.engine.entry_dispatch_runtime.time.time",
+        lambda: now_ms / 1000.0,
+    )
+    assert runtime._capture_entry_execution_benchmark_receipt(entry) is None
+    assert asyncio.run(
+        runtime.decide_after_first_fill(
+            ctx=entry,
+            maker_fill=SimpleNamespace(quantity=1.0, price=100.0),
+            hedge_request=SimpleNamespace(price=101.0),
+            now_ms=now_ms,
+        )
+    ) == {
+        "action": "complete_hedge",
+        "reason": "post_first_fill_market_data_unavailable_complete_hedge",
+        "hedge_price": 101.0,
+        "market_evidence": {},
+    }
+
+
 def test_immediate_post_first_fill_decision_includes_taker_fees() -> None:
     """The live first-fill path cannot choose an unwind on raw price alone."""
-
-    class Book:
-        observed_at_ms = 1_000
-
-        def __init__(self, bid: float, ask: float) -> None:
-            self._bid = bid
-            self._ask = ask
-
-        def best_bid(self) -> float:
-            return self._bid
-
-        def best_ask(self) -> float:
-            return self._ask
-
     books = {
-        "binance": Book(99.99, 101.0),
-        "bybit": Book(99.5, 100.0),
+        "binance": LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[PriceLevel(price=99.99, quantity=1.0)],
+            asks=[PriceLevel(price=101.0, quantity=1.0)],
+        ),
+        "bybit": LocalL2Book(
+            venue="bybit",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[PriceLevel(price=99.5, quantity=1.0)],
+            asks=[PriceLevel(price=100.0, quantity=1.0)],
+        ),
     }
     runtime = object.__new__(EntryDispatchRuntime)
     runtime.ctx = SimpleNamespace(

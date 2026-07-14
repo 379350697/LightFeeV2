@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from copy import deepcopy
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -95,7 +96,21 @@ class OpenPosition:
     entry_benchmark_long_price: float = 0.0
     entry_benchmark_short_price: float = 0.0
     entry_implementation_shortfall_quote: float = 0.0
+    # Unlike entry price hints, this is the sealed L2 receipt that binds the
+    # entry benchmark to actual paired fills.  ``None`` is intentionally not
+    # treated as a zero-cost benchmark.
+    entry_execution_benchmark_receipt: dict[str, object] | None = None
     exit_implementation_shortfall_quote: float = 0.0
+    # Every aggressive close that contributes execution-quality evidence keeps
+    # its immutable, side-aware L2 receipt here.  These receipts are outside
+    # the V1 PnL/risk path and exist solely to make canary attribution
+    # auditable across snapshots and post-close settlement reconciliation.
+    exit_execution_benchmark_receipts: list[dict[str, object]] = field(
+        default_factory=list
+    )
+    # Entry and every completed close chunk supplied a finite fee observation.
+    # This gate is audit-only and does not alter V1 lifecycle PnL arithmetic.
+    execution_fee_complete: bool = False
     execution_benchmark_complete: bool = False
     # --- PnL attribution (matches Rust V1 realized_* fields) ---
     realized_price_pnl_quote: float = 0.0
@@ -1911,9 +1926,20 @@ class EngineState:
                     "entry_implementation_shortfall_quote": (
                         pos.entry_implementation_shortfall_quote
                     ),
+                    "entry_execution_benchmark_receipt": (
+                        deepcopy(pos.entry_execution_benchmark_receipt)
+                        if isinstance(pos.entry_execution_benchmark_receipt, dict)
+                        else None
+                    ),
                     "exit_implementation_shortfall_quote": (
                         pos.exit_implementation_shortfall_quote
                     ),
+                    "exit_execution_benchmark_receipts": [
+                        deepcopy(receipt)
+                        for receipt in pos.exit_execution_benchmark_receipts
+                        if isinstance(receipt, dict)
+                    ],
+                    "execution_fee_complete": pos.execution_fee_complete,
                     "execution_benchmark_complete": pos.execution_benchmark_complete,
                     "funding_edge_bps_entry": pos.funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,

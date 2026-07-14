@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import math
-from dataclasses import dataclass, field, replace
-from typing import Any, Optional
+from copy import deepcopy
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, OrderRequest, Side, TimeInForce, Venue
@@ -35,7 +36,13 @@ from lightfee.engine.duplicate_client_reconcile import (
     build_duplicate_client_reconcile_result_payload,
     reconcile_duplicate_client_order,
 )
-from lightfee.engine.exit import CloseExecution
+from lightfee.engine.exit import (
+    CloseExecution,
+    EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS,
+    execution_benchmark_receipt_digest,
+    position_execution_benchmark_evidence_complete,
+    seal_execution_benchmark_receipt,
+)
 from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
 from lightfee.engine.state import CloseLegRecord, OpenPosition, PendingClose
@@ -298,6 +305,46 @@ def close_balance_from_closed_quantities(
 # ---------------------------------------------------------------------------
 
 
+def _execution_fee_observed(value: object) -> bool:
+    """Return whether a close fill includes a finite quote-fee observation."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _official_pnl_permitted(
+    *,
+    funding_reconciled: bool,
+    execution_fee_complete: bool,
+    price_pnl_quote: object,
+    settled_funding_quote: object,
+    entry_fee_quote: object,
+    exit_fee_quote: object,
+) -> bool:
+    """Allow an official *net* PnL only when every required cash fact exists.
+
+    A private funding statement makes the funding leg official, but it cannot
+    turn an unknown execution fee (represented by V1's arithmetic zero) into
+    an official whole-trade net result.  This is an attribution/promotion gate
+    only; V1 lifecycle accounting remains available in ``net_quote``.
+    """
+    if funding_reconciled is not True or execution_fee_complete is not True:
+        return False
+    try:
+        values = (
+            float(price_pnl_quote),
+            float(settled_funding_quote),
+            float(entry_fee_quote),
+            float(exit_fee_quote),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return all(math.isfinite(value) for value in values)
+
+
 def build_close_execution_from_legs(
     position: OpenPosition,
     chunk_count: int,
@@ -326,6 +373,10 @@ def build_close_execution_from_legs(
     long_fee = sum(leg.fill.fee_quote or 0.0 for leg in long_legs)
     short_fee = sum(leg.fill.fee_quote or 0.0 for leg in short_legs)
     total_exit_fee = long_fee + short_fee
+    execution_fee_complete = all(
+        _execution_fee_observed(leg.fill.fee_quote)
+        for leg in (*long_legs, *short_legs)
+    )
 
     # Quantities
     long_close_qty = sum(leg.fill.quantity for leg in long_legs)
@@ -350,6 +401,7 @@ def build_close_execution_from_legs(
         short_fee_quote=short_fee,
         realized_price_pnl_quote=realized_price_pnl,
         funding_pnl_quote=position.captured_funding_quote + position.second_stage_funding_quote,
+        execution_fee_complete=execution_fee_complete,
         net_quote=(
             realized_price_pnl
             + position.captured_funding_quote
@@ -531,7 +583,6 @@ def compute_close_chunks(
             min_allowed = max(min_allowed, min_short_notional / short_price_hint if short_price_hint > 0 else 0.0)
         if min_allowed > 0 and base_qty < min_allowed:
             # Chunks would be too small — fall back to fewer, larger chunks
-            max_chunk_qty = total_notional / max_notional_quote
             num_chunks = max(1, int(math.floor(total_quantity / min_allowed)))
             # But each chunk must still respect the notional cap
             max_qty_per_chunk = max_notional_quote / price_per_unit
@@ -955,6 +1006,10 @@ class CloseExecutor:
         state: Any | None = None,
         short_stage: str = "exit_short",
         long_stage: str = "exit_long",
+        execution_benchmark_receipt: dict[str, object] | None = None,
+        execution_benchmark_capture: Callable[
+            [float, int], dict[str, object] | None
+        ] | None = None,
     ) -> CloseExecution | None:
         """Execute a full close for an open position.
 
@@ -1004,10 +1059,45 @@ class CloseExecutor:
         chunk_long_order_ids: list[str] = []
         any_short_uncertain = False
         any_long_uncertain = False
+        # Each close chunk needs its own pre-trade observation.  Reusing an
+        # initial receipt across delayed chunks would price later fills with
+        # stale book depth and make implementation shortfall meaningless.
+        chunk_benchmark_bindings: list[
+            tuple[
+                dict[str, object],
+                float,
+                list[CloseExecutionLeg],
+                list[CloseExecutionLeg],
+            ]
+        ] = []
 
         for chunk_idx, chunk_qty in enumerate(chunk_quantities):
             chunk_suffix = f"_chunk_{chunk_idx + 1}" if total_chunks > 1 else ""
-            chunk_start_ms = now_ms
+            chunk_benchmark_receipt: dict[str, object] | None = None
+            if execution_benchmark_capture is not None:
+                # Capture immediately before the first leg of this chunk.
+                # Failure only removes acceptance evidence; it never blocks
+                # V1's risk/close routing.
+                capture_now_ms = wall_clock_now_ms()
+                try:
+                    chunk_benchmark_receipt = execution_benchmark_capture(
+                        float(chunk_qty), capture_now_ms
+                    )
+                except Exception as exc:
+                    self.journal.append(
+                        "execution.close_benchmark_capture_failed",
+                        {
+                            "position_id": position.position_id,
+                            "chunk_index": chunk_idx,
+                            "chunk_quantity": chunk_qty,
+                            "error": f"{type(exc).__name__}: {exc}"[:240],
+                        },
+                    )
+            elif total_chunks == 1:
+                # Preserve the explicit one-shot API for non-runtime callers.
+                chunk_benchmark_receipt = execution_benchmark_receipt
+            short_leg_start = len(short_legs)
+            long_leg_start = len(long_legs)
 
             short_cid = compact_client_order_id(
                 position.position_id,
@@ -1033,7 +1123,14 @@ class CloseExecutor:
                 short_legs.append(CloseExecutionLeg(
                     fill=short_result["fill"],
                     client_order_id=short_cid,
-                    submit_started_at_ms=chunk_start_ms,
+                    # A retry may succeed long after its first attempt.  The
+                    # retry helper returns the timestamp taken immediately
+                    # before the adapter accepted the *successful* request;
+                    # synthetic/reconciled fills deliberately have no such
+                    # evidence and therefore cannot promote a benchmark.
+                    submit_started_at_ms=int(
+                        short_result.get("submitted_at_ms") or 0
+                    ),
                 ))
                 chunk_short_order_ids.append(short_result["fill"].order_id)
             elif short_result["outcome"] == "terminal_flat":
@@ -1116,7 +1213,9 @@ class CloseExecutor:
                 long_legs.append(CloseExecutionLeg(
                     fill=long_result["fill"],
                     client_order_id=long_cid,
-                    submit_started_at_ms=chunk_start_ms,
+                    submit_started_at_ms=int(
+                        long_result.get("submitted_at_ms") or 0
+                    ),
                 ))
                 chunk_long_order_ids.append(long_result["fill"].order_id)
             elif long_result["outcome"] == "terminal_flat":
@@ -1208,6 +1307,16 @@ class CloseExecutor:
                 },
             )
 
+            if chunk_benchmark_receipt is not None:
+                chunk_benchmark_bindings.append(
+                    (
+                        chunk_benchmark_receipt,
+                        float(chunk_qty),
+                        list(long_legs[long_leg_start:]),
+                        list(short_legs[short_leg_start:]),
+                    )
+                )
+
             # Inter-chunk delay (skip after last chunk)
             if chunk_idx < total_chunks - 1 and self.config.close_chunk_min_interval_ms > 0:
                 delay_s = self.config.close_chunk_min_interval_ms / 1000.0
@@ -1231,15 +1340,58 @@ class CloseExecutor:
             position, total_chunks, short_legs, long_legs,
         )
         close.reason = reason
-        close.implementation_shortfall_quote = (
-            _close_implementation_shortfall_quote(
+        finalized_benchmarks: list[dict[str, object]] = []
+        benchmarked_long_legs = 0
+        benchmarked_short_legs = 0
+        for (
+            chunk_receipt,
+            chunk_quantity,
+            chunk_long_legs,
+            chunk_short_legs,
+        ) in chunk_benchmark_bindings:
+            chunk_shortfall = _close_implementation_shortfall_quote(
                 position,
-                long_legs=long_legs,
-                short_legs=short_legs,
-                long_benchmark_price=long_price_hint,
-                short_benchmark_price=short_price_hint,
+                long_legs=chunk_long_legs,
+                short_legs=chunk_short_legs,
+                execution_benchmark_receipt=chunk_receipt,
+                expected_quantity=chunk_quantity,
             )
-        )
+            if chunk_shortfall is None:
+                finalized_benchmarks = []
+                break
+            finalized = _finalized_execution_benchmark_receipt(
+                position,
+                chunk_receipt,
+                expected_quantity=chunk_quantity,
+                long_legs=chunk_long_legs,
+                short_legs=chunk_short_legs,
+                implementation_shortfall_quote=chunk_shortfall,
+            )
+            if finalized is None:
+                finalized_benchmarks = []
+                break
+            finalized_benchmarks.append(finalized)
+            benchmarked_long_legs += len(chunk_long_legs)
+            benchmarked_short_legs += len(chunk_short_legs)
+        # A receipt for a subset of close fills would understate adverse
+        # selection.  All confirmed legs must be covered, or the metric is
+        # unavailable for the entire close.
+        if (
+            finalized_benchmarks
+            and benchmarked_long_legs == len(long_legs)
+            and benchmarked_short_legs == len(short_legs)
+        ):
+            close.execution_benchmark_receipts = finalized_benchmarks
+            close.execution_benchmark_receipt = (
+                finalized_benchmarks[0] if len(finalized_benchmarks) == 1 else None
+            )
+            total_shortfall = sum(
+                float(receipt["implementation_shortfall_quote"])
+                for receipt in finalized_benchmarks
+            )
+            close.implementation_shortfall_quote = (
+                total_shortfall if math.isfinite(total_shortfall) else None
+            )
 
         # Detect residual from total closed quantities
         long_closed = sum(leg.fill.quantity for leg in long_legs)
@@ -1302,6 +1454,20 @@ class CloseExecutor:
 
         if terminal_close and (long_closed > 1e-12 or short_closed > 1e-12):
             # V1: terminal exit.closed is synchronously durable.
+            # ``now_ms`` is the scheduler tick that initiated the close.  It
+            # can predate retries and the final confirmed fill, so keep it as
+            # V1's legacy ``closed_at_ms`` and derive a separate completion
+            # boundary from the latest confirmed exchange fill.  Unlike a
+            # second scheduler clock read, this fact remains meaningful when
+            # an adapter retry or journal write is delayed.
+            confirmed_fill_times = [
+                int(getattr(leg.fill, "filled_at_ms", 0) or 0)
+                for leg in (*long_legs, *short_legs)
+            ]
+            execution_completed_at_ms = max(
+                now_ms,
+                *(timestamp for timestamp in confirmed_fill_times if timestamp > 0),
+            )
             self.journal.append_critical(
                 now_ms,
                 "exit.closed",
@@ -1310,6 +1476,11 @@ class CloseExecutor:
                     "symbol": position.symbol,
                     "long_venue": position.long_venue.value,
                     "short_venue": position.short_venue.value,
+                    # This is the immutable close boundary for downstream
+                    # funding-canary truth timing; journal append time alone
+                    # cannot prove when the position became terminal.
+                    "closed_at_ms": now_ms,
+                    "execution_completed_at_ms": execution_completed_at_ms,
                     "reason": reason,
                     "long_closed_qty": long_closed,
                     "short_closed_qty": short_closed,
@@ -1339,6 +1510,20 @@ class CloseExecutor:
                     "execution_benchmark_complete": pnl_attr[
                         "execution_benchmark_complete"
                     ],
+                    "execution_fee_complete": pnl_attr["execution_fee_complete"],
+                    "entry_execution_benchmark_receipt": (
+                        deepcopy(position.entry_execution_benchmark_receipt)
+                        if isinstance(position.entry_execution_benchmark_receipt, dict)
+                        else None
+                    ),
+                    "exit_execution_benchmark_receipts": (
+                        [deepcopy(receipt) for receipt in position.exit_execution_benchmark_receipts]
+                        if state is not None
+                        else [
+                            deepcopy(receipt)
+                            for receipt in close.execution_benchmark_receipts
+                        ]
+                    ),
                     "calculation_version": position.calculation_version,
                     "model_epoch": position.model_epoch,
                     "economics_observed_at_ms": position.economics_observed_at_ms,
@@ -1385,12 +1570,21 @@ class CloseExecutor:
         position.short_quantity = max(position.short_quantity - short_closed, 0.0)
         position.realized_price_pnl_quote += close.realized_price_pnl_quote
         position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+        position.execution_fee_complete = bool(
+            position.execution_fee_complete is True
+            and close.execution_fee_complete is True
+        )
         if (
             position.execution_benchmark_complete is True
             and close.implementation_shortfall_quote is not None
+            and close.execution_benchmark_receipts
         ):
             position.exit_implementation_shortfall_quote += (
                 close.implementation_shortfall_quote
+            )
+            position.exit_execution_benchmark_receipts.extend(
+                deepcopy(receipt)
+                for receipt in close.execution_benchmark_receipts
             )
         else:
             # Missing quote evidence may not be silently converted to a zero
@@ -1607,6 +1801,11 @@ class CloseExecutor:
             return {"outcome": "rejected", "fill": None, "reason": "no adapter", "order_id": ""}
 
         try:
+            # This is the evidence boundary for a fill returned by this
+            # adapter call.  It intentionally lives inside the retry attempt
+            # rather than at the caller: an UNCERTAIN first attempt may be
+            # followed by a later order that creates the fill we persist.
+            submitted_at_ms = wall_clock_now_ms()
             fill = await adapter.place_order(request)
             if fill.quantity > 0:
                 # V1 parity: execution.order_filled includes venue/symbol/side/filled_at_ms
@@ -1626,7 +1825,12 @@ class CloseExecutor:
                         "filled_at_ms": fill.filled_at_ms,
                     },
                 )
-                return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
+                return {
+                    "outcome": "filled",
+                    "fill": fill,
+                    "order_id": fill.order_id,
+                    "submitted_at_ms": submitted_at_ms,
+                }
             else:
                 self.journal.append(
                     "order.uncertain",
@@ -2536,7 +2740,21 @@ def build_exit_pnl_attribution(
     exit_fee = close.long_fee_quote + close.short_fee_quote
     net = close.realized_price_pnl_quote + funding_quote - entry_fee - exit_fee
 
-    official = position.funding_settlement_evidence_status == "complete"
+    fee_complete = bool(
+        position.execution_fee_complete is True
+        and close.execution_fee_complete is True
+    )
+    official_funding_reconciled = (
+        position.funding_settlement_evidence_status == "complete"
+    )
+    official = _official_pnl_permitted(
+        funding_reconciled=official_funding_reconciled,
+        execution_fee_complete=fee_complete,
+        price_pnl_quote=close.realized_price_pnl_quote,
+        settled_funding_quote=position.settled_funding_quote,
+        entry_fee_quote=entry_fee,
+        exit_fee_quote=exit_fee,
+    )
     official_net = (
         close.realized_price_pnl_quote
         + position.settled_funding_quote
@@ -2545,13 +2763,34 @@ def build_exit_pnl_attribution(
         if official
         else None
     )
+    close_receipts = (
+        list(close.execution_benchmark_receipts)
+        if close.execution_benchmark_receipts
+        else (
+            [close.execution_benchmark_receipt]
+            if isinstance(close.execution_benchmark_receipt, dict)
+            else []
+        )
+    )
+    benchmark_complete = bool(
+        fee_complete
+        and close.implementation_shortfall_quote is not None
+        and position_execution_benchmark_evidence_complete(
+            position,
+            exit_receipts=close_receipts,
+            exit_shortfall_quote=close.implementation_shortfall_quote,
+        )
+    )
     return {
         "funding_quote": funding_quote,
         "lifecycle_forecast_funding_quote": funding_quote,
         "settled_funding_quote": position.settled_funding_quote,
         "funding_settlement_evidence_status": position.funding_settlement_evidence_status,
+        "official_funding_reconciled": official_funding_reconciled,
         "official_pnl": official,
-        "official_funding_quote": position.settled_funding_quote if official else None,
+        "official_funding_quote": (
+            position.settled_funding_quote if official_funding_reconciled else None
+        ),
         "official_net_quote": official_net,
         "funding_forecast_error_quote": position.funding_forecast_error_quote,
         "price_pnl_quote": close.realized_price_pnl_quote,
@@ -2560,16 +2799,11 @@ def build_exit_pnl_attribution(
         "implementation_shortfall_quote": (
             position.entry_implementation_shortfall_quote
             + close.implementation_shortfall_quote
-            if (
-                position.execution_benchmark_complete is True
-                and close.implementation_shortfall_quote is not None
-            )
+            if benchmark_complete
             else None
         ),
-        "execution_benchmark_complete": (
-            position.execution_benchmark_complete is True
-            and close.implementation_shortfall_quote is not None
-        ),
+        "execution_benchmark_complete": benchmark_complete,
+        "execution_fee_complete": fee_complete,
         "net_quote": net,
     }
 
@@ -2586,19 +2820,34 @@ def build_position_pnl_attribution(position: OpenPosition) -> dict[str, object]:
     entry_fee = position.long_entry_fee_quote + position.short_entry_fee_quote
     exit_fee = position.realized_exit_fee_quote
     price_pnl = position.realized_price_pnl_quote
-    official = position.funding_settlement_evidence_status == "complete"
+    fee_complete = position.execution_fee_complete is True
+    official_funding_reconciled = (
+        position.funding_settlement_evidence_status == "complete"
+    )
+    official = _official_pnl_permitted(
+        funding_reconciled=official_funding_reconciled,
+        execution_fee_complete=fee_complete,
+        price_pnl_quote=price_pnl,
+        settled_funding_quote=position.settled_funding_quote,
+        entry_fee_quote=entry_fee,
+        exit_fee_quote=exit_fee,
+    )
     official_net = (
         price_pnl + position.settled_funding_quote - entry_fee - exit_fee
         if official
         else None
     )
+    benchmark_complete = position_execution_benchmark_evidence_complete(position)
     return {
         "funding_quote": funding_quote,
         "lifecycle_forecast_funding_quote": funding_quote,
         "settled_funding_quote": position.settled_funding_quote,
         "funding_settlement_evidence_status": position.funding_settlement_evidence_status,
+        "official_funding_reconciled": official_funding_reconciled,
         "official_pnl": official,
-        "official_funding_quote": position.settled_funding_quote if official else None,
+        "official_funding_quote": (
+            position.settled_funding_quote if official_funding_reconciled else None
+        ),
         "official_net_quote": official_net,
         "funding_forecast_error_quote": position.funding_forecast_error_quote,
         "price_pnl_quote": price_pnl,
@@ -2607,10 +2856,11 @@ def build_position_pnl_attribution(position: OpenPosition) -> dict[str, object]:
         "implementation_shortfall_quote": (
             position.entry_implementation_shortfall_quote
             + position.exit_implementation_shortfall_quote
-            if position.execution_benchmark_complete is True
+            if benchmark_complete
             else None
         ),
-        "execution_benchmark_complete": position.execution_benchmark_complete is True,
+        "execution_benchmark_complete": benchmark_complete,
+        "execution_fee_complete": fee_complete,
         "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
     }
 
@@ -2620,21 +2870,34 @@ def _close_implementation_shortfall_quote(
     *,
     long_legs: list[CloseExecutionLeg],
     short_legs: list[CloseExecutionLeg],
-    long_benchmark_price: object,
-    short_benchmark_price: object,
+    execution_benchmark_receipt: object,
+    expected_quantity: object,
 ) -> float | None:
-    """Measure adverse close fills without conflating them with holding PnL."""
-    try:
-        long_benchmark = float(long_benchmark_price)
-        short_benchmark = float(short_benchmark_price)
-    except (TypeError, ValueError, OverflowError):
+    """Measure adverse close fills against a persisted executable L2 receipt.
+
+    The close price hints deliberately retain their V1 routing role.  They
+    cannot be repurposed as fill-quality evidence because the aggressive path
+    may use a midpoint hint.  Only a full, side-aware L2 receipt for the exact
+    intended close quantity may enter the canary metric.
+    """
+    receipt = _normalized_execution_benchmark_receipt(
+        position,
+        execution_benchmark_receipt,
+        expected_quantity=expected_quantity,
+    )
+    if position.execution_benchmark_complete is not True or receipt is None:
         return None
+    long_benchmark = float(receipt["long"]["vwap_price"])
+    short_benchmark = float(receipt["short"]["vwap_price"])
+    intended_quantity = float(receipt["requested_base_quantity"])
+    long_filled = sum(float(leg.fill.quantity) for leg in long_legs)
+    short_filled = sum(float(leg.fill.quantity) for leg in short_legs)
+    quantity_tolerance = max(1e-10, intended_quantity * 1e-8)
     if (
-        position.execution_benchmark_complete is not True
-        or not all(
-            math.isfinite(value) and value > 0.0
-            for value in (long_benchmark, short_benchmark)
-        )
+        not math.isfinite(long_filled)
+        or not math.isfinite(short_filled)
+        or abs(long_filled - intended_quantity) > quantity_tolerance
+        or abs(short_filled - intended_quantity) > quantity_tolerance
     ):
         return None
     shortfall = 0.0
@@ -2659,6 +2922,241 @@ def _close_implementation_shortfall_quote(
             return None
         shortfall += max(fill.price - short_benchmark, 0.0) * fill.quantity
     return shortfall if math.isfinite(shortfall) else None
+
+
+def _normalized_execution_benchmark_receipt(
+    position: OpenPosition,
+    receipt: object,
+    *,
+    expected_quantity: object,
+) -> dict[str, object] | None:
+    """Validate and canonicalize an immutable close benchmark receipt.
+
+    The digest binds the raw, side-aware L2 observation to the position and
+    target quantity.  It is a persistence-integrity guard, not an order
+    routing input; a malformed or stale receipt simply removes the trade from
+    execution-quality acceptance evidence.
+    """
+    if not isinstance(receipt, dict):
+        return None
+    try:
+        requested_quantity = float(receipt.get("requested_base_quantity"))
+        expected = float(expected_quantity)
+        schema_version = int(receipt.get("schema_version", 0))
+        captured_at_ms = int(receipt.get("captured_at_ms", 0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        schema_version != 1
+        or str(receipt.get("source", "") or "") != "local_l2_vwap"
+        or str(receipt.get("position_id", "") or "") != position.position_id
+        or str(receipt.get("symbol", "") or "") != position.symbol
+        or not math.isfinite(requested_quantity)
+        or not math.isfinite(expected)
+        or requested_quantity <= 0.0
+        or expected <= 0.0
+        or captured_at_ms <= 0
+    ):
+        return None
+    quantity_tolerance = max(1e-10, max(requested_quantity, expected) * 1e-8)
+    if abs(requested_quantity - expected) > quantity_tolerance:
+        return None
+
+    normalized_legs: dict[str, dict[str, object]] = {}
+    expected_legs = {
+        "long": (position.long_venue.value, "sell"),
+        "short": (position.short_venue.value, "buy"),
+    }
+    for name, (venue, side) in expected_legs.items():
+        raw_leg = receipt.get(name)
+        if not isinstance(raw_leg, dict):
+            return None
+        try:
+            vwap_price = float(raw_leg.get("vwap_price"))
+            available_quantity = float(raw_leg.get("available_base_quantity"))
+            observed_at_ms = int(raw_leg.get("observed_at_ms", 0))
+            age_ms = int(raw_leg.get("age_ms", -1))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            str(raw_leg.get("venue", "") or "") != venue
+            or str(raw_leg.get("side", "") or "") != side
+            or not math.isfinite(vwap_price)
+            or not math.isfinite(available_quantity)
+            or vwap_price <= 0.0
+            or available_quantity + quantity_tolerance < requested_quantity
+            or observed_at_ms <= 0
+            or age_ms < 0
+            or observed_at_ms > captured_at_ms
+            or captured_at_ms - observed_at_ms != age_ms
+        ):
+            return None
+        normalized_legs[name] = {
+            "venue": venue,
+            "side": side,
+            "vwap_price": vwap_price,
+            "available_base_quantity": available_quantity,
+            "observed_at_ms": observed_at_ms,
+            "age_ms": age_ms,
+        }
+
+    normalized: dict[str, object] = {
+        "schema_version": 1,
+        "source": "local_l2_vwap",
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "captured_at_ms": captured_at_ms,
+        "requested_base_quantity": requested_quantity,
+        "long": normalized_legs["long"],
+        "short": normalized_legs["short"],
+    }
+    digest = _execution_benchmark_receipt_digest(normalized)
+    supplied_digest = receipt.get("receipt_digest")
+    if supplied_digest not in (None, "") and supplied_digest != digest:
+        return None
+    normalized["receipt_digest"] = digest
+    return normalized
+
+
+def _finalized_execution_benchmark_receipt(
+    position: OpenPosition,
+    receipt: object,
+    *,
+    expected_quantity: object,
+    long_legs: list[CloseExecutionLeg],
+    short_legs: list[CloseExecutionLeg],
+    implementation_shortfall_quote: object,
+) -> dict[str, object] | None:
+    """Bind the executable benchmark to the actual, complete close fills.
+
+    The pre-trade L2 observation is necessary but insufficient: a persisted
+    aggregate shortfall can otherwise be detached from the fills that produced
+    it.  This receipt retains each confirmed fill (including its stable order
+    identity when available) and hashes the whole fact set at the same
+    persistence boundary as the terminal close record.
+    """
+    normalized = _normalized_execution_benchmark_receipt(
+        position,
+        receipt,
+        expected_quantity=expected_quantity,
+    )
+    if normalized is None:
+        return None
+    try:
+        expected = float(normalized["requested_base_quantity"])
+        reported_shortfall = float(implementation_shortfall_quote)
+        captured_at_ms = int(normalized["captured_at_ms"])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(reported_shortfall) or reported_shortfall < 0.0:
+        return None
+
+    finalized = {
+        key: value for key, value in normalized.items() if key != "receipt_digest"
+    }
+    # Persist this policy in the sealed receipt.  Analysis must validate the
+    # same exact bound rather than accepting a caller-supplied interpretation
+    # of what a "fresh" book means.
+    finalized["max_observation_to_submit_ms"] = (
+        EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
+    )
+    total_shortfall = 0.0
+    quantity_tolerance = max(1e-10, expected * 1e-8)
+    for name, legs, adverse_sign in (
+        ("long", long_legs, -1.0),
+        ("short", short_legs, 1.0),
+    ):
+        benchmark_leg = finalized.get(name)
+        if not isinstance(benchmark_leg, dict):
+            return None
+        try:
+            benchmark_price = float(benchmark_leg["vwap_price"])
+            observed_at_ms = int(benchmark_leg["observed_at_ms"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        fills: list[dict[str, object]] = []
+        filled_quantity = 0.0
+        adverse_shortfall = 0.0
+        for leg in legs:
+            fill = leg.fill
+            if not (
+                math.isfinite(fill.quantity)
+                and math.isfinite(fill.price)
+                and fill.quantity > 0.0
+                and fill.price > 0.0
+            ):
+                return None
+            order_id = str(fill.order_id or "")
+            client_order_id = str(
+                fill.client_order_id or leg.client_order_id or ""
+            )
+            # A fill without either exchange or deterministic client identity
+            # remains valid for V1 position handling, but cannot be promoted
+            # as an independently auditable execution-quality observation.
+            if not order_id and not client_order_id:
+                return None
+            fee_quote = _execution_fee_quote(fill.fee_quote)
+            try:
+                submitted_at_ms = int(leg.submit_started_at_ms)
+                filled_at_ms = int(fill.filled_at_ms or 0)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (
+                submitted_at_ms <= 0
+                or filled_at_ms <= 0
+                or captured_at_ms > submitted_at_ms
+                or submitted_at_ms > filled_at_ms
+                or submitted_at_ms - observed_at_ms
+                > EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
+            ):
+                return None
+            fills.append(
+                {
+                    "order_id": order_id,
+                    "client_order_id": client_order_id,
+                    "submitted_at_ms": submitted_at_ms,
+                    "filled_at_ms": filled_at_ms,
+                    "quantity": float(fill.quantity),
+                    "price": float(fill.price),
+                    **({"fee_quote": fee_quote} if fee_quote is not None else {}),
+                }
+            )
+            filled_quantity += float(fill.quantity)
+            adverse_shortfall += max(
+                adverse_sign * (float(fill.price) - benchmark_price), 0.0
+            ) * float(fill.quantity)
+        if (
+            not fills
+            or not math.isfinite(filled_quantity)
+            or not math.isfinite(adverse_shortfall)
+            or abs(filled_quantity - expected) > quantity_tolerance
+        ):
+            return None
+        benchmark_leg["fills"] = fills
+        benchmark_leg["filled_base_quantity"] = filled_quantity
+        benchmark_leg["implementation_shortfall_quote"] = adverse_shortfall
+        total_shortfall += adverse_shortfall
+    shortfall_tolerance = max(1e-8, max(total_shortfall, reported_shortfall) * 1e-8)
+    if abs(total_shortfall - reported_shortfall) > shortfall_tolerance:
+        return None
+    finalized["implementation_shortfall_quote"] = total_shortfall
+    return seal_execution_benchmark_receipt(finalized)
+
+
+def _execution_fee_quote(value: object) -> float | None:
+    """Return a finite observed fill fee; absence stays explicitly absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        fee_quote = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return fee_quote if math.isfinite(fee_quote) else None
+
+
+def _execution_benchmark_receipt_digest(receipt: dict[str, object]) -> str:
+    """Compatibility alias; HMAC, not this checksum, authenticates receipts."""
+    return execution_benchmark_receipt_digest(receipt)
 
 
 def _residual_task_to_dict(task: ResidualExposureTask) -> dict[str, Any]:

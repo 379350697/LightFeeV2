@@ -95,8 +95,9 @@ def test_execution_shortfall_is_an_audit_cost_not_a_v1_net_pnl_rewrite() -> None
 
     attribution = build_exit_pnl_attribution(position, close)
 
-    assert attribution["implementation_shortfall_quote"] == pytest.approx(2.0)
-    assert attribution["execution_benchmark_complete"] is True
+    # A number without the raw side-aware receipt is not execution evidence.
+    assert attribution["implementation_shortfall_quote"] is None
+    assert attribution["execution_benchmark_complete"] is False
     # V1 realised/funding PnL remains the unchanged accounting series.
     assert attribution["net_quote"] == pytest.approx(2.0)
 
@@ -133,6 +134,39 @@ def test_complete_two_leg_statement_settlement_makes_official_pnl_and_roundtrips
     assert restored.funding_settlement_evidence_status == "complete"
     assert restored.settled_funding_quote == pytest.approx(2.5)
     assert len(restored.funding_settlement_records) == 2
+
+
+def test_complete_funding_statement_does_not_promote_unknown_execution_fee_to_official_net() -> None:
+    position = _position(execution_fee_complete=False)
+    StrategyAttributionService.record_settlements(
+        position,
+        [
+            _record("long", "binance", -1.0),
+            _record("short", "okx", 3.5),
+        ],
+    )
+    close = CloseExecution(
+        position_id=position.position_id,
+        reason="funding_capture",
+        long_close_price=100.0,
+        short_close_price=100.0,
+        long_close_qty=1.0,
+        short_close_qty=1.0,
+        long_fee_quote=0.0,
+        short_fee_quote=0.0,
+        realized_price_pnl_quote=0.0,
+        funding_pnl_quote=2.0,
+        net_quote=2.0,
+        execution_fee_complete=False,
+    )
+
+    attribution = build_exit_pnl_attribution(position, close)
+
+    assert attribution["official_funding_reconciled"] is True
+    assert attribution["official_funding_quote"] == pytest.approx(2.5)
+    assert attribution["official_pnl"] is False
+    assert attribution["official_net_quote"] is None
+    assert attribution["net_quote"] == pytest.approx(2.0)
 
 
 def test_staggered_second_stage_requires_only_settled_legs_not_a_future_leg() -> None:

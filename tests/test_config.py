@@ -130,6 +130,28 @@ def test_live_funding_entries_require_the_canary_gate():
     )
 
 
+def test_live_funding_canary_requires_execution_benchmark_signing_key(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = AppConfig()
+    cfg.runtime.mode = "live"
+    cfg.strategy.risk_monitor_enabled = True
+    cfg.strategy.funding_new_entries_enabled = True
+    cfg.strategy.funding_canary_enabled = True
+    monkeypatch.delenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", raising=False)
+
+    assert (
+        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY must be non-empty for a live funding canary"
+        in validate_config(cfg)
+    )
+
+    monkeypatch.setenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", "canary-test-key")
+    assert not any(
+        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY" in issue
+        for issue in validate_config(cfg)
+    )
+
+
 def test_dynamic_spread_cost_gate_and_model_epoch_are_indivisible():
     cfg = AppConfig()
     cfg.strategy.spread_dynamic_net_edge_enabled = True

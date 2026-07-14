@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from lightfee.config.schema import ENTRY_READINESS_PROVIDERS
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2BookKey
+from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
 
 @dataclass(frozen=True)
@@ -407,12 +408,6 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
     ) -> tuple[str, dict[str, Any]] | None:
         if getattr(book, "status", None) != L2BookStatus.HOT:
             return self._reason("book_not_hot"), self._book_evidence(book, now_ms)
-        bid = float(book.best_bid() if hasattr(book, "best_bid") else 0.0)
-        ask = float(book.best_ask() if hasattr(book, "best_ask") else 0.0)
-        if bid <= 0.0 or ask <= 0.0:
-            return self._reason("invalid_book"), self._book_evidence(book, now_ms)
-        if bid >= ask:
-            return self._reason("crossed_book"), self._book_evidence(book, now_ms)
 
         max_age_ms = self._runtime.config.runtime.max_market_age_ms
         observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
@@ -427,6 +422,18 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             if observed_at_ms > now_ms:
                 evidence["timestamp_after_now"] = True
             return self._reason("stale_book"), evidence
+
+        # Readiness is an entry-permission boundary.  A valid top level alone
+        # cannot hide duplicate, non-monotonic, or malformed depth beneath it.
+        snapshot = execution_liquidity_from_local_l2(
+            book,
+            max_depth=1,
+            max_age_ms=max_age_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        if not snapshot.book_ready:
+            return self._reason("invalid_book"), self._book_evidence(book, now_ms)
 
         ws_evidence_ms = self._ws_evidence_ms(str(book.venue), str(book.symbol))
         if ws_evidence_ms <= 0:

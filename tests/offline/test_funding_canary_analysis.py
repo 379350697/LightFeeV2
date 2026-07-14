@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import pytest
+
+from lightfee.engine.exit import seal_execution_benchmark_receipt
 from lightfee.offline.funding_canary_analysis import analyze_funding_canary_events
+
+
+@pytest.fixture(autouse=True)
+def _execution_benchmark_integrity_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", "canary-test-secret")
 
 
 def _event(entry_id: str, seq: int, kind: str, payload: dict) -> dict:
     return {
         "run_id": f"run-{entry_id}",
         "seq": seq,
+        "ts_ms": seq * 1_000,
         "kind": kind,
         "payload": payload,
     }
@@ -37,6 +46,133 @@ def _selected_payload(entry_id: str) -> dict:
     }
 
 
+def _signed_exit_receipt(
+    entry_id: str,
+    *,
+    shortfall_quote: float = 0.0,
+    quantity: float = 1.0,
+    fee_quote: float = 0.0,
+) -> dict:
+    sealed = seal_execution_benchmark_receipt(
+        {
+            "source": "local_l2_vwap",
+            "position_id": entry_id,
+            "symbol": "BTCUSDT",
+            "captured_at_ms": 1_000,
+            "max_observation_to_submit_ms": 1_000,
+            "requested_base_quantity": quantity,
+            "long": {
+                "venue": "cheap",
+                "side": "sell",
+                "vwap_price": 20.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+                "filled_base_quantity": quantity,
+                "implementation_shortfall_quote": 0.0,
+                "fills": [
+                    {
+                        "order_id": "long-close",
+                        "client_order_id": "long-close-client",
+                        "submitted_at_ms": 1_000,
+                        "filled_at_ms": 1_001,
+                        "quantity": quantity,
+                        "price": 20.0,
+                        "fee_quote": fee_quote,
+                    }
+                ],
+            },
+            "short": {
+                "venue": "rich",
+                "side": "buy",
+                "vwap_price": 20.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+                "filled_base_quantity": quantity,
+                "implementation_shortfall_quote": 0.0,
+                "fills": [
+                    {
+                        "order_id": "short-close",
+                        "client_order_id": "short-close-client",
+                        "submitted_at_ms": 1_000,
+                        "filled_at_ms": 1_001,
+                        "quantity": quantity,
+                        "price": 20.0,
+                        "fee_quote": fee_quote,
+                    }
+                ],
+            },
+            "implementation_shortfall_quote": shortfall_quote,
+        }
+    )
+    assert sealed is not None
+    return sealed
+
+
+def _signed_entry_receipt(
+    entry_id: str,
+    *,
+    shortfall_quote: float = 0.0,
+    fee_quote: float = 0.0,
+) -> dict:
+    sealed = seal_execution_benchmark_receipt(
+        {
+            "source": "local_l2_vwap",
+            "position_id": entry_id,
+            "symbol": "BTCUSDT",
+            "captured_at_ms": 1_000,
+            "max_observation_to_submit_ms": 1_000,
+            "requested_base_quantity": 1.0,
+            "long": {
+                "venue": "cheap",
+                "side": "buy",
+                "vwap_price": 20.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+                "filled_base_quantity": 1.0,
+                "implementation_shortfall_quote": 0.0,
+                "fills": [
+                    {
+                        "order_id": "long-entry",
+                        "client_order_id": "long-entry-client",
+                        "submitted_at_ms": 1_000,
+                        "filled_at_ms": 1_001,
+                        "quantity": 1.0,
+                        "price": 20.0,
+                        "fee_quote": fee_quote,
+                    }
+                ],
+            },
+            "short": {
+                "venue": "rich",
+                "side": "sell",
+                "vwap_price": 20.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+                "filled_base_quantity": 1.0,
+                "implementation_shortfall_quote": 0.0,
+                "fills": [
+                    {
+                        "order_id": "short-entry",
+                        "client_order_id": "short-entry-client",
+                        "submitted_at_ms": 1_000,
+                        "filled_at_ms": 1_001,
+                        "quantity": 1.0,
+                        "price": 20.0,
+                        "fee_quote": fee_quote,
+                    }
+                ],
+            },
+            "implementation_shortfall_quote": shortfall_quote,
+        }
+    )
+    assert sealed is not None
+    return sealed
+
+
 def _complete_loop(entry_id: str, *, cost_bps: float = 3.0, truth: bool = True) -> list[dict]:
     # The maximum per-leg notional is 20 quote, so a fee quote of cost/500
     # produces exactly ``cost_bps`` after bps conversion.
@@ -60,12 +196,23 @@ def _complete_loop(entry_id: str, *, cost_bps: float = 3.0, truth: bool = True) 
             "exit.closed",
             {
                 "position_id": entry_id,
+                "symbol": "BTCUSDT",
+                "long_venue": "cheap",
+                "short_venue": "rich",
+                "closed_at_ms": 3_000,
+                "execution_completed_at_ms": 3_000,
                 "entry_fee_quote": fee_quote,
                 "exit_fee_quote": 0.0,
                 # Explicit independent shortfall benchmark result; price PnL
                 # below must not be repurposed as an execution-cost proxy.
                 "implementation_shortfall_quote": 0.0,
                 "execution_benchmark_complete": True,
+                "execution_fee_complete": True,
+                "entry_execution_benchmark_receipt": _signed_entry_receipt(
+                    entry_id,
+                    fee_quote=fee_quote / 2.0,
+                ),
+                "exit_execution_benchmark_receipts": [_signed_exit_receipt(entry_id)],
                 "price_pnl_quote": 0.0,
             },
         ),
@@ -75,11 +222,21 @@ def _complete_loop(entry_id: str, *, cost_bps: float = 3.0, truth: bool = True) 
             "runtime.position_lifecycle_terminal",
             {
                 "position_id": entry_id,
+                "symbol": "BTCUSDT",
+                "long_venue": "cheap",
+                "short_venue": "rich",
+                "exchange_truth_captured_at_ms": 4_000,
+                "exchange_truth_scope": {
+                    "position_id": entry_id,
+                    "symbol": "BTCUSDT",
+                    "venues": ["cheap", "rich"],
+                },
                 "exchange_truth": {
                     "truth_available": truth,
                     "positions_flat": truth,
                     "open_orders_flat": truth,
                 },
+                "terminal_reason": "post_close_exchange_truth_for_funding_reconciliation",
             },
         ),
         _event(
@@ -89,6 +246,7 @@ def _complete_loop(entry_id: str, *, cost_bps: float = 3.0, truth: bool = True) 
             {
                 "position_id": entry_id,
                 "symbol": "BTCUSDT",
+                "reconciled_at_ms": 5_000,
                 "required_settlement_count": 1,
                 "observed_settlement_count": 1,
                 "official_pnl": True,
@@ -178,6 +336,166 @@ def test_canary_rejects_zero_shortfall_without_complete_execution_benchmark() ->
     assert report.missing_actual_cost_count == 1
 
 
+def test_canary_rejects_tampered_or_missing_signed_execution_receipt() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    terminal["payload"]["exit_execution_benchmark_receipts"][0][
+        "implementation_shortfall_quote"
+    ] = 1.0
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_signed_entry_receipt_with_false_shortfall_aggregate() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    receipt = terminal["payload"]["entry_execution_benchmark_receipt"]
+    receipt["long"]["fills"][0]["price"] = 21.0
+    resealed = seal_execution_benchmark_receipt(receipt)
+    assert resealed is not None
+    terminal["payload"]["entry_execution_benchmark_receipt"] = resealed
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.complete_loop_count == 29
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_signed_receipt_with_stale_l2_observation() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    receipt = terminal["payload"]["exit_execution_benchmark_receipts"][0]
+    receipt["long"]["fills"][0]["submitted_at_ms"] = 2_000
+    receipt["long"]["fills"][0]["filled_at_ms"] = 2_001
+    resealed = seal_execution_benchmark_receipt(receipt)
+    assert resealed is not None
+    terminal["payload"]["exit_execution_benchmark_receipts"] = [resealed]
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_signed_receipt_set_that_does_not_cover_opened_quantity() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    entry_id = terminal["payload"]["position_id"]
+    # The receipt is authentic and internally self-consistent, but only covers
+    # half the base quantity actually opened.  It must not turn the uncovered
+    # close into a zero-cost canary observation.
+    terminal["payload"]["exit_execution_benchmark_receipts"] = [
+        _signed_exit_receipt(entry_id, quantity=0.5)
+    ]
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.complete_loop_count == 29
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_entry_receipt_that_does_not_match_opened_quantity() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    opened = next(event for event in records if event["kind"] == "entry.opened")
+    opened["payload"]["matched_quantity"] = 0.5
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.complete_loop_count == 29
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_fee_total_not_backed_by_signed_fill_observations() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    terminal["payload"]["entry_fee_quote"] = 0.25
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.complete_loop_count == 29
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_signed_benchmark_without_per_fill_fee_observation() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    receipt = terminal["payload"]["exit_execution_benchmark_receipts"][0]
+    del receipt["long"]["fills"][0]["fee_quote"]
+    resealed = seal_execution_benchmark_receipt(receipt)
+    assert resealed is not None
+    terminal["payload"]["exit_execution_benchmark_receipts"] = [resealed]
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.complete_loop_count == 29
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_unknown_execution_fee_as_zero_cost() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    terminal = next(event for event in records if event["kind"] == "exit.closed")
+    terminal["payload"]["execution_fee_complete"] = False
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.missing_actual_cost_count == 1
+
+
+def test_canary_rejects_truth_captured_before_exit_or_after_reconciliation() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    exit_closed = next(
+        event
+        for event in records
+        if event["kind"] == "exit.closed"
+        and event["payload"]["position_id"] == "entry-0"
+    )
+    early_truth = next(
+        event
+        for event in records
+        if event["kind"] == "runtime.position_lifecycle_terminal"
+        and event["payload"]["position_id"] == "entry-0"
+    )
+    settlement = next(
+        event
+        for event in records
+        if event["kind"] == "funding.settlement_reconciled"
+        and event["payload"]["position_id"] == "entry-0"
+    )
+    exit_closed["seq"] = 5
+    early_truth["seq"] = 4
+    settlement["seq"] = 6
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.missing_terminal_truth_count == 1
+
+
+def test_canary_rejects_duplicate_or_unscoped_terminal_truth_receipt() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    duplicate = next(
+        event
+        for event in records
+        if event["kind"] == "runtime.position_lifecycle_terminal"
+        and event["payload"]["position_id"] == "entry-0"
+    )
+    duplicate = {
+        **duplicate,
+        "seq": 6,
+        "payload": dict(duplicate["payload"]),
+    }
+    records.append(duplicate)
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.missing_terminal_truth_count == 1
+
+
 def test_canary_requires_account_identity_binding_in_selected_evidence() -> None:
     records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
     next(
@@ -216,6 +534,12 @@ def test_canary_rejects_cost_above_immutable_budget_and_reserve() -> None:
     records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
     terminal = next(event for event in records if event["kind"] == "exit.closed")
     terminal["payload"]["entry_fee_quote"] = 6.0 / 500.0
+    receipt = terminal["payload"]["entry_execution_benchmark_receipt"]
+    for leg_name in ("long", "short"):
+        receipt[leg_name]["fills"][0]["fee_quote"] = 3.0 / 500.0
+    resealed = seal_execution_benchmark_receipt(receipt)
+    assert resealed is not None
+    terminal["payload"]["entry_execution_benchmark_receipt"] = resealed
 
     report = analyze_funding_canary_events(records, source_evidence_verified=True)
 
@@ -242,6 +566,117 @@ def test_canary_rejects_duplicate_or_unsequenced_lifecycle_evidence() -> None:
     assert report.missing_event_sequence_count == 1
     assert "acceptance_event_ambiguity" in report.promotion_blockers
     assert "acceptance_event_sequence_missing" in report.promotion_blockers
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "sequence"),
+    [
+        ("execution.entry_selected", 6),
+        ("entry.opened", 6),
+    ],
+)
+def test_canary_rejects_lifecycle_event_after_close(
+    event_kind: str,
+    sequence: int,
+) -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    event = next(item for item in records if item["kind"] == event_kind)
+    event["seq"] = sequence
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.complete_loop_count == 29
+    assert report.invalid_lifecycle_evidence_count == 1
+    assert "canary_lifecycle_evidence_not_ordered_and_scoped" in report.promotion_blockers
+
+
+def test_canary_requires_dedicated_post_close_truth_reason() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    truth = next(
+        item
+        for item in records
+        if item["kind"] == "runtime.position_lifecycle_terminal"
+    )
+    truth["payload"]["terminal_reason"] = "recovery_flat"
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.complete_loop_count == 29
+    assert report.invalid_lifecycle_evidence_count == 1
+    assert "canary_lifecycle_evidence_not_ordered_and_scoped" in report.promotion_blockers
+
+
+def test_canary_requires_truth_capture_between_close_and_reconciliation() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    truth = next(
+        item
+        for item in records
+        if item["kind"] == "runtime.position_lifecycle_terminal"
+    )
+    truth["payload"]["exchange_truth_captured_at_ms"] = 1
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.complete_loop_count == 29
+    assert report.invalid_lifecycle_evidence_count == 1
+
+
+def test_canary_rejects_malformed_relevant_event_instead_of_skipping_it() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    records.append(
+        {
+            "run_id": "run-entry-0",
+            "seq": 6,
+            "ts_ms": 6_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": "corrupted",
+        }
+    )
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.complete_loop_count == 30
+    assert report.malformed_relevant_event_count == 1
+    assert "acceptance_relevant_event_malformed" in report.promotion_blockers
+
+
+def test_canary_binds_optional_finalized_marker_between_open_and_close() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    first_loop = [item for item in records if item["run_id"] == "run-entry-0"]
+    for event in first_loop:
+        if event["kind"] == "exit.closed":
+            event["seq"] = 4
+        elif event["kind"] == "runtime.position_lifecycle_terminal":
+            event["seq"] = 5
+        elif event["kind"] == "funding.settlement_reconciled":
+            event["seq"] = 6
+    records.append(
+        _event(
+            "entry-0",
+            3,
+            "pending_entry.pending_entry_finalized",
+            {"entry_id": "entry-0", "position_id": "entry-0"},
+        )
+    )
+
+    valid = analyze_funding_canary_events(records, source_evidence_verified=True)
+    assert valid.promotion_ready is True
+
+    finalized = next(
+        item
+        for item in records
+        if item["kind"] == "pending_entry.pending_entry_finalized"
+    )
+    finalized["seq"] = 7
+    invalid = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert invalid.promotion_ready is False
+    assert invalid.complete_loop_count == 29
+    assert invalid.invalid_lifecycle_evidence_count == 1
 
 
 def test_canary_rejects_mixed_cohort_and_order_independent_replay() -> None:

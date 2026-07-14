@@ -12080,26 +12080,46 @@ class LiveRuntime:
         if book is None:
             payload["freshness"] = "missing"
             return False, "missing_bbo", payload
+        # A post-only reprice/submit permission is execution evidence, not a
+        # diagnostic BBO read.  Route it through the same HOT/fresh/whole-book
+        # gate as every other local-L2 execution consumer.
+        from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
-        try:
-            best_bid = float(book.best_bid())
-            best_ask = float(book.best_ask())
-        except Exception:
-            best_bid = 0.0
-            best_ask = 0.0
-        try:
-            age_ms = int(book.age_ms(now_ms))
-        except Exception:
-            observed = int(getattr(book, "observed_at_ms", 0) or 0)
-            age_ms = now_ms - observed if observed > 0 else 0
+        snapshot = execution_liquidity_from_local_l2(
+            book,
+            max_depth=1,
+            max_age_ms=stale_after_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        observed = int(getattr(book, "observed_at_ms", 0) or 0)
+        age_ms = max(now_ms - observed, 0) if observed > 0 else 0
+        status = getattr(
+            getattr(book, "status", None),
+            "value",
+            str(getattr(book, "status", "")),
+        )
+        lifecycle_or_freshness_failed = (
+            status != "hot"
+            or observed <= 0
+            or observed > now_ms
+            or age_ms > stale_after_ms
+        )
+        if not snapshot.book_ready:
+            payload.update(
+                {
+                    "book_age_ms": age_ms,
+                    "observed_at_ms": observed,
+                    "freshness": (
+                        "stale" if lifecycle_or_freshness_failed else "invalid_bbo"
+                    ),
+                }
+            )
+            return False, "stale_bbo" if lifecycle_or_freshness_failed else "invalid_bbo", payload
 
-        status = getattr(getattr(book, "status", None), "value", str(getattr(book, "status", "")))
-        try:
-            stale = bool(book.is_stale(stale_after_ms, now_ms))
-        except Exception:
-            stale = age_ms > stale_after_ms
-        fresh = status == "hot" and not stale
-        valid_bbo = best_bid > 0.0 and best_ask > best_bid
+        best_bid = snapshot.bids[0].price
+        best_ask = snapshot.asks[0].price
+        valid_bbo = True
         would_cross = (
             valid_bbo
             and price > 0.0
@@ -12114,15 +12134,10 @@ class LiveRuntime:
                 "best_bid": best_bid,
                 "best_ask": best_ask,
                 "book_age_ms": age_ms,
-                "freshness": "fresh" if fresh else "stale",
+                "freshness": "fresh",
                 "would_cross": would_cross,
             }
         )
-        if not valid_bbo:
-            payload["freshness"] = "invalid_bbo"
-            return False, "invalid_bbo", payload
-        if not fresh:
-            return False, "stale_bbo", payload
         if would_cross:
             return False, "would_cross_bbo", payload
         return True, "", payload

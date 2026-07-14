@@ -31,7 +31,7 @@ def test_spread_paper_analysis_script_emits_strict_json_report(tmp_path: Path) -
                     "paper_funding_quote": 0.0,
                     "model_epoch": "v2_signed_reversion",
                     "calculation_version": "spread_paper_v3",
-                    "journal_schema_version": 6,
+                        "journal_schema_version": 8,
                     "official_pnl": True,
                     "paper_unpriced": False,
                     "paper_order_status": "FILLED",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import binascii
 
+import pytest
+
 from lightfee.marketdata.l2 import (
     L2BookStatus,
     LocalL2Update,
@@ -11,8 +13,6 @@ from lightfee.marketdata.l2 import (
 from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
 from lightfee.marketdata.local_l2_runtime import LocalL2Runtime
 from lightfee.marketdata.local_l2_ws import (
-    BinanceL2WsClient,
-    BitgetL2WsClient,
     BybitL2WsClient,
     GateL2WsClient,
     HyperliquidL2WsClient,
@@ -248,6 +248,64 @@ def test_okx_checksum_uses_raw_wire_strings_not_float_normalization(tmp_path):
         assert result.applied is True
         assert result.rebuild_required is False
         assert runtime.get_book("okx", "BTCUSDT").status != L2BookStatus.REBUILDING
+    finally:
+        journal.close()
+
+
+def test_raw_checksum_nonfinite_wire_value_rebuilds_before_execution_book_apply(tmp_path):
+    _dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        result = runtime.record_update_result(
+            LocalL2Update(
+                venue="okx",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[PriceLevel(101.0, 1.0)],
+                raw_bids=[("100.0", "1.0")],
+                raw_asks=[("nan", "1.0")],
+                sequence=10,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=1,
+        )
+
+        book = runtime.get_book("okx", "BTCUSDT")
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert result.fault_reason == "invalid_raw_checksum_level"
+        assert book is not None
+        assert book.fault_reason == "data_integrity: invalid_raw_checksum_level"
+        assert runtime.metrics.data_integrity_rebuild_total == 1
+        assert book.bids == []
+        assert book.asks == []
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize("quantity", ["-1.0", "0.0"])
+def test_raw_checksum_snapshot_nonpositive_quantity_rebuilds_before_execution_book_apply(
+    tmp_path,
+    quantity: str,
+):
+    _dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        result = runtime.record_update_result(
+            LocalL2Update(
+                venue="okx",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[PriceLevel(101.0, 1.0)],
+                raw_bids=[("100.0", quantity)],
+                raw_asks=[("101.0", "1.0")],
+                sequence=10,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=1,
+        )
+
+        assert result.applied is False
+        assert result.rebuild_required is True
+        assert runtime.metrics.data_integrity_rebuild_total == 1
     finally:
         journal.close()
 

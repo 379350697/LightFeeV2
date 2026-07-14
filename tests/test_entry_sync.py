@@ -469,6 +469,77 @@ class TestEntrySyncDualTakerSuccess:
         assert result.residual_task is None
 
     @pytest.mark.asyncio
+    async def test_exact_dual_fills_finalize_raw_entry_benchmark(
+        self, adapters, journal, btc_context, monkeypatch
+    ):
+        from lightfee.engine.exit import TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV
+
+        now_ms = 1_700_000_000_000
+        monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "entry-sync-secret")
+        monkeypatch.setattr(
+            "lightfee.engine.entry_sync.time.time", lambda: now_ms / 1000.0
+        )
+        btc_context.entry_execution_benchmark_receipt = {
+            "source": "local_l2_vwap",
+            "position_id": btc_context.entry_id,
+            "symbol": btc_context.symbol,
+            "captured_at_ms": now_ms,
+            "max_observation_to_submit_ms": 1_000,
+            "requested_base_quantity": btc_context.long_quantity,
+            "long": {
+                "venue": "binance",
+                "side": "buy",
+                "vwap_price": 49_999.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": now_ms,
+                "age_ms": 0,
+            },
+            "short": {
+                "venue": "okx",
+                "side": "sell",
+                "vwap_price": 49_991.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": now_ms,
+                "age_ms": 0,
+            },
+        }
+        adapters[Venue.BINANCE].place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                50_000.0,
+                "m-benchmark",
+                fee_quote=1.0,
+                filled_at_ms=now_ms,
+            )
+        ]
+        adapters[Venue.OKX].place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.SELL,
+                0.01,
+                49_990.0,
+                "h-benchmark",
+                fee_quote=1.0,
+                filled_at_ms=now_ms,
+            )
+        ]
+
+        result = await EntrySyncExecutor(adapters=adapters, journal=journal).execute(
+            btc_context
+        )
+
+        assert result.open_position is not None
+        assert result.open_position.execution_benchmark_complete is True
+        assert result.open_position.entry_execution_benchmark_receipt is not None
+        assert result.open_position.entry_implementation_shortfall_quote == pytest.approx(
+            0.02
+        )
+
+    @pytest.mark.asyncio
     async def test_journal_entries_on_completion(self, adapters, journal, btc_context):
         binance_ada = adapters[Venue.BINANCE]
         okx_ada = adapters[Venue.OKX]

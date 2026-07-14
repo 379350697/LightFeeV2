@@ -16,6 +16,7 @@ import pytest
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from lightfee.core.domain import (
     OrderFill,
@@ -31,7 +32,7 @@ from lightfee.core.domain import (
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.close_executor import (
-    CloseBalance,
+    CloseExecutor,
     CloseExecutionLeg,
     close_balance_from_closed_quantities,
     close_leg_exchange_min_notional_violation,
@@ -39,10 +40,14 @@ from lightfee.engine.close_executor import (
     build_close_execution_from_legs,
     split_close_fill_residual,
     build_exit_pnl_attribution,
+    compute_close_chunks,
 )
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
-from lightfee.engine.exit import CloseExecution
+from lightfee.engine.exit import (
+    CloseExecution,
+    TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV,
+)
 from lightfee.engine.pending_entry_runtime import PendingEntryRuntime
 from lightfee.engine.residual import ResidualOrigin
 from lightfee.engine.state import CloseLegRecord, EngineState, OpenPosition, PendingClose
@@ -1439,9 +1444,6 @@ class TestClosePnlAttribution:
 # ---------------------------------------------------------------------------
 
 
-from lightfee.engine.close_executor import compute_close_chunks
-
-
 class TestComputeCloseChunks:
     """Test close chunk planning: splitting large positions by notional cap."""
 
@@ -1636,6 +1638,8 @@ class TestCloseChunkExecutor:
             journal=journal,
             config_overrides={
                 "close_chunk_max_notional_quote": 5000.0,  # low cap to force chunks
+                # This test verifies aggregation, not wall-clock pacing.
+                "close_chunk_min_interval_ms": 0,
             },
         )
 
@@ -1673,7 +1677,10 @@ class TestCloseChunkExecutor:
         executor = CloseExecutor(
             adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
             journal=journal,
-            config_overrides={"close_chunk_max_notional_quote": 1000.0},
+            config_overrides={
+                "close_chunk_max_notional_quote": 1000.0,
+                "close_chunk_min_interval_ms": 0,
+            },
         )
 
         # 0.5 BTC * $50000 = $25000, cap $1000 → ~25 chunks
@@ -1735,6 +1742,7 @@ class TestCloseChunkExecutor:
             journal=journal,
             config_overrides={
                 "close_chunk_max_notional_quote": 5000.0,
+                "close_chunk_min_interval_ms": 0,
                 "max_close_retries": 1,  # don't retry on uncertain — register immediately
             },
         )
@@ -2494,9 +2502,15 @@ class TestCloseChunkExecutor:
 class FakeVenueAdapter:
     """Minimal inline fake for chunking tests."""
 
-    def __init__(self, venue: Venue, default_fill_price: float = 50000.0):
+    def __init__(
+        self,
+        venue: Venue,
+        default_fill_price: float = 50000.0,
+        filled_at_ms: int = 1_000,
+    ):
         self._venue = venue
         self.default_fill_price = default_fill_price
+        self.filled_at_ms = filled_at_ms
         self.place_order_outcomes: list = []
         self.last_request = None
         self.place_order_call_count = 0
@@ -2524,7 +2538,7 @@ class FakeVenueAdapter:
             quantity=request.quantity,
             price=price,
             order_id=f"fake-{self._venue.value}-{self.place_order_call_count}",
-            filled_at_ms=1000,
+            filled_at_ms=self.filled_at_ms,
         )
 
     async def fetch_position(self, symbol: str):
@@ -2546,6 +2560,400 @@ class FakeVenueAdapter:
     async def cancel_order(self, request):
         self.last_request = request
         return None
+
+
+@pytest.mark.asyncio
+async def test_aggressive_close_persists_side_aware_execution_benchmark_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "test-benchmark-secret")
+    monkeypatch.setattr("lightfee.engine.close_executor.wall_clock_now_ms", lambda: 1_000)
+    journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+    journal.open()
+    position = _make_position(
+        execution_benchmark_complete=True,
+        entry_benchmark_long_price=50_000.0,
+        entry_benchmark_short_price=50_000.0,
+    )
+    state = EngineState(open_positions={position.position_id: position})
+    executor = CloseExecutor(
+        adapters={
+            Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE, default_fill_price=50_000.0),
+            Venue.OKX: FakeVenueAdapter(Venue.OKX, default_fill_price=50_000.0),
+        },
+        journal=journal,
+    )
+    receipt = {
+        "schema_version": 1,
+        "source": "local_l2_vwap",
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "captured_at_ms": 1_000,
+        "requested_base_quantity": position.matched_quantity,
+        "long": {
+            "venue": Venue.BINANCE.value,
+            "side": "sell",
+            "vwap_price": 49_900.0,
+            "available_base_quantity": 0.02,
+            "observed_at_ms": 995,
+            "age_ms": 5,
+        },
+        "short": {
+            "venue": Venue.OKX.value,
+            "side": "buy",
+            "vwap_price": 50_100.0,
+            "available_base_quantity": 0.02,
+            "observed_at_ms": 995,
+            "age_ms": 5,
+        },
+    }
+    expected_quantity = position.matched_quantity
+
+    close = await executor.execute_close(
+        position,
+        "risk_delever",
+        now_ms=1_000,
+        long_price_hint=50_000.0,
+        short_price_hint=50_000.0,
+        state=state,
+        execution_benchmark_receipt=receipt,
+    )
+
+    assert close is not None
+    assert close.implementation_shortfall_quote == pytest.approx(0.0)
+    assert close.execution_benchmark_receipt is not None
+    assert close.execution_benchmark_receipt["receipt_digest"]
+    assert close.execution_benchmark_receipt["implementation_shortfall_quote"] == pytest.approx(0.0)
+    long_fill = close.execution_benchmark_receipt["long"]["fills"][0]
+    short_fill = close.execution_benchmark_receipt["short"]["fills"][0]
+    assert long_fill["order_id"] == "fake-binance-1"
+    assert short_fill["order_id"] == "fake-okx-1"
+    assert long_fill["filled_at_ms"] == short_fill["filled_at_ms"] == 1_000
+    assert long_fill["quantity"] == short_fill["quantity"] == expected_quantity
+    assert long_fill["price"] == short_fill["price"] == 50_000.0
+    assert position.exit_execution_benchmark_receipts == [
+        close.execution_benchmark_receipt
+    ]
+    terminal = [
+        event for event in journal.read_all() if event["kind"] == "exit.closed"
+    ]
+    assert terminal[-1]["payload"]["exit_execution_benchmark_receipts"] == [
+        close.execution_benchmark_receipt
+    ]
+    assert terminal[-1]["payload"]["closed_at_ms"] == 1_000
+    journal.close()
+
+
+@pytest.mark.asyncio
+async def test_chunked_close_captures_and_seals_one_benchmark_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Later chunks must never inherit the first chunk's book observation."""
+    monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "test-benchmark-secret")
+    timestamps = iter((1_000, 1_001, 1_002, 1_003, 1_004, 1_005))
+    monkeypatch.setattr(
+        "lightfee.engine.close_executor.wall_clock_now_ms", lambda: next(timestamps)
+    )
+    journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+    journal.open()
+    position = _make_position(
+        long_quantity=0.04,
+        short_quantity=0.04,
+        matched_quantity=0.04,
+        execution_benchmark_complete=True,
+    )
+    state = EngineState(open_positions={position.position_id: position})
+    executor = CloseExecutor(
+        adapters={
+            Venue.BINANCE: FakeVenueAdapter(
+                Venue.BINANCE, default_fill_price=50_000.0, filled_at_ms=2_000
+            ),
+            Venue.OKX: FakeVenueAdapter(
+                Venue.OKX, default_fill_price=50_000.0, filled_at_ms=2_000
+            ),
+        },
+        journal=journal,
+        config_overrides={
+            "close_chunk_max_notional_quote": 1_000.0,
+            "close_chunk_min_interval_ms": 0,
+        },
+    )
+    captures: list[tuple[float, int]] = []
+
+    def capture(quantity: float, captured_at_ms: int) -> dict[str, object]:
+        captures.append((quantity, captured_at_ms))
+        return {
+            "schema_version": 1,
+            "source": "local_l2_vwap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "captured_at_ms": captured_at_ms,
+            "requested_base_quantity": quantity,
+            "long": {
+                "venue": Venue.BINANCE.value,
+                "side": "sell",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+            "short": {
+                "venue": Venue.OKX.value,
+                "side": "buy",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+        }
+
+    close = await executor.execute_close(
+        position,
+        "risk_delever",
+        now_ms=1_000,
+        long_price_hint=50_000.0,
+        short_price_hint=50_000.0,
+        state=state,
+        execution_benchmark_capture=capture,
+    )
+
+    assert close is not None
+    assert len(captures) == 2
+    assert [quantity for quantity, _ in captures] == pytest.approx([0.02, 0.02])
+    assert [captured_at_ms for _, captured_at_ms in captures] == [1_000, 1_003]
+    assert len(close.execution_benchmark_receipts) == 2
+    assert close.execution_benchmark_receipt is None
+    assert close.implementation_shortfall_quote == pytest.approx(0.0)
+    assert [
+        receipt["requested_base_quantity"]
+        for receipt in close.execution_benchmark_receipts
+    ] == pytest.approx([0.02, 0.02])
+    assert [
+        receipt["short"]["fills"][0]["submitted_at_ms"]  # type: ignore[index]
+        for receipt in close.execution_benchmark_receipts
+    ] == [1_001, 1_004]
+    assert [
+        receipt["long"]["fills"][0]["submitted_at_ms"]  # type: ignore[index]
+        for receipt in close.execution_benchmark_receipts
+    ] == [1_002, 1_005]
+    for receipt in close.execution_benchmark_receipts:
+        assert receipt["schema_version"] == 3
+        assert receipt["max_observation_to_submit_ms"] == 1_000
+        assert receipt["integrity"]["algorithm"] == "hmac-sha256"  # type: ignore[index]
+        assert receipt["short"]["fills"][0]["filled_at_ms"] == 2_000  # type: ignore[index]
+    assert position.exit_execution_benchmark_receipts == close.execution_benchmark_receipts
+    journal.close()
+
+
+@pytest.mark.asyncio
+async def test_execution_receipt_uses_successful_retry_submit_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A retry receipt must not attribute its fill to the first attempt."""
+    monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "test-benchmark-secret")
+    timestamps = iter((1_000, 1_001, 1_002, 1_003))
+    monkeypatch.setattr(
+        "lightfee.engine.close_executor.wall_clock_now_ms", lambda: next(timestamps)
+    )
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("lightfee.engine.close_executor.asyncio.sleep", no_sleep)
+    journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+    journal.open()
+    position = _make_position(execution_benchmark_complete=True)
+    state = EngineState(open_positions={position.position_id: position})
+    short_adapter = FakeVenueAdapter(
+        Venue.OKX, default_fill_price=50_000.0, filled_at_ms=2_000
+    )
+    short_adapter.place_order_outcomes = [_make_uncertain_error("timeout")]
+    executor = CloseExecutor(
+        adapters={
+            Venue.BINANCE: FakeVenueAdapter(
+                Venue.BINANCE, default_fill_price=50_000.0, filled_at_ms=2_000
+            ),
+            Venue.OKX: short_adapter,
+        },
+        journal=journal,
+        config_overrides={"max_close_retries": 2},
+    )
+
+    def capture(quantity: float, captured_at_ms: int) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "source": "local_l2_vwap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "captured_at_ms": captured_at_ms,
+            "requested_base_quantity": quantity,
+            "long": {
+                "venue": Venue.BINANCE.value,
+                "side": "sell",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+            "short": {
+                "venue": Venue.OKX.value,
+                "side": "buy",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+        }
+
+    close = await executor.execute_close(
+        position,
+        "risk_delever",
+        now_ms=1_000,
+        long_price_hint=50_000.0,
+        short_price_hint=50_000.0,
+        state=state,
+        execution_benchmark_capture=capture,
+    )
+
+    assert close is not None
+    assert short_adapter.place_order_call_count == 2
+    assert close.execution_benchmark_receipt is not None
+    assert close.execution_benchmark_receipt["short"]["fills"][0][  # type: ignore[index]
+        "submitted_at_ms"
+    ] == 1_002
+    assert close.execution_benchmark_receipt["long"]["fills"][0][  # type: ignore[index]
+        "submitted_at_ms"
+    ] == 1_003
+    journal.close()
+
+
+@pytest.mark.asyncio
+async def test_delayed_retry_close_is_not_accepted_as_fresh_l2_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A normal V1 retry may finish, but stale L2 must not become a receipt."""
+    monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "test-benchmark-secret")
+    # The first short attempt is uncertain; the successful retry is 1,002 ms
+    # after the captured book, beyond the sealed 1,000 ms acceptance bound.
+    timestamps = iter((1_000, 1_001, 2_002, 2_003))
+    monkeypatch.setattr(
+        "lightfee.engine.close_executor.wall_clock_now_ms", lambda: next(timestamps)
+    )
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("lightfee.engine.close_executor.asyncio.sleep", no_sleep)
+    journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+    journal.open()
+    position = _make_position(execution_benchmark_complete=True)
+    state = EngineState(open_positions={position.position_id: position})
+    short_adapter = FakeVenueAdapter(
+        Venue.OKX, default_fill_price=50_000.0, filled_at_ms=3_000
+    )
+    short_adapter.place_order_outcomes = [_make_uncertain_error("timeout")]
+    executor = CloseExecutor(
+        adapters={
+            Venue.BINANCE: FakeVenueAdapter(
+                Venue.BINANCE, default_fill_price=50_000.0, filled_at_ms=3_000
+            ),
+            Venue.OKX: short_adapter,
+        },
+        journal=journal,
+        config_overrides={"max_close_retries": 2},
+    )
+
+    def capture(quantity: float, captured_at_ms: int) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "source": "local_l2_vwap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "captured_at_ms": captured_at_ms,
+            "requested_base_quantity": quantity,
+            "long": {
+                "venue": Venue.BINANCE.value,
+                "side": "sell",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+            "short": {
+                "venue": Venue.OKX.value,
+                "side": "buy",
+                "vwap_price": 50_000.0,
+                "available_base_quantity": quantity,
+                "observed_at_ms": captured_at_ms,
+                "age_ms": 0,
+            },
+        }
+
+    close = await executor.execute_close(
+        position,
+        "risk_delever",
+        now_ms=1_000,
+        long_price_hint=50_000.0,
+        short_price_hint=50_000.0,
+        state=state,
+        execution_benchmark_capture=capture,
+    )
+
+    assert close is not None
+    assert short_adapter.place_order_call_count == 2
+    assert close.execution_benchmark_receipt is None
+    assert position.execution_benchmark_complete is False
+    journal.close()
+
+
+def test_close_runtime_captures_bid_for_long_sell_and_ask_for_short_buy():
+    from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
+
+    position = _make_position()
+    runtime = object.__new__(CloseRuntime)
+    journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+    journal.open()
+    books = {
+        Venue.BINANCE.value: LocalL2Book(
+            venue=Venue.BINANCE.value,
+            symbol=position.symbol,
+            bids=[PriceLevel(price=49_900.0, quantity=0.005), PriceLevel(price=49_800.0, quantity=0.01)],
+            asks=[PriceLevel(price=50_100.0, quantity=1.0)],
+            status=L2BookStatus.HOT,
+            observed_at_ms=995,
+        ),
+        Venue.OKX.value: LocalL2Book(
+            venue=Venue.OKX.value,
+            symbol=position.symbol,
+            bids=[PriceLevel(price=49_700.0, quantity=1.0)],
+            asks=[PriceLevel(price=50_100.0, quantity=0.005), PriceLevel(price=50_200.0, quantity=0.01)],
+            status=L2BookStatus.HOT,
+            observed_at_ms=995,
+        ),
+    }
+    runtime.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=SimpleNamespace(max_liquidity_snapshot_age_ms=100)
+        ),
+        local_l2_runtime=SimpleNamespace(
+            get_book=lambda venue, _symbol: books[venue]
+        ),
+        journal=journal,
+    )
+    runtime._entry_readiness_provider_uses_local_l2 = lambda: True
+
+    receipt = runtime._capture_local_l2_close_execution_benchmark(
+        position,
+        now_ms=1_000,
+    )
+
+    assert receipt is not None
+    assert receipt["long"]["side"] == "sell"
+    assert receipt["long"]["vwap_price"] == pytest.approx(49_850.0)
+    assert receipt["short"]["side"] == "buy"
+    assert receipt["short"]["vwap_price"] == pytest.approx(50_150.0)
+    assert receipt["long"]["age_ms"] == receipt["short"]["age_ms"] == 5
+    journal.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2601,7 +3009,7 @@ class TestCompensateFailedFullClose:
     @pytest.mark.asyncio
     async def test_compensate_flat_position_noop(self):
         """When exchange position is flat, compensation is a no-op."""
-        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.close_executor import CloseExecutor
         from lightfee.engine.state import EngineState
 
         short_adapter = FakeCompensationAdapter(
@@ -2642,7 +3050,7 @@ class TestCompensateFailedFullClose:
     @pytest.mark.asyncio
     async def test_compensate_flattens_residual(self):
         """When exchange has residual position, compensation flattens it."""
-        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.close_executor import CloseExecutor
         from lightfee.engine.state import EngineState
 
         # Short venue has 0.01 residual (SELL side = short → cleanup BUY)
@@ -2766,7 +3174,7 @@ class TestCompensateFailedFullClose:
     @pytest.mark.asyncio
     async def test_compensate_flatten_fails_hard_stop_succeeds(self):
         """Tier 1 flatten fails → Tier 2 hard stop succeeds."""
-        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.close_executor import CloseExecutor
         from lightfee.engine.state import EngineState
 
         # Short adapter: place_order fails first 3 times (max retries), then re-fetch still shows position
@@ -2868,7 +3276,7 @@ class TestCompensateFailedFullClose:
         flat after compensation attempts, treat as success — do NOT enter
         FAIL_CLOSED.
         """
-        from lightfee.engine.close_executor import CloseExecutor, CompensationFailedError
+        from lightfee.engine.close_executor import CloseExecutor
         from lightfee.engine.state import EngineState
         from lightfee.risk.modes import GlobalRiskMode
 
@@ -2976,4 +3384,3 @@ class _RetryThenSucceedAdapter:
 
     async def normalize_quantity(self, symbol, quantity):
         return quantity
-from lightfee.core.domain import PositionSnapshot

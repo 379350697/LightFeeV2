@@ -12,6 +12,7 @@ Rust references:
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -219,6 +220,23 @@ def _restore_funding_settlement_records(value: object) -> list[FundingSettlement
     return records
 
 
+def _restore_execution_benchmark_receipts(value: object) -> list[dict[str, object]]:
+    """Preserve only JSON-object benchmark receipts across restart.
+
+    Receipt validity is intentionally rechecked by the funding reconciler at
+    promotion time.  Recovery must not turn a scalar, list, or truthy object
+    into a plausible zero-cost execution receipt.
+    """
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        return []
+    return [deepcopy(item) for item in value]
+
+
+def _restore_execution_benchmark_receipt(value: object) -> dict[str, object] | None:
+    """Preserve one entry receipt without granting it any trust on restore."""
+    return deepcopy(value) if isinstance(value, dict) else None
+
+
 def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
     """Deserialize an OpenPosition from snapshot dict."""
     from lightfee.core.domain import Venue as DomainVenue
@@ -282,9 +300,16 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         entry_implementation_shortfall_quote=float(
             data.get("entry_implementation_shortfall_quote", 0)
         ),
+        entry_execution_benchmark_receipt=_restore_execution_benchmark_receipt(
+            data.get("entry_execution_benchmark_receipt")
+        ),
         exit_implementation_shortfall_quote=float(
             data.get("exit_implementation_shortfall_quote", 0)
         ),
+        exit_execution_benchmark_receipts=_restore_execution_benchmark_receipts(
+            data.get("exit_execution_benchmark_receipts")
+        ),
+        execution_fee_complete=(data.get("execution_fee_complete") is True),
         # This is an acceptance-evidence fact, not a permissive configuration
         # flag: only a JSON boolean ``true`` can certify the benchmark.
         execution_benchmark_complete=(
@@ -446,9 +471,20 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "entry_implementation_shortfall_quote": (
             pos.entry_implementation_shortfall_quote
         ),
+        "entry_execution_benchmark_receipt": (
+            deepcopy(pos.entry_execution_benchmark_receipt)
+            if isinstance(pos.entry_execution_benchmark_receipt, dict)
+            else None
+        ),
         "exit_implementation_shortfall_quote": (
             pos.exit_implementation_shortfall_quote
         ),
+        "exit_execution_benchmark_receipts": [
+            deepcopy(receipt)
+            for receipt in pos.exit_execution_benchmark_receipts
+            if isinstance(receipt, dict)
+        ],
+        "execution_fee_complete": pos.execution_fee_complete,
         "execution_benchmark_complete": pos.execution_benchmark_complete,
         "funding_edge_bps_entry": pos.funding_edge_bps_entry,
         "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,

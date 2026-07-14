@@ -111,14 +111,31 @@ class SpreadSidecarService:
         )
         if self._paper_tracker.enabled:
             persistence = config.persistence
+            # A paper registration can remain stateful until its terminal
+            # horizon.  Generic log rotation can prune that registration while
+            # keeping a later fill/close row, making safe state reconstruction
+            # mathematically impossible.  This dedicated journal therefore
+            # never rotates; normal log compaction settings remain for the
+            # non-stateful event logs.
             self._paper_journal = Journal(
                 persistence.spread_paper_event_log_path,
-                max_bytes=persistence.event_log_compaction_max_bytes,
-                archive_count=persistence.event_log_archive_count,
-                retention_hours=persistence.event_log_retention_hours,
             )
             self._paper_journal.open()
-            self._paper_tracker.restore_from_records(self._paper_journal.read_all())
+            paper_records, paper_journal_intact = (
+                self._paper_journal.read_all_with_integrity()
+            )
+            if paper_journal_intact and not self._paper_journal.has_archives():
+                self._paper_tracker.restore_from_records(
+                    paper_records,
+                    require_journal_envelope=True,
+                )
+            else:
+                # A missing close/fill row is indistinguishable from an active
+                # paper entry after restart.  Rotated segments are equally
+                # unsafe: their oldest predecessor may already be pruned.
+                # Feed an explicit invalid replay boundary to disable paper
+                # admission instead of reviving a partial episode.
+                self._paper_tracker.invalidate_replay()
 
     async def close(self) -> None:
         if self._paper_journal is not None:

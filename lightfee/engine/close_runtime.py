@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import math
+from copy import deepcopy
 from typing import Any
 
 from lightfee.core.domain import OrderFillProbeStatus, Side, Venue
@@ -31,6 +32,7 @@ from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.engine.state import funding_settlement_task_recovery_key
+from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -47,12 +49,14 @@ def _funding_settlement_receipt_payload(
         "position_id": result.position_id,
         "symbol": str(task.get("symbol") or ""),
         "closed_at_ms": int(task.get("closed_at_ms") or 0),
+        "reconciled_at_ms": int(task.get("reconciled_at_ms") or 0),
         "required_settlement_count": result.required_count,
         "observed_settlement_count": result.observed_count,
         "statement_claims": statement_claims,
         # Keep the promotion permission itself in the durable receipt.  A
         # complete-looking number/claim payload is not official accounting
         # unless the reconciler explicitly granted the literal boolean.
+        "official_funding_reconciled": task.get("official_funding_reconciled") is True,
         "official_pnl": task.get("official_pnl") is True,
         "official_funding_quote": task.get("official_funding_quote"),
         "official_net_quote": task.get("official_net_quote"),
@@ -65,6 +69,17 @@ def _funding_settlement_receipt_payload(
         "execution_benchmark_complete": task.get(
             "execution_benchmark_complete"
         ) is True,
+        "execution_fee_complete": task.get("execution_fee_complete") is True,
+        "entry_execution_benchmark_receipt": (
+            deepcopy(task["entry_execution_benchmark_receipt"])
+            if isinstance(task.get("entry_execution_benchmark_receipt"), dict)
+            else None
+        ),
+        "exit_execution_benchmark_receipts": (
+            deepcopy(task["exit_execution_benchmark_receipts"])
+            if isinstance(task.get("exit_execution_benchmark_receipts"), list)
+            else []
+        ),
         "lifecycle_forecast_funding_quote": task.get(
             "lifecycle_forecast_funding_quote"
         ),
@@ -128,6 +143,91 @@ def _terminal_account_truth_for_funding_receipt(
     normalized["positions_flat"] = positions_flat
     normalized["open_orders_flat"] = open_orders_flat
     return normalized
+
+
+def _post_close_truth_receipt_payload(
+    task: dict[str, Any],
+    exchange_truth: dict[str, Any],
+    *,
+    captured_at_ms: int,
+) -> dict[str, Any] | None:
+    """Bind a fresh flat probe to one closed two-venue position.
+
+    The funding receipt remains accounting evidence.  This separate event is
+    the temporal exchange-truth proof consumed by canary promotion, so its
+    identity and scope cannot be inferred from an account-wide probe later.
+    """
+    position_id = str(task.get("position_id") or "")
+    symbol = str(task.get("symbol") or "").upper()
+    long_venue = str(task.get("long_venue") or "").lower()
+    short_venue = str(task.get("short_venue") or "").lower()
+    if (
+        not position_id
+        or not symbol
+        or not long_venue
+        or not short_venue
+        or long_venue == short_venue
+        or captured_at_ms <= 0
+    ):
+        return None
+    return {
+        "position_id": position_id,
+        "symbol": symbol,
+        "long_venue": long_venue,
+        "short_venue": short_venue,
+        "terminal_state": "flat",
+        "terminal_reason": "post_close_exchange_truth_for_funding_reconciliation",
+        "exchange_truth_captured_at_ms": captured_at_ms,
+        "exchange_truth_scope": {
+            "position_id": position_id,
+            "symbol": symbol,
+            "venues": sorted((long_venue, short_venue)),
+        },
+        "exchange_truth": deepcopy(exchange_truth),
+    }
+
+
+def _has_durable_post_close_truth_receipt(
+    journal: Any,
+    *,
+    position_id: str,
+    symbol: str,
+    venues: set[str],
+) -> bool:
+    """Avoid emitting a second truth proof if receipt append must be retried."""
+    records: list[Any] = []
+    stream_records = getattr(journal, "stream_records", None)
+    if callable(stream_records):
+        try:
+            records = list(stream_records())
+        except Exception:
+            records = []
+    if not records:
+        raw_records = getattr(journal, "records", None)
+        if isinstance(raw_records, list):
+            records = raw_records
+    for record in records:
+        if isinstance(record, tuple) and len(record) == 2:
+            kind, payload = record
+        elif isinstance(record, dict):
+            kind, payload = record.get("kind"), record.get("payload")
+        else:
+            continue
+        if kind != "runtime.position_lifecycle_terminal" or not isinstance(payload, dict):
+            continue
+        scope = payload.get("exchange_truth_scope")
+        scope_venues = scope.get("venues") if isinstance(scope, dict) else None
+        if (
+            payload.get("terminal_reason")
+            != "post_close_exchange_truth_for_funding_reconciliation"
+            or str(payload.get("position_id") or "") != position_id
+            or str(payload.get("symbol") or "").upper() != symbol
+            or not isinstance(scope_venues, list)
+            or {str(venue or "").lower() for venue in scope_venues} != venues
+        ):
+            continue
+        return True
+    return False
 
 
 def _funding_settlement_terminal_receipt_row(
@@ -2729,6 +2829,32 @@ class CloseRuntime:
                             current_exchange_truth=terminal_account_truth,
                         )
                     ):
+                        truth_receipt = _post_close_truth_receipt_payload(
+                            merged,
+                            terminal_account_truth,
+                            captured_at_ms=now_ms,
+                        )
+                        if truth_receipt is not None:
+                            scope = truth_receipt["exchange_truth_scope"]
+                            assert isinstance(scope, dict)
+                            scope_venues = {
+                                str(venue).lower()
+                                for venue in scope["venues"]
+                            }
+                            if not _has_durable_post_close_truth_receipt(
+                                self.ctx.journal,
+                                position_id=str(truth_receipt["position_id"]),
+                                symbol=str(truth_receipt["symbol"]),
+                                venues=scope_venues,
+                            ):
+                                # The independent truth receipt must become
+                                # durable before accounting reconciliation so
+                                # the journal can prove close < truth < PnL.
+                                self.ctx.journal.append_critical(
+                                    now_ms,
+                                    "runtime.position_lifecycle_terminal",
+                                    truth_receipt,
+                                )
                         receipt["exchange_truth"] = terminal_account_truth
                     self.ctx.journal.append_critical(
                         now_ms,
@@ -3207,6 +3333,14 @@ class CloseRuntime:
                         long_price_hint=self._call_resolve_local_l2_mid(position.long_venue, position.symbol, now_ms=now_ms),
                         short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
                         state=self.ctx.state,
+                        execution_benchmark_capture=(
+                            lambda quantity, captured_at_ms:
+                            self._capture_local_l2_close_execution_benchmark(
+                                position,
+                                now_ms=captured_at_ms,
+                                requested_quantity=quantity,
+                            )
+                        ),
                     )
     def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
         """Resolve a close price hint from the active WS BBO quote provider."""
@@ -3340,30 +3474,98 @@ class CloseRuntime:
         if self._entry_readiness_provider_uses_ws_bbo():
             return self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
         budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        if budget_ms <= 0:
+            self.ctx.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "local_l2_book",
+                    "reason": "liquidity_snapshot_budget_unavailable",
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "local_l2",
+                    "ts_ms": now_ms,
+                },
+            )
+            return 0.0
         try:
-            book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
-            if book is not None and book.status.value == "hot":
-                age_ms = book.age_ms(now_ms)
-                if budget_ms > 0 and book.is_stale(budget_ms, now_ms):
-                    self.ctx.journal.append(
-                        "runtime.close_price_evidence_stale",
-                        {
-                            "venue": venue_value,
-                            "symbol": symbol,
-                            "domain": "local_l2_book",
-                            "age_ms": age_ms,
-                            "budget_ms": budget_ms,
-                            "decision": "reject_price_hint",
-                            "fallback_source": "none",
-                            "ts_ms": now_ms,
-                        },
-                    )
-                    return 0.0
-                mid = book.mid_price()
-                if mid and mid > 0:
-                    return mid
-        except Exception:
-            pass
+            local_l2_runtime = getattr(self.ctx, "local_l2_runtime", None)
+            get_book = getattr(local_l2_runtime, "get_book", None)
+            book = get_book(venue_value, symbol) if callable(get_book) else None
+            if book is None:
+                self.ctx.journal.append(
+                    "runtime.close_price_evidence_missing",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "local_l2_book",
+                        "reason": "missing_book",
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "local_l2",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+            age_ms = (
+                max(now_ms - observed_at_ms, 0)
+                if observed_at_ms > 0
+                else None
+            )
+            snapshot = execution_liquidity_from_local_l2(
+                book,
+                max_depth=1,
+                max_age_ms=budget_ms,
+                now_ms=now_ms,
+                require_ready=True,
+            )
+            if not snapshot.book_ready:
+                reason = (
+                    "book_stale"
+                    if observed_at_ms <= 0
+                    or observed_at_ms > now_ms
+                    or age_ms is None
+                    or age_ms > budget_ms
+                    else "book_invalid_for_execution_liquidity"
+                )
+                self.ctx.journal.append(
+                    "runtime.close_price_evidence_stale",
+                    {
+                        "venue": venue_value,
+                        "symbol": symbol,
+                        "domain": "local_l2_book",
+                        "reason": reason,
+                        "observed_at_ms": observed_at_ms,
+                        "age_ms": age_ms,
+                        "budget_ms": budget_ms,
+                        "decision": "reject_price_hint",
+                        "fallback_source": "none",
+                        "provider": "local_l2",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return 0.0
+            return (snapshot.bids[0].price + snapshot.asks[0].price) / 2.0
+        except Exception as exc:
+            self.ctx.journal.append(
+                "runtime.close_price_evidence_missing",
+                {
+                    "venue": venue_value,
+                    "symbol": symbol,
+                    "domain": "local_l2_book",
+                    "reason": "book_read_error",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "budget_ms": budget_ms,
+                    "decision": "reject_price_hint",
+                    "fallback_source": "none",
+                    "provider": "local_l2",
+                    "ts_ms": now_ms,
+                },
+            )
         return 0.0
     def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
         """Get best bid/ask from the local L2 book for passive tick inference."""
@@ -3371,19 +3573,158 @@ class CloseRuntime:
             return self._call_resolve_ws_bbo_close_quote(venue, symbol)
         if not self._entry_readiness_provider_uses_local_l2():
             return None
+        now_ms = wall_clock_now_ms()
+        budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        if budget_ms <= 0:
+            return None
         try:
             book = self.ctx.local_l2_runtime.get_book(
                 venue.value if hasattr(venue, "value") else str(venue),
                 symbol,
             )
-            if book is not None and book.status.value == "hot":
-                best_bid = book.best_bid()
-                best_ask = book.best_ask()
-                if best_bid > 0 and best_ask > best_bid:
-                    return best_bid, best_ask
+            if book is None:
+                return None
+            snapshot = execution_liquidity_from_local_l2(
+                book,
+                max_depth=1,
+                max_age_ms=budget_ms,
+                now_ms=now_ms,
+                require_ready=True,
+            )
+            if snapshot.book_ready:
+                return snapshot.bids[0].price, snapshot.asks[0].price
         except Exception:
             pass
         return None
+
+    def _capture_local_l2_close_execution_benchmark(
+        self,
+        position: Any,
+        *,
+        now_ms: int,
+        requested_quantity: float | None = None,
+    ) -> dict[str, object] | None:
+        """Capture a full-size executable L2 receipt for aggressive close.
+
+        This deliberately does not alter the V1 close order hints.  The
+        receipt is acceptance-only evidence: when the local L2 book is stale,
+        incomplete, or unavailable, the close still routes normally but its
+        fill-quality metric fails closed.
+        """
+        if not self._entry_readiness_provider_uses_local_l2():
+            return None
+        try:
+            target_quantity = float(
+                position.matched_quantity
+                if requested_quantity is None
+                else requested_quantity
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(target_quantity) or target_quantity <= 0.0:
+            return None
+        budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        if budget_ms <= 0:
+            return None
+        legs: dict[str, dict[str, object]] = {}
+        for name, venue, side in (
+            ("long", position.long_venue, "sell"),
+            ("short", position.short_venue, "buy"),
+        ):
+            venue_value = venue.value if hasattr(venue, "value") else str(venue)
+            try:
+                book = self.ctx.local_l2_runtime.get_book(venue_value, position.symbol)
+                if book is None:
+                    return None
+                snapshot = execution_liquidity_from_local_l2(
+                    book,
+                    max_age_ms=budget_ms,
+                    now_ms=now_ms,
+                    require_ready=True,
+                )
+                if not snapshot.book_ready:
+                    return None
+                execution = self._l2_vwap_for_base_quantity(
+                    snapshot,
+                    side=side,
+                    requested_quantity=target_quantity,
+                )
+                if execution is None:
+                    return None
+                vwap_price, available_quantity = execution
+                observed_at_ms = snapshot.observed_at_ms
+                age_ms = max(now_ms - observed_at_ms, 0)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return None
+            legs[name] = {
+                "venue": venue_value,
+                "side": side,
+                "vwap_price": vwap_price,
+                "available_base_quantity": available_quantity,
+                "observed_at_ms": observed_at_ms,
+                "age_ms": age_ms,
+            }
+        receipt = {
+            "schema_version": 1,
+            "source": "local_l2_vwap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "captured_at_ms": now_ms,
+            "requested_base_quantity": target_quantity,
+            "long": legs["long"],
+            "short": legs["short"],
+        }
+        self.ctx.journal.append(
+            "runtime.close_execution_benchmark_captured",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "source": receipt["source"],
+                "requested_base_quantity": target_quantity,
+                "captured_at_ms": now_ms,
+            },
+        )
+        return receipt
+
+    @staticmethod
+    def _l2_vwap_for_base_quantity(
+        book: Any,
+        *,
+        side: str,
+        requested_quantity: float,
+    ) -> tuple[float, float] | None:
+        """Return executable VWAP and available base quantity for a ladder."""
+        levels = getattr(book, "bids" if side == "sell" else "asks", ())
+        remaining = requested_quantity
+        quote_total = 0.0
+        filled_quantity = 0.0
+        available_quantity = 0.0
+        for level in levels:
+            try:
+                price = float(level.price)
+                quantity = float(
+                    getattr(level, "quantity", getattr(level, "size", 0.0))
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(price) or not math.isfinite(quantity) or price <= 0.0 or quantity <= 0.0:
+                return None
+            available_quantity += quantity
+            take = min(remaining, quantity)
+            if take > 0.0:
+                quote_total += take * price
+                filled_quantity += take
+                remaining -= take
+            if remaining <= max(1e-12, requested_quantity * 1e-10):
+                break
+        if (
+            not math.isfinite(quote_total)
+            or not math.isfinite(available_quantity)
+            or filled_quantity + max(1e-12, requested_quantity * 1e-10) < requested_quantity
+            or filled_quantity <= 0.0
+        ):
+            return None
+        return quote_total / filled_quantity, available_quantity
     def _resolve_ws_bbo_close_quote(
         self,
         venue,

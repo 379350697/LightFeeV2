@@ -9,7 +9,12 @@ V1 references:
 from __future__ import annotations
 
 import pytest
-from lightfee.core.domain import OrderFill, OrderRequest, Side, TimeInForce, Venue
+from lightfee.core.domain import OrderFill, Side, TimeInForce, Venue
+from lightfee.engine.exit import (
+    TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV,
+    execution_benchmark_receipt_semantically_verified,
+    seal_execution_benchmark_receipt,
+)
 from lightfee.engine.entry import (
     EntryContext,
     EntryState,
@@ -17,10 +22,10 @@ from lightfee.engine.entry import (
     advance_entry_state,
     build_entry_orders,
     build_open_position,
+    finalize_entry_execution_benchmark_receipt,
 )
 from lightfee.engine.execution_planner import (
     ExecutionRoute,
-    IncrementalEntryExecutionPlan,
     align_quantity_down_to_chunk,
     align_quantity_up_to_step,
     bounded_maker_first_initial_target_quantity,
@@ -30,7 +35,7 @@ from lightfee.engine.execution_planner import (
     plan_incremental_entry_execution,
     quantities_match,
 )
-from lightfee.engine.state import OpenPosition, PendingEntry, PendingEntryRemainderSlice
+from lightfee.engine.state import PendingEntry, PendingEntryRemainderSlice
 
 
 # ============================================================================
@@ -298,6 +303,137 @@ class TestEntryExecutionIdempotency:
         # Client order IDs differ between maker and hedge
         assert maker_req.client_order_id != hedge_req.client_order_id
 
+    def test_finalize_entry_receipt_binds_fresh_l2_to_exact_fills(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A runtime capture is promotable only after matching exchange fills."""
+        monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "entry-test-secret")
+        raw_receipt = {
+            "source": "local_l2_vwap",
+            "position_id": "entry-receipt",
+            "symbol": "BTC-USDT",
+            "captured_at_ms": 1_000,
+            "max_observation_to_submit_ms": 1_000,
+            "requested_base_quantity": 1.0,
+            "long": {
+                "venue": "binance",
+                "side": "buy",
+                "vwap_price": 100.0,
+                "available_base_quantity": 2.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+            },
+            "short": {
+                "venue": "bybit",
+                "side": "sell",
+                "vwap_price": 100.0,
+                "available_base_quantity": 2.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+            },
+        }
+        receipt = finalize_entry_execution_benchmark_receipt(
+            raw_receipt,
+            position_id="entry-receipt",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_fill=OrderFill(
+                venue=Venue.BINANCE,
+                symbol="BTC-USDT",
+                side=Side.BUY,
+                quantity=1.0,
+                price=101.0,
+                order_id="long-entry",
+                filled_at_ms=1_002,
+            ),
+            short_fill=OrderFill(
+                venue=Venue.BYBIT,
+                symbol="BTC-USDT",
+                side=Side.SELL,
+                quantity=1.0,
+                price=99.0,
+                order_id="short-entry",
+                filled_at_ms=1_003,
+            ),
+            long_client_order_id="long-client",
+            short_client_order_id="short-client",
+            long_submitted_at_ms=1_000,
+            short_submitted_at_ms=1_001,
+        )
+
+        assert receipt is not None
+        assert receipt["implementation_shortfall_quote"] == pytest.approx(2.0)
+        assert execution_benchmark_receipt_semantically_verified(
+            receipt,
+            position_id="entry-receipt",
+            symbol="BTC-USDT",
+            expected_legs={
+                "long": ("binance", "buy"),
+                "short": ("bybit", "sell"),
+            },
+        )
+
+    def test_finalize_entry_receipt_rejects_delayed_second_leg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "entry-test-secret")
+        raw_receipt = {
+            "source": "local_l2_vwap",
+            "position_id": "entry-delayed",
+            "symbol": "BTC-USDT",
+            "captured_at_ms": 1_000,
+            "max_observation_to_submit_ms": 1_000,
+            "requested_base_quantity": 1.0,
+            "long": {
+                "venue": "binance",
+                "side": "buy",
+                "vwap_price": 100.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+            },
+            "short": {
+                "venue": "bybit",
+                "side": "sell",
+                "vwap_price": 100.0,
+                "available_base_quantity": 1.0,
+                "observed_at_ms": 995,
+                "age_ms": 5,
+            },
+        }
+        receipt = finalize_entry_execution_benchmark_receipt(
+            raw_receipt,
+            position_id="entry-delayed",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_fill=OrderFill(
+                venue=Venue.BINANCE,
+                symbol="BTC-USDT",
+                side=Side.BUY,
+                quantity=1.0,
+                price=100.0,
+                order_id="long-entry",
+                filled_at_ms=1_001,
+            ),
+            short_fill=OrderFill(
+                venue=Venue.BYBIT,
+                symbol="BTC-USDT",
+                side=Side.SELL,
+                quantity=1.0,
+                price=100.0,
+                order_id="short-entry",
+                filled_at_ms=2_100,
+            ),
+            long_client_order_id="long-client",
+            short_client_order_id="short-client",
+            long_submitted_at_ms=1_000,
+            short_submitted_at_ms=2_100,
+        )
+
+        assert receipt is None
+
     def test_build_entry_orders_maker_post_only(self):
         ctx = EntryContext(
             entry_id="test-entry-2",
@@ -439,7 +575,9 @@ class TestEntryExecutionIdempotency:
         assert pos.peak_net_quote == pytest.approx(-2.0)
         assert pos.entry_quality_completed_at_ms == 0
 
-    def test_build_open_position_records_independent_adverse_entry_shortfall(self):
+    def test_build_open_position_requires_sealed_entry_receipt_for_shortfall(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         ctx = EntryContext(
             entry_id="pos-shortfall",
             symbol="BTC-USDT",
@@ -474,9 +612,67 @@ class TestEntryExecutionIdempotency:
 
         position = build_open_position(ctx, long_fill, short_fill, now_ms=1_000)
 
+        assert position.execution_benchmark_complete is False
+        assert position.execution_fee_complete is False
+        assert position.entry_implementation_shortfall_quote == pytest.approx(0.0)
+        assert position.current_net_quote == pytest.approx(0.0)
+
+        monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "entry-test-secret")
+        receipt = seal_execution_benchmark_receipt(
+            {
+                "source": "local_l2_vwap",
+                "position_id": ctx.entry_id,
+                "symbol": ctx.symbol,
+                "captured_at_ms": 900,
+                "max_observation_to_submit_ms": 1_000,
+                "requested_base_quantity": 1.0,
+                "long": {
+                    "venue": "binance",
+                    "side": "buy",
+                    "vwap_price": 100.0,
+                    "available_base_quantity": 1.0,
+                    "observed_at_ms": 895,
+                    "age_ms": 5,
+                    "filled_base_quantity": 1.0,
+                    "implementation_shortfall_quote": 1.0,
+                    "fills": [{
+                        "order_id": "long-entry",
+                        "client_order_id": "long-entry-client",
+                        "submitted_at_ms": 900,
+                        "filled_at_ms": 901,
+                        "quantity": 1.0,
+                        "price": 101.0,
+                    }],
+                },
+                "short": {
+                    "venue": "bybit",
+                    "side": "sell",
+                    "vwap_price": 100.0,
+                    "available_base_quantity": 1.0,
+                    "observed_at_ms": 895,
+                    "age_ms": 5,
+                    "filled_base_quantity": 1.0,
+                    "implementation_shortfall_quote": 1.0,
+                    "fills": [{
+                        "order_id": "short-entry",
+                        "client_order_id": "short-entry-client",
+                        "submitted_at_ms": 900,
+                        "filled_at_ms": 901,
+                        "quantity": 1.0,
+                        "price": 99.0,
+                    }],
+                },
+                "implementation_shortfall_quote": 2.0,
+            }
+        )
+        assert receipt is not None
+        ctx.entry_execution_benchmark_receipt = receipt
+
+        position = build_open_position(ctx, long_fill, short_fill, now_ms=1_000)
+
         assert position.execution_benchmark_complete is True
         assert position.entry_implementation_shortfall_quote == pytest.approx(2.0)
-        assert position.current_net_quote == pytest.approx(0.0)
+        assert position.entry_execution_benchmark_receipt == receipt
 
     def test_build_open_position_preserves_funding_semantics(self):
         """Entry-selected funding timestamps must survive into close decisions."""

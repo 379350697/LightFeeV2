@@ -27,9 +27,7 @@ from lightfee.marketdata.l2 import (
     PriceLevel,
 )
 from lightfee.marketdata.local_l2_runtime import (
-    AssignmentLease,
     LocalL2Runtime,
-    LocalL2RuntimeMetrics,
     RuntimeFaultKind,
 )
 from lightfee.marketdata.local_l2_data_plane import (
@@ -484,7 +482,6 @@ class TestMarketSnapshotDiagnostics:
 
     def test_snapshot_diagnostics(self):
         """Snapshot diagnostics exports relevant counters."""
-        dp = LocalL2DataPlane.__new__(LocalL2DataPlane)
         # Can't fully init without journal, but we can test the interval mapping
         assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.COLD) == SNAPSHOT_INTERVAL_COLD_MS
         assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.BOOTSTRAPPING) == SNAPSHOT_INTERVAL_BOOTSTRAPPING_MS
@@ -748,6 +745,16 @@ class TestRuntimeFaultHandling:
         )
         assert rt.metrics.runtime_transport_failure_total == 1
 
+        rt.handle_runtime_failure(
+            "binance", "BTCUSDT",
+            RuntimeFaultKind.DATA_INTEGRITY, "invalid raw level", now_ms=1000,
+        )
+        assert rt.metrics.data_integrity_rebuild_total == 1
+        assert rt.metrics.rebuild_total == 2
+        assert rt.get_book("binance", "BTCUSDT").fault_reason == (
+            "data_integrity: invalid raw level"
+        )
+
     def test_runtime_suspends_book_on_budget(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
@@ -767,6 +774,7 @@ class TestRuntimeFaultHandling:
         assert "active_books" in diag
         assert "bootstrapping_books" in diag
         assert "rebuild_total" in diag
+        assert "data_integrity_rebuild_total" in diag
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +817,7 @@ class TestPassiveOrderSemantics:
         assert ack.state == PassiveOrderAck.__dataclass_fields__["state"].default  # UNKNOWN
 
     def test_client_order_id_optional_in_progress(self):
-        from lightfee.core.domain import PassiveOrderProgress, Venue, Side, PassiveOrderState
+        from lightfee.core.domain import PassiveOrderProgress, Venue, Side
         progress = PassiveOrderProgress(
             venue=Venue.BINANCE,
             symbol="BTCUSDT",

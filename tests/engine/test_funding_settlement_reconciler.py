@@ -7,6 +7,10 @@ import pytest
 
 from lightfee.core.domain import FundingSettlement, Venue
 from lightfee.engine.close_executor import CloseExecutor
+from lightfee.engine.exit import (
+    TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV,
+    seal_execution_benchmark_receipt,
+)
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.recovery import (
@@ -46,6 +50,119 @@ def _position(
     }
     fields.update(overrides)
     return OpenPosition(**fields)
+
+
+@pytest.fixture(autouse=True)
+def _execution_benchmark_integrity_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "test-benchmark-secret")
+
+
+def _exit_benchmark_receipt(position: OpenPosition) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "source": "local_l2_vwap",
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "captured_at_ms": 1_500,
+        "max_observation_to_submit_ms": 1_000,
+        "requested_base_quantity": 1.0,
+        "long": {
+            "venue": position.long_venue.value,
+            "side": "sell",
+            "vwap_price": 99.0,
+            "available_base_quantity": 2.0,
+            "observed_at_ms": 1_490,
+            "age_ms": 10,
+            "filled_base_quantity": 1.0,
+            "implementation_shortfall_quote": 0.0,
+            "fills": [
+                {
+                    "order_id": "long-close-1",
+                    "client_order_id": "long-close-client-1",
+                    "submitted_at_ms": 1_500,
+                    "filled_at_ms": 1_500,
+                    "quantity": 1.0,
+                    "price": 99.0,
+                }
+            ],
+        },
+        "short": {
+            "venue": position.short_venue.value,
+            "side": "buy",
+            "vwap_price": 101.0,
+            "available_base_quantity": 2.0,
+            "observed_at_ms": 1_490,
+            "age_ms": 10,
+            "filled_base_quantity": 1.0,
+            "implementation_shortfall_quote": 0.0,
+            "fills": [
+                {
+                    "order_id": "short-close-1",
+                    "client_order_id": "short-close-client-1",
+                    "submitted_at_ms": 1_500,
+                    "filled_at_ms": 1_500,
+                    "quantity": 1.0,
+                    "price": 101.0,
+                }
+            ],
+        },
+        "implementation_shortfall_quote": 0.0,
+    }
+    sealed = seal_execution_benchmark_receipt(receipt)
+    assert sealed is not None
+    return sealed
+
+
+def _entry_benchmark_receipt(position: OpenPosition) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_version": 1,
+        "source": "local_l2_vwap",
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "captured_at_ms": 500,
+        "max_observation_to_submit_ms": 1_000,
+        "requested_base_quantity": 1.0,
+        "long": {
+            "venue": position.long_venue.value,
+            "side": "buy",
+            "vwap_price": 100.0,
+            "available_base_quantity": 2.0,
+            "observed_at_ms": 490,
+            "age_ms": 10,
+            "filled_base_quantity": 1.0,
+            "implementation_shortfall_quote": 0.0,
+            "fills": [{
+                "order_id": "long-entry-1",
+                "client_order_id": "long-entry-client-1",
+                "submitted_at_ms": 500,
+                "filled_at_ms": 500,
+                "quantity": 1.0,
+                "price": 100.0,
+            }],
+        },
+        "short": {
+            "venue": position.short_venue.value,
+            "side": "sell",
+            "vwap_price": 100.0,
+            "available_base_quantity": 2.0,
+            "observed_at_ms": 490,
+            "age_ms": 10,
+            "filled_base_quantity": 1.0,
+            "implementation_shortfall_quote": 0.0,
+            "fills": [{
+                "order_id": "short-entry-1",
+                "client_order_id": "short-entry-client-1",
+                "submitted_at_ms": 500,
+                "filled_at_ms": 500,
+                "quantity": 1.0,
+                "price": 100.0,
+            }],
+        },
+        "implementation_shortfall_quote": 0.0,
+    }
+    sealed = seal_execution_benchmark_receipt(receipt)
+    assert sealed is not None
+    return sealed
 
 
 class _StatementsAdapter:
@@ -97,7 +214,7 @@ def _statement(
 
 @pytest.mark.asyncio
 async def test_reconciler_allocates_only_exact_single_owner_statement_targets() -> None:
-    position = _position()
+    position = _position(execution_fee_complete=True)
     binance = _StatementsAdapter([_statement(Venue.BINANCE, -0.1, reference="binance-1")])
     okx = _StatementsAdapter([_statement(Venue.OKX, 0.5, reference="okx-1")])
 
@@ -150,7 +267,9 @@ async def test_reconciler_rejects_timestamp_and_currency_near_matches() -> None:
 
 @pytest.mark.asyncio
 async def test_post_close_task_remains_non_official_until_all_private_statements_arrive() -> None:
-    position = _position()
+    # This case isolates the private-statement gate.  Fee completeness is
+    # supplied so a completed statement set may legitimately publish net PnL.
+    position = _position(execution_fee_complete=True)
     task = FundingSettlementReconciler.new_pending_task(
         position,
         closed_at_ms=2_000,
@@ -184,6 +303,35 @@ async def test_post_close_task_remains_non_official_until_all_private_statements
     assert complete["funding_forecast_error_quote"] == pytest.approx(0.0)
 
 
+@pytest.mark.asyncio
+async def test_complete_statement_task_keeps_unknown_execution_fee_out_of_official_net_pnl() -> None:
+    task = FundingSettlementReconciler.new_pending_task(
+        _position(execution_fee_complete=False),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.0,
+        exit_fee_quote=0.0,
+    )
+    assert task is not None
+
+    complete, result = await FundingSettlementReconciler().reconcile_pending_task(
+        task,
+        {
+            Venue.BINANCE: _StatementsAdapter([_statement(Venue.BINANCE, -0.1)]),
+            Venue.OKX: _StatementsAdapter([_statement(Venue.OKX, 0.5)]),
+        },
+        now_ms=3_000,
+    )
+
+    # The result drives durable funding receipt commit; it says only that the
+    # private statement set is complete, not that whole-trade net PnL is safe.
+    assert result.official is True
+    assert complete["official_funding_reconciled"] is True
+    assert complete["official_funding_quote"] == pytest.approx(0.4)
+    assert complete["official_pnl"] is False
+    assert complete["official_net_quote"] is None
+
+
 def test_pending_task_requires_persisted_execution_benchmark_facts() -> None:
     missing_benchmarks = FundingSettlementReconciler.new_pending_task(
         _position(execution_benchmark_complete=True),
@@ -192,14 +340,22 @@ def test_pending_task_requires_persisted_execution_benchmark_facts() -> None:
         entry_fee_quote=0.2,
         exit_fee_quote=0.3,
     )
+    complete_position = _position(
+        execution_benchmark_complete=True,
+        execution_fee_complete=True,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    complete_position.exit_execution_benchmark_receipts = [
+        _exit_benchmark_receipt(complete_position)
+    ]
+    complete_position.entry_execution_benchmark_receipt = _entry_benchmark_receipt(
+        complete_position
+    )
     complete_benchmarks = FundingSettlementReconciler.new_pending_task(
-        _position(
-            execution_benchmark_complete=True,
-            entry_benchmark_long_price=100.0,
-            entry_benchmark_short_price=100.0,
-            entry_implementation_shortfall_quote=0.0,
-            exit_implementation_shortfall_quote=0.0,
-        ),
+        complete_position,
         closed_at_ms=2_000,
         price_pnl_quote=1.0,
         entry_fee_quote=0.2,
@@ -211,7 +367,150 @@ def test_pending_task_requires_persisted_execution_benchmark_facts() -> None:
     assert missing_benchmarks["implementation_shortfall_quote"] is None
     assert complete_benchmarks is not None
     assert complete_benchmarks["execution_benchmark_complete"] is True
+    assert complete_benchmarks["execution_fee_complete"] is True
     assert complete_benchmarks["implementation_shortfall_quote"] == pytest.approx(0.0)
+    complete_benchmarks["exit_execution_benchmark_receipts"][0]["long"]["fills"][0][
+        "price"
+    ] = 1.0
+    assert complete_position.exit_execution_benchmark_receipts[0]["long"]["fills"][0][
+        "price"
+    ] == pytest.approx(99.0)
+
+
+def test_pending_task_rejects_unknown_fee_as_zero_cost() -> None:
+    position = _position(
+        execution_benchmark_complete=True,
+        execution_fee_complete=False,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    position.exit_execution_benchmark_receipts = [_exit_benchmark_receipt(position)]
+
+    task = FundingSettlementReconciler.new_pending_task(
+        position,
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.0,
+        exit_fee_quote=0.0,
+    )
+
+    assert task is not None
+    assert task["execution_benchmark_complete"] is False
+    assert task["implementation_shortfall_quote"] is None
+
+
+def test_pending_task_rejects_receipt_whose_raw_fills_disagree_with_aggregate() -> None:
+    position = _position(
+        execution_benchmark_complete=True,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    receipt = _exit_benchmark_receipt(position)
+    # Re-seal a syntactically valid payload whose actual long fill implies a
+    # one-quote adverse cost while the persisted aggregate still claims zero.
+    receipt["long"]["fills"][0]["price"] = 98.0
+    sealed = seal_execution_benchmark_receipt(receipt)
+    assert sealed is not None
+    receipt = sealed
+    position.exit_execution_benchmark_receipts = [receipt]
+
+    task = FundingSettlementReconciler.new_pending_task(
+        position,
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+
+    assert task is not None
+    assert task["execution_benchmark_complete"] is False
+    assert task["implementation_shortfall_quote"] is None
+
+
+def test_pending_task_rejects_hmac_mutated_execution_benchmark_receipt() -> None:
+    """A snapshot edit must not turn a signed receipt into acceptance evidence."""
+    position = _position(
+        execution_benchmark_complete=True,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    receipt = _exit_benchmark_receipt(position)
+    receipt["long"]["fills"][0]["price"] = 1.0  # type: ignore[index]
+    position.exit_execution_benchmark_receipts = [receipt]
+
+    task = FundingSettlementReconciler.new_pending_task(
+        position,
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+
+    assert task is not None
+    assert task["execution_benchmark_complete"] is False
+    assert task["implementation_shortfall_quote"] is None
+
+
+def test_pending_task_rejects_signed_receipt_with_invalid_fill_timeline() -> None:
+    """Even a valid HMAC cannot promote a receipt with impossible timing."""
+    position = _position(
+        execution_benchmark_complete=True,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    receipt = _exit_benchmark_receipt(position)
+    receipt["short"]["fills"][0]["submitted_at_ms"] = 0  # type: ignore[index]
+    resealed = seal_execution_benchmark_receipt(receipt)
+    assert resealed is not None
+    position.exit_execution_benchmark_receipts = [resealed]
+
+    task = FundingSettlementReconciler.new_pending_task(
+        position,
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+
+    assert task is not None
+    assert task["execution_benchmark_complete"] is False
+    assert task["implementation_shortfall_quote"] is None
+
+
+def test_pending_task_rejects_unidentified_execution_fill_receipt() -> None:
+    position = _position(
+        execution_benchmark_complete=True,
+        entry_benchmark_long_price=100.0,
+        entry_benchmark_short_price=100.0,
+        entry_implementation_shortfall_quote=0.0,
+        exit_implementation_shortfall_quote=0.0,
+    )
+    receipt = _exit_benchmark_receipt(position)
+    receipt["short"]["fills"][0]["order_id"] = ""
+    receipt["short"]["fills"][0]["client_order_id"] = ""
+    sealed = seal_execution_benchmark_receipt(receipt)
+    assert sealed is not None
+    receipt = sealed
+    position.exit_execution_benchmark_receipts = [receipt]
+
+    task = FundingSettlementReconciler.new_pending_task(
+        position,
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+
+    assert task is not None
+    assert task["execution_benchmark_complete"] is False
 
 
 @pytest.mark.asyncio
@@ -464,7 +763,7 @@ async def test_worker_failure_preserves_retry_when_deferred_telemetry_fails(
 async def test_runtime_reconciles_complete_task_without_reopening_exposure_lifecycle() -> None:
     state = EngineState()
     task = FundingSettlementReconciler.new_pending_task(
-        _position(),
+        _position(execution_fee_complete=True),
         closed_at_ms=2_000,
         price_pnl_quote=1.0,
         entry_fee_quote=0.2,
@@ -495,6 +794,7 @@ async def test_runtime_reconciles_complete_task_without_reopening_exposure_lifec
     assert state.pending_funding_settlement_reconciliations == []
     record = next(payload for kind, payload in journal.records if kind == "funding.settlement_reconciled")
     assert record["official_pnl"] is True
+    assert record["reconciled_at_ms"] == 3_000
     assert record["official_funding_quote"] == pytest.approx(0.4)
     assert record["official_net_quote"] == pytest.approx(0.9)
     assert record["price_pnl_quote"] == pytest.approx(1.0)
@@ -571,8 +871,110 @@ async def test_nonblocking_receipt_derives_flat_truth_from_fresh_account_probe()
         if kind == "funding.settlement_reconciled"
     )
     assert receipt["exchange_truth"]["truth_available"] is True
+    assert receipt["reconciled_at_ms"] == 3_000
     assert receipt["exchange_truth"]["positions_flat"] is True
     assert receipt["exchange_truth"]["open_orders_flat"] is True
+    truth_index = next(
+        index
+        for index, (kind, _) in enumerate(journal.records)
+        if kind == "runtime.position_lifecycle_terminal"
+    )
+    receipt_index = next(
+        index
+        for index, (kind, _) in enumerate(journal.records)
+        if kind == "funding.settlement_reconciled"
+    )
+    truth = journal.records[truth_index][1]
+    assert truth_index < receipt_index
+    assert truth["exchange_truth_captured_at_ms"] == 3_000
+    assert truth["exchange_truth_scope"] == {
+        "position_id": "position-1",
+        "symbol": "BTCUSDT",
+        "venues": ["binance", "okx"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_truth_receipt_is_idempotent_when_accounting_receipt_retries() -> None:
+    """A receipt write failure must not create duplicate truth evidence."""
+    state = EngineState()
+    task = FundingSettlementReconciler.new_pending_task(
+        _position(),
+        closed_at_ms=2_000,
+        price_pnl_quote=1.0,
+        entry_fee_quote=0.2,
+        exit_fee_quote=0.3,
+    )
+    assert task is not None
+    state.enqueue_pending_funding_settlement_reconciliation(task)
+    # First critical write is the truth event, second is the accounting
+    # receipt.  Fail only the latter, then verify retry reuses its proof.
+    journal = _FailNthCriticalJournal(2)
+
+    async def collect_account_truth(_now_ms: int) -> dict[str, object]:
+        evidence = []
+        for venue in ("binance", "okx"):
+            evidence.extend(
+                [
+                    {
+                        "venue": venue,
+                        "symbol": "*",
+                        "endpoint": "fetch_all_positions",
+                        "classification": "position_probe_unfiltered_succeeded",
+                    },
+                    {
+                        "venue": venue,
+                        "symbol": "*",
+                        "endpoint": "fetch_open_orders",
+                        "classification": "open_order_probe_unfiltered_succeeded",
+                    },
+                ]
+            )
+        return {
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": evidence,
+            "errors": [],
+        }
+
+    runtime = CloseRuntime(
+        SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={
+                Venue.BINANCE: _StatementsAdapter([_statement(Venue.BINANCE, -0.1)]),
+                Venue.OKX: _StatementsAdapter([_statement(Venue.OKX, 0.5)]),
+            },
+            journal=journal,
+            _collect_recovery_ledger_account_truth=collect_account_truth,
+        )
+    )
+
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_000)
+
+    assert [kind for kind, _ in journal.records].count(
+        "runtime.position_lifecycle_terminal"
+    ) == 1
+    assert not any(kind == "funding.settlement_reconciled" for kind, _ in journal.records)
+    retained = state.pending_funding_settlement_reconciliations[0]
+    retained["next_attempt_ms"] = 3_100
+
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_100)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await runtime.drive_pending_funding_settlement_reconciliations_nonblocking(3_100)
+
+    kinds = [kind for kind, _ in journal.records]
+    assert kinds.count("runtime.position_lifecycle_terminal") == 1
+    assert kinds.count("funding.settlement_reconciled") == 1
+    assert kinds.index("runtime.position_lifecycle_terminal") < kinds.index(
+        "funding.settlement_reconciled"
+    )
 
 
 @pytest.mark.asyncio

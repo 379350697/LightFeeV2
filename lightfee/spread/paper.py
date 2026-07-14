@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from math import isfinite
+from typing import Iterable
 
 from lightfee.offline.paper_outcome import classify_paper_outcome
 from lightfee.sidecar.snapshot import QuoteSnapshot
@@ -18,6 +19,7 @@ from lightfee.spread.models import SpreadReversionCandidate
 from lightfee.spread.research_manifest import (
     DEFAULT_SPREAD_RESEARCH_MANIFEST,
     SpreadResearchManifest,
+    research_contract_digest,
 )
 from lightfee.strategy.fee_evidence import (
     FEE_EVIDENCE_SCHEMA_VERSION,
@@ -26,12 +28,221 @@ from lightfee.strategy.fee_evidence import (
 )
 
 
-# v6 persists the fee schedule, signed account-evidence provenance, manifest
-# digest and latency reserve captured at entry.  Older
+# v8 persists a complete, immutable execution contract with every position.
+# A live fee refresh may change admission for *new* paper positions, but it
+# must never re-price a pending or open observation.  Older
 # rows remain historical diagnostics but cannot be resumed as official paper
 # positions because re-pricing their exit fee under today's schedule would
 # rewrite their economics.
-SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 6
+SPREAD_PAPER_JOURNAL_SCHEMA_VERSION = 8
+
+# Paper records are a state machine, not independent analytics samples.  Keep
+# this vocabulary and the transition validator shared by restart recovery and
+# the offline promotion gate: otherwise a new writer event can be accepted by
+# one path while silently disabling or miscounting the other.
+SPREAD_PAPER_REPLAY_KINDS = frozenset(
+    {
+        "opportunity.paper_registered",
+        "opportunity.paper_maker_fill_observed",
+        "opportunity.paper_hedge_filled",
+        "opportunity.paper_taker_pair_filled",
+        "opportunity.paper_funding_settlement_observed",
+        "opportunity.paper_markout",
+        "opportunity.paper_delta_markout",
+        "opportunity.paper_evaluation_skipped",
+        "opportunity.paper_closed",
+        "opportunity.paper_expired",
+    }
+)
+_PAPER_INCREMENTAL_REPLAY_KINDS = frozenset(
+    {
+        "opportunity.paper_maker_fill_observed",
+        "opportunity.paper_hedge_filled",
+        "opportunity.paper_taker_pair_filled",
+        "opportunity.paper_funding_settlement_observed",
+    }
+)
+_PAPER_POSITION_REPLAY_KINDS = _PAPER_INCREMENTAL_REPLAY_KINDS | frozenset(
+    {"opportunity.paper_registered"}
+)
+_PAPER_HORIZON_REPLAY_KINDS = frozenset(
+    {
+        "opportunity.paper_markout",
+        "opportunity.paper_delta_markout",
+        "opportunity.paper_evaluation_skipped",
+    }
+)
+_PAPER_TERMINAL_REPLAY_KINDS = frozenset(
+    {
+        "opportunity.paper_closed",
+        "opportunity.paper_expired",
+    }
+)
+
+
+def _paper_replay_next_state(state: str | None, kind: str) -> str | None:
+    """Return the next paper lifecycle state, or ``None`` for a bad edge.
+
+    ``pending`` is deliberately distinct from a fully paired position.  A
+    close has PnL meaning only after a taker pair or maker-then-hedge fill;
+    allowing ``registered -> closed`` would let a fabricated terminal row
+    masquerade as an executable acceptance observation.
+    """
+    if kind == "opportunity.paper_registered":
+        return "pending" if state is None else None
+    if kind == "opportunity.paper_taker_pair_filled":
+        # A complete taker fill can be the first record after journal
+        # rotation; partial maker/hedge/funding updates cannot create a
+        # position by themselves.
+        if state in {None, "pending"}:
+            return "active_taker"
+        return None
+    if kind == "opportunity.paper_maker_fill_observed":
+        return "active_maker" if state == "pending" else None
+    if kind == "opportunity.paper_hedge_filled":
+        return "active_taker" if state == "active_maker" else None
+    if kind == "opportunity.paper_funding_settlement_observed":
+        # A maker leg is genuine exposure before its delayed hedge arrives;
+        # its position-allocated funding cash flow is therefore replayable,
+        # but it must remain non-official until the hedge transition.
+        if state in {"active_maker", "active_taker"}:
+            return state
+        return None
+    if kind in {
+        "opportunity.paper_markout",
+        "opportunity.paper_evaluation_skipped",
+    }:
+        return "active_taker" if state == "active_taker" else None
+    if kind == "opportunity.paper_delta_markout":
+        return "active_maker" if state == "active_maker" else None
+    if kind == "opportunity.paper_closed":
+        return "terminal" if state == "active_taker" else None
+    if kind == "opportunity.paper_expired":
+        # Pending entries expire without a fill.  A maker exposure can also
+        # reach its terminal risk boundary before its delayed hedge arrives.
+        if state in {"pending", "active_maker"}:
+            return "terminal"
+        return None
+    return None
+
+
+def paper_journal_replay_integrity_faults(
+    records: Iterable[object],
+    *,
+    require_journal_envelope: bool = False,
+) -> int:
+    """Count non-replayable paper-state rows without mutating a tracker.
+
+    This deliberately uses the same lifecycle transitions as recovery.  The
+    offline v3 promoter therefore cannot treat an isolated, hand-edited
+    terminal row as a complete paper cohort merely because its frozen PnL
+    fields look plausible.
+    """
+    faults = 0
+    paper_states: dict[str, str] = {}
+    paper_identities: dict[str, tuple[str, ...]] = {}
+    paper_horizons: dict[str, dict[str, tuple[bool, int]]] = {}
+    emitted_horizons: dict[str, set[str]] = {}
+    seen_event_ids: set[tuple[str, int]] = set()
+    last_seq_by_run: dict[str, int] = {}
+    last_ts_by_run: dict[str, int] = {}
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        if not isinstance(kind, str) or not kind.startswith("opportunity.paper_"):
+            continue
+        payload = record.get("payload")
+        if kind not in SPREAD_PAPER_REPLAY_KINDS or not isinstance(payload, dict):
+            faults += 1
+            continue
+
+        paper_id = str(payload.get("paper_id", "") or "").strip()
+        if not paper_id:
+            faults += 1
+            continue
+
+        identity = _paper_immutable_identity(payload)
+        if identity is None:
+            faults += 1
+            continue
+        prior_identity = paper_identities.get(paper_id)
+        if prior_identity is not None and identity != prior_identity:
+            faults += 1
+            continue
+
+        # Registration and fill updates are the rows from which recovery
+        # reconstructs an executable position.  Applying only their event
+        # names would let a malformed v8 contract be followed by a plausible
+        # close and promoted offline, despite runtime recovery poisoning it.
+        if (
+            kind in _PAPER_POSITION_REPLAY_KINDS
+            and not _paper_state_payload_replayable(payload)
+        ):
+            faults += 1
+            continue
+
+        if require_journal_envelope:
+            raw_run_id = record.get("run_id")
+            run_id = raw_run_id.strip() if isinstance(raw_run_id, str) else ""
+            raw_sequence = record.get("seq", 0)
+            raw_journal_at_ms = record.get("ts_ms", 0)
+            try:
+                sequence = int(raw_sequence)
+                journal_at_ms = int(raw_journal_at_ms)
+            except (TypeError, ValueError, OverflowError):
+                faults += 1
+                continue
+            event_id = (run_id, sequence)
+            if (
+                not run_id
+                or isinstance(raw_sequence, bool)
+                or isinstance(raw_journal_at_ms, bool)
+                or sequence <= 0
+                or journal_at_ms <= 0
+                or event_id in seen_event_ids
+                or sequence <= last_seq_by_run.get(run_id, 0)
+                or journal_at_ms < last_ts_by_run.get(run_id, 0)
+            ):
+                faults += 1
+                continue
+            seen_event_ids.add(event_id)
+            last_seq_by_run[run_id] = sequence
+            last_ts_by_run[run_id] = journal_at_ms
+
+        next_state = _paper_replay_next_state(paper_states.get(paper_id), kind)
+        if next_state is None:
+            faults += 1
+            continue
+        if kind in _PAPER_POSITION_REPLAY_KINDS:
+            horizons = _paper_due_horizons_from_state_payload(payload)
+            if horizons is None:
+                faults += 1
+                continue
+        elif kind in _PAPER_HORIZON_REPLAY_KINDS | _PAPER_TERMINAL_REPLAY_KINDS:
+            horizon_kind = _paper_replay_horizon_key(
+                kind,
+                payload,
+                paper_horizons.get(paper_id),
+            )
+            emitted = emitted_horizons.setdefault(paper_id, set())
+            if horizon_kind is None or horizon_kind in emitted:
+                faults += 1
+                continue
+        else:
+            horizon_kind = ""
+        paper_states[paper_id] = next_state
+        paper_identities.setdefault(paper_id, identity)
+        if kind in _PAPER_POSITION_REPLAY_KINDS:
+            paper_horizons[paper_id] = horizons
+            if kind in _PAPER_INCREMENTAL_REPLAY_KINDS - {
+                "opportunity.paper_funding_settlement_observed"
+            }:
+                emitted_horizons[paper_id] = set()
+        elif kind in _PAPER_HORIZON_REPLAY_KINDS | _PAPER_TERMINAL_REPLAY_KINDS:
+            emitted_horizons[paper_id].add(horizon_kind)
+    return faults
 
 
 class PaperOrderState(StrEnum):
@@ -115,6 +326,408 @@ class SpreadPaperConfig:
     research_manifest: SpreadResearchManifest = field(
         default_factory=lambda: DEFAULT_SPREAD_RESEARCH_MANIFEST
     )
+
+
+@dataclass(frozen=True)
+class SpreadPaperExecutionContract:
+    """All post-registration paper economics, frozen per position.
+
+    ``SpreadPaperConfig`` is deliberately mutable at the tracker boundary: a
+    service refresh can install newer fee evidence for future admissions.  A
+    position instead carries this serializable contract through pending fill,
+    active exit, markout, funding allocation, and recovery.
+    """
+
+    schema_version: int
+    enabled: bool
+    model_epoch: str
+    research_manifest_digest: str
+    finalist_limit: int
+    min_decision_latency_ms: int
+    markout_secs: tuple[int, ...]
+    terminal_secs: int
+    active_exit_enabled: bool
+    exit_z: float
+    stop_z: float
+    max_hold_ms: int
+    taker_fee_bps_by_venue: dict[str, float]
+    maker_fee_bps_by_venue: dict[str, float]
+    verified_maker_rebate_bps_by_venue: dict[str, float]
+    slippage_buffer_bps: float
+    latency_buffer_bps: float
+    require_l2_vwap: bool
+    require_account_fee_evidence: bool
+    fee_evidence_account_identity_hashes: dict[str, str]
+    allow_verified_maker_rebates: bool
+    oos_start_ms: int
+    require_out_of_sample: bool
+    excluded_symbols: tuple[str, ...]
+    allowed_opportunity_labels: tuple[str, ...]
+    episode_cooldown_ms: int
+    paper_bot_ids: tuple[str, ...]
+    primary_fill_model: str
+    require_taker_taker: bool
+    quote_ttl_ms: int
+    quote_skew_ms: int
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "enabled": self.enabled,
+            "model_epoch": self.model_epoch,
+            "research_manifest_digest": self.research_manifest_digest,
+            "finalist_limit": self.finalist_limit,
+            "min_decision_latency_ms": self.min_decision_latency_ms,
+            "markout_secs": list(self.markout_secs),
+            "terminal_secs": self.terminal_secs,
+            "active_exit_enabled": self.active_exit_enabled,
+            "exit_z": self.exit_z,
+            "stop_z": self.stop_z,
+            "max_hold_ms": self.max_hold_ms,
+            "taker_fee_bps_by_venue": dict(self.taker_fee_bps_by_venue),
+            "maker_fee_bps_by_venue": dict(self.maker_fee_bps_by_venue),
+            "verified_maker_rebate_bps_by_venue": dict(
+                self.verified_maker_rebate_bps_by_venue
+            ),
+            "slippage_buffer_bps": self.slippage_buffer_bps,
+            "latency_buffer_bps": self.latency_buffer_bps,
+            "require_l2_vwap": self.require_l2_vwap,
+            "require_account_fee_evidence": self.require_account_fee_evidence,
+            "fee_evidence_account_identity_hashes": dict(
+                self.fee_evidence_account_identity_hashes
+            ),
+            "allow_verified_maker_rebates": self.allow_verified_maker_rebates,
+            "oos_start_ms": self.oos_start_ms,
+            "require_out_of_sample": self.require_out_of_sample,
+            "excluded_symbols": list(self.excluded_symbols),
+            "allowed_opportunity_labels": list(self.allowed_opportunity_labels),
+            "episode_cooldown_ms": self.episode_cooldown_ms,
+            "paper_bot_ids": list(self.paper_bot_ids),
+            "primary_fill_model": self.primary_fill_model,
+            "require_taker_taker": self.require_taker_taker,
+            "quote_ttl_ms": self.quote_ttl_ms,
+            "quote_skew_ms": self.quote_skew_ms,
+        }
+
+    @property
+    def digest(self) -> str:
+        try:
+            return research_contract_digest(self.to_payload())
+        except (TypeError, ValueError):
+            return ""
+
+
+PaperExecutionConfig = SpreadPaperConfig | SpreadPaperExecutionContract
+
+
+def _normalized_fee_map(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for raw_venue, raw_bps in value.items():
+        venue = str(raw_venue or "").strip().lower()
+        try:
+            bps = float(raw_bps)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if venue and isfinite(bps):
+            normalized[venue] = bps
+    return dict(sorted(normalized.items()))
+
+
+def _strict_contract_int(payload: dict[str, object], field: str) -> int | None:
+    """Read a persisted contract integer without Python's bool/float coercion."""
+    value = payload.get(field)
+    return value if type(value) is int else None
+
+
+def _strict_contract_float(payload: dict[str, object], field: str) -> float | None:
+    """Read a canonical JSON float, rejecting coercible but different values."""
+    value = payload.get(field)
+    return value if type(value) is float and isfinite(value) else None
+
+
+def _strict_contract_bool(payload: dict[str, object], field: str) -> bool | None:
+    value = payload.get(field)
+    return value if type(value) is bool else None
+
+
+def _strict_contract_string(payload: dict[str, object], field: str) -> str | None:
+    value = payload.get(field)
+    return value if type(value) is str else None
+
+
+def _strict_contract_int_list(
+    payload: dict[str, object], field: str
+) -> list[int] | None:
+    value = payload.get(field)
+    if not isinstance(value, list) or any(type(item) is not int for item in value):
+        return None
+    return value
+
+
+def _strict_contract_string_list(
+    payload: dict[str, object], field: str
+) -> list[str] | None:
+    value = payload.get(field)
+    if not isinstance(value, list) or any(type(item) is not str for item in value):
+        return None
+    return value
+
+
+def _strict_contract_fee_map(
+    payload: dict[str, object], field: str
+) -> dict[str, float] | None:
+    value = payload.get(field)
+    if not isinstance(value, dict) or any(
+        type(venue) is not str
+        or type(fee_bps) is not float
+        or not isfinite(fee_bps)
+        for venue, fee_bps in value.items()
+    ):
+        return None
+    return _normalized_fee_map(value)
+
+
+def _strict_contract_identity_hash_map(
+    payload: dict[str, object], field: str
+) -> dict[str, str] | None:
+    value = payload.get(field)
+    if not isinstance(value, dict) or any(
+        type(venue) is not str or type(identity) is not str
+        for venue, identity in value.items()
+    ):
+        return None
+    return dict(
+        sorted((venue.lower(), identity.lower()) for venue, identity in value.items())
+    )
+
+
+def _execution_contract_from_config(
+    config: SpreadPaperConfig,
+) -> SpreadPaperExecutionContract:
+    evidence = config.account_fee_evidence
+    verified_maker_rebates: dict[str, float] = {}
+    if (
+        config.allow_verified_maker_rebates is True
+        and evidence is not None
+        and evidence.integrity_verified is True
+    ):
+        for venue, raw_fee in config.maker_fee_bps_by_venue.items():
+            normalized_venue = str(venue or "").lower()
+            try:
+                fee = float(raw_fee)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            schedule = evidence.schedule_for(normalized_venue)
+            if (
+                fee < 0.0
+                and schedule is not None
+                and abs(schedule.maker_fee_bps - fee) <= 1e-12
+            ):
+                verified_maker_rebates[normalized_venue] = fee
+    return SpreadPaperExecutionContract(
+        schema_version=1,
+        enabled=config.enabled is True,
+        model_epoch=str(config.model_epoch or ""),
+        research_manifest_digest=str(config.research_manifest.digest or "").lower(),
+        finalist_limit=int(config.finalist_limit),
+        min_decision_latency_ms=int(config.min_decision_latency_ms),
+        markout_secs=tuple(int(value) for value in config.markout_secs),
+        terminal_secs=int(config.terminal_secs),
+        active_exit_enabled=config.active_exit_enabled is True,
+        exit_z=float(config.exit_z),
+        stop_z=float(config.stop_z),
+        max_hold_ms=int(config.max_hold_ms),
+        taker_fee_bps_by_venue=_normalized_fee_map(config.taker_fee_bps_by_venue),
+        maker_fee_bps_by_venue=_normalized_fee_map(config.maker_fee_bps_by_venue),
+        verified_maker_rebate_bps_by_venue=_normalized_fee_map(verified_maker_rebates),
+        slippage_buffer_bps=float(config.slippage_buffer_bps),
+        latency_buffer_bps=float(config.latency_buffer_bps),
+        require_l2_vwap=config.require_l2_vwap is True,
+        require_account_fee_evidence=config.require_account_fee_evidence is True,
+        fee_evidence_account_identity_hashes=dict(
+            sorted(
+                (
+                    str(venue or "").lower(),
+                    str(identity or "").lower(),
+                )
+                for venue, identity in config.fee_evidence_account_identity_hashes.items()
+            )
+        ),
+        allow_verified_maker_rebates=config.allow_verified_maker_rebates is True,
+        oos_start_ms=int(config.oos_start_ms),
+        require_out_of_sample=config.require_out_of_sample is True,
+        excluded_symbols=tuple(
+            sorted({str(symbol or "").upper() for symbol in config.excluded_symbols})
+        ),
+        allowed_opportunity_labels=tuple(
+            sorted({str(label or "") for label in config.allowed_opportunity_labels})
+        ),
+        episode_cooldown_ms=int(config.episode_cooldown_ms),
+        paper_bot_ids=tuple(str(bot or "") for bot in config.paper_bot_ids),
+        primary_fill_model=str(config.primary_fill_model or "").lower(),
+        require_taker_taker=config.require_taker_taker is True,
+        quote_ttl_ms=int(config.quote_ttl_ms),
+        quote_skew_ms=int(config.quote_skew_ms),
+    )
+
+
+def _execution_contract_from_payload(
+    payload: object,
+) -> SpreadPaperExecutionContract | None:
+    if not isinstance(payload, dict):
+        return None
+    schema_version = _strict_contract_int(payload, "schema_version")
+    enabled = _strict_contract_bool(payload, "enabled")
+    model_epoch = _strict_contract_string(payload, "model_epoch")
+    research_manifest_digest = _strict_contract_string(
+        payload, "research_manifest_digest"
+    )
+    finalist_limit = _strict_contract_int(payload, "finalist_limit")
+    min_decision_latency_ms = _strict_contract_int(
+        payload, "min_decision_latency_ms"
+    )
+    markout_secs = _strict_contract_int_list(payload, "markout_secs")
+    terminal_secs = _strict_contract_int(payload, "terminal_secs")
+    active_exit_enabled = _strict_contract_bool(payload, "active_exit_enabled")
+    exit_z = _strict_contract_float(payload, "exit_z")
+    stop_z = _strict_contract_float(payload, "stop_z")
+    max_hold_ms = _strict_contract_int(payload, "max_hold_ms")
+    taker_fees = _strict_contract_fee_map(payload, "taker_fee_bps_by_venue")
+    maker_fees = _strict_contract_fee_map(payload, "maker_fee_bps_by_venue")
+    verified_rebates = _strict_contract_fee_map(
+        payload, "verified_maker_rebate_bps_by_venue"
+    )
+    slippage_buffer_bps = _strict_contract_float(payload, "slippage_buffer_bps")
+    latency_buffer_bps = _strict_contract_float(payload, "latency_buffer_bps")
+    require_l2_vwap = _strict_contract_bool(payload, "require_l2_vwap")
+    require_account_fee_evidence = _strict_contract_bool(
+        payload, "require_account_fee_evidence"
+    )
+    fee_identity_hashes = _strict_contract_identity_hash_map(
+        payload, "fee_evidence_account_identity_hashes"
+    )
+    allow_verified_maker_rebates = _strict_contract_bool(
+        payload, "allow_verified_maker_rebates"
+    )
+    oos_start_ms = _strict_contract_int(payload, "oos_start_ms")
+    require_out_of_sample = _strict_contract_bool(payload, "require_out_of_sample")
+    excluded_symbols = _strict_contract_string_list(payload, "excluded_symbols")
+    allowed_opportunity_labels = _strict_contract_string_list(
+        payload, "allowed_opportunity_labels"
+    )
+    episode_cooldown_ms = _strict_contract_int(payload, "episode_cooldown_ms")
+    paper_bot_ids = _strict_contract_string_list(payload, "paper_bot_ids")
+    primary_fill_model = _strict_contract_string(payload, "primary_fill_model")
+    require_taker_taker = _strict_contract_bool(payload, "require_taker_taker")
+    quote_ttl_ms = _strict_contract_int(payload, "quote_ttl_ms")
+    quote_skew_ms = _strict_contract_int(payload, "quote_skew_ms")
+    if any(
+        value is None
+        for value in (
+            schema_version,
+            enabled,
+            model_epoch,
+            research_manifest_digest,
+            finalist_limit,
+            min_decision_latency_ms,
+            markout_secs,
+            terminal_secs,
+            active_exit_enabled,
+            exit_z,
+            stop_z,
+            max_hold_ms,
+            taker_fees,
+            maker_fees,
+            verified_rebates,
+            slippage_buffer_bps,
+            latency_buffer_bps,
+            require_l2_vwap,
+            require_account_fee_evidence,
+            fee_identity_hashes,
+            allow_verified_maker_rebates,
+            oos_start_ms,
+            require_out_of_sample,
+            excluded_symbols,
+            allowed_opportunity_labels,
+            episode_cooldown_ms,
+            paper_bot_ids,
+            primary_fill_model,
+            require_taker_taker,
+            quote_ttl_ms,
+            quote_skew_ms,
+        )
+    ):
+        return None
+    try:
+        contract = SpreadPaperExecutionContract(
+            schema_version=schema_version,
+            enabled=enabled,
+            model_epoch=model_epoch,
+            research_manifest_digest=research_manifest_digest.lower(),
+            finalist_limit=finalist_limit,
+            min_decision_latency_ms=min_decision_latency_ms,
+            markout_secs=tuple(markout_secs),
+            terminal_secs=terminal_secs,
+            active_exit_enabled=active_exit_enabled,
+            exit_z=exit_z,
+            stop_z=stop_z,
+            max_hold_ms=max_hold_ms,
+            taker_fee_bps_by_venue=taker_fees,
+            maker_fee_bps_by_venue=maker_fees,
+            verified_maker_rebate_bps_by_venue=verified_rebates,
+            slippage_buffer_bps=slippage_buffer_bps,
+            latency_buffer_bps=latency_buffer_bps,
+            require_l2_vwap=require_l2_vwap,
+            require_account_fee_evidence=require_account_fee_evidence,
+            fee_evidence_account_identity_hashes=fee_identity_hashes,
+            allow_verified_maker_rebates=allow_verified_maker_rebates,
+            oos_start_ms=oos_start_ms,
+            require_out_of_sample=require_out_of_sample,
+            excluded_symbols=tuple(sorted(set(excluded_symbols))),
+            allowed_opportunity_labels=tuple(sorted(set(allowed_opportunity_labels))),
+            episode_cooldown_ms=episode_cooldown_ms,
+            paper_bot_ids=tuple(paper_bot_ids),
+            primary_fill_model=primary_fill_model.lower(),
+            require_taker_taker=require_taker_taker,
+            quote_ttl_ms=quote_ttl_ms,
+            quote_skew_ms=quote_skew_ms,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        contract.schema_version != 1
+        or contract.to_payload() != payload
+        or not contract.digest
+    ):
+        return None
+    return contract
+
+
+def execution_contract_from_payload(
+    payload: object,
+) -> SpreadPaperExecutionContract | None:
+    """Strictly restore a frozen paper execution contract for read-only users.
+
+    Offline acceptance consumes the same canonical parser as runtime recovery.
+    Keeping that boundary public prevents reporting from accepting a record
+    whose economics runtime itself would reject after a restart.
+    """
+    return _execution_contract_from_payload(payload)
+
+
+def _research_config_contract_digest(config: SpreadPaperConfig) -> str:
+    """Return the identity of every config field that changes paper evidence.
+
+    The manifest digest alone is insufficient: changing cost assumptions,
+    exit thresholds, quote freshness, or OOS admission under one manifest
+    would otherwise silently mix incomparable samples.
+    """
+    try:
+        return _execution_contract_from_config(config).digest
+    except (TypeError, ValueError, OverflowError):
+        return ""
 
 
 def _is_strict_positive_int(value: object) -> bool:
@@ -227,6 +840,11 @@ class SpreadPaperPosition:
     official_pnl: bool = False
     research_manifest_version: str = "spread_research_manifest_v2"
     research_manifest_digest: str = ""
+    research_config_digest: str = ""
+    # This is the complete post-admission economics contract.  It is distinct
+    # from ``SpreadPaperTracker.config``, which may be refreshed for future
+    # registrations while this position is pending or open.
+    execution_contract: SpreadPaperExecutionContract | None = None
     research_hypothesis: str = ""
     acceptance_eligible: bool = False
     account_fee_evidence_complete: bool = False
@@ -263,6 +881,7 @@ class SpreadPaperTracker:
         self._emitted_horizons: dict[str, set[str]] = {}
         self._known_paper_ids: set[str] = set()
         self._episode_started_at_ms: dict[tuple[str, str, str, str], int] = {}
+        self._replay_integrity_valid = True
 
     @property
     def enabled(self) -> bool:
@@ -270,6 +889,8 @@ class SpreadPaperTracker:
         # A config typo must disable paper admission rather than silently turn
         # a maker control into the official result stream.
         return (
+            self._replay_integrity_valid is True
+            and
             self.config.enabled is True
             and _is_strict_positive_int(self.config.finalist_limit)
             and _is_strict_positive_int(self.config.min_decision_latency_ms)
@@ -278,11 +899,35 @@ class SpreadPaperTracker:
             and str(self.config.primary_fill_model or "").lower() == "taker_taker"
             and self.config.require_taker_taker is True
             and self.config.research_manifest.model_epoch == self.config.model_epoch
+            and bool(_research_config_contract_digest(self.config))
         )
 
     @property
     def tracked_count(self) -> int:
         return len(self._positions)
+
+    def invalidate_replay(self) -> None:
+        """Disable paper admission after an unscoped replay integrity fault."""
+        self._positions.clear()
+        self._emitted_horizons.clear()
+        self._known_paper_ids.clear()
+        self._episode_started_at_ms.clear()
+        self._replay_integrity_valid = False
+
+    @staticmethod
+    def _position_execution_contract(
+        position: SpreadPaperPosition,
+    ) -> SpreadPaperExecutionContract | None:
+        contract = position.execution_contract
+        if (
+            contract is None
+            or contract.digest != position.research_config_digest
+            or contract.model_epoch != position.model_epoch
+            or contract.research_manifest_digest
+            != position.research_manifest_digest.lower()
+        ):
+            return None
+        return contract
 
     def missing_due_quote_keys(
         self, now_ms: int, quotes: dict[str, QuoteSnapshot]
@@ -292,14 +937,15 @@ class SpreadPaperTracker:
     def missing_evaluation_quote_keys(
         self, now_ms: int, quotes: dict[str, QuoteSnapshot]
     ) -> set[tuple[str, str]]:
-        if not self.enabled:
-            return set()
         missing: set[tuple[str, str]] = set()
         for position in self._positions.values():
+            contract = self._position_execution_contract(position)
+            if contract is None:
+                continue
             if _position_has_pending_entry(position):
                 missing.update(_missing_quote_keys(position, quotes))
                 continue
-            if self._has_due_evaluation(position, now_ms):
+            if self._has_due_evaluation(position, now_ms, contract):
                 missing.update(_missing_quote_keys(position, quotes))
         return missing
 
@@ -401,54 +1047,219 @@ class SpreadPaperTracker:
             events.append(_registration_event(position))
         return events
 
-    def restore_from_records(self, records: list[dict]) -> None:
-        """Restore v5 open positions; prior journal schemas stay diagnostic-only."""
+    def restore_from_records(
+        self,
+        records: list[dict],
+        *,
+        require_journal_envelope: bool = False,
+    ) -> None:
+        """Restore v8 positions from their own frozen execution contracts."""
+        self._replay_integrity_valid = True
         self._positions.clear()
         self._emitted_horizons.clear()
         self._known_paper_ids.clear()
         self._episode_started_at_ms.clear()
+        # A later malformed state-bearing record must invalidate the whole
+        # replayed episode.  Keeping an earlier valid registration alive would
+        # turn a damaged fill/update row into a stale pending position that can
+        # be evaluated again after restart.
+        poisoned_paper_ids: set[str] = set()
+        paper_states: dict[str, str] = {}
+        paper_identities: dict[str, tuple[str, ...]] = {}
+        paper_horizons: dict[str, dict[str, tuple[bool, int]]] = {}
+        replayed_horizons: dict[str, set[str]] = {}
+        seen_event_ids: set[tuple[str, int]] = set()
+        last_seq_by_run: dict[str, int] = {}
+        last_ts_by_run: dict[str, int] = {}
+
+        def invalidate_replay() -> None:
+            self.invalidate_replay()
+
+        def poison(paper_id: str) -> None:
+            prior = self._positions.pop(paper_id, None)
+            self._emitted_horizons.pop(paper_id, None)
+            self._known_paper_ids.add(paper_id)
+            if prior is not None:
+                self._episode_started_at_ms.pop(
+                    _episode_key_from_position(prior), None
+                )
+            poisoned_paper_ids.add(paper_id)
+
         for record in records:
+            if not isinstance(record, dict):
+                # An unparseable journal record cannot be scoped to one paper
+                # position.  Continuing would make a prior pending position
+                # executable again after an unknown state transition.
+                invalidate_replay()
+                return
+            if require_journal_envelope:
+                raw_run_id = record.get("run_id")
+                run_id = raw_run_id.strip() if isinstance(raw_run_id, str) else ""
+                raw_sequence = record.get("seq", 0)
+                raw_journal_at_ms = record.get("ts_ms", 0)
+                try:
+                    sequence = int(raw_sequence)
+                    journal_at_ms = int(raw_journal_at_ms)
+                except (TypeError, ValueError, OverflowError):
+                    invalidate_replay()
+                    return
+                event_id = (run_id, sequence)
+                if (
+                    not run_id
+                    or isinstance(raw_sequence, bool)
+                    or isinstance(raw_journal_at_ms, bool)
+                    or sequence <= 0
+                    or journal_at_ms <= 0
+                    or event_id in seen_event_ids
+                    or sequence <= last_seq_by_run.get(run_id, 0)
+                    or journal_at_ms < last_ts_by_run.get(run_id, 0)
+                ):
+                    invalidate_replay()
+                    return
+                seen_event_ids.add(event_id)
+                last_seq_by_run[run_id] = sequence
+                last_ts_by_run[run_id] = journal_at_ms
             kind = str(record.get("kind", "") or "")
             payload = record.get("payload")
+            if (
+                kind.startswith("opportunity.paper_")
+                and kind not in SPREAD_PAPER_REPLAY_KINDS
+            ):
+                # This namespace is a versioned state machine.  An unknown
+                # event can be a terminal transition from a newer writer; it
+                # must not be ignored and leave an older pending entry live.
+                invalidate_replay()
+                return
+            if kind in SPREAD_PAPER_REPLAY_KINDS and not isinstance(payload, dict):
+                # The event is a state transition but its owner is unavailable,
+                # so per-paper poison is impossible.  Reject the full replay.
+                invalidate_replay()
+                return
             if not isinstance(payload, dict):
                 continue
             paper_id = str(payload.get("paper_id", "") or "")
+            if kind in SPREAD_PAPER_REPLAY_KINDS and not paper_id:
+                invalidate_replay()
+                return
             if not paper_id:
                 continue
-            if kind in {
-                "opportunity.paper_registered",
-                "opportunity.paper_maker_fill_observed",
-                "opportunity.paper_hedge_filled",
-                "opportunity.paper_taker_pair_filled",
-                "opportunity.paper_funding_settlement_observed",
-            }:
+            if paper_id in poisoned_paper_ids:
+                continue
+            state = paper_states.get(paper_id)
+            if kind in SPREAD_PAPER_REPLAY_KINDS:
+                next_state = _paper_replay_next_state(state, kind)
+                if next_state is None:
+                    invalidate_replay()
+                    return
+                identity = _paper_immutable_identity(payload)
+                if identity is None:
+                    invalidate_replay()
+                    return
+                prior_identity = paper_identities.get(paper_id)
+                if prior_identity is not None and identity != prior_identity:
+                    invalidate_replay()
+                    return
+                if kind in _PAPER_POSITION_REPLAY_KINDS:
+                    horizons = _paper_due_horizons_from_state_payload(payload)
+                    if horizons is None:
+                        invalidate_replay()
+                        return
+                elif kind in _PAPER_HORIZON_REPLAY_KINDS | _PAPER_TERMINAL_REPLAY_KINDS:
+                    horizon_kind = _paper_replay_horizon_key(
+                        kind,
+                        payload,
+                        paper_horizons.get(paper_id),
+                    )
+                    emitted = replayed_horizons.setdefault(paper_id, set())
+                    if horizon_kind is None or horizon_kind in emitted:
+                        invalidate_replay()
+                        return
+            else:
+                next_state = state
+            if kind in _PAPER_INCREMENTAL_REPLAY_KINDS:
+                # A taker-pair fill is a full, frozen position snapshot.  A
+                # journal rotation can therefore begin with it; requiring an
+                # earlier registration would discard valid diagnostic
+                # observations on restart.  Incremental transitions remain
+                # ordered and may not create a position by themselves.
                 # A journal is an external restart boundary.  Older records
                 # remain readable on disk, but may not acquire current-model
                 # execution authority or official-PnL status by being loaded
                 # into a newer process.
-                if not _restorable_current_v3_record(payload, self.config):
-                    self._known_paper_ids.add(paper_id)
+                if not _restorable_current_v3_record(payload):
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
                     continue
                 position = _position_from_payload(payload)
                 if position is None:
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
                     continue
-                if not _restored_position_has_fee_evidence(position, self.config):
-                    self._known_paper_ids.add(paper_id)
+                contract = self._position_execution_contract(position)
+                if contract is None or not _restored_position_has_fee_evidence(
+                    position, contract
+                ):
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
                     continue
-                if not _restored_position_is_official_eligible(position, self.config):
+                if not _restored_position_is_official_eligible(
+                    position,
+                    contract,
+                    self.config,
+                ):
                     position = replace(position, official_pnl=False)
                 self._known_paper_ids.add(paper_id)
                 self._positions[paper_id] = position
                 self._emitted_horizons.setdefault(paper_id, set())
                 self._record_episode(position)
-            elif kind in {"opportunity.paper_markout", "opportunity.paper_delta_markout", "opportunity.paper_closed", "opportunity.paper_expired"}:
+                paper_states[paper_id] = next_state
+            elif kind == "opportunity.paper_registered":
+                if not _restorable_current_v3_record(payload):
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
+                    continue
+                position = _position_from_payload(payload)
+                if position is None:
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
+                    continue
+                contract = self._position_execution_contract(position)
+                if contract is None or not _restored_position_has_fee_evidence(
+                    position, contract
+                ):
+                    poison(paper_id)
+                    paper_states[paper_id] = "poisoned"
+                    continue
+                if not _restored_position_is_official_eligible(
+                    position,
+                    contract,
+                    self.config,
+                ):
+                    position = replace(position, official_pnl=False)
+                self._known_paper_ids.add(paper_id)
+                self._positions[paper_id] = position
+                self._emitted_horizons.setdefault(paper_id, set())
+                self._record_episode(position)
+                paper_states[paper_id] = next_state
+            elif kind in _PAPER_HORIZON_REPLAY_KINDS | _PAPER_TERMINAL_REPLAY_KINDS:
                 self._known_paper_ids.add(paper_id)
                 horizon = str(payload.get("horizon_kind", "") or "")
                 if horizon:
                     self._emitted_horizons.setdefault(paper_id, set()).add(horizon)
-                if kind in {"opportunity.paper_closed", "opportunity.paper_expired"}:
+                if kind in _PAPER_TERMINAL_REPLAY_KINDS:
                     self._positions.pop(paper_id, None)
                     self._emitted_horizons.pop(paper_id, None)
+                paper_states[paper_id] = next_state
+            if kind in SPREAD_PAPER_REPLAY_KINDS:
+                paper_identities.setdefault(paper_id, identity)
+                if kind in _PAPER_POSITION_REPLAY_KINDS:
+                    paper_horizons[paper_id] = horizons
+                    if kind in _PAPER_INCREMENTAL_REPLAY_KINDS - {
+                        "opportunity.paper_funding_settlement_observed"
+                    }:
+                        replayed_horizons[paper_id] = set()
+                elif kind in _PAPER_HORIZON_REPLAY_KINDS | _PAPER_TERMINAL_REPLAY_KINDS:
+                    replayed_horizons[paper_id].add(horizon_kind)
 
     def record_funding_settlements(
         self,
@@ -516,22 +1327,55 @@ class SpreadPaperTracker:
         """
         settlements: list[FundingSettlement] = []
         for position in self._positions.values():
+            contract = self._position_execution_contract(position)
+            if contract is None:
+                continue
             settlements.extend(
                 _public_settled_funding_for_position(
                     position,
                     now_ms=int(now_ms),
                     quotes=quotes,
-                    config=self.config,
+                    config=contract,
                 )
             )
         return self.record_funding_settlements(settlements)
 
     def evaluate_due(self, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> list[dict]:
-        if not self.enabled:
-            return []
         events: list[dict] = []
         closed: set[str] = set()
         for position in list(self._positions.values()):
+            contract = self._position_execution_contract(position)
+            if contract is None:
+                # A malformed persisted contract must never inherit today's
+                # schedule.  Emit one diagnostic terminal event and remove it
+                # from the executable lifecycle rather than silently re-price
+                # it under a refreshed tracker config.
+                events.append(
+                    _unpriced_event(
+                        position,
+                        {"kind": "terminal_invalid_contract", "terminal": True},
+                        now_ms,
+                        quotes,
+                        SpreadPaperConfig(),
+                    )
+                )
+                closed.add(position.paper_id)
+                continue
+            # Runtime config refreshes are a cohort boundary just like a
+            # restart.  Preserve the frozen legs and their diagnostic PnL,
+            # but remove official permission before *any* later lifecycle
+            # event so the result cannot depend on whether a process happened
+            # to restart between the configuration change and this markout.
+            if (
+                position.official_pnl is True
+                and not _position_matches_active_paper_cohort(
+                    position,
+                    contract,
+                    self.config,
+                )
+            ):
+                position = replace(position, official_pnl=False)
+                self._positions[position.paper_id] = position
             if _position_has_pending_entry(position):
                 # The pending-entry terminal is a strict admission boundary.
                 # Do this before inspecting executable quotes so a delayed
@@ -544,15 +1388,28 @@ class SpreadPaperTracker:
                             now_ms,
                             quotes,
                             "entry_not_filled",
-                            self.config,
+                            contract,
                         )
                     )
                     closed.add(position.paper_id)
                     continue
 
-                transition = self._advance_pending_entry(position, now_ms, quotes)
+                transition = self._advance_pending_entry(
+                    position, now_ms, quotes, contract
+                )
                 if transition is not None:
                     position, transition_kind = transition
+                    # A frozen execution contract preserves the original
+                    # economics, but it cannot grant current-cohort official
+                    # status after a manifest, model, fee, or v3 account
+                    # identity change.  This must be enforced again at the
+                    # pending-fill transition, not only during recovery.
+                    if not _position_matches_active_paper_cohort(
+                        position,
+                        contract,
+                        self.config,
+                    ):
+                        position = replace(position, official_pnl=False)
                     self._positions[position.paper_id] = position
                     # A maker-only delta observation belongs to the incomplete
                     # exposure phase.  Once a later transition rebases the
@@ -578,7 +1435,7 @@ class SpreadPaperTracker:
                                 horizon,
                                 now_ms,
                                 quotes,
-                                self.config,
+                                contract,
                             )
                         )
                         self._emitted_horizons.setdefault(position.paper_id, set()).add(
@@ -586,7 +1443,7 @@ class SpreadPaperTracker:
                         )
                 continue
 
-            active = self._active_exit_horizon(position, now_ms, quotes)
+            active = self._active_exit_horizon(position, now_ms, quotes, contract)
             # A delayed evaluator must emit every outstanding observation in
             # chronological order.  Emitting only the first due markout would
             # leave the terminal close open until another refresh, which is a
@@ -603,12 +1460,14 @@ class SpreadPaperTracker:
                 horizon_kind = str(horizon["kind"])
                 if horizon_kind in emitted:
                     continue
-                if not self._exit_quotes_fresh(position, now_ms, quotes):
+                if not self._exit_quotes_fresh(position, now_ms, quotes, contract):
                     event = _unpriced_event(
-                        position, horizon, now_ms, quotes, self.config
+                        position, horizon, now_ms, quotes, contract
                     )
                 else:
-                    event = self._build_due_event(position, horizon, now_ms, quotes)
+                    event = self._build_due_event(
+                        position, horizon, now_ms, quotes, contract
+                    )
                 events.append(event)
                 emitted.add(horizon_kind)
                 if bool(horizon.get("terminal")):
@@ -637,6 +1496,9 @@ class SpreadPaperTracker:
         registered_at_ms = int(decision_at_ms or 0)
         if registered_at_ms <= 0:
             return None
+        execution_contract = _execution_contract_from_config(self.config)
+        if not execution_contract.digest:
+            return None
         sample_split = _research_sample_split(candidate, self.config, registered_at_ms)
         if self.config.require_out_of_sample and sample_split != "out_of_sample":
             return None
@@ -653,11 +1515,11 @@ class SpreadPaperTracker:
             return None
         long_leg = _pending_leg(
             long_quote, candidate.long_venue, "long", bot.entry_long_role, long_raw,
-            requested_qty, self.config,
+            requested_qty, execution_contract,
         )
         short_leg = _pending_leg(
             short_quote, candidate.short_venue, "short", bot.entry_short_role, short_raw,
-            requested_qty, self.config,
+            requested_qty, execution_contract,
         )
         filled_qty = 0.0
         residual_qty = requested_qty
@@ -684,21 +1546,23 @@ class SpreadPaperTracker:
             registered_at_ms=registered_at_ms,
             entry_eligible_at_ms=entry_eligible_at_ms,
             entry_notional_quote=target_notional,
-            long_leg=_with_exit_terms(long_leg, bot.exit_long_role, self.config),
-            short_leg=_with_exit_terms(short_leg, bot.exit_short_role, self.config),
+            long_leg=_with_exit_terms(long_leg, bot.exit_long_role, execution_contract),
+            short_leg=_with_exit_terms(short_leg, bot.exit_short_role, execution_contract),
             candidate_snapshot=_candidate_snapshot(candidate),
             entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
             # Pending entries can expire after the decision window; once
             # filled, horizons are rebuilt from the actual fill timestamp.
-            due_horizons=_due_horizons(entry_eligible_at_ms, self.config),
+            due_horizons=_due_horizons(entry_eligible_at_ms, execution_contract),
             requested_base_qty=requested_qty,
             filled_base_qty=filled_qty,
             residual_base_qty=residual_qty,
             delta_exposure_base_qty=0.0,
-            model_epoch=self.config.model_epoch,
+            model_epoch=execution_contract.model_epoch,
             official_pnl=False,
             research_manifest_version=bot.manifest_version,
             research_manifest_digest=bot.manifest_digest,
+            research_config_digest=execution_contract.digest,
+            execution_contract=execution_contract,
             research_hypothesis=bot.hypothesis,
             acceptance_eligible=acceptance_eligible,
             account_fee_evidence_complete=(
@@ -723,6 +1587,7 @@ class SpreadPaperTracker:
         position: SpreadPaperPosition,
         now_ms: int,
         quotes: dict[str, QuoteSnapshot],
+        config: SpreadPaperExecutionContract,
     ) -> tuple[SpreadPaperPosition, str] | None:
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
         short_quote = _quote_for(quotes, position.short_venue, position.symbol)
@@ -732,8 +1597,8 @@ class SpreadPaperTracker:
             long_quote,
             short_quote,
             now_ms=now_ms,
-            ttl_ms=self.config.quote_ttl_ms,
-            quote_skew_ms=self.config.quote_skew_ms,
+            ttl_ms=config.quote_ttl_ms,
+            quote_skew_ms=config.quote_skew_ms,
         ):
             return None
         # A refresh may carry the identical quote object/timestamp long after
@@ -760,6 +1625,7 @@ class SpreadPaperTracker:
                 max(int(long_quote.observed_at_ms), int(short_quote.observed_at_ms)),
                 long_quote,
                 short_quote,
+                config,
             )
         if position.maker_fill_observed_at_ms <= 0:
             maker_position_leg = position.long_leg if maker_leg == "long" else position.short_leg
@@ -780,7 +1646,7 @@ class SpreadPaperTracker:
                 maker_position_leg.entry_raw_price,
                 maker_qty,
                 position.requested_base_qty,
-                self.config,
+                config,
                 PaperOrderState.UNKNOWN,
                 filled_at_ms=int(maker_quote.observed_at_ms),
                 execution_source="maker_bbo_unknown",
@@ -791,7 +1657,7 @@ class SpreadPaperTracker:
                     long_leg=_with_exit_terms(
                         filled_maker,
                         position.long_leg.exit_liquidity_role,
-                        self.config,
+                        config,
                     ),
                     maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=maker_qty,
@@ -804,7 +1670,7 @@ class SpreadPaperTracker:
                     ),
                     due_horizons=_due_horizons(
                         int(maker_quote.observed_at_ms),
-                        self.config,
+                        config,
                     ),
                 )
             else:
@@ -813,7 +1679,7 @@ class SpreadPaperTracker:
                     short_leg=_with_exit_terms(
                         filled_maker,
                         position.short_leg.exit_liquidity_role,
-                        self.config,
+                        config,
                     ),
                     maker_fill_observed_at_ms=int(maker_quote.observed_at_ms),
                     delta_exposure_base_qty=-maker_qty,
@@ -823,7 +1689,7 @@ class SpreadPaperTracker:
                     ),
                     due_horizons=_due_horizons(
                         int(maker_quote.observed_at_ms),
-                        self.config,
+                        config,
                     ),
                 )
             return next_position, "maker_fill_observed"
@@ -886,7 +1752,7 @@ class SpreadPaperTracker:
             hedge_execution.price,
             qty,
             position.requested_base_qty,
-            self.config,
+            config,
             PaperOrderState.UNKNOWN,
             filled_at_ms=int(hedge_quote.observed_at_ms),
             execution_source=hedge_execution.source,
@@ -897,7 +1763,7 @@ class SpreadPaperTracker:
                 short_leg=_with_exit_terms(
                     filled_hedge,
                     position.short_leg.exit_liquidity_role,
-                    self.config,
+                    config,
                 ),
                 filled_base_qty=qty,
                 residual_base_qty=residual,
@@ -907,7 +1773,7 @@ class SpreadPaperTracker:
                         int(position.long_leg.entry_filled_at_ms),
                         int(filled_hedge.entry_filled_at_ms),
                     ),
-                    self.config,
+                    config,
                 ),
             )
         else:
@@ -916,7 +1782,7 @@ class SpreadPaperTracker:
                 long_leg=_with_exit_terms(
                     filled_hedge,
                     position.long_leg.exit_liquidity_role,
-                    self.config,
+                    config,
                 ),
                 filled_base_qty=qty,
                 residual_base_qty=residual,
@@ -926,7 +1792,7 @@ class SpreadPaperTracker:
                         int(position.short_leg.entry_filled_at_ms),
                         int(filled_hedge.entry_filled_at_ms),
                     ),
-                    self.config,
+                    config,
                 ),
             )
         return next_position, "hedge_filled"
@@ -937,6 +1803,7 @@ class SpreadPaperTracker:
         now_ms: int,
         long_quote: QuoteSnapshot,
         short_quote: QuoteSnapshot,
+        config: SpreadPaperExecutionContract,
     ) -> tuple[SpreadPaperPosition, str] | None:
         """Fill a taker/taker paper pair only from later executable quotes."""
         requested_qty = position.requested_base_qty
@@ -950,7 +1817,7 @@ class SpreadPaperTracker:
         )
         if long_execution is None or short_execution is None:
             return None
-        if self.config.require_l2_vwap and not _executions_have_l2(
+        if config.require_l2_vwap and not _executions_have_l2(
             long_execution,
             short_execution,
         ):
@@ -994,14 +1861,14 @@ class SpreadPaperTracker:
         long_leg = _filled_leg(
             long_quote, position.long_venue, "long",
             position.long_leg.entry_liquidity_role, long_execution.price, quantity,
-            requested_qty, self.config, state,
+            requested_qty, config, state,
             filled_at_ms=int(long_quote.observed_at_ms),
             execution_source=long_execution.source,
         )
         short_leg = _filled_leg(
             short_quote, position.short_venue, "short",
             position.short_leg.entry_liquidity_role, short_execution.price, quantity,
-            requested_qty, self.config, state,
+            requested_qty, config, state,
             filled_at_ms=int(short_quote.observed_at_ms),
             execution_source=short_execution.source,
         )
@@ -1013,9 +1880,9 @@ class SpreadPaperTracker:
             # Disabling either strict gate retains diagnostic paper lifecycle
             # events, but must never relabel a BBO/unauthenticated simulation
             # as an official acceptance observation.
-            and self.config.require_l2_vwap is True
-            and self.config.require_account_fee_evidence is True
-            and _position_account_fee_evidence_complete(position, self.config)
+            and config.require_l2_vwap is True
+            and config.require_account_fee_evidence is True
+            and _position_account_fee_evidence_complete(position, config)
             and _executions_have_l2(long_execution, short_execution)
         )
         return (
@@ -1024,15 +1891,15 @@ class SpreadPaperTracker:
                 long_leg=_with_exit_terms(
                     long_leg,
                     position.long_leg.exit_liquidity_role,
-                    self.config,
+                    config,
                 ),
                 short_leg=_with_exit_terms(
                     short_leg,
                     position.short_leg.exit_liquidity_role,
-                    self.config,
+                    config,
                 ),
                 entry_market_snapshot=_market_snapshot_payload(long_quote, short_quote),
-                due_horizons=_due_horizons(now_ms, self.config),
+                due_horizons=_due_horizons(now_ms, config),
                 filled_base_qty=quantity,
                 residual_base_qty=residual,
                 delta_exposure_base_qty=0.0,
@@ -1041,9 +1908,14 @@ class SpreadPaperTracker:
             "taker_pair_filled",
         )
 
-    def _has_due_evaluation(self, position: SpreadPaperPosition, now_ms: int) -> bool:
+    def _has_due_evaluation(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        config: SpreadPaperExecutionContract,
+    ) -> bool:
         return self._next_horizon(position, now_ms) is not None or (
-            self.config.active_exit_enabled
+            config.active_exit_enabled
             and now_ms > _position_entry_completed_at_ms(position)
         )
 
@@ -1057,7 +1929,13 @@ class SpreadPaperTracker:
     def _terminal_due(self, position: SpreadPaperPosition, now_ms: int) -> bool:
         return any(bool(item["terminal"]) and int(item["due_at_ms"]) <= now_ms for item in position.due_horizons)
 
-    def _exit_quotes_fresh(self, position: SpreadPaperPosition, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> bool:
+    def _exit_quotes_fresh(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+        config: SpreadPaperExecutionContract,
+    ) -> bool:
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
         short_quote = _quote_for(quotes, position.short_venue, position.symbol)
         if long_quote is None or short_quote is None:
@@ -1066,8 +1944,8 @@ class SpreadPaperTracker:
             long_quote,
             short_quote,
             now_ms=now_ms,
-            ttl_ms=self.config.quote_ttl_ms,
-            quote_skew_ms=self.config.quote_skew_ms,
+            ttl_ms=config.quote_ttl_ms,
+            quote_skew_ms=config.quote_skew_ms,
         ):
             return False
         long_execution = _exit_execution(
@@ -1086,20 +1964,26 @@ class SpreadPaperTracker:
             long_execution is not None
             and short_execution is not None
             and (
-                not self.config.require_l2_vwap
+                not config.require_l2_vwap
                 or _executions_have_l2(long_execution, short_execution)
             )
             and long_execution.capacity + 1e-12 >= position.long_leg.qty
             and short_execution.capacity + 1e-12 >= position.short_leg.qty
         )
 
-    def _active_exit_horizon(self, position: SpreadPaperPosition, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> dict | None:
-        if not self.config.active_exit_enabled:
+    def _active_exit_horizon(
+        self,
+        position: SpreadPaperPosition,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+        config: SpreadPaperExecutionContract,
+    ) -> dict | None:
+        if not config.active_exit_enabled:
             return None
         if (
-            self.config.max_hold_ms > 0
+            config.max_hold_ms > 0
             and now_ms - _position_entry_completed_at_ms(position)
-            >= self.config.max_hold_ms
+            >= config.max_hold_ms
         ):
             return {"kind": "active_exit:max_hold", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_max_hold_elapsed"}
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
@@ -1108,16 +1992,23 @@ class SpreadPaperTracker:
         z = _position_exit_z_score(position, spread)
         if z is None:
             return None
-        if self.config.stop_z > 0.0 and abs(z) >= self.config.stop_z:
+        if config.stop_z > 0.0 and abs(z) >= config.stop_z:
             return {"kind": "active_exit:stop", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_stop_z_reached", "exit_z_score": z}
-        if abs(z) <= max(self.config.exit_z, 0.0):
+        if abs(z) <= max(config.exit_z, 0.0):
             return {"kind": "active_exit:converged", "due_at_ms": now_ms, "terminal": True, "close_reason": "spread_converged", "exit_z_score": z}
         return None
 
-    def _build_due_event(self, position: SpreadPaperPosition, horizon: dict, now_ms: int, quotes: dict[str, QuoteSnapshot]) -> dict:
+    def _build_due_event(
+        self,
+        position: SpreadPaperPosition,
+        horizon: dict,
+        now_ms: int,
+        quotes: dict[str, QuoteSnapshot],
+        config: SpreadPaperExecutionContract,
+    ) -> dict:
         long_quote = _quote_for(quotes, position.long_venue, position.symbol)
         short_quote = _quote_for(quotes, position.short_venue, position.symbol)
-        payload = _payload(position, str(horizon["kind"]), now_ms, long_quote, short_quote, self.config)
+        payload = _payload(position, str(horizon["kind"]), now_ms, long_quote, short_quote, config)
         if horizon.get("close_reason"):
             payload["paper_close_reason"] = str(horizon["close_reason"])
         if horizon.get("exit_z_score") is not None:
@@ -1210,7 +2101,7 @@ def _paper_bot_execution_supported(bot: SpreadPaperBotSpec) -> bool:
     )
 
 
-def _pending_leg(quote: QuoteSnapshot, venue: str, side: str, role: str, raw_price: float, requested_qty: float, config: SpreadPaperConfig) -> SpreadPaperLeg:
+def _pending_leg(quote: QuoteSnapshot, venue: str, side: str, role: str, raw_price: float, requested_qty: float, config: PaperExecutionConfig) -> SpreadPaperLeg:
     return _leg(quote, venue, side, role, raw_price, 0.0, requested_qty, config, pending=True, state=PaperOrderState.WORKING)
 
 
@@ -1222,7 +2113,7 @@ def _filled_leg(
     raw_price: float,
     qty: float,
     requested_qty: float,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
     state: PaperOrderState,
     *,
     filled_at_ms: int,
@@ -1252,7 +2143,7 @@ def _leg(
     raw_price: float,
     qty: float,
     requested_qty: float,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
     *,
     pending: bool,
     state: PaperOrderState,
@@ -1286,7 +2177,7 @@ def _leg(
 def _with_exit_terms(
     leg: SpreadPaperLeg,
     exit_role: str,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> SpreadPaperLeg:
     """Freeze exit role/fee when a paper position is registered or filled."""
     normalized_role = _liquidity_role(exit_role)
@@ -1300,7 +2191,7 @@ def _with_exit_terms(
 def _slippage_terms(
     raw_price: float,
     quantity: float,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
     action: str,
 ) -> tuple[float, float, float]:
     """Price total execution reserve and expose its latency component."""
@@ -1565,13 +2456,13 @@ def _missing_quote_keys(position: SpreadPaperPosition, quotes: dict[str, QuoteSn
     return missing
 
 
-def _due_horizons(registered_at_ms: int, config: SpreadPaperConfig) -> list[dict]:
+def _due_horizons(registered_at_ms: int, config: PaperExecutionConfig) -> list[dict]:
     horizons = [{"kind": f"markout_{int(seconds)}s", "due_at_ms": registered_at_ms + int(seconds) * 1000, "terminal": False} for seconds in config.markout_secs if int(seconds) > 0]
     horizons.append({"kind": f"terminal_{int(config.terminal_secs)}s", "due_at_ms": registered_at_ms + int(config.terminal_secs) * 1000, "terminal": True})
     return sorted(horizons, key=lambda item: (int(item["due_at_ms"]), str(item["kind"])))
 
 
-def _payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None, config: SpreadPaperConfig) -> dict:
+def _payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int, long_quote: QuoteSnapshot | None, short_quote: QuoteSnapshot | None, config: PaperExecutionConfig) -> dict:
     base = _base_payload(position, horizon_kind, now_ms, long_quote, short_quote)
     if long_quote is None or short_quote is None or not _quotes_fresh(
         long_quote,
@@ -1607,7 +2498,7 @@ def _base_payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int,
         "paper_id": position.paper_id, "candidate_id": position.candidate_id, "review_id": None, "symbol": position.symbol,
         "pair_id": f"{position.long_venue}:{position.short_venue}:{position.symbol}", "long_venue": position.long_venue, "short_venue": position.short_venue,
         "candidate_opportunity_label": position.candidate_opportunity_label, "paper_bot_id": position.paper_bot_id, "paper_cohort": position.paper_cohort,
-        "research_manifest_version": position.research_manifest_version, "research_manifest_digest": position.research_manifest_digest, "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
+        "research_manifest_version": position.research_manifest_version, "research_manifest_digest": position.research_manifest_digest, "research_config_digest": position.research_config_digest, "execution_contract": (position.execution_contract.to_payload() if position.execution_contract is not None else {}), "research_hypothesis": position.research_hypothesis, "acceptance_eligible": position.acceptance_eligible,
         "paper_entry_mode": position.paper_entry_mode, "paper_exit_mode": position.paper_exit_mode, "paper_execution_model": position.paper_entry_mode,
         "paper_maker_leg": position.paper_maker_leg, "paper_hedge_delay_ms": position.paper_hedge_delay_ms, "paper_control_group": position.paper_control_group,
         "paper_fill_assumption": position.paper_fill_assumption, "horizon_kind": horizon_kind, "registered_at_ms": position.registered_at_ms, "entry_eligible_at_ms": position.entry_eligible_at_ms, "evaluated_at_ms": now_ms,
@@ -1627,7 +2518,7 @@ def _base_payload(position: SpreadPaperPosition, horizon_kind: str, now_ms: int,
     }
 
 
-def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, long_quote: QuoteSnapshot, short_quote: QuoteSnapshot, config: SpreadPaperConfig) -> dict:
+def _markout_payload(base: dict, position: SpreadPaperPosition, now_ms: int, long_quote: QuoteSnapshot, short_quote: QuoteSnapshot, config: PaperExecutionConfig) -> dict:
     long_execution = _exit_execution(
         long_quote,
         "long",
@@ -1775,7 +2666,7 @@ def _unpriced_event(
     horizon: dict,
     now_ms: int,
     quotes: dict[str, QuoteSnapshot],
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> dict:
     long_quote = _quote_for(quotes, position.long_venue, position.symbol)
     short_quote = _quote_for(quotes, position.short_venue, position.symbol)
@@ -1828,7 +2719,7 @@ def _delta_markout_event(
     horizon: dict,
     now_ms: int,
     quotes: dict[str, QuoteSnapshot],
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> dict:
     """Record naked maker-leg markout without manufacturing two-leg PnL."""
     long_quote = _quote_for(quotes, position.long_venue, position.symbol)
@@ -1887,7 +2778,7 @@ def _expired_event(
     now_ms: int,
     quotes: dict[str, QuoteSnapshot],
     reason: str,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> dict:
     long_quote = _quote_for(quotes, position.long_venue, position.symbol)
     short_quote = _quote_for(quotes, position.short_venue, position.symbol)
@@ -1974,7 +2865,18 @@ def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
     long_leg = _leg_from_payload(payload.get("long_leg"))
     short_leg = _leg_from_payload(payload.get("short_leg"))
     paper_id = str(payload.get("paper_id", "") or "")
-    if long_leg is None or short_leg is None or not paper_id:
+    contract = _execution_contract_from_payload(payload.get("execution_contract"))
+    if (
+        long_leg is None
+        or short_leg is None
+        or not paper_id
+        or contract is None
+        or str(payload.get("research_config_digest", "") or "").lower()
+        != contract.digest
+        or str(payload.get("research_manifest_digest", "") or "").lower()
+        != contract.research_manifest_digest
+        or str(payload.get("model_epoch", "") or "") != contract.model_epoch
+    ):
         return None
     horizons = _valid_restored_horizons(payload.get("due_horizons"))
     if horizons is None:
@@ -2008,6 +2910,8 @@ def _position_from_payload(payload: dict) -> SpreadPaperPosition | None:
         official_pnl=official_pnl,
         research_manifest_version=str(payload.get("research_manifest_version", "legacy") or "legacy"),
         research_manifest_digest=str(payload.get("research_manifest_digest", "") or ""),
+        research_config_digest=str(payload.get("research_config_digest", "") or ""),
+        execution_contract=contract,
         research_hypothesis=str(payload.get("research_hypothesis", "") or ""),
         acceptance_eligible=acceptance_eligible,
         account_fee_evidence_complete=account_fee_evidence_complete,
@@ -2094,7 +2998,7 @@ def _paper_position_numerics_valid(position: SpreadPaperPosition) -> bool:
     )
 
 
-def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> bool:
+def _restorable_current_v3_record(payload: dict) -> bool:
     try:
         journal_schema_version = int(payload.get("journal_schema_version", 0) or 0)
     except (TypeError, ValueError, OverflowError):
@@ -2103,20 +3007,21 @@ def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> b
         return False
     if str(payload.get("calculation_version", "") or "") != "spread_paper_v3":
         return False
-    if str(payload.get("model_epoch", "") or "") != config.model_epoch:
-        return False
+    contract = _execution_contract_from_payload(payload.get("execution_contract"))
     if (
-        str(payload.get("research_manifest_digest", "") or "").lower()
-        != config.research_manifest.digest
+        contract is None
+        or str(payload.get("model_epoch", "") or "") != contract.model_epoch
+        or str(payload.get("research_manifest_digest", "") or "").lower()
+        != contract.research_manifest_digest
+        or str(payload.get("research_config_digest", "") or "").lower()
+        != contract.digest
     ):
         return False
     candidate = payload.get("candidate_snapshot")
     if not isinstance(candidate, dict):
         return False
-    # Journal v6 cannot infer a missing exit cost, account-evidence identity,
-    # or manifest digest from today's schedule.  A partial row would otherwise
-    # silently become a zero-fee record or altered research contract on
-    # restore, which is exactly the economic rewrite this schema prevents.
+    # The complete execution contract and all entry costs must be in the
+    # record itself.  A partial row must never inherit today's schedule.
     frozen_leg_fields = {
         "entry_fee_bps",
         "exit_fee_bps",
@@ -2130,7 +3035,7 @@ def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> b
         if not isinstance(leg, dict) or not frozen_leg_fields.issubset(leg):
             return False
     account_evidence_matches = (
-        not config.require_account_fee_evidence
+        not contract.require_account_fee_evidence
         or _restored_account_fee_evidence_matches_candidate(payload, candidate)
     )
     return (
@@ -2139,10 +3044,216 @@ def _restorable_current_v3_record(payload: dict, config: SpreadPaperConfig) -> b
         and str(candidate.get("contract_normalization_status", "") or "").lower()
         == "complete"
         and str(candidate.get("calculation_version", "") or "")
-        == _candidate_calculation_version(config)
-        and str(candidate.get("model_epoch", "") or "") == config.model_epoch
+        == _candidate_calculation_version(contract)
+        and str(candidate.get("model_epoch", "") or "") == contract.model_epoch
         and account_evidence_matches
     )
+
+
+def _paper_state_payload_replayable(payload: dict) -> bool:
+    """Apply the recovery parser to a state-bearing v8 paper record.
+
+    This is intentionally configuration-independent: offline promotion checks
+    whether an immutable historical row is replayable at all, while recovery
+    separately decides whether the current active cohort may call it
+    official.  Both paths must nevertheless reject the same malformed frozen
+    contract, legs, fee proof, and candidate snapshot.
+    """
+    if not _restorable_current_v3_record(payload):
+        return False
+    position = _position_from_payload(payload)
+    if position is None:
+        return False
+    contract = SpreadPaperTracker._position_execution_contract(position)
+    return bool(
+        contract is not None
+        and _restored_position_has_fee_evidence(position, contract)
+    )
+
+
+def _paper_immutable_identity(payload: dict) -> tuple[str, ...] | None:
+    """Return the immutable paper identity carried by every lifecycle row.
+
+    Horizon and terminal records contain newly calculated exit data, but they
+    may not change the position, venue pair, model, manifest, or frozen
+    execution contract that created that position.  Binding every row to this
+    tuple makes recovery and offline acceptance reject a terminal spliced in
+    from another paper episode.
+    """
+    raw_schema_version = payload.get("journal_schema_version", 0)
+    if isinstance(raw_schema_version, bool):
+        return None
+    try:
+        schema_version = int(raw_schema_version)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        schema_version != SPREAD_PAPER_JOURNAL_SCHEMA_VERSION
+        or str(payload.get("calculation_version", "") or "") != "spread_paper_v3"
+    ):
+        return None
+    contract = _execution_contract_from_payload(payload.get("execution_contract"))
+    if contract is None:
+        return None
+    paper_id = str(payload.get("paper_id", "") or "").strip()
+    candidate_id = str(payload.get("candidate_id", "") or "").strip()
+    symbol = str(payload.get("symbol", "") or "").strip().upper()
+    long_venue = str(payload.get("long_venue", "") or "").strip().lower()
+    short_venue = str(payload.get("short_venue", "") or "").strip().lower()
+    model_epoch = str(payload.get("model_epoch", "") or "").strip()
+    manifest_digest = str(payload.get("research_manifest_digest", "") or "").lower()
+    config_digest = str(payload.get("research_config_digest", "") or "").lower()
+    if (
+        not all(
+            (
+                paper_id,
+                candidate_id,
+                symbol,
+                long_venue,
+                short_venue,
+                model_epoch,
+                manifest_digest,
+                config_digest,
+                contract.digest,
+            )
+        )
+        or long_venue == short_venue
+        or model_epoch != contract.model_epoch
+        or manifest_digest != contract.research_manifest_digest
+        or config_digest != contract.digest
+    ):
+        return None
+    return (
+        candidate_id,
+        symbol,
+        long_venue,
+        short_venue,
+        model_epoch,
+        manifest_digest,
+        config_digest,
+        contract.digest,
+    )
+
+
+def _paper_due_horizons_from_state_payload(
+    payload: dict,
+) -> dict[str, tuple[bool, int]] | None:
+    horizons = _valid_restored_horizons(payload.get("due_horizons"))
+    if horizons is None:
+        return None
+    return {
+        str(item["kind"]): (bool(item["terminal"]), int(item["due_at_ms"]))
+        for item in horizons
+    }
+
+
+def _paper_replay_horizon_key(
+    kind: str,
+    payload: dict,
+    due_horizons: dict[str, tuple[bool, int]] | None,
+) -> str | None:
+    """Validate a lifecycle observation against its frozen due-horizon plan."""
+    if not due_horizons:
+        return None
+    horizon_kind = str(payload.get("horizon_kind", "") or "").strip()
+    if not horizon_kind:
+        return None
+    raw_evaluated_at_ms = payload.get("evaluated_at_ms", 0)
+    if isinstance(raw_evaluated_at_ms, bool):
+        return None
+    try:
+        evaluated_at_ms = int(raw_evaluated_at_ms)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if evaluated_at_ms <= 0:
+        return None
+    if kind == "opportunity.paper_closed" and horizon_kind.startswith("active_exit:"):
+        contract = _execution_contract_from_payload(payload.get("execution_contract"))
+        if (
+            contract is not None
+            and contract.active_exit_enabled is True
+            and _paper_active_exit_replayable(
+                horizon_kind,
+                payload,
+                contract,
+                evaluated_at_ms,
+            )
+        ):
+            return horizon_kind
+        return None
+    if kind == "opportunity.paper_expired" and horizon_kind == "terminal_expired":
+        terminal_due_at_ms = [
+            due_at_ms
+            for is_terminal, due_at_ms in due_horizons.values()
+            if is_terminal
+        ]
+        return (
+            horizon_kind
+            if terminal_due_at_ms and evaluated_at_ms >= min(terminal_due_at_ms)
+            else None
+        )
+    horizon = due_horizons.get(horizon_kind)
+    if horizon is None:
+        return None
+    terminal, due_at_ms = horizon
+    if evaluated_at_ms < due_at_ms:
+        return None
+    if kind in _PAPER_HORIZON_REPLAY_KINDS:
+        return horizon_kind if terminal is False else None
+    if kind in _PAPER_TERMINAL_REPLAY_KINDS:
+        return horizon_kind if terminal is True else None
+    return None
+
+
+def _paper_active_exit_replayable(
+    horizon_kind: str,
+    payload: dict,
+    contract: SpreadPaperExecutionContract,
+    evaluated_at_ms: int,
+) -> bool:
+    """Validate the event-time boundary of a frozen active exit."""
+    long_leg = payload.get("long_leg")
+    short_leg = payload.get("short_leg")
+    if not isinstance(long_leg, dict) or not isinstance(short_leg, dict):
+        return False
+    entry_times: list[int] = []
+    for leg in (long_leg, short_leg):
+        raw_entry_filled_at_ms = leg.get("entry_filled_at_ms", 0)
+        if isinstance(raw_entry_filled_at_ms, bool):
+            return False
+        try:
+            entry_filled_at_ms = int(raw_entry_filled_at_ms)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if entry_filled_at_ms <= 0:
+            return False
+        entry_times.append(entry_filled_at_ms)
+    entry_completed_at_ms = max(entry_times)
+    if evaluated_at_ms < entry_completed_at_ms:
+        return False
+    if horizon_kind == "active_exit:max_hold":
+        return bool(
+            contract.max_hold_ms > 0
+            and evaluated_at_ms >= entry_completed_at_ms + contract.max_hold_ms
+        )
+    if horizon_kind not in {"active_exit:stop", "active_exit:converged"}:
+        return False
+    raw_exit_z = payload.get("paper_exit_z_score")
+    if isinstance(raw_exit_z, bool):
+        return False
+    try:
+        exit_z = float(raw_exit_z)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    # The exact z is market-data-derived and is independently source-verified
+    # by the journal owner; replay still requires the event to carry a finite
+    # exit measurement and its contemporaneous two-venue snapshot.
+    exit_snapshot = payload.get("exit_market_snapshot")
+    if not (isfinite(exit_z) and isinstance(exit_snapshot, dict) and exit_snapshot):
+        return False
+    if horizon_kind == "active_exit:stop":
+        return contract.stop_z > 0.0 and abs(exit_z) >= contract.stop_z
+    return abs(exit_z) <= max(contract.exit_z, 0.0)
 
 
 def _restored_account_fee_evidence_matches_candidate(
@@ -2186,7 +3297,7 @@ def _restored_account_fee_evidence_matches_candidate(
 
 def _restored_position_has_fee_evidence(
     position: SpreadPaperPosition,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> bool:
     # A schema-v5 record is intentionally self-contained: the four pricing
     # terms were frozen at entry, so a later service refresh must not either
@@ -2199,14 +3310,29 @@ def _restored_position_has_fee_evidence(
 
 def _restored_position_is_official_eligible(
     position: SpreadPaperPosition,
-    config: SpreadPaperConfig,
+    frozen_contract: SpreadPaperExecutionContract,
+    active_config: SpreadPaperConfig,
 ) -> bool:
+    """Return whether an historical row may resume as the active cohort.
+
+    The frozen contract keeps its original PnL reproducible, but does not give
+    a restarted service permission to promote that row under a changed
+    research manifest, fee schedule, or v3 account identity.  Such rows are
+    retained as diagnostic positions and their later events stay
+    non-official.
+    """
+    if not _position_matches_active_paper_cohort(
+        position,
+        frozen_contract,
+        active_config,
+    ):
+        return False
     # The runtime gate above is deliberately repeated during recovery.  A
     # journal row produced by an earlier diagnostic configuration cannot be
     # promoted merely because its boolean flag survived serialization.
     if (
-        config.require_l2_vwap is not True
-        or config.require_account_fee_evidence is not True
+        frozen_contract.require_l2_vwap is not True
+        or frozen_contract.require_account_fee_evidence is not True
     ):
         return False
     baseline_entry_sources = {"l2_vwap"}
@@ -2217,7 +3343,7 @@ def _restored_position_is_official_eligible(
         and not position.paper_maker_leg
         and position.paper_control_group is False
         and position.acceptance_eligible is True
-        and _position_account_fee_evidence_complete(position, config)
+        and _position_account_fee_evidence_complete(position, frozen_contract)
         and not position.long_leg.entry_pending
         and not position.short_leg.entry_pending
         # The mode strings are reporting fields; on restart they cannot be
@@ -2237,6 +3363,23 @@ def _restored_position_is_official_eligible(
         and position.residual_base_qty <= 1e-12
         and abs(position.delta_exposure_base_qty) <= 1e-12
         and abs(position.long_leg.qty - position.short_leg.qty) <= 1e-12
+    )
+
+
+def _position_matches_active_paper_cohort(
+    position: SpreadPaperPosition,
+    frozen_contract: SpreadPaperExecutionContract,
+    active_config: SpreadPaperConfig,
+) -> bool:
+    """Bind lifecycle promotion to the service's current research cohort."""
+    active_contract = _execution_contract_from_config(active_config)
+    return bool(
+        active_contract is not None
+        and frozen_contract.digest == active_contract.digest
+        and position.model_epoch == active_contract.model_epoch
+        and position.research_manifest_digest.lower()
+        == active_contract.research_manifest_digest
+        and position.research_config_digest.lower() == active_contract.digest
     )
 
 
@@ -2517,7 +3660,7 @@ def _liquidity_role(role: str) -> str:
     return "maker" if str(role or "").lower() == "maker" else "taker"
 
 
-def _fee_bps(config: SpreadPaperConfig, venue: str, role: str) -> float:
+def _fee_bps(config: PaperExecutionConfig, venue: str, role: str) -> float:
     fees = (
         config.maker_fee_bps_by_venue
         if _liquidity_role(role) == "maker"
@@ -2550,7 +3693,7 @@ def _fee_bps(config: SpreadPaperConfig, venue: str, role: str) -> float:
     return fallback if isfinite(fallback) and fallback >= 0.0 else 0.0
 
 
-def _candidate_calculation_version(config: SpreadPaperConfig) -> str:
+def _candidate_calculation_version(config: PaperExecutionConfig) -> str:
     return (
         "spread_v3_cost_normalized_reversion"
         if str(config.model_epoch or "").startswith("v3_")
@@ -2559,8 +3702,18 @@ def _candidate_calculation_version(config: SpreadPaperConfig) -> str:
 
 
 def _verified_maker_rebate(
-    config: SpreadPaperConfig, venue: str, fee_bps: float
+    config: PaperExecutionConfig, venue: str, fee_bps: float
 ) -> bool:
+    if isinstance(config, SpreadPaperExecutionContract):
+        verified_fee = config.verified_maker_rebate_bps_by_venue.get(
+            str(venue or "").lower()
+        )
+        return bool(
+            config.allow_verified_maker_rebates is True
+            and verified_fee is not None
+            and verified_fee < 0.0
+            and abs(verified_fee - fee_bps) <= 1e-12
+        )
     evidence = config.account_fee_evidence
     if (
         config.allow_verified_maker_rebates is not True
@@ -2622,7 +3775,7 @@ def _candidate_account_fee_evidence_complete(
 
 def _position_account_fee_evidence_complete(
     position: SpreadPaperPosition,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> bool:
     if not config.require_account_fee_evidence:
         return True
@@ -2649,7 +3802,7 @@ def _position_account_fee_evidence_complete(
     )
 
 
-def _v3_fee_identity_binding_required(config: SpreadPaperConfig) -> bool:
+def _v3_fee_identity_binding_required(config: PaperExecutionConfig) -> bool:
     return str(config.model_epoch or "").startswith("v3_")
 
 
@@ -2727,7 +3880,7 @@ def _paper_fee_evidence_complete(
 
 
 def _execution_fee_evidence_complete(
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
     *,
     long_venue: str,
     short_venue: str,
@@ -2806,7 +3959,7 @@ def _public_settled_funding_for_position(
     *,
     now_ms: int,
     quotes: dict[str, QuoteSnapshot],
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> list[FundingSettlement]:
     """Build only settlement facts directly evidenced by the public snapshot.
 
@@ -2843,7 +3996,7 @@ def _public_settled_funding_for_leg(
     leg: SpreadPaperLeg,
     quote: QuoteSnapshot | None,
     now_ms: int,
-    config: SpreadPaperConfig,
+    config: PaperExecutionConfig,
 ) -> FundingSettlement | None:
     if leg.entry_pending or leg.qty <= 0.0 or quote is None:
         return None

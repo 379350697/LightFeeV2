@@ -7,12 +7,6 @@ ts (microsecond or better), kind (string), payload (JSON), critical durability
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
-from pathlib import Path
-
-import pytest
 from lightfee.persistence.journal import Journal, replay_journal_records
 
 
@@ -41,6 +35,27 @@ class TestJournalEnvelope:
         finally:
             journal.close()
 
+    def test_strict_read_reports_malformed_line_without_dropping_integrity_signal(self, tmp_path):
+        journal = Journal(tmp_path / "test.jsonl")
+        journal.open()
+        try:
+            journal.append("test.kind", {"key": "value"})
+            journal._file.write("{truncated\n")
+            journal._file.flush()
+        finally:
+            journal.close()
+
+        records, intact = journal.read_all_with_integrity()
+
+        assert len(records) == 1
+        assert intact is False
+
+    def test_has_archives_detects_any_rotated_segment(self, tmp_path):
+        journal = Journal(tmp_path / "paper.jsonl")
+        assert journal.has_archives() is False
+        (tmp_path / "paper.jsonl.1").write_text("{}\n", encoding="utf-8")
+        assert journal.has_archives() is True
+
     def test_seq_is_monotonic(self, tmp_path):
         journal = Journal(tmp_path / "test.jsonl")
         journal.open()
@@ -67,7 +82,7 @@ class TestJournalEnvelope:
         journal.open()
         try:
             before = int(time.time() * 1000)
-            seq = journal.append("test.kind", {"key": "value"})
+            journal.append("test.kind", {"key": "value"})
             after = int(time.time() * 1000)
             records = journal.read_all()
             r = records[0]

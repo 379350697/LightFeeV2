@@ -21,6 +21,9 @@ from typing import Mapping
 
 
 FEE_EVIDENCE_SCHEMA_VERSION = 3
+# The same ceiling is enforced at configuration validation and immediately
+# before a live canary entry, so programmatic configuration cannot weaken it.
+LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 _ACCEPTED_SOURCES = frozenset({"account_fee_api", "private_fill"})
 _INTEGRITY_ALGORITHM = "hmac-sha256"
 # Live admission never trusts a TOML-selected secret.  The release/CI

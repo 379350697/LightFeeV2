@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +15,17 @@ from lightfee.config.schema import (
 )
 from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
-from lightfee.strategy.fee_evidence import TRUSTED_FEE_EVIDENCE_HMAC_ENV
+from lightfee.strategy.fee_evidence import (
+    LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
+    TRUSTED_FEE_EVIDENCE_HMAC_ENV,
+)
+from lightfee.engine.exit import TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV
 
 
 _CANARY_HARD_MAX_CONCURRENT_POSITIONS = 1
 _CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
 _CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
 _CANARY_HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
-_LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 _CANARY_STATEMENT_RECONCILABLE_VENUES = frozenset({"binance", "bybit", "okx", "gate"})
 
 
@@ -350,12 +354,24 @@ def validate_config(config: AppConfig) -> list[str]:
     if (
         config.runtime.mode == "live"
         and config.strategy.funding_new_entries_enabled is True
+        and config.strategy.funding_canary_enabled is True
+        and not os.environ.get(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "").strip()
+    ):
+        # The runtime deliberately keeps V1 close/recovery working without a
+        # receipt key, but a live canary must discover this omission before it
+        # can submit a position that is structurally unable to graduate.
+        issues.append(
+            "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY must be non-empty for a live funding canary"
+        )
+    if (
+        config.runtime.mode == "live"
+        and config.strategy.funding_new_entries_enabled is True
         and config.strategy.funding_canary_require_account_fee_evidence is True
     ):
         if (
             _is_positive_int(config.runtime.fee_evidence_max_age_ms)
             and int(config.runtime.fee_evidence_max_age_ms)
-            > _LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS
+            > LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS
         ):
             issues.append(
                 "runtime.fee_evidence_max_age_ms must be <= 86400000 for a live funding canary"

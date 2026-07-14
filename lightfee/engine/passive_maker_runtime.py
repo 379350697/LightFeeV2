@@ -15,6 +15,7 @@ from lightfee.engine.business_contract import (
     pending_entry_has_unhedged_maker_exposure,
 )
 from lightfee.engine.runtime_context import PassiveMakerRuntimeContext
+from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
 if TYPE_CHECKING:
     from lightfee.engine.entry_sync import HedgeDriveResult
@@ -372,17 +373,28 @@ class PassiveMakerRuntime:
             if not relevant:
                 continue
 
-            # Get current mid price from local-L2 books
+            # Repricing a working maker order is an execution action.  Do not
+            # infer a mid from a merely HOT book: the whole book must remain
+            # fresh and structurally valid at the exact reprice decision.
             long_book = self.ctx.local_l2_runtime.get_book(pending.long_venue.value, pending.symbol)
             short_book = self.ctx.local_l2_runtime.get_book(pending.short_venue.value, pending.symbol)
-
-            long_mid = long_book.mid_price() if long_book else 0.0
-            short_mid = short_book.mid_price() if short_book else 0.0
             # V1: use the maker venue's mid price, not a single-leg fallback
             # post_only_entry_reprice_price_hint takes from working_market (entry_sync.rs:1475-1481)
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
-            maker_mid = long_mid if maker_venue == pending.long_venue else short_mid
-            mid = maker_mid
+            maker_book = long_book if maker_venue == pending.long_venue else short_book
+            max_age_ms = max(self.ctx.config.strategy.max_liquidity_snapshot_age_ms, 0)
+            if maker_book is None or max_age_ms <= 0:
+                continue
+            snapshot = execution_liquidity_from_local_l2(
+                maker_book,
+                max_depth=1,
+                max_age_ms=max_age_ms,
+                now_ms=now_ms,
+                require_ready=True,
+            )
+            if not snapshot.book_ready:
+                continue
+            mid = (snapshot.bids[0].price + snapshot.asks[0].price) / 2.0
             if mid <= 0:
                 continue
             block_reason = self._maker_event_reprice_block_reason(pending)

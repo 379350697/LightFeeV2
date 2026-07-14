@@ -10,9 +10,7 @@ from __future__ import annotations
 import pytest
 from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.engine.close_executor import (
-    CloseBalance,
     CloseExecutionLeg,
-    ChunkPlan,
     build_close_execution_from_legs,
     build_exit_pnl_attribution,
     close_balance_from_closed_quantities,
@@ -21,7 +19,6 @@ from lightfee.engine.close_executor import (
     compute_close_chunks,
     split_close_fill_residual,
 )
-from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import OpenPosition
 
 
@@ -110,6 +107,7 @@ class TestClosePnLAttribution:
         # Short PnL: (50000 - 51000) * 1.0 = -1000
         # Net = 0
         assert close.realized_price_pnl_quote == pytest.approx(0.0, abs=1e-6)
+        assert close.execution_fee_complete is False
 
     def test_price_pnl_profitable_close(self):
         pos = make_test_position(long_entry_price=50000.0, short_entry_price=51000.0)
@@ -155,6 +153,7 @@ class TestClosePnLAttribution:
         assert attr["funding_quote"] == 10.0
         assert attr["entry_fee_quote"] == 3.5
         assert attr["exit_fee_quote"] == 5.0
+        assert close.execution_fee_complete is True
 
     def test_net_quote_formula(self):
         """V1: net_quote = price_pnl + funding - exit_fee (entry_fee already
@@ -276,7 +275,7 @@ class TestM12CloseLegErrorClassification:
 
     def test_gate_empty_position_case_insensitive_label(self):
         """Case insensitive: LABEL=REDUCE_EXCEEDED msg=EMPTY POSITION."""
-        from lightfee.engine.close_executor import _classify_close_leg_error, _is_terminal_reduce_only
+        from lightfee.engine.close_executor import _classify_close_leg_error
 
         error_str = "LABEL=REDUCE_EXCEEDED msg=EMPTY POSITION"
         cls = _classify_close_leg_error(error_str)
@@ -314,7 +313,7 @@ class TestM12CloseLegErrorClassification:
 
     def test_generic_reduce_only_text_terminal(self):
         """Generic 'reduce_only' text without structured label → terminal fallback."""
-        from lightfee.engine.close_executor import _classify_close_leg_error, _is_terminal_reduce_only
+        from lightfee.engine.close_executor import _classify_close_leg_error
 
         error_str = "Order rejected: reduce_only order requires position"
         cls = _classify_close_leg_error(error_str)

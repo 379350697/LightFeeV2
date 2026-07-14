@@ -9,12 +9,20 @@ multi-position ownership ambiguity.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Iterable, Mapping
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import FundingSettlement, Venue
+from lightfee.engine.exit import (
+    EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS,
+    EXECUTION_BENCHMARK_RECEIPT_SCHEMA_VERSION,
+    execution_benchmark_receipt_integrity_verified,
+    execution_benchmark_receipt_semantically_verified,
+    position_execution_benchmark_evidence_complete,
+)
 from lightfee.engine.state import FundingSettlementRecord, OpenPosition
 from lightfee.strategy.attribution import StrategyAttributionService
 
@@ -89,6 +97,17 @@ def _int_positive(value: object) -> int:
     return converted if converted > 0 else 0
 
 
+def _finite_task_amount(value: object) -> float | None:
+    """Parse a persisted accounting amount without converting missing to zero."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return amount if isfinite(amount) else None
+
+
 def _execution_benchmark_receipt_complete(position: OpenPosition) -> bool:
     """Return whether persisted fill-quality facts can support promotion.
 
@@ -98,30 +117,213 @@ def _execution_benchmark_receipt_complete(position: OpenPosition) -> bool:
     shortfall values; otherwise a missing measurement could masquerade as a
     zero-cost receipt.
     """
-    if position.execution_benchmark_complete is not True:
+    return position_execution_benchmark_evidence_complete(position)
+
+
+def _entry_execution_benchmark_receipt_complete(position: OpenPosition) -> bool:
+    """Bind persisted entry aggregates to one sealed, side-aware receipt.
+
+    Entry price hints are routing inputs and cannot prove execution quality.
+    The closed-position accounting path therefore requires the same immutable
+    L2/fill evidence as the exit path, with the entry sides reversed.  Keeping
+    this check beside the exit verifier prevents a recovered state snapshot
+    from promoting manually edited aggregate fields.
+    """
+    receipt = position.entry_execution_benchmark_receipt
+    if not execution_benchmark_receipt_semantically_verified(
+        receipt,
+        position_id=position.position_id,
+        symbol=position.symbol,
+        expected_legs={
+            "long": (position.long_venue.value, "buy"),
+            "short": (position.short_venue.value, "sell"),
+        },
+    ):
+        return False
+    assert isinstance(receipt, dict)
+    try:
+        receipt_long = float(receipt["long"]["vwap_price"])
+        receipt_short = float(receipt["short"]["vwap_price"])
+        receipt_shortfall = float(receipt["implementation_shortfall_quote"])
+        position_long = float(position.entry_benchmark_long_price)
+        position_short = float(position.entry_benchmark_short_price)
+        position_shortfall = float(position.entry_implementation_shortfall_quote)
+    except (KeyError, TypeError, ValueError, OverflowError):
         return False
     values = (
-        position.entry_benchmark_long_price,
-        position.entry_benchmark_short_price,
-        position.entry_implementation_shortfall_quote,
-        position.exit_implementation_shortfall_quote,
+        receipt_long,
+        receipt_short,
+        receipt_shortfall,
+        position_long,
+        position_short,
+        position_shortfall,
     )
-    try:
-        long_benchmark, short_benchmark, entry_shortfall, exit_shortfall = (
-            float(value) for value in values
-        )
-    except (TypeError, ValueError, OverflowError):
+    if not all(isfinite(value) for value in values):
         return False
     return (
-        isfinite(long_benchmark)
-        and isfinite(short_benchmark)
-        and isfinite(entry_shortfall)
-        and isfinite(exit_shortfall)
-        and long_benchmark > 0.0
-        and short_benchmark > 0.0
-        and entry_shortfall >= 0.0
-        and exit_shortfall >= 0.0
+        abs(receipt_long - position_long)
+        <= max(1e-8, max(abs(receipt_long), abs(position_long)) * 1e-8)
+        and abs(receipt_short - position_short)
+        <= max(1e-8, max(abs(receipt_short), abs(position_short)) * 1e-8)
+        and abs(receipt_shortfall - position_shortfall)
+        <= max(1e-8, max(abs(receipt_shortfall), abs(position_shortfall)) * 1e-8)
     )
+
+
+def _exit_execution_benchmark_receipts_complete(position: OpenPosition) -> bool:
+    """Require raw, side-aware exit receipts in addition to their aggregate.
+
+    A numerical aggregate alone is not audit evidence: it cannot establish
+    whether the close was priced against an executable bid/ask ladder rather
+    than a midpoint.  A keyed HMAC authenticates each persisted payload, so
+    mutation or a receipt written without the trusted runtime key fails
+    closed at the promotion boundary.  The accompanying SHA-256 digest is
+    retained only as a corruption diagnostic, not as an authenticity proof.
+    """
+    receipts = position.exit_execution_benchmark_receipts
+    if not isinstance(receipts, list) or not receipts:
+        return False
+    total_shortfall = 0.0
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            return False
+        if (
+            receipt.get("schema_version")
+            != EXECUTION_BENCHMARK_RECEIPT_SCHEMA_VERSION
+            or receipt.get("source") != "local_l2_vwap"
+            or receipt.get("position_id") != position.position_id
+            or receipt.get("symbol") != position.symbol
+            or not execution_benchmark_receipt_integrity_verified(receipt)
+            or not execution_benchmark_receipt_semantically_verified(
+                receipt,
+                position_id=position.position_id,
+                symbol=position.symbol,
+                expected_legs={
+                    "long": (position.long_venue.value, "sell"),
+                    "short": (position.short_venue.value, "buy"),
+                },
+            )
+        ):
+            return False
+        try:
+            captured_at_ms = int(receipt.get("captured_at_ms", 0))
+            requested_quantity = float(receipt.get("requested_base_quantity"))
+            max_observation_to_submit_ms = int(
+                receipt.get("max_observation_to_submit_ms", 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            captured_at_ms <= 0
+            or not isfinite(requested_quantity)
+            or requested_quantity <= 0.0
+            or max_observation_to_submit_ms
+            != EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
+        ):
+            return False
+        try:
+            receipt_shortfall = float(receipt.get("implementation_shortfall_quote"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not isfinite(receipt_shortfall) or receipt_shortfall < 0.0:
+            return False
+        receipt_recomputed_shortfall = 0.0
+        for name, venue, side in (
+            ("long", position.long_venue.value, "sell"),
+            ("short", position.short_venue.value, "buy"),
+        ):
+            leg = receipt.get(name)
+            if not isinstance(leg, dict):
+                return False
+            try:
+                price = float(leg.get("vwap_price"))
+                available = float(leg.get("available_base_quantity"))
+                observed_at_ms = int(leg.get("observed_at_ms", 0))
+                age_ms = int(leg.get("age_ms", -1))
+                filled_quantity = float(leg.get("filled_base_quantity"))
+                leg_shortfall = float(leg.get("implementation_shortfall_quote"))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                leg.get("venue") != venue
+                or leg.get("side") != side
+                or not isfinite(price)
+                or not isfinite(available)
+                or price <= 0.0
+                or available + max(1e-10, requested_quantity * 1e-8) < requested_quantity
+                or observed_at_ms <= 0
+                or age_ms < 0
+                or observed_at_ms > captured_at_ms
+                or captured_at_ms - observed_at_ms != age_ms
+                or not isfinite(filled_quantity)
+                or not isfinite(leg_shortfall)
+                or filled_quantity <= 0.0
+                or leg_shortfall < 0.0
+            ):
+                return False
+            quantity_tolerance = max(1e-10, requested_quantity * 1e-8)
+            if abs(filled_quantity - requested_quantity) > quantity_tolerance:
+                return False
+            fills = leg.get("fills")
+            if not isinstance(fills, list) or not fills:
+                return False
+            observed_fill_quantity = 0.0
+            observed_leg_shortfall = 0.0
+            for fill in fills:
+                if not isinstance(fill, dict):
+                    return False
+                try:
+                    fill_quantity = float(fill.get("quantity"))
+                    fill_price = float(fill.get("price"))
+                    submitted_at_ms = int(fill.get("submitted_at_ms", 0))
+                    fill_at_ms = int(fill.get("filled_at_ms", 0))
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if (
+                    not isfinite(fill_quantity)
+                    or not isfinite(fill_price)
+                    or fill_quantity <= 0.0
+                    or fill_price <= 0.0
+                    or submitted_at_ms <= 0
+                    or fill_at_ms <= 0
+                    or captured_at_ms > submitted_at_ms
+                    or submitted_at_ms > fill_at_ms
+                    or submitted_at_ms - observed_at_ms
+                    > max_observation_to_submit_ms
+                    or (
+                        not str(fill.get("order_id", "") or "")
+                        and not str(fill.get("client_order_id", "") or "")
+                    )
+                ):
+                    return False
+                observed_fill_quantity += fill_quantity
+                adverse_move = price - fill_price if name == "long" else fill_price - price
+                observed_leg_shortfall += max(adverse_move, 0.0) * fill_quantity
+            shortfall_tolerance = max(
+                1e-8,
+                max(observed_leg_shortfall, leg_shortfall) * 1e-8,
+            )
+            if (
+                abs(observed_fill_quantity - filled_quantity) > quantity_tolerance
+                or abs(observed_leg_shortfall - leg_shortfall) > shortfall_tolerance
+            ):
+                return False
+            receipt_recomputed_shortfall += observed_leg_shortfall
+        receipt_tolerance = max(
+            1e-8,
+            max(receipt_recomputed_shortfall, receipt_shortfall) * 1e-8,
+        )
+        if abs(receipt_recomputed_shortfall - receipt_shortfall) > receipt_tolerance:
+            return False
+        total_shortfall += receipt_shortfall
+    try:
+        persisted_shortfall = float(position.exit_implementation_shortfall_quote)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    total_tolerance = max(1e-8, max(total_shortfall, persisted_shortfall) * 1e-8)
+    if abs(total_shortfall - persisted_shortfall) > total_tolerance:
+        return False
+    return True
 
 
 class FundingSettlementReconciler:
@@ -402,6 +604,18 @@ class FundingSettlementReconciler:
                 else None
             ),
             "execution_benchmark_complete": benchmark_complete,
+            "execution_fee_complete": position.execution_fee_complete is True,
+            "entry_execution_benchmark_receipt": (
+                deepcopy(position.entry_execution_benchmark_receipt)
+                if benchmark_complete
+                and isinstance(position.entry_execution_benchmark_receipt, dict)
+                else None
+            ),
+            "exit_execution_benchmark_receipts": (
+                [deepcopy(receipt) for receipt in position.exit_execution_benchmark_receipts]
+                if benchmark_complete
+                else []
+            ),
         }
 
     @classmethod
@@ -599,17 +813,39 @@ class FundingSettlementReconciler:
         reason = problem
         complete = len(observed) == len(required_targets) and not reason
         if complete:
-            lifecycle_forecast = float(updated.get("lifecycle_forecast_funding_quote") or 0.0)
-            price_pnl = float(updated.get("price_pnl_quote") or 0.0)
-            entry_fee = float(updated.get("entry_fee_quote") or 0.0)
-            exit_fee = float(updated.get("exit_fee_quote") or 0.0)
+            lifecycle_forecast = _finite_task_amount(
+                updated.get("lifecycle_forecast_funding_quote")
+            )
+            price_pnl = _finite_task_amount(updated.get("price_pnl_quote"))
+            entry_fee = _finite_task_amount(updated.get("entry_fee_quote"))
+            exit_fee = _finite_task_amount(updated.get("exit_fee_quote"))
+            net_pnl_complete = bool(
+                updated.get("execution_fee_complete") is True
+                and lifecycle_forecast is not None
+                and price_pnl is not None
+                and entry_fee is not None
+                and exit_fee is not None
+                and isfinite(settled_funding_quote)
+            )
             updated.update(
                 {
                     "status": "complete",
-                    "official_pnl": True,
+                    # Statement facts are fully reconciled even if a fill fee
+                    # was not observable.  Preserve that distinction instead
+                    # of promoting V1's zero fallback into official net PnL.
+                    "official_funding_reconciled": True,
+                    "official_pnl": net_pnl_complete,
                     "official_funding_quote": settled_funding_quote,
-                    "official_net_quote": price_pnl + settled_funding_quote - entry_fee - exit_fee,
-                    "funding_forecast_error_quote": settled_funding_quote - lifecycle_forecast,
+                    "official_net_quote": (
+                        price_pnl + settled_funding_quote - entry_fee - exit_fee
+                        if net_pnl_complete
+                        else None
+                    ),
+                    "funding_forecast_error_quote": (
+                        settled_funding_quote - lifecycle_forecast
+                        if lifecycle_forecast is not None
+                        else None
+                    ),
                     "reconciled_at_ms": int(now_ms),
                 }
             )

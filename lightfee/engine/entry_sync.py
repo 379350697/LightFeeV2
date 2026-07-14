@@ -38,6 +38,7 @@ from lightfee.engine.entry import (
     advance_entry_state,
     build_entry_orders,
     build_open_position,
+    finalize_entry_execution_benchmark_receipt,
     generate_review_id,
 )
 from lightfee.engine.execution_planner import (
@@ -191,7 +192,13 @@ class EntrySyncExecutor:
         maker_req, hedge_req = build_entry_orders(ctx)
 
         # --- Phase 1: Submit maker ---
-        maker_result = await self._submit_maker(ctx, maker_req, now_ms)
+        maker_submitted_at_ms = int(time.time() * 1000)
+        maker_result = await self._submit_maker(
+            ctx,
+            maker_req,
+            now_ms,
+            submit_started_at_ms=maker_submitted_at_ms,
+        )
         result.journal_entries.extend(maker_result.get("journal", []))
         result.maker_fill = maker_result.get("fill")
 
@@ -292,7 +299,13 @@ class EntrySyncExecutor:
         )
 
         # --- Phase 3: submit the sized, repriced hedge ---
-        hedge_result = await self._submit_hedge(ctx, hedge_req, now_ms)
+        hedge_submitted_at_ms = int(time.time() * 1000)
+        hedge_result = await self._submit_hedge(
+            ctx,
+            hedge_req,
+            now_ms,
+            submit_started_at_ms=hedge_submitted_at_ms,
+        )
         result.journal_entries.extend(hedge_result.get("journal", []))
         result.hedge_fill = hedge_result.get("fill")
 
@@ -431,6 +444,41 @@ class EntrySyncExecutor:
             )
             return result
 
+        # Bind the raw pre-submit L2 capture to the two exchange fills only
+        # after a symmetric, successful entry.  In particular, never make a
+        # partial/residual branch look like a complete execution observation.
+        if ctx.entry_execution_benchmark_receipt is not None:
+            if ctx.maker_leg == Side.BUY:
+                long_fill, short_fill = maker_fill, hedge_fill
+                long_client_order_id = maker_req.client_order_id or ""
+                short_client_order_id = hedge_req.client_order_id or ""
+                long_submitted_at_ms = maker_submitted_at_ms
+                short_submitted_at_ms = hedge_submitted_at_ms
+            else:
+                long_fill, short_fill = hedge_fill, maker_fill
+                long_client_order_id = hedge_req.client_order_id or ""
+                short_client_order_id = maker_req.client_order_id or ""
+                long_submitted_at_ms = hedge_submitted_at_ms
+                short_submitted_at_ms = maker_submitted_at_ms
+            ctx = replace(
+                ctx,
+                entry_execution_benchmark_receipt=(
+                    finalize_entry_execution_benchmark_receipt(
+                        ctx.entry_execution_benchmark_receipt,
+                        position_id=ctx.entry_id,
+                        symbol=ctx.symbol,
+                        long_venue=ctx.long_venue,
+                        short_venue=ctx.short_venue,
+                        long_fill=long_fill,
+                        short_fill=short_fill,
+                        long_client_order_id=long_client_order_id,
+                        short_client_order_id=short_client_order_id,
+                        long_submitted_at_ms=long_submitted_at_ms,
+                        short_submitted_at_ms=short_submitted_at_ms,
+                    )
+                ),
+            )
+
         # Success — build OpenPosition
         position = build_open_position(ctx, maker_fill, hedge_fill, now_ms, review_id=review_id)
         result.open_position = position
@@ -469,6 +517,8 @@ class EntrySyncExecutor:
                 "expected_edge_bps_entry": position.expected_edge_bps_entry,
                 "long_entry_fee_quote": position.long_entry_fee_quote,
                 "short_entry_fee_quote": position.short_entry_fee_quote,
+                "entry_execution_benchmark_receipt": position.entry_execution_benchmark_receipt,
+                "execution_benchmark_complete": position.execution_benchmark_complete,
                 "funding_captured": position.funding_captured,
                 "second_stage_funding_captured": position.second_stage_funding_captured,
                 "maker_order_id": maker_fill.order_id,
@@ -656,7 +706,12 @@ class EntrySyncExecutor:
     # ------------------------------------------------------------------
 
     async def _submit_maker(
-        self, ctx: EntryContext, request: OrderRequest, now_ms: int
+        self,
+        ctx: EntryContext,
+        request: OrderRequest,
+        now_ms: int,
+        *,
+        submit_started_at_ms: int = 0,
     ) -> dict[str, Any]:
         """Submit maker order and classify outcome."""
         self.journal.append(
@@ -676,10 +731,20 @@ class EntrySyncExecutor:
                 "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
-        return await self._submit_order(request, ctx.entry_id, "maker", now_ms)
+        return await self._submit_order(
+            request,
+            ctx.entry_id,
+            "maker",
+            submit_started_at_ms or now_ms,
+        )
 
     async def _submit_hedge(
-        self, ctx: EntryContext, request: OrderRequest, now_ms: int
+        self,
+        ctx: EntryContext,
+        request: OrderRequest,
+        now_ms: int,
+        *,
+        submit_started_at_ms: int = 0,
     ) -> dict[str, Any]:
         """Submit hedge order and classify outcome."""
         self.journal.append(
@@ -699,7 +764,12 @@ class EntrySyncExecutor:
                 "time_in_force": request.time_in_force.value if request.time_in_force else "",
             },
         )
-        return await self._submit_order(request, ctx.entry_id, "hedge", now_ms)
+        return await self._submit_order(
+            request,
+            ctx.entry_id,
+            "hedge",
+            submit_started_at_ms or now_ms,
+        )
 
     async def _decide_after_first_fill(
         self,

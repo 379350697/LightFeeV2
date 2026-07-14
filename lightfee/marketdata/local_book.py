@@ -17,10 +17,16 @@ from lightfee.marketdata.l2 import (
 def get_active_books(
     books: dict[LocalL2BookKey, LocalL2Book], max_age_ms: int, now_ms: int
 ) -> list[LocalL2Book]:
-    """Return books that are HOT and within max age."""
+    """Return HOT, fresh books for lifecycle/coverage monitoring.
+
+    ``active`` is intentionally weaker than execution readiness: a corrupt HOT
+    book remains visible to health diagnostics, while ``get_ready_books`` and
+    the execution path require structural validity through ``is_ready``.
+    """
     return [
-        b for b in books.values()
-        if b.status == L2BookStatus.HOT and (now_ms - b.observed_at_ms) <= max_age_ms
+        b
+        for b in books.values()
+        if b.status == L2BookStatus.HOT and not b.is_stale(max_age_ms, now_ms)
     ]
 
 

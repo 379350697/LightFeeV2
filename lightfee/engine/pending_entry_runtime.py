@@ -21,6 +21,7 @@ from lightfee.engine.pending_entry_terminalizer import (
 )
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 from lightfee.risk.modes import EngineLifecycle
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 
@@ -232,15 +233,20 @@ class PendingEntryRuntime:
             source = "ws_bbo_quote_lease"
         elif self.ctx._local_l2_effective_enabled():
             book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
-            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0) if book else 0
-            try:
-                bid = float(book.best_bid() or 0.0) if book else 0.0
-                ask = float(book.best_ask() or 0.0) if book else 0.0
-            except Exception:
-                bid, ask = 0.0, 0.0
-            status = str(getattr(getattr(book, "status", None), "value", "") or "")
-            if status != "hot":
+            if book is None:
                 return None
+            snapshot = execution_liquidity_from_local_l2(
+                book,
+                max_depth=1,
+                max_age_ms=max_age_ms,
+                now_ms=now_ms,
+                require_ready=True,
+            )
+            if not snapshot.book_ready:
+                return None
+            observed_at_ms = snapshot.observed_at_ms
+            bid = snapshot.bids[0].price
+            ask = snapshot.asks[0].price
             source = "local_l2_final_bbo"
         else:
             return None
@@ -2745,6 +2751,8 @@ class PendingEntryRuntime:
                 "funding_edge_bps_entry": position.funding_edge_bps_entry,
                 "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
                 "expected_edge_bps_entry": position.expected_edge_bps_entry,
+                "entry_execution_benchmark_receipt": position.entry_execution_benchmark_receipt,
+                "execution_benchmark_complete": position.execution_benchmark_complete,
                 "quantity_source": "matched_fill_open_position",
                 "long_venue_metadata": long_venue_metadata,
                 "short_venue_metadata": short_venue_metadata,

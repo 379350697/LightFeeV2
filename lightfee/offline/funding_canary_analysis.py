@@ -12,6 +12,13 @@ from dataclasses import asdict, dataclass, field
 from math import ceil, isfinite
 from typing import Iterable, Mapping
 
+from lightfee.engine.exit import (
+    EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS,
+    execution_benchmark_receipt_integrity_verified,
+    execution_benchmark_receipt_max_fill_at_ms,
+    execution_benchmark_receipt_semantically_verified,
+)
+
 
 _TERMINAL_KINDS = frozenset(
     {
@@ -38,6 +45,38 @@ _HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
 _HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
 _HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
 _MIN_REQUIRED_CLOSED_LOOPS = 30
+_POST_CLOSE_FUNDING_TRUTH_REASON = "post_close_exchange_truth_for_funding_reconciliation"
+
+
+def _relevant_event_owner_is_complete(kind: str, payload: Mapping[str, object]) -> bool:
+    """Require each promotion event to identify the lifecycle object it owns.
+
+    A record without an owner used to be silently ignored after collection,
+    which let a damaged ``exit.closed`` or terminal-truth row coexist with a
+    seemingly complete loop.  The report is a safety gate, so malformed
+    relevant evidence poisons the cohort instead of being treated as an
+    unrelated diagnostic event.
+    """
+    entry_id = _text(payload.get("entry_id"))
+    position_id = _text(payload.get("position_id"))
+    symbol = _text(payload.get("symbol"))
+    long_venue = _text(payload.get("long_venue"))
+    short_venue = _text(payload.get("short_venue"))
+    if kind == _SELECTED_KIND:
+        return bool(entry_id)
+    if kind == _FINALIZED_KIND:
+        return bool(entry_id and position_id)
+    if kind == _OPENED_KIND:
+        return bool(position_id)
+    if kind == "exit.closed":
+        return bool(position_id and symbol and long_venue and short_venue)
+    if kind == "runtime.position_lifecycle_terminal":
+        return bool(position_id and symbol)
+    if kind == "exit.passive_close_resolved":
+        return bool(position_id)
+    if kind == _RECONCILED_KIND:
+        return bool(position_id and symbol)
+    return False
 
 
 @dataclass(frozen=True)
@@ -78,6 +117,8 @@ class FundingCanaryReport:
     opened_unclosed_count: int = 0
     missing_actual_cost_count: int = 0
     missing_terminal_truth_count: int = 0
+    invalid_lifecycle_evidence_count: int = 0
+    malformed_relevant_event_count: int = 0
     over_notional_count: int = 0
     execution_cost_budget_breach_count: int = 0
     # Kept as a diagnostic for reports produced before the contract change.
@@ -111,21 +152,45 @@ def analyze_funding_canary_events(
         source_evidence_verified=source_evidence_verified is True,
     )
     selected: dict[tuple[str, str], dict[str, object]] = {}
+    finalized: dict[tuple[str, str], dict[str, object]] = {}
     opened: dict[tuple[str, str], dict[str, object]] = {}
     terminal_events: dict[tuple[str, str], list[dict[str, object]]] = {}
     reconciled: dict[tuple[str, str], dict[str, object]] = {}
     entry_to_position: dict[tuple[str, str], str] = {}
     seen_event_ids: set[tuple[str, int]] = set()
-    ordered_records: list[tuple[str, int, int, str, dict[str, object]]] = []
+    ordered_records: list[tuple[str, int, int, int, str, dict[str, object]]] = []
 
     for ordinal, record in enumerate(records):
         if not isinstance(record, Mapping):
             continue
         kind = _text(record.get("kind"))
+        if kind not in _RELEVANT_KINDS:
+            continue
         payload = record.get("payload")
-        if kind not in _RELEVANT_KINDS or not isinstance(payload, Mapping):
+        run_id = _text(record.get("run_id"))
+        seq = _positive_int(record.get("seq"))
+        journal_at_ms = _positive_int(record.get("ts_ms"))
+        if not run_id or seq is None:
+            report.missing_event_sequence_count += 1
+        if (
+            not isinstance(payload, Mapping)
+            or not run_id
+            or seq is None
+            or journal_at_ms is None
+        ):
+            # A selected/opened/closed/truth/reconciliation row is promotion
+            # evidence.  Dropping a damaged row would splice a false complete
+            # lifecycle from its neighbours, so it blocks the whole cohort.
+            report.malformed_relevant_event_count += 1
             continue
         data = dict(payload)
+        # These events form the only ownership chain accepted for promotion.
+        # Do this before filtering paper selections or joining positions: a
+        # malformed owner record must not disappear merely because it cannot
+        # be joined to a selected canary loop.
+        if not _relevant_event_owner_is_complete(kind, data):
+            report.malformed_relevant_event_count += 1
+            continue
         # Explicit paper selected events are intentionally ignored.  All
         # candidate live evidence must be journal-sequenced and bound to a run.
         is_paper_selected = (
@@ -135,19 +200,25 @@ def analyze_funding_canary_events(
         )
         if is_paper_selected:
             continue
-        run_id = _text(record.get("run_id"))
-        seq = _positive_int(record.get("seq"))
-        if not run_id or seq is None:
-            report.missing_event_sequence_count += 1
-            continue
+        assert seq is not None
+        assert journal_at_ms is not None
         event_id = (run_id, seq)
         if event_id in seen_event_ids:
             report.ambiguous_event_count += 1
             continue
         seen_event_ids.add(event_id)
-        ordered_records.append((run_id, seq, ordinal, kind, data))
+        ordered_records.append((run_id, seq, journal_at_ms, ordinal, kind, data))
 
-    for run_id, _, _, kind, data in sorted(ordered_records):
+    for run_id, seq, journal_at_ms, _, kind, data in sorted(ordered_records):
+        # Preserve journal order as evidence.  The input iterable may be
+        # reordered by a report/export path, so ordinal is never used to infer
+        # lifecycle order.
+        data = {
+            **data,
+            "_canary_journal_kind": kind,
+            "_canary_journal_seq": seq,
+            "_canary_journal_at_ms": journal_at_ms,
+        }
         if kind == _SELECTED_KIND:
             if data.get("funding_canary") is not True:
                 continue
@@ -166,13 +237,18 @@ def analyze_funding_canary_events(
         if kind == _FINALIZED_KIND:
             entry_id = _text(data.get("entry_id"))
             position_id = _text(data.get("position_id"))
-            if entry_id and position_id:
+            if entry_id:
                 entry_key = (run_id, entry_id)
-                prior = entry_to_position.get(entry_key)
-                if prior is not None:
+                if entry_key in finalized:
                     report.ambiguous_event_count += 1
                 else:
-                    entry_to_position[entry_key] = position_id
+                    finalized[entry_key] = data
+                if position_id:
+                    prior = entry_to_position.get(entry_key)
+                    if prior is not None:
+                        report.ambiguous_event_count += 1
+                    else:
+                        entry_to_position[entry_key] = position_id
             continue
         position_id = _text(data.get("position_id") or data.get("internal_entry_id"))
         if not position_id:
@@ -261,9 +337,12 @@ def analyze_funding_canary_events(
         )
         if terminal_ambiguous:
             report.ambiguous_event_count += 1
-        truth_flat = _terminal_truth_flat_from_events(
+        truth_flat, lifecycle_evidence_valid = _terminal_truth_flat_from_events(
             position_terminal_events,
             settlement_payload,
+            selected=selected_payload,
+            opened=opened_payload,
+            finalized=finalized.get((run_id, entry_id)),
         )
         official = _official_reconciliation_complete(settlement_payload, position_id=position_id)
         budget, reserve = _selection_execution_cost_budget(selected_payload)
@@ -271,6 +350,8 @@ def analyze_funding_canary_events(
             report.missing_actual_cost_count += 1
         if not truth_flat:
             report.missing_terminal_truth_count += 1
+        if not lifecycle_evidence_valid:
+            report.invalid_lifecycle_evidence_count += 1
         if official:
             report.official_reconciled_count += 1
         else:
@@ -293,6 +374,7 @@ def analyze_funding_canary_events(
             and budget is not None
             and reserve is not None
             and not terminal_ambiguous
+            and lifecycle_evidence_valid
         )
         if complete:
             report.complete_loop_count += 1
@@ -360,6 +442,8 @@ def _promotion_blockers(report: FundingCanaryReport) -> list[str]:
         blockers.append("terminal_canaries_missing_actual_cost")
     if report.missing_terminal_truth_count:
         blockers.append("terminal_canaries_missing_exchange_truth_flat")
+    if report.invalid_lifecycle_evidence_count:
+        blockers.append("canary_lifecycle_evidence_not_ordered_and_scoped")
     if report.missing_official_reconciliation_count:
         blockers.append("terminal_canaries_missing_official_funding_reconciliation")
     if report.invalid_canary_contract_count:
@@ -374,6 +458,8 @@ def _promotion_blockers(report: FundingCanaryReport) -> list[str]:
         blockers.append("acceptance_event_ambiguity")
     if report.missing_event_sequence_count:
         blockers.append("acceptance_event_sequence_missing")
+    if report.malformed_relevant_event_count:
+        blockers.append("acceptance_relevant_event_malformed")
     if report.cross_run_lifecycle_evidence_count:
         blockers.append("cross_run_lifecycle_evidence_not_promotable")
     if report.mixed_cohort_count or len(report.cohort_ids) != 1:
@@ -456,6 +542,10 @@ def _actual_execution_cost_bps(
     # serialized as ``0.0`` and falsely improve the canary result.
     if terminal.get("execution_benchmark_complete") is not True:
         return None
+    if terminal.get("execution_fee_complete") is not True:
+        return None
+    if not _terminal_execution_benchmark_receipts_complete(opened, terminal):
+        return None
     notional = _entry_notional(opened)
     entry_fee = _finite_required(terminal.get("entry_fee_quote"))
     exit_fee = _finite_required(terminal.get("exit_fee_quote"))
@@ -478,6 +568,242 @@ def _actual_execution_cost_bps(
     )
 
 
+def _terminal_execution_benchmark_receipts_complete(
+    opened: Mapping[str, object],
+    terminal: Mapping[str, object],
+) -> bool:
+    """Verify that a terminal cost aggregate is backed by signed raw receipts.
+
+    The close runtime persists the raw, side-aware L2 receipts alongside the
+    terminal aggregate.  Accepting only the aggregate here would turn a
+    tampered or synthetic journal row into promotion evidence even though the
+    trusted close path deliberately HMAC-seals the underlying receipts.  This
+    is a read-only admission check: it neither changes close behaviour nor
+    attempts to recreate missing measurements.
+    """
+    position_id = _text(terminal.get("position_id"))
+    symbol = _text(terminal.get("symbol"))
+    long_venue = _text(terminal.get("long_venue"))
+    short_venue = _text(terminal.get("short_venue"))
+    reported_shortfall = _finite_required(
+        terminal.get("implementation_shortfall_quote")
+    )
+    entry_receipt = terminal.get("entry_execution_benchmark_receipt")
+    receipts = terminal.get("exit_execution_benchmark_receipts")
+    if (
+        not position_id
+        or not symbol
+        or not long_venue
+        or not short_venue
+        or reported_shortfall is None
+        or reported_shortfall < 0.0
+        or not isinstance(entry_receipt, dict)
+        or not isinstance(receipts, list)
+        or not receipts
+    ):
+        return False
+
+    if not execution_benchmark_receipt_semantically_verified(
+        entry_receipt,
+        position_id=position_id,
+        symbol=symbol,
+        expected_legs={
+            "long": (long_venue, "buy"),
+            "short": (short_venue, "sell"),
+        },
+        require_fee_observations=True,
+    ) or not _execution_benchmark_receipt_is_timely(entry_receipt):
+        return False
+    entry_quantity = _finite_required(entry_receipt.get("requested_base_quantity"))
+    opened_quantity = _opened_matched_base_quantity(opened)
+    if (
+        entry_quantity is None
+        or opened_quantity is None
+        or not _execution_benchmark_quantities_match(entry_quantity, opened_quantity)
+    ):
+        # A signed receipt for a smaller entry is not a harmless diagnostic
+        # mismatch: treating it as complete would let the unbenchmarked part
+        # of an actually opened pair disappear from the cost denominator.
+        return False
+    entry_shortfall = _finite_required(
+        entry_receipt.get("implementation_shortfall_quote")
+    )
+    if entry_shortfall is None or entry_shortfall < 0.0:
+        return False
+
+    entry_receipt_fee = _execution_benchmark_receipt_fee_quote(entry_receipt)
+    if entry_receipt_fee is None:
+        return False
+    receipt_shortfall = entry_shortfall
+    receipt_fee_quote = entry_receipt_fee
+    exit_quantity = 0.0
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("source") != "local_l2_vwap"
+            or _text(receipt.get("position_id")) != position_id
+            or not execution_benchmark_receipt_integrity_verified(receipt)
+            or not execution_benchmark_receipt_semantically_verified(
+                receipt,
+                position_id=position_id,
+                symbol=symbol,
+                expected_legs={
+                    "long": (long_venue, "sell"),
+                    "short": (short_venue, "buy"),
+                },
+                require_fee_observations=True,
+            )
+            or not _execution_benchmark_receipt_is_timely(receipt)
+        ):
+            return False
+        shortfall = _finite_required(receipt.get("implementation_shortfall_quote"))
+        receipt_quantity = _finite_required(receipt.get("requested_base_quantity"))
+        if (
+            shortfall is None
+            or shortfall < 0.0
+            or receipt_quantity is None
+            or receipt_quantity <= 0.0
+        ):
+            return False
+        receipt_shortfall += shortfall
+        exit_quantity += receipt_quantity
+        receipt_fee = _execution_benchmark_receipt_fee_quote(receipt)
+        if receipt_fee is None:
+            return False
+        receipt_fee_quote += receipt_fee
+
+    tolerance = max(1e-8, max(receipt_shortfall, reported_shortfall) * 1e-8)
+    observed_entry_fee = _finite_required(terminal.get("entry_fee_quote"))
+    observed_exit_fee = _finite_required(terminal.get("exit_fee_quote"))
+    if observed_entry_fee is None or observed_exit_fee is None:
+        return False
+    fee_tolerance = max(
+        1e-8,
+        max(abs(receipt_fee_quote), abs(observed_entry_fee + observed_exit_fee))
+        * 1e-8,
+    )
+    return (
+        isfinite(exit_quantity)
+        and _execution_benchmark_quantities_match(exit_quantity, opened_quantity)
+        and abs(receipt_shortfall - reported_shortfall) <= tolerance
+        and abs(receipt_fee_quote - (observed_entry_fee + observed_exit_fee))
+        <= fee_tolerance
+    )
+
+
+def _opened_matched_base_quantity(opened: Mapping[str, object]) -> float | None:
+    """Read the actual common entry quantity from durable opening evidence.
+
+    ``entry.opened`` has used both ``matched_quantity`` and ``quantity`` in
+    historical journals.  The canary accepts either only when it is a finite,
+    positive base quantity; it never substitutes a planned size because the
+    execution receipts must cover what actually reached the exchange.
+    """
+    for field in ("matched_quantity", "quantity"):
+        quantity = _finite_required(opened.get(field))
+        if quantity is not None and quantity > 0.0:
+            return quantity
+    return None
+
+
+def _execution_benchmark_quantities_match(left: float, right: float) -> bool:
+    return abs(left - right) <= max(1e-10, max(abs(left), abs(right)) * 1e-8)
+
+
+def _execution_benchmark_receipt_fee_quote(
+    receipt: Mapping[str, object],
+) -> float | None:
+    """Sum literal per-fill fees only after the semantic verifier accepts them."""
+    total = 0.0
+    for leg_name in ("long", "short"):
+        leg = receipt.get(leg_name)
+        fills = leg.get("fills") if isinstance(leg, Mapping) else None
+        if not isinstance(fills, list) or not fills:
+            return None
+        for fill in fills:
+            fee_quote = _finite_required(
+                fill.get("fee_quote") if isinstance(fill, Mapping) else None
+            )
+            if fee_quote is None:
+                return None
+            total += fee_quote
+    return total if isfinite(total) else None
+
+
+def _execution_benchmark_receipt_is_timely(receipt: Mapping[str, object]) -> bool:
+    """Verify the sealed L2 observation remained current when every leg sent."""
+    try:
+        captured_at_ms = int(receipt.get("captured_at_ms", 0))
+        max_delay_ms = int(receipt.get("max_observation_to_submit_ms", 0))
+        requested_quantity = float(receipt.get("requested_base_quantity"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (
+        captured_at_ms <= 0
+        or max_delay_ms != EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
+        or not isfinite(requested_quantity)
+        or requested_quantity <= 0.0
+    ):
+        return False
+    for leg_name in ("long", "short"):
+        leg = receipt.get(leg_name)
+        if not isinstance(leg, Mapping):
+            return False
+        try:
+            observed_at_ms = int(leg.get("observed_at_ms", 0))
+            age_ms = int(leg.get("age_ms", -1))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        fills = leg.get("fills")
+        if (
+            observed_at_ms <= 0
+            or age_ms < 0
+            or observed_at_ms > captured_at_ms
+            or captured_at_ms - observed_at_ms != age_ms
+            or not isinstance(fills, list)
+            or not fills
+        ):
+            return False
+        for fill in fills:
+            if not isinstance(fill, Mapping):
+                return False
+            try:
+                submitted_at_ms = int(fill.get("submitted_at_ms", 0))
+                filled_at_ms = int(fill.get("filled_at_ms", 0))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                submitted_at_ms <= 0
+                or filled_at_ms <= 0
+                or captured_at_ms > submitted_at_ms
+                or submitted_at_ms > filled_at_ms
+                or submitted_at_ms - observed_at_ms > max_delay_ms
+            ):
+                return False
+    return True
+
+
+def _terminal_execution_benchmark_max_fill_at_ms(
+    terminal: Mapping[str, object],
+) -> int | None:
+    """Return the last sealed close-fill timestamp, or ``None`` if absent.
+
+    This is deliberately separate from journal time: the producer may buffer
+    a journal append, while the fill boundary is the fact that the later
+    exchange-flat probe must follow.
+    """
+    receipts = terminal.get("exit_execution_benchmark_receipts")
+    if not isinstance(receipts, list) or not receipts:
+        return None
+    latest = 0
+    for receipt in receipts:
+        filled_at_ms = execution_benchmark_receipt_max_fill_at_ms(receipt)
+        if filled_at_ms is None:
+            return None
+        latest = max(latest, filled_at_ms)
+    return latest or None
+
+
 def _actual_execution_cost_from_terminal_events(
     opened: Mapping[str, object], terminal_events: Iterable[Mapping[str, object]]
 ) -> tuple[float | None, bool]:
@@ -496,20 +822,122 @@ def _actual_execution_cost_from_terminal_events(
 def _terminal_truth_flat_from_events(
     events: Iterable[Mapping[str, object]],
     settlement: Mapping[str, object] | None = None,
-) -> bool:
-    """Require exactly one terminal flat-truth receipt for the same loop.
+    *,
+    selected: Mapping[str, object],
+    opened: Mapping[str, object],
+    finalized: Mapping[str, object] | None,
+) -> tuple[bool, bool]:
+    """Require one ordered, scoped proof between close and reconciliation.
 
-    A normal close provides execution-cost facts; its post-close accounting
-    receipt provides the fresh exchange truth.  Legacy terminal events that
-    already carry the receipt remain supported, but duplicated truth claims
-    are treated as ambiguous rather than selected by input order.
+    A flat account probe attached to a reconciliation row can be captured
+    before or after any number of unrelated lifecycle changes.  Promotion
+    instead needs one durable post-close proof with an explicit capture time
+    and target scope, sequenced strictly after the actual ``exit.closed`` and
+    strictly before the funding-accounting receipt.
     """
-    truth_events = [event for event in events if "exchange_truth" in event]
-    if isinstance(settlement, Mapping) and "exchange_truth" in settlement:
-        truth_events.append(settlement)
-    if len(truth_events) != 1:
-        return False
-    return _terminal_truth_flat(truth_events[0])
+    terminal_events = list(events)
+    closed_events = [
+        event
+        for event in terminal_events
+        if event.get("_canary_journal_kind") == "exit.closed"
+    ]
+    truth_events = [
+        event
+        for event in terminal_events
+        if event.get("_canary_journal_kind")
+        == "runtime.position_lifecycle_terminal"
+        and "exchange_truth" in event
+    ]
+    # A canary loop is a linear state machine, not an event bag.  Extra
+    # terminal rows (including passive-close resolution) make it impossible
+    # to know which close actually owns the subsequent truth probe, even when
+    # only one of them carries a cost field.
+    if (
+        len(terminal_events) != 2
+        or len(closed_events) != 1
+        or len(truth_events) != 1
+        or not isinstance(settlement, Mapping)
+    ):
+        return False, False
+    close_event = closed_events[0]
+    truth_event = truth_events[0]
+    close_seq = _positive_int(close_event.get("_canary_journal_seq"))
+    truth_seq = _positive_int(truth_event.get("_canary_journal_seq"))
+    settlement_seq = _positive_int(settlement.get("_canary_journal_seq"))
+    close_journal_at_ms = _positive_int(close_event.get("_canary_journal_at_ms"))
+    truth_journal_at_ms = _positive_int(truth_event.get("_canary_journal_at_ms"))
+    settlement_journal_at_ms = _positive_int(settlement.get("_canary_journal_at_ms"))
+    position_id = _text(close_event.get("position_id"))
+    symbol = _text(close_event.get("symbol")).upper()
+    long_venue = _text(close_event.get("long_venue")).lower()
+    short_venue = _text(close_event.get("short_venue")).lower()
+    if (
+        close_seq is None
+        or truth_seq is None
+        or settlement_seq is None
+        or close_journal_at_ms is None
+        or truth_journal_at_ms is None
+        or settlement_journal_at_ms is None
+        or not (close_seq < truth_seq < settlement_seq)
+        or not (close_journal_at_ms <= truth_journal_at_ms <= settlement_journal_at_ms)
+        or not position_id
+        or not symbol
+        or not long_venue
+        or not short_venue
+        or long_venue == short_venue
+        or _text(settlement.get("position_id")) != position_id
+    ):
+        return False, False
+    selected_seq = _positive_int(selected.get("_canary_journal_seq"))
+    opened_seq = _positive_int(opened.get("_canary_journal_seq"))
+    finalized_seq = (
+        _positive_int(finalized.get("_canary_journal_seq"))
+        if isinstance(finalized, Mapping)
+        else None
+    )
+    if (
+        selected_seq is None
+        or opened_seq is None
+        or not (selected_seq < opened_seq < close_seq < truth_seq < settlement_seq)
+        or (
+            finalized_seq is not None
+            and not (opened_seq < finalized_seq < close_seq)
+        )
+    ):
+        return False, False
+    scope = truth_event.get("exchange_truth_scope")
+    capture_at_ms = _positive_int(truth_event.get("exchange_truth_captured_at_ms"))
+    closed_at_ms = _positive_int(close_event.get("closed_at_ms"))
+    execution_completed_at_ms = _positive_int(
+        close_event.get("execution_completed_at_ms")
+    )
+    reconciled_at_ms = _positive_int(settlement.get("reconciled_at_ms"))
+    max_fill_at_ms = _terminal_execution_benchmark_max_fill_at_ms(close_event)
+    venues = scope.get("venues") if isinstance(scope, Mapping) else None
+    if (
+        capture_at_ms is None
+        or closed_at_ms is None
+        or execution_completed_at_ms is None
+        or reconciled_at_ms is None
+        or max_fill_at_ms is None
+        or not (
+            closed_at_ms
+            <= execution_completed_at_ms
+            and max_fill_at_ms <= execution_completed_at_ms
+            and execution_completed_at_ms <= capture_at_ms <= reconciled_at_ms
+        )
+        or not isinstance(venues, list)
+        or {_text(venue).lower() for venue in venues} != {long_venue, short_venue}
+        or len(venues) != 2
+        or _text(truth_event.get("position_id")) != position_id
+        or _text(truth_event.get("symbol")).upper() != symbol
+        or _text(scope.get("position_id")) != position_id
+        or _text(scope.get("symbol")).upper() != symbol
+    ):
+        return False, False
+    if _text(truth_event.get("terminal_reason")) != _POST_CLOSE_FUNDING_TRUTH_REASON:
+        return False, False
+    return _terminal_truth_flat(truth_event), True
 
 
 def _entry_notional(opened: Mapping[str, object]) -> float:

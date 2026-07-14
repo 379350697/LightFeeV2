@@ -9,6 +9,7 @@ from lightfee.offline.spread_paper_analysis import (
     analyze_spread_paper_events,
     spread_paper_report_dict,
 )
+from lightfee.spread.paper import SpreadPaperExecutionContract
 
 
 def _closed(
@@ -40,7 +41,7 @@ def _closed(
             "paper_net_bps": net_quote / 20.0 * 10_000.0,
             "model_epoch": "v2_signed_reversion",
             "calculation_version": "spread_paper_v3",
-            "journal_schema_version": 6,
+            "journal_schema_version": 8,
             "official_pnl": True,
             "paper_unpriced": False,
             "paper_order_status": "FILLED",
@@ -62,11 +63,47 @@ def _analyze(records: list[dict], **kwargs: object):
 
 def _v3_closed(symbol: str = "V3USDT") -> dict:
     record = _closed(symbol, 2.0)
+    record.update({"run_id": f"run-{symbol}", "seq": 1, "ts_ms": 1_000})
     payload = record["payload"]
+    contract = SpreadPaperExecutionContract(
+        schema_version=1,
+        enabled=True,
+        model_epoch="v3_cost_normalized_reversion",
+        research_manifest_digest="d" * 64,
+        finalist_limit=1,
+        min_decision_latency_ms=0,
+        markout_secs=(60,),
+        terminal_secs=600,
+        active_exit_enabled=True,
+        exit_z=0.5,
+        stop_z=2.0,
+        max_hold_ms=600_000,
+        taker_fee_bps_by_venue={"binance": 1.0, "gate": 1.1},
+        maker_fee_bps_by_venue={"binance": 0.2, "gate": 0.2},
+        verified_maker_rebate_bps_by_venue={},
+        slippage_buffer_bps=1.0,
+        latency_buffer_bps=1.0,
+        require_l2_vwap=True,
+        require_account_fee_evidence=True,
+        fee_evidence_account_identity_hashes={},
+        allow_verified_maker_rebates=False,
+        oos_start_ms=1,
+        require_out_of_sample=True,
+        excluded_symbols=(),
+        allowed_opportunity_labels=("spread_reversion",),
+        episode_cooldown_ms=0,
+        paper_bot_ids=("tt_conservative",),
+        primary_fill_model="taker_taker",
+        require_taker_taker=True,
+        quote_ttl_ms=1_000,
+        quote_skew_ms=250,
+    )
     payload.update(
         {
             "model_epoch": "v3_cost_normalized_reversion",
-            "research_manifest_digest": "d" * 64,
+            "research_manifest_digest": contract.research_manifest_digest,
+            "research_config_digest": contract.digest,
+            "execution_contract": contract.to_payload(),
             "research_sample_split": "out_of_sample",
             "long_venue": "gate",
             "short_venue": "binance",
@@ -154,7 +191,7 @@ def test_v3_analysis_requires_oos_official_taker_taker_contract() -> None:
             require_out_of_sample=True,
             require_taker_taker=False,
         )
-    with pytest.raises(ValueError, match="journal schema v6"):
+    with pytest.raises(ValueError, match="journal schema v8"):
         analyze_spread_paper_events(
             [],
             model_epoch="v3_cost_normalized_reversion",
@@ -181,16 +218,65 @@ def test_v3_analysis_rechecks_frozen_l2_funding_and_account_fee_receipts() -> No
     forged_fingerprint["payload"]["candidate_snapshot"][
         "account_fee_evidence_fingerprint"
     ] = "0" * 64
+    missing_contract = _v3_closed("BADCONTRACTV3USDT")
+    missing_contract["payload"].pop("execution_contract")
+    tampered_contract = _v3_closed("BADCONTRACTDIGESTV3USDT")
+    tampered_contract["payload"]["execution_contract"]["terminal_secs"] = 601
 
     report = analyze_spread_paper_events(
-        [accepted, missing_fee_receipt, bbo_exit, forged_fingerprint],
+        [
+            accepted,
+            missing_fee_receipt,
+            bbo_exit,
+            forged_fingerprint,
+            missing_contract,
+            tampered_contract,
+        ],
         model_epoch="v3_cost_normalized_reversion",
         require_out_of_sample=True,
         source_evidence_verified=True,
     )
 
     assert report.closed_count == 1
-    assert report.excluded_evidence_count == 3
+    assert report.excluded_evidence_count == 5
+
+
+def test_v3_analysis_requires_replayable_paper_lifecycle() -> None:
+    terminal_only = _v3_closed("TERMINALONLYV3USDT")
+    truncated = analyze_spread_paper_events(
+        [terminal_only],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    # A terminal's frozen receipts remain useful diagnostic evidence, but the
+    # promotion gate must reject it when the preceding state transition is
+    # absent from the append-only journal.
+    assert truncated.closed_count == 1
+    assert truncated.journal_replay_integrity_count == 1
+    assert truncated.acceptance_ready is False
+
+    registered_without_fill = _v3_closed("REGISTEREDONLYV3USDT")
+    registered_without_fill.update(
+        {
+            "kind": "opportunity.paper_registered",
+            "run_id": "run-REGISTEREDONLYV3USDT",
+            "seq": 1,
+            "ts_ms": 1_000,
+        }
+    )
+    illegal_close = _v3_closed("REGISTEREDONLYV3USDT")
+    illegal_close.update({"seq": 2, "ts_ms": 1_001})
+    unfilled_close = analyze_spread_paper_events(
+        [registered_without_fill, illegal_close],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    assert unfilled_close.journal_replay_integrity_count >= 1
+    assert unfilled_close.acceptance_ready is False
 
 
 def test_v3_analysis_rejects_missing_cost_component_and_forged_net_identity() -> None:
@@ -229,6 +315,27 @@ def test_v3_analysis_rejects_coercible_non_numeric_economics() -> None:
     assert report.acceptance_ready is False
 
 
+def test_v3_analysis_rejects_negative_cost_as_synthetic_subsidy() -> None:
+    negative_fee = _v3_closed("NEGATIVEFEEV3USDT")
+    negative_fee["payload"].update(
+        {
+            "paper_fee_quote": -4.0,
+            "paper_net_quote": 6.0,
+        }
+    )
+
+    report = analyze_spread_paper_events(
+        [negative_fee],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    assert report.closed_count == 0
+    assert report.invalid_economics_count == 1
+    assert report.acceptance_ready is False
+
+
 def test_v3_analysis_blocks_duplicate_or_mixed_manifest_acceptance() -> None:
     first = _v3_closed("DUPV3USDT")
     duplicate = _v3_closed("DUPV3USDT")
@@ -242,10 +349,55 @@ def test_v3_analysis_blocks_duplicate_or_mixed_manifest_acceptance() -> None:
         source_evidence_verified=True,
     )
 
-    assert report.closed_count == 1
+    assert report.closed_count == 0
     assert report.duplicate_episode_count == 1
     assert report.manifest_digest_mismatch_count == 1
     assert report.research_manifest_digest == ""
+    assert report.acceptance_ready is False
+
+
+def test_v3_analysis_blocks_mixed_research_config_cohorts() -> None:
+    first = _v3_closed("CONFIGONEV3USDT")
+    changed_config = _v3_closed("CONFIGTWOV3USDT")
+    changed_config["payload"]["research_config_digest"] = "e" * 64
+
+    report = analyze_spread_paper_events(
+        [first, changed_config],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    assert report.closed_count == 0
+    assert report.research_config_digest_mismatch_count == 1
+    assert report.acceptance_ready is False
+
+
+def test_v3_analysis_blocks_mixed_cohort_even_when_other_row_is_nonofficial() -> None:
+    official = _v3_closed("OFFICIALV3USDT")
+    nonofficial = _v3_closed("NONOFFICIALV3USDT")
+    nonofficial["payload"].update(
+        {
+            "official_pnl": False,
+            "research_manifest_digest": "e" * 64,
+            "research_config_digest": "a" * 64,
+        }
+    )
+
+    report = analyze_spread_paper_events(
+        [official, nonofficial],
+        model_epoch="v3_cost_normalized_reversion",
+        require_out_of_sample=True,
+        source_evidence_verified=True,
+    )
+
+    # Cohort identity is validated before official-PnL filtering.  Otherwise a
+    # nonofficial row could silently hide a second contract beside a selected
+    # promotion cohort.
+    assert report.closed_count == 0
+    assert report.excluded_nonofficial_count == 1
+    assert report.manifest_digest_mismatch_count == 1
+    assert report.research_config_digest_mismatch_count == 1
     assert report.acceptance_ready is False
 
 

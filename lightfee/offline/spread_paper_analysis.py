@@ -16,12 +16,17 @@ from random import Random
 from statistics import median, stdev
 from typing import Iterable
 
+from lightfee.spread.paper import (
+    execution_contract_from_payload,
+    paper_journal_replay_integrity_faults,
+)
+
 from lightfee.strategy.fee_evidence import TRUSTED_FEE_EVIDENCE_KEY_ID
 
 
 DEFAULT_ALLOWED_OPPORTUNITY_LABELS = ("spread_reversion",)
 DEFAULT_MODEL_EPOCH = "v2_signed_reversion"
-CURRENT_PAPER_JOURNAL_SCHEMA_VERSION = 6
+CURRENT_PAPER_JOURNAL_SCHEMA_VERSION = 8
 
 
 @dataclass
@@ -102,6 +107,7 @@ class SpreadPaperAnalysisReport(SpreadPaperGroupStats):
     excluded_nonofficial_count: int = 0
     excluded_execution_cohort_count: int = 0
     excluded_evidence_count: int = 0
+    journal_replay_integrity_count: int = 0
     journal_schema_mismatch_count: int = 0
     calculation_version_mismatch_count: int = 0
     invalid_economics_count: int = 0
@@ -109,6 +115,9 @@ class SpreadPaperAnalysisReport(SpreadPaperGroupStats):
     manifest_digest_missing_count: int = 0
     manifest_digest_mismatch_count: int = 0
     research_manifest_digest: str = ""
+    research_config_digest_missing_count: int = 0
+    research_config_digest_mismatch_count: int = 0
+    research_config_digest: str = ""
     excluded_in_sample_count: int = 0
     filled_count: int = 0
     stress_net_quote_mean_by_multiplier: dict[str, float] = field(default_factory=dict)
@@ -144,11 +153,16 @@ class SpreadPaperAnalysisReport(SpreadPaperGroupStats):
             and self.independent_episode_count > 0
             and not any(
                 (
+                    self.journal_schema_mismatch_count,
+                    self.calculation_version_mismatch_count,
                     self.excluded_evidence_count,
+                    self.journal_replay_integrity_count,
                     self.invalid_economics_count,
                     self.duplicate_episode_count,
                     self.manifest_digest_missing_count,
                     self.manifest_digest_mismatch_count,
+                    self.research_config_digest_missing_count,
+                    self.research_config_digest_mismatch_count,
                 )
             )
         )
@@ -201,22 +215,38 @@ def analyze_spread_paper_events(
         if require_taker_taker is not True:
             raise ValueError("taker_taker execution is required for a v3 model epoch")
         if required_journal_schema_version != CURRENT_PAPER_JOURNAL_SCHEMA_VERSION:
-            raise ValueError("journal schema v6 is required for a v3 model epoch")
+            raise ValueError("journal schema v8 is required for a v3 model epoch")
         if allowed_labels != set(DEFAULT_ALLOWED_OPPORTUNITY_LABELS):
             raise ValueError("spread_reversion label is required for a v3 model epoch")
         if source_evidence_verified is not True:
             raise ValueError("verified source evidence is required for a v3 model epoch")
+    all_records = list(records)
     report = SpreadPaperAnalysisReport(
         model_epoch=requested_epoch,
         source_evidence_verified=source_evidence_verified is True,
         excluded_symbols=sorted(excluded),
         allowed_opportunity_labels=sorted(allowed_labels),
     )
+    if requested_epoch.startswith("v3_"):
+        report.journal_replay_integrity_count = paper_journal_replay_integrity_faults(
+            all_records,
+            require_journal_envelope=True,
+        )
     episode_ids: set[str] = set()
     manifest_digests: set[str] = set()
-    accepted: list[tuple[int, int, dict, str, str]] = []
+    research_config_digests: set[str] = set()
+    # Cohort identity is an input-integrity property, not a PnL eligibility
+    # property.  A nonofficial, stale, or otherwise excluded v3 row with a
+    # different contract still proves the source mixes incomparable cohorts.
+    # Keep every syntactically current v3 identity before later filters.
+    v3_cohort_digests: list[tuple[str, str]] = []
+    # Keep the cohort identities with every candidate until the complete input
+    # has been scanned.  Selecting the first valid row and dropping later
+    # incompatible rows makes reported PnL depend on JSONL ordering, which is
+    # unacceptable for a promotion artefact.
+    accepted: list[tuple[int, int, dict, str, str, str, str]] = []
 
-    for ordinal, record in enumerate(records):
+    for ordinal, record in enumerate(all_records):
         kind = str(record.get("kind", "") or "")
         if kind not in {"opportunity.paper_closed", "opportunity.paper_expired"}:
             continue
@@ -243,9 +273,14 @@ def analyze_spread_paper_events(
                 report.manifest_digest_missing_count += 1
                 continue
             manifest_digests.add(manifest_digest)
-            if len(manifest_digests) > 1:
-                report.manifest_digest_mismatch_count += 1
+            research_config_digest = str(
+                payload.get("research_config_digest", "") or ""
+            ).lower()
+            if not _sha256_hex(research_config_digest):
+                report.research_config_digest_missing_count += 1
                 continue
+            research_config_digests.add(research_config_digest)
+            v3_cohort_digests.append((manifest_digest, research_config_digest))
         symbol = str(payload.get("symbol", "") or "").upper()
         if not symbol or symbol in excluded:
             continue
@@ -302,12 +337,60 @@ def analyze_spread_paper_events(
             report.invalid_economics_count += 1
             continue
 
-        accepted.append((_event_time_ms(record, payload), ordinal, payload, label, symbol))
+        accepted.append(
+            (
+                _event_time_ms(record, payload),
+                ordinal,
+                payload,
+                label,
+                symbol,
+                manifest_digest if requested_epoch.startswith("v3_") else "",
+                research_config_digest if requested_epoch.startswith("v3_") else "",
+            )
+        )
+
+    # A mixed v3 journal is not one cohort.  Do not retain an arbitrary
+    # "first" cohort for headline statistics: that would be deterministic only
+    # by file order and would still invite accidental or deliberate
+    # cherry-picking.  The caller must split the source by exact manifest and
+    # config digest before it can obtain a promotion report.
+    if requested_epoch.startswith("v3_"):
+        if len(manifest_digests) > 1:
+            report.manifest_digest_mismatch_count = sum(
+                1
+                for manifest_digest, _ in v3_cohort_digests
+                if manifest_digest != min(manifest_digests)
+            )
+        if len(research_config_digests) > 1:
+            report.research_config_digest_mismatch_count = sum(
+                1
+                for _, research_config_digest in v3_cohort_digests
+                if research_config_digest != min(research_config_digests)
+            )
+        if (
+            report.manifest_digest_mismatch_count
+            or report.research_config_digest_mismatch_count
+        ):
+            # Preserve the integrity diagnostics even though mixed cohorts
+            # deliberately contribute no headline PnL.  Otherwise a duplicate
+            # could be hidden merely by putting it beside a second config.
+            seen_mixed_episode_ids: set[str] = set()
+            for _, _, payload, _, _, _, _ in sorted(
+                accepted, key=lambda item: (item[0], item[1])
+            ):
+                episode_id = _episode_id(payload)
+                if episode_id in seen_mixed_episode_ids:
+                    report.duplicate_episode_count += 1
+                else:
+                    seen_mixed_episode_ids.add(episode_id)
+            accepted = []
 
     # JSONL append order is normally chronological, but restored/merged
     # journal segments need not be.  Drawdown, group paths and block bootstrap
     # must be invariant to the input-file ordering, not merely to their totals.
-    for _, _, payload, label, symbol in sorted(accepted, key=lambda item: (item[0], item[1])):
+    for _, _, payload, label, symbol, _, _ in sorted(
+        accepted, key=lambda item: (item[0], item[1])
+    ):
         episode_id = _episode_id(payload)
         if episode_id in episode_ids:
             report.duplicate_episode_count += 1
@@ -332,6 +415,8 @@ def analyze_spread_paper_events(
     report.independent_episode_count = len(episode_ids)
     if len(manifest_digests) == 1:
         report.research_manifest_digest = next(iter(manifest_digests))
+    if len(research_config_digests) == 1:
+        report.research_config_digest = next(iter(research_config_digests))
     report.finalize_stress()
     return report
 
@@ -354,6 +439,7 @@ def spread_paper_report_dict(report: SpreadPaperAnalysisReport) -> dict:
         "excluded_nonofficial_count": report.excluded_nonofficial_count,
         "excluded_execution_cohort_count": report.excluded_execution_cohort_count,
         "excluded_evidence_count": report.excluded_evidence_count,
+        "journal_replay_integrity_count": report.journal_replay_integrity_count,
         "journal_schema_mismatch_count": report.journal_schema_mismatch_count,
         "calculation_version_mismatch_count": report.calculation_version_mismatch_count,
         "invalid_economics_count": report.invalid_economics_count,
@@ -361,6 +447,9 @@ def spread_paper_report_dict(report: SpreadPaperAnalysisReport) -> dict:
         "manifest_digest_missing_count": report.manifest_digest_missing_count,
         "manifest_digest_mismatch_count": report.manifest_digest_mismatch_count,
         "research_manifest_digest": report.research_manifest_digest,
+        "research_config_digest_missing_count": report.research_config_digest_missing_count,
+        "research_config_digest_mismatch_count": report.research_config_digest_mismatch_count,
+        "research_config_digest": report.research_config_digest,
         "acceptance_ready": report.acceptance_ready,
         "excluded_in_sample_count": report.excluded_in_sample_count,
         "filled_count": report.filled_count,
@@ -451,6 +540,16 @@ def _has_v3_acceptance_evidence(payload: dict) -> bool:
         or payload.get("funding_settlement_evidence_complete") is not True
         or payload.get("paper_fill_capacity_source") != "l2_vwap"
         or payload.get("paper_exit_capacity_source") != "l2_vwap"
+    ):
+        return False
+    contract = execution_contract_from_payload(payload.get("execution_contract"))
+    if (
+        contract is None
+        or str(payload.get("research_config_digest") or "").lower()
+        != contract.digest
+        or str(payload.get("research_manifest_digest") or "").lower()
+        != contract.research_manifest_digest
+        or str(payload.get("model_epoch") or "") != contract.model_epoch
     ):
         return False
     registered_at_ms = _positive_int(payload.get("registered_at_ms"))
@@ -617,6 +716,20 @@ def _paper_economics_are_finite(payload: dict, *, require_complete: bool) -> boo
                 return False
         except (TypeError, ValueError):
             return False
+    # Negative costs invert the PnL identity into a synthetic subsidy.  Funding
+    # and gross PnL are legitimately signed, but these three terms are
+    # explicitly subtracted by the paper engine and must be non-negative.
+    if require_complete:
+        for metric_name in (
+            "paper_fee_quote",
+            "paper_slippage_quote",
+            "paper_adverse_selection_assumption_quote",
+        ):
+            try:
+                if float(payload[metric_name]) < 0.0:
+                    return False
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
     return True
 
 
@@ -641,6 +754,8 @@ def _paper_economics_reconciled(payload: dict) -> bool:
             payload["paper_adverse_selection_assumption_quote"]
         )
     except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if fee < 0.0 or slippage < 0.0 or adverse_selection < 0.0:
         return False
     expected = gross + funding - fee - slippage - adverse_selection
     tolerance = max(1e-9, 1e-9 * max(abs(net), abs(expected), 1.0))

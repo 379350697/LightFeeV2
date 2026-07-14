@@ -11,6 +11,26 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
+
+
+def research_contract_digest(payload: Mapping[str, object]) -> str:
+    """Hash the complete, execution-relevant research cohort contract.
+
+    The manifest identifies the hypothesis and bot cohorts.  The paper
+    configuration also controls timing, exit, costs, and sample admission, so
+    it requires a separate deterministic identity before records can be mixed
+    or restored under a changed service configuration.
+    """
+    return hashlib.sha256(
+        json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,15 +97,7 @@ class SpreadResearchManifest:
                 for cohort in self.cohorts
             ],
         }
-        return hashlib.sha256(
-            json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
-            ).encode("utf-8")
-        ).hexdigest()
+        return research_contract_digest(payload)
 
 
 DEFAULT_SPREAD_RESEARCH_MANIFEST = SpreadResearchManifest(

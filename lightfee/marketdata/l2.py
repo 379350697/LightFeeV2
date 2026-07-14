@@ -13,7 +13,7 @@ from __future__ import annotations
 import binascii
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from math import isfinite
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +180,34 @@ class LocalL2Book:
         max_depth: int = 0,
     ) -> LocalL2UpdateResult:
         """Replace entire book with a snapshot. Returns events emitted."""
+        incoming_fault = _snapshot_level_fault(bids, asks)
+        if incoming_fault:
+            return LocalL2UpdateResult(
+                applied=False,
+                events=[
+                    _make_event(
+                        self,
+                        LocalL2EventKind.REBUILD_REQUIRED,
+                        now_ms,
+                        sequence,
+                        detail=incoming_fault,
+                    )
+                ],
+                fault_reason=incoming_fault,
+                rebuild_required=True,
+            )
         depth = max_depth or self.max_depth
-        next_bids = _sort_bids(bids)[:depth] if depth > 0 else _sort_bids(bids)
-        next_asks = _sort_asks(asks)[:depth] if depth > 0 else _sort_asks(asks)
+        sorted_bids = _sort_bids(bids)
+        sorted_asks = _sort_asks(asks)
+        if depth > 0:
+            sorted_bids = sorted_bids[:depth]
+            sorted_asks = sorted_asks[:depth]
+        # A validated snapshot must become an owned immutable-by-convention
+        # book state.  Keeping producer-owned ``PriceLevel`` instances here
+        # lets a later caller mutation bypass ingest validation after the book
+        # has already become HOT.
+        next_bids = _copy_levels(sorted_bids)
+        next_asks = _copy_levels(sorted_asks)
         fault = _book_structure_fault(next_bids, next_asks)
         if fault:
             return LocalL2UpdateResult(
@@ -289,6 +314,24 @@ class LocalL2Book:
         else:
             events = []
 
+        incoming_fault = _delta_level_fault(bids, asks)
+        if incoming_fault:
+            events.append(
+                _make_event(
+                    self,
+                    LocalL2EventKind.REBUILD_REQUIRED,
+                    now_ms,
+                    sequence,
+                    detail=incoming_fault,
+                )
+            )
+            return LocalL2UpdateResult(
+                applied=False,
+                events=events,
+                fault_reason=incoming_fault,
+                rebuild_required=True,
+            )
+
         depth = max_depth or self.max_depth
 
         next_bids = _merge_levels(self.bids, bids, side="bid", max_depth=depth)
@@ -339,18 +382,24 @@ class LocalL2Book:
         asks: list[tuple[str, str]],
         update_kind: LocalL2UpdateKind,
         max_depth: int = 200,
-    ) -> None:
+    ) -> bool:
         """Maintain V1-style raw-string checksum book for OKX/Bitget.
 
         V1 computes CRC over the original exchange strings, not float-normalized
         values.  The execution book can use floats, but checksum verification
         must retain the wire text and process zero-size deletes.
         """
+        if not raw_checksum_levels_valid(
+            bids,
+            asks,
+            allow_zero_quantity=update_kind == LocalL2UpdateKind.DELTA,
+        ):
+            return False
         depth = max(1, max_depth)
         if update_kind == LocalL2UpdateKind.SNAPSHOT:
             self.raw_checksum_bids = _sanitize_raw_checksum_side(bids, descending=True, max_depth=depth)
             self.raw_checksum_asks = _sanitize_raw_checksum_side(asks, descending=False, max_depth=depth)
-            return
+            return True
 
         self.raw_checksum_bids = _merge_raw_checksum_side(
             self.raw_checksum_bids,
@@ -364,6 +413,7 @@ class LocalL2Book:
             descending=False,
             max_depth=depth,
         )
+        return True
 
     def compute_raw_checksum(self) -> int:
         if not self.raw_checksum_bids or not self.raw_checksum_asks:
@@ -506,8 +556,12 @@ class LocalL2Book:
         return self.status in (L2BookStatus.HOT, L2BookStatus.BOOTSTRAPPING)
 
     def is_ready(self, max_age_ms: int, now_ms: int) -> bool:
-        """True if book is HOT and within freshness window."""
-        return self.status == L2BookStatus.HOT and not self.is_stale(max_age_ms, now_ms)
+        """True only for a HOT, fresh, structurally valid execution book."""
+        return (
+            self.status == L2BookStatus.HOT
+            and not self.is_stale(max_age_ms, now_ms)
+            and not _book_structure_fault(self.bids, self.asks)
+        )
 
     def age_ms(self, now_ms: int) -> int:
         if self.observed_at_ms <= 0:
@@ -586,17 +640,88 @@ def _sort_asks(levels: list[PriceLevel]) -> list[PriceLevel]:
     return sorted(levels, key=lambda x: x.price)
 
 
+def _copy_levels(levels: list[PriceLevel]) -> list[PriceLevel]:
+    """Detach accepted snapshot data from mutable producer-side objects."""
+    return [
+        PriceLevel(price=float(level.price), quantity=float(level.quantity))
+        for level in levels
+    ]
+
+
+def _finite_level_values(level: object) -> tuple[float, float] | None:
+    """Read one parser-owned numeric level without allowing coercible junk."""
+    if not isinstance(level, PriceLevel):
+        return None
+    price = level.price
+    quantity = level.quantity
+    if (
+        isinstance(price, bool)
+        or isinstance(quantity, bool)
+        or not isinstance(price, (int, float))
+        or not isinstance(quantity, (int, float))
+    ):
+        return None
+    parsed_price = float(price)
+    parsed_quantity = float(quantity)
+    if not isfinite(parsed_price) or not isfinite(parsed_quantity):
+        return None
+    return parsed_price, parsed_quantity
+
+
 def _book_structure_fault(bids: list[PriceLevel], asks: list[PriceLevel]) -> str:
     if not bids:
         return "book_empty_side_bid"
     if not asks:
         return "book_empty_side_ask"
-    best_bid = bids[0].price
-    best_ask = asks[0].price
+    for side, levels in (("bid", bids), ("ask", asks)):
+        previous_price: float | None = None
+        for index, level in enumerate(levels):
+            values = _finite_level_values(level)
+            if values is None or values[0] <= 0.0 or values[1] <= 0.0:
+                return f"invalid_{side}_level index={index}"
+            price = values[0]
+            if previous_price is not None and (
+                (side == "bid" and price >= previous_price)
+                or (side == "ask" and price <= previous_price)
+            ):
+                return f"non_monotonic_{side}_levels index={index}"
+            previous_price = price
+    best_bid = float(bids[0].price)
+    best_ask = float(asks[0].price)
     if best_bid <= 0 or best_ask <= 0:
         return f"non_positive_top best_bid={best_bid} best_ask={best_ask}"
     if best_bid >= best_ask:
         return f"crossed_or_locked_book best_bid={best_bid} best_ask={best_ask}"
+    return ""
+
+
+def _snapshot_level_fault(bids: list[PriceLevel], asks: list[PriceLevel]) -> str:
+    """Validate the full exchange snapshot before depth trimming can hide it."""
+    for side, levels in (("bid", bids), ("ask", asks)):
+        seen_prices: set[float] = set()
+        for index, level in enumerate(levels):
+            values = _finite_level_values(level)
+            if values is None or values[0] <= 0.0 or values[1] <= 0.0:
+                return f"invalid_{side}_snapshot_level index={index}"
+            if values[0] in seen_prices:
+                return f"duplicate_{side}_snapshot_price index={index}"
+            seen_prices.add(values[0])
+    return ""
+
+
+def _delta_level_fault(bids: list[PriceLevel], asks: list[PriceLevel]) -> str:
+    """Validate deltas while preserving zero-size delete semantics only."""
+    for side, levels in (("bid", bids), ("ask", asks)):
+        seen_prices: set[float] = set()
+        for index, level in enumerate(levels):
+            values = _finite_level_values(level)
+            if values is None:
+                return f"nonfinite_{side}_delta_level index={index}"
+            if values[0] <= 0.0 or values[1] < 0.0:
+                return f"invalid_{side}_delta_level index={index}"
+            if values[0] in seen_prices:
+                return f"duplicate_{side}_delta_price index={index}"
+            seen_prices.add(values[0])
     return ""
 
 
@@ -606,8 +731,12 @@ def _checksum_number(value: float) -> str:
     return format(value, "f").rstrip("0").rstrip(".")
 
 
-def _raw_checksum_level(level: tuple[str, str]) -> tuple[float, float, str, str] | None:
-    if len(level) < 2:
+def _raw_checksum_level(
+    level: object,
+    *,
+    allow_zero_quantity: bool = True,
+) -> tuple[float, float, str, str] | None:
+    if not isinstance(level, (tuple, list)) or len(level) < 2:
         return None
     price_text = str(level[0])
     quantity_text = str(level[1])
@@ -616,9 +745,27 @@ def _raw_checksum_level(level: tuple[str, str]) -> tuple[float, float, str, str]
         quantity = float(quantity_text)
     except (TypeError, ValueError):
         return None
-    if not (price > 0):
+    if not (
+        isfinite(price)
+        and isfinite(quantity)
+        and price > 0.0
+        and (quantity >= 0.0 if allow_zero_quantity else quantity > 0.0)
+    ):
         return None
     return (price, quantity, price_text, quantity_text)
+
+
+def raw_checksum_levels_valid(
+    bids: list[tuple[str, str]],
+    asks: list[tuple[str, str]],
+    *,
+    allow_zero_quantity: bool,
+) -> bool:
+    """Validate raw wire levels before they can influence a checksum bridge."""
+    return all(
+        _raw_checksum_level(level, allow_zero_quantity=allow_zero_quantity) is not None
+        for level in [*bids, *asks]
+    )
 
 
 def _sanitize_raw_checksum_side(
@@ -714,22 +861,40 @@ def _make_event(
 
 
 def _walk_levels(levels: list[PriceLevel], target_quote: float) -> tuple[float, float]:
-    if not levels or target_quote <= 0:
+    if not levels or not isfinite(target_quote) or target_quote <= 0:
         return (0.0, 0.0)
     filled_quote = 0.0
-    cost_basis = 0.0
+    filled_quantity = 0.0
     for lvl in levels:
+        if (
+            not isfinite(lvl.price)
+            or not isfinite(lvl.quantity)
+            or lvl.price <= 0.0
+            or lvl.quantity <= 0.0
+        ):
+            # A corrupt level means this snapshot is not executable evidence;
+            # do not skip it and price against a convenient later level.
+            return (0.0, 0.0)
         level_quote = lvl.price * lvl.quantity
-        if level_quote <= 0:
-            continue
+        if not isfinite(level_quote) or level_quote <= 0.0:
+            return (0.0, 0.0)
         take = min(level_quote, target_quote - filled_quote)
         filled_quote += take
-        cost_basis += take * lvl.price
+        # ``take`` is quote notional, not base quantity.  Price must therefore
+        # be reconstructed as total quote divided by total base; a
+        # quote-weighted average of level prices biases a multi-level VWAP.
+        filled_quantity += take / lvl.price
         if filled_quote >= target_quote:
             break
-    if filled_quote <= 0:
+    if (
+        not isfinite(filled_quote)
+        or not isfinite(filled_quantity)
+        or filled_quote <= 0
+        or filled_quantity <= 0
+    ):
         return (0.0, 0.0)
-    return (filled_quote, cost_basis / filled_quote)
+    vwap = filled_quote / filled_quantity
+    return (filled_quote, vwap) if isfinite(vwap) and vwap > 0.0 else (0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
