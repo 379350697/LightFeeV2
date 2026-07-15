@@ -542,7 +542,7 @@ class TestLiquiditySourceWiredIntoRefresh:
         assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
 
     @pytest.mark.asyncio
-    async def test_funding_fetch_reconciles_silent_symbol_omission(self):
+    async def test_funding_fetch_treats_bulk_endpoint_omission_as_unlisted(self):
         from lightfee.sidecar.service import SidecarService
 
         class SilentPartialSource:
@@ -573,7 +573,10 @@ class TestLiquiditySourceWiredIntoRefresh:
         assert venue == "binance"
         assert error is None
         assert set(quotes or {}) == {"binance:BTCUSDT"}
-        assert failed_symbols == {"ETHUSDT"}
+        # The service sends the configured union to every venue.  A bulk
+        # endpoint omitting ETH means that venue does not list it; it is not a
+        # failed fetch for a symbol the venue promised to return.
+        assert failed_symbols == set()
 
     @pytest.mark.asyncio
     async def test_refresh_binds_missing_and_crossed_symbols_to_lifecycle_proof(
@@ -615,17 +618,15 @@ class TestLiquiditySourceWiredIntoRefresh:
             await service.close()
 
         assert snapshot.degraded_venues == ["binance"]
-        assert snapshot.degraded_symbols == {
-            "binance": ["BTCUSDT", "ETHUSDT"]
-        }
+        assert snapshot.degraded_symbols == {"binance": ["BTCUSDT"]}
         assert snapshot.acquisition_mode == "degraded_sidecar"
-        assert snapshot.funding_lifecycle[0].symbol_count == 2
+        assert snapshot.funding_lifecycle[0].symbol_count == 1
         assert snapshot.funding_lifecycle[0].coverage_usable == 1
-        assert "ETHUSDT: fetch failed" in snapshot.funding_lifecycle[0].degraded_reason
-        assert snapshot.market_lifecycle[0].symbol_count == 2
+        assert snapshot.funding_lifecycle[0].degraded_reason == ""
+        assert snapshot.market_lifecycle[0].symbol_count == 1
         assert snapshot.market_lifecycle[0].coverage_usable == 0
         assert "BTCUSDT: crossed BBO" in snapshot.market_lifecycle[0].degraded_reason
-        assert snapshot.liquidity_lifecycle[0].symbol_count == 2
+        assert snapshot.liquidity_lifecycle[0].symbol_count == 1
         assert snapshot.liquidity_lifecycle[0].coverage_usable == 0
         assert load_snapshot(snapshot_path) is not None
 

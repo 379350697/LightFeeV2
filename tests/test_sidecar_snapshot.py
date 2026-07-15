@@ -1261,7 +1261,7 @@ class TestPublisher:
             ),
             (
                 "requested_count_mismatch",
-                "lifecycle_requested_count_mismatch:funding:binance",
+                "lifecycle_requested_count_exceeded:funding:binance",
             ),
             (
                 "coverage_overclaim",

@@ -83,6 +83,77 @@ def _fresh_seven_venue_snapshot() -> dict:
     }
 
 
+def _complete_unblocked_candidate() -> dict:
+    return {
+        "long_venue": "binance",
+        "short_venue": "okx",
+        "symbol": "BTCUSDT",
+        "funding_diff_bps": 10.0,
+        "funding_edge_bps": 10.0,
+        "expected_edge_bps": 10.0,
+        "worst_case_edge_bps": 8.0,
+        "ranking_edge_bps": 8.0,
+        "first_stage_funding_edge_bps": 10.0,
+        "first_stage_expected_edge_bps": 10.0,
+        "first_stage_worst_case_edge_bps": 8.0,
+        "second_stage_incremental_funding_edge_bps": 0.0,
+        "second_stage_worst_case_funding_edge_bps": 0.0,
+        "stagger_gap_ms": 0,
+        "entry_notional_quote": 100.0,
+        "entry_target_quantity": 1.0,
+        "entry_max_executable_quantity": 1.0,
+        "gross_signal_edge_bps": 0.0,
+        "entry_cross_bps": 0.0,
+        "expected_exit_cross_bps": 0.0,
+        "entry_fee_bps": 0.0,
+        "exit_fee_bps": 0.0,
+        "fee_bps": 0.0,
+        "entry_slippage_bps": 0.0,
+        "exit_slippage_bps": 0.0,
+        "adverse_selection_bps": 0.0,
+        "capital_buffer_bps": 0.0,
+        "execution_buffer_bps": 0.0,
+        "venue_risk_haircut_bps": 0.0,
+        "transfer_or_inventory_bias_bps": 0.0,
+        "expected_net_edge_bps": 10.0,
+        "long_taker_fee_bps": 0.0,
+        "short_taker_fee_bps": 0.0,
+        "taker_fee_evidence_complete": True,
+        "forecast_distribution_stable": False,
+        "forecast_stability_reason": "not_calibrated",
+        "forecast_worst_funding_edge_bps": 8.0,
+        "economics_complete": True,
+        "economics_observed_at_ms": 1_778_786_998_500,
+        "calculation_version": "v1_exact",
+        "model_epoch": "v1_exact",
+        "funding_timestamp_ms": 1_778_815_798_000,
+        "first_funding_timestamp_ms": 1_778_815_798_000,
+        "long_funding_timestamp_ms": 1_778_815_798_000,
+        "short_funding_timestamp_ms": 1_778_815_798_000,
+    }
+
+
+def _add_complete_contract_proof(quote: dict) -> None:
+    quote.update(
+        {
+            "underlying": "BTC",
+            "quote_currency": "USDT",
+            "contract_type": "linear",
+            "contract_multiplier": 1.0,
+            "mark_index_source": "venue_index",
+            "price_precision": 2,
+            "quantity_precision": 3,
+            "price_tick": 0.01,
+            "quantity_step_base": 0.001,
+            "min_quantity_base": 0.001,
+            "min_notional_quote": 5.0,
+            "min_notional_evidence_complete": True,
+            "venue_status": "active",
+            "contract_normalization_complete": True,
+        }
+    )
+
+
 def test_sidecar_unit_rejects_missing_config():
     text = """
 [Service]
@@ -220,6 +291,48 @@ def test_snapshot_cannot_be_green_when_funding_coverage_is_unproved():
     )
 
 
+def test_snapshot_rejects_lifecycle_total_above_requested_universe():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["funding_lifecycle"][0]["symbol_count"] = 2
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert (
+        "lifecycle_requested_count_exceeded:funding:aster"
+        in report.details["contract_errors"]
+    )
+
+
+def test_snapshot_rejects_lifecycle_total_below_returned_quote_universe():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
+    snapshot["acquisition_mode"] = "degraded_sidecar"
+    snapshot["funding_lifecycle"][0].update(
+        {
+            "symbol_count": 0,
+            "coverage_usable": 0,
+            "degraded_reason": "BTCUSDT: funding unavailable",
+        }
+    )
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert (
+        "lifecycle_total_below_quote_symbols:funding:aster"
+        in report.details["contract_errors"]
+    )
+
+
 def test_snapshot_rejects_arbitrary_seven_venues_replacing_expected_venue():
     snapshot = _fresh_seven_venue_snapshot()
     snapshot["quotes"]["mexc:BTCUSDT"] = snapshot["quotes"].pop(
@@ -341,6 +454,82 @@ def test_snapshot_declared_degradation_cannot_be_production_green():
     assert report.details["contract_errors"] == []
     assert not report.ok
     assert "sidecar_snapshot_degraded" in report.fingerprints
+
+
+def test_snapshot_scoped_symbol_degradation_keeps_healthy_candidates_green():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"]["aster:BTCUSDT"]["bid"] = 65_002.0
+    snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
+    snapshot["acquisition_mode"] = "degraded_sidecar"
+    for lifecycle_name in ("market_lifecycle", "liquidity_lifecycle"):
+        lifecycle = next(
+            row for row in snapshot[lifecycle_name] if row["venue"] == "aster"
+        )
+        lifecycle["coverage_usable"] = 0
+        lifecycle["degraded_reason"] = "BTCUSDT: crossed BBO"
+    snapshot["candidate_build_diagnostics"].update(
+        {
+            "directional_pair_count": 2,
+            "output_candidate_count": 1,
+            "rejection_counts": {"invalid_trade_quote": 1},
+        }
+    )
+    _add_complete_contract_proof(snapshot["quotes"]["binance:BTCUSDT"])
+    _add_complete_contract_proof(snapshot["quotes"]["okx:BTCUSDT"])
+    snapshot["candidates"] = [_complete_unblocked_candidate()]
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.ok
+    assert report.details["unblocked_candidate_count"] == 1
+    assert report.details["degraded_symbols"] == {"aster": ["BTCUSDT"]}
+
+
+def test_snapshot_unscoped_interval_gap_remains_critical_with_healthy_candidates():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"]["okx:BTCUSDT"]["funding_interval_ms"] = 0
+    snapshot["funding_lifecycle"][-1]["coverage_usable"] = 0
+    snapshot["funding_lifecycle"][-1]["degraded_reason"] = (
+        "BTCUSDT: funding_interval_ms_invalid"
+    )
+    snapshot["candidate_build_diagnostics"].update(
+        {"directional_pair_count": 1, "output_candidate_count": 1}
+    )
+    funding_timestamp_ms = 1_778_815_798_000
+    snapshot["candidates"] = [
+        {
+            "long_venue": "binance",
+            "short_venue": "aster",
+            "symbol": "BTCUSDT",
+            "funding_diff_bps": 1.0,
+            "funding_edge_bps": 1.0,
+            "expected_edge_bps": 1.0,
+            "worst_case_edge_bps": 1.0,
+            "ranking_edge_bps": 1.0,
+            "funding_timestamp_ms": funding_timestamp_ms,
+            "first_funding_timestamp_ms": funding_timestamp_ms,
+            "long_funding_timestamp_ms": funding_timestamp_ms,
+            "short_funding_timestamp_ms": funding_timestamp_ms,
+            "blocked": False,
+            "blocked_reasons": [],
+            "economics_complete": True,
+            "economics_incomplete_reason": "",
+            "economics_observed_at_ms": 1_778_786_998_500,
+        }
+    ]
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "funding_interval_evidence_incomplete" in report.fingerprints
 
 
 def test_sidecar_snapshot_rejects_unknown_schema_and_missing_proof() -> None:
@@ -665,6 +854,37 @@ def test_spread_snapshot_partial_input_is_warning_not_green():
     assert report.severity == "warning"
     assert "spread_source_sidecar_snapshot_partial" in report.fingerprints
     assert "spread_degraded_inputs" in report.fingerprints
+
+
+def test_spread_snapshot_scoped_partial_input_with_live_pipeline_is_green():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot_partial",
+            "degraded_venues": [],
+            "degraded_symbols": {"okx": ["ETHUSDT"]},
+            "input_quote_count": 3,
+            "valid_quote_count": 2,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {"insufficient_history_samples": 1},
+            "paper_admission_rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert report.ok
 
 
 def test_spread_snapshot_rejects_invalid_count_invariants():

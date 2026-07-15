@@ -1189,6 +1189,52 @@ class TestProductionSidecarParserRegressions:
         assert client.max_active_funding > 1
 
     @pytest.mark.asyncio
+    async def test_okx_funding_rate_uses_batch_any_before_symbol_fallback(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.funding_requests: list[str] = []
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"{symbol}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                            for symbol in ("BTC", "ETH")
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
+                    self.funding_requests.append(inst_id)
+                    assert inst_id == "ANY"
+                    return {
+                        "data": [
+                            {
+                                "instId": f"{symbol}-USDT-SWAP",
+                                "fundingRate": rate,
+                                "fundingTime": "1778784000000",
+                                "nextFundingTime": "1778812800000",
+                            }
+                            for symbol, rate in (("BTC", "0.0001"), ("ETH", "0.0002"))
+                        ]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        result = await client._fetch_okx_style(["BTCUSDT", "ETHUSDT"])
+
+        assert client.funding_requests == ["ANY"]
+        assert result["okx:BTCUSDT"].funding_rate_bps == pytest.approx(1.0)
+        assert result["okx:ETHUSDT"].funding_rate_bps == pytest.approx(2.0)
+        assert result["okx:BTCUSDT"].funding_interval_ms == 28_800_000
+
+    @pytest.mark.asyncio
     async def test_okx_open_interest_uses_usd_value_and_missing_data_is_unavailable(self):
         class FakeOkxClient(MarketDataClient):
             async def _public_get(self, path, params=None):
@@ -2064,6 +2110,7 @@ class TestProductionSidecarParserRegressions:
                 if path == "/api/v5/public/funding-rate":
                     self.funding_calls += 1
                     return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
                         "fundingRate": "0.0001",
                         "fundingTime": "4099978400000",
                         "nextFundingTime": "4100007200000",

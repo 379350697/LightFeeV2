@@ -343,30 +343,54 @@ def analyze_sidecar_snapshot(
         fingerprints.append("fixture_100_quotes")
     if future_quote_rejections > 0 or future_input_quote_count > 0:
         fingerprints.append("candidate_build_watermark_rejected_quotes")
-    if _safe_int(rejection_counts.get("invalid_trade_quote", 0)) > 0:
+    invalid_trade_quote_count = _safe_int(
+        rejection_counts.get("invalid_trade_quote", 0)
+    )
+    if invalid_trade_quote_count > 0 and unblocked_candidate_count <= 0:
         fingerprints.append("sidecar_market_quality_rejected_quotes")
-    if interval_missing_quote_keys:
+    degraded_venues = snapshot.get("degraded_venues", [])
+    degraded_domains = snapshot.get("degraded_domains", [])
+    degraded_symbols = snapshot.get("degraded_symbols", {})
+    degraded_symbol_items = (
+        degraded_symbols.items() if isinstance(degraded_symbols, dict) else ()
+    )
+    degraded_symbol_keys = {
+        f"{str(venue).strip().lower()}:{str(symbol).strip().upper()}"
+        for venue, symbols in degraded_symbol_items
+        for symbol in (symbols if isinstance(symbols, list) else [])
+        if isinstance(venue, str)
+        and isinstance(symbol, str)
+    }
+    unscoped_interval_missing_quote_keys = sorted(
+        quote_key
+        for quote_key in interval_missing_quote_keys
+        if quote_key not in degraded_symbol_keys
+    )
+    if unscoped_interval_missing_quote_keys:
         # An unknown cadence is not safely substitutable with a venue-wide
         # 8-hour assumption: it changes annualisation, aligned/staggered
         # lifecycle semantics, and the first-settlement gate.  Surface the
         # liveness failure by venue instead of leaving operators with a generic
         # zero-candidate symptom.
         fingerprints.append("funding_interval_evidence_incomplete")
-    degraded_venues = snapshot.get("degraded_venues", [])
-    degraded_domains = snapshot.get("degraded_domains", [])
-    degraded_symbols = snapshot.get("degraded_symbols", {})
     acquisition_mode = str(snapshot.get("acquisition_mode", "") or "")
-    has_declared_degradation = (
-        isinstance(degraded_venues, list)
-        and bool(degraded_venues)
-        or isinstance(degraded_domains, list)
-        and bool(degraded_domains)
-        or isinstance(degraded_symbols, dict)
-        and any(bool(symbols) for symbols in degraded_symbols.values())
-        or acquisition_mode
-        in {"degraded_sidecar", "last_good_sidecar", "unavailable"}
+    has_degraded_venues = isinstance(degraded_venues, list) and bool(
+        degraded_venues
     )
-    if has_declared_degradation:
+    has_degraded_domains = isinstance(degraded_domains, list) and bool(
+        degraded_domains
+    )
+    symbol_degradation_has_no_usable_candidate = bool(
+        degraded_symbol_keys and unblocked_candidate_count <= 0
+    )
+    has_global_degradation = bool(
+        has_degraded_venues
+        or has_degraded_domains
+        or acquisition_mode in {"last_good_sidecar", "unavailable"}
+        or (acquisition_mode == "degraded_sidecar" and not degraded_symbol_keys)
+        or symbol_degradation_has_no_usable_candidate
+    )
+    if has_global_degradation:
         fingerprints.append("sidecar_snapshot_degraded")
     if acquisition_mode == "unavailable":
         fingerprints.append("sidecar_snapshot_unavailable")
@@ -407,6 +431,9 @@ def analyze_sidecar_snapshot(
             ),
             "funding_interval_missing_quote_keys": sorted(
                 interval_missing_quote_keys
+            ),
+            "funding_interval_unscoped_missing_quote_keys": (
+                unscoped_interval_missing_quote_keys
             ),
             "degraded_venues": list(degraded_venues)
             if isinstance(degraded_venues, list)
@@ -594,13 +621,30 @@ def analyze_spread_snapshot(
         "sidecar_snapshot_degraded",
     }:
         fingerprints.append(f"spread_source_{source_mode}")
-    if source_mode == "sidecar_snapshot_partial":
-        fingerprints.append("spread_source_sidecar_snapshot_partial")
     degraded_venues = snapshot.get("degraded_venues", [])
     degraded_symbols = snapshot.get("degraded_symbols", {})
+    degraded_symbol_venues = (
+        {
+            str(venue).strip().lower()
+            for venue, symbols in degraded_symbols.items()
+            if isinstance(symbols, list) and symbols
+        }
+        if isinstance(degraded_symbols, dict)
+        else set()
+    )
+    scoped_symbol_partial = bool(
+        source_mode == "sidecar_snapshot_partial"
+        and not degraded_venues
+        and degraded_symbol_venues
+        and degraded_symbol_venues <= EXPECTED_VENUES
+        and valid_quote_count > 0
+    )
+    if source_mode == "sidecar_snapshot_partial" and not scoped_symbol_partial:
+        fingerprints.append("spread_source_sidecar_snapshot_partial")
     if (isinstance(degraded_venues, list) and degraded_venues) or (
         isinstance(degraded_symbols, dict)
         and any(bool(symbols) for symbols in degraded_symbols.values())
+        and not scoped_symbol_partial
     ):
         fingerprints.append("spread_degraded_inputs")
     if input_quote_count > 0 and valid_quote_count == 0 and not rejection_counts:

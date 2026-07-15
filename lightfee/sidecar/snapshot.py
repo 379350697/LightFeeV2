@@ -476,8 +476,12 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
                 errors.append(
                     f"lifecycle_coverage_exceeds_quote_symbols:{domain}:{venue}"
                 )
+            if symbol_count < len(symbols):
+                errors.append(
+                    f"lifecycle_total_below_quote_symbols:{domain}:{venue}"
+                )
             if (
-                (symbol_count < len(symbols) or coverage_usable < len(symbols))
+                coverage_usable < len(symbols)
                 and not degraded_reason.strip()
             ):
                 errors.append(f"quote_coverage_unproved:{domain}:{venue}")
@@ -714,9 +718,12 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
     if _nonnegative_int(requested_symbol_count, positive=True):
         for domain, evidence_by_venue in lifecycle_evidence_by_domain.items():
             for venue, (symbol_count, _coverage, _reason) in evidence_by_venue.items():
-                if symbol_count != int(requested_symbol_count):
+                # Candidate construction requests a cross-venue union.  A
+                # venue lifecycle total describes only that venue's listed
+                # subset, but it may never claim symbols outside the request.
+                if symbol_count > int(requested_symbol_count):
                     errors.append(
-                        f"lifecycle_requested_count_mismatch:{domain}:{venue}"
+                        f"lifecycle_requested_count_exceeded:{domain}:{venue}"
                     )
     return errors
 

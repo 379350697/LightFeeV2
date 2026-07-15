@@ -1787,7 +1787,11 @@ class MarketDataClient:
                 if swap_id in venue_sym_to_canon and index_price > 0.0:
                     index_price_map[swap_id] = index_price
 
-        # 2. per-symbol funding-rate with V1 parity cache
+        # 2. funding-rate with V1 parity cache.  OKX supports ``instId=ANY``
+        # for the complete perpetual universe.  Prefer that single coherent
+        # observation on a cold start, then fall back only for requested rows
+        # absent from the batch response.  Per-symbol fan-out alone cannot
+        # finish a production-sized universe inside the enrichment budget.
         funding_map: dict[str, dict] = {}
         if spec.funding_rate_path:
             # Separate symbols into cache-hit (fresh) and cache-miss (need fetch)
@@ -1803,7 +1807,41 @@ class MarketDataClient:
                 else:
                     symbols_to_fetch.append(venue_sym)
 
-            # Fetch only stale or missing symbols
+            if symbols_to_fetch:
+                try:
+                    batch = await asyncio.wait_for(
+                        self._public_get(
+                            spec.funding_rate_path,
+                            params={"instId": "ANY"},
+                        ),
+                        timeout=OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S,
+                    )
+                except (PublicTransportError, asyncio.TimeoutError):
+                    batch = {}
+                batch_rows = batch.get("data", []) if isinstance(batch, dict) else []
+                for item in batch_rows if isinstance(batch_rows, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    venue_sym = str(item.get("instId", "") or "")
+                    if venue_sym not in venue_sym_to_canon:
+                        continue
+                    funding_map[venue_sym] = item
+                    cache_key = f"{venue_str}:{venue_sym_to_canon[venue_sym]}"
+                    rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
+                    ts_ms = _funding_timestamp_ms(item)
+                    if ts_ms > 0:
+                        self._funding_cache[cache_key] = (
+                            rate_bps,
+                            ts_ms,
+                            now_ms,
+                        )
+                symbols_to_fetch = [
+                    venue_sym
+                    for venue_sym in symbols_to_fetch
+                    if venue_sym not in funding_map
+                ]
+
+            # Fetch only rows still missing after cache and batch hydration.
             if symbols_to_fetch:
                 sem = asyncio.Semaphore(_OKX_FUNDING_RATE_SEMAPHORE)
 
@@ -1830,7 +1868,10 @@ class MarketDataClient:
                             if ts_ms > 0:
                                 self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
 
-                tasks = [asyncio.create_task(_fetch_funding(sym)) for sym in symbols_to_fetch]
+                tasks = [
+                    asyncio.create_task(_fetch_funding(sym))
+                    for sym in symbols_to_fetch
+                ]
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*tasks),

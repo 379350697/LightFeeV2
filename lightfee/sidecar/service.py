@@ -174,6 +174,7 @@ class SidecarService:
         market_quality_failed_symbols: dict[str, set[str]] = {}
         quote_liquidity_by_venue: dict[str, dict[str, PerpLiquiditySnapshot]] = {}
         requested_symbol_count = len(_canonical_symbol_set(symbols))
+        listed_symbols_by_venue: dict[str, set[str]] = {}
 
         # --- Funding + Market fetch (per venue, funding timeout) ---
         funding_results = await self._fetch_all_venues(
@@ -298,6 +299,8 @@ class SidecarService:
                 venue_quotes,
                 requested_symbols=_canonical_symbol_set(symbols),
             )
+            listed_symbols = _snapshot_map_symbols(venue_quotes)
+            listed_symbols_by_venue[venue_name] = set(listed_symbols)
             market_failures = _market_failure_reasons(venue_quotes)
             market_failures = {**identity_failures, **market_failures}
             crossed_symbols = {
@@ -395,7 +398,7 @@ class SidecarService:
                 FundingLifecycle(
                     venue=venue_name,
                     observed_at_ms=refresh_started_at_ms,
-                    symbol_count=requested_symbol_count,
+                    symbol_count=len(listed_symbols),
                     coverage_usable=funding_usable,
                     degraded_reason=funding_reason,
                 )
@@ -404,7 +407,7 @@ class SidecarService:
                 MarketLifecycle(
                     venue=venue_name,
                     observed_at_ms=refresh_started_at_ms,
-                    symbol_count=requested_symbol_count,
+                    symbol_count=len(listed_symbols),
                     coverage_usable=market_usable,
                     degraded_reason=market_reason,
                 )
@@ -424,7 +427,12 @@ class SidecarService:
                     LiquidityLifecycle(
                         venue=venue_name,
                         observed_at_ms=refresh_started_at_ms,
-                        symbol_count=requested_symbol_count,
+                        symbol_count=len(
+                            listed_symbols_by_venue.get(
+                                venue_name,
+                                _canonical_symbol_set(symbols),
+                            )
+                        ),
                         coverage_usable=0,
                         degraded_reason=str(liq_error),
                     )
@@ -451,7 +459,12 @@ class SidecarService:
                 LiquidityLifecycle(
                     venue=venue_name,
                     observed_at_ms=refresh_started_at_ms,
-                    symbol_count=requested_symbol_count,
+                    symbol_count=len(
+                        returned_liquidity_symbols | liq_failed_symbols
+                        | _snapshot_map_symbols(
+                            quote_liquidity_by_venue.get(venue_name, {})
+                        )
+                    ),
                     coverage_usable=max(0, usable),
                     degraded_reason=coverage_reason,
                 )
@@ -708,8 +721,13 @@ class SidecarService:
                     for key, quote in (result or {}).items()
                     if _snapshot_item_symbol(key, quote) in requested
                 }
-                failed_symbols = requested - _snapshot_map_symbols(result)
-                return (venue_name, result, None, failed_symbols)
+                # Public bulk endpoints return the venue's listed universe.
+                # The caller supplies the cross-venue union, so an omitted row
+                # normally means "not listed here", not a per-symbol fetch
+                # failure.  Transport failures are already represented by the
+                # exception branch; malformed returned rows are attributed by
+                # the canonicalisation and market/funding validators.
+                return (venue_name, result, None, set())
             except asyncio.TimeoutError:
                 return (venue_name, None, TimeoutError(f"funding timeout {timeout_s}s"), set())
             except Exception as e:
@@ -833,8 +851,7 @@ class SidecarService:
                 )
             derived = quote_liquidity_by_venue.get(venue_name)
             if derived:
-                missing = _canonical_symbol_set(symbols) - _snapshot_map_symbols(derived)
-                return (venue_name, derived, None, missing)
+                return (venue_name, derived, None, set())
             source = self._liquidity_sources.get(venue_name)
             if source is None:
                 requested = _canonical_symbol_set(symbols)
@@ -853,7 +870,7 @@ class SidecarService:
                     venue_name,
                     result,
                     None,
-                    requested - _snapshot_map_symbols(result),
+                    set(),
                 )
             except asyncio.TimeoutError:
                 return (venue_name, None, TimeoutError(f"liquidity timeout {timeout_s}s"), set())
