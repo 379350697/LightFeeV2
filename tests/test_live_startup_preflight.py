@@ -48,7 +48,7 @@ from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain
 
 @pytest.fixture(autouse=True)
 def _isolate_non_canary_preflight_stages(monkeypatch):
-    """The preflight suite does not test the separate signed-canary contract."""
+    """This suite isolates non-economic live preflight stages."""
     monkeypatch.setattr(
         EntryDispatchRuntime,
         "_funding_canary_admission_reason",
@@ -58,6 +58,11 @@ def _isolate_non_canary_preflight_stages(monkeypatch):
         EntryDispatchRuntime,
         "_funding_canary_submission_reason",
         lambda *_args, **_kwargs: "",
+    )
+    monkeypatch.setattr(
+        EntryDispatchRuntime,
+        "_revalidate_final_entry_economics",
+        lambda *_args, **_kwargs: True,
     )
 
 

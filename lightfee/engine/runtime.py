@@ -163,7 +163,11 @@ from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
-from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
+from lightfee.sidecar.snapshot import (
+    SnapshotFreshness,
+    decide_snapshot_freshness,
+    has_usable_funding_payload,
+)
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
 from lightfee.venues.transport import (
@@ -4429,6 +4433,70 @@ class LiveRuntime:
     # Tick lanes
     # ------------------------------------------------------------------
 
+    def _finalize_unusable_snapshot_scan(
+        self,
+        *,
+        snapshot,
+        now_ms: int,
+        freshness: str,
+        no_entry_reason: str,
+    ) -> None:
+        """Close every early no-scan path without retaining stale healthy state."""
+        candidates = list(getattr(snapshot, "candidates", []) or [])
+        self.state.last_scan = {
+            "ts_ms": now_ms,
+            "snapshot_freshness": freshness,
+            "candidate_count": len(candidates),
+            "tradeable_count": 0,
+            "selected_candidate_count": 0,
+            "dispatched_candidate_count": 0,
+            "max_concurrent_positions": max(
+                self.config.strategy.max_concurrent_positions,
+                1,
+            ),
+            "open_position_count": len(self.state.open_positions),
+            "remaining_slots": 0,
+            "degraded_venues": list(getattr(snapshot, "degraded_venues", []) or []),
+            "no_entry_reason": no_entry_reason,
+        }
+        (
+            metrics,
+            ages,
+            budgets,
+            publish_intervals,
+            status,
+        ) = self._snapshot_freshness_observability(
+            snapshot=snapshot,
+            candidates=[],
+            now_ms=now_ms,
+        )
+        self.state.last_scan.update(
+            {
+                "snapshot_freshness_metrics": metrics,
+                "snapshot_freshness_observed_age_ms": ages,
+                "snapshot_freshness_budget_ms": budgets,
+                "snapshot_freshness_publish_interval_ms": publish_intervals,
+                "snapshot_freshness_status": status,
+                "snapshot_freshness_candidate_scope": "global_snapshot",
+                "snapshot_freshness_candidate_count": 0,
+                "snapshot_freshness_all_candidate_count": len(candidates),
+                "snapshot_freshness_skipped_untracked_count": len(candidates),
+                "funding_basis_risk": {
+                    "model_version": "funding_basis_es_v2",
+                    "checkpoint_healthy": False,
+                    "source": "fresh_snapshot_required",
+                },
+            }
+        )
+        self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
+        try:
+            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
+        except Exception as exc:
+            self.journal.append(
+                "runtime.current_state_scan_progress_export_error",
+                {"error": str(exc)},
+            )
+
     async def tick(self) -> None:
         """Full engine tick: consume snapshot, scan, supervise, manage positions."""
         now_ms = wall_clock_now_ms()
@@ -4448,20 +4516,35 @@ class LiveRuntime:
         last_good_max_age = self.config.runtime.live_scan_last_good_max_age_ms
 
         # V1: evaluate_snapshot_freshness — multi-state freshness evaluation
-        freshness = evaluate_snapshot_freshness(
+        freshness_decision = decide_snapshot_freshness(
             snapshot=snapshot,
             max_age_ms=max_age,
             now_ms=now_ms,
             last_good=self._last_good_snapshot,
             last_good_max_age_ms=last_good_max_age,
             market_max_age_ms=self.config.runtime.max_market_age_ms,
+            usable_payload=has_usable_funding_payload,
         )
+        freshness = freshness_decision.freshness
+        snapshot = freshness_decision.snapshot
         if freshness == SnapshotFreshness.MISSING:
             self._live_scan_success_streak = 0
+            self._finalize_unusable_snapshot_scan(
+                snapshot=snapshot,
+                now_ms=now_ms,
+                freshness="missing",
+                no_entry_reason="snapshot_missing",
+            )
             self.journal.append("runtime.snapshot_missing", {"ts_ms": now_ms})
             return
         if freshness == SnapshotFreshness.STALE:
             self._live_scan_success_streak = 0
+            self._finalize_unusable_snapshot_scan(
+                snapshot=snapshot,
+                now_ms=now_ms,
+                freshness="stale",
+                no_entry_reason="snapshot_stale",
+            )
             self.journal.append(
                 "runtime.snapshot_stale",
                 self._snapshot_health_payload(
@@ -4474,6 +4557,24 @@ class LiveRuntime:
             return
         if freshness == SnapshotFreshness.DEGRADED:
             # Some venues degraded but can still trade on healthy ones
+            if not has_usable_funding_payload(snapshot):
+                self._live_scan_success_streak = 0
+                self._finalize_unusable_snapshot_scan(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    freshness="unavailable",
+                    no_entry_reason="snapshot_unavailable",
+                )
+                self.journal.append(
+                    "runtime.snapshot_unavailable",
+                    self._snapshot_health_payload(
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        max_age_ms=max_age,
+                        freshness="unavailable",
+                    ),
+                )
+                return
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
             self.journal.append(
@@ -4487,10 +4588,33 @@ class LiveRuntime:
             )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             # Current snapshot is stale/missing; fall back to last good
-            snapshot = snapshot if snapshot is not None else self._last_good_snapshot
             if snapshot is None:
                 self._live_scan_success_streak = 0
+                self._finalize_unusable_snapshot_scan(
+                    snapshot=None,
+                    now_ms=now_ms,
+                    freshness="missing",
+                    no_entry_reason="snapshot_missing",
+                )
                 self.journal.append("runtime.snapshot_missing", {"ts_ms": now_ms})
+                return
+            if not has_usable_funding_payload(snapshot):
+                self._live_scan_success_streak = 0
+                self._finalize_unusable_snapshot_scan(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    freshness="unavailable",
+                    no_entry_reason="snapshot_unavailable",
+                )
+                self.journal.append(
+                    "runtime.snapshot_unavailable",
+                    self._snapshot_health_payload(
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        max_age_ms=max_age,
+                        freshness="unavailable",
+                    ),
+                )
                 return
             self._last_good_snapshot = snapshot
             self._live_scan_success_streak += 1

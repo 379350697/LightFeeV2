@@ -254,6 +254,9 @@ hyperliquid_submit_ack_min_samples = 3
 [persistence]
 event_log_path = "runtime/events.jsonl"
 spread_paper_event_log_path = "runtime/spread-paper-events.jsonl"
+# Required only when strategy.spread_paper_enabled=true.  Production should
+# place it on an independently retained volume.
+spread_paper_rollback_anchor_path = ""
 snapshot_path = "runtime/state.json"
 tuning_diagnostics_enabled = true
 tuning_diagnostics_max_records = 10000

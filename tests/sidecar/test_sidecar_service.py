@@ -7,10 +7,40 @@ import json
 
 import pytest
 
-from lightfee.config.schema import AppConfig, StrategyConfig
-from lightfee.sidecar.pairing import FundingCandidateService, build_same_symbol_pairs
-from lightfee.sidecar.service import SidecarService
+from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
+from lightfee.sidecar.pairing import (
+    FundingCandidateService,
+    _funding_contract_block_reasons,
+    build_same_symbol_pairs,
+)
+from lightfee.sidecar.service import (
+    SidecarService,
+    _canonical_venue_configs,
+    _canonicalize_venue_quotes,
+    _market_failure_reasons,
+    _quote_cache_contract_eligible,
+    _restorable_prior_last_good_quotes,
+)
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
+
+
+def _complete_contract_fields(*, quantity_precision: int = 3) -> dict[str, object]:
+    return {
+        "underlying": "BTC",
+        "quote_currency": "USDT",
+        "contract_type": "linear",
+        "contract_multiplier": 1.0,
+        "mark_index_source": "venue_index",
+        "price_precision": 2,
+        "quantity_precision": quantity_precision,
+        "price_tick": 0.01,
+        "quantity_step_base": 1.0 if quantity_precision == 0 else 0.001,
+        "min_quantity_base": 1.0 if quantity_precision == 0 else 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
+        "venue_status": "active",
+        "contract_normalization_complete": True,
+    }
 
 
 def test_recovery_constructed_calibrator_keeps_strategy_stability_contract(tmp_path):
@@ -35,10 +65,12 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
         "cheap:BTCUSDT": QuoteSnapshot(
             venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
             funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
             venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
             funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
         ),
     }
     service = FundingCandidateService(
@@ -61,6 +93,438 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
     assert id(service._allocator) == allocator_id
 
 
+def test_source_identity_corruption_is_quarantined_per_symbol() -> None:
+    duplicate = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+    )
+    accepted, failures = _canonicalize_venue_quotes(
+        "binance",
+        {
+            "binance:BTCUSDT": duplicate,
+            "BINANCE:btcusdt": QuoteSnapshot(**duplicate.__dict__),
+            "binance:ETHUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="ETHUSDT",
+                bid=200.0,
+                ask=201.0,
+            ),
+        },
+        requested_symbols={"BTCUSDT", "ETHUSDT"},
+    )
+
+    assert accepted == {}
+    assert failures == {
+        "BTCUSDT": "duplicate_quote_identity",
+        "ETHUSDT": "quote_source_venue_mismatch",
+    }
+
+
+def test_source_identity_casing_is_canonicalized_in_key_and_payload() -> None:
+    accepted, failures = _canonicalize_venue_quotes(
+        "okx",
+        {
+            "OKX:btcusdt": QuoteSnapshot(
+                venue="OKX",
+                symbol="btcusdt",
+                bid=100.0,
+                ask=101.0,
+            )
+        },
+        requested_symbols={"BTCUSDT"},
+    )
+
+    assert failures == {}
+    assert list(accepted) == ["okx:BTCUSDT"]
+    assert accepted["okx:BTCUSDT"].venue == "okx"
+    assert accepted["okx:BTCUSDT"].symbol == "BTCUSDT"
+
+
+def test_zero_observation_is_quarantined_before_atomic_publish() -> None:
+    failures = _market_failure_reasons(
+        {
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=0,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=2_000,
+                funding_interval_ms=28_800_000,
+            )
+        }
+    )
+
+    assert failures == {"BTCUSDT": "observed_at_ms_invalid"}
+
+
+def test_duplicate_venue_aliases_share_one_operational_fetch() -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            self.calls += 1
+            return {
+                "binance:BTCUSDT": QuoteSnapshot(
+                    venue="binance",
+                    symbol="BTCUSDT",
+                    bid=100.0,
+                    ask=101.0,
+                    observed_at_ms=1_000,
+                    funding_rate_bps=1.0,
+                    funding_timestamp_ms=2_000,
+                    funding_interval_ms=28_800_000,
+                )
+            }
+
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        venues=[
+            VenueConfig(venue=" BINANCE ", taker_fee_bps=1.0),
+            VenueConfig(venue="binance", taker_fee_bps=9.0),
+        ]
+    )
+    source = Source()
+    service._exchange_sources = {"binance": source}
+
+    results = asyncio.run(service._fetch_all_venues(["BTCUSDT"], timeout_s=1.0))
+
+    assert list(_canonical_venue_configs(service.config.venues)) == ["binance"]
+    assert source.calls == 1
+    assert [venue for venue, *_ in results] == ["binance"]
+
+
+def test_partial_refresh_updates_last_good_cache_per_key() -> None:
+    service = object.__new__(SidecarService)
+    old_binance = QuoteSnapshot(
+        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
+        observed_at_ms=1_000,
+    )
+    old_okx = QuoteSnapshot(
+        venue="okx", symbol="BTCUSDT", bid=100.0, ask=101.0,
+        observed_at_ms=1_000,
+    )
+    fresh_binance = QuoteSnapshot(
+        venue="binance", symbol="BTCUSDT", bid=101.0, ask=102.0,
+        observed_at_ms=2_000,
+    )
+    service._last_good_quotes = {
+        "binance:BTCUSDT": old_binance,
+        "okx:BTCUSDT": old_okx,
+    }
+    service._last_good_at_ms = 1_100
+    service._last_good_at_ms_by_key = {
+        "binance:BTCUSDT": 1_100,
+        "okx:BTCUSDT": 1_100,
+    }
+
+    service._update_last_good_quote_cache(
+        {"binance:BTCUSDT": fresh_binance},
+        {"binance:BTCUSDT"},
+        published_at_ms=2_100,
+    )
+
+    assert service._last_good_quotes["binance:BTCUSDT"].bid == 101.0
+    assert service._last_good_quotes["okx:BTCUSDT"] == old_okx
+    assert service._last_good_at_ms_by_key == {
+        "binance:BTCUSDT": 2_100,
+        "okx:BTCUSDT": 1_100,
+    }
+
+
+def test_incomplete_contract_cannot_advance_last_good_cache() -> None:
+    quote = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        observed_at_ms=2_000,
+        funding_rate_bps=1.0,
+        funding_timestamp_ms=30_000_000,
+        funding_interval_ms=28_800_000,
+        underlying="BTC",
+        quote_currency="USDT",
+        contract_type="linear",
+        contract_multiplier=1.0,
+        mark_index_source="venue_index",
+        price_precision=2,
+        quantity_precision=3,
+        venue_status="active",
+        contract_normalization_complete=False,
+    )
+
+    assert _quote_cache_contract_eligible(quote) is False
+    quote.contract_normalization_complete = True
+    quote.price_tick = 0.01
+    quote.quantity_step_base = 0.001
+    quote.min_quantity_base = 0.001
+    quote.min_notional_quote = 1.0
+    quote.min_notional_evidence_complete = True
+    assert _quote_cache_contract_eligible(quote) is True
+    quote.quantity_precision = 0
+    assert _quote_cache_contract_eligible(quote) is True
+
+
+def test_restart_restore_accepts_only_fresh_direct_contract_truth() -> None:
+    quote = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        observed_at_ms=1_000,
+        funding_rate_bps=1.0,
+        funding_timestamp_ms=30_000_000,
+        funding_interval_ms=28_800_000,
+        **_complete_contract_fields(quantity_precision=0),
+    )
+    fresh = SidecarSnapshot(
+        acquisition_mode="fresh_sidecar",
+        source_mode="direct_market",
+        quotes={"binance:BTCUSDT": quote},
+    )
+
+    restored = _restorable_prior_last_good_quotes(
+        fresh,
+        configured_venues={"binance"},
+        configured_symbols={"BTCUSDT"},
+        now_ms=1_500,
+        max_age_ms=500,
+    )
+
+    assert list(restored) == ["binance:BTCUSDT"]
+    assert restored["binance:BTCUSDT"] is not quote
+    assert _restorable_prior_last_good_quotes(
+        fresh,
+        configured_venues={"binance"},
+        configured_symbols={"BTCUSDT"},
+        now_ms=1_501,
+        max_age_ms=500,
+    ) == {}
+    fresh.acquisition_mode = "last_good_sidecar"
+    assert _restorable_prior_last_good_quotes(
+        fresh,
+        configured_venues={"binance"},
+        configured_symbols={"BTCUSDT"},
+        now_ms=1_500,
+        max_age_ms=500,
+    ) == {}
+
+
+def test_restart_restore_never_promotes_legacy_schema_market_evidence() -> None:
+    quote = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        observed_at_ms=1_000,
+        funding_rate_bps=1.0,
+        funding_timestamp_ms=30_000_000,
+        funding_interval_ms=28_800_000,
+        **_complete_contract_fields(),
+    )
+    legacy = SidecarSnapshot(
+        schema_version=2,
+        acquisition_mode="fresh_sidecar",
+        source_mode="direct_market",
+        quotes={"binance:BTCUSDT": quote},
+    )
+
+    assert _restorable_prior_last_good_quotes(
+        legacy,
+        configured_venues={"binance"},
+        configured_symbols={"BTCUSDT"},
+        now_ms=1_500,
+        max_age_ms=500,
+    ) == {}
+
+    legacy.schema_version = 3
+    assert _restorable_prior_last_good_quotes(
+        legacy,
+        configured_venues={"binance"},
+        configured_symbols={"BTCUSDT"},
+        now_ms=1_500,
+        max_age_ms=500,
+    ) == {}
+
+
+def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> None:
+    prior = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        acquisition_mode="fresh_sidecar",
+        source_mode="direct_market",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=1_000,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=30_000_000,
+                funding_interval_ms=28_800_000,
+                **_complete_contract_fields(),
+            )
+        },
+    )
+    monkeypatch.setattr("lightfee.sidecar.service.load_snapshot", lambda _path: prior)
+    monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: 1.5)
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "sidecar.json")
+    config.runtime.live_scan_last_good_max_age_ms = 500
+
+    service = SidecarService(config)
+
+    assert list(service._inject_last_good(
+        "binance", ["BTCUSDT"], now_ms=1_500
+    )) == ["binance:BTCUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance"), VenueConfig(venue="okx")],
+    )
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service.config.runtime.sidecar_snapshot_path = str(service.snapshot_path)
+    service._funding_timeout_s = 1.0
+    service._liquidity_timeout_s = 1.0
+    service._last_good_quotes = {}
+    service._last_good_at_ms = 0
+    service._last_liquidity_publish_at_ms = 0
+
+    async def funding_results(symbols, timeout_s):
+        return [
+            (
+                "binance",
+                {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance", symbol="BTCUSDT", bid=100.0, ask=101.0,
+                        observed_at_ms=1_500, funding_rate_bps=1.0,
+                        funding_timestamp_ms=30_000_000,
+                        funding_interval_ms=28_800_000,
+                        **_complete_contract_fields(),
+                    )
+                },
+                None,
+                set(),
+            ),
+            (
+                "okx",
+                {
+                    "okx:BTCUSDT": QuoteSnapshot(
+                        venue="okx", symbol="BTCUSDT", bid=100.0, ask=101.0,
+                        observed_at_ms=2_500, funding_rate_bps=-1.0,
+                        funding_timestamp_ms=30_000_000,
+                        funding_interval_ms=28_800_000,
+                        **_complete_contract_fields(quantity_precision=0),
+                    )
+                },
+                None,
+                set(),
+            ),
+        ]
+
+    async def liquidity_results(
+        symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None,
+    ):
+        return [
+            ("binance", {"binance:BTCUSDT": object()}, None, set()),
+            ("okx", {"okx:BTCUSDT": object()}, None, set()),
+        ]
+
+    service._fetch_all_venues = funding_results
+    service._fetch_liquidity_all_venues = liquidity_results
+    clock = iter([1.0, 2.0, 3.0])
+    monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
+
+    snapshot = await service.refresh_once()
+
+    assert list(snapshot.quotes) == ["binance:BTCUSDT"]
+    assert snapshot.candidate_build_diagnostics["quarantined_future_quote_count"] == 1
+    assert snapshot.degraded_symbols == {"okx": ["BTCUSDT"]}
+    assert "observed_at_ms_after_candidate_build" in (
+        next(row for row in snapshot.market_lifecycle if row.venue == "okx").degraded_reason
+    )
+    assert list(service._last_good_quotes) == ["binance:BTCUSDT"]
+
+
+def test_pairing_rejects_zero_funding_schedule_proof() -> None:
+    diagnostics: dict[str, object] = {}
+    quotes = {
+        f"{venue}:BTCUSDT": QuoteSnapshot(
+            venue=venue,
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            funding_rate_bps=rate,
+            funding_timestamp_ms=0,
+            funding_interval_ms=28_800_000,
+        )
+        for venue, rate in (("binance", 1.0), ("okx", 2.0))
+    }
+
+    assert build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        diagnostics=diagnostics,
+    ) == []
+    assert diagnostics["rejection_counts"] == {"invalid_trade_quote": 2}
+
+
+def test_pairing_accepts_zero_decimal_precision_as_integer_lot_proof() -> None:
+    common = {
+        "symbol": "BTCUSDT",
+        "bid": 100.0,
+        "ask": 101.0,
+        "funding_timestamp_ms": 30_000_000,
+        "funding_interval_ms": 28_800_000,
+        **_complete_contract_fields(quantity_precision=0),
+    }
+    long_quote = QuoteSnapshot(venue="binance", funding_rate_bps=1.0, **common)
+    short_quote = QuoteSnapshot(venue="hyperliquid", funding_rate_bps=2.0, **common)
+
+    assert _funding_contract_block_reasons(long_quote, short_quote) == ()
+
+
+def test_pairing_canonicalizes_duplicate_requested_symbols_once() -> None:
+    quotes = {
+        f"{venue}:BTCUSDT": QuoteSnapshot(
+            venue=venue,
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            funding_rate_bps=rate,
+            funding_timestamp_ms=2_000,
+            funding_interval_ms=28_800_000,
+        )
+        for venue, rate in (("binance", 1.0), ("okx", 2.0))
+    }
+    diagnostics: dict[str, object] = {}
+
+    candidates = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT", "btcusdt", " BTCUSDT "],
+        diagnostics=diagnostics,
+    )
+
+    assert len(candidates) == 1
+    assert diagnostics["requested_symbol_count"] == 1
+    assert diagnostics["output_candidate_count"] == 1
+
+
 class TestSidecarPairingV2:
     """Pairing must produce V2-native candidate identity fields."""
 
@@ -70,11 +534,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000001000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000002000,
+                funding_interval_ms=28_800_000,
             ),
         }
         strategy = StrategyConfig(
@@ -96,11 +562,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000001000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000002000,
+                funding_interval_ms=28_800_000,
             ),
         }
         strategy = StrategyConfig(
@@ -120,11 +588,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000000000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000001000,  # 1 second apart
+                funding_interval_ms=28_800_000,
             ),
         }
         candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
@@ -141,11 +611,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000000000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000100000,  # 100 seconds apart
+                funding_interval_ms=28_800_000,
             ),
         }
         candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
@@ -160,11 +632,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000001000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000002000,
+                funding_interval_ms=28_800_000,
             ),
         }
         candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
@@ -183,11 +657,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=50000, ask=50001, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000001000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50100, ask=50200, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000002000,
+                funding_interval_ms=28_800_000,
             ),
         }
         strategy = StrategyConfig(
@@ -211,11 +687,13 @@ class TestSidecarPairingV2:
                 venue="binance", symbol="BTCUSDT",
                 bid=60000, ask=60100, funding_rate_bps=5.0,
                 funding_timestamp_ms=1700000001000,
+                funding_interval_ms=28_800_000,
             ),
             "okx:btcusdt": QuoteSnapshot(
                 venue="okx", symbol="BTCUSDT",
                 bid=50000, ask=50100, funding_rate_bps=15.0,
                 funding_timestamp_ms=1700000002000,
+                funding_interval_ms=28_800_000,
             ),
         }
         candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
@@ -227,9 +705,9 @@ class TestSidecarPairingV2:
 class TestSidecarSnapshotV2:
     """Snapshot must include all V2 candidate identity fields."""
 
-    def test_schema_is_v3(self):
+    def test_schema_is_v4(self):
         s = SidecarSnapshot()
-        assert s.schema_version == 3
+        assert s.schema_version == 4
 
     def test_candidate_has_v2_fields(self):
         c = CandidateInput(

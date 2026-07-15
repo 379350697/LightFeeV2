@@ -11,6 +11,7 @@ while adding private trading methods (order, position, account risk).
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 from dataclasses import dataclass, replace
@@ -52,6 +53,8 @@ class FundingTicker:
     # transition of the exchange's next-settlement timestamp).  Never assume
     # a universal eight-hour interval here.
     funding_interval_ms: int = 0
+    funding_interval_source: str = ""
+    funding_interval_observed_at_ms: int = 0
     volume_24h_quote: float = 0.0
     open_interest_quote: float = 0.0
     open_interest_evidence_status: str = "available"
@@ -76,6 +79,15 @@ class FundingTicker:
     quantity_precision: int = 0
     venue_status: str = "unknown"
     contract_normalization_complete: bool = False
+    # Parser-owned proof that BBO sizes are already canonical base quantity.
+    # ``price_tick`` and ``quantity_step_base`` must come from symbol-level
+    # exchange metadata when a venue quotes derivatives in contract lots.
+    base_quantity_evidence: bool = False
+    price_tick: float = 0.0
+    quantity_step_base: float = 0.0
+    min_quantity_base: float = 0.0
+    min_notional_quote: float = 0.0
+    min_notional_evidence_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,9 +110,10 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
     if isinstance(value, str) and value.strip() == "":
         return default
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _has_nonempty_field(item: dict[str, Any], *keys: str) -> bool:
@@ -114,6 +127,110 @@ def _has_nonempty_field(item: dict[str, Any], *keys: str) -> bool:
             continue
         return True
     return False
+
+
+def _positive_exchange_number(value: Any) -> float:
+    """Parse an exchange JSON number/string while rejecting JSON booleans."""
+    if isinstance(value, bool):
+        return 0.0
+    parsed = _safe_float(value)
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else 0.0
+
+
+def _gate_contract_metadata_complete(item: dict[str, Any]) -> bool:
+    """One predicate for both Gate retry/liveness and unit admission."""
+    return bool(
+        _positive_exchange_number(item.get("quanto_multiplier")) > 0.0
+        and _positive_exchange_number(item.get("order_size_min")) > 0.0
+        and _positive_exchange_number(item.get("order_price_round")) > 0.0
+        and item.get("in_delisting") is False
+    )
+
+
+def _binance_style_symbol_increments(
+    item: dict[str, Any],
+) -> tuple[float, float]:
+    filters = item.get("filters", [])
+    if not isinstance(filters, list):
+        return 0.0, 0.0
+    price_tick = 0.0
+    quantity_step = 0.0
+    for raw_filter in filters:
+        if not isinstance(raw_filter, dict):
+            continue
+        filter_type = str(raw_filter.get("filterType", "") or "").upper()
+        if filter_type == "PRICE_FILTER":
+            price_tick = _positive_exchange_number(raw_filter.get("tickSize"))
+        elif filter_type == "LOT_SIZE":
+            quantity_step = _positive_exchange_number(raw_filter.get("stepSize"))
+    return price_tick, quantity_step
+
+
+def _binance_style_symbol_minimums(
+    item: dict[str, Any],
+) -> tuple[float, float]:
+    filters = item.get("filters", [])
+    if not isinstance(filters, list):
+        return 0.0, 0.0
+    min_quantity = 0.0
+    exchange_min_notional = 0.0
+    for raw_filter in filters:
+        if not isinstance(raw_filter, dict):
+            continue
+        filter_type = str(raw_filter.get("filterType", "") or "").upper()
+        if filter_type == "LOT_SIZE":
+            min_quantity = _positive_exchange_number(raw_filter.get("minQty"))
+        elif filter_type in {"MIN_NOTIONAL", "NOTIONAL"}:
+            exchange_min_notional = _positive_exchange_number(
+                raw_filter.get("notional", raw_filter.get("minNotional"))
+            )
+    return min_quantity, exchange_min_notional
+
+
+def _binance_style_contract_metadata_complete(
+    item: dict[str, Any],
+    *,
+    underlying: str,
+    quote_currency: str,
+) -> bool:
+    price_tick, quantity_step = _binance_style_symbol_increments(item)
+    min_quantity, _ = _binance_style_symbol_minimums(item)
+    return bool(
+        str(item.get("status", "") or "").upper() == "TRADING"
+        and str(item.get("contractType", "") or "").upper() == "PERPETUAL"
+        and str(item.get("baseAsset", "") or "").upper() == underlying
+        and str(item.get("quoteAsset", "") or "").upper() == quote_currency
+        and str(item.get("marginAsset", quote_currency) or "").upper()
+        == quote_currency
+        and price_tick > 0.0
+        and quantity_step > 0.0
+        and min_quantity > 0.0
+    )
+
+
+def _hyperliquid_size_decimals(item: dict[str, Any]) -> int | None:
+    value = item.get("szDecimals")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > 6:
+        return None
+    delisted = item.get("isDelisted")
+    # Hyperliquid omits this optional flag for active instruments.  If it is
+    # present, only a literal JSON false is admissible as active evidence.
+    if delisted is not None and delisted is not False:
+        return None
+    return value
+
+
+def _hyperliquid_price_tick(reference_price: float, size_decimals: int) -> float:
+    """Return the current valid perp price quantum under Hyperliquid rules."""
+    if not math.isfinite(reference_price) or reference_price <= 0.0:
+        return 0.0
+    max_decimals = 6 - size_decimals
+    magnitude = math.floor(math.log10(reference_price))
+    significant_decimals = max(4 - magnitude, 0)
+    decimals = min(max_decimals, significant_decimals)
+    return 10.0 ** (-decimals)
 
 
 def _first_present_float(
@@ -146,6 +263,8 @@ def _optional_rate_bps(item: dict[str, Any], *keys: str) -> float | None:
 
 def _decimal_precision(step: float) -> int:
     """Return decimal places implied by a configured exchange increment."""
+    if not math.isfinite(step) or step <= 0.0:
+        return 0
     try:
         normalized = Decimal(str(step)).normalize()
     except (InvalidOperation, ValueError):
@@ -178,6 +297,8 @@ BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
 OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S = 0.2
+_FUNDING_INTERVAL_HISTORY_SEMAPHORE = 8
+_FUNDING_INTERVAL_HISTORY_BUDGET_S = 3.0
 
 # V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
 _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
@@ -185,6 +306,8 @@ _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
 # When funding just settled, the exchange publishes the next funding time, so stale-on-settlement
 # avoids using a just-expired timestamp.
 _FUNDING_CACHE_MIN_FUTURE_MS = 30_000  # 30 seconds
+_GATE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
+_BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
 
 
 def _next_hour_boundary(now_ms: int) -> int:
@@ -200,14 +323,25 @@ def _next_hour_boundary(now_ms: int) -> int:
 def _funding_timestamp_ms(item: dict[str, Any], *, fallback_ms: int = 0) -> int:
     """Return the first explicit funding timestamp field, or a venue fallback."""
     for key in ("nextFundingTime", "fundingTime"):
-        ts_ms = int(_safe_float(item.get(key, 0)))
+        value = item.get(key, 0)
+        if isinstance(value, bool):
+            continue
+        parsed = _safe_float(value)
+        if not math.isfinite(parsed):
+            continue
+        ts_ms = int(parsed)
         if ts_ms > 0:
             return ts_ms
     return fallback_ms
 
 
 def _funding_timestamp_ms_or_seconds(value: Any) -> int:
-    ts = int(_safe_float(value, default=0.0))
+    if isinstance(value, bool):
+        return 0
+    parsed = _safe_float(value, default=0.0)
+    if not math.isfinite(parsed):
+        return 0
+    ts = int(parsed)
     if ts <= 0:
         return 0
     if ts < 10_000_000_000:
@@ -249,7 +383,19 @@ class MarketDataClient:
         # inferred after the exchange itself advances the next timestamp; a
         # cold process remains explicitly interval-unknown.
         self._funding_schedule_next_by_key: dict[str, int] = {}
-        self._funding_interval_by_key: dict[str, int] = {}
+        # key -> (interval_ms, source, evidence_observed_at_ms).  Interval
+        # evidence is deliberately time-bounded because venues can temporarily
+        # alter settlement cadence.
+        self._funding_interval_by_key: dict[str, tuple[int, str, int]] = {}
+        # Gate BBO sizes are contract lots.  This symbol-level cache stays
+        # separate from the shorter-lived funding cache so funding reuse can
+        # never erase quantity conversion evidence.
+        self._gate_contract_metadata_by_key: dict[
+            str, tuple[dict[str, Any], int]
+        ] = {}
+        self._binance_style_contract_metadata_by_key: dict[
+            str, tuple[dict[str, Any], int]
+        ] = {}
         # V1-style evidence cache for Binance-compatible per-symbol OI.
         # key -> (open_interest_quote, mark_price, observed_at_ms, status, reason)
         self._binance_style_open_interest_cache: dict[
@@ -452,6 +598,10 @@ class MarketDataClient:
                 key,
                 next_timestamp_ms=int(ticker.funding_timestamp_ms or 0),
                 explicit_interval_ms=int(ticker.funding_interval_ms or 0),
+                explicit_source=str(ticker.funding_interval_source or ""),
+                explicit_observed_at_ms=int(
+                    ticker.funding_interval_observed_at_ms or observed_at_ms
+                ),
             )
             underlying, quote_currency = _canonical_contract_identity(
                 self._spec.venue_id,
@@ -460,29 +610,37 @@ class MarketDataClient:
             mark_index_source = ""
             if float(ticker.mark_price or 0.0) > 0.0 and float(ticker.index_price or 0.0) > 0.0:
                 mark_index_source = "venue_mark_and_index"
-            price_precision = _decimal_precision(float(self._spec.price_tick or 0.0))
-            quantity_precision = _decimal_precision(float(self._spec.quantity_step or 0.0))
+            raw_price_tick = float(ticker.price_tick or 0.0)
+            raw_quantity_step = float(ticker.quantity_step_base or 0.0)
+            price_precision = _decimal_precision(raw_price_tick)
+            quantity_precision = _decimal_precision(raw_quantity_step)
             # The parsers below only mark venues complete where their BBO
             # quantity is documented/converted into base units.  In
             # particular, an OKX/Bitget top size may be a contract count; a
             # static spec is not proof that it is comparable to base quantity.
             contract_type = "linear" if underlying and quote_currency else ""
             normalised_multiplier = 1.0 if contract_type == "linear" else 0.0
-            base_quantity_evidence = self._spec.venue_id in {
-                Venue.BINANCE,
-                Venue.ASTER,
-                Venue.BYBIT,
-                Venue.GATE,
-                Venue.HYPERLIQUID,
-            }
+            base_quantity_evidence = ticker.base_quantity_evidence is True
             complete_contract = bool(
                 underlying
                 and quote_currency
                 and contract_type
                 and normalised_multiplier > 0.0
                 and mark_index_source
-                and price_precision > 0
-                and quantity_precision > 0
+                # Zero decimal places is valid precision (for example a
+                # quantity step of 1.0).  Presence is proved by the positive
+                # raw exchange increments, not by overloading zero as a
+                # missing-value sentinel.
+                and raw_price_tick > 0.0
+                and raw_quantity_step > 0.0
+                and math.isfinite(raw_price_tick)
+                and math.isfinite(raw_quantity_step)
+                and float(ticker.min_quantity_base or 0.0) > 0.0
+                and math.isfinite(float(ticker.min_notional_quote or 0.0))
+                and float(ticker.min_notional_quote or 0.0) >= 0.0
+                and ticker.min_notional_evidence_complete is True
+                and price_precision >= 0
+                and quantity_precision >= 0
                 and base_quantity_evidence
             )
             enriched[key] = replace(
@@ -506,15 +664,24 @@ class MarketDataClient:
         *,
         next_timestamp_ms: int,
         explicit_interval_ms: int,
+        explicit_source: str = "",
+        explicit_observed_at_ms: int = 0,
     ) -> int:
         """Keep a measured interval cache without assuming an 8-hour cadence."""
+        now_ms = _now_ms()
         explicit = max(int(explicit_interval_ms or 0), 0)
-        if explicit > 0:
-            self._funding_interval_by_key[key] = explicit
+        source = str(explicit_source or "").strip()
+        evidence_at_ms = max(int(explicit_observed_at_ms or 0), 0)
+        if explicit > 0 and source and evidence_at_ms > 0:
+            self._funding_interval_by_key[key] = (explicit, source, evidence_at_ms)
         # Hyperliquid's venue protocol is explicitly hourly; this is not the
         # old cross-venue default and remains tagged by its source parser.
         elif self._spec.venue_id == Venue.HYPERLIQUID:
-            self._funding_interval_by_key[key] = 3_600_000
+            self._funding_interval_by_key[key] = (
+                3_600_000,
+                "hyperliquid_protocol_hourly",
+                now_ms,
+            )
         observed = max(int(next_timestamp_ms or 0), 0)
         previous = int(self._funding_schedule_next_by_key.get(key, 0) or 0)
         if observed > 0:
@@ -524,9 +691,28 @@ class MarketDataClient:
                 # funding cadences outside this bounded range are unsupported
                 # until directly supplied by the venue.
                 if 60_000 <= advanced_by <= 7 * 24 * 60 * 60 * 1_000:
-                    self._funding_interval_by_key[key] = advanced_by
+                    self._funding_interval_by_key[key] = (
+                        advanced_by,
+                        "observed_next_funding_transition",
+                        now_ms,
+                    )
             self._funding_schedule_next_by_key[key] = observed
-        return max(int(self._funding_interval_by_key.get(key, 0) or 0), 0)
+        evidence = self._funding_interval_by_key.get(key)
+        if evidence is None:
+            return 0
+        if not isinstance(evidence, tuple) or len(evidence) != 3:
+            # The cache is not an authority boundary.  Corrupt or legacy
+            # in-memory values must degrade this symbol, never crash the whole
+            # venue refresh or regain the old unproven interval assumption.
+            self._funding_interval_by_key.pop(key, None)
+            return 0
+        interval_ms, _, interval_observed_at_ms = evidence
+        max_age_ms = min(max(2 * interval_ms, 3_600_000), 86_400_000)
+        age_ms = now_ms - interval_observed_at_ms
+        if age_ms < 0 or age_ms > max_age_ms:
+            self._funding_interval_by_key.pop(key, None)
+            return 0
+        return max(int(interval_ms or 0), 0)
 
     def prime_funding_schedule(self, tickers: Iterable[FundingTicker]) -> None:
         """Restore previously measured settlement cadence without HTTP I/O."""
@@ -534,10 +720,84 @@ class MarketDataClient:
             key = f"{str(ticker.venue).lower()}:{str(ticker.symbol).upper()}"
             interval = max(int(ticker.funding_interval_ms or 0), 0)
             if interval > 0:
-                self._funding_interval_by_key[key] = interval
+                self._funding_interval_by_key[key] = (
+                    interval,
+                    "validated_v3_restart_snapshot",
+                    _now_ms(),
+                )
             next_timestamp_ms = max(int(ticker.funding_timestamp_ms or 0), 0)
             if next_timestamp_ms > 0:
                 self._funding_schedule_next_by_key[key] = next_timestamp_ms
+
+    def _funding_interval_evidence_fresh(self, key: str, now_ms: int) -> bool:
+        evidence = self._funding_interval_by_key.get(key)
+        if evidence is None or not isinstance(evidence, tuple) or len(evidence) != 3:
+            return False
+        interval_ms, _, observed_at_ms = evidence
+        max_age_ms = min(max(2 * int(interval_ms), 3_600_000), 86_400_000)
+        age_ms = int(now_ms) - int(observed_at_ms)
+        return int(interval_ms) > 0 and 0 <= age_ms <= max_age_ms
+
+    async def _fetch_binance_style_funding_intervals(
+        self,
+        venue_sym_to_canon: dict[str, str],
+        *,
+        observed_at_ms: int,
+    ) -> dict[str, tuple[int, str, int]]:
+        """Cold-start interval proof from two venue funding settlements."""
+        evidence: dict[str, tuple[int, str, int]] = {}
+        missing = [
+            venue_symbol
+            for venue_symbol, canonical_symbol in venue_sym_to_canon.items()
+            if not self._funding_interval_evidence_fresh(
+                f"{self._spec.venue_id.value}:{canonical_symbol}",
+                observed_at_ms,
+            )
+        ]
+        if not missing:
+            return evidence
+        semaphore = asyncio.Semaphore(_FUNDING_INTERVAL_HISTORY_SEMAPHORE)
+
+        async def _one(venue_symbol: str) -> None:
+            async with semaphore:
+                try:
+                    raw = await self._public_get(
+                        "/fapi/v1/fundingRate",
+                        params={"symbol": venue_symbol, "limit": 2},
+                    )
+                except PublicTransportError:
+                    return
+                rows = raw if isinstance(raw, list) else []
+                timestamps = sorted(
+                    {
+                        int(_safe_float(row.get("fundingTime", 0)))
+                        for row in rows
+                        if isinstance(row, dict)
+                        and _safe_float(row.get("fundingTime", 0)) > 0.0
+                    }
+                )
+                if len(timestamps) < 2:
+                    return
+                interval_ms = timestamps[-1] - timestamps[-2]
+                if 60_000 <= interval_ms <= 7 * 24 * 60 * 60 * 1_000:
+                    evidence[venue_symbol] = (
+                        interval_ms,
+                        "venue_funding_history",
+                        observed_at_ms,
+                    )
+
+        tasks = [asyncio.create_task(_one(symbol)) for symbol in missing]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=_FUNDING_INTERVAL_HISTORY_BUDGET_S,
+            )
+        except asyncio.TimeoutError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return evidence
 
     async def fetch_entry_open_interest_evidence(
         self,
@@ -1075,6 +1335,68 @@ class MarketDataClient:
             if sym in venue_sym_to_canon:
                 ticker_map[sym] = item
 
+        # Symbol-level exchangeInfo is the execution contract for price and
+        # quantity increments.  Venue-wide defaults are configuration hints,
+        # not proof that an individual perpetual is tradable with those units.
+        contract_map: dict[str, dict[str, Any]] = {}
+        missing_contract_metadata = False
+        for venue_sym, canon in venue_sym_to_canon.items():
+            cache_key = f"{venue_str}:{canon}"
+            cached = self._binance_style_contract_metadata_by_key.get(cache_key)
+            if cached is not None:
+                metadata, metadata_observed_at_ms = cached
+                metadata_age_ms = now_ms - int(metadata_observed_at_ms)
+                underlying, quote_currency = _canonical_contract_identity(
+                    spec.venue_id,
+                    canon,
+                )
+                if (
+                    0 <= metadata_age_ms <= _BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS
+                    and _binance_style_contract_metadata_complete(
+                        metadata,
+                        underlying=underlying,
+                        quote_currency=quote_currency,
+                    )
+                ):
+                    contract_map[venue_sym] = dict(metadata)
+                    continue
+                if metadata_age_ms > _BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS:
+                    self._binance_style_contract_metadata_by_key.pop(cache_key, None)
+            missing_contract_metadata = True
+
+        if spec.funding_contracts_path and missing_contract_metadata:
+            try:
+                exchange_info = await self._public_get(spec.funding_contracts_path)
+            except PublicTransportError:
+                exchange_info = {}
+            contract_items = (
+                exchange_info.get("symbols", [])
+                if isinstance(exchange_info, dict)
+                else []
+            )
+            for metadata in contract_items if isinstance(contract_items, list) else []:
+                if not isinstance(metadata, dict):
+                    continue
+                venue_sym = str(metadata.get("symbol", "") or "")
+                canon = venue_sym_to_canon.get(venue_sym)
+                if canon is None:
+                    continue
+                cache_key = f"{venue_str}:{canon}"
+                self._binance_style_contract_metadata_by_key[cache_key] = (
+                    dict(metadata),
+                    now_ms,
+                )
+                underlying, quote_currency = _canonical_contract_identity(
+                    spec.venue_id,
+                    canon,
+                )
+                if _binance_style_contract_metadata_complete(
+                    metadata,
+                    underlying=underlying,
+                    quote_currency=quote_currency,
+                ):
+                    contract_map[venue_sym] = metadata
+
         # 2. premiumIndex (mark, index, funding rate, funding time)
         raw_pi: list[dict] = []
         if spec.premium_index_path:
@@ -1086,6 +1408,29 @@ class MarketDataClient:
             sym = str(item.get("symbol", ""))
             if sym in venue_sym_to_canon:
                 pi_map[sym] = item
+
+        interval_evidence: dict[str, tuple[int, str, int]] = {}
+        for venue_sym, pi in pi_map.items():
+            explicit_hours = _safe_float(
+                pi.get("fundingIntervalHours", pi.get("fundingInterval", 0))
+            )
+            if explicit_hours > 0.0:
+                evidence = (
+                    int(explicit_hours * 3_600_000),
+                    "venue_premium_index_interval",
+                    now_ms,
+                )
+                interval_evidence[venue_sym] = evidence
+                canonical_symbol = venue_sym_to_canon[venue_sym]
+                self._funding_interval_by_key[
+                    f"{venue_str}:{canonical_symbol}"
+                ] = evidence
+        interval_evidence.update(
+            await self._fetch_binance_style_funding_intervals(
+                venue_sym_to_canon,
+                observed_at_ms=now_ms,
+            )
+        )
 
         # 3. 24hr (volume)
         vol_map: dict[str, float] = {}
@@ -1250,13 +1595,36 @@ class MarketDataClient:
             if not pi and t:
                 # V1 parity: bookTicker-only entries are not perpetual contracts.
                 continue
+            interval_ms, interval_source, interval_observed_at_ms = (
+                interval_evidence.get(venue_sym, (0, "", 0))
+            )
+            contract_metadata = contract_map.get(venue_sym, {})
+            underlying, quote_currency = _canonical_contract_identity(
+                spec.venue_id,
+                canon,
+            )
+            metadata_complete = _binance_style_contract_metadata_complete(
+                contract_metadata,
+                underlying=underlying,
+                quote_currency=quote_currency,
+            )
+            price_tick, quantity_step = _binance_style_symbol_increments(
+                contract_metadata
+            )
+            min_quantity, min_notional = _binance_style_symbol_minimums(
+                contract_metadata
+            )
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
                 bid=_safe_float(t.get("bidPrice", 0)),
                 ask=_safe_float(t.get("askPrice", 0)),
-                bid_size=_safe_float(t.get("bidQty", 0)),
-                ask_size=_safe_float(t.get("askQty", 0)),
+                bid_size=(
+                    _safe_float(t.get("bidQty", 0)) if metadata_complete else 0.0
+                ),
+                ask_size=(
+                    _safe_float(t.get("askQty", 0)) if metadata_complete else 0.0
+                ),
                 mark_price=_safe_float(pi.get("markPrice", 0)),
                 index_price=_safe_float(pi.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(pi.get("lastFundingRate", 0)) * 10000.0,
@@ -1274,6 +1642,9 @@ class MarketDataClient:
                     else "quoted_rate"
                 ),
                 funding_timestamp_ms=int(_safe_float(pi.get("nextFundingTime", 0))),
+                funding_interval_ms=interval_ms,
+                funding_interval_source=interval_source,
+                funding_interval_observed_at_ms=interval_observed_at_ms,
                 volume_24h_quote=vol_map.get(venue_sym, 0.0),
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
                 open_interest_evidence_status=oi_evidence_status.get(
@@ -1289,6 +1660,12 @@ class MarketDataClient:
                 oi_deferred_count=oi_deferred_count,
                 oi_timeout_count=oi_timeout_count,
                 oi_refresh_elapsed_ms=oi_refresh_elapsed_ms,
+                base_quantity_evidence=metadata_complete,
+                price_tick=price_tick if metadata_complete else 0.0,
+                quantity_step_base=quantity_step if metadata_complete else 0.0,
+                min_quantity_base=min_quantity if metadata_complete else 0.0,
+                min_notional_quote=min_notional if metadata_complete else 0.0,
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 
@@ -1341,6 +1718,74 @@ class MarketDataClient:
             sym = str(item.get("instId", ""))
             if sym in venue_sym_to_canon:
                 ticker_map[sym] = item
+
+        # OKX BBO sizes for SWAP are contract counts.  Only symbol-level
+        # instrument metadata can prove the base-quantity conversion.
+        instrument_map: dict[str, dict[str, Any]] = {}
+        try:
+            instruments_raw = await self._public_get(
+                "/api/v5/public/instruments",
+                params={"instType": "SWAP"},
+            )
+        except PublicTransportError:
+            instruments_raw = {}
+        instrument_data = (
+            instruments_raw.get("data", [])
+            if isinstance(instruments_raw, dict)
+            else []
+        )
+        for instrument in instrument_data if isinstance(instrument_data, list) else []:
+            if not isinstance(instrument, dict):
+                continue
+            instrument_id = str(instrument.get("instId", "") or "")
+            if instrument_id in venue_sym_to_canon:
+                instrument_map[instrument_id] = instrument
+
+        # Funding-rate responses and the local funding cache do not prove the
+        # current mark or index price.  Fetch both from their dedicated OKX
+        # public endpoints so a funding-cache hit cannot silently erase the
+        # contract-normalisation evidence required by spread paper.
+        mark_price_map: dict[str, float] = {}
+        try:
+            mark_raw = await self._public_get(
+                "/api/v5/public/mark-price",
+                params={"instType": "SWAP"},
+            )
+        except PublicTransportError:
+            mark_raw = {}
+        mark_data = mark_raw.get("data", []) if isinstance(mark_raw, dict) else []
+        for mark_item in mark_data if isinstance(mark_data, list) else []:
+            if not isinstance(mark_item, dict):
+                continue
+            instrument_id = str(mark_item.get("instId", "") or "")
+            mark_price = _safe_float(mark_item.get("markPx", 0))
+            if instrument_id in venue_sym_to_canon and mark_price > 0.0:
+                mark_price_map[instrument_id] = mark_price
+
+        index_price_map: dict[str, float] = {}
+        quote_currencies = {
+            _canonical_contract_identity(spec.venue_id, canon)[1]
+            for canon in venue_sym_to_canon.values()
+        }
+        for quote_currency in sorted(quote_currencies):
+            try:
+                index_raw = await self._public_get(
+                    "/api/v5/market/index-tickers",
+                    params={"quoteCcy": quote_currency},
+                )
+            except PublicTransportError:
+                continue
+            index_data = (
+                index_raw.get("data", []) if isinstance(index_raw, dict) else []
+            )
+            for index_item in index_data if isinstance(index_data, list) else []:
+                if not isinstance(index_item, dict):
+                    continue
+                index_id = str(index_item.get("instId", "") or "")
+                swap_id = f"{index_id}-SWAP"
+                index_price = _safe_float(index_item.get("idxPx", 0))
+                if swap_id in venue_sym_to_canon and index_price > 0.0:
+                    index_price_map[swap_id] = index_price
 
         # 2. per-symbol funding-rate with V1 parity cache
         funding_map: dict[str, dict] = {}
@@ -1428,12 +1873,7 @@ class MarketDataClient:
                             "oiCcy",
                             "oi",
                         )
-                        mark = _safe_float(
-                            ticker_map.get(sym, {}).get(
-                                "markPx",
-                                ticker_map.get(sym, {}).get("last", 0),
-                            )
-                        )
+                        mark = mark_price_map.get(sym, 0.0)
                         if has_raw_oi and mark > 0.0:
                             oi_map[sym] = raw_oi * mark
                             oi_evidence_status[sym] = "available"
@@ -1460,6 +1900,38 @@ class MarketDataClient:
                 continue
             seen_canon.add(canon)
             fr = funding_map.get(venue_sym, {})
+            instrument = instrument_map.get(venue_sym, {})
+            underlying, quote_currency = _canonical_contract_identity(
+                self._spec.venue_id,
+                canon,
+            )
+            contract_value = _safe_float(instrument.get("ctVal", 0))
+            contract_value_currency = str(
+                instrument.get("ctValCcy", "") or ""
+            ).strip().upper()
+            metadata_complete = bool(
+                contract_value > 0.0
+                and str(instrument.get("ctType", "") or "").strip().lower()
+                == "linear"
+                and contract_value_currency == underlying
+                and str(instrument.get("settleCcy", "") or "").strip().upper()
+                == quote_currency
+                and str(instrument.get("state", "") or "").strip().lower()
+                == "live"
+                and _safe_float(instrument.get("tickSz", 0)) > 0.0
+                and _safe_float(instrument.get("lotSz", 0)) > 0.0
+                and _safe_float(instrument.get("minSz", 0)) > 0.0
+            )
+            base_size_multiplier = contract_value if metadata_complete else 0.0
+            funding_time_ms = _funding_timestamp_ms_or_seconds(
+                fr.get("fundingTime", 0)
+            )
+            next_funding_time_ms = _funding_timestamp_ms(fr)
+            explicit_interval_ms = (
+                next_funding_time_ms - funding_time_ms
+                if next_funding_time_ms > funding_time_ms > 0
+                else 0
+            )
             vol_ccy = _safe_float(t.get("volCcy24h", 0))
             last = _safe_float(t.get("last", 0))
             result[f"{venue_str}:{canon}"] = FundingTicker(
@@ -1467,10 +1939,10 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(t.get("bidPx", 0)),
                 ask=_safe_float(t.get("askPx", 0)),
-                bid_size=_safe_float(t.get("bidSz", 0)),
-                ask_size=_safe_float(t.get("askSz", 0)),
-                mark_price=_safe_float(fr.get("markPrice", t.get("markPx", 0))),
-                index_price=_safe_float(fr.get("indexPrice", 0)),
+                bid_size=_safe_float(t.get("bidSz", 0)) * base_size_multiplier,
+                ask_size=_safe_float(t.get("askSz", 0)) * base_size_multiplier,
+                mark_price=mark_price_map.get(venue_sym, 0.0),
+                index_price=index_price_map.get(venue_sym, 0.0),
                 funding_rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
                 predicted_funding_rate_bps=_optional_rate_bps(
                     fr, "nextFundingRate", "predictedFundingRate"
@@ -1480,7 +1952,14 @@ class MarketDataClient:
                     if _optional_rate_bps(fr, "nextFundingRate", "predictedFundingRate") is not None
                     else "quoted_rate"
                 ),
-                funding_timestamp_ms=_funding_timestamp_ms(fr),
+                funding_timestamp_ms=next_funding_time_ms,
+                funding_interval_ms=explicit_interval_ms,
+                funding_interval_source=(
+                    "okx_funding_time_pair" if explicit_interval_ms > 0 else ""
+                ),
+                funding_interval_observed_at_ms=(
+                    now_ms if explicit_interval_ms > 0 else 0
+                ),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),
                 open_interest_evidence_status=oi_evidence_status.get(
@@ -1488,6 +1967,26 @@ class MarketDataClient:
                     "unavailable" if spec.open_interest_path else "unsupported",
                 ),
                 open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
+                base_quantity_evidence=metadata_complete,
+                price_tick=(
+                    _safe_float(instrument.get("tickSz", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
+                quantity_step_base=(
+                    _safe_float(instrument.get("lotSz", 0)) * contract_value
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_quantity_base=(
+                    _safe_float(instrument.get("minSz", 0)) * contract_value
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_notional_quote=(
+                    0.0
+                ),
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 
@@ -1504,7 +2003,57 @@ class MarketDataClient:
         result_wrap = raw.get("result", raw)
         items = result_wrap.get("list", []) if isinstance(result_wrap, dict) else (result_wrap if isinstance(result_wrap, list) else [])
 
+        instrument_map: dict[str, dict[str, Any]] = {}
+        if spec.funding_contracts_path:
+            cursor = ""
+            seen_cursors: set[str] = set()
+            metadata_failed = False
+            for _page in range(10):
+                params = {"category": "linear", "limit": 1000}
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    instruments_raw = await self._public_get(
+                        spec.funding_contracts_path,
+                        params=params,
+                    )
+                except PublicTransportError:
+                    metadata_failed = True
+                    break
+                instruments_wrap = (
+                    instruments_raw.get("result", instruments_raw)
+                    if isinstance(instruments_raw, dict)
+                    else instruments_raw
+                )
+                instrument_items = (
+                    instruments_wrap.get("list", [])
+                    if isinstance(instruments_wrap, dict)
+                    else instruments_wrap if isinstance(instruments_wrap, list) else []
+                )
+                for instrument in instrument_items:
+                    if isinstance(instrument, dict):
+                        instrument_map[str(instrument.get("symbol", ""))] = instrument
+                next_cursor = (
+                    str(instruments_wrap.get("nextPageCursor", "") or "")
+                    if isinstance(instruments_wrap, dict)
+                    else ""
+                )
+                if not next_cursor:
+                    break
+                if next_cursor == cursor or next_cursor in seen_cursors:
+                    metadata_failed = True
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                metadata_failed = True
+            if metadata_failed:
+                # A partial instrument universe is not a complete execution
+                # contract.  Never mix first-page proof with an unknown tail.
+                instrument_map.clear()
+
         result: dict[str, FundingTicker] = {}
+        now_ms = _now_ms()
         for item in items:
             sym = str(item.get("symbol", ""))
             canon = venue_sym_to_canon.get(sym)
@@ -1521,13 +2070,52 @@ class MarketDataClient:
             else:
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest_value"
+            instrument = instrument_map.get(sym, {})
+            price_filter = instrument.get("priceFilter", {})
+            lot_size_filter = instrument.get("lotSizeFilter", {})
+            if not isinstance(price_filter, dict):
+                price_filter = {}
+            if not isinstance(lot_size_filter, dict):
+                lot_size_filter = {}
+            funding_interval_minutes = _safe_float(
+                instrument.get("fundingInterval", 0)
+            )
+            explicit_interval_ms = (
+                int(funding_interval_minutes * 60_000)
+                if funding_interval_minutes > 0
+                else 0
+            )
+            metadata_complete = bool(
+                instrument
+                and str(instrument.get("status", "")).lower() == "trading"
+                and str(instrument.get("contractType", "")).lower()
+                in {"linearperpetual", "perpetual"}
+                and str(instrument.get("settleCoin", "")).upper() == "USDT"
+                and _safe_float(price_filter.get("tickSize", 0)) > 0
+                and _safe_float(lot_size_filter.get("qtyStep", 0)) > 0
+                and _safe_float(lot_size_filter.get("minOrderQty", 0)) > 0
+                and _positive_exchange_number(
+                    lot_size_filter.get("minNotionalValue")
+                ) > 0.0
+            )
+            funding_timestamp_ms = _funding_timestamp_ms(item, fallback_ms=0)
+            if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+                funding_timestamp_ms = 0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
                 bid=_safe_float(item.get("bid1Price", 0)),
                 ask=_safe_float(item.get("ask1Price", 0)),
-                bid_size=_safe_float(item.get("bid1Size", 0)),
-                ask_size=_safe_float(item.get("ask1Size", 0)),
+                bid_size=(
+                    _safe_float(item.get("bid1Size", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
+                ask_size=(
+                    _safe_float(item.get("ask1Size", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
@@ -1539,11 +2127,42 @@ class MarketDataClient:
                     if _optional_rate_bps(item, "predictedFundingRate", "nextFundingRate") is not None
                     else "quoted_rate"
                 ),
-                funding_timestamp_ms=_funding_timestamp_ms(item, fallback_ms=_now_ms()),
+                funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=explicit_interval_ms,
+                funding_interval_source=(
+                    "bybit_instrument_metadata" if explicit_interval_ms > 0 else ""
+                ),
+                funding_interval_observed_at_ms=(
+                    now_ms if explicit_interval_ms > 0 else 0
+                ),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,
+                base_quantity_evidence=metadata_complete,
+                price_tick=(
+                    _safe_float(price_filter.get("tickSize", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
+                quantity_step_base=(
+                    _safe_float(lot_size_filter.get("qtyStep", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_quantity_base=(
+                    _safe_float(lot_size_filter.get("minOrderQty", 0))
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_notional_quote=(
+                    _positive_exchange_number(
+                        lot_size_filter.get("minNotionalValue")
+                    )
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 
@@ -1559,6 +2178,30 @@ class MarketDataClient:
         raw = await self._public_get(spec.funding_ticker_path, params={"productType": "USDT-FUTURES"})
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
+
+        # Bitget documents ticker BBO sizes and order quantities in base coin.
+        # The contract-config endpoint supplies symbol identity, quantity step,
+        # price step, status, and the funding interval needed to prove that
+        # unit contract rather than relying on a venue-wide assumption.
+        contract_map: dict[str, dict[str, Any]] = {}
+        try:
+            contracts_raw = await self._public_get(
+                "/api/v2/mix/market/contracts",
+                params={"productType": "USDT-FUTURES"},
+            )
+        except PublicTransportError:
+            contracts_raw = {}
+        contracts_data = (
+            contracts_raw.get("data", [])
+            if isinstance(contracts_raw, dict)
+            else []
+        )
+        for contract in contracts_data if isinstance(contracts_data, list) else []:
+            if not isinstance(contract, dict):
+                continue
+            contract_symbol = str(contract.get("symbol", "") or "")
+            if contract_symbol in venue_sym_to_canon:
+                contract_map[contract_symbol] = contract
 
         now_ms = _now_ms()
         funding_map: dict[str, dict[str, Any]] = {}
@@ -1608,6 +2251,44 @@ class MarketDataClient:
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
             funding_item = funding_map.get(sym, {})
+            contract = contract_map.get(sym, {})
+            underlying, quote_currency = _canonical_contract_identity(
+                self._spec.venue_id,
+                canon,
+            )
+            size_multiplier = _safe_float(contract.get("sizeMultiplier", 0))
+            min_trade_quantity = _positive_exchange_number(
+                contract.get("minTradeNum")
+            )
+            price_place = _safe_float(contract.get("pricePlace", -1), default=-1.0)
+            price_end_step = _safe_float(contract.get("priceEndStep", 0))
+            price_tick = (
+                price_end_step * (10.0 ** -int(price_place))
+                if price_place >= 0.0
+                and float(price_place).is_integer()
+                and price_end_step > 0.0
+                else 0.0
+            )
+            metadata_complete = bool(
+                str(contract.get("baseCoin", "") or "").strip().upper()
+                == underlying
+                and str(contract.get("quoteCoin", "") or "").strip().upper()
+                == quote_currency
+                and str(contract.get("symbolType", "") or "").strip().lower()
+                == "perpetual"
+                and str(contract.get("symbolStatus", "") or "").strip().lower()
+                == "normal"
+                and size_multiplier > 0.0
+                and min_trade_quantity > 0.0
+                and price_tick > 0.0
+                and _positive_exchange_number(contract.get("minTradeUSDT")) > 0.0
+            )
+            fund_interval_hours = _safe_float(contract.get("fundInterval", 0))
+            explicit_interval_ms = (
+                int(fund_interval_hours * 3_600_000)
+                if fund_interval_hours > 0.0
+                else 0
+            )
             funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
                 funding_item.get("nextUpdate", 0)
             )
@@ -1618,8 +2299,12 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(item.get("bidPr", item.get("bestBid", 0))),
                 ask=_safe_float(item.get("askPr", item.get("bestAsk", 0))),
-                bid_size=_safe_float(item.get("bidSz", 0)),
-                ask_size=_safe_float(item.get("askSz", 0)),
+                bid_size=(
+                    _safe_float(item.get("bidSz", 0)) if metadata_complete else 0.0
+                ),
+                ask_size=(
+                    _safe_float(item.get("askSz", 0)) if metadata_complete else 0.0
+                ),
                 mark_price=mark,
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(
@@ -1636,12 +2321,33 @@ class MarketDataClient:
                     else "quoted_rate"
                 ),
                 funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=explicit_interval_ms,
+                funding_interval_source=(
+                    "bitget_contract_config" if explicit_interval_ms > 0 else ""
+                ),
+                funding_interval_observed_at_ms=(
+                    now_ms if explicit_interval_ms > 0 else 0
+                ),
                 volume_24h_quote=_safe_float(
                     item.get("usdtVolume", item.get("quoteVolume", 0))
                 ),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,
+                base_quantity_evidence=metadata_complete,
+                price_tick=price_tick if metadata_complete else 0.0,
+                quantity_step_base=(
+                    size_multiplier if metadata_complete else 0.0
+                ),
+                min_quantity_base=(
+                    min_trade_quantity if metadata_complete else 0.0
+                ),
+                min_notional_quote=(
+                    _positive_exchange_number(contract.get("minTradeUSDT"))
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 
@@ -1662,13 +2368,27 @@ class MarketDataClient:
         missing_contract_symbols: set[str] = set()
         for venue_sym, canon in venue_sym_to_canon.items():
             cache_key = f"{venue_str}:{canon}"
+            cached_metadata = self._gate_contract_metadata_by_key.get(cache_key)
+            if cached_metadata is not None:
+                metadata, metadata_observed_at_ms = cached_metadata
+                metadata_age_ms = now_ms - int(metadata_observed_at_ms)
+                if 0 <= metadata_age_ms <= _GATE_CONTRACT_METADATA_MAX_AGE_MS:
+                    contract_map[venue_sym] = dict(metadata)
+                else:
+                    self._gate_contract_metadata_by_key.pop(cache_key, None)
             if self._funding_rate_is_fresh(cache_key, now_ms):
                 rate_bps, ts_ms, _ = self._funding_cache[cache_key]
-                contract_map[venue_sym] = {
-                    "funding_rate": str(rate_bps / 10000.0),
-                    "funding_next_apply": ts_ms,
-                }
-            else:
+                contract_map.setdefault(venue_sym, {}).update(
+                    {
+                        "funding_rate": str(rate_bps / 10000.0),
+                        "funding_next_apply": ts_ms,
+                    }
+                )
+            if (
+                not self._funding_rate_is_fresh(cache_key, now_ms)
+                or venue_sym not in contract_map
+                or not _gate_contract_metadata_complete(contract_map[venue_sym])
+            ):
                 missing_contract_symbols.add(venue_sym)
 
         if spec.funding_contracts_path and missing_contract_symbols:
@@ -1690,15 +2410,20 @@ class MarketDataClient:
                 )
                 if not sym:
                     continue
+                canon = venue_sym_to_canon.get(
+                    sym,
+                    self._from_venue_symbol(sym).upper(),
+                )
+                cache_key = f"{venue_str}:{canon}"
+                self._gate_contract_metadata_by_key[cache_key] = (
+                    dict(contract_item),
+                    now_ms,
+                )
                 funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
                     contract_item.get("funding_next_apply", 0)
                 )
                 funding_is_fresh = funding_timestamp_ms > now_ms + _FUNDING_CACHE_MIN_FUTURE_MS
                 if funding_is_fresh and _has_nonempty_field(contract_item, "funding_rate"):
-                    canon = venue_sym_to_canon.get(
-                        sym,
-                        self._from_venue_symbol(sym).upper(),
-                    )
                     self._funding_cache[f"{venue_str}:{canon}"] = (
                         _safe_float(contract_item.get("funding_rate", 0)) * 10000.0,
                         funding_timestamp_ms,
@@ -1714,7 +2439,12 @@ class MarketDataClient:
             if canon is None:
                 continue
             mark = _safe_float(item.get("mark_price", 0))
-            quanto = _safe_float(item.get("quanto_multiplier", 1.0))
+            contract_item = contract_map.get(sym, {})
+            # Gate ticker sizes are contract counts.  A missing symbol-level
+            # quanto multiplier is unknown, never an implicit 1x contract.
+            quanto = _positive_exchange_number(
+                contract_item.get("quanto_multiplier")
+            )
             oi_contracts, has_oi_contracts, oi_key = _first_present_float(
                 item,
                 "total_size",
@@ -1724,14 +2454,17 @@ class MarketDataClient:
                 oi_status = "available"
                 oi_reason = f"{oi_key}_times_quanto_mark"
             elif has_oi_contracts:
-                open_interest_quote = oi_contracts
-                oi_status = "available"
-                oi_reason = oi_key
+                open_interest_quote = 0.0
+                oi_status = "unavailable"
+                oi_reason = (
+                    "missing_contract_multiplier"
+                    if quanto <= 0
+                    else "missing_mark_price"
+                )
             else:
                 open_interest_quote = 0.0
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
-            contract_item = contract_map.get(sym, {})
             funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
                 contract_item.get("funding_next_apply", 0)
             )
@@ -1743,7 +2476,22 @@ class MarketDataClient:
             ask_size_contracts = _safe_float(
                 item.get("lowest_size", item.get("ask_size", 0))
             )
-            size_multiplier = quanto if quanto > 0 else 1.0
+            size_multiplier = quanto if quanto > 0 else 0.0
+            order_size_min_contracts = _positive_exchange_number(
+                contract_item.get("order_size_min")
+            )
+            order_price_round = _positive_exchange_number(
+                contract_item.get("order_price_round")
+            )
+            metadata_complete = _gate_contract_metadata_complete(contract_item)
+            funding_interval_seconds = _safe_float(
+                contract_item.get("funding_interval", 0)
+            )
+            explicit_interval_ms = (
+                int(funding_interval_seconds * 1_000)
+                if funding_interval_seconds > 0
+                else 0
+            )
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
@@ -1767,12 +2515,35 @@ class MarketDataClient:
                     else "quoted_rate"
                 ),
                 funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=explicit_interval_ms,
+                funding_interval_source=(
+                    "gate_contract_metadata" if explicit_interval_ms > 0 else ""
+                ),
+                funding_interval_observed_at_ms=(
+                    now_ms if explicit_interval_ms > 0 else 0
+                ),
                 volume_24h_quote=_safe_float(
                     item.get("volume_24h_quote", item.get("volume_24h", 0))
                 ),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,
+                base_quantity_evidence=metadata_complete,
+                price_tick=(order_price_round if metadata_complete else 0.0),
+                quantity_step_base=(
+                    order_size_min_contracts * quanto
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_quantity_base=(
+                    order_size_min_contracts * quanto
+                    if metadata_complete
+                    else 0.0
+                ),
+                min_notional_quote=(
+                    0.0
+                ),
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 
@@ -1818,7 +2589,8 @@ class MarketDataClient:
         for idx, item in enumerate(universe):
             if not isinstance(item, dict):
                 continue
-            if bool(item.get("isDelisted", False)):
+            size_decimals = _hyperliquid_size_decimals(item)
+            if size_decimals is None:
                 continue
             name = str(item.get("name", ""))
             canon = name + "USDT"
@@ -1850,6 +2622,9 @@ class MarketDataClient:
             impact_notional = 6_000.0 if name not in ("BTC", "ETH") else 20_000.0
             bid_size = impact_notional / best_bid if best_bid > 0 else 0.0
             ask_size = impact_notional / best_ask if best_ask > 0 else 0.0
+            price_tick = _hyperliquid_price_tick(mid_price, size_decimals)
+            quantity_step = 10.0 ** (-size_decimals)
+            metadata_complete = price_tick > 0.0 and quantity_step > 0.0
 
             open_interest, has_open_interest, oi_key = _first_present_float(
                 ctx,
@@ -1873,18 +2648,34 @@ class MarketDataClient:
                 symbol=canon.upper(),
                 bid=best_bid,
                 ask=best_ask,
-                bid_size=bid_size,
-                ask_size=ask_size,
+                bid_size=bid_size if metadata_complete else 0.0,
+                ask_size=ask_size if metadata_complete else 0.0,
                 mark_price=mark,
-                index_price=_safe_float(item.get("indexPx", 0)),
+                index_price=_safe_float(
+                    ctx.get("oraclePx", ctx.get("indexPx", item.get("indexPx", 0)))
+                ),
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
                 funding_timestamp_ms=funding_ts,
                 funding_interval_ms=3_600_000,
+                funding_interval_source="hyperliquid_protocol_hourly",
+                funding_interval_observed_at_ms=observed_at_ms,
                 funding_forecast_source="quoted_rate_hourly_protocol",
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
                 open_interest_quote=open_interest_quote,
                 open_interest_evidence_status=oi_status,
                 open_interest_evidence_reason=oi_reason,
+                base_quantity_evidence=metadata_complete,
+                price_tick=price_tick if metadata_complete else 0.0,
+                quantity_step_base=(
+                    quantity_step if metadata_complete else 0.0
+                ),
+                min_quantity_base=(
+                    quantity_step if metadata_complete else 0.0
+                ),
+                min_notional_quote=(
+                    10.0 if metadata_complete else 0.0
+                ),
+                min_notional_evidence_complete=metadata_complete,
             )
         return result
 

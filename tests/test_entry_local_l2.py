@@ -57,6 +57,8 @@ def _complete_v3_economics_fields(
         "expected_exit_cross_bps": 0.0,
         "entry_fee_bps": 0.0,
         "exit_fee_bps": 0.0,
+        # Aggregate round-trip fee contract; it must equal entry + exit.
+        "fee_bps": 0.0,
         "entry_slippage_bps": 0.0,
         "exit_slippage_bps": 0.0,
         "adverse_selection_bps": 0.0,
@@ -78,6 +80,23 @@ def _complete_v3_economics_fields(
     }
 
 
+def _complete_candidate_funding_timestamps(
+    timestamp_ms: int,
+    *,
+    long_timestamp_ms: int | None = None,
+    short_timestamp_ms: int | None = None,
+) -> dict[str, int]:
+    """Directed-pair funding schedule proof required by funding-live."""
+    long_timestamp_ms = timestamp_ms if long_timestamp_ms is None else long_timestamp_ms
+    short_timestamp_ms = timestamp_ms if short_timestamp_ms is None else short_timestamp_ms
+    return {
+        "funding_timestamp_ms": min(long_timestamp_ms, short_timestamp_ms),
+        "first_funding_timestamp_ms": min(long_timestamp_ms, short_timestamp_ms),
+        "long_funding_timestamp_ms": long_timestamp_ms,
+        "short_funding_timestamp_ms": short_timestamp_ms,
+    }
+
+
 def _complete_v3_contract_quote(
     venue: str,
     symbol: str,
@@ -95,9 +114,59 @@ def _complete_v3_contract_quote(
         "mark_index_source": "venue_index",
         "price_precision": 2,
         "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 5.0,
+        "min_notional_evidence_complete": True,
         "venue_status": "active",
         "contract_normalization_complete": True,
         **market_fields,
+    }
+
+
+def _v3_candidate_build_proof(
+    observed_at_ms: int,
+    *,
+    input_quote_count: int,
+    output_candidate_count: int,
+    requested_symbols: list[str] | None = None,
+) -> dict[str, object]:
+    normalized_requested_symbols = (
+        requested_symbols
+        if requested_symbols is not None
+        else (["BTCUSDT"] if output_candidate_count else [])
+    )
+    symbol_count = len(normalized_requested_symbols)
+
+    def lifecycle_rows() -> list[dict[str, object]]:
+        return [
+            {
+                "venue": venue,
+                "observed_at_ms": observed_at_ms,
+                "symbol_count": symbol_count,
+                "coverage_usable": symbol_count,
+                "degraded_reason": "",
+            }
+            for venue in ("binance", "bybit")
+        ]
+
+    return {
+        "candidate_build_observed_at_ms": observed_at_ms,
+        "candidate_build_diagnostics": {
+            "input_quote_count": input_quote_count,
+            "requested_symbol_count": len(normalized_requested_symbols),
+            "requested_symbols": normalized_requested_symbols,
+            "requested_venues": ["binance", "bybit"],
+            "directional_pair_count": output_candidate_count,
+            "output_candidate_count": output_candidate_count,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+        },
+        "funding_lifecycle": lifecycle_rows(),
+        "market_lifecycle": lifecycle_rows(),
+        "transfer_lifecycle": [],
+        "liquidity_lifecycle": lifecycle_rows(),
     }
 
 
@@ -794,6 +863,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "liquidity_lifecycle": [],
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1234,6 +1304,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "liquidity_lifecycle": [],
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1302,6 +1373,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "liquidity_lifecycle": [],
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1613,12 +1685,14 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
-            "funding_lifecycle": [],
-            "market_lifecycle": [],
-            "transfer_lifecycle": [],
-            "liquidity_lifecycle": [],
+            **_v3_candidate_build_proof(
+                now_ms,
+                input_quote_count=2,
+                output_candidate_count=1,
+            ),
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1627,6 +1701,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     "BTCUSDT",
                     bid=50000,
                     ask=50010,
+                    observed_at_ms=now_ms,
                     volume_24h_quote=10_000_000.0,
                     open_interest=2_000_000.0,
                     funding_rate_bps=10.0,
@@ -1637,6 +1712,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     "BTCUSDT",
                     bid=50005,
                     ask=50015,
+                    observed_at_ms=now_ms,
                     volume_24h_quote=10_000_000.0,
                     open_interest=2_000_000.0,
                     funding_rate_bps=-5.0,
@@ -1648,6 +1724,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 "short_venue": "bybit",
                 "symbol": "BTCUSDT",
                 "funding_diff_bps": 15.0,
+                **_complete_candidate_funding_timestamps(370_000),
                 **_complete_v3_economics_fields(15.0, now_ms),
             }],
         }))
@@ -1774,12 +1851,14 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
-            "funding_lifecycle": [],
-            "market_lifecycle": [],
-            "transfer_lifecycle": [],
-            "liquidity_lifecycle": [],
+            **_v3_candidate_build_proof(
+                now_ms,
+                input_quote_count=2,
+                output_candidate_count=1,
+            ),
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1788,6 +1867,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     "BTCUSDT",
                     bid=50000,
                     ask=50010,
+                    observed_at_ms=now_ms,
                     volume_24h_quote=10_000_000.0,
                     open_interest=2_000_000.0,
                     funding_rate_bps=10.0,
@@ -1798,6 +1878,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     "BTCUSDT",
                     bid=50005,
                     ask=50015,
+                    observed_at_ms=now_ms,
                     volume_24h_quote=10_000_000.0,
                     open_interest=2_000_000.0,
                     funding_rate_bps=-5.0,
@@ -1809,6 +1890,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 "short_venue": "bybit",
                 "symbol": "BTCUSDT",
                 "funding_diff_bps": 15.0,
+                **_complete_candidate_funding_timestamps(funding_ts),
                 **_complete_v3_economics_fields(15.0, now_ms),
             }],
         }))
@@ -1904,19 +1986,22 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 "short_venue": "bybit",
                 "symbol": f"S{i}USDT",
                 "funding_diff_bps": 20.0 - i,
-                "first_funding_timestamp_ms": 370000,
+                **_complete_candidate_funding_timestamps(370_000),
                 **_complete_v3_economics_fields(20.0 - i, now_ms),
             })
         snapshot_path.write_text(json.dumps({
             "schema_version": 3,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
-            "funding_lifecycle": [],
-            "market_lifecycle": [],
-            "transfer_lifecycle": [],
-            "liquidity_lifecycle": [],
+            **_v3_candidate_build_proof(
+                now_ms,
+                input_quote_count=10,
+                output_candidate_count=5,
+                requested_symbols=[f"S{index}USDT" for index in range(5)],
+            ),
             "degraded_venues": [],
             "degraded_domains": [],
+            "degraded_symbols": {},
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
@@ -1925,6 +2010,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     f"S{index}USDT",
                     bid=50_000.0,
                     ask=50_001.0,
+                    observed_at_ms=now_ms,
                     funding_rate_bps=(10.0 if venue == "binance" else -10.0),
                     funding_timestamp_ms=370_000,
                 )
@@ -2260,8 +2346,18 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "source_mode": "direct_market",
             "acquisition_mode": "fresh_sidecar",
             "quotes": {
-                "binance:BTCUSDT": {"venue": "binance", "symbol": "BTCUSDT", "bid": 1, "ask": 2},
-                "bybit:BTCUSDT": {"venue": "bybit", "symbol": "BTCUSDT", "bid": 1, "ask": 2},
+                "binance:BTCUSDT": {
+                    "venue": "binance", "symbol": "BTCUSDT", "bid": 1, "ask": 2,
+                    "funding_rate_bps": 1.0,
+                    "funding_timestamp_ms": now_ms + 60_000,
+                    "funding_interval_ms": 28_800_000,
+                },
+                "bybit:BTCUSDT": {
+                    "venue": "bybit", "symbol": "BTCUSDT", "bid": 1, "ask": 2,
+                    "funding_rate_bps": -1.0,
+                    "funding_timestamp_ms": now_ms + 60_000,
+                    "funding_interval_ms": 28_800_000,
+                },
             },
             "candidates": [
                 {
@@ -2273,7 +2369,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     "expected_edge_bps": 1.0,
                     "worst_case_edge_bps": 1.0,
                     "ranking_edge_bps": 1.0,
-                    "first_funding_timestamp_ms": now_ms + 60000,
+                    **_complete_candidate_funding_timestamps(now_ms + 60_000),
                 }
             ],
         }
@@ -4070,6 +4166,9 @@ class TestEntryReadinessProviderFactory:
             entry_notional_quote=500.0,
             pair_id="bananausdt:bybit->hyperliquid",
             first_funding_timestamp_ms=now_ms + 300_000,
+            funding_timestamp_ms=now_ms + 300_000,
+            long_funding_timestamp_ms=now_ms + 300_000,
+            short_funding_timestamp_ms=now_ms + 300_000,
             economics_complete=True,
             economics_observed_at_ms=now_ms,
             calculation_version="v1_exact",

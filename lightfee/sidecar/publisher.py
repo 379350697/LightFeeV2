@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields as dataclass_fields
 from math import isclose, isfinite
 import os
 import tempfile
 from pathlib import Path
 
-from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+from lightfee.sidecar.snapshot import (
+    LEGACY_SNAPSHOT_SCHEMA_VERSIONS,
+    SNAPSHOT_SCHEMA_VERSION,
+    QuoteSnapshot,
+    SidecarSnapshot,
+    validate_v4_snapshot_contract,
+)
 from lightfee.strategy.economics import build_edge_breakdown
+from lightfee.strategy.fee_contract import derive_candidate_stage_fee_bps
 
 
 _V3_ECONOMICS_NUMERIC_FIELDS = (
@@ -32,6 +40,7 @@ _V3_ECONOMICS_NUMERIC_FIELDS = (
     "forecast_worst_funding_edge_bps",
     "long_taker_fee_bps",
     "short_taker_fee_bps",
+    "fee_bps",
 )
 
 _V3_LIFECYCLE_NUMERIC_FIELDS = (
@@ -135,18 +144,27 @@ def _v3_economics_contract_reason(
     ):
         if values[name] < 0.0:
             return f"invalid_v3_economics_cost_sign:{name}"
-    # A negative fee is a maker rebate, not a generic discount.  The candidate
-    # must therefore retain the selected passive leg that makes the rebate
-    # executable.  Without that proof an untrusted V3 payload could turn a
-    # missing fee schedule into positive alpha simply by sending ``-x``.
-    for fee_field, maker_leg_field in (
-        ("entry_fee_bps", "entry_maker_leg"),
-        ("exit_fee_bps", "exit_maker_leg"),
+    for stage in ("entry", "exit"):
+        derived_fee_bps, fee_reason = derive_candidate_stage_fee_bps(
+            candidate,
+            stage,
+        )
+        if fee_reason or derived_fee_bps is None:
+            return f"invalid_v3_fee_contract:{stage}:{fee_reason}"
+        if not isclose(
+            values[f"{stage}_fee_bps"],
+            derived_fee_bps,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return f"v3_fee_contract_mismatch:{stage}_fee_bps"
+    if not isclose(
+        values["fee_bps"],
+        values["entry_fee_bps"] + values["exit_fee_bps"],
+        rel_tol=0.0,
+        abs_tol=1e-12,
     ):
-        if values[fee_field] < 0.0 and str(
-            candidate.get(maker_leg_field, "") or ""
-        ).lower() not in {"long", "short"}:
-            return f"invalid_v3_signed_fee_proof:{maker_leg_field}"
+        return "v3_fee_contract_mismatch:fee_bps"
     if isinstance(candidate["economics_observed_at_ms"], bool):
         return "invalid_v3_economics_observed_at_ms"
     try:
@@ -299,18 +317,32 @@ def _v3_normalised_contract_fields(raw: dict) -> tuple[str, str, float] | None:
         or str(raw.get("venue_status", "") or "").lower() != "active"
     ):
         return None
-    try:
-        multiplier = float(raw.get("contract_multiplier", 0.0) or 0.0)
-    except (TypeError, ValueError, OverflowError):
+    raw_multiplier = raw.get("contract_multiplier")
+    if isinstance(raw_multiplier, bool) or not isinstance(
+        raw_multiplier, (int, float)
+    ):
         return None
-    price_precision = _v3_positive_int(raw.get("price_precision"))
-    quantity_precision = _v3_positive_int(raw.get("quantity_precision"))
+    multiplier = float(raw_multiplier)
+    price_precision = _v3_nonnegative_int(raw.get("price_precision"))
+    quantity_precision = _v3_nonnegative_int(raw.get("quantity_precision"))
+    exact_contract_numbers = tuple(
+        _v3_positive_number(raw.get(field))
+        for field in (
+            "price_tick",
+            "quantity_step_base",
+            "min_quantity_base",
+        )
+    )
+    min_notional_quote = _v3_nonnegative_number(raw.get("min_notional_quote"))
     funding_interval_ms = _v3_positive_int(raw.get("funding_interval_ms"))
     if (
         not isfinite(multiplier)
         or multiplier <= 0.0
         or price_precision is None
         or quantity_precision is None
+        or any(value is None for value in exact_contract_numbers)
+        or min_notional_quote is None
+        or raw.get("min_notional_evidence_complete") is not True
         or funding_interval_ms is None
     ):
         return None
@@ -319,26 +351,48 @@ def _v3_normalised_contract_fields(raw: dict) -> tuple[str, str, float] | None:
 
 def _v3_positive_int(value: object) -> int | None:
     """Accept only a finite, literal positive integer from raw JSON."""
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError):
+    return value
+
+
+def _v3_positive_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not isfinite(numeric) or numeric <= 0.0 or not numeric.is_integer():
+    parsed = float(value)
+    return parsed if isfinite(parsed) and parsed > 0.0 else None
+
+
+def _v3_nonnegative_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return int(numeric)
+    parsed = float(value)
+    return parsed if isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _v3_nonnegative_int(value: object) -> int | None:
+    """Accept a literal non-negative integer such as zero-place precision."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
-    """Write snapshot atomically: temp file, flush, replace."""
+    """Validate and atomically replace the last readable snapshot."""
+    data = _snapshot_to_dict(snapshot)
+    if data.get("schema_version") == SNAPSHOT_SCHEMA_VERSION:
+        contract_errors = validate_v4_snapshot_contract(data)
+        if contract_errors:
+            raise ValueError(
+                "refusing to publish invalid V4 snapshot: "
+                + "; ".join(contract_errors)
+            )
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".snapshot-")
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        data = _snapshot_to_dict(snapshot)
         content = json.dumps(data, ensure_ascii=False, indent=2)
         with open(tmp, "w") as f:
             f.write(content)
@@ -367,12 +421,26 @@ def load_snapshot(path: str | Path) -> SidecarSnapshot | None:
         return None
     if not isinstance(data, dict):
         return None
-    if _safe_int(data.get("schema_version"), default=0) <= 0:
+    raw_schema_version = data.get("schema_version")
+    if not isinstance(raw_schema_version, int) or isinstance(raw_schema_version, bool):
+        return None
+    schema_version = int(raw_schema_version)
+    if schema_version not in {
+        *LEGACY_SNAPSHOT_SCHEMA_VERSIONS,
+        SNAPSHOT_SCHEMA_VERSION,
+    }:
+        return None
+    if schema_version == SNAPSHOT_SCHEMA_VERSION and not _v4_proof_contract_valid(data):
         return None
     try:
         return _dict_to_snapshot(data)
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
+
+
+def _v4_proof_contract_valid(data: dict[str, object]) -> bool:
+    """Require producer proof before a v4 snapshot enters live consumers."""
+    return not validate_v4_snapshot_contract(data)
 
 
 def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
@@ -381,26 +449,47 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
         "published_at_ms": s.published_at_ms,
         "market_observed_at_ms": s.market_observed_at_ms,
         "funding_lifecycle": [
-            {"venue": fl.venue, "observed_at_ms": fl.observed_at_ms, "symbol_count": fl.symbol_count,
-             "coverage_usable": fl.coverage_usable, "degraded_reason": fl.degraded_reason}
+            {
+                "venue": fl.venue,
+                "observed_at_ms": fl.observed_at_ms,
+                "symbol_count": fl.symbol_count,
+                "coverage_usable": fl.coverage_usable,
+                "degraded_reason": fl.degraded_reason,
+            }
             for fl in s.funding_lifecycle
         ],
         "market_lifecycle": [
-            {"venue": ml.venue, "observed_at_ms": ml.observed_at_ms, "symbol_count": ml.symbol_count,
-             "coverage_usable": ml.coverage_usable, "degraded_reason": ml.degraded_reason}
+            {
+                "venue": ml.venue,
+                "observed_at_ms": ml.observed_at_ms,
+                "symbol_count": ml.symbol_count,
+                "coverage_usable": ml.coverage_usable,
+                "degraded_reason": ml.degraded_reason,
+            }
             for ml in s.market_lifecycle
         ],
         "transfer_lifecycle": [
-            {"from_venue": tl.from_venue, "to_venue": tl.to_venue, "observed_at_ms": tl.observed_at_ms,
-             "coverage_usable": tl.coverage_usable, "degraded_reason": tl.degraded_reason}
+            {
+                "from_venue": tl.from_venue,
+                "to_venue": tl.to_venue,
+                "observed_at_ms": tl.observed_at_ms,
+                "coverage_usable": tl.coverage_usable,
+                "degraded_reason": tl.degraded_reason,
+            }
             for tl in s.transfer_lifecycle
         ],
         "liquidity_lifecycle": [
-            {"venue": ll.venue, "observed_at_ms": ll.observed_at_ms, "symbol_count": ll.symbol_count,
-             "coverage_usable": ll.coverage_usable, "degraded_reason": ll.degraded_reason,
-             "domain": ll.domain, "source": ll.source,
-             "publish_interval_ms": ll.publish_interval_ms,
-             "published_at_ms": ll.published_at_ms}
+            {
+                "venue": ll.venue,
+                "observed_at_ms": ll.observed_at_ms,
+                "symbol_count": ll.symbol_count,
+                "coverage_usable": ll.coverage_usable,
+                "degraded_reason": ll.degraded_reason,
+                "domain": ll.domain,
+                "source": ll.source,
+                "publish_interval_ms": ll.publish_interval_ms,
+                "published_at_ms": ll.published_at_ms,
+            }
             for ll in s.liquidity_lifecycle
         ],
         "degraded_venues": list(s.degraded_venues),
@@ -408,6 +497,8 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
         "degraded_symbols": {k: list(v) for k, v in s.degraded_symbols.items()},
         "source_mode": s.source_mode,
         "acquisition_mode": s.acquisition_mode,
+        "candidate_build_observed_at_ms": s.candidate_build_observed_at_ms,
+        "candidate_build_diagnostics": dict(s.candidate_build_diagnostics),
         "quotes": {
             k: {
                 "venue": q.venue,
@@ -454,6 +545,11 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "mark_index_source": q.mark_index_source,
                 "price_precision": q.price_precision,
                 "quantity_precision": q.quantity_precision,
+                "price_tick": q.price_tick,
+                "quantity_step_base": q.quantity_step_base,
+                "min_quantity_base": q.min_quantity_base,
+                "min_notional_quote": q.min_notional_quote,
+                "min_notional_evidence_complete": q.min_notional_evidence_complete,
                 "venue_status": q.venue_status,
                 "contract_normalization_complete": q.contract_normalization_complete,
             }
@@ -487,6 +583,23 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "long_taker_fee_bps": c.long_taker_fee_bps,
                 "short_taker_fee_bps": c.short_taker_fee_bps,
                 "taker_fee_evidence_complete": c.taker_fee_evidence_complete,
+                # Untrusted assertion only.  The live admission boundary
+                # reloads the signed account-fee document and requires an
+                # exact epoch/fingerprint/provenance match before authorising
+                # an order.  Dropping these fields here makes every genuine
+                # candidate indistinguishable from a provenance-free one
+                # after the required JSON round trip.
+                "account_fee_evidence_complete": c.account_fee_evidence_complete,
+                "account_fee_evidence_observed_at_ms": (
+                    c.account_fee_evidence_observed_at_ms
+                ),
+                "account_fee_evidence_source": c.account_fee_evidence_source,
+                "account_fee_evidence_fingerprint": (
+                    c.account_fee_evidence_fingerprint
+                ),
+                "account_fee_evidence_provenance": list(
+                    c.account_fee_evidence_provenance
+                ),
                 "opportunity_type": c.opportunity_type,
                 "blocked": c.blocked,
                 "blocked_reasons": c.blocked_reasons,
@@ -562,6 +675,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
     # --- V1 compat: convert V1 Rust sidecar format to V2 (see v1_compat.py) ---
     if schema_version == 1:
         from lightfee.sidecar.v1_compat import convert_v1_snapshot_to_v2
+
         d = convert_v1_snapshot_to_v2(d)
         schema_version = _safe_int(d.get("schema_version"), default=0)
     # --- end V1 compat ---
@@ -575,6 +689,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
     )
 
     quotes_raw = d.get("quotes", {})
+
     def _enrich_candidate(c: dict) -> CandidateInput:
         """Enrich a candidate dict with V1-required identity + prewarm fields.
 
@@ -611,22 +726,28 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
             and raw_economics_complete is not False
         ):
             contract_reason = "invalid_v3_economics_field:economics_complete"
-        if (
-            schema_version < 3
-            or (
-                schema_version >= 3
-                and (
-                    not complete_economics
-                    or economics_observed_at_ms <= 0
-                    or bool(contract_reason)
-                )
-            )
+        if schema_version < 3 or (
+            schema_version >= 3
+            and (not complete_economics or economics_observed_at_ms <= 0 or bool(contract_reason))
         ):
             c["economics_complete"] = False
             c.setdefault("calculation_version", "legacy_schema_incomplete")
             c.setdefault("model_epoch", "v1_legacy")
-            if contract_reason:
-                c["economics_incomplete_reason"] = contract_reason
+            if schema_version >= 3:
+                incomplete_reason = (
+                    contract_reason
+                    or str(c.get("economics_incomplete_reason", "") or "").strip()
+                    or "incomplete_v3_economics"
+                )
+                c["economics_incomplete_reason"] = incomplete_reason
+                c["blocked"] = True
+                blocked_reasons = c.get("blocked_reasons")
+                normalized_blocked_reasons = (
+                    list(blocked_reasons) if isinstance(blocked_reasons, list) else []
+                )
+                if incomplete_reason not in normalized_blocked_reasons:
+                    normalized_blocked_reasons.append(incomplete_reason)
+                c["blocked_reasons"] = normalized_blocked_reasons
 
         pair_id = str(c.get("pair_id", "") or "")
         symbol = str(c.get("symbol", ""))
@@ -636,7 +757,17 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         if not pair_id and symbol and long_ven and short_ven:
             pair_id = f"{symbol.lower()}:{long_ven}->{short_ven}"
 
-        ff_ts = _safe_int(c.get("first_funding_timestamp_ms"), default=0)
+        raw_ff_ts = c.get("first_funding_timestamp_ms")
+        explicit_ff_ts_malformed = (
+            schema_version >= 3
+            and "first_funding_timestamp_ms" in c
+            and raw_ff_ts not in (None, 0)
+            and (
+                isinstance(raw_ff_ts, bool)
+                or not isinstance(raw_ff_ts, int)
+            )
+        )
+        ff_ts = _safe_int(raw_ff_ts, default=0)
         f_ts = _safe_int(c.get("funding_timestamp_ms"), default=0)
         long_fts = _safe_int(c.get("long_funding_timestamp_ms"), default=0)
         short_fts = _safe_int(c.get("short_funding_timestamp_ms"), default=0)
@@ -655,9 +786,14 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
                             short_fts = qts
 
         # Derive first_funding_timestamp_ms from per-leg timestamps (V1: min(long, short))
-        if ff_ts <= 0 and long_fts > 0 and short_fts > 0:
+        if (
+            not explicit_ff_ts_malformed
+            and ff_ts <= 0
+            and long_fts > 0
+            and short_fts > 0
+        ):
             ff_ts = min(long_fts, short_fts)
-        elif ff_ts <= 0:
+        elif not explicit_ff_ts_malformed and ff_ts <= 0:
             # Fallback: derive from quotes
             ts_candidates: list[int] = []
             for venue in (long_ven, short_ven):
@@ -688,6 +824,20 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         c["short_funding_timestamp_ms"] = short_fts
         c["second_funding_timestamp_ms"] = second_fts
 
+        invalid_fields = _normalise_candidate_fields(c, CandidateInput)
+        if invalid_fields:
+            c["blocked"] = True
+            blocked_reasons = c.get("blocked_reasons")
+            c["blocked_reasons"] = (
+                list(blocked_reasons) if isinstance(blocked_reasons, list) else []
+            ) + [f"invalid_candidate_field:{name}" for name in invalid_fields]
+            c["economics_complete"] = False
+            c["economics_incomplete_reason"] = (
+                contract_reason
+                or str(c.get("economics_incomplete_reason", "") or "")
+                or "invalid_candidate_fields:" + ",".join(invalid_fields)
+            )
+
         candidate = CandidateInput(**c)
         if pair_id:
             candidate.pair_id = pair_id
@@ -705,9 +855,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         # V1: first_funding_leg — which leg's funding settles first
         # discovery.rs:850-863 — Long if long_ts <= short_ts, else Short
         if long_fts > 0 and short_fts > 0:
-            candidate.first_funding_leg = (
-                "long" if long_fts <= short_fts else "short"
-            )
+            candidate.first_funding_leg = "long" if long_fts <= short_fts else "short"
 
         # Fail-closed: candidates without usable funding timestamp are not tradeable.
         # V1 never emits a tradeable candidate with first_funding_timestamp_ms=0.
@@ -732,6 +880,15 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         degraded_symbols=_parse_degraded_symbols(d.get("degraded_symbols", {})),
         source_mode=d.get("source_mode", ""),
         acquisition_mode=d.get("acquisition_mode", ""),
+        candidate_build_observed_at_ms=_safe_int(
+            d.get("candidate_build_observed_at_ms"),
+            default=0,
+        ),
+        candidate_build_diagnostics=(
+            dict(d.get("candidate_build_diagnostics", {}))
+            if isinstance(d.get("candidate_build_diagnostics", {}), dict)
+            else {}
+        ),
         quotes={k: _quote_from_dict(v) for k, v in quotes_raw.items()},
         candidates=[_enrich_candidate(c) for c in d.get("candidates", [])],
     )
@@ -764,6 +921,10 @@ def _quote_from_dict(raw: object) -> QuoteSnapshot:
         "volume_24h_quote",
         "open_interest",
         "contract_multiplier",
+        "price_tick",
+        "quantity_step_base",
+        "min_quantity_base",
+        "min_notional_quote",
     ):
         if field in value:
             value[field] = _safe_float(value[field], default=0.0)
@@ -797,6 +958,7 @@ def _quote_from_dict(raw: object) -> QuoteSnapshot:
     for field in (
         "funding_forecast_distribution_stable",
         "contract_normalization_complete",
+        "min_notional_evidence_complete",
     ):
         if field in value and value[field] is not True and value[field] is not False:
             value[field] = False
@@ -832,6 +994,59 @@ def _safe_optional_float(value: object) -> float | None:
         return None
     parsed = _safe_float(value, default=float("nan"))
     return parsed if isfinite(parsed) else None
+
+
+def _normalise_candidate_fields(
+    raw: dict[str, object],
+    candidate_type: type,
+) -> list[str]:
+    """Fail closed and make every present candidate scalar runtime-safe."""
+    invalid: list[str] = []
+    for candidate_field in dataclass_fields(candidate_type):
+        name = candidate_field.name
+        if name not in raw:
+            continue
+        value = raw[name]
+        annotation = str(candidate_field.type).strip("'\"")
+        normalized = value
+        valid = True
+        if annotation == "float":
+            valid = (
+                type(value) in (int, float)
+                and isfinite(float(value))
+            )
+            normalized = float(value) if valid else 0.0
+        elif annotation == "int":
+            valid = type(value) is int
+            normalized = value if valid else 0
+        elif annotation == "bool":
+            valid = type(value) is bool
+            normalized = value if valid else False
+        elif annotation == "str":
+            valid = isinstance(value, str)
+            normalized = value if valid else ""
+        elif annotation == "Optional[float]":
+            valid = value is None or (
+                type(value) in (int, float) and isfinite(float(value))
+            )
+            normalized = None if value is None or not valid else float(value)
+        elif annotation == "Optional[str]":
+            valid = value is None or isinstance(value, str)
+            normalized = value if valid else None
+        elif annotation == "list[str]":
+            valid = isinstance(value, list) and all(
+                isinstance(item, str) for item in value
+            )
+            normalized = list(value) if valid else []
+        elif annotation == "list[dict[str, object]]":
+            valid = isinstance(value, list) and all(
+                isinstance(item, dict) for item in value
+            )
+            normalized = list(value) if valid else []
+        raw[name] = normalized
+        if not valid:
+            invalid.append(name)
+    return invalid
 
 
 def _normalise_depth(raw: object) -> tuple[tuple[float, float], ...]:

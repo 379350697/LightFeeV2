@@ -37,6 +37,11 @@ def _quote(
     contract.setdefault("mark_index_source", "venue_mark")
     contract.setdefault("price_precision", 2)
     contract.setdefault("quantity_precision", 3)
+    contract.setdefault("price_tick", 0.01)
+    contract.setdefault("quantity_step_base", 0.001)
+    contract.setdefault("min_quantity_base", 0.001)
+    contract.setdefault("min_notional_quote", 0.1)
+    contract.setdefault("min_notional_evidence_complete", True)
     contract.setdefault("contract_normalization_complete", True)
     contract.setdefault("funding_timestamp_ms", observed_at_ms + 3_600_000)
     contract.setdefault("funding_interval_ms", 28_800_000)
@@ -493,11 +498,11 @@ def test_contract_evidence_and_funding_schedule_are_required_with_stable_reasons
 
 
 @pytest.mark.parametrize("field", ("price_precision", "quantity_precision"))
-def test_contract_precision_evidence_is_required(field: str) -> None:
+def test_malformed_contract_precision_is_rejected(field: str) -> None:
     tracker = SpreadStatsTracker()
     _prewarm(tracker)
     rejection_counts: dict[str, int] = {}
-    quotes = _quotes_for_signed_basis(20.0, now_ms=31_000, **{field: 0})
+    quotes = _quotes_for_signed_basis(20.0, now_ms=31_000, **{field: -1})
 
     assert build_spread_reversion_candidates(
         quotes,
@@ -508,3 +513,26 @@ def test_contract_precision_evidence_is_required(field: str) -> None:
         rejection_counts=rejection_counts,
     ) == []
     assert rejection_counts == {f"missing_{field}": 1}
+
+
+def test_zero_decimal_quantity_precision_is_valid_for_integer_lots() -> None:
+    tracker = SpreadStatsTracker()
+    _prewarm(tracker)
+    rejection_counts: dict[str, int] = {}
+    quotes = _quotes_for_signed_basis(
+        20.0,
+        now_ms=31_000,
+        quantity_precision=0,
+    )
+
+    candidates = build_spread_reversion_candidates(
+        quotes,
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=_config(),
+        now_ms=31_000,
+        rejection_counts=rejection_counts,
+    )
+
+    assert candidates
+    assert "missing_quantity_precision" not in rejection_counts

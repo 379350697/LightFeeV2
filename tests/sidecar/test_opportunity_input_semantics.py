@@ -18,10 +18,94 @@ from pathlib import Path
 import pytest
 
 from lightfee.sidecar.snapshot import (
+    CandidateInput,
+    FundingLifecycle,
+    LiquidityLifecycle,
+    MarketLifecycle,
+    QuoteSnapshot,
     SidecarSnapshot,
     SnapshotFreshness,
+    TransferLifecycle,
     evaluate_snapshot_freshness,
+    decide_snapshot_freshness,
+    has_usable_funding_payload,
 )
+
+
+def test_funding_payload_accepts_staggered_candidate_but_not_single_leg_quote():
+    staggered = CandidateInput(
+        long_venue="binance",
+        short_venue="okx",
+        symbol="BTCUSDT",
+        funding_diff_bps=3.0,
+        funding_edge_bps=3.0,
+        expected_edge_bps=2.0,
+        worst_case_edge_bps=1.0,
+        ranking_edge_bps=1.0,
+        funding_timestamp_ms=2_000,
+        first_funding_timestamp_ms=2_000,
+        long_funding_timestamp_ms=2_000,
+        short_funding_timestamp_ms=3_000,
+        opportunity_type="staggered",
+        interval_aligned=False,
+    )
+    assert has_usable_funding_payload(
+        SidecarSnapshot(acquisition_mode="fresh_sidecar", candidates=[staggered])
+    )
+
+    single_leg = SidecarSnapshot(
+        acquisition_mode="degraded_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=2_000,
+                funding_interval_ms=28_800_000,
+            )
+        },
+    )
+    assert not has_usable_funding_payload(single_leg)
+
+
+def test_funding_fallback_decision_selects_healthy_last_good_not_bad_current():
+    current = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        acquisition_mode="degraded_sidecar",
+        quotes={},
+    )
+    last_good = SidecarSnapshot(
+        published_at_ms=1_900,
+        market_observed_at_ms=1_900,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"{venue}:BTCUSDT": QuoteSnapshot(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                funding_rate_bps=rate,
+                funding_timestamp_ms=3_000,
+                funding_interval_ms=28_800_000,
+            )
+            for venue, rate in (("binance", 1.0), ("okx", 2.0))
+        },
+    )
+
+    decision = decide_snapshot_freshness(
+        current,
+        max_age_ms=100,
+        now_ms=2_000,
+        last_good=last_good,
+        last_good_max_age_ms=5_000,
+        usable_payload=has_usable_funding_payload,
+    )
+
+    assert decision.freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+    assert decision.snapshot is last_good
 from lightfee.sidecar.lifecycle import (
     DomainStatus,
     DomainLifecycle,
@@ -38,12 +122,34 @@ from lightfee.config.validation import check_raw_toml_for_chillybot
 # ── OPP-001: Sidecar Snapshot Freshness States ──────────────────────────────
 
 
+def _usable_snapshot(*, published_at_ms: int, **kwargs) -> SidecarSnapshot:
+    market_observed_at_ms = kwargs.pop("market_observed_at_ms", published_at_ms)
+    candidate_build_observed_at_ms = kwargs.pop(
+        "candidate_build_observed_at_ms", published_at_ms
+    )
+    return SidecarSnapshot(
+        published_at_ms=published_at_ms,
+        market_observed_at_ms=market_observed_at_ms,
+        candidate_build_observed_at_ms=candidate_build_observed_at_ms,
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=market_observed_at_ms,
+            )
+        },
+        **kwargs,
+    )
+
+
 class TestSnapshotFreshnessStates:
     """OPP-001: Five freshness states: fresh, last-good fallback, stale, missing, degraded."""
 
     def test_fresh_snapshot(self):
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(published_at_ms=now_ms - 1000)
+        snapshot = _usable_snapshot(published_at_ms=now_ms - 1000)
         freshness = evaluate_snapshot_freshness(snapshot, max_age_ms=10000, now_ms=now_ms)
         assert freshness == SnapshotFreshness.FRESH
 
@@ -61,8 +167,8 @@ class TestSnapshotFreshnessStates:
     def test_last_good_fallback(self):
         """When current is stale but a recent valid (last good) snapshot exists."""
         now_ms = int(time.time() * 1000)
-        current = SidecarSnapshot(published_at_ms=now_ms - 30000)
-        last_good = SidecarSnapshot(published_at_ms=now_ms - 5000)
+        current = _usable_snapshot(published_at_ms=now_ms - 30000)
+        last_good = _usable_snapshot(published_at_ms=now_ms - 5000)
         freshness = evaluate_snapshot_freshness(
             current, max_age_ms=10000, now_ms=now_ms, last_good=last_good
         )
@@ -71,7 +177,7 @@ class TestSnapshotFreshnessStates:
     def test_current_snapshot_inside_last_good_window_falls_back(self):
         """V1: stale publish age can remain usable as last-good until last_good_max_age."""
         now_ms = int(time.time() * 1000)
-        current = SidecarSnapshot(published_at_ms=now_ms - 30000)
+        current = _usable_snapshot(published_at_ms=now_ms - 30000)
         freshness = evaluate_snapshot_freshness(
             current,
             max_age_ms=10000,
@@ -83,7 +189,7 @@ class TestSnapshotFreshnessStates:
     def test_missing_snapshot_uses_live_scan_last_good_max_age(self):
         """V1: cached last-good age is governed by live_scan_last_good_max_age_ms."""
         now_ms = int(time.time() * 1000)
-        last_good = SidecarSnapshot(published_at_ms=now_ms - 500000)
+        last_good = _usable_snapshot(published_at_ms=now_ms - 500000)
         freshness = evaluate_snapshot_freshness(
             None,
             max_age_ms=10000,
@@ -96,7 +202,7 @@ class TestSnapshotFreshnessStates:
     def test_stale_market_observation_enters_last_good_fallback(self):
         """V1: fresh file publish with stale market observation is last-good, not fresh."""
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(
+        snapshot = _usable_snapshot(
             published_at_ms=now_ms - 1000,
             market_observed_at_ms=now_ms - 30000,
         )
@@ -110,7 +216,7 @@ class TestSnapshotFreshnessStates:
 
     def test_market_max_age_can_be_stricter_than_snapshot_publish_age(self):
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(
+        snapshot = _usable_snapshot(
             published_at_ms=now_ms - 1000,
             market_observed_at_ms=now_ms - 30000,
         )
@@ -125,7 +231,7 @@ class TestSnapshotFreshnessStates:
 
     def test_degraded_snapshot_with_degraded_venues(self):
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(
+        snapshot = _usable_snapshot(
             published_at_ms=now_ms - 1000,
             degraded_venues=["binance"],
         )
@@ -134,7 +240,7 @@ class TestSnapshotFreshnessStates:
 
     def test_degraded_snapshot_with_missing_health_domains(self):
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(
+        snapshot = _usable_snapshot(
             published_at_ms=now_ms - 1000,
             degraded_domains=["market"],
         )
@@ -144,7 +250,7 @@ class TestSnapshotFreshnessStates:
     def test_fresh_has_highest_priority(self):
         """Fresh takes priority over degraded — no degraded venues or domains means fresh."""
         now_ms = int(time.time() * 1000)
-        snapshot = SidecarSnapshot(published_at_ms=now_ms - 100)
+        snapshot = _usable_snapshot(published_at_ms=now_ms - 100)
         freshness = evaluate_snapshot_freshness(snapshot, max_age_ms=10000, now_ms=now_ms)
         assert freshness == SnapshotFreshness.FRESH
 
@@ -154,6 +260,78 @@ class TestSnapshotFreshnessStates:
         current = SidecarSnapshot(published_at_ms=now_ms - 30000)
         freshness = evaluate_snapshot_freshness(current, max_age_ms=10000, now_ms=now_ms)
         assert freshness == SnapshotFreshness.STALE
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"published_at_ms": 20_001},
+            {"market_observed_at_ms": 20_001},
+            {"candidate_build_observed_at_ms": 20_001},
+        ],
+    )
+    def test_future_snapshot_watermarks_are_never_fresh(self, mutation):
+        values = {"published_at_ms": 20_000, **mutation}
+        snapshot = SidecarSnapshot(**values)
+        last_good = _usable_snapshot(
+            published_at_ms=19_000,
+            market_observed_at_ms=19_000,
+            candidate_build_observed_at_ms=19_000,
+        )
+
+        freshness = evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=10_000,
+            now_ms=20_000,
+            last_good=last_good,
+        )
+
+        assert freshness == SnapshotFreshness.STALE
+
+    def test_unavailable_current_never_uses_last_good_window(self):
+        snapshot = SidecarSnapshot(
+            published_at_ms=1_000,
+            market_observed_at_ms=1_000,
+            candidate_build_observed_at_ms=1_000,
+            acquisition_mode="unavailable",
+            degraded_venues=["binance"],
+        )
+
+        assert evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=100,
+            now_ms=2_000,
+            last_good_max_age_ms=5_000,
+        ) == SnapshotFreshness.DEGRADED
+
+    def test_fresh_age_unavailable_is_still_degraded(self):
+        snapshot = SidecarSnapshot(
+            published_at_ms=1_950,
+            market_observed_at_ms=1_950,
+            candidate_build_observed_at_ms=1_950,
+            acquisition_mode="unavailable",
+            degraded_venues=["binance"],
+        )
+
+        assert evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=100,
+            now_ms=2_000,
+        ) == SnapshotFreshness.DEGRADED
+
+    def test_unavailable_snapshot_is_never_accepted_as_last_good(self):
+        unavailable = SidecarSnapshot(
+            published_at_ms=1_000,
+            acquisition_mode="unavailable",
+            degraded_venues=["binance"],
+        )
+
+        assert evaluate_snapshot_freshness(
+            None,
+            max_age_ms=100,
+            now_ms=2_000,
+            last_good=unavailable,
+            last_good_max_age_ms=5_000,
+        ) == SnapshotFreshness.MISSING
 
 
 # ── OPP-002: Health Domain Diagnostics ─────────────────────────────────────
@@ -197,7 +375,9 @@ class TestHealthDomainDiagnostics:
         lifecycle = SidecarLifecycleState(
             domains={
                 "market": DomainLifecycle(domain="market", observed_at_ms=now_ms, venue_count=3),
-                "transfer": DomainLifecycle(domain="transfer", observed_at_ms=now_ms - 30000, venue_count=2),
+                "transfer": DomainLifecycle(
+                    domain="transfer", observed_at_ms=now_ms - 30000, venue_count=2
+                ),
             },
             degraded_venues=["binance"],
         )
@@ -212,9 +392,13 @@ class TestHealthDomainDiagnostics:
         lifecycle = SidecarLifecycleState(
             domains={
                 "market": DomainLifecycle(domain="market", observed_at_ms=1000000, venue_count=3),
-                "transfer": DomainLifecycle(domain="transfer", observed_at_ms=1000000, venue_count=2),
+                "transfer": DomainLifecycle(
+                    domain="transfer", observed_at_ms=1000000, venue_count=2
+                ),
                 "hint": DomainLifecycle(domain="hint", observed_at_ms=1000000, venue_count=1),
-                "perp_liquidity": DomainLifecycle(domain="perp_liquidity", observed_at_ms=1000000, venue_count=2),
+                "perp_liquidity": DomainLifecycle(
+                    domain="perp_liquidity", observed_at_ms=1000000, venue_count=2
+                ),
             },
         )
         diag = lifecycle.to_dict()
@@ -301,7 +485,9 @@ class TestChillybotRemovalIsExplicit:
         """DEV-001 must be referenced in the approved deviations."""
         deviations_path = (
             Path(__file__).resolve().parent.parent.parent
-            / "docs" / "parity" / "approved_deviations.md"
+            / "docs"
+            / "parity"
+            / "approved_deviations.md"
         )
         text = deviations_path.read_text()
         assert "DEV-001" in text
@@ -321,8 +507,60 @@ class TestSnapshotPersistence:
         original = SidecarSnapshot(
             published_at_ms=now_ms,
             market_observed_at_ms=now_ms - 100,
-            degraded_venues=["gate"],
+            candidate_build_observed_at_ms=now_ms - 50,
+            candidate_build_diagnostics={
+                "input_quote_count": 0,
+                "requested_symbol_count": 1,
+                "requested_symbols": ["BTCUSDT"],
+                "requested_venues": ["gate", "okx"],
+                "directional_pair_count": 0,
+                "output_candidate_count": 0,
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
+            degraded_venues=["gate", "okx"],
             degraded_domains=["transfer"],
+            source_mode="direct_market",
+            acquisition_mode="degraded_sidecar",
+            funding_lifecycle=[
+                FundingLifecycle(
+                    venue=venue,
+                    observed_at_ms=now_ms - 100,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason="funding unavailable",
+                )
+                for venue in ("gate", "okx")
+            ],
+            market_lifecycle=[
+                MarketLifecycle(
+                    venue=venue,
+                    observed_at_ms=now_ms - 100,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason="market unavailable",
+                )
+                for venue in ("gate", "okx")
+            ],
+            liquidity_lifecycle=[
+                LiquidityLifecycle(
+                    venue=venue,
+                    observed_at_ms=now_ms - 100,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason="liquidity unavailable",
+                )
+                for venue in ("gate", "okx")
+            ],
+            transfer_lifecycle=[
+                TransferLifecycle(
+                    from_venue="gate",
+                    to_venue="okx",
+                    observed_at_ms=now_ms - 100,
+                    coverage_usable=0,
+                    degraded_reason="transfer unavailable",
+                )
+            ],
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "snapshot.json")
@@ -330,5 +568,65 @@ class TestSnapshotPersistence:
             loaded = load_snapshot(path)
             assert loaded is not None
             assert loaded.published_at_ms == now_ms
-            assert loaded.degraded_venues == ["gate"]
+            assert loaded.candidate_build_observed_at_ms == now_ms - 50
+            assert loaded.candidate_build_diagnostics == original.candidate_build_diagnostics
+            assert loaded.degraded_venues == ["gate", "okx"]
             assert loaded.degraded_domains == ["transfer"]
+
+    def test_loader_rejects_unknown_schema_and_missing_v4_proof(self, tmp_path):
+        from lightfee.sidecar.publisher import load_snapshot
+
+        unknown = tmp_path / "unknown.json"
+        unknown.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
+        missing_proof = tmp_path / "missing-proof.json"
+        missing_proof.write_text(
+            json.dumps(
+                {
+                    "schema_version": 4,
+                    "published_at_ms": 20_000,
+                    "market_observed_at_ms": 20_000,
+                    "quotes": {
+                        "venue:BTCUSDT": {
+                            "venue": "venue",
+                            "symbol": "BTCUSDT",
+                            "bid": 100.0,
+                            "ask": 101.0,
+                            "observed_at_ms": 20_000,
+                        }
+                    },
+                    "candidates": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        legacy_v3 = tmp_path / "legacy-v3.json"
+        legacy_v3.write_text(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "published_at_ms": 20_000,
+                    "market_observed_at_ms": 20_000,
+                    "quotes": {
+                        "venue:BTCUSDT": {
+                            "venue": "venue",
+                            "symbol": "BTCUSDT",
+                            "bid": 100.0,
+                            "ask": 101.0,
+                            "observed_at_ms": 20_000,
+                        }
+                    },
+                    "candidates": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert load_snapshot(unknown) is None
+        assert load_snapshot(missing_proof) is None
+        loaded_legacy = load_snapshot(legacy_v3)
+        assert loaded_legacy is not None
+        assert loaded_legacy.schema_version == 3
+        assert (
+            loaded_legacy.quotes["venue:BTCUSDT"].min_notional_evidence_complete
+            is False
+        )

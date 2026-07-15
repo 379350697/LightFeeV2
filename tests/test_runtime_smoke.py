@@ -100,7 +100,13 @@ class TestRuntimeLaneScheduling:
         from lightfee.config.schema import RuntimeConfig, PersistenceConfig
         from lightfee.engine.runtime import LiveRuntime
         from lightfee.sidecar.publisher import publish_snapshot
-        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+        from lightfee.sidecar.snapshot import (
+            FundingLifecycle,
+            LiquidityLifecycle,
+            MarketLifecycle,
+            QuoteSnapshot,
+            SidecarSnapshot,
+        )
 
         now_ms = 2_000_000
         config = AppConfig(
@@ -121,6 +127,31 @@ class TestRuntimeLaneScheduling:
             SidecarSnapshot(
                 published_at_ms=now_ms,
                 market_observed_at_ms=now_ms,
+                candidate_build_observed_at_ms=now_ms,
+                candidate_build_diagnostics={
+                    "input_quote_count": 2,
+                    "requested_symbol_count": 1,
+                    "requested_symbols": ["BTCUSDT"],
+                    "requested_venues": ["binance", "okx"],
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                source_mode="direct_market",
+                acquisition_mode="fresh_sidecar",
+                funding_lifecycle=[
+                    FundingLifecycle("binance", now_ms, 1, 1),
+                    FundingLifecycle("okx", now_ms, 1, 1),
+                ],
+                market_lifecycle=[
+                    MarketLifecycle("binance", now_ms, 1, 1),
+                    MarketLifecycle("okx", now_ms, 1, 1),
+                ],
+                liquidity_lifecycle=[
+                    LiquidityLifecycle("binance", now_ms, 1, 1),
+                    LiquidityLifecycle("okx", now_ms, 1, 1),
+                ],
                 quotes={
                     "binance:BTCUSDT": QuoteSnapshot(
                         venue="binance",
@@ -128,7 +159,20 @@ class TestRuntimeLaneScheduling:
                         bid=100.0,
                         ask=101.0,
                         observed_at_ms=now_ms,
-                    )
+                        funding_rate_bps=1.0,
+                        funding_timestamp_ms=now_ms + 28_800_000,
+                        funding_interval_ms=28_800_000,
+                    ),
+                    "okx:BTCUSDT": QuoteSnapshot(
+                        venue="okx",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=now_ms,
+                        funding_rate_bps=-1.0,
+                        funding_timestamp_ms=now_ms + 28_800_000,
+                        funding_interval_ms=28_800_000,
+                    ),
                 },
             ),
             config.runtime.sidecar_snapshot_path,
@@ -168,7 +212,13 @@ class TestRuntimeLaneScheduling:
         from lightfee.config.schema import RuntimeConfig, PersistenceConfig
         from lightfee.engine.runtime import LiveRuntime
         from lightfee.sidecar.publisher import publish_snapshot
-        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+        from lightfee.sidecar.snapshot import (
+            FundingLifecycle,
+            LiquidityLifecycle,
+            MarketLifecycle,
+            QuoteSnapshot,
+            SidecarSnapshot,
+        )
 
         now_ms = 2_000_000
         config = AppConfig(
@@ -189,7 +239,33 @@ class TestRuntimeLaneScheduling:
             SidecarSnapshot(
                 published_at_ms=now_ms,
                 market_observed_at_ms=now_ms,
+                candidate_build_observed_at_ms=now_ms,
+                candidate_build_diagnostics={
+                    "input_quote_count": 1,
+                    "requested_symbol_count": 1,
+                    "requested_symbols": ["BTCUSDT"],
+                    "requested_venues": ["binance"],
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                source_mode="direct_market",
+                acquisition_mode="degraded_sidecar",
                 degraded_domains=["perp_liquidity"],
+                funding_lifecycle=[
+                    FundingLifecycle("binance", now_ms, 1, 1)
+                ],
+                market_lifecycle=[MarketLifecycle("binance", now_ms, 1, 1)],
+                liquidity_lifecycle=[
+                    LiquidityLifecycle(
+                        venue="binance",
+                        observed_at_ms=now_ms,
+                        symbol_count=1,
+                        coverage_usable=0,
+                        degraded_reason="liquidity unavailable",
+                    )
+                ],
                 quotes={
                     "binance:BTCUSDT": QuoteSnapshot(
                         venue="binance",
@@ -197,6 +273,9 @@ class TestRuntimeLaneScheduling:
                         bid=100.0,
                         ask=101.0,
                         observed_at_ms=now_ms,
+                        funding_rate_bps=1.0,
+                        funding_timestamp_ms=now_ms + 28_800_000,
+                        funding_interval_ms=28_800_000,
                     )
                 },
             ),
@@ -669,6 +748,19 @@ class TestRuntimeLaneScheduling:
                     "bid": 50000.0,
                     "ask": 50005.0,
                     "observed_at_ms": now_ms,
+                    "funding_rate_bps": 1.0,
+                    "funding_timestamp_ms": now_ms + 28_800_000,
+                    "funding_interval_ms": 28_800_000,
+                },
+                "OKX:BTCUSDT": {
+                    "venue": "okx",
+                    "symbol": "BTCUSDT",
+                    "bid": 50000.0,
+                    "ask": 50005.0,
+                    "observed_at_ms": now_ms,
+                    "funding_rate_bps": -1.0,
+                    "funding_timestamp_ms": now_ms + 28_800_000,
+                    "funding_interval_ms": 28_800_000,
                 },
             },
             "candidates": [],

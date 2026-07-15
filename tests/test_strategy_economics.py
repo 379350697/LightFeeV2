@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import math
 import json
 from types import SimpleNamespace
@@ -12,7 +13,15 @@ from lightfee.core.domain import EntryLeverageEvidence, Venue
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.sidecar.pairing import build_same_symbol_pairs
-from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
+from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
+from lightfee.sidecar.snapshot import (
+    CandidateInput,
+    FundingLifecycle,
+    LiquidityLifecycle,
+    MarketLifecycle,
+    QuoteSnapshot,
+    SidecarSnapshot,
+)
 from lightfee.strategy.economics import (
     FundingForecast,
     build_edge_breakdown,
@@ -51,6 +60,48 @@ def _candidate(**overrides: object) -> CandidateInput:
     }
     values.update(overrides)
     return CandidateInput(**values)
+
+
+def _verified_fee_provenance_candidate_fields(
+    *, observed_at_ms: int,
+) -> dict[str, object]:
+    document_sha256 = "a" * 64
+    account_hashes = {"cheap": "b" * 64, "rich": "c" * 64}
+    rows = [
+        {
+            "venue": venue,
+            "taker_fee_bps": 1.0,
+            "maker_fee_bps": 1.0,
+            "observed_at_ms": observed_at_ms,
+            "source": "account_fee_api",
+            "evidence_ref": f"test:{venue}",
+            "account_identity_hash": account_hashes[venue],
+            "document_sha256": document_sha256,
+            "integrity_key_id": "lightfee-fee-evidence-v3",
+            "integrity_verified": True,
+        }
+        for venue in ("cheap", "rich")
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            rows,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "long_taker_fee_bps": 1.0,
+        "short_taker_fee_bps": 1.0,
+        "taker_fee_evidence_complete": True,
+        "account_fee_evidence_complete": True,
+        "account_fee_evidence_observed_at_ms": observed_at_ms,
+        "account_fee_evidence_source": "account_fee_api",
+        "account_fee_evidence_fingerprint": fingerprint,
+        "account_fee_evidence_provenance": rows,
+        "economics_observed_at_ms": observed_at_ms,
+    }
 
 
 def test_edge_breakdown_has_one_expected_and_worst_formula() -> None:
@@ -113,7 +164,9 @@ def test_live_funding_selection_uses_v1_depth_risk_priority_before_ranking_tiebr
 
     # V1 orders execution-risk-adjusted priority before it deduplicates a
     # symbol; raw ranking remains the deterministic tie-break only.
-    assert gate._candidate_final_selection_sort_key(lower_edge) < gate._candidate_final_selection_sort_key(higher_edge)
+    assert gate._candidate_final_selection_sort_key(
+        lower_edge
+    ) < gate._candidate_final_selection_sort_key(higher_edge)
 
     tied_higher = SimpleNamespace(
         ranking_edge_bps=12.0,
@@ -128,7 +181,9 @@ def test_live_funding_selection_uses_v1_depth_risk_priority_before_ranking_tiebr
     risk_by_pair.update({"z-higher": 1.0, "a-lower": 0.0})
 
     # Both have priority 6 bps; raw V1 ranking must win before lexical ID.
-    assert gate._candidate_final_selection_sort_key(tied_higher) < gate._candidate_final_selection_sort_key(tied_lower)
+    assert gate._candidate_final_selection_sort_key(
+        tied_higher
+    ) < gate._candidate_final_selection_sort_key(tied_lower)
 
 
 @pytest.mark.parametrize("value", ["true", "false", 1, 0, object()])
@@ -215,13 +270,21 @@ def test_non_finite_economics_fail_closed_before_live_revalidation() -> None:
 def test_non_finite_sidecar_quote_is_excluded_before_funding_candidate_ranking() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=float("nan"), ask=100.4,
-            funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=float("nan"),
+            ask=100.4,
+            funding_rate_bps=8.0,
+            funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
         ),
     }
@@ -232,18 +295,137 @@ def test_non_finite_sidecar_quote_is_excluded_before_funding_candidate_ranking()
 def test_crossed_sidecar_quote_is_excluded_before_funding_candidate_ranking() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=100.1, ask=100.0,
-            funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=100.1,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
         ),
     }
 
     assert build_same_symbol_pairs(quotes, ["BTCUSDT"], observed_at_ms=1) == []
+
+
+@pytest.mark.parametrize("invalid_rate", [None, "bad", float("nan"), float("inf"), True])
+def test_invalid_funding_scalar_rejects_pairs_without_aborting_refresh(
+    invalid_rate: object,
+) -> None:
+    quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=invalid_rate,
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+        ),
+    }
+    diagnostics: dict[str, object] = {}
+
+    assert build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        observed_at_ms=1,
+        diagnostics=diagnostics,
+    ) == []
+    assert diagnostics["directional_pair_count"] == 2
+    assert diagnostics["rejection_counts"] == {"invalid_trade_quote": 2}
+
+
+def test_same_venue_duplicate_quotes_never_form_a_candidate() -> None:
+    quotes = {
+        "binance:BTCUSDT:first": QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=0.0,
+        ),
+        "binance:BTCUSDT:second": QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=10.0,
+        ),
+    }
+    diagnostics: dict[str, object] = {}
+
+    assert build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        observed_at_ms=1,
+        diagnostics=diagnostics,
+    ) == []
+    assert diagnostics["directional_pair_count"] == 0
+    assert diagnostics["output_candidate_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("contract_multiplier", "bad"),
+        ("price_precision", "bad"),
+        ("quantity_precision", "bad"),
+        ("funding_interval_ms", "bad"),
+    ],
+)
+def test_bad_contract_scalar_never_aborts_pair_construction(
+    field: str, invalid_value: object
+) -> None:
+    def quote(venue: str, rate: float) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            venue=venue,
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=100.0,
+            funding_rate_bps=rate,
+            funding_timestamp_ms=1_000,
+            funding_interval_ms=28_800_000,
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
+
+    long_quote = quote("cheap", 1.0)
+    short_quote = quote("rich", 5.0)
+    setattr(long_quote, field, invalid_value)
+
+    candidates = build_same_symbol_pairs(
+        {"cheap:BTCUSDT": long_quote, "rich:BTCUSDT": short_quote},
+        ["BTCUSDT"],
+        observed_at_ms=1,
+    )
+
+    assert not candidates or all(candidate.blocked for candidate in candidates)
 
 
 def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> None:
@@ -254,6 +436,8 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
             bid=99.0,
             ask=100.0,
             funding_rate_bps=1.0,
+            funding_timestamp_ms=2_000,
+            funding_interval_ms=28_800_000,
             observed_at_ms=1_001,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
@@ -262,23 +446,44 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
             bid=100.0,
             ask=101.0,
             funding_rate_bps=5.0,
+            funding_timestamp_ms=2_000,
+            funding_interval_ms=28_800_000,
             observed_at_ms=1_000,
         ),
     }
 
-    assert build_same_symbol_pairs(quotes, ["BTCUSDT"], observed_at_ms=1_000) == []
+    diagnostics: dict[str, object] = {}
+    assert (
+        build_same_symbol_pairs(
+            quotes,
+            ["BTCUSDT"],
+            observed_at_ms=1_000,
+            diagnostics=diagnostics,
+        )
+        == []
+    )
+    assert diagnostics["future_input_quote_count"] == 1
+    assert diagnostics["rejection_counts"] == {"quote_after_candidate_watermark": 1}
 
 
 def test_funding_forecast_worst_case_uses_short_lower_and_long_upper_bounds() -> None:
     long = FundingForecast.from_quote(
-        venue="cheap", symbol="BTCUSDT", quoted_rate_bps=2.0,
-        next_funding_timestamp_ms=1_000, funding_interval_ms=28_800_000,
-        observed_at_ms=1, uncertainty_haircut_bps=1.0,
+        venue="cheap",
+        symbol="BTCUSDT",
+        quoted_rate_bps=2.0,
+        next_funding_timestamp_ms=1_000,
+        funding_interval_ms=28_800_000,
+        observed_at_ms=1,
+        uncertainty_haircut_bps=1.0,
     )
     short = FundingForecast.from_quote(
-        venue="rich", symbol="BTCUSDT", quoted_rate_bps=8.0,
-        next_funding_timestamp_ms=1_000, funding_interval_ms=28_800_000,
-        observed_at_ms=1, uncertainty_haircut_bps=1.0,
+        venue="rich",
+        symbol="BTCUSDT",
+        quoted_rate_bps=8.0,
+        next_funding_timestamp_ms=1_000,
+        funding_interval_ms=28_800_000,
+        observed_at_ms=1,
+        uncertainty_haircut_bps=1.0,
     )
 
     expected, worst = conservative_funding_edge_bps(long_forecast=long, short_forecast=short)
@@ -356,10 +561,15 @@ def test_nonfinite_predicted_funding_cannot_pass_enhanced_forecast_confidence() 
 def test_funding_calibrator_uses_only_advanced_settlement_evidence(tmp_path) -> None:
     calibrator = FundingForecastCalibrator(tmp_path / "forecast.json")
     first = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=5.0, funding_timestamp_ms=1_000,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=5.0,
+        funding_timestamp_ms=1_000,
         funding_interval_ms=1_000,
-        settled_funding_rate_bps=1.0, observed_at_ms=100,
+        settled_funding_rate_bps=1.0,
+        observed_at_ms=100,
     )
     # The same next timestamp is not a settlement transition, even if a
     # public endpoint repeats a last-funding field.
@@ -368,10 +578,15 @@ def test_funding_calibrator_uses_only_advanced_settlement_evidence(tmp_path) -> 
     assert first.funding_forecast_started_at_ms == 100
 
     advanced = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=2_000,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=2_000,
         funding_interval_ms=1_000,
-        settled_funding_rate_bps=2.0, observed_at_ms=1_100,
+        settled_funding_rate_bps=2.0,
+        observed_at_ms=1_100,
     )
     calibrator.apply({"binance:BTCUSDT": advanced}, now_ms=1_100)
     assert advanced.funding_forecast_sample_count == 1
@@ -380,11 +595,16 @@ def test_funding_calibrator_uses_only_advanced_settlement_evidence(tmp_path) -> 
     # Current-rate forecasts become usable only when an explicit configured
     # sample threshold has been met; no next-rate field is required.
     forecast = FundingForecast.from_quote(
-        venue="binance", symbol="BTCUSDT", quoted_rate_bps=6.0,
-        next_funding_timestamp_ms=2_000, funding_interval_ms=28_800_000,
+        venue="binance",
+        symbol="BTCUSDT",
+        quoted_rate_bps=6.0,
+        next_funding_timestamp_ms=2_000,
+        funding_interval_ms=28_800_000,
         observed_at_ms=1_100,
         uncertainty_haircut_bps=advanced.funding_forecast_uncertainty_bps,
-        sample_count=1, min_samples=1, source="quoted_rate",
+        sample_count=1,
+        min_samples=1,
+        source="quoted_rate",
     )
     assert forecast.confidence == 1.0
     assert forecast.lower_bound_bps == pytest.approx(3.0)
@@ -393,9 +613,14 @@ def test_funding_calibrator_uses_only_advanced_settlement_evidence(tmp_path) -> 
 def test_funding_calibrator_ignores_future_timestamp_settlement_evidence(tmp_path) -> None:
     calibrator = FundingForecastCalibrator(tmp_path / "forecast.json")
     future = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=2_000,
-        funding_interval_ms=1_000, settled_funding_rate_bps=2.0,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=2_000,
+        funding_interval_ms=1_000,
+        settled_funding_rate_bps=2.0,
         observed_at_ms=101,
     )
 
@@ -408,14 +633,56 @@ def test_funding_calibrator_ignores_future_timestamp_settlement_evidence(tmp_pat
     assert not calibrator._errors.get("binance:BTCUSDT")
 
 
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("observed_at_ms", "bad"),
+        ("funding_timestamp_ms", "bad"),
+        ("funding_interval_ms", "bad"),
+        ("funding_rate_bps", "bad"),
+        ("predicted_funding_rate_bps", "bad"),
+        ("settled_funding_rate_bps", "bad"),
+    ],
+)
+def test_funding_calibrator_rejects_bad_quote_scalar_without_state_pollution(
+    tmp_path, field, invalid_value
+) -> None:
+    calibrator = FundingForecastCalibrator(tmp_path / "forecast.json")
+    quote = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=5.0,
+        funding_timestamp_ms=1_000,
+        funding_interval_ms=1_000,
+        observed_at_ms=100,
+    )
+    setattr(quote, field, invalid_value)
+
+    calibrator.prime({"binance:BTCUSDT": quote})
+    calibrator.apply({"binance:BTCUSDT": quote}, now_ms=100)
+
+    assert quote.funding_forecast_sample_count == 0
+    assert quote.funding_forecast_distribution_stable is False
+    assert quote.funding_forecast_stability_reason == "invalid_funding_evidence"
+    assert "binance:BTCUSDT" not in calibrator._pending
+    assert not calibrator._errors.get("binance:BTCUSDT")
+
+
 def test_funding_calibrator_rejects_advanced_schedule_before_settlement_time(tmp_path) -> None:
     calibrator = FundingForecastCalibrator(tmp_path / "forecast.json")
     calibrator.apply(
         {
             "binance:BTCUSDT": QuoteSnapshot(
-                venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-                funding_rate_bps=5.0, funding_timestamp_ms=1_000,
-                funding_interval_ms=1_000, observed_at_ms=100,
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=99.0,
+                ask=100.0,
+                funding_rate_bps=5.0,
+                funding_timestamp_ms=1_000,
+                funding_interval_ms=1_000,
+                observed_at_ms=100,
             )
         },
         now_ms=100,
@@ -425,9 +692,14 @@ def test_funding_calibrator_rejects_advanced_schedule_before_settlement_time(tmp
     # timestamp is still before the prior settlement.  This is not a settled
     # funding fact and cannot earn calibration credit.
     premature = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=2_000,
-        funding_interval_ms=1_000, settled_funding_rate_bps=2.0,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=2_000,
+        funding_interval_ms=1_000,
+        settled_funding_rate_bps=2.0,
         observed_at_ms=900,
     )
     calibrator.apply({"binance:BTCUSDT": premature}, now_ms=900)
@@ -441,17 +713,27 @@ def test_funding_calibrator_does_not_misallocate_a_multi_interval_gap(tmp_path) 
     calibrator.apply(
         {
             "binance:BTCUSDT": QuoteSnapshot(
-                venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-                funding_rate_bps=5.0, funding_timestamp_ms=1_000,
-                funding_interval_ms=1_000, observed_at_ms=100,
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=99.0,
+                ask=100.0,
+                funding_rate_bps=5.0,
+                funding_timestamp_ms=1_000,
+                funding_interval_ms=1_000,
+                observed_at_ms=100,
             )
         },
         now_ms=100,
     )
     after_outage = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=3_000,
-        funding_interval_ms=1_000, settled_funding_rate_bps=2.0,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=3_000,
+        funding_interval_ms=1_000,
+        settled_funding_rate_bps=2.0,
         observed_at_ms=2_100,
     )
 
@@ -478,9 +760,14 @@ def test_funding_calibrator_requires_stable_recent_error_distribution(tmp_path) 
         (6_000, 1.0),
     ]
     stable = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=7_000,
-        funding_interval_ms=1_000, observed_at_ms=6_000,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=7_000,
+        funding_interval_ms=1_000,
+        observed_at_ms=6_000,
     )
     calibrator.apply({key: stable}, now_ms=6_000)
 
@@ -499,9 +786,14 @@ def test_funding_calibrator_requires_stable_recent_error_distribution(tmp_path) 
         (6_000, 5.0),
     ]
     unstable = QuoteSnapshot(
-        venue="binance", symbol="BTCUSDT", bid=99.0, ask=100.0,
-        funding_rate_bps=6.0, funding_timestamp_ms=8_000,
-        funding_interval_ms=1_000, observed_at_ms=6_000,
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        funding_rate_bps=6.0,
+        funding_timestamp_ms=8_000,
+        funding_interval_ms=1_000,
+        observed_at_ms=6_000,
     )
     calibrator.apply({key: unstable}, now_ms=6_000)
 
@@ -513,25 +805,57 @@ def test_funding_calibrator_requires_stable_recent_error_distribution(tmp_path) 
 def test_v1_and_shadow_keep_quoted_funding_gate_until_enhanced_live_is_calibrated() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, predicted_funding_rate_bps=1.0,
-            funding_timestamp_ms=1_000_000, funding_interval_ms=28_800_000,
-            ask_size=10.0, funding_forecast_sample_count=100,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            predicted_funding_rate_bps=1.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
+            funding_forecast_sample_count=100,
             funding_forecast_distribution_stable=True,
-            underlying="BTC", quote_currency="USDT", contract_type="linear",
-            contract_multiplier=1.0, mark_index_source="venue_mark_and_index",
-            price_precision=2, quantity_precision=3, venue_status="active",
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_and_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
             contract_normalization_complete=True,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, predicted_funding_rate_bps=20.0,
-            funding_timestamp_ms=1_000_000, funding_interval_ms=28_800_000,
-            bid_size=10.0, funding_forecast_sample_count=100,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            predicted_funding_rate_bps=20.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
+            funding_forecast_sample_count=100,
             funding_forecast_distribution_stable=True,
-            underlying="BTC", quote_currency="USDT", contract_type="linear",
-            contract_multiplier=1.0, mark_index_source="venue_mark_and_index",
-            price_precision=2, quantity_precision=3, venue_status="active",
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_and_index",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
             contract_normalization_complete=True,
         ),
     }
@@ -617,17 +941,32 @@ def test_enhanced_live_discovers_a_direction_reversed_by_calibrated_forecast() -
         "mark_index_source": "venue_mark_and_index",
         "price_precision": 2,
         "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
         "venue_status": "active",
         "contract_normalization_complete": True,
     }
     quotes = {
         "a:BTCUSDT": QuoteSnapshot(
-            venue="a", bid=99.9, ask=100.0, ask_size=10.0,
-            funding_rate_bps=8.0, predicted_funding_rate_bps=1.0, **common,
+            venue="a",
+            bid=99.9,
+            ask=100.0,
+            ask_size=10.0,
+            funding_rate_bps=8.0,
+            predicted_funding_rate_bps=1.0,
+            **common,
         ),
         "b:BTCUSDT": QuoteSnapshot(
-            venue="b", bid=100.2, ask=100.3, bid_size=10.0,
-            funding_rate_bps=1.0, predicted_funding_rate_bps=10.0, **common,
+            venue="b",
+            bid=100.2,
+            ask=100.3,
+            bid_size=10.0,
+            funding_rate_bps=1.0,
+            predicted_funding_rate_bps=10.0,
+            **common,
         ),
     }
     enhanced = StrategyConfig(
@@ -649,9 +988,7 @@ def test_enhanced_live_discovers_a_direction_reversed_by_calibrated_forecast() -
     )
 
     assert not any(c.long_venue == "a" and c.short_venue == "b" for c in legacy)
-    reversed_direction = next(
-        c for c in candidates if c.long_venue == "a" and c.short_venue == "b"
-    )
+    reversed_direction = next(c for c in candidates if c.long_venue == "a" and c.short_venue == "b")
     assert reversed_direction.funding_edge_bps == pytest.approx(9.0)
     assert reversed_direction.economics_complete is True
 
@@ -676,29 +1013,59 @@ def test_enhanced_live_requires_the_configured_shadow_duration() -> None:
     now_ms = 8 * 24 * 60 * 60 * 1000
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, predicted_funding_rate_bps=1.0,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            predicted_funding_rate_bps=1.0,
             funding_timestamp_ms=now_ms + 1_000_000,
-            funding_interval_ms=28_800_000, ask_size=10.0,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
             funding_forecast_sample_count=100,
             funding_forecast_started_at_ms=now_ms - 6 * 24 * 60 * 60 * 1000,
             funding_forecast_distribution_stable=True,
-            underlying="BTC", quote_currency="USDT", contract_type="linear",
-            contract_multiplier=1.0, mark_index_source="venue_mark_and_index",
-            price_precision=2, quantity_precision=3, venue_status="active",
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_and_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
             contract_normalization_complete=True,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, predicted_funding_rate_bps=20.0,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            predicted_funding_rate_bps=20.0,
             funding_timestamp_ms=now_ms + 1_000_000,
-            funding_interval_ms=28_800_000, bid_size=10.0,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
             funding_forecast_sample_count=100,
             funding_forecast_started_at_ms=now_ms - 6 * 24 * 60 * 60 * 1000,
             funding_forecast_distribution_stable=True,
-            underlying="BTC", quote_currency="USDT", contract_type="linear",
-            contract_multiplier=1.0, mark_index_source="venue_mark_and_index",
-            price_precision=2, quantity_precision=3, venue_status="active",
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_and_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
             contract_normalization_complete=True,
         ),
     }
@@ -736,16 +1103,28 @@ def test_enhanced_live_requires_the_configured_shadow_duration() -> None:
 def test_every_funding_mode_blocks_unproven_common_base_contracts() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, predicted_funding_rate_bps=1.0,
-            funding_timestamp_ms=1_000_000, funding_interval_ms=28_800_000,
-            ask_size=10.0, funding_forecast_sample_count=100,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            predicted_funding_rate_bps=1.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
+            funding_forecast_sample_count=100,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, predicted_funding_rate_bps=20.0,
-            funding_timestamp_ms=1_000_000, funding_interval_ms=28_800_000,
-            bid_size=10.0, funding_forecast_sample_count=100,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            predicted_funding_rate_bps=20.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
+            funding_forecast_sample_count=100,
         ),
     }
 
@@ -786,16 +1165,29 @@ def test_funding_contract_normalization_requires_literal_boolean_true() -> None:
         "mark_index_source": "venue_mark_and_index",
         "price_precision": 2,
         "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
         "venue_status": "active",
     }
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", bid=99.9, ask=100.0, funding_rate_bps=2.0,
-            contract_normalization_complete="false", **common,
+            venue="cheap",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            contract_normalization_complete="false",
+            **common,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", bid=100.3, ask=100.4, funding_rate_bps=8.0,
-            contract_normalization_complete=True, **common,
+            venue="rich",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            contract_normalization_complete=True,
+            **common,
         ),
     }
 
@@ -807,8 +1199,8 @@ def test_funding_contract_normalization_requires_literal_boolean_true() -> None:
     assert "long_contract_normalization_incomplete" in candidate.blocked_reasons
 
 
-def test_v1_candidate_economics_preserve_passive_maker_fee_cross_and_impact_semantics() -> None:
-    """Sidecar scoring must match the V1 directed-pair formula term by term."""
+def test_passive_candidate_credits_spread_but_not_unverified_maker_discount() -> None:
+    """Passive scoring keeps V1 price impact but floors fees at two takers."""
     common = {
         "symbol": "BTCUSDT",
         "funding_timestamp_ms": 1_000_000,
@@ -820,17 +1212,32 @@ def test_v1_candidate_economics_preserve_passive_maker_fee_cross_and_impact_sema
         "mark_index_source": "venue_mark_and_index",
         "price_precision": 2,
         "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
         "venue_status": "active",
         "contract_normalization_complete": True,
     }
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", bid=99.0, ask=100.0, bid_size=1.0, ask_size=10.0,
-            funding_rate_bps=2.0, **common,
+            venue="cheap",
+            bid=99.0,
+            ask=100.0,
+            bid_size=1.0,
+            ask_size=10.0,
+            funding_rate_bps=2.0,
+            **common,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", bid=102.0, ask=104.0, bid_size=10.0, ask_size=1.0,
-            funding_rate_bps=12.0, **common,
+            venue="rich",
+            bid=102.0,
+            ask=104.0,
+            bid_size=10.0,
+            ask_size=1.0,
+            funding_rate_bps=12.0,
+            **common,
         ),
     }
     config = StrategyConfig(
@@ -852,13 +1259,14 @@ def test_v1_candidate_economics_preserve_passive_maker_fee_cross_and_impact_sema
         observed_at_ms=10,
     )[0]
 
-    # V1 selects the leg with greater taker impact as maker; the lower fee on
-    # that leg, one recovered spread, and only the opposite-leg impact must
-    # all be reflected exactly once.
+    # V1 selects the leg with greater taker impact as maker.  Spread recovery
+    # and the opposite-leg impact remain executable, but a static maker tier
+    # cannot authenticate its own snapshot provenance, so it may not create
+    # alpha and the fee stays at the conservative two-taker floor.
     assert passive.entry_maker_leg == "short"
     assert passive.exit_maker_leg == "short"
-    assert passive.entry_fee_bps == pytest.approx(6.0)
-    assert passive.exit_fee_bps == pytest.approx(6.0)
+    assert passive.entry_fee_bps == pytest.approx(12.0)
+    assert passive.exit_fee_bps == pytest.approx(12.0)
     assert passive.entry_slippage_bps == pytest.approx(passive.long_entry_slippage_bps)
     assert passive.exit_slippage_bps == pytest.approx(passive.long_exit_slippage_bps)
     raw_cross_bps = (102.0 - 100.0) / 101.0 * 10_000.0
@@ -904,16 +1312,28 @@ def test_v1_candidate_economics_preserve_passive_maker_fee_cross_and_impact_sema
 def test_staggered_candidate_is_admitted_on_first_settlement_not_total_carry() -> None:
     quotes = {
         "binance:BTCUSDT": QuoteSnapshot(
-            venue="binance", symbol="BTCUSDT", bid=99.9, ask=100.0,
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
             # Long receives 12 bps first; the later short settlement pays
             # 8 bps.  Its carry is incremental, not first-stage income.
-        funding_rate_bps=-12.0, funding_timestamp_ms=1_000_000,
-        funding_interval_ms=28_800_000, bid_size=10.0, ask_size=10.0,
+            funding_rate_bps=-12.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
+            ask_size=10.0,
         ),
         "okx:BTCUSDT": QuoteSnapshot(
-            venue="okx", symbol="BTCUSDT", bid=100.4, ask=100.5,
-        funding_rate_bps=-8.0, funding_timestamp_ms=1_060_001,
-        funding_interval_ms=28_800_000, bid_size=10.0, ask_size=10.0,
+            venue="okx",
+            symbol="BTCUSDT",
+            bid=100.4,
+            ask=100.5,
+            funding_rate_bps=-8.0,
+            funding_timestamp_ms=1_060_001,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
+            ask_size=10.0,
         ),
     }
 
@@ -929,23 +1349,31 @@ def test_staggered_candidate_is_admitted_on_first_settlement_not_total_carry() -
     assert candidate.second_stage_incremental_funding_edge_bps == pytest.approx(-8.0)
     # The entry expected edge is based on the 12 bps first-stage receipt, not
     # the lower total that only exists if a later-stage hold is chosen.
-    assert candidate.expected_edge_bps == pytest.approx(
-        candidate.first_stage_expected_edge_bps
-    )
+    assert candidate.expected_edge_bps == pytest.approx(candidate.first_stage_expected_edge_bps)
     assert candidate.expected_edge_bps > candidate.total_funding_edge_bps
 
 
 def test_funding_candidate_fails_closed_without_explicit_taker_fee_evidence() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000, ask_size=10.0,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000, bid_size=10.0,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
         ),
     }
 
@@ -969,14 +1397,24 @@ def test_funding_candidate_fails_closed_without_explicit_taker_fee_evidence() ->
 def test_funding_candidate_rejects_boolean_taker_fee_evidence() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", symbol="BTCUSDT", bid=99.9, ask=100.0,
-            funding_rate_bps=2.0, funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000, ask_size=10.0,
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
         ),
         "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", symbol="BTCUSDT", bid=100.3, ask=100.4,
-            funding_rate_bps=8.0, funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000, bid_size=10.0,
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
         ),
     }
 
@@ -991,6 +1429,90 @@ def test_funding_candidate_rejects_boolean_taker_fee_evidence() -> None:
     assert candidate.economics_complete is False
     assert candidate.taker_fee_evidence_complete is False
     assert "missing_taker_fee_evidence" in candidate.blocked_reasons
+
+
+def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    evidence_path = tmp_path / "pairing-account-fees.json"
+    raw_evidence = {
+        "schema_version": 3,
+        "venues": {
+            venue: {
+                "taker_fee_bps": 1.0,
+                "maker_fee_bps": 0.5,
+                "observed_at_ms": 1_000,
+                "source": "account_fee_api",
+                "evidence_ref": f"pairing:{venue}",
+                "account_identity_hash": identity_hash,
+            }
+            for venue, identity_hash in {
+                "cheap": "a" * 64,
+                "rich": "b" * 64,
+            }.items()
+        },
+        "integrity": {
+            "algorithm": "hmac-sha256",
+            "key_id": "lightfee-fee-evidence-v3",
+            "signature": "",
+        },
+    }
+    monkeypatch.setenv("LIGHTFEE_FEE_EVIDENCE_HMAC_KEY", "pairing-secret")
+    evidence_path.write_text(
+        json.dumps(sign_fee_evidence_payload(raw_evidence, "pairing-secret")),
+        encoding="utf-8",
+    )
+    evidence = load_fee_evidence(evidence_path, now_ms=1_100, max_age_ms=10_000)
+    quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=2.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            ask_size=10.0,
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.3,
+            ask=100.4,
+            funding_rate_bps=8.0,
+            funding_timestamp_ms=1_000_000,
+            funding_interval_ms=28_800_000,
+            bid_size=10.0,
+        ),
+    }
+    common = {
+        "strategy": StrategyConfig(),
+        "venue_fee_bps": {"cheap": 1.0, "rich": 1.0},
+        "venue_maker_fee_bps": {"cheap": 0.5, "rich": 0.5},
+        "fee_evidence": evidence,
+        "observed_at_ms": 1_100,
+    }
+
+    matching = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        expected_fee_identity_hashes={"cheap": "a" * 64, "rich": "b" * 64},
+        **common,
+    )[0]
+    mismatching = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        expected_fee_identity_hashes={"cheap": "c" * 64, "rich": "b" * 64},
+        **common,
+    )[0]
+
+    assert matching.account_fee_evidence_complete is True
+    assert matching.account_fee_evidence_provenance == evidence.provenance_for(
+        "cheap", "rich"
+    )
+    assert mismatching.account_fee_evidence_complete is False
+    assert "account_fee_account_identity_mismatch" in mismatching.blocked_reasons
 
 
 def test_risk_allocator_returns_one_common_base_quantity_and_falls_back_on_missing_margin() -> None:
@@ -1038,9 +1560,7 @@ def test_live_final_entry_revalidation_fails_closed_without_complete_economics()
     runtime = EntryDispatchRuntime(
         SimpleNamespace(
             config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
-            journal=SimpleNamespace(
-                append=lambda kind, payload: events.append((kind, payload))
-            ),
+            journal=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
             _candidate_pair_id=lambda _candidate: "binance:bybit:BTCUSDT",
         )
     )
@@ -1084,7 +1604,9 @@ def test_live_final_entry_revalidation_fails_closed_without_complete_economics()
 
 
 @pytest.mark.asyncio
-async def test_live_margin_sizing_uses_conservative_one_x_until_effective_leverage_is_proven() -> None:
+async def test_live_margin_sizing_uses_conservative_one_x_until_effective_leverage_is_proven() -> (
+    None
+):
     events: list[tuple[str, dict]] = []
 
     async def margin_evidence(_venue: Venue, _now_ms: int) -> dict:
@@ -1099,9 +1621,7 @@ async def test_live_margin_sizing_uses_conservative_one_x_until_effective_levera
                     funding_missing_margin_fallback_notional_quote=0.0,
                 )
             ),
-            journal=SimpleNamespace(
-                append=lambda kind, payload: events.append((kind, payload))
-            ),
+            journal=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
             _candidate_pair_id=lambda _candidate: "binance:aster:BTCUSDT",
             _funding_entry_margin_evidence=margin_evidence,
         )
@@ -1143,9 +1663,7 @@ async def test_live_margin_sizing_rejects_truthy_non_boolean_evidence() -> None:
                     funding_missing_margin_fallback_notional_quote=0.0,
                 )
             ),
-            journal=SimpleNamespace(
-                append=lambda kind, payload: events.append((kind, payload))
-            ),
+            journal=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
             _candidate_pair_id=lambda _candidate: "binance:aster:BTCUSDT",
             _funding_entry_margin_evidence=margin_evidence,
         )
@@ -1166,9 +1684,7 @@ async def test_live_margin_sizing_rejects_truthy_non_boolean_evidence() -> None:
 
     assert result is None
     payload = next(
-        payload
-        for kind, payload in events
-        if kind == "runtime.entry_margin_sizing_blocked"
+        payload for kind, payload in events if kind == "runtime.entry_margin_sizing_blocked"
     )
     assert payload["margin_evidence_complete"] is False
 
@@ -1189,9 +1705,7 @@ async def test_live_margin_sizing_uses_minimum_verified_effective_leverage_for_b
                     funding_missing_margin_fallback_notional_quote=0.0,
                 )
             ),
-            journal=SimpleNamespace(
-                append=lambda kind, payload: events.append((kind, payload))
-            ),
+            journal=SimpleNamespace(append=lambda kind, payload: events.append((kind, payload))),
             _candidate_pair_id=lambda _candidate: "binance:aster:BTCUSDT",
             _funding_entry_margin_evidence=margin_evidence,
         )
@@ -1417,7 +1931,9 @@ def test_post_first_fill_fee_lookup_refuses_unknown_or_nonfinite_venue_evidence(
     assert revalidator.taker_fee_bps_for_venue("cheap", [known]) == pytest.approx(2.0)
     assert revalidator.taker_fee_bps_for_venue("missing", [known]) is None
     assert revalidator.taker_fee_bps_for_venue("broken", [malformed]) is None
-    assert revalidator.taker_fee_quote(price=100.0, quantity=0.1, fee_bps=2.0) == pytest.approx(0.002)
+    assert revalidator.taker_fee_quote(price=100.0, quantity=0.1, fee_bps=2.0) == pytest.approx(
+        0.002
+    )
 
 
 def test_risk_allocator_enforces_portfolio_venue_symbol_and_settlement_limits() -> None:
@@ -1547,9 +2063,7 @@ def test_risk_allocator_uses_each_open_position_entry_es_or_blocks() -> None:
         open_positions=[SimpleNamespace(**base_position)], **common
     )
     complete = allocator.assess_portfolio_admission(
-        open_positions=[
-            SimpleNamespace(**base_position, expected_shortfall_bps_entry=50.0)
-        ],
+        open_positions=[SimpleNamespace(**base_position, expected_shortfall_bps_entry=50.0)],
         **common,
     )
 
@@ -1604,6 +2118,7 @@ def test_final_revalidation_prices_the_selected_passive_leg_and_only_hedge_vwap(
         entry_fee_bps=2.0,
         entry_slippage_bps=3.0,
         entry_target_quantity=1.0,
+        **_verified_fee_provenance_candidate_fields(observed_at_ms=10),
     )
 
     decision = FundingEntryRevalidator().revalidate_before_first_leg(
@@ -1667,6 +2182,7 @@ def test_standard_fallback_revalidates_with_four_taker_costs() -> None:
     assert decision.long_entry_price == pytest.approx(101.0)
     assert decision.short_entry_price == pytest.approx(101.0)
     assert decision.edge.entry_fee_bps == pytest.approx(7.0)
+    assert decision.edge.exit_fee_bps == pytest.approx(7.0)
     assert decision.edge.entry_slippage_bps == 0.0
 
 
@@ -1766,7 +2282,9 @@ def test_final_entry_revalidation_treats_truthy_passive_override_as_standard_ioc
     assert decision.edge.entry_fee_bps == pytest.approx(7.0)
 
 
-def test_final_entry_revalidation_preserves_worst_case_and_filled_first_leg_never_abandons_risk() -> None:
+def test_final_entry_revalidation_preserves_worst_case_and_filled_first_leg_never_abandons_risk() -> (
+    None
+):
     candidate = _candidate()
     config = StrategyConfig(min_expected_edge_bps=1.0, min_worst_case_edge_bps=0.0)
     revalidator = FundingEntryRevalidator()
@@ -1891,6 +2409,111 @@ def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monke
         account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
     )
 
+    # Production consumes the candidate only after the sidecar JSON boundary.
+    # Provenance is an untrusted assertion at this point; the final canary gate
+    # below independently reloads and verifies the signed local evidence.
+    snapshot_path = tmp_path / "sidecar.json"
+    snapshot = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        candidate_build_observed_at_ms=1_000,
+        candidate_build_diagnostics={
+            "input_quote_count": 2,
+            "requested_symbol_count": 1,
+            "requested_symbols": ["BTCUSDT"],
+            "requested_venues": ["cheap", "rich"],
+            "directional_pair_count": 1,
+            "output_candidate_count": 1,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+        },
+        source_mode="direct_market",
+        acquisition_mode="fresh_sidecar",
+        funding_lifecycle=[
+            FundingLifecycle(
+                venue=venue,
+                observed_at_ms=1_000,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("cheap", "rich")
+        ],
+        market_lifecycle=[
+            MarketLifecycle(
+                venue=venue,
+                observed_at_ms=1_000,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("cheap", "rich")
+        ],
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue=venue,
+                observed_at_ms=1_000,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("cheap", "rich")
+        ],
+        quotes={
+            f"{venue}:BTCUSDT": QuoteSnapshot(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=100.1,
+                observed_at_ms=1_000,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=1_000_000,
+                funding_interval_ms=28_800_000,
+                underlying="BTC",
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="venue_index",
+                price_precision=1,
+                quantity_precision=3,
+                price_tick=0.1,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+            for venue in ("cheap", "rich")
+        },
+        # This test isolates the final canary trust boundary.  Marking the
+        # synthetic candidate diagnostic-only avoids pretending its hand-built
+        # economics came from the production pairing formula.
+        candidates=[
+            replace(
+                candidate,
+                blocked=True,
+                blocked_reasons=["synthetic_round_trip_fixture"],
+                economics_complete=False,
+                economics_incomplete_reason="synthetic_round_trip_fixture",
+                funding_timestamp_ms=1_000_000,
+                first_funding_timestamp_ms=1_000_000,
+                long_funding_timestamp_ms=1_000_000,
+                short_funding_timestamp_ms=1_000_000,
+            )
+        ],
+    )
+    publish_snapshot(snapshot, snapshot_path)
+    loaded_snapshot = load_snapshot(snapshot_path)
+    assert loaded_snapshot is not None
+    candidate = loaded_snapshot.candidates[0]
+    assert candidate.account_fee_evidence_complete is True
+    assert candidate.account_fee_evidence_observed_at_ms == 1_000
+    assert candidate.account_fee_evidence_source == "account_fee_api"
+    assert candidate.account_fee_evidence_fingerprint == evidence.fingerprint_for(
+        "cheap", "rich"
+    )
+    assert candidate.account_fee_evidence_provenance == evidence.provenance_for(
+        "cheap", "rich"
+    )
+
     assert dispatch._funding_canary_admission_reason(candidate, 1_100) == ""
     stale_candidate = replace(candidate, account_fee_evidence_observed_at_ms=999)
     assert (
@@ -1904,9 +2527,7 @@ def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monke
         exit_fee_bps=0.1,
     )
     assert (
-        dispatch._funding_canary_admission_reason(
-            understated_passive_candidate, 1_100
-        )
+        dispatch._funding_canary_admission_reason(understated_passive_candidate, 1_100)
         == "funding_canary_fee_cost_understated"
     )
 
@@ -1992,6 +2613,5 @@ def test_funding_canary_runtime_defense_blocks_live_bypass_before_economics() ->
     )
 
     assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
-        == "funding_canary_required"
+        dispatch._funding_canary_admission_reason(_candidate(), 1_000) == "funding_canary_required"
     )

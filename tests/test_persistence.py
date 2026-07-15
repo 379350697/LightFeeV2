@@ -78,6 +78,120 @@ class TestJournal:
                 },
             ]
 
+    def test_committed_batch_is_durable_and_replayable(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "committed-batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+
+            sequences = journal.append_committed_batch(
+                [
+                    ("opportunity.paper_registered", {"paper_id": "one"}),
+                    ("opportunity.paper_closed", {"paper_id": "one"}),
+                ],
+                ts_ms=1_234,
+            )
+            journal.close()
+
+            records, intact = journal.read_committed_batches_with_integrity()
+            assert intact is True
+            assert sequences == [2, 3]
+            assert [record["kind"] for record in records] == [
+                "journal.batch_begin",
+                "opportunity.paper_registered",
+                "opportunity.paper_closed",
+                "journal.batch_commit",
+            ]
+
+    def test_uncommitted_batch_prefix_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "partial-batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+            events = [("opportunity.paper_registered", {"paper_id": "one"})]
+            envelope = journal._build_batch_envelope(
+                events,
+                batch_id="partial",
+            )
+            journal.append("journal.batch_begin", envelope, ts_ms=1_234)
+            journal.append_many(events, ts_ms=1_234)
+            journal.close()
+
+            records, intact = journal.read_committed_batches_with_integrity()
+            assert records == []
+            assert intact is False
+
+    def test_committed_batch_digest_mismatch_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "tampered-batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+            journal.append_committed_batch(
+                [("opportunity.paper_registered", {"paper_id": "one"})],
+                ts_ms=1_234,
+            )
+            journal.close()
+            lines = path.read_text(encoding="utf-8").splitlines()
+            event = json.loads(lines[1])
+            event["payload"]["paper_id"] = "tampered"
+            lines[1] = json.dumps(event)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            records, intact = journal.read_committed_batches_with_integrity()
+            assert records == []
+            assert intact is False
+
+    def test_deleting_a_complete_middle_batch_breaks_cumulative_chain(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "deleted-middle-batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+            for paper_id in ("one", "two", "three"):
+                journal.append_committed_batch(
+                    [("opportunity.paper_registered", {"paper_id": paper_id})],
+                    ts_ms=1_234,
+                    purpose="spread_paper_events",
+                )
+            journal.close()
+
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            middle_batch_id = records[3]["payload"]["batch_id"]
+            surviving = [
+                record
+                for record in records
+                if record.get("payload", {}).get("batch_id") != middle_batch_id
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in surviving),
+                encoding="utf-8",
+            )
+
+            replayed, intact = journal.read_committed_batches_with_integrity()
+            assert replayed == []
+            assert intact is False
+
+    def test_committed_batch_reader_rejects_oversized_file_before_replay(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "oversized-batch.jsonl"
+            journal = Journal(path)
+            journal.open()
+            journal.append_committed_batch(
+                [("opportunity.paper_registered", {"paper_id": "one"})],
+                ts_ms=1_234,
+            )
+            journal.close()
+
+            replayed, intact = journal.read_committed_batches_with_integrity(
+                max_bytes=path.stat().st_size - 1,
+            )
+
+            assert replayed == []
+            assert intact is False
+
     def test_has_run_id(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "test.jsonl"
@@ -94,7 +208,9 @@ class TestJournal:
             # lightfee-{ts_ms}-{pid}
             assert len(parts) >= 3, f"run_id '{j.run_id}' should be lightfee-{{ts_ms}}-{{pid}}"
             assert parts[0] == "lightfee"
-            assert parts[1].isdigit(), f"timestamp part of run_id should be digits, got '{parts[1]}'"
+            assert parts[1].isdigit(), (
+                f"timestamp part of run_id should be digits, got '{parts[1]}'"
+            )
             assert parts[2].isdigit(), f"pid part of run_id should be digits, got '{parts[2]}'"
 
     def test_seq_starts_at_1(self):
@@ -167,9 +283,7 @@ class TestJournal:
                 if not candidate.exists():
                     continue
                 records.extend(
-                    json.loads(line)
-                    for line in candidate.read_text().splitlines()
-                    if line.strip()
+                    json.loads(line) for line in candidate.read_text().splitlines() if line.strip()
                 )
             assert [record["seq"] for record in records] == list(range(1, len(records) + 1))
 
@@ -244,7 +358,9 @@ class TestSqliteStore:
             path = Path(td) / "test.sqlite"
             store = SqliteStore(path)
             conn = store.open()
-            store.insert_daily_snapshot(conn, "2026-05-10", "binance", "BTCUSDT", 100.0, 5.0, 3, 3, 1000)
+            store.insert_daily_snapshot(
+                conn, "2026-05-10", "binance", "BTCUSDT", 100.0, 5.0, 3, 3, 1000
+            )
             rows = conn.execute("SELECT * FROM daily_snapshots").fetchall()
             assert len(rows) == 1
             conn.close()
@@ -340,15 +456,26 @@ class TestMetrics:
         """Rust V1: all 19 JournalRuntimeMetrics counters must exist."""
         m = PersistenceMetrics()
         v1_counter_fields = {
-            "async_appends", "critical_appends", "sync_fallback_appends",
-            "dropped_async_appends", "flush_requests", "writer_flushes",
-            "writer_failures", "queue_disconnects",
-            "open_position_count", "net_exposure_milli_quote",
-            "venue_health_normal_count", "venue_health_pause_entry_count",
-            "venue_health_reduce_only_count", "venue_health_fail_closed_count",
-            "risk_warning_trigger_count", "risk_delever_trigger_count",
-            "risk_death_trigger_count", "order_timeout_count",
-            "ws_disconnect_count", "rest_failure_count",
+            "async_appends",
+            "critical_appends",
+            "sync_fallback_appends",
+            "dropped_async_appends",
+            "flush_requests",
+            "writer_flushes",
+            "writer_failures",
+            "queue_disconnects",
+            "open_position_count",
+            "net_exposure_milli_quote",
+            "venue_health_normal_count",
+            "venue_health_pause_entry_count",
+            "venue_health_reduce_only_count",
+            "venue_health_fail_closed_count",
+            "risk_warning_trigger_count",
+            "risk_delever_trigger_count",
+            "risk_death_trigger_count",
+            "order_timeout_count",
+            "ws_disconnect_count",
+            "rest_failure_count",
             "reconcile_drift_count",
         }
         for field in v1_counter_fields:
@@ -381,7 +508,10 @@ class TestJournalPayloadPreservation:
             r = records[0]
             assert r["payload"]["nested"]["pair_id"] == "btcusdt:binance->okx"
             assert r["payload"]["nested"]["depth"]["a"] == 1
-            assert r["payload"]["blocked_reasons"] == ["stale_market_data:binance", "low_liquidity:okx"]
+            assert r["payload"]["blocked_reasons"] == [
+                "stale_market_data:binance",
+                "low_liquidity:okx",
+            ]
             assert len(r["payload"]["candidates"]) == 2
             assert r["payload"]["metadata"]["source"] == "live"
 
@@ -392,8 +522,15 @@ class TestJournalPayloadPreservation:
             j = Journal(path)
             j.open()
             ts = 1715000000000
-            payload = {"order_id": "ord-123", "venue": "binance", "quantity": 0.15, "price": 68750.5,
-                       "reduce_only": True, "post_only": False, "client_order_id": "cl-456"}
+            payload = {
+                "order_id": "ord-123",
+                "venue": "binance",
+                "quantity": 0.15,
+                "price": 68750.5,
+                "reduce_only": True,
+                "post_only": False,
+                "client_order_id": "cl-456",
+            }
             seq = j.append("order.submitted", payload, ts_ms=ts, flush=True)
             j.close()
 
@@ -439,8 +576,11 @@ class TestJournalCriticalAppendDurability:
             # Regular append
             j.append("scan.completed", {"cycle": 1}, ts_ms=ts)
             # Critical append
-            j.append_critical(ts_ms=ts + 1, kind="runtime.lifecycle_changed",
-                              payload={"from": "booting", "to": "reconciling", "reason": "startup"})
+            j.append_critical(
+                ts_ms=ts + 1,
+                kind="runtime.lifecycle_changed",
+                payload={"from": "booting", "to": "reconciling", "reason": "startup"},
+            )
             j.close()
 
             records = j.read_all()
@@ -464,8 +604,11 @@ class TestJournalCriticalAppendDurability:
             j = Journal(path)
             j.open()
 
-            j.append_critical(ts_ms=1715000000200, kind="runtime.risk_mode_changed",
-                              payload={"from": "running", "to": "fail_closed"})
+            j.append_critical(
+                ts_ms=1715000000200,
+                kind="runtime.risk_mode_changed",
+                payload={"from": "running", "to": "fail_closed"},
+            )
             j.close()
 
             # Read back from a fresh Journal instance (same path)
@@ -505,10 +648,10 @@ class TestJournalStreaming:
             path = Path(td) / "stream_from.jsonl"
             j = Journal(path)
             j.open()
-            j.append("scan.completed", {"cycle": 1}, flush=True)   # seq=1
-            j.append("scan.completed", {"cycle": 2}, flush=True)   # seq=2
+            j.append("scan.completed", {"cycle": 1}, flush=True)  # seq=1
+            j.append("scan.completed", {"cycle": 2}, flush=True)  # seq=2
             j.append("entry.opened", {"position_id": "P1"}, flush=True)  # seq=3
-            j.append("exit.closed", {"position_id": "P1"}, flush=True)   # seq=4
+            j.append("exit.closed", {"position_id": "P1"}, flush=True)  # seq=4
             j.close()
 
             records = list(j.stream_from(start_seq=3))
@@ -1057,8 +1200,13 @@ class TestProjectionSqliteStore:
             store = SqliteStore(path)
             conn = store.open()
             args = dict(
-                conn=conn, seq=5, ts_ms=1715000000100, kind="scan.completed",
-                venue="bybit", symbol="ETHUSDT", payload_json='{"cycle":1}',
+                conn=conn,
+                seq=5,
+                ts_ms=1715000000100,
+                kind="scan.completed",
+                venue="bybit",
+                symbol="ETHUSDT",
+                payload_json='{"cycle":1}',
             )
             first = store.insert_projected_fact(**args)
             assert first is True
@@ -1074,16 +1222,31 @@ class TestProjectionSqliteStore:
             store = SqliteStore(path)
             conn = store.open()
             store.insert_projected_fact(
-                conn, seq=1, ts_ms=1000, kind="order.submitted",
-                venue="binance", symbol="BTCUSDT", payload_json="{}",
+                conn,
+                seq=1,
+                ts_ms=1000,
+                kind="order.submitted",
+                venue="binance",
+                symbol="BTCUSDT",
+                payload_json="{}",
             )
             store.insert_projected_fact(
-                conn, seq=2, ts_ms=2000, kind="scan.completed",
-                venue="binance", symbol="BTCUSDT", payload_json="{}",
+                conn,
+                seq=2,
+                ts_ms=2000,
+                kind="scan.completed",
+                venue="binance",
+                symbol="BTCUSDT",
+                payload_json="{}",
             )
             store.insert_projected_fact(
-                conn, seq=3, ts_ms=3000, kind="order.filled",
-                venue="binance", symbol="ETHUSDT", payload_json="{}",
+                conn,
+                seq=3,
+                ts_ms=3000,
+                kind="order.filled",
+                venue="binance",
+                symbol="ETHUSDT",
+                payload_json="{}",
             )
 
             orders = store.query_projected_facts(conn, kind="order.submitted")

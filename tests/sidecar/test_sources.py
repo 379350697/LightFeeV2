@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -29,16 +30,25 @@ class TestExchangeSource:
         async def _run():
             src = ExchangeSource(binance_spec())
             await src.close()
+
         asyncio.run(_run())
 
     def test_from_funding_ticker(self):
         from lightfee.venues.market_data import FundingTicker
+
         ft = FundingTicker(
-            venue="binance", symbol="BTCUSDT",
-            bid=50000, ask=50001, bid_size=1.5, ask_size=2.0,
-            mark_price=50000.5, index_price=50000.0,
-            funding_rate_bps=10.0, funding_timestamp_ms=1700000000000,
-            volume_24h_quote=1_000_000.0, open_interest_quote=500_000.0,
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=50000,
+            ask=50001,
+            bid_size=1.5,
+            ask_size=2.0,
+            mark_price=50000.5,
+            index_price=50000.0,
+            funding_rate_bps=10.0,
+            funding_timestamp_ms=1700000000000,
+            volume_24h_quote=1_000_000.0,
+            open_interest_quote=500_000.0,
         )
         qs = ExchangeSource._from_funding_ticker(ft)
         assert isinstance(qs, QuoteSnapshot)
@@ -81,6 +91,7 @@ class TestLiquiditySource:
         async def _run():
             src = LiquiditySource(okx_spec())
             await src.close()
+
         asyncio.run(_run())
 
 
@@ -116,7 +127,14 @@ class TestSidecarServiceRateLimitWiring:
                 if path == "/fapi/v1/ticker/bookTicker":
                     return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
                 if path == "/fapi/v1/premiumIndex":
-                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                            "nextFundingTime": "2000000000000",
+                        }
+                    ]
                 if path == "/fapi/v1/ticker/24hr":
                     return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
                 if path == "/fapi/v1/openInterest":
@@ -141,6 +159,9 @@ class TestSidecarServiceRateLimitWiring:
         )
         service = SidecarService(config)
         service._exchange_sources["binance"]._client = FakeBinanceClient(binance_spec())
+        service._exchange_sources["binance"]._client._funding_interval_by_key[
+            "binance:BTCUSDT"
+        ] = (28_800_000, "test_fixture", int(time.time() * 1_000))
         service._liquidity_sources["binance"] = FakeLiquiditySource()
 
         try:
@@ -158,3 +179,123 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.open_interest_evidence_reason == "background_refresh_inflight"
         assert quote.oi_refresh_attempt_count == 1
         assert quote.oi_timeout_count == 0
+
+    @pytest.mark.asyncio
+    async def test_refresh_build_watermark_includes_quotes_received_during_refresh(
+        self, tmp_path, monkeypatch
+    ):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            ),
+            venues=[
+                VenueConfig(venue="binance", taker_fee_bps=1.0),
+                VenueConfig(venue="bybit", taker_fee_bps=1.0),
+            ],
+        )
+        service = SidecarService(config)
+        quotes = {
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=100.1,
+                bid_size=10.0,
+                ask_size=10.0,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=20_000,
+                funding_interval_ms=28_800_000,
+                observed_at_ms=10_100,
+            ),
+            "bybit:BTCUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="BTCUSDT",
+                bid=100.2,
+                ask=100.3,
+                bid_size=10.0,
+                ask_size=10.0,
+                funding_rate_bps=10.0,
+                funding_timestamp_ms=20_000,
+                funding_interval_ms=28_800_000,
+                observed_at_ms=10_200,
+            ),
+        }
+
+        async def fake_funding(*_args, **_kwargs):
+            return [
+                ("binance", {"binance:BTCUSDT": quotes["binance:BTCUSDT"]}, None, set()),
+                ("bybit", {"bybit:BTCUSDT": quotes["bybit:BTCUSDT"]}, None, set()),
+            ]
+
+        async def fake_liquidity(*_args, **_kwargs):
+            return [
+                ("binance", {}, None, set()),
+                ("bybit", {}, None, set()),
+            ]
+
+        clock = iter((10.0, 10.25, 10.3))
+        monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
+        service._fetch_all_venues = fake_funding
+        service._fetch_liquidity_all_venues = fake_liquidity
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        assert len(snapshot.candidates) == 1
+        assert snapshot.market_observed_at_ms == 10_200
+        assert snapshot.candidate_build_observed_at_ms >= 10_200
+        assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 1
+        assert snapshot.candidate_build_diagnostics["output_candidate_count"] == 1
+        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {}
+
+    @pytest.mark.asyncio
+    async def test_liquidity_fetch_skips_venue_already_degraded_by_market_data(self, tmp_path):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        calls: list[str] = []
+
+        class FakeLiquiditySource:
+            def __init__(self, venue: str):
+                self.venue = venue
+
+            async def fetch_perp_liquidity(self, symbols):
+                calls.append(self.venue)
+                return {}
+
+            async def close(self):
+                return None
+
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+            )
+        )
+        service._liquidity_sources = {
+            "binance": FakeLiquiditySource("binance"),
+            "bybit": FakeLiquiditySource("bybit"),
+        }
+
+        try:
+            results = await service._fetch_liquidity_all_venues(
+                ["BTCUSDT"],
+                timeout_s=0.1,
+                skip_venues={"bybit"},
+            )
+        finally:
+            await service.close()
+
+        assert calls == ["binance"]
+        bybit = next(row for row in results if row[0] == "bybit")
+        assert isinstance(bybit[2], RuntimeError)
+        assert "market data degradation" in str(bybit[2])

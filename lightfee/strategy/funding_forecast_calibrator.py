@@ -17,6 +17,31 @@ _CALIBRATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
 _MAX_ERRORS_PER_KEY = 512
 
 
+def _literal_int(value: object, *, positive: bool = False) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < (1 if positive else 0):
+        return None
+    return value
+
+
+def _finite_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _mark_forecast_unusable(quote: QuoteSnapshot, reason: str) -> None:
+    quote.funding_forecast_sample_count = 0
+    quote.funding_forecast_uncertainty_bps = 0.0
+    quote.funding_forecast_started_at_ms = 0
+    quote.funding_forecast_distribution_stable = False
+    quote.funding_forecast_stability_reason = reason
+    quote.funding_forecast_median_drift_bps = 0.0
+    quote.funding_forecast_p90_drift_bps = 0.0
+
+
 @dataclass(frozen=True)
 class _PendingForecast:
     settlement_timestamp_ms: int
@@ -62,33 +87,70 @@ class FundingForecastCalibrator:
     def prime(self, quotes: dict[str, QuoteSnapshot]) -> None:
         for quote in quotes.values():
             key = self._key(quote)
-            started_at_ms = int(
-                quote.funding_forecast_started_at_ms or quote.observed_at_ms or 0
+            started_at_ms = _literal_int(
+                quote.funding_forecast_started_at_ms or quote.observed_at_ms or 0,
+                positive=True,
             )
-            if started_at_ms > 0:
+            if started_at_ms is not None:
                 self._started_at_ms.setdefault(key, started_at_ms)
-            timestamp = int(quote.funding_timestamp_ms or 0)
-            if timestamp <= 0:
-                continue
+            timestamp = _literal_int(quote.funding_timestamp_ms, positive=True)
+            interval_ms = _literal_int(quote.funding_interval_ms, positive=True)
+            observed_at_ms = _literal_int(quote.observed_at_ms or 0)
             rate = quote.predicted_funding_rate_bps
-            predicted = float(rate if rate is not None else quote.funding_rate_bps)
-            if math.isfinite(predicted):
-                self._pending.setdefault(
-                    key,
-                    _PendingForecast(
-                        timestamp,
-                        predicted,
-                        int(quote.observed_at_ms or 0),
-                        max(int(quote.funding_interval_ms or 0), 0),
-                    ),
-                )
+            predicted = _finite_float(
+                rate if rate is not None else quote.funding_rate_bps
+            )
+            settled_raw = quote.settled_funding_rate_bps
+            settled = (
+                None if settled_raw is None else _finite_float(settled_raw)
+            )
+            if (
+                timestamp is None
+                or interval_ms is None
+                or observed_at_ms is None
+                or predicted is None
+                or (settled_raw is not None and settled is None)
+            ):
+                continue
+            self._pending.setdefault(
+                key,
+                _PendingForecast(
+                    timestamp,
+                    predicted,
+                    observed_at_ms,
+                    interval_ms,
+                ),
+            )
 
     def apply(self, quotes: dict[str, QuoteSnapshot], *, now_ms: int) -> None:
         changed = False
-        current_now_ms = max(int(now_ms or 0), 0)
+        parsed_now_ms = _literal_int(now_ms or 0)
+        current_now_ms = parsed_now_ms if parsed_now_ms is not None else 0
         for quote in quotes.values():
             key = self._key(quote)
-            observed_at_ms = int(quote.observed_at_ms or current_now_ms or 0)
+            observed_at_ms = _literal_int(
+                quote.observed_at_ms or current_now_ms or 0,
+                positive=True,
+            )
+            timestamp = _literal_int(quote.funding_timestamp_ms, positive=True)
+            interval_ms = _literal_int(quote.funding_interval_ms, positive=True)
+            rate = quote.predicted_funding_rate_bps
+            predicted = _finite_float(
+                rate if rate is not None else quote.funding_rate_bps
+            )
+            settled_raw = quote.settled_funding_rate_bps
+            settled = (
+                None if settled_raw is None else _finite_float(settled_raw)
+            )
+            if (
+                observed_at_ms is None
+                or timestamp is None
+                or interval_ms is None
+                or predicted is None
+                or (settled_raw is not None and settled is None)
+            ):
+                _mark_forecast_unusable(quote, "invalid_funding_evidence")
+                continue
             # A source observation after the refresh clock is not evidence of
             # a settlement.  Recording it would let a bad venue/local clock
             # advance the persisted error distribution and later make an
@@ -96,21 +158,13 @@ class FundingForecastCalibrator:
             # calibration state for a later valid observation, but expose no
             # usable confidence on this untrusted quote.
             if observed_at_ms > current_now_ms:
-                quote.funding_forecast_sample_count = 0
-                quote.funding_forecast_uncertainty_bps = 0.0
-                quote.funding_forecast_started_at_ms = 0
-                quote.funding_forecast_distribution_stable = False
-                quote.funding_forecast_stability_reason = "future_quote_timestamp"
-                quote.funding_forecast_median_drift_bps = 0.0
-                quote.funding_forecast_p90_drift_bps = 0.0
+                _mark_forecast_unusable(quote, "future_quote_timestamp")
                 continue
             effective_now_ms = current_now_ms
             if observed_at_ms > 0 and key not in self._started_at_ms:
                 self._started_at_ms[key] = observed_at_ms
                 changed = True
-            timestamp = int(quote.funding_timestamp_ms or 0)
             pending = self._pending.get(key)
-            settled = quote.settled_funding_rate_bps
             if (
                 timestamp > 0
                 and pending is not None
@@ -124,22 +178,19 @@ class FundingForecastCalibrator:
                 # model before its own settlement timestamp.
                 and observed_at_ms >= pending.settlement_timestamp_ms
                 and settled is not None
-                and math.isfinite(float(settled))
             ):
-                error = abs(float(settled) - pending.predicted_rate_bps)
+                error = abs(settled - pending.predicted_rate_bps)
                 if math.isfinite(error):
                     self._errors[key].append((effective_now_ms, error))
                     changed = True
-            rate = quote.predicted_funding_rate_bps
-            predicted = float(rate if rate is not None else quote.funding_rate_bps)
-            if timestamp > 0 and math.isfinite(predicted) and (
+            if timestamp > 0 and (
                 pending is None or timestamp != pending.settlement_timestamp_ms
             ):
                 self._pending[key] = _PendingForecast(
                     timestamp,
                     predicted,
                     int(quote.observed_at_ms or now_ms or 0),
-                    max(int(quote.funding_interval_ms or 0), 0),
+                    interval_ms,
                 )
                 changed = True
             prior_errors = tuple(self._errors.get(key, []))
@@ -159,7 +210,7 @@ class FundingForecastCalibrator:
             ) = self._distribution_stability(
                 errors,
                 now_ms=effective_now_ms,
-                funding_interval_ms=int(quote.funding_interval_ms or 0),
+                funding_interval_ms=interval_ms,
             )
         if changed:
             self._save()

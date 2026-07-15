@@ -15,6 +15,11 @@ from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 _INTERVAL_ALIGNED_THRESHOLD_MS = 60_000
 
 
+def _record_rejection(counts: dict[str, int] | None, reason: str) -> None:
+    if counts is not None:
+        counts[reason] = int(counts.get(reason, 0)) + 1
+
+
 class FundingCandidateService:
     """Reusable funding-shortlist builder owned by the sidecar service.
 
@@ -33,10 +38,12 @@ class FundingCandidateService:
         venue_notional_caps: dict[str, float],
         passive_execution_enabled: bool,
         fee_evidence: FeeEvidenceBook | None = None,
+        expected_fee_identity_hashes: dict[str, str] | None = None,
     ) -> None:
         self._strategy = strategy
         self._fee_by_venue = _normalise_venue_bps(venue_fee_bps)
         self._fee_evidence = fee_evidence
+        self._expected_fee_identity_hashes = expected_fee_identity_hashes
         self._maker_fee_by_venue = _normalise_venue_bps(
             venue_maker_fee_bps,
             allow_negative=bool(
@@ -53,6 +60,7 @@ class FundingCandidateService:
         symbols: list[str],
         *,
         observed_at_ms: int = 0,
+        diagnostics: dict[str, object] | None = None,
     ) -> list[CandidateInput]:
         return _build_same_symbol_pairs(
             quotes,
@@ -64,7 +72,9 @@ class FundingCandidateService:
             allocator=self._allocator,
             passive_execution_enabled=self._passive_execution_enabled,
             fee_evidence=self._fee_evidence,
+            expected_fee_identity_hashes=self._expected_fee_identity_hashes,
             observed_at_ms=observed_at_ms,
+            diagnostics=diagnostics,
         )
 
 
@@ -78,7 +88,9 @@ def build_same_symbol_pairs(
     venue_notional_caps: dict[str, float] | None = None,
     passive_execution_enabled: bool = False,
     fee_evidence: FeeEvidenceBook | None = None,
+    expected_fee_identity_hashes: dict[str, str] | None = None,
     observed_at_ms: int = 0,
+    diagnostics: dict[str, object] | None = None,
 ) -> list[CandidateInput]:
     """Build directed funding pairs using a common base quantity.
 
@@ -103,7 +115,9 @@ def build_same_symbol_pairs(
         allocator=StrategyRiskAllocator(),
         passive_execution_enabled=passive_execution_enabled is True,
         fee_evidence=fee_evidence,
+        expected_fee_identity_hashes=expected_fee_identity_hashes,
         observed_at_ms=observed_at_ms,
+        diagnostics=diagnostics,
     )
 
 
@@ -118,22 +132,70 @@ def _build_same_symbol_pairs(
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
     fee_evidence: FeeEvidenceBook | None,
+    expected_fee_identity_hashes: dict[str, str] | None,
     observed_at_ms: int,
+    diagnostics: dict[str, object] | None,
 ) -> list[CandidateInput]:
     candidates: list[CandidateInput] = []
+    rejection_counts: dict[str, int] = {}
+    directional_pair_count = 0
+    future_input_quote_count = sum(
+        1
+        for quote in quotes.values()
+        if observed_at_ms > 0 and _quote_observed_after(quote, observed_at_ms)
+    )
 
     quotes_by_symbol: dict[str, list[QuoteSnapshot]] = {}
+    seen_quote_identities: set[tuple[str, str]] = set()
+    duplicate_quote_identities: set[tuple[str, str]] = set()
     for quote in quotes.values():
-        quotes_by_symbol.setdefault(str(quote.symbol).upper(), []).append(quote)
+        identity = (
+            str(quote.venue).strip().lower(),
+            str(quote.symbol).strip().upper(),
+        )
+        if identity in seen_quote_identities:
+            duplicate_quote_identities.add(identity)
+            continue
+        seen_quote_identities.add(identity)
+        quotes_by_symbol.setdefault(identity[1], []).append(quote)
+    if duplicate_quote_identities:
+        quotes_by_symbol = {
+            symbol: [
+                quote
+                for quote in venue_quotes
+                if (
+                    str(quote.venue).strip().lower(),
+                    str(quote.symbol).strip().upper(),
+                )
+                not in duplicate_quote_identities
+            ]
+            for symbol, venue_quotes in quotes_by_symbol.items()
+        }
 
-    for symbol in symbols:
+    canonical_symbols = list(
+        dict.fromkeys(
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip()
+        )
+    )
+    for symbol in canonical_symbols:
         venue_quotes = quotes_by_symbol.get(str(symbol).upper(), [])
         if len(venue_quotes) < 2:
             continue
         economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
         for long_q in venue_quotes:
             for short_q in venue_quotes:
-                if long_q is short_q:
+                if long_q is short_q or str(long_q.venue).strip().lower() == str(
+                    short_q.venue
+                ).strip().lower():
+                    continue
+                # Validate both records before any arithmetic or ordering.
+                # A malformed funding scalar must reject only this directed
+                # pair, never abort publication of unrelated venue/symbols.
+                if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
+                    directional_pair_count += 1
+                    _record_rejection(rejection_counts, "invalid_trade_quote")
                     continue
                 # V1 and the shadow comparison must preserve the legacy
                 # quoted-rate discovery universe exactly.  Once calibrated
@@ -146,6 +208,7 @@ def _build_same_symbol_pairs(
                     and short_q.funding_rate_bps <= long_q.funding_rate_bps
                 ):
                     continue
+                directional_pair_count += 1
                 candidate = _candidate_for_pair(
                     long_q=long_q,
                     short_q=short_q,
@@ -156,12 +219,30 @@ def _build_same_symbol_pairs(
                     allocator=allocator,
                     passive_execution_enabled=passive_execution_enabled,
                     fee_evidence=fee_evidence,
+                    expected_fee_identity_hashes=expected_fee_identity_hashes,
                     observed_at_ms=observed_at_ms,
+                    rejection_counts=rejection_counts,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
 
-    return sorted(candidates, key=lambda c: c.ranking_edge_bps, reverse=True)
+    ordered = sorted(candidates, key=lambda c: c.ranking_edge_bps, reverse=True)
+    if diagnostics is not None:
+        requested_symbols = sorted(canonical_symbols)
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "input_quote_count": len(quotes),
+                "requested_symbol_count": len(requested_symbols),
+                "requested_symbols": requested_symbols,
+                "directional_pair_count": directional_pair_count,
+                "output_candidate_count": len(ordered),
+                "future_input_quote_count": future_input_quote_count,
+                "duplicate_input_quote_count": len(duplicate_quote_identities),
+                "rejection_counts": dict(sorted(rejection_counts.items())),
+            }
+        )
+    return ordered
 
 
 def _candidate_for_pair(
@@ -175,7 +256,9 @@ def _candidate_for_pair(
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
     fee_evidence: FeeEvidenceBook | None,
+    expected_fee_identity_hashes: dict[str, str] | None,
     observed_at_ms: int,
+    rejection_counts: dict[str, int] | None = None,
 ) -> CandidateInput | None:
     # A snapshot is only a coherent cross-venue observation when no source
     # quote claims to have arrived after the refresh that is building it.
@@ -184,15 +267,17 @@ def _candidate_for_pair(
     # age as a fresh executable market.
     now_ms = max(int(observed_at_ms or 0), 0)
     if now_ms > 0 and (
-        _quote_observed_after(long_q, now_ms)
-        or _quote_observed_after(short_q, now_ms)
+        _quote_observed_after(long_q, now_ms) or _quote_observed_after(short_q, now_ms)
     ):
+        _record_rejection(rejection_counts, "quote_after_candidate_watermark")
         return None
     if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
+        _record_rejection(rejection_counts, "invalid_trade_quote")
         return None
     long_mid = _mid(long_q)
     short_mid = _mid(short_q)
     if long_mid <= 0.0 or short_mid <= 0.0 or long_q.ask <= 0.0 or short_q.bid <= 0.0:
+        _record_rejection(rejection_counts, "invalid_reference_price")
         return None
     contract_block_reasons = _funding_contract_block_reasons(long_q, short_q)
     # V1 prices a directed entry against the actual executable long ask and
@@ -212,9 +297,7 @@ def _candidate_for_pair(
     first_leg = "long" if long_ts <= short_ts else "short" if long_ts and short_ts else ""
     now_ms = int(observed_at_ms or long_q.observed_at_ms or short_q.observed_at_ms or 0)
 
-    configured_uncertainty = max(
-        float(config.funding_forecast_uncertainty_haircut_bps or 0.0), 0.0
-    )
+    configured_uncertainty = max(float(config.funding_forecast_uncertainty_haircut_bps or 0.0), 0.0)
     long_forecast = FundingForecast.from_quote(
         venue=long_q.venue,
         symbol=long_q.symbol,
@@ -256,9 +339,9 @@ def _candidate_for_pair(
     forecast_short_component = float(short_forecast.predicted_settled_rate_bps)
     worst_long_component = -float(long_forecast.upper_bound_bps)
     worst_short_component = float(short_forecast.lower_bound_bps)
-    required_shadow_age_ms = max(
-        int(config.funding_forecast_shadow_min_days or 0), 0
-    ) * 24 * 60 * 60 * 1000
+    required_shadow_age_ms = (
+        max(int(config.funding_forecast_shadow_min_days or 0), 0) * 24 * 60 * 60 * 1000
+    )
     long_shadow_age_ms = _forecast_shadow_age_ms(long_q, now_ms)
     short_shadow_age_ms = _forecast_shadow_age_ms(short_q, now_ms)
     forecast_shadow_age_ms = min(long_shadow_age_ms, short_shadow_age_ms)
@@ -271,11 +354,14 @@ def _candidate_for_pair(
         long_q.funding_forecast_distribution_stable is True
         and short_q.funding_forecast_distribution_stable is True
     )
-    forecast_stability_reason = "|".join(
-        f"{leg}:{str(getattr(quote, 'funding_forecast_stability_reason', '') or 'unknown')}"
-        for leg, quote in (("long", long_q), ("short", short_q))
-        if getattr(quote, "funding_forecast_distribution_stable", False) is not True
-    ) or "stable"
+    forecast_stability_reason = (
+        "|".join(
+            f"{leg}:{str(getattr(quote, 'funding_forecast_stability_reason', '') or 'unknown')}"
+            for leg, quote in (("long", long_q), ("short", short_q))
+            if getattr(quote, "funding_forecast_distribution_stable", False) is not True
+        )
+        or "stable"
+    )
     forecast_median_drift_bps = max(
         _finite_nonnegative(long_q.funding_forecast_median_drift_bps),
         _finite_nonnegative(short_q.funding_forecast_median_drift_bps),
@@ -286,9 +372,7 @@ def _candidate_for_pair(
     )
     economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
     use_forecast_for_live_gate = (
-        economics_mode == "enhanced_live"
-        and forecast_ready
-        and forecast_distribution_stable
+        economics_mode == "enhanced_live" and forecast_ready and forecast_distribution_stable
     )
     # V1 exact and enhanced shadow keep the same entry gate.  Shadow records
     # the calibrated forecast without allowing an unproven model to alter a
@@ -316,15 +400,31 @@ def _candidate_for_pair(
         long_q.venue,
         short_q.venue,
     )
-    account_fee_evidence_complete = bool(
+    account_fee_evidence_base_complete = bool(
         fee_evidence is not None
         and fee_evidence.complete_for(long_q.venue, short_q.venue)
+        and fee_evidence.integrity_verified is True
+    )
+    account_fee_identity_matches = bool(
+        account_fee_evidence_base_complete
+        and (
+            expected_fee_identity_hashes is None
+            or fee_evidence.identity_matches(
+                expected_fee_identity_hashes,
+                long_q.venue,
+                short_q.venue,
+            )
+        )
+    )
+    account_fee_evidence_complete = (
+        account_fee_evidence_base_complete and account_fee_identity_matches
     )
     long_maker_fee = maker_fee_by_venue.get(str(long_q.venue).lower(), long_fee)
     short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
-    venue_haircut = (
-        float(config.funding_venue_risk_haircut_bps_by_venue.get(str(long_q.venue).lower(), 0.0) or 0.0)
-        + float(config.funding_venue_risk_haircut_bps_by_venue.get(str(short_q.venue).lower(), 0.0) or 0.0)
+    venue_haircut = float(
+        config.funding_venue_risk_haircut_bps_by_venue.get(str(long_q.venue).lower(), 0.0) or 0.0
+    ) + float(
+        config.funding_venue_risk_haircut_bps_by_venue.get(str(short_q.venue).lower(), 0.0) or 0.0
     )
     opportunity_type = "aligned" if interval_aligned else "staggered"
     stagger_gap_ms = max(second_ts - first_ts, 0) if first_ts > 0 else 0
@@ -359,8 +459,12 @@ def _candidate_for_pair(
         max(float(config.live_entry_notional_cap_quote or 0.0), 0.0),
     )
     conservative_depth_quantity = configured_cap / reference_mid if configured_cap > 0.0 else 0.0
-    long_depth = float(long_q.ask_size or 0.0) * max(float(config.max_top_book_usage_ratio or 0.0), 0.0)
-    short_depth = float(short_q.bid_size or 0.0) * max(float(config.max_top_book_usage_ratio or 0.0), 0.0)
+    long_depth = float(long_q.ask_size or 0.0) * max(
+        float(config.max_top_book_usage_ratio or 0.0), 0.0
+    )
+    short_depth = float(short_q.bid_size or 0.0) * max(
+        float(config.max_top_book_usage_ratio or 0.0), 0.0
+    )
     venue_cap = _minimum_positive(
         caps_by_venue.get(str(long_q.venue).lower(), 0.0),
         caps_by_venue.get(str(short_q.venue).lower(), 0.0),
@@ -389,14 +493,18 @@ def _candidate_for_pair(
         configured_notional_cap_quote=configured_cap,
         venue_notional_cap_quote=venue_cap,
         symbol_risk_budget_quote=float(config.max_symbol_exposure_quote or 0.0),
-        venue_pair_risk_budget_quote=float(
-            config.funding_max_venue_pair_exposure_quote or 0.0
-        ),
+        venue_pair_risk_budget_quote=float(config.funding_max_venue_pair_exposure_quote or 0.0),
         global_risk_budget_quote=global_reference_cap,
         fallback_notional_quote=float(config.funding_missing_margin_fallback_notional_quote or 0.0),
         health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
     )
     candidate_block_reasons = list(contract_block_reasons)
+    if (
+        account_fee_evidence_base_complete
+        and expected_fee_identity_hashes is not None
+        and not account_fee_identity_matches
+    ):
+        candidate_block_reasons.append("account_fee_account_identity_mismatch")
     if not taker_fee_evidence_complete:
         # A zero fee can be a valid explicitly configured VIP tier, but an
         # omitted, non-finite, or negative taker fee is not evidence.  The
@@ -416,20 +524,12 @@ def _candidate_for_pair(
     # taker-impact estimate.  This cannot be reconstructed from aggregate
     # four-leg fee fields after the fact.
     quantity = float(allocation.base_quantity or 0.0)
-    long_entry_slippage_bps = _heuristic_slippage_bps(
-        long_q, quantity, taking_ask=True
-    )
-    short_entry_slippage_bps = _heuristic_slippage_bps(
-        short_q, quantity, taking_ask=False
-    )
-    entry_maker_leg = _select_maker_leg(
-        long_entry_slippage_bps, short_entry_slippage_bps
-    )
+    long_entry_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=True)
+    short_entry_slippage_bps = _heuristic_slippage_bps(short_q, quantity, taking_ask=False)
+    entry_maker_leg = _select_maker_leg(long_entry_slippage_bps, short_entry_slippage_bps)
     entry_cross_bps = raw_entry_cross_bps
     if passive_execution_enabled:
-        entry_cross_bps += _pair_spread_bps(
-            long_q, short_q, reference_mid, entry_maker_leg
-        )
+        entry_cross_bps += _pair_spread_bps(long_q, short_q, reference_mid, entry_maker_leg)
     entry_fee_bps = _effective_fee_bps(
         long_taker_fee_bps=long_fee,
         long_maker_fee_bps=long_maker_fee,
@@ -444,15 +544,9 @@ def _candidate_for_pair(
         entry_maker_leg,
         passive_execution_enabled,
     )
-    long_exit_slippage_bps = _heuristic_slippage_bps(
-        long_q, quantity, taking_ask=False
-    )
-    short_exit_slippage_bps = _heuristic_slippage_bps(
-        short_q, quantity, taking_ask=True
-    )
-    exit_maker_leg = _select_maker_leg(
-        long_exit_slippage_bps, short_exit_slippage_bps
-    )
+    long_exit_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=False)
+    short_exit_slippage_bps = _heuristic_slippage_bps(short_q, quantity, taking_ask=True)
+    exit_maker_leg = _select_maker_leg(long_exit_slippage_bps, short_exit_slippage_bps)
     exit_fee_bps = _effective_fee_bps(
         long_taker_fee_bps=long_fee,
         long_maker_fee_bps=long_maker_fee,
@@ -482,9 +576,7 @@ def _candidate_for_pair(
         calculation_version=calculation_version,
         model_epoch=calculation_version,
         observed_at_ms=now_ms,
-        economics_complete=(
-            quantity > 0.0 and bool(first_ts) and not candidate_block_reasons
-        ),
+        economics_complete=(quantity > 0.0 and bool(first_ts) and not candidate_block_reasons),
     )
     # A common-base hedge cannot be claimed for an unnormalised, inverse,
     # quanto, mismatched-underlying, or otherwise incompatible pair.  This is
@@ -554,7 +646,9 @@ def _candidate_for_pair(
         entry_target_quantity=allocation.base_quantity,
         long_max_executable_quantity=long_depth,
         short_max_executable_quantity=short_depth,
-        entry_max_executable_quantity=min(long_depth, short_depth) if long_depth and short_depth else allocation.base_quantity,
+        entry_max_executable_quantity=min(long_depth, short_depth)
+        if long_depth and short_depth
+        else allocation.base_quantity,
         entry_max_executable_notional_quote=allocation.reference_notional_quote,
         entry_capacity_constrained=bool(long_depth > 0.0 or short_depth > 0.0),
         entry_depth_capped_at_entry=bool(long_depth > 0.0 or short_depth > 0.0),
@@ -588,9 +682,7 @@ def _candidate_for_pair(
         # (which includes the later settlement) for a first-stage worst case.
         forecast_worst_funding_edge_bps=first_stage_worst_funding,
         forecast_confidence=min(long_forecast.confidence, short_forecast.confidence),
-        forecast_sample_count=min(
-            long_forecast.sample_count, short_forecast.sample_count
-        ),
+        forecast_sample_count=min(long_forecast.sample_count, short_forecast.sample_count),
         forecast_shadow_age_ms=forecast_shadow_age_ms,
         forecast_ready=forecast_ready,
         forecast_distribution_stable=forecast_distribution_stable,
@@ -624,22 +716,23 @@ def check_stale_snapshot(snapshot_published_at_ms: int, max_age_ms: int, now_ms:
 
 
 def reference_mid_valid(long_q: QuoteSnapshot, short_q: QuoteSnapshot) -> bool:
+    try:
+        long_ask = float(long_q.ask)
+        short_bid = float(short_q.bid)
+    except (TypeError, ValueError, OverflowError):
+        return False
     return (
-        isfinite(float(long_q.ask or 0.0))
-        and isfinite(float(short_q.bid or 0.0))
-        and long_q.ask > 0
-        and short_q.bid > 0
+        isfinite(long_ask)
+        and isfinite(short_bid)
+        and long_ask > 0
+        and short_bid > 0
     )
 
 
 def _mid(quote: QuoteSnapshot) -> float:
     bid = float(quote.bid or 0.0)
     ask = float(quote.ask or 0.0)
-    return (
-        (bid + ask) / 2.0
-        if isfinite(bid) and isfinite(ask) and bid > 0.0 and ask > 0.0
-        else 0.0
-    )
+    return (bid + ask) / 2.0 if isfinite(bid) and isfinite(ask) and bid > 0.0 and ask > 0.0 else 0.0
 
 
 def _valid_trade_quote(quote: QuoteSnapshot) -> bool:
@@ -651,11 +744,40 @@ def _valid_trade_quote(quote: QuoteSnapshot) -> bool:
     slippage branch prices missing depth as a large penalty rather than
     pretending the pair has no price.
     """
+    raw_values = (quote.bid, quote.ask, quote.funding_rate_bps)
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in raw_values
+    ):
+        return False
+    optional_numeric_values = (
+        quote.predicted_funding_rate_bps,
+        quote.funding_forecast_uncertainty_bps,
+        quote.bid_size,
+        quote.ask_size,
+    )
+    if any(
+        value is not None
+        and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(float(value))
+        )
+        for value in optional_numeric_values
+    ):
+        return False
+    for value in (quote.funding_timestamp_ms, quote.funding_interval_ms):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+        ):
+            return False
     try:
-        bid = float(quote.bid or 0.0)
-        ask = float(quote.ask or 0.0)
-        funding = float(quote.funding_rate_bps or 0.0)
-    except (TypeError, ValueError):
+        bid = float(quote.bid)
+        ask = float(quote.ask)
+        funding = float(quote.funding_rate_bps)
+    except (TypeError, ValueError, OverflowError):
         return False
     return (
         all(isfinite(value) for value in (bid, ask, funding))
@@ -743,11 +865,18 @@ def _effective_fee_bps(
     maker_leg: str,
     passive_execution_enabled: bool,
 ) -> float:
+    taker_floor = float(long_taker_fee_bps) + float(short_taker_fee_bps)
     if not passive_execution_enabled:
-        return float(long_taker_fee_bps) + float(short_taker_fee_bps)
+        return taker_floor
     if maker_leg == "long":
-        return float(long_maker_fee_bps) + float(short_taker_fee_bps)
-    return float(long_taker_fee_bps) + float(short_maker_fee_bps)
+        asserted = float(long_maker_fee_bps) + float(short_taker_fee_bps)
+    else:
+        asserted = float(long_taker_fee_bps) + float(short_maker_fee_bps)
+    # Maker schedules are useful operational evidence, but their serialized
+    # provenance cannot authenticate itself.  Never let a discount/rebate
+    # create shortlist alpha; the local live boundary may only improve this
+    # after reloading the signed account evidence.
+    return max(asserted, taker_floor)
 
 
 def _taker_fee_evidence_complete(
@@ -806,11 +935,11 @@ def _funding_contract_block_reasons(
         reasons.append("long_contract_type_incompatible")
     if str(short_quote.contract_type or "").lower() != "linear":
         reasons.append("short_contract_type_incompatible")
-    long_multiplier = float(long_quote.contract_multiplier or 0.0)
-    short_multiplier = float(short_quote.contract_multiplier or 0.0)
+    long_multiplier = _positive_finite_number(long_quote.contract_multiplier)
+    short_multiplier = _positive_finite_number(short_quote.contract_multiplier)
     if (
-        long_multiplier <= 0.0
-        or short_multiplier <= 0.0
+        long_multiplier is None
+        or short_multiplier is None
         or abs(long_multiplier - short_multiplier) > 1e-12
     ):
         reasons.append("contract_multiplier_mismatch")
@@ -818,19 +947,59 @@ def _funding_contract_block_reasons(
         reasons.append("long_mark_index_source_missing")
     if not str(short_quote.mark_index_source or "").strip():
         reasons.append("short_mark_index_source_missing")
-    if int(long_quote.price_precision or 0) <= 0 or int(long_quote.quantity_precision or 0) <= 0:
+    if not _nonnegative_literal_int(long_quote.price_precision) or not _nonnegative_literal_int(
+        long_quote.quantity_precision
+    ):
         reasons.append("long_precision_missing")
-    if int(short_quote.price_precision or 0) <= 0 or int(short_quote.quantity_precision or 0) <= 0:
+    if not _nonnegative_literal_int(short_quote.price_precision) or not _nonnegative_literal_int(
+        short_quote.quantity_precision
+    ):
         reasons.append("short_precision_missing")
+    for leg_name, quote in (("long", long_quote), ("short", short_quote)):
+        for field_name in (
+            "price_tick",
+            "quantity_step_base",
+            "min_quantity_base",
+        ):
+            if _positive_finite_number(getattr(quote, field_name, 0.0)) is None:
+                reasons.append(f"{leg_name}_{field_name}_missing")
+        min_notional = getattr(quote, "min_notional_quote", None)
+        if (
+            quote.min_notional_evidence_complete is not True
+            or isinstance(min_notional, bool)
+            or not isinstance(min_notional, (int, float))
+            or not isfinite(float(min_notional))
+            or float(min_notional) < 0.0
+        ):
+            reasons.append(f"{leg_name}_min_notional_evidence_missing")
     if str(long_quote.venue_status or "").lower() != "active":
         reasons.append("long_venue_inactive")
     if str(short_quote.venue_status or "").lower() != "active":
         reasons.append("short_venue_inactive")
-    if int(long_quote.funding_interval_ms or 0) <= 0:
+    if not _positive_literal_int(long_quote.funding_interval_ms):
         reasons.append("long_funding_interval_unknown")
-    if int(short_quote.funding_interval_ms or 0) <= 0:
+    if not _positive_literal_int(short_quote.funding_interval_ms):
         reasons.append("short_funding_interval_unknown")
+    if not _positive_literal_int(long_quote.funding_timestamp_ms):
+        reasons.append("long_funding_timestamp_unknown")
+    if not _positive_literal_int(short_quote.funding_timestamp_ms):
+        reasons.append("short_funding_timestamp_unknown")
     return tuple(reasons)
+
+
+def _positive_finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if isfinite(parsed) and parsed > 0.0 else None
+
+
+def _positive_literal_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _nonnegative_literal_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _normalise_venue_bps(
@@ -864,9 +1033,7 @@ def _same_text(left: object, right: object) -> bool:
 
 
 def _forecast_shadow_age_ms(quote: QuoteSnapshot, now_ms: int) -> int:
-    started_at_ms = int(
-        getattr(quote, "funding_forecast_started_at_ms", 0) or 0
-    )
+    started_at_ms = int(getattr(quote, "funding_forecast_started_at_ms", 0) or 0)
     if started_at_ms <= 0:
         return 0
     return max(int(now_ms or 0) - started_at_ms, 0)

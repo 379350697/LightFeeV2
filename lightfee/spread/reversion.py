@@ -55,6 +55,7 @@ class SpreadReversionConfig:
     rank_by_capital_efficiency: bool = False
     volatility_high_std_bps: float = 10.0
     account_fee_evidence: FeeEvidenceBook | None = None
+    fee_evidence_account_identity_hashes: dict[str, str] | None = None
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
     ranker_max_candidates: int = 10
@@ -115,6 +116,9 @@ class SpreadReversionConfig:
             rank_by_capital_efficiency=s.spread_rank_by_capital_efficiency,
             volatility_high_std_bps=s.spread_volatility_high_std_bps,
             account_fee_evidence=fee_evidence,
+            fee_evidence_account_identity_hashes=dict(
+                config.runtime.fee_evidence_account_identity_hashes
+            ),
             mean_reversion_min_std_bps=s.spread_mean_reversion_min_std_bps,
             mean_reversion_max_half_life_ms=s.spread_mean_reversion_max_half_life_ms,
             ranker_max_candidates=s.spread_ranker_max_candidates,
@@ -400,9 +404,7 @@ class SpreadStatsTracker:
         median, robust_scale = _robust_location_scale(values)
         phi, half_life = _ar1_residual_quality(samples, median)
         exit_half_spreads = [
-            sample.exit_half_spread_bps
-            for sample in samples
-            if sample.exit_half_spread_bps >= 0.0
+            sample.exit_half_spread_bps for sample in samples if sample.exit_half_spread_bps >= 0.0
         ]
         return SpreadStatsSnapshot(
             sample_count=len(values),
@@ -472,6 +474,7 @@ class SpreadSignalEngine:
         *,
         now_ms: int,
         rejection_counts: dict[str, int] | None = None,
+        diagnostics: dict[str, int] | None = None,
     ) -> list[SpreadReversionCandidate]:
         return build_spread_reversion_candidates(
             quotes,
@@ -480,6 +483,7 @@ class SpreadSignalEngine:
             config=self.config,
             now_ms=now_ms,
             rejection_counts=rejection_counts,
+            diagnostics=diagnostics,
             _models=self._models,
         )
 
@@ -492,6 +496,7 @@ def build_spread_reversion_candidates(
     config: SpreadReversionConfig,
     now_ms: int,
     rejection_counts: dict[str, int] | None = None,
+    diagnostics: dict[str, int] | None = None,
     _models: _SpreadSignalModels | None = None,
 ) -> list[SpreadReversionCandidate]:
     """Score each canonical pair exactly once and update after signal lookup."""
@@ -505,17 +510,16 @@ def build_spread_reversion_candidates(
             by_symbol.setdefault(symbol, []).append(quote)
 
     candidates: list[SpreadReversionCandidate] = []
+    evaluated_pair_count = 0
     for symbol in sorted(wanted):
         symbol_quotes = by_symbol.get(symbol, [])
         fair_price = models.fair_price.assess(symbol_quotes)
         sorted_quotes = sorted(symbol_quotes, key=lambda q: str(q.venue).lower())
         for venue_a, venue_b in combinations(sorted_quotes, 2):
+            evaluated_pair_count += 1
             compatibility = _contract_compatibility(venue_a, venue_b)
             if not compatibility.compatible:
-                if rejection_counts is not None:
-                    rejection_counts[compatibility.reason] = (
-                        rejection_counts.get(compatibility.reason, 0) + 1
-                    )
+                _record_spread_rejection(rejection_counts, compatibility.reason)
                 continue
             candidate = _candidate_for_pair(
                 venue_a,
@@ -532,7 +536,25 @@ def build_spread_reversion_candidates(
             )
             if candidate is not None:
                 candidates.append(candidate)
-    return models.ranker.rank(candidates)
+    ranked = models.ranker.rank(candidates)
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "evaluated_pair_count": evaluated_pair_count,
+                "accepted_pair_count": len(candidates),
+                "output_candidate_count": len(ranked),
+            }
+        )
+    return ranked
+
+
+def _record_spread_rejection(
+    rejection_counts: dict[str, int] | None,
+    reason: str,
+) -> None:
+    if rejection_counts is not None:
+        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
 
 
 def _candidate_for_pair(
@@ -550,14 +572,18 @@ def _candidate_for_pair(
     rejection_counts: dict[str, int] | None,
 ) -> SpreadReversionCandidate | None:
     a, b = _canonical_quotes(venue_a, venue_b)
-    if not _contract_compatibility(a, b).compatible:
+    compatibility = _contract_compatibility(a, b)
+    if not compatibility.compatible:
+        _record_spread_rejection(rejection_counts, compatibility.reason)
         return None
     a_mid, b_mid = _mid(a), _mid(b)
     if a_mid <= 0.0 or b_mid <= 0.0:
+        _record_spread_rejection(rejection_counts, "invalid_mid_price")
         return None
     if not liquidity_gate.quote_fresh(
         a, b, now_ms=now_ms, signal_ttl_ms=config.signal_ttl_ms, quote_skew_ms=config.quote_skew_ms
     ):
+        _record_spread_rejection(rejection_counts, "quote_not_fresh_or_coherent")
         return None
     reference_mid = (a_mid + b_mid) / 2.0
     signed_mid = ((a_mid - b_mid) / reference_mid) * 10_000.0
@@ -572,6 +598,7 @@ def _candidate_for_pair(
     # out-of-order market event.  Using its old price against newer samples is
     # look-ahead, so reject it and leave the state unchanged.
     if stats.last_observed_ms > now_ms:
+        _record_spread_rejection(rejection_counts, "out_of_order_stats_window")
         return None
     updated = tracker.update(
         a.symbol,
@@ -581,12 +608,18 @@ def _candidate_for_pair(
         observed_at_ms=now_ms,
         exit_half_spread_bps=observed_exit_half_spread,
     )
-    if updated.structural_break or now_ms < updated.cooldown_until_ms:
+    if updated.structural_break:
+        _record_spread_rejection(rejection_counts, "structural_break")
+        return None
+    if now_ms < updated.cooldown_until_ms:
+        _record_spread_rejection(rejection_counts, "structural_break_cooldown")
         return None
 
     a_fair = fair_price.get(str(a.venue).lower())
     b_fair = fair_price.get(str(b.venue).lower())
-    outliers = [assessment for assessment in (a_fair, b_fair) if assessment and not assessment.eligible]
+    outliers = [
+        assessment for assessment in (a_fair, b_fair) if assessment and not assessment.eligible
+    ]
     opportunity_label = "spread_reversion"
     screening_reasons: list[str] = []
     if outliers:
@@ -596,6 +629,7 @@ def _candidate_for_pair(
             fair_price=fair_price,
             config=config,
         ):
+            _record_spread_rejection(rejection_counts, "fair_price_outlier")
             return None
         opportunity_label = "single_venue_dislocation"
         screening_reasons.append("fair_outlier_override")
@@ -603,15 +637,19 @@ def _candidate_for_pair(
     is_dislocation = opportunity_label == "single_venue_dislocation"
     if not is_dislocation:
         if stats.sample_count < max(int(config.min_samples or 0), 1):
+            _record_spread_rejection(rejection_counts, "insufficient_history_samples")
             return None
         if stats.history_age_ms < max(int(config.min_history_ms or 0), 0):
+            _record_spread_rejection(rejection_counts, "insufficient_history_age")
             return None
         if stats.std_bps < max(float(config.mean_reversion_min_std_bps or 0.0), 0.0):
+            _record_spread_rejection(rejection_counts, "insufficient_spread_variance")
             return None
     z_score = zscore_model.z_score(
         spread_mid_bps=signed_mid, mean_bps=stats.mean_bps, std_bps=stats.std_bps
     )
     if not is_dislocation and abs(z_score) < abs(float(config.entry_z or 0.0)):
+        _record_spread_rejection(rejection_counts, "entry_z_not_reached")
         return None
     quality = quality_model.assess(
         z_score=z_score,
@@ -621,6 +659,7 @@ def _candidate_for_pair(
         half_life_ms=stats.half_life_ms,
     )
     if not is_dislocation and not quality.entry_allowed:
+        _record_spread_rejection(rejection_counts, "mean_reversion_quality")
         return None
 
     if z_score >= 0.0:
@@ -635,10 +674,7 @@ def _candidate_for_pair(
         short_q.venue,
     )
     if not fee_evidence_complete:
-        if rejection_counts is not None:
-            rejection_counts["missing_taker_fee_evidence"] = (
-                rejection_counts.get("missing_taker_fee_evidence", 0) + 1
-            )
+        _record_spread_rejection(rejection_counts, "missing_taker_fee_evidence")
         return None
     target_exit = stats.mean_bps + math.copysign(
         abs(float(config.exit_z or 0.0)) * stats.std_bps, z_score
@@ -647,14 +683,17 @@ def _candidate_for_pair(
     if (z_score > 0.0 and current_executable <= target_exit) or (
         z_score < 0.0 and current_executable >= target_exit
     ):
+        _record_spread_rejection(rejection_counts, "non_convergent_executable_spread")
         return None
     absolute_executable = abs(current_executable)
     if not is_dislocation and not config.dynamic_net_edge_enabled:
         minimum = max(float(config.min_executable_spread_bps or 0.0), 0.0)
         maximum = max(float(config.max_executable_spread_bps or 0.0), 0.0)
         if minimum > 0.0 and absolute_executable < minimum:
+            _record_spread_rejection(rejection_counts, "below_min_executable_spread")
             return None
         if maximum > 0.0 and absolute_executable >= maximum:
+            _record_spread_rejection(rejection_counts, "above_max_executable_spread")
             return None
 
     entry_fee = _fee_bps(config, long_q.venue) + _fee_bps(config, short_q.venue)
@@ -670,6 +709,7 @@ def _candidate_for_pair(
         short_funding_interval_ms=int(short_q.funding_interval_ms or 0),
     )
     if not funding.economics_complete:
+        _record_spread_rejection(rejection_counts, "funding_economics_incomplete")
         return None
     edge = build_edge_breakdown(
         gross_signal_edge_bps=gross_reversion,
@@ -694,6 +734,7 @@ def _candidate_for_pair(
         economics_complete=funding.economics_complete and fee_evidence_complete,
     )
     if edge.expected_net_edge_bps < config.min_net_edge_bps:
+        _record_spread_rejection(rejection_counts, "below_min_net_edge")
         return None
     # Absolute entry-spread floors are not portable across fee tiers or
     # symbols.  The v3 epoch instead requires reversion headroom to exceed
@@ -715,15 +756,11 @@ def _candidate_for_pair(
     )
     dynamic_min_gross_edge_bps = 0.0
     if config.dynamic_net_edge_enabled:
-        dynamic_min_gross_edge_bps = (
-            execution_burden_bps * max(float(config.min_gross_profit_multiple), 1.0)
-            + max(float(config.min_profit_buffer_bps), 0.0)
-        )
+        dynamic_min_gross_edge_bps = execution_burden_bps * max(
+            float(config.min_gross_profit_multiple), 1.0
+        ) + max(float(config.min_profit_buffer_bps), 0.0)
         if gross_reversion + 1e-12 < dynamic_min_gross_edge_bps:
-            if rejection_counts is not None:
-                rejection_counts["dynamic_min_gross_edge"] = (
-                    rejection_counts.get("dynamic_min_gross_edge", 0) + 1
-                )
+            _record_spread_rejection(rejection_counts, "dynamic_min_gross_edge")
             return None
 
     # ``max_gross_quote`` is the sum of absolute notionals across both legs.
@@ -736,24 +773,35 @@ def _candidate_for_pair(
         gross_cap / 2.0,
     )
     if entry_notional <= 0.0:
+        _record_spread_rejection(rejection_counts, "invalid_entry_notional")
         return None
     capacity_quote = liquidity_gate.capacity_quote(long_q, short_q, entry_notional)
-    if capacity_quote < entry_notional * max(float(config.min_liquidity_capacity_ratio or 0.0), 0.0):
+    if capacity_quote < entry_notional * max(
+        float(config.min_liquidity_capacity_ratio or 0.0), 0.0
+    ):
+        _record_spread_rejection(rejection_counts, "insufficient_liquidity_capacity")
         return None
-    fair_price_value = (a_fair.fair_price if a_fair else b_fair.fair_price if b_fair else reference_mid)
+    fair_price_value = (
+        a_fair.fair_price if a_fair else b_fair.fair_price if b_fair else reference_mid
+    )
     confidence = max(a_fair.confidence if a_fair else 0.0, b_fair.confidence if b_fair else 0.0)
     if confidence < config.min_fair_price_confidence:
+        _record_spread_rejection(rejection_counts, "insufficient_fair_price_confidence")
         return None
-    liquidity_score = liquidity_gate.liquidity_score(capacity_quote=capacity_quote, entry_notional_quote=entry_notional)
-    effective_z = min(abs(z_score), max(float(config.score_z_cap or 0.0), 0.0)) if config.score_z_cap > 0 else abs(z_score)
+    liquidity_score = liquidity_gate.liquidity_score(
+        capacity_quote=capacity_quote, entry_notional_quote=entry_notional
+    )
+    effective_z = (
+        min(abs(z_score), max(float(config.score_z_cap or 0.0), 0.0))
+        if config.score_z_cap > 0
+        else abs(z_score)
+    )
     penalty = _liquidity_rank_penalty_bps(capacity_quote, config)
     # Funding is already a signed component of `edge.ranking_edge_bps`.
     # Adding `score_adjustment_bps` here would rank a favourable funding leg
     # twice, while a headwind was already deducted by the same edge contract.
     hold_time_ms = max(int(quality.hold_time_hint_ms or 0), 60_000)
-    net_edge_per_capital_hour_bps = (
-        edge.expected_net_edge_bps * 3_600_000.0 / hold_time_ms
-    )
+    net_edge_per_capital_hour_bps = edge.expected_net_edge_bps * 3_600_000.0 / hold_time_ms
     # A short observed half-life from a thin/noisy sample must not outrank a
     # slower but robust opportunity solely because it inflates expected edge
     # per capital-hour.  Scale holding-time confidence by both sample depth
@@ -761,30 +809,52 @@ def _candidate_for_pair(
     # downside edge over the confidence-expanded holding-time estimate.
     sample_confidence = min(
         1.0,
-        math.sqrt(
-            max(float(stats.sample_count), 0.0)
-            / max(float(config.min_samples) * 4.0, 1.0)
-        ),
+        math.sqrt(max(float(stats.sample_count), 0.0) / max(float(config.min_samples) * 4.0, 1.0)),
     )
     hold_time_confidence = max(
         0.25,
         min(1.0, sample_confidence * max(min(float(quality.quality), 1.0), 0.0)),
     )
     risk_adjusted_edge_per_capital_hour_bps = (
-        max(edge.worst_case_edge_bps, 0.0)
-        * 3_600_000.0
-        / (hold_time_ms / hold_time_confidence)
+        max(edge.worst_case_edge_bps, 0.0) * 3_600_000.0 / (hold_time_ms / hold_time_confidence)
     )
-    statistical_score = edge.ranking_edge_bps + effective_z * 2.0 + quality.quality * 5.0 + liquidity_score * config.score_liquidity_weight - penalty
+    statistical_score = (
+        edge.ranking_edge_bps
+        + effective_z * 2.0
+        + quality.quality * 5.0
+        + liquidity_score * config.score_liquidity_weight
+        - penalty
+    )
     score = (
         risk_adjusted_edge_per_capital_hour_bps
         if config.rank_by_capital_efficiency
         else statistical_score
     )
-    account_fee_evidence_complete = bool(
+    account_fee_evidence_base_complete = bool(
         config.account_fee_evidence is not None
         and config.account_fee_evidence.complete_for(long_q.venue, short_q.venue)
+        and config.account_fee_evidence.integrity_verified is True
     )
+    account_fee_identity_matches = bool(
+        account_fee_evidence_base_complete
+        and (
+            config.fee_evidence_account_identity_hashes is None
+            or config.account_fee_evidence.identity_matches(
+                config.fee_evidence_account_identity_hashes,
+                long_q.venue,
+                short_q.venue,
+            )
+        )
+    )
+    account_fee_evidence_complete = (
+        account_fee_evidence_base_complete and account_fee_identity_matches
+    )
+    if (
+        account_fee_evidence_base_complete
+        and config.fee_evidence_account_identity_hashes is not None
+        and not account_fee_identity_matches
+    ):
+        screening_reasons.append("account_fee_account_identity_mismatch")
     calculation_version = edge.calculation_version
 
     return SpreadReversionCandidate(
@@ -813,7 +883,11 @@ def _candidate_for_pair(
         funding_timestamp_ms=funding.first_funding_timestamp_ms,
         first_funding_timestamp_ms=funding.first_funding_timestamp_ms,
         fair_price=fair_price_value,
-        venue_premium_bps=((abs(a_fair.premium_bps) if a_fair else 0.0) + (abs(b_fair.premium_bps) if b_fair else 0.0)) / 2.0,
+        venue_premium_bps=(
+            (abs(a_fair.premium_bps) if a_fair else 0.0)
+            + (abs(b_fair.premium_bps) if b_fair else 0.0)
+        )
+        / 2.0,
         fair_price_confidence=confidence,
         mean_reversion_quality=quality.quality,
         half_life_ms=quality.half_life_ms,
@@ -888,9 +962,7 @@ def _candidate_for_pair(
             "high" if stats.std_bps >= float(config.volatility_high_std_bps) else "low"
         ),
         net_edge_per_capital_hour_bps=net_edge_per_capital_hour_bps,
-        risk_adjusted_edge_per_capital_hour_bps=(
-            risk_adjusted_edge_per_capital_hour_bps
-        ),
+        risk_adjusted_edge_per_capital_hour_bps=(risk_adjusted_edge_per_capital_hour_bps),
         hold_time_confidence=hold_time_confidence,
         dynamic_min_gross_edge_bps=dynamic_min_gross_edge_bps,
         contract_normalization_status="complete",
@@ -915,7 +987,9 @@ def _ar1_residual_quality(samples: list[_Sample], center: float) -> tuple[float 
     denominator = sum(value * value for value in residuals[:-1])
     if denominator <= 1e-12:
         return None, 0
-    phi = sum(current * previous for previous, current in zip(residuals, residuals[1:])) / denominator
+    phi = (
+        sum(current * previous for previous, current in zip(residuals, residuals[1:])) / denominator
+    )
     if not 0.0 < phi < 1.0:
         return phi, 0
     intervals = [
@@ -949,7 +1023,10 @@ def _contract_compatibility(a: QuoteSnapshot, b: QuoteSnapshot) -> ContractCompa
         or b.contract_normalization_complete is not True
     ):
         return ContractCompatibility(False, "contract_normalization_incomplete")
-    if str(a.venue_status or "").lower() != "active" or str(b.venue_status or "").lower() != "active":
+    if (
+        str(a.venue_status or "").lower() != "active"
+        or str(b.venue_status or "").lower() != "active"
+    ):
         return ContractCompatibility(False, "venue_not_active")
     for property_name in ("underlying", "quote_currency", "contract_type"):
         left = str(getattr(a, property_name, "") or "").strip().lower()
@@ -973,15 +1050,47 @@ def _contract_compatibility(a: QuoteSnapshot, b: QuoteSnapshot) -> ContractCompa
         return ContractCompatibility(False, "missing_mark_index_source")
     if float(a.contract_multiplier or 0.0) <= 0.0 or float(b.contract_multiplier or 0.0) <= 0.0:
         return ContractCompatibility(False, "missing_contract_multiplier")
-    if int(a.price_precision or 0) <= 0 or int(b.price_precision or 0) <= 0:
+    if not _literal_nonnegative_int(a.price_precision) or not _literal_nonnegative_int(
+        b.price_precision
+    ):
         return ContractCompatibility(False, "missing_price_precision")
-    if int(a.quantity_precision or 0) <= 0 or int(b.quantity_precision or 0) <= 0:
+    if not _literal_nonnegative_int(
+        a.quantity_precision
+    ) or not _literal_nonnegative_int(b.quantity_precision):
         return ContractCompatibility(False, "missing_quantity_precision")
+    for field_name in (
+        "price_tick",
+        "quantity_step_base",
+        "min_quantity_base",
+    ):
+        for quote in (a, b):
+            value = getattr(quote, field_name, 0.0)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                return ContractCompatibility(False, f"missing_{field_name}")
+    for quote in (a, b):
+        min_notional = getattr(quote, "min_notional_quote", None)
+        if (
+            quote.min_notional_evidence_complete is not True
+            or isinstance(min_notional, bool)
+            or not isinstance(min_notional, (int, float))
+            or not math.isfinite(float(min_notional))
+            or float(min_notional) < 0.0
+        ):
+            return ContractCompatibility(False, "missing_min_notional_evidence")
     if not math.isclose(float(a.contract_multiplier), float(b.contract_multiplier), rel_tol=1e-12):
         return ContractCompatibility(False, "mismatched_contract_multiplier")
     if int(a.funding_interval_ms or 0) <= 0 or int(b.funding_interval_ms or 0) <= 0:
         return ContractCompatibility(False, "missing_funding_interval")
     return ContractCompatibility(True)
+
+
+def _literal_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _two_leg_half_spread_bps(a: QuoteSnapshot, b: QuoteSnapshot, reference_mid: float) -> float:
@@ -1003,28 +1112,43 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
 
 
-def _canonical_quotes(left: QuoteSnapshot, right: QuoteSnapshot) -> tuple[QuoteSnapshot, QuoteSnapshot]:
+def _canonical_quotes(
+    left: QuoteSnapshot, right: QuoteSnapshot
+) -> tuple[QuoteSnapshot, QuoteSnapshot]:
     return (left, right) if str(left.venue).lower() <= str(right.venue).lower() else (right, left)
 
 
 def _fee_map(venues: list[VenueConfig]) -> dict[str, float]:
-    return {str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0) for venue in venues if str(venue.venue or "")}
+    return {
+        str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0)
+        for venue in venues
+        if str(venue.venue or "")
+    }
 
 
 def _maker_fee_map(venues: list[VenueConfig]) -> dict[str, float]:
     return {
         str(venue.venue).lower(): float(
-            venue.maker_fee_bps
-            if venue.maker_fee_bps is not None
-            else venue.taker_fee_bps or 0.0
+            venue.maker_fee_bps if venue.maker_fee_bps is not None else venue.taker_fee_bps or 0.0
         )
         for venue in venues
         if str(venue.venue or "")
     }
 
 
-def _single_venue_dislocation_allowed(*, long_outlier: bool, short_outlier: bool, fair_price: dict[str, FairPriceAssessment], config: SpreadReversionConfig) -> bool:
-    return bool(config.single_venue_dislocation_enabled and long_outlier != short_outlier and sum(1 for value in fair_price.values() if value.eligible) >= max(int(config.single_venue_dislocation_min_anchor_venues or 0), 1))
+def _single_venue_dislocation_allowed(
+    *,
+    long_outlier: bool,
+    short_outlier: bool,
+    fair_price: dict[str, FairPriceAssessment],
+    config: SpreadReversionConfig,
+) -> bool:
+    return bool(
+        config.single_venue_dislocation_enabled
+        and long_outlier != short_outlier
+        and sum(1 for value in fair_price.values() if value.eligible)
+        >= max(int(config.single_venue_dislocation_min_anchor_venues or 0), 1)
+    )
 
 
 def _fee_bps(config: SpreadReversionConfig, venue: str) -> float:

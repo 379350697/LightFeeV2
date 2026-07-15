@@ -95,6 +95,10 @@ def _quote(
     mark_price: float = 0.0,
     bid_depth: tuple[tuple[float, float], ...] = (),
     ask_depth: tuple[tuple[float, float], ...] = (),
+    price_tick: float = 0.1,
+    quantity_step_base: float = 0.001,
+    min_quantity_base: float = 0.001,
+    min_notional_quote: float = 0.1,
 ) -> QuoteSnapshot:
     return QuoteSnapshot(
         venue=venue,
@@ -111,6 +115,11 @@ def _quote(
         mark_price=mark_price,
         bid_depth=bid_depth,
         ask_depth=ask_depth,
+        price_tick=price_tick,
+        quantity_step_base=quantity_step_base,
+        min_quantity_base=min_quantity_base,
+        min_notional_quote=min_notional_quote,
+        min_notional_evidence_complete=True,
     )
 
 
@@ -200,6 +209,112 @@ def _quotes_at(
         key: replace(quote, observed_at_ms=now_ms)
         for key, quote in quotes.items()
     }
+
+
+def test_registration_aligns_quantity_to_both_exact_exchange_steps() -> None:
+    tracker = _tracker()
+    quotes = _quotes(now_ms=1_000)
+    quotes["cheap:BTCUSDT"] = replace(
+        quotes["cheap:BTCUSDT"],
+        quantity_step_base=0.5,
+        min_quantity_base=0.5,
+    )
+    quotes["rich:BTCUSDT"] = replace(
+        quotes["rich:BTCUSDT"],
+        quantity_step_base=0.1,
+        min_quantity_base=0.1,
+    )
+
+    event = tracker.register(
+        _candidate(entry_notional_quote=100.0),
+        quotes,
+        finalist_rank=0,
+    )
+
+    assert event is not None
+    assert event["payload"]["requested_base_qty"] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [("min_quantity_base", 0.5), ("min_notional_quote", 50.0)],
+)
+def test_registration_rejects_below_symbol_execution_minimum(
+    field_name: str,
+    value: float,
+) -> None:
+    tracker = _tracker()
+    quotes = {
+        key: replace(quote, **{field_name: value})
+        for key, quote in _quotes(now_ms=1_000).items()
+    }
+
+    assert (
+        tracker.register(
+            _candidate(entry_notional_quote=20.0),
+            quotes,
+            finalist_rank=0,
+        )
+        is None
+    )
+
+
+def test_min_quantity_only_contract_does_not_invent_ask_based_notional_floor() -> None:
+    tracker = _tracker()
+    quotes = _quotes(
+        now_ms=1_000,
+        long_bid=19.0,
+        long_ask=20.0,
+        short_bid=22.0,
+        short_ask=23.0,
+    )
+    quotes = {
+        key: replace(
+            quote,
+            quantity_step_base=1.0,
+            min_quantity_base=1.0,
+            min_notional_quote=0.0,
+        )
+        for key, quote in quotes.items()
+    }
+
+    event = tracker.register(
+        _candidate(entry_notional_quote=22.0),
+        quotes,
+        finalist_rank=0,
+    )
+
+    assert event is not None
+    assert event["payload"]["requested_base_qty"] == pytest.approx(1.0)
+
+
+def test_protocol_notional_floor_is_not_raised_to_step_times_ask() -> None:
+    tracker = _tracker()
+    quotes = _quotes(
+        now_ms=1_000,
+        long_bid=19.0,
+        long_ask=20.0,
+        short_bid=22.0,
+        short_ask=23.0,
+    )
+    quotes = {
+        key: replace(
+            quote,
+            quantity_step_base=1.0,
+            min_quantity_base=1.0,
+            min_notional_quote=10.0,
+        )
+        for key, quote in quotes.items()
+    }
+
+    event = tracker.register(
+        _candidate(entry_notional_quote=22.0),
+        quotes,
+        finalist_rank=0,
+    )
+
+    assert event is not None
+    assert event["payload"]["requested_base_qty"] == pytest.approx(1.0)
 
 
 def _account_fee_evidence(*, schema_v3: bool = False) -> FeeEvidenceBook:
@@ -2613,8 +2728,32 @@ def test_active_exit_uses_fresh_quotes_and_closes_before_terminal() -> None:
 
 def test_unsupported_legacy_bot_ids_do_not_create_hidden_cohorts() -> None:
     tracker = _tracker(paper_bot_ids=["core_v1_bot", "bad_pair_control_bot"])
+    rejection_counts: dict[str, int] = {}
 
-    assert tracker.register_many(_candidate(), _quotes(now_ms=1_000), finalist_rank=0) == []
+    assert tracker.register_many(
+        _candidate(),
+        _quotes(now_ms=1_000),
+        finalist_rank=0,
+        rejection_counts=rejection_counts,
+    ) == []
+    assert rejection_counts == {"paper_bot_configuration_empty": 1}
+
+
+def test_paper_admission_attributes_exact_minimum_rejection() -> None:
+    tracker = _tracker()
+    quotes = _quotes(now_ms=1_000)
+    quotes["cheap:BTCUSDT"] = replace(
+        quotes["cheap:BTCUSDT"], min_notional_quote=1_000.0
+    )
+    rejection_counts: dict[str, int] = {}
+
+    assert tracker.register_many(
+        _candidate(),
+        quotes,
+        finalist_rank=0,
+        rejection_counts=rejection_counts,
+    ) == []
+    assert rejection_counts == {"paper_min_notional_not_met": 1}
 
 
 def test_episode_is_deduplicated_and_restores_from_journal() -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-SPREAD_SNAPSHOT_SCHEMA_VERSION = 3
+SPREAD_SNAPSHOT_SCHEMA_VERSION = 4
 SPREAD_STRATEGY_BUCKET = "spread_reversion"
 
 
@@ -101,9 +101,7 @@ class SpreadReversionCandidate:
     account_fee_evidence_observed_at_ms: int = 0
     account_fee_evidence_source: str = ""
     account_fee_evidence_fingerprint: str = ""
-    account_fee_evidence_provenance: list[dict[str, object]] = field(
-        default_factory=list
-    )
+    account_fee_evidence_provenance: list[dict[str, object]] = field(default_factory=list)
     # P1 research attribution: an immutable model epoch must not mix tuned
     # and holdout observations, and capital efficiency must be auditable.
     research_sample_split: str = "in_sample"
@@ -121,15 +119,30 @@ class SpreadReversionCandidate:
 @dataclass(frozen=True)
 class SpreadSnapshot:
     schema_version: int = SPREAD_SNAPSHOT_SCHEMA_VERSION
+    decision_at_ms: int = 0
     published_at_ms: int = 0
     market_observed_at_ms: int = 0
     snapshot_path: str = ""
     source_mode: str = ""
     degraded_venues: list[str] = field(default_factory=list)
     degraded_symbols: dict[str, list[str]] = field(default_factory=dict)
+    input_quote_count: int = 0
+    valid_quote_count: int = 0
+    evaluated_pair_count: int = 0
+    accepted_pair_count: int = 0
+    paper_configured_enabled: bool = False
+    paper_admission_enabled: bool = False
+    paper_tracked_count: int = 0
+    paper_refresh_status: str = ""
+    paper_event_count: int = 0
+    paper_last_success_at_ms: int = 0
     # Aggregated stable reasons make a zero-candidate refresh diagnostically
     # useful without pretending blocked pairs are tradeable candidates.
     rejection_counts: dict[str, int] = field(default_factory=dict)
+    # Paper admission is a separate funnel from signal construction.  Keep its
+    # reasons separate so accepted signals that never become paper positions
+    # cannot be misreported as a healthy no-event refresh.
+    paper_admission_rejection_counts: dict[str, int] = field(default_factory=dict)
     candidates: list[SpreadReversionCandidate] = field(default_factory=list)
 
 

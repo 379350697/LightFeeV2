@@ -28,10 +28,10 @@ runtime、journal 与诊断工具读取。
   配置中计入。可用 `scripts/validate_fee_evidence.py ... --require-integrity
   --require-venue binance --require-account-identity binance=<sha256>` 离线验证，
   不会访问交易所。
-- sidecar schema v3 承载完整经济学和 funding forecast。解析时同时将 candidate
+- sidecar schema v4 承载完整经济学、funding forecast 和精确执行合约证据。解析时同时将 candidate
   的 venue/symbol 回查到两条原始 quote，要求二者均为已标准化的 linear 合约、
   underlying/quote/multiplier 一致且精度、interval、index 与 venue 状态完整；
-  因此被篡改或跨合约回放的 candidate 不能凭正确的收益公式取得 live 权限。v1/v2
+  因此被篡改或跨合约回放的 candidate 不能凭正确的收益公式取得 live 权限。v1/v2/v3
   快照仍可读，但缺少完整经济学、观测时间或这项合约证明的候选在 live 模式
   fail-closed。
 - 候选以同一 base quantity sizing，受共同 L2 容量、名义上限、保证金和

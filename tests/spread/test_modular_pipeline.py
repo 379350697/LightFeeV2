@@ -44,6 +44,14 @@ def _quote(
         contract_type="linear",
         contract_multiplier=1.0,
         mark_index_source="venue_mark",
+        price_precision=2,
+        quantity_precision=3,
+        price_tick=0.01,
+        quantity_step_base=0.001,
+        min_quantity_base=0.001,
+        min_notional_quote=1.0,
+        min_notional_evidence_complete=True,
+        venue_status="active",
         contract_normalization_complete=True,
     )
 

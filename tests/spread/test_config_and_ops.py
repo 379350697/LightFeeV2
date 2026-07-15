@@ -44,6 +44,8 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_paper_terminal_secs == 1800
     assert strategy.spread_paper_slippage_buffer_bps == 0.0
     assert PersistenceConfig().spread_paper_event_log_path == "runtime/spread-paper-events.jsonl"
+    assert PersistenceConfig().spread_paper_rollback_anchor_path == ""
+    assert PersistenceConfig().spread_paper_event_log_hard_max_bytes == 67_108_864
 
 
 def test_loads_spread_reversion_config_without_loader_changes(tmp_path) -> None:
@@ -88,6 +90,8 @@ spread_paper_slippage_buffer_bps = 4.0
 
 [persistence]
 spread_paper_event_log_path = "runtime/custom-spread-paper.jsonl"
+spread_paper_rollback_anchor_path = "/var/lib/lightfee-test/spread-paper.epoch"
+spread_paper_event_log_hard_max_bytes = 12345678
 
 [[venues]]
 venue = "binance"
@@ -139,6 +143,11 @@ venue = "okx"
     assert config.strategy.spread_paper_terminal_secs == 20
     assert config.strategy.spread_paper_slippage_buffer_bps == 4.0
     assert config.persistence.spread_paper_event_log_path == "runtime/custom-spread-paper.jsonl"
+    assert (
+        config.persistence.spread_paper_rollback_anchor_path
+        == "/var/lib/lightfee-test/spread-paper.epoch"
+    )
+    assert config.persistence.spread_paper_event_log_hard_max_bytes == 12_345_678
     assert config.venues[0].taker_fee_bps == 0.6
     assert config.venues[0].maker_fee_bps == 0.2
 

@@ -1709,6 +1709,8 @@ class TestPlannerDispatchIntegration:
             entry_notional_quote=500.0,
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
+            long_funding_timestamp_ms=605_000,
+            short_funding_timestamp_ms=605_000,
             economics_complete=True,
             economics_observed_at_ms=1_000,
             # This helper represents a complete v3 sidecar candidate.  An

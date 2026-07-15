@@ -108,7 +108,33 @@ class TestFundingTickerType:
 
 
 class TestFundingTickerEnrichment:
-    def test_contract_evidence_is_normalized_from_the_shared_venue_spec(self):
+    @pytest.mark.parametrize("malformed", [float("inf"), float("nan")])
+    def test_nonfinite_symbol_increment_fails_closed_without_exception(
+        self, malformed
+    ):
+        raw = FundingTicker(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            mark_price=100.5,
+            index_price=100.4,
+            base_quantity_evidence=True,
+            price_tick=malformed,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=5.0,
+            min_notional_evidence_complete=True,
+        )
+
+        ticker = MarketDataClient(binance_spec())._enrich_tickers(
+            {"binance:BTCUSDT": raw},
+            observed_at_ms=1,
+        )["binance:BTCUSDT"]
+
+        assert ticker.contract_normalization_complete is False
+
+    def test_contract_evidence_accepts_complete_symbol_level_exchange_proof(self):
         client = MarketDataClient(binance_spec())
         raw = FundingTicker(
             venue="binance",
@@ -118,6 +144,12 @@ class TestFundingTickerEnrichment:
             mark_price=100.5,
             index_price=100.4,
             funding_timestamp_ms=9_000_000,
+            base_quantity_evidence=True,
+            price_tick=0.1,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=5.0,
+            min_notional_evidence_complete=True,
         )
 
         ticker = client._enrich_tickers({"binance:BTCUSDT": raw}, observed_at_ms=1)[
@@ -156,6 +188,35 @@ class TestFundingTickerEnrichment:
 
         assert ticker.contract_normalization_complete is False
         assert ticker.venue_status == "unknown"
+
+    def test_integer_lot_precision_is_complete_when_raw_step_is_positive(self):
+        from lightfee.venues.specs import hyperliquid_spec
+
+        client = MarketDataClient(hyperliquid_spec())
+        raw = FundingTicker(
+            venue="hyperliquid",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            mark_price=100.5,
+            index_price=100.4,
+            funding_timestamp_ms=9_000_000,
+            funding_interval_ms=3_600_000,
+            base_quantity_evidence=True,
+            price_tick=1.0,
+            quantity_step_base=1.0,
+            min_quantity_base=1.0,
+            min_notional_quote=10.0,
+            min_notional_evidence_complete=True,
+        )
+
+        ticker = client._enrich_tickers(
+            {"hyperliquid:BTCUSDT": raw}, observed_at_ms=1
+        )["hyperliquid:BTCUSDT"]
+
+        assert ticker.quantity_precision == 0
+        assert ticker.contract_normalization_complete is True
+        assert ticker.venue_status == "active"
 
 
 class TestPerpLiquidityType:
@@ -338,6 +399,117 @@ class TestParserFixtures:
 
 
 class TestProductionSidecarParserRegressions:
+    @pytest.mark.asyncio
+    async def test_binance_symbol_metadata_controls_each_exact_order_contract(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [
+                        {"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101", "bidQty": "2", "askQty": "3"},
+                        {"symbol": "FOOUSDT", "bidPrice": "2", "askPrice": "2.1", "bidQty": "20", "askQty": "30"},
+                    ]
+                if path == "/fapi/v1/exchangeInfo":
+                    return {"symbols": [
+                        {
+                            "symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+                            "baseAsset": "BTC", "quoteAsset": "USDT", "marginAsset": "USDT",
+                            "filters": [
+                                {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                                {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                            ],
+                        },
+                        {
+                            "symbol": "FOOUSDT", "status": "TRADING", "contractType": "PERPETUAL",
+                            "baseAsset": "FOO", "quoteAsset": "USDT", "marginAsset": "USDT",
+                            "filters": [
+                                {"filterType": "PRICE_FILTER", "tickSize": "0.0001"},
+                                {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                            ],
+                        },
+                    ]}
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {"symbol": symbol, "markPrice": "100", "indexPrice": "100", "lastFundingRate": "0.0001", "nextFundingTime": "4100007200000", "fundingIntervalHours": "8"}
+                        for symbol in ("BTCUSDT", "FOOUSDT")
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return []
+                if path == "/fapi/v1/fundingRate":
+                    return []
+                if path == "/fapi/v1/openInterest":
+                    return {"openInterest": "10"}
+                return {}
+
+        tickers = await FakeBinanceClient(binance_spec()).fetch_funding_tickers(
+            ["BTCUSDT", "FOOUSDT"]
+        )
+
+        btc = tickers["binance:BTCUSDT"]
+        foo = tickers["binance:FOOUSDT"]
+        assert btc.contract_normalization_complete is True
+        assert foo.contract_normalization_complete is True
+        assert btc.quantity_step_base == pytest.approx(0.001)
+        assert foo.quantity_step_base == pytest.approx(1.0)
+        assert btc.price_tick == pytest.approx(0.1)
+        assert foo.price_tick == pytest.approx(0.0001)
+        assert foo.quantity_precision == 0
+
+    @pytest.mark.asyncio
+    async def test_bybit_instrument_metadata_follows_cursor_to_requested_symbol(self):
+        class FakeBybitClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/v5/market/tickers":
+                    return {"result": {"list": [{
+                        "symbol": "TAILUSDT", "bid1Price": "10", "ask1Price": "10.1",
+                        "bid1Size": "2", "ask1Size": "3", "markPrice": "10.05",
+                        "indexPrice": "10.04", "fundingRate": "0.0001",
+                        "nextFundingTime": "4100007200000",
+                    }]}}
+                cursor = str((params or {}).get("cursor", ""))
+                if not cursor:
+                    return {"result": {"list": [], "nextPageCursor": "page-2"}}
+                assert cursor == "page-2"
+                return {"result": {"list": [{
+                    "symbol": "TAILUSDT", "status": "Trading",
+                    "contractType": "LinearPerpetual", "settleCoin": "USDT",
+                    "fundingInterval": "480", "priceFilter": {"tickSize": "0.01"},
+                    "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1", "minNotionalValue": "1"},
+                }], "nextPageCursor": ""}}
+
+        ticker = (
+            await FakeBybitClient(bybit_spec()).fetch_funding_tickers(["TAILUSDT"])
+        )["bybit:TAILUSDT"]
+        assert ticker.contract_normalization_complete is True
+        assert ticker.quantity_step_base == pytest.approx(0.1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_timestamp", [None, True, "NaN", 1])
+    async def test_bybit_unknown_or_invalid_funding_timestamp_fails_closed(
+        self, bad_timestamp
+    ):
+        class FakeBybitClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/v5/market/tickers":
+                    return {"result": {"list": [{
+                        "symbol": "BTCUSDT", "bid1Price": "100", "ask1Price": "101",
+                        "bid1Size": "1", "ask1Size": "1", "markPrice": "100.5",
+                        "indexPrice": "100.4", "fundingRate": "0.0001",
+                        "nextFundingTime": bad_timestamp,
+                    }]}}
+                return {"result": {"list": [{
+                    "symbol": "BTCUSDT", "status": "Trading",
+                    "contractType": "LinearPerpetual", "settleCoin": "USDT",
+                    "fundingInterval": "480", "priceFilter": {"tickSize": "0.1"},
+                    "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001", "minNotionalValue": "1"},
+                }]}}
+
+        ticker = (
+            await FakeBybitClient(bybit_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["bybit:BTCUSDT"]
+        assert ticker.funding_timestamp_ms == 0
+
     """Regression coverage for live sidecar deployment failures."""
 
     @pytest.mark.asyncio
@@ -1183,6 +1355,8 @@ class TestProductionSidecarParserRegressions:
                             }
                         ]
                     }
+                if path == "/api/v2/mix/market/contracts":
+                    return {"data": []}
                 raise AssertionError(f"unexpected path: {path}")
 
         result = await FakeBitgetClient(bitget_spec())._fetch_bitget_style(["BTCUSDT"])
@@ -1208,6 +1382,8 @@ class TestProductionSidecarParserRegressions:
                         ]
                     }
                 if path == "/api/v2/mix/market/current-fund-rate":
+                    return {"data": []}
+                if path == "/api/v2/mix/market/contracts":
                     return {"data": []}
                 raise AssertionError(f"unexpected path: {path}")
 
@@ -1243,6 +1419,10 @@ class TestProductionSidecarParserRegressions:
                             "name": "BTC_USDT",
                             "funding_rate": "0.0004",
                             "funding_next_apply": 4100007200,
+                            "quanto_multiplier": "0.01",
+                            "order_size_min": "1",
+                            "order_price_round": "0.1",
+                            "in_delisting": False,
                         }
                     ]
                 raise AssertionError(f"unexpected path: {path}")
@@ -1292,11 +1472,19 @@ class TestProductionSidecarParserRegressions:
                             "name": "ALL_USDT",
                             "funding_rate": "-0.000269",
                             "funding_next_apply": 4100007200,
+                            "quanto_multiplier": "1",
+                            "order_size_min": "1",
+                            "order_price_round": "0.0001",
+                            "in_delisting": False,
                         },
                         {
                             "name": "LAB_USDT",
                             "funding_rate": "-0.003463",
                             "funding_next_apply": 4100007200,
+                            "quanto_multiplier": "100",
+                            "order_size_min": "0.1",
+                            "order_price_round": "0.00001",
+                            "in_delisting": False,
                         },
                     ]
                 raise AssertionError(f"unexpected path: {path}")
@@ -1311,6 +1499,8 @@ class TestProductionSidecarParserRegressions:
         assert all_ticker.ask_size == pytest.approx(2.0)
         assert lab_ticker.bid_size == pytest.approx(10.0)
         assert lab_ticker.ask_size == pytest.approx(20.0)
+        assert lab_ticker.base_quantity_evidence is True
+        assert lab_ticker.quantity_step_base == pytest.approx(10.0)
 
     @pytest.mark.asyncio
     async def test_gate_contracts_funding_bulk_cache_reuses_fresh_metadata(self):
@@ -1346,11 +1536,19 @@ class TestProductionSidecarParserRegressions:
                             "name": "BTC_USDT",
                             "funding_rate": "0.0004",
                             "funding_next_apply": 4100007200,
+                            "quanto_multiplier": "0.01",
+                            "order_size_min": "1",
+                            "order_price_round": "0.1",
+                            "in_delisting": False,
                         },
                         {
                             "name": "ETH_USDT",
                             "funding_rate": "0.0005",
                             "funding_next_apply": 4100007200,
+                            "quanto_multiplier": "0.01",
+                            "order_size_min": "1",
+                            "order_price_round": "0.01",
+                            "in_delisting": False,
                         },
                     ]
                 raise AssertionError(f"unexpected path: {path}")
@@ -1396,7 +1594,7 @@ class TestProductionSidecarParserRegressions:
             async def _public_post(self, path, body=None):
                 assert body == {"type": "metaAndAssetCtxs"}
                 return [
-                    {"universe": [{"name": "BTC"}]},
+                    {"universe": [{"name": "BTC", "szDecimals": 5}]},
                     [{"coin": "BTC", "markPx": "65000", "funding": "0.0001", "dayNtlVlm": "1000", "openInterest": "20"}],
                 ]
 
@@ -1417,7 +1615,10 @@ class TestProductionSidecarParserRegressions:
             async def _public_post(self, path, body=None):
                 assert body == {"type": "metaAndAssetCtxs"}
                 return [
-                    {"universe": [{"name": "BTC"}, {"name": "MERL"}]},
+                    {"universe": [
+                        {"name": "BTC", "szDecimals": 5},
+                        {"name": "MERL", "szDecimals": 0},
+                    ]},
                     [
                         {
                             "markPx": "65000", "funding": "0.0001",
@@ -1448,7 +1649,10 @@ class TestProductionSidecarParserRegressions:
             async def _public_post(self, path, body=None):
                 assert body == {"type": "metaAndAssetCtxs"}
                 return [
-                    {"universe": [{"name": "BTC"}, {"name": "MERL"}]},
+                    {"universe": [
+                        {"name": "BTC", "szDecimals": 5},
+                        {"name": "MERL", "szDecimals": 0},
+                    ]},
                     [{
                         "markPx": "65000", "funding": "0.0001",
                         "dayNtlVlm": "1000", "openInterest": "20",
@@ -1495,10 +1699,18 @@ class TestProductionSidecarParserRegressions:
                         "data": [{
                             "fundingRate": "0.0002",
                             "fundingTime": "1700000000000",
-                            "markPrice": "10.5",
-                            "indexPrice": "10.4",
                         }]
                     }
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT-SWAP", "markPx": "10.5"}
+                        for i in range(64)
+                    ]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT", "idxPx": "10.4"}
+                        for i in range(64)
+                    ]}
                 if path == "/api/v5/public/open-interest":
                     return {"data": []}
                 return {}
@@ -1510,7 +1722,7 @@ class TestProductionSidecarParserRegressions:
         # V1 parity: funding_rate_bps must be non-zero for large universe
         assert result["okx:S0USDT"].funding_rate_bps == 2.0  # 0.0002 * 10000
         assert result["okx:S63USDT"].funding_rate_bps == 2.0
-        # mark/index must be populated from per-symbol funding response
+        # Mark/index are independent bulk proofs, not funding-response fields.
         assert result["okx:S0USDT"].mark_price == 10.5
         assert result["okx:S0USDT"].index_price == 10.4
         # funding_timestamp_ms must be from funding response
@@ -1542,9 +1754,18 @@ class TestProductionSidecarParserRegressions:
                         "data": [{
                             "fundingRate": "0.0003",
                             "fundingTime": "1700000000000",
-                            "markPrice": "10.5",
                         }]
                     }
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT-SWAP", "markPx": "10.2"}
+                        for i in range(64)
+                    ]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT", "idxPx": "10.1"}
+                        for i in range(64)
+                    ]}
                 if path == "/api/v5/public/open-interest":
                     return {"data": []}
                 return {}
@@ -1590,9 +1811,18 @@ class TestProductionSidecarParserRegressions:
                         "data": [{
                             "fundingRate": "0.0003",
                             "fundingTime": "1700000000000",
-                            "markPrice": "10.5",
                         }]
                     }
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT-SWAP", "markPx": "10.2"}
+                        for i in range(10)
+                    ]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [
+                        {"instId": f"S{i}-USDT", "idxPx": "10.1"}
+                        for i in range(10)
+                    ]}
                 if path == "/api/v5/public/open-interest":
                     return {"data": []}
                 return {}
@@ -1614,7 +1844,10 @@ class TestProductionSidecarParserRegressions:
         class FakeHyperliquidClient(MarketDataClient):
             async def _public_post(self, path, body=None):
                 return [
-                    {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+                    {"universe": [
+                        {"name": "BTC", "szDecimals": 5},
+                        {"name": "ETH", "szDecimals": 4},
+                    ]},
                     [
                         {
                             "coin": "BTC", "markPx": "65000", "funding": "0.0001",
@@ -1652,7 +1885,7 @@ class TestProductionSidecarParserRegressions:
         class FakeHyperliquidClient(MarketDataClient):
             async def _public_post(self, path, body=None):
                 return [
-                    {"universe": [{"name": "BTC"}]},
+                    {"universe": [{"name": "BTC", "szDecimals": 5}]},
                     [{
                         "coin": "BTC", "markPx": "65000", "funding": "0.0001",
                         "dayNtlVlm": "1000", "openInterest": "20",
@@ -1671,8 +1904,8 @@ class TestProductionSidecarParserRegressions:
         assert ticker.funding_timestamp_ms % 3_600_000 == 0
 
     @pytest.mark.asyncio
-    async def test_funding_timestamp_ms_not_zero_for_venues_without_explicit_time(self):
-        """Venues without explicit funding time (Bybit, etc.) must use observed_at_ms."""
+    async def test_missing_funding_timestamp_remains_unknown(self):
+        """Unknown exchange schedule must not be replaced by observation time."""
         class FakeBybitClient(MarketDataClient):
             async def _public_get(self, path, params=None):
                 return {
@@ -1694,9 +1927,436 @@ class TestProductionSidecarParserRegressions:
         result = await FakeBybitClient(bybit_spec())._fetch_bybit_style(["BTCUSDT"])
 
         ticker = result["bybit:BTCUSDT"]
-        # Bybit ticker doesn't include funding timestamp, must use observed_at_ms
-        assert ticker.funding_timestamp_ms > 0
-        # Should be within last few seconds (not 0)
-        import time
-        now_ms = int(time.time() * 1000)
-        assert abs(ticker.funding_timestamp_ms - now_ms) < 10_000
+        assert ticker.funding_timestamp_ms == 0
+
+    @pytest.mark.asyncio
+    async def test_binance_cold_start_interval_comes_from_settlement_history(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{
+                        "symbol": "BTCUSDT",
+                        "lastFundingRate": "0.0001",
+                        "markPrice": "100.5",
+                        "indexPrice": "100.4",
+                        "nextFundingTime": "4100007200000",
+                    }]
+                if path == "/fapi/v1/fundingRate":
+                    assert params == {"symbol": "BTCUSDT", "limit": 2}
+                    return [
+                        {"fundingTime": "4099978400000"},
+                        {"fundingTime": "4100007200000"},
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "1000000"}]
+                if path == "/fapi/v1/openInterest":
+                    return {"symbol": "BTCUSDT", "openInterest": "10"}
+                return {}
+
+        ticker = (
+            await FakeBinanceClient(binance_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["binance:BTCUSDT"]
+
+        assert ticker.funding_interval_ms == 28_800_000
+        assert ticker.funding_interval_source == "venue_funding_history"
+        assert ticker.funding_interval_observed_at_ms > 0
+
+    @pytest.mark.asyncio
+    async def test_okx_contract_counts_are_converted_to_base_and_interval_is_proved(self):
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "bidPx": "100",
+                        "askPx": "101",
+                        "bidSz": "10",
+                        "askSz": "20",
+                        "markPx": "100.5",
+                        "last": "100.5",
+                    }]}
+                if path == "/api/v5/public/instruments":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "ctVal": "0.01",
+                        "ctValCcy": "BTC",
+                        "settleCcy": "USDT",
+                        "ctType": "linear",
+                        "state": "live",
+                        "tickSz": "0.1",
+                        "lotSz": "0.1",
+                        "minSz": "1",
+                    }]}
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "markPx": "100.5",
+                    }]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [{
+                        "instId": "BTC-USDT",
+                        "idxPx": "100.4",
+                    }]}
+                if path == "/api/v5/public/funding-rate":
+                    return {"data": [{
+                        "fundingRate": "0.0001",
+                        "fundingTime": "4099978400000",
+                        "nextFundingTime": "4100007200000",
+                    }]}
+                if path == "/api/v5/public/open-interest":
+                    return {"data": [{"instId": "BTC-USDT-SWAP", "oiUsd": "1000"}]}
+                return {}
+
+        ticker = (
+            await FakeOkxClient(okx_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["okx:BTCUSDT"]
+
+        assert ticker.bid_size == pytest.approx(0.1)
+        assert ticker.ask_size == pytest.approx(0.2)
+        assert ticker.quantity_precision == 3
+        assert ticker.funding_interval_ms == 28_800_000
+        assert ticker.funding_interval_source == "okx_funding_time_pair"
+        assert ticker.min_notional_quote == 0.0
+        assert ticker.min_notional_evidence_complete is True
+        assert ticker.contract_normalization_complete is True
+
+    @pytest.mark.asyncio
+    async def test_okx_funding_cache_keeps_independent_mark_and_index_proof(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.funding_calls = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "bidPx": "100",
+                        "askPx": "101",
+                        "bidSz": "10",
+                        "askSz": "20",
+                        "last": "100.5",
+                    }]}
+                if path == "/api/v5/public/instruments":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "ctVal": "0.01",
+                        "ctValCcy": "BTC",
+                        "settleCcy": "USDT",
+                        "ctType": "linear",
+                        "state": "live",
+                        "tickSz": "0.1",
+                        "lotSz": "0.1",
+                        "minSz": "1",
+                    }]}
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "markPx": "100.5",
+                    }]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [{
+                        "instId": "BTC-USDT",
+                        "idxPx": "100.4",
+                    }]}
+                if path == "/api/v5/public/funding-rate":
+                    self.funding_calls += 1
+                    return {"data": [{
+                        "fundingRate": "0.0001",
+                        "fundingTime": "4099978400000",
+                        "nextFundingTime": "4100007200000",
+                    }]}
+                if path == "/api/v5/public/open-interest":
+                    return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
+                        "oiUsd": "1000",
+                    }]}
+                return {}
+
+        client = FakeOkxClient()
+        first = (await client.fetch_funding_tickers(["BTCUSDT"]))["okx:BTCUSDT"]
+        second = (await client.fetch_funding_tickers(["BTCUSDT"]))["okx:BTCUSDT"]
+
+        assert client.funding_calls == 1
+        assert first.contract_normalization_complete is True
+        assert second.contract_normalization_complete is True
+        assert second.mark_price == pytest.approx(100.5)
+        assert second.index_price == pytest.approx(100.4)
+
+    @pytest.mark.asyncio
+    async def test_bybit_first_fetch_uses_instrument_interval_and_steps(self):
+        class FakeBybitClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/v5/market/tickers":
+                    return {"result": {"list": [{
+                        "symbol": "BTCUSDT",
+                        "bid1Price": "100",
+                        "ask1Price": "101",
+                        "bid1Size": "1",
+                        "ask1Size": "2",
+                        "markPrice": "100.5",
+                        "indexPrice": "100.4",
+                        "fundingRate": "0.0001",
+                        "nextFundingTime": "4100007200000",
+                    }]}}
+                if path == "/v5/market/instruments-info":
+                    return {"result": {"list": [{
+                        "symbol": "BTCUSDT",
+                        "status": "Trading",
+                        "contractType": "LinearPerpetual",
+                        "settleCoin": "USDT",
+                        "fundingInterval": "480",
+                        "priceFilter": {"tickSize": "0.1"},
+                        "lotSizeFilter": {
+                            "qtyStep": "0.001",
+                            "minOrderQty": "0.001",
+                            "minNotionalValue": "1",
+                        },
+                    }]}}
+                return {}
+
+        ticker = (
+            await FakeBybitClient(bybit_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["bybit:BTCUSDT"]
+
+        assert ticker.funding_interval_ms == 28_800_000
+        assert ticker.funding_interval_source == "bybit_instrument_metadata"
+        assert ticker.quantity_precision == 3
+        assert ticker.contract_normalization_complete is True
+
+    @pytest.mark.asyncio
+    async def test_bitget_base_sizes_contract_config_and_interval_share_one_proof(self):
+        class FakeBitgetClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v2/mix/market/tickers":
+                    return {"data": [{
+                        "symbol": "BTCUSDT",
+                        "bidPr": "100",
+                        "askPr": "101",
+                        "bidSz": "1.5",
+                        "askSz": "2.5",
+                        "markPrice": "100.5",
+                        "indexPrice": "100.4",
+                        "fundingRate": "0.0001",
+                    }]}
+                if path == "/api/v2/mix/market/contracts":
+                    return {"data": [{
+                        "symbol": "BTCUSDT",
+                        "baseCoin": "BTC",
+                        "quoteCoin": "USDT",
+                        "symbolType": "perpetual",
+                        "symbolStatus": "normal",
+                        "sizeMultiplier": "0.001",
+                        "minTradeNum": "0.001",
+                        "minTradeUSDT": "1",
+                        "pricePlace": "2",
+                        "priceEndStep": "1",
+                        "fundInterval": "8",
+                    }]}
+                if path == "/api/v2/mix/market/current-fund-rate":
+                    return {"data": [{
+                        "symbol": "BTCUSDT",
+                        "fundingRate": "0.0001",
+                        "nextUpdate": "4100007200000",
+                    }]}
+                return {}
+
+        ticker = (
+            await FakeBitgetClient(bitget_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["bitget:BTCUSDT"]
+
+        assert ticker.bid_size == pytest.approx(1.5)
+        assert ticker.ask_size == pytest.approx(2.5)
+        assert ticker.quantity_precision == 3
+        assert ticker.funding_interval_ms == 28_800_000
+        assert ticker.funding_interval_source == "bitget_contract_config"
+        assert ticker.contract_normalization_complete is True
+
+    @pytest.mark.asyncio
+    async def test_gate_and_hyperliquid_interval_provenance_is_explicit(self):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [{
+                        "contract": "BTC_USDT",
+                        "highest_bid": "100",
+                        "lowest_ask": "101",
+                        "mark_price": "100.5",
+                        "index_price": "100.4",
+                    }]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return [{
+                        "name": "BTC_USDT",
+                        "funding_rate": "0.0001",
+                        "funding_next_apply": 4100007200,
+                        "funding_interval": "28800",
+                        "quanto_multiplier": "0.01",
+                        "order_size_min": "1",
+                        "order_price_round": "0.1",
+                        "in_delisting": False,
+                    }]
+                return {}
+
+        gate_ticker = (
+            await FakeGateClient(gate_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["gate:BTCUSDT"]
+        assert gate_ticker.funding_interval_ms == 28_800_000
+        assert gate_ticker.funding_interval_source == "gate_contract_metadata"
+        assert gate_ticker.min_notional_quote == 0.0
+        assert gate_ticker.min_notional_evidence_complete is True
+        assert gate_ticker.contract_normalization_complete is True
+
+        class FakeHyperliquidClient(MarketDataClient):
+            async def _public_post(self, path, body=None):
+                return [
+                    {"universe": [{"name": "BTC", "szDecimals": 5}]},
+                    [{
+                        "coin": "BTC",
+                        "markPx": "65000",
+                        "oraclePx": "64999",
+                        "funding": "0.0001",
+                        "impactPxs": ["64000", "66000"],
+                    }],
+                ]
+
+        hyper_ticker = (
+            await FakeHyperliquidClient(hyperliquid_spec()).fetch_funding_tickers(
+                ["BTCUSDT"]
+            )
+        )["hyperliquid:BTCUSDT"]
+        assert hyper_ticker.min_notional_quote == 10.0
+        assert hyper_ticker.min_notional_evidence_complete is True
+        assert hyper_ticker.funding_interval_ms == 3_600_000
+        assert hyper_ticker.funding_interval_source == "hyperliquid_protocol_hourly"
+        assert hyper_ticker.funding_interval_observed_at_ms > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "delisting_status",
+        [None, "false", "true", 1, True],
+    )
+    async def test_gate_contract_status_requires_literal_active_boolean(
+        self,
+        delisting_status,
+    ):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [{
+                        "contract": "BTC_USDT",
+                        "highest_bid": "100",
+                        "lowest_ask": "101",
+                        "highest_size": "10",
+                        "lowest_size": "20",
+                        "mark_price": "100.5",
+                        "index_price": "100.4",
+                    }]
+                if path == "/api/v4/futures/usdt/contracts":
+                    contract = {
+                        "name": "BTC_USDT",
+                        "funding_rate": "0.0001",
+                        "funding_next_apply": 4100007200,
+                        "funding_interval": "28800",
+                        "quanto_multiplier": "0.01",
+                        "order_size_min": "1",
+                        "order_price_round": "0.1",
+                    }
+                    if delisting_status is not None:
+                        contract["in_delisting"] = delisting_status
+                    return [contract]
+                return {}
+
+        ticker = (
+            await FakeGateClient(gate_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["gate:BTCUSDT"]
+
+        assert ticker.contract_normalization_complete is False
+        assert ticker.venue_status == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_gate_missing_quanto_never_promotes_contract_sizes_to_base(self):
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [{
+                        "contract": "BTC_USDT",
+                        "highest_bid": "100",
+                        "lowest_ask": "101",
+                        "highest_size": "10",
+                        "lowest_size": "20",
+                        "mark_price": "100.5",
+                        "index_price": "100.4",
+                        "total_size": "500",
+                    }]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return [{
+                        "name": "BTC_USDT",
+                        "funding_rate": "0.0001",
+                        "funding_next_apply": 4100007200,
+                        "funding_interval": "28800",
+                        "order_size_min": "1",
+                        "order_price_round": "0.1",
+                        "in_delisting": False,
+                    }]
+                return {}
+
+        ticker = (
+            await FakeGateClient(gate_spec()).fetch_funding_tickers(["BTCUSDT"])
+        )["gate:BTCUSDT"]
+
+        assert ticker.bid_size == 0.0
+        assert ticker.ask_size == 0.0
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_evidence_reason == "missing_contract_multiplier"
+        assert ticker.contract_normalization_complete is False
+
+    @pytest.mark.asyncio
+    async def test_gate_partial_contract_metadata_retries_and_recovers_next_refresh(self):
+        class FakeGateClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(gate_spec())
+                self.contract_calls = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [{
+                        "contract": "BTC_USDT",
+                        "highest_bid": "100",
+                        "lowest_ask": "101",
+                        "highest_size": "10",
+                        "lowest_size": "20",
+                        "mark_price": "100.5",
+                        "index_price": "100.4",
+                    }]
+                if path == "/api/v4/futures/usdt/contracts":
+                    self.contract_calls += 1
+                    contract = {
+                        "name": "BTC_USDT",
+                        "funding_rate": "0.0001",
+                        "funding_next_apply": 4100007200,
+                        "funding_interval": "28800",
+                        "quanto_multiplier": "0.01",
+                        "order_size_min": "1",
+                        "in_delisting": False,
+                    }
+                    if self.contract_calls > 1:
+                        contract["order_price_round"] = "0.1"
+                    return [contract]
+                return {}
+
+        client = FakeGateClient()
+
+        first = (await client.fetch_funding_tickers(["BTCUSDT"]))[
+            "gate:BTCUSDT"
+        ]
+        second = (await client.fetch_funding_tickers(["BTCUSDT"]))[
+            "gate:BTCUSDT"
+        ]
+
+        assert first.contract_normalization_complete is False
+        assert second.contract_normalization_complete is True
+        assert second.bid_size == pytest.approx(0.1)
+        assert client.contract_calls == 2

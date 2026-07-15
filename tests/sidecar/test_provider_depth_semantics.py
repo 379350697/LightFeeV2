@@ -67,8 +67,21 @@ class TestProviderDepthProvenance:
         import tempfile
         import os
 
+        now_ms = int(time.time() * 1000)
         snapshot = SidecarSnapshot(
-            published_at_ms=int(time.time() * 1000),
+            published_at_ms=now_ms,
+            market_observed_at_ms=now_ms,
+            candidate_build_observed_at_ms=now_ms,
+            candidate_build_diagnostics={
+                "input_quote_count": 0,
+                "requested_symbol_count": 0,
+                "requested_symbols": [],
+                "requested_venues": [],
+                "directional_pair_count": 0,
+                "output_candidate_count": 0,
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
             source_mode="coarse_sidecar",
             acquisition_mode="fresh_sidecar",
         )

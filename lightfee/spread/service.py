@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
+from pathlib import Path
+import tempfile
 import time
 
 from lightfee.config.schema import AppConfig, VenueConfig
@@ -34,6 +38,251 @@ from lightfee.strategy.fee_evidence import (
 
 
 logger = logging.getLogger("lightfee.spread.service")
+
+_PAPER_JOURNAL_HEAD_VERSION = 1
+_PAPER_JOURNAL_EPOCH_VERSION = 2
+_PAPER_JOURNAL_GENESIS_PURPOSE = "spread_paper_genesis"
+_PAPER_JOURNAL_EVENT_PURPOSE = "spread_paper_events"
+_PAPER_JOURNAL_MIN_HARD_MAX_BYTES = 16_384
+
+
+def _paper_journal_head_path(journal_path: str | Path) -> Path:
+    path = Path(journal_path)
+    return path.with_name(f"{path.name}.head")
+
+
+def _paper_rollback_anchor_path(
+    journal_path: str | Path,
+    configured_path: str | Path,
+) -> Path | None:
+    """Return a syntactically independent rollback anchor or fail closed.
+
+    The operating environment is responsible for placing this absolute path
+    on an independently retained volume.  Requiring a distinct directory
+    prevents the prior implementation from silently keeping all three rollback
+    witnesses beside the journal.
+    """
+
+    raw = str(configured_path or "").strip()
+    if not raw:
+        return None
+    anchor = Path(raw)
+    if not anchor.is_absolute():
+        return None
+    try:
+        journal_parent = Path(journal_path).expanduser().resolve(strict=False).parent
+        anchor_parent = anchor.expanduser().resolve(strict=False).parent
+    except OSError:
+        return None
+    if anchor_parent == journal_parent:
+        return None
+    return anchor
+
+
+def _load_paper_journal_head(path: Path) -> tuple[dict[str, object] | None, bool]:
+    if not path.exists():
+        return None, True
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, False
+    if (
+        not isinstance(raw, dict)
+        or raw.get("head_version") != _PAPER_JOURNAL_HEAD_VERSION
+        or not isinstance(raw.get("committed_batch"), dict)
+    ):
+        return None, False
+    return dict(raw["committed_batch"]), True
+
+
+def _publish_durable_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with open(temporary, "w", encoding="utf-8") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
+def _publish_paper_journal_head(path: Path, envelope: dict[str, object]) -> None:
+    _publish_durable_json(
+        path,
+        {
+            "head_version": _PAPER_JOURNAL_HEAD_VERSION,
+            "committed_batch": envelope,
+        },
+    )
+
+
+def _load_paper_journal_epoch(path: Path) -> tuple[dict[str, object] | None, bool]:
+    if not path.exists():
+        return None, True
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, False
+    if (
+        not isinstance(raw, dict)
+        or raw.get("epoch_version") != _PAPER_JOURNAL_EPOCH_VERSION
+        or not isinstance(raw.get("genesis_batch"), dict)
+        or not isinstance(raw.get("latest_committed_batch"), dict)
+        or not isinstance(raw.get("generation"), int)
+        or isinstance(raw.get("generation"), bool)
+        or int(raw["generation"]) < 0
+    ):
+        return None, False
+    return dict(raw), True
+
+
+def _publish_paper_journal_epoch(
+    path: Path,
+    *,
+    genesis: dict[str, object],
+    latest: dict[str, object],
+    generation: int,
+) -> None:
+    _publish_durable_json(
+        path,
+        {
+            "epoch_version": _PAPER_JOURNAL_EPOCH_VERSION,
+            "genesis_batch": genesis,
+            "latest_committed_batch": latest,
+            "generation": int(generation),
+        },
+    )
+
+
+def _publish_paper_journal_checkpoint(
+    path: Path,
+    envelopes: list[dict[str, object]],
+) -> None:
+    if not envelopes:
+        raise ValueError("paper journal checkpoint requires a genesis envelope")
+    _publish_paper_journal_epoch(
+        path,
+        genesis=envelopes[0],
+        latest=envelopes[-1],
+        generation=len(envelopes) - 1,
+    )
+
+
+def _synchronize_paper_journal_head(
+    journal: Journal,
+    head_path: Path,
+    epoch_path: Path,
+    *,
+    now_ms: int,
+    has_legacy_state_records: bool,
+) -> bool:
+    head, head_valid = _load_paper_journal_head(head_path)
+    epoch, epoch_valid = _load_paper_journal_epoch(epoch_path)
+    if not head_valid or not epoch_valid or has_legacy_state_records:
+        return False
+    envelopes = journal.committed_batch_envelopes
+    if epoch is None:
+        if not envelopes and head is None:
+            journal.append_committed_batch(
+                [],
+                ts_ms=now_ms,
+                purpose=_PAPER_JOURNAL_GENESIS_PURPOSE,
+            )
+            envelope = journal.last_committed_batch_envelope
+            assert envelope is not None
+            _publish_paper_journal_head(head_path, envelope)
+            _publish_paper_journal_checkpoint(
+                epoch_path,
+                journal.committed_batch_envelopes,
+            )
+            return True
+        # Even a lone genesis can be a journal+head rollback after previously
+        # committed paper state.  Missing independent state is therefore never
+        # auto-promoted.  An initialization crash fails closed and requires an
+        # explicit operator recovery instead of weakening rollback detection.
+        return False
+    epoch_genesis = epoch["genesis_batch"]
+    epoch_latest = epoch["latest_committed_batch"]
+    epoch_generation = int(epoch["generation"])
+    if (
+        not envelopes
+        or envelopes[0] != epoch_genesis
+        or epoch_generation >= len(envelopes)
+        or envelopes[epoch_generation] != epoch_latest
+    ):
+        return False
+    if (
+        envelopes[0].get("purpose") != _PAPER_JOURNAL_GENESIS_PURPOSE
+        or int(envelopes[0].get("event_count", -1)) != 0
+        or any(
+            envelope.get("purpose") != _PAPER_JOURNAL_EVENT_PURPOSE
+            for envelope in envelopes[1:]
+        )
+    ):
+        return False
+    if head is None or head not in envelopes:
+        return False
+    head_index = envelopes.index(head)
+    latest_index = len(envelopes) - 1
+    if latest_index == epoch_generation and head_index == latest_index:
+        return True
+    if latest_index != epoch_generation + 1:
+        return False
+    latest = envelopes[-1]
+    if head_index == epoch_generation:
+        # Crash after the journal commit but before the external head.
+        _publish_paper_journal_head(head_path, latest)
+    elif head_index != latest_index:
+        return False
+    # Crash after the journal and head commit but before advancing the
+    # independent rollback checkpoint.  Only one generation may be repaired.
+    _publish_paper_journal_checkpoint(epoch_path, envelopes)
+    return True
+
+
+def _paper_journal_has_capacity(
+    journal: Journal,
+    events: list[tuple[str, dict]],
+    *,
+    hard_max_bytes: int,
+) -> bool:
+    maximum = max(int(hard_max_bytes or 0), 1)
+    reserve = min(1_048_576, max(maximum // 10, 4_096))
+    usable_limit = max(maximum - reserve, 1)
+    try:
+        current_size = journal.path.stat().st_size if journal.path.exists() else 0
+    except OSError:
+        return False
+    estimated_batch_bytes = 4_096 + sum(
+        len(
+            json.dumps(
+                {"kind": kind, "payload": payload},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        + 512
+        for kind, payload in events
+    )
+    return current_size + estimated_batch_bytes <= usable_limit
 
 
 def _paper_quote_key(venue: str, symbol: str) -> str:
@@ -115,15 +364,67 @@ class SpreadSidecarService:
             # horizon.  Generic log rotation can prune that registration while
             # keeping a later fill/close row, making safe state reconstruction
             # mathematically impossible.  This dedicated journal therefore
-            # never rotates; normal log compaction settings remain for the
-            # non-stateful event logs.
+            # never rotates.  It is instead hard-bounded and fails paper
+            # admission closed before the bound; normal log compaction settings
+            # remain for non-stateful event logs.
             self._paper_journal = Journal(
                 persistence.spread_paper_event_log_path,
             )
-            self._paper_journal.open()
-            paper_records, paper_journal_intact = (
-                self._paper_journal.read_all_with_integrity()
+            self._paper_journal_head_path = _paper_journal_head_path(
+                persistence.spread_paper_event_log_path
             )
+            self._paper_journal_epoch_path = _paper_rollback_anchor_path(
+                persistence.spread_paper_event_log_path,
+                persistence.spread_paper_rollback_anchor_path,
+            )
+            self._paper_journal.open()
+            paper_hard_max_bytes = int(
+                persistence.spread_paper_event_log_hard_max_bytes
+            )
+            if self._paper_journal_epoch_path is None:
+                logger.error(
+                    "spread paper rollback anchor must be an absolute path in "
+                    "a directory distinct from the journal; admission disabled"
+                )
+                paper_records, paper_journal_intact = [], False
+            elif paper_hard_max_bytes < _PAPER_JOURNAL_MIN_HARD_MAX_BYTES:
+                logger.error(
+                    "spread paper journal hard capacity is below safe minimum; "
+                    "admission disabled"
+                )
+                paper_records, paper_journal_intact = [], False
+            else:
+                paper_records, paper_journal_intact = (
+                    self._paper_journal.read_committed_batches_with_integrity(
+                        max_bytes=paper_hard_max_bytes,
+                    )
+                )
+            if paper_journal_intact and not self._paper_journal.has_archives():
+                try:
+                    paper_journal_intact = _synchronize_paper_journal_head(
+                        self._paper_journal,
+                        self._paper_journal_head_path,
+                        self._paper_journal_epoch_path,
+                        now_ms=int(time.time() * 1000),
+                        has_legacy_state_records=any(
+                            str(record.get("kind", "") or "").startswith("opportunity.paper_")
+                            for record in self._paper_journal.legacy_records
+                        ),
+                    )
+                except OSError:
+                    logger.exception("spread paper journal head synchronization failed")
+                    paper_journal_intact = False
+            if paper_journal_intact and not _paper_journal_has_capacity(
+                self._paper_journal,
+                [],
+                hard_max_bytes=(
+                    persistence.spread_paper_event_log_hard_max_bytes
+                ),
+            ):
+                logger.error(
+                    "spread paper journal capacity limit reached; admission disabled"
+                )
+                paper_journal_intact = False
             if paper_journal_intact and not self._paper_journal.has_archives():
                 self._paper_tracker.restore_from_records(
                     paper_records,
@@ -142,40 +443,37 @@ class SpreadSidecarService:
             try:
                 self._paper_journal.close()
             except Exception:
-                logger.exception(
-                    "spread sidecar journal close failed; continuing resource cleanup"
-                )
+                logger.exception("spread sidecar journal close failed; continuing resource cleanup")
             finally:
                 self._paper_journal = None
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
-        observed_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        self._refresh_fee_evidence(observed_ms)
-        self._restore_stats_checkpoint_once(observed_ms)
-        quotes, degraded_venues, source_mode = await self._fetch_quotes(observed_ms)
+        decision_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        self._refresh_fee_evidence(decision_at_ms)
+        self._restore_stats_checkpoint_once(decision_at_ms)
+        (
+            quotes,
+            degraded_venues,
+            source_mode,
+            input_quote_count,
+            market_observed_at_ms,
+            degraded_symbols,
+        ) = await self._fetch_quotes(decision_at_ms)
         rejection_counts: dict[str, int] = {}
+        evaluation_diagnostics: dict[str, int] = {}
         candidates = self.signal_engine.build(
             quotes,
             list(self.config.symbols),
-            now_ms=observed_ms,
+            now_ms=decision_at_ms,
             rejection_counts=rejection_counts,
+            diagnostics=evaluation_diagnostics,
         )
-        snapshot = SpreadSnapshot(
-            published_at_ms=observed_ms,
-            market_observed_at_ms=observed_ms,
-            snapshot_path=str(self.snapshot_path),
-            source_mode=source_mode,
-            degraded_venues=sorted(degraded_venues),
-            rejection_counts=rejection_counts,
-            candidates=candidates,
-        )
-        publish_spread_snapshot(snapshot, self.snapshot_path)
         try:
             publish_spread_stats_checkpoint(
                 self.stats,
                 self.stats_checkpoint_path,
                 model_epoch=self.signal_config.model_epoch,
-                now_ms=observed_ms,
+                now_ms=decision_at_ms,
             )
         except OSError:
             # The next process starts cold if this fails, which is safe because
@@ -184,7 +482,39 @@ class SpreadSidecarService:
                 "spread stats checkpoint publish failed; next restart will cold-start",
                 extra={"checkpoint_path": self.stats_checkpoint_path},
             )
-        await self._refresh_paper(candidates, quotes, observed_ms)
+        paper_result = await self._refresh_paper(
+            candidates,
+            quotes,
+            decision_at_ms,
+        )
+        published_at_ms = (
+            decision_at_ms if now_ms is not None else max(int(time.time() * 1000), decision_at_ms)
+        )
+        snapshot = SpreadSnapshot(
+            decision_at_ms=decision_at_ms,
+            published_at_ms=published_at_ms,
+            market_observed_at_ms=market_observed_at_ms,
+            snapshot_path=str(self.snapshot_path),
+            source_mode=source_mode,
+            degraded_venues=sorted(degraded_venues),
+            degraded_symbols=degraded_symbols,
+            input_quote_count=input_quote_count,
+            valid_quote_count=len(quotes),
+            evaluated_pair_count=int(evaluation_diagnostics.get("evaluated_pair_count", 0)),
+            accepted_pair_count=int(evaluation_diagnostics.get("accepted_pair_count", 0)),
+            paper_configured_enabled=(self.config.strategy.spread_paper_enabled is True),
+            paper_admission_enabled=self._paper_tracker.enabled,
+            paper_tracked_count=self._paper_tracker.tracked_count,
+            paper_refresh_status=str(paper_result["status"]),
+            paper_event_count=int(paper_result["event_count"]),
+            paper_last_success_at_ms=int(paper_result["last_success_at_ms"]),
+            rejection_counts=rejection_counts,
+            paper_admission_rejection_counts=dict(
+                paper_result["admission_rejection_counts"]
+            ),
+            candidates=candidates,
+        )
+        publish_spread_snapshot(snapshot, self.snapshot_path)
         return snapshot
 
     def _restore_stats_checkpoint_once(self, now_ms: int) -> None:
@@ -203,92 +533,209 @@ class SpreadSidecarService:
         candidates: list,
         quotes: dict[str, QuoteSnapshot],
         observed_ms: int,
-    ) -> None:
-        if self._paper_journal is None or not self._paper_tracker.enabled:
-            return
-        paper_events: list[tuple[str, dict]] = []
-        for rank, candidate in enumerate(candidates):
-            if rank >= self._paper_tracker.config.finalist_limit:
-                break
-            for registered_event in self._paper_tracker.register_many(
-                candidate,
+    ) -> dict[str, int | str | dict[str, int]]:
+        if self.config.strategy.spread_paper_enabled is not True:
+            return {
+                "status": "disabled",
+                "event_count": 0,
+                "last_success_at_ms": 0,
+                "admission_rejection_counts": {},
+            }
+        if self._paper_journal is None:
+            return {
+                "status": "journal_unavailable",
+                "event_count": 0,
+                "last_success_at_ms": 0,
+                "admission_rejection_counts": {"paper_journal_unavailable": 1},
+            }
+        if not self._paper_tracker.enabled:
+            return {
+                "status": "admission_disabled",
+                "event_count": 0,
+                "last_success_at_ms": 0,
+                "admission_rejection_counts": {"paper_admission_disabled": 1},
+            }
+        try:
+            paper_events: list[tuple[str, dict]] = []
+            admission_rejection_counts: dict[str, int] = {}
+            finalist_limit = self._paper_tracker.config.finalist_limit
+            if len(candidates) > finalist_limit:
+                admission_rejection_counts["paper_finalist_limit"] = (
+                    len(candidates) - finalist_limit
+                )
+            for rank, candidate in enumerate(candidates):
+                if rank >= finalist_limit:
+                    break
+                for registered_event in self._paper_tracker.register_many(
+                    candidate,
+                    quotes,
+                    finalist_rank=rank,
+                    decision_at_ms=observed_ms,
+                    rejection_counts=admission_rejection_counts,
+                ):
+                    paper_events.append(
+                        (
+                            str(registered_event["kind"]),
+                            dict(registered_event["payload"]),
+                        )
+                    )
+            for settlement_event in self._paper_tracker.record_observed_public_funding_settlements(
+                observed_ms,
                 quotes,
-                finalist_rank=rank,
-                decision_at_ms=observed_ms,
             ):
                 paper_events.append(
                     (
-                        str(registered_event["kind"]),
-                        dict(registered_event["payload"]),
+                        str(settlement_event["kind"]),
+                        dict(settlement_event["payload"]),
                     )
                 )
-        for settlement_event in self._paper_tracker.record_observed_public_funding_settlements(
-            observed_ms,
-            quotes,
-        ):
-            paper_events.append(
-                (
-                    str(settlement_event["kind"]),
-                    dict(settlement_event["payload"]),
+            for event in self._paper_tracker.evaluate_due(observed_ms, quotes):
+                paper_events.append((str(event["kind"]), dict(event["payload"])))
+            if paper_events:
+                if not _paper_journal_has_capacity(
+                    self._paper_journal,
+                    paper_events,
+                    hard_max_bytes=(
+                        self.config.persistence.spread_paper_event_log_hard_max_bytes
+                    ),
+                ):
+                    raise OSError(
+                        "spread paper journal hard capacity limit reached"
+                    )
+                self._paper_journal.append_committed_batch(
+                    paper_events,
+                    ts_ms=observed_ms,
+                    purpose=_PAPER_JOURNAL_EVENT_PURPOSE,
                 )
-            )
-        for event in self._paper_tracker.evaluate_due(observed_ms, quotes):
-            paper_events.append((str(event["kind"]), dict(event["payload"])))
-        self._paper_journal.append_many(paper_events, ts_ms=observed_ms)
+                envelope = self._paper_journal.last_committed_batch_envelope
+                assert envelope is not None
+                _publish_paper_journal_head(
+                    self._paper_journal_head_path,
+                    envelope,
+                )
+                _publish_paper_journal_checkpoint(
+                    self._paper_journal_epoch_path,
+                    self._paper_journal.committed_batch_envelopes,
+                )
+        except Exception:
+            self._paper_tracker.invalidate_replay()
+            raise
+        return {
+            "status": "success",
+            "event_count": len(paper_events),
+            "last_success_at_ms": observed_ms,
+            "admission_rejection_counts": admission_rejection_counts,
+        }
 
     async def _fetch_quotes(
         self,
         observed_ms: int,
-    ) -> tuple[dict[str, QuoteSnapshot], set[str], str]:
+    ) -> tuple[
+        dict[str, QuoteSnapshot],
+        set[str],
+        str,
+        int,
+        int,
+        dict[str, list[str]],
+    ]:
         snapshot = load_snapshot(self.sidecar_snapshot_path)
         configured_venues = {
-            str(vc.venue or "").lower()
-            for vc in self.config.venues
-            if str(vc.venue or "").strip()
+            str(vc.venue or "").lower() for vc in self.config.venues if str(vc.venue or "").strip()
         }
         if snapshot is None:
-            return {}, configured_venues, "sidecar_snapshot_unavailable"
+            return {}, configured_venues, "sidecar_snapshot_unavailable", 0, 0, {}
 
         max_age_ms = int(self.config.runtime.sidecar_snapshot_max_age_ms)
         published_at_ms = int(snapshot.published_at_ms or 0)
-        market_observed_at_ms = int(snapshot.market_observed_at_ms or 0)
         if (
             published_at_ms <= 0
             or published_at_ms > observed_ms
             or observed_ms - published_at_ms > max_age_ms
-            or market_observed_at_ms <= 0
-            or market_observed_at_ms > observed_ms
-            or observed_ms - market_observed_at_ms > max_age_ms
         ):
-            return {}, configured_venues, "sidecar_snapshot_stale"
+            return (
+                {},
+                configured_venues,
+                "sidecar_snapshot_stale",
+                len(snapshot.quotes),
+                0,
+                {},
+            )
 
         quotes: dict[str, QuoteSnapshot] = {}
-        degraded_venues = {
-            str(venue).lower()
-            for venue in snapshot.degraded_venues
-            if str(venue)
+        degraded_venues = {str(venue).lower() for venue in snapshot.degraded_venues if str(venue)}
+        degraded_symbol_sets: dict[str, set[str]] = {
+            str(venue).lower(): {str(symbol).upper() for symbol in symbols if str(symbol)}
+            for venue, symbols in snapshot.degraded_symbols.items()
+            if isinstance(symbols, list)
         }
-        dropped_count = 0
+        source_declared_degradation = bool(snapshot.degraded_venues or degraded_symbol_sets)
+        invalid_quote_keys: set[str] = set()
         for key, quote in snapshot.quotes.items():
-            if _quote_is_valid_for_spread_sidecar(
+            venue = str(getattr(quote, "venue", "") or "").strip().lower()
+            symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
+            if venue in degraded_venues or symbol in degraded_symbol_sets.get(venue, set()):
+                invalid_quote_keys.add(str(key))
+                continue
+            if not _quote_is_valid_for_spread_sidecar(
                 quote,
                 observed_ms=observed_ms,
                 max_age_ms=max_age_ms,
             ):
-                quotes[str(key)] = quote
-                continue
-            dropped_count += 1
+                invalid_quote_keys.add(str(key))
+                if venue and symbol:
+                    degraded_symbol_sets.setdefault(venue, set()).add(symbol)
+
+        # Apply the final degradation set in a second pass.  A one-pass filter
+        # is insertion-order dependent: a fresh quote encountered before a
+        # stale sibling can survive even after its (venue, symbol) is marked
+        # degraded.  Per-symbol degradation also avoids discarding unrelated
+        # fresh instruments from the same otherwise healthy venue.
+        for key, quote in snapshot.quotes.items():
             venue = str(getattr(quote, "venue", "") or "").strip().lower()
-            if venue:
-                degraded_venues.add(venue)
+            symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
+            if (
+                str(key) in invalid_quote_keys
+                or venue in degraded_venues
+                or symbol in degraded_symbol_sets.get(venue, set())
+            ):
+                continue
+            quotes[str(key)] = quote
+
+        degraded_symbols = {
+            venue: sorted(symbols) for venue, symbols in degraded_symbol_sets.items() if symbols
+        }
+        dropped_count = len(snapshot.quotes) - len(quotes)
 
         if dropped_count and not quotes:
             if not degraded_venues:
                 degraded_venues.update(configured_venues)
-            return {}, degraded_venues, "sidecar_snapshot_quotes_stale"
+            source_mode = (
+                "sidecar_snapshot_degraded"
+                if source_declared_degradation
+                else "sidecar_snapshot_quotes_stale"
+            )
+            return (
+                {},
+                degraded_venues,
+                source_mode,
+                len(snapshot.quotes),
+                0,
+                degraded_symbols,
+            )
 
         source_mode = "sidecar_snapshot_partial" if dropped_count else "sidecar_snapshot"
-        return quotes, degraded_venues, source_mode
+        market_observed_at_ms = max(
+            (int(quote.observed_at_ms or 0) for quote in quotes.values()),
+            default=0,
+        )
+        return (
+            quotes,
+            degraded_venues,
+            source_mode,
+            len(snapshot.quotes),
+            market_observed_at_ms,
+            degraded_symbols,
+        )
 
     def _load_fee_evidence(self, now_ms: int) -> FeeEvidenceBook:
         return load_fee_evidence(
@@ -321,9 +768,7 @@ class SpreadSidecarService:
         strategy = config.strategy
         manifest = DEFAULT_SPREAD_RESEARCH_MANIFEST
         if strategy.spread_paper_enabled:
-            manifest = load_spread_research_manifest(
-                strategy.spread_paper_research_manifest_path
-            )
+            manifest = load_spread_research_manifest(strategy.spread_paper_research_manifest_path)
             if manifest.model_epoch != strategy.spread_paper_model_epoch:
                 raise ValueError(
                     "spread research manifest model_epoch must match "
@@ -346,16 +791,12 @@ class SpreadSidecarService:
             configured_taker,
             configured_maker,
             fee_evidence,
-            allow_verified_maker_rebates=(
-                strategy.spread_allow_verified_maker_rebates is True
-            ),
+            allow_verified_maker_rebates=(strategy.spread_allow_verified_maker_rebates is True),
         )
         return SpreadPaperConfig(
             enabled=strategy.spread_paper_enabled,
             finalist_limit=int(strategy.spread_paper_finalist_limit),
-            min_decision_latency_ms=int(
-                strategy.spread_paper_min_decision_latency_ms
-            ),
+            min_decision_latency_ms=int(strategy.spread_paper_min_decision_latency_ms),
             markout_secs=list(strategy.spread_paper_markout_secs),
             terminal_secs=int(strategy.spread_paper_terminal_secs),
             active_exit_enabled=True,
@@ -376,16 +817,12 @@ class SpreadSidecarService:
             quote_skew_ms=strategy.spread_quote_skew_ms,
             latency_buffer_bps=float(strategy.spread_paper_latency_buffer_bps),
             require_l2_vwap=strategy.spread_paper_require_l2_vwap,
-            require_account_fee_evidence=(
-                strategy.spread_paper_require_account_fee_evidence
-            ),
+            require_account_fee_evidence=(strategy.spread_paper_require_account_fee_evidence),
             account_fee_evidence=fee_evidence,
             fee_evidence_account_identity_hashes=dict(
                 config.runtime.fee_evidence_account_identity_hashes
             ),
-            allow_verified_maker_rebates=(
-                strategy.spread_allow_verified_maker_rebates is True
-            ),
+            allow_verified_maker_rebates=(strategy.spread_allow_verified_maker_rebates is True),
             oos_start_ms=int(strategy.spread_paper_oos_start_ms),
             require_out_of_sample=strategy.spread_paper_require_out_of_sample,
             research_manifest=manifest,

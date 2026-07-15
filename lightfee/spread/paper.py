@@ -9,8 +9,9 @@ remain non-official unless a trade-tape/queue adapter is added.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from enum import StrEnum
-from math import isfinite
+from math import gcd, isfinite
 from typing import Iterable
 
 from lightfee.offline.paper_outcome import classify_paper_outcome
@@ -972,43 +973,57 @@ class SpreadPaperTracker:
         *,
         finalist_rank: int,
         decision_at_ms: int | None = None,
+        rejection_counts: dict[str, int] | None = None,
     ) -> list[dict]:
-        if not self.enabled or finalist_rank >= self.config.finalist_limit:
+        def reject(reason: str) -> list[dict]:
+            if rejection_counts is not None:
+                rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
             return []
-        if (
-            candidate.signal_status != "entry_ready"
-            or candidate.economics_complete is not True
-            or candidate.fee_evidence_complete is not True
-        ):
-            return []
+
+        def count(reason: str) -> None:
+            if rejection_counts is not None:
+                rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
+
+        if not self.enabled:
+            return reject("paper_tracker_disabled")
+        if finalist_rank >= self.config.finalist_limit:
+            return reject("paper_finalist_limit")
+        if candidate.signal_status != "entry_ready":
+            return reject("paper_candidate_not_entry_ready")
+        if candidate.economics_complete is not True:
+            return reject("paper_candidate_economics_incomplete")
+        if candidate.fee_evidence_complete is not True:
+            return reject("paper_candidate_fee_evidence_incomplete")
         # Do not let a manually constructed candidate turn an unverified
         # contract into an official paper observation.  Snapshot v1/v2
         # compatibility defaults to ``unknown`` and must remain diagnostic
         # only until the signed-basis builder proves the two legs compatible.
         if str(candidate.contract_normalization_status or "").lower() != "complete":
-            return []
+            return reject("paper_contract_normalization_incomplete")
         if candidate.calculation_version != _candidate_calculation_version(self.config):
-            return []
+            return reject("paper_calculation_version_mismatch")
         if str(candidate.model_epoch or "") != self.config.model_epoch:
-            return []
+            return reject("paper_model_epoch_mismatch")
         if not _candidate_account_fee_evidence_complete(self.config, candidate):
-            return []
+            return reject("paper_account_fee_evidence_incomplete")
         if candidate.symbol.upper() in _excluded_symbols(self.config):
-            return []
+            return reject("paper_symbol_excluded")
         if _allowed_labels(self.config) and candidate.opportunity_label not in _allowed_labels(self.config):
-            return []
+            return reject("paper_opportunity_label_disallowed")
         try:
             decision_ms = int(
                 candidate.signal_ts_ms if decision_at_ms is None else decision_at_ms
             )
         except (TypeError, ValueError, OverflowError):
-            return []
-        if decision_ms <= 0 or int(candidate.signal_ts_ms or 0) > decision_ms:
-            return []
+            return reject("paper_decision_timestamp_invalid")
+        if decision_ms <= 0:
+            return reject("paper_decision_timestamp_invalid")
+        if int(candidate.signal_ts_ms or 0) > decision_ms:
+            return reject("paper_candidate_after_decision")
         long_quote = _quote_for(quotes, candidate.long_venue, candidate.symbol)
         short_quote = _quote_for(quotes, candidate.short_venue, candidate.symbol)
         if long_quote is None or short_quote is None:
-            return []
+            return reject("paper_quote_missing")
         if not _quotes_fresh(
             long_quote,
             short_quote,
@@ -1016,18 +1031,36 @@ class SpreadPaperTracker:
             ttl_ms=self.config.quote_ttl_ms,
             quote_skew_ms=self.config.quote_skew_ms,
         ):
-            return []
+            return reject("paper_quote_stale_or_skewed")
 
+        bots = _paper_bot_specs(self.config)
+        if not bots:
+            return reject("paper_bot_configuration_empty")
         events: list[dict] = []
-        for bot in _paper_bot_specs(self.config):
+        for bot in bots:
             if not _paper_fee_evidence_complete(
                 self.config,
                 candidate,
                 bot,
             ):
+                count("paper_bot_fee_evidence_incomplete")
                 continue
             paper_id = _paper_id(candidate, bot.bot_id)
-            if paper_id in self._known_paper_ids or self._episode_in_cooldown(candidate, bot.bot_id):
+            if paper_id in self._known_paper_ids:
+                count("paper_duplicate")
+                continue
+            if self._episode_in_cooldown(candidate, bot.bot_id):
+                count("paper_episode_cooldown")
+                continue
+            build_rejection = self._position_build_rejection_reason(
+                candidate=candidate,
+                long_quote=long_quote,
+                short_quote=short_quote,
+                bot=bot,
+                decision_at_ms=decision_ms,
+            )
+            if build_rejection:
+                count(build_rejection)
                 continue
             position = self._build_position(
                 paper_id=paper_id,
@@ -1039,6 +1072,7 @@ class SpreadPaperTracker:
                 decision_at_ms=decision_ms,
             )
             if position is None:
+                count("paper_execution_build_failure")
                 continue
             self._positions[paper_id] = position
             self._emitted_horizons[paper_id] = set()
@@ -1046,6 +1080,42 @@ class SpreadPaperTracker:
             self._record_episode(position)
             events.append(_registration_event(position))
         return events
+
+    def _position_build_rejection_reason(
+        self,
+        *,
+        candidate: SpreadReversionCandidate,
+        long_quote: QuoteSnapshot,
+        short_quote: QuoteSnapshot,
+        bot: SpreadPaperBotSpec,
+        decision_at_ms: int,
+    ) -> str:
+        if decision_at_ms <= 0:
+            return "paper_decision_timestamp_invalid"
+        execution_contract = _execution_contract_from_config(self.config)
+        if not execution_contract.digest:
+            return "paper_execution_contract_invalid"
+        sample_split = _research_sample_split(candidate, self.config, decision_at_ms)
+        if self.config.require_out_of_sample and sample_split != "out_of_sample":
+            return "paper_out_of_sample_required"
+        target_notional = float(candidate.entry_notional_quote or 0.0)
+        long_raw = _entry_raw_price(long_quote, "long", bot.entry_long_role)
+        short_raw = _entry_raw_price(short_quote, "short", bot.entry_short_role)
+        if target_notional <= 0.0 or long_raw <= 0.0 or short_raw <= 0.0:
+            return "paper_entry_price_or_notional_invalid"
+        requested_qty = target_notional / max(long_raw, short_raw)
+        _, quantity_rejection = _aligned_executable_quantity_with_reason(
+            requested_qty,
+            long_quote,
+            short_quote,
+            long_price=long_raw,
+            short_price=short_raw,
+        )
+        if quantity_rejection:
+            return quantity_rejection
+        if not _paper_bot_execution_supported(bot):
+            return "paper_bot_execution_unsupported"
+        return ""
 
     def restore_from_records(
         self,
@@ -1509,6 +1579,13 @@ class SpreadPaperTracker:
         if target_notional <= 0.0 or long_raw <= 0.0 or short_raw <= 0.0:
             return None
         requested_qty = target_notional / max(long_raw, short_raw)
+        requested_qty = _aligned_executable_quantity(
+            requested_qty,
+            long_quote,
+            short_quote,
+            long_price=long_raw,
+            short_price=short_raw,
+        )
         if requested_qty <= 0.0:
             return None
         if not _paper_bot_execution_supported(bot):
@@ -1636,6 +1713,21 @@ class SpreadPaperTracker:
                 position.requested_base_qty,
                 _entry_capacity(maker_quote, maker_leg),
             )
+            maker_qty = _aligned_executable_quantity(
+                maker_qty,
+                long_quote,
+                short_quote,
+                long_price=_entry_raw_price(
+                    long_quote,
+                    "long",
+                    position.long_leg.entry_liquidity_role,
+                ),
+                short_price=_entry_raw_price(
+                    short_quote,
+                    "short",
+                    position.short_leg.entry_liquidity_role,
+                ),
+            )
             if maker_qty <= 0.0 or maker_position_leg.entry_raw_price is None:
                 return None
             filled_maker = _filled_leg(
@@ -1731,6 +1823,21 @@ class SpreadPaperTracker:
                 hedge_position_leg.entry_liquidity_role,
                 qty,
                 position.entry_notional_quote,
+            ),
+        )
+        qty = _aligned_executable_quantity(
+            qty,
+            long_quote,
+            short_quote,
+            long_price=(
+                position.long_leg.entry_price
+                if maker_leg == "long"
+                else hedge_execution.price
+            ),
+            short_price=(
+                hedge_execution.price
+                if maker_leg == "long"
+                else position.short_leg.entry_price
             ),
         )
         if qty <= 0.0:
@@ -1841,6 +1948,13 @@ class SpreadPaperTracker:
                 quantity,
                 position.entry_notional_quote,
             ),
+        )
+        quantity = _aligned_executable_quantity(
+            quantity,
+            long_quote,
+            short_quote,
+            long_price=long_execution.price,
+            short_price=short_execution.price,
         )
         if quantity <= 0.0:
             return None
@@ -2378,6 +2492,124 @@ def _entry_quantity_under_notional_cap(
         else:
             high = mid
     return low
+
+
+def _positive_contract_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed <= 0:
+        return None
+    return parsed
+
+
+def _nonnegative_contract_decimal(value: object) -> Decimal | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
+def _common_quantity_step(
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+) -> Decimal | None:
+    left = _positive_contract_decimal(long_quote.quantity_step_base)
+    right = _positive_contract_decimal(short_quote.quantity_step_base)
+    if left is None or right is None:
+        return None
+    decimal_places = max(-left.as_tuple().exponent, -right.as_tuple().exponent, 0)
+    if decimal_places > 18:
+        return None
+    scale = 10**decimal_places
+    left_units = int(left * scale)
+    right_units = int(right * scale)
+    if left_units <= 0 or right_units <= 0:
+        return None
+    common_units = abs(left_units * right_units) // gcd(left_units, right_units)
+    return Decimal(common_units) / Decimal(scale)
+
+
+def _aligned_executable_quantity(
+    quantity: object,
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+    *,
+    long_price: object,
+    short_price: object,
+) -> float:
+    """Floor a paper hedge to a quantity executable on both exact contracts."""
+    aligned, _ = _aligned_executable_quantity_with_reason(
+        quantity,
+        long_quote,
+        short_quote,
+        long_price=long_price,
+        short_price=short_price,
+    )
+    return aligned
+
+
+def _aligned_executable_quantity_with_reason(
+    quantity: object,
+    long_quote: QuoteSnapshot,
+    short_quote: QuoteSnapshot,
+    *,
+    long_price: object,
+    short_price: object,
+) -> tuple[float, str]:
+    """Return the common executable quantity and a stable rejection reason."""
+    requested = _positive_contract_decimal(quantity)
+    common_step = _common_quantity_step(long_quote, short_quote)
+    long_px = _positive_contract_decimal(long_price)
+    short_px = _positive_contract_decimal(short_price)
+    if requested is None or long_px is None or short_px is None:
+        return 0.0, "paper_quantity_or_price_invalid"
+    if common_step is None:
+        return 0.0, "paper_quantity_step_invalid"
+    aligned = (requested / common_step).to_integral_value(
+        rounding=ROUND_FLOOR
+    ) * common_step
+    long_min_qty = _positive_contract_decimal(long_quote.min_quantity_base)
+    short_min_qty = _positive_contract_decimal(short_quote.min_quantity_base)
+    long_min_notional = (
+        _nonnegative_contract_decimal(long_quote.min_notional_quote)
+        if long_quote.min_notional_evidence_complete is True
+        else None
+    )
+    short_min_notional = (
+        _nonnegative_contract_decimal(short_quote.min_notional_quote)
+        if short_quote.min_notional_evidence_complete is True
+        else None
+    )
+    if any(
+        value is None
+        for value in (
+            long_min_qty,
+            short_min_qty,
+            long_min_notional,
+            short_min_notional,
+        )
+    ):
+        return 0.0, "paper_contract_minimum_missing"
+    assert long_min_qty is not None
+    assert short_min_qty is not None
+    assert long_min_notional is not None
+    assert short_min_notional is not None
+    if aligned < max(long_min_qty, short_min_qty):
+        return 0.0, "paper_min_quantity_not_met"
+    if long_min_notional > 0 and aligned * long_px < long_min_notional:
+        return 0.0, "paper_min_notional_not_met"
+    if short_min_notional > 0 and aligned * short_px < short_min_notional:
+        return 0.0, "paper_min_notional_not_met"
+    return float(aligned), ""
 
 
 def _maker_crossed(leg: SpreadPaperLeg, quote: QuoteSnapshot) -> bool:

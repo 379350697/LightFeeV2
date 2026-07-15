@@ -9,6 +9,7 @@ from typing import Iterable
 from lightfee.config.schema import StrategyConfig
 from lightfee.sidecar.snapshot import CandidateInput
 from lightfee.strategy.economics import EdgeBreakdown, build_edge_breakdown
+from lightfee.strategy.fee_contract import derive_candidate_stage_fee_bps
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,26 +160,30 @@ class FundingEntryRevalidator:
             max(long_price - baseline_long_price, 0.0)
             + max(baseline_short_price - short_price, 0.0)
         ) / bbo_reference * 10_000.0
-        fallback_fee_evidence_complete = (
-            getattr(candidate, "taker_fee_evidence_complete", False) is True
-            or planned_maker_leg not in {"long", "short"}
+        entry_fee_bps, entry_fee_reason = derive_candidate_stage_fee_bps(
+            candidate,
+            "entry",
+            maker_leg_override=planned_maker_leg if passive_execution else "",
         )
-        if not passive_execution and planned_maker_leg in {"long", "short"}:
-            if not fallback_fee_evidence_complete:
-                return FundingEntryRevalidation(
-                    False,
-                    "missing_taker_fee_evidence_for_standard_fallback",
-                    _incomplete_edge(candidate, now_ms),
-                    long_price,
-                    short_price,
-                    l2_entry_slippage_bps,
-                )
-            entry_fee_bps = (
-                float(getattr(candidate, "long_taker_fee_bps", 0.0) or 0.0)
-                + float(getattr(candidate, "short_taker_fee_bps", 0.0) or 0.0)
+        exit_fee_bps, exit_fee_reason = derive_candidate_stage_fee_bps(
+            candidate,
+            "exit",
+        )
+        if (
+            entry_fee_reason
+            or exit_fee_reason
+            or entry_fee_bps is None
+            or exit_fee_bps is None
+        ):
+            return FundingEntryRevalidation(
+                False,
+                "invalid_final_fee_evidence:"
+                + (entry_fee_reason or exit_fee_reason or "missing_derived_fee"),
+                _incomplete_edge(candidate, now_ms),
+                long_price,
+                short_price,
+                l2_entry_slippage_bps,
             )
-        else:
-            entry_fee_bps = float(candidate.entry_fee_bps)
         # When executable VWAP is used, the signed cross already contains the
         # exact book impact.  Subtracting a BBO heuristic again would double
         # charge the same entry slippage.  Without complete L2, retain the
@@ -196,6 +201,7 @@ class FundingEntryRevalidator:
             now_ms,
             worst_case_funding_edge_bps=worst_funding_edge,
             entry_fee_bps=entry_fee_bps,
+            exit_fee_bps=exit_fee_bps,
             entry_slippage_bps=entry_slippage_bps,
         )
         if not edge.economics_complete:
@@ -385,6 +391,7 @@ def _edge(
     now_ms: int,
     worst_case_funding_edge_bps: float | None = None,
     entry_fee_bps: float | None = None,
+    exit_fee_bps: float | None = None,
     entry_slippage_bps: float | None = None,
 ) -> EdgeBreakdown:
     return build_edge_breakdown(
@@ -398,7 +405,11 @@ def _edge(
             if entry_fee_bps is None
             else float(entry_fee_bps)
         ),
-        exit_fee_bps=float(candidate.exit_fee_bps),
+        exit_fee_bps=(
+            float(candidate.exit_fee_bps)
+            if exit_fee_bps is None
+            else float(exit_fee_bps)
+        ),
         entry_slippage_bps=(
             float(candidate.entry_slippage_bps)
             if entry_slippage_bps is None

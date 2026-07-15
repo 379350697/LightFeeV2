@@ -105,11 +105,17 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
         return None
     if not isinstance(data, dict):
         return None
-    schema_version = int(data.get("schema_version", 0) or 0)
-    if schema_version not in {1, 2, 3}:
+    raw_schema_version = data.get("schema_version", 0)
+    if type(raw_schema_version) is not int:
+        return None
+    schema_version = raw_schema_version
+    if schema_version not in {1, 2, 3, 4}:
         return None
     candidates = []
-    for raw in data.get("candidates", []) or []:
+    raw_candidates = data.get("candidates", [])
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+    for raw in raw_candidates:
         if isinstance(raw, dict):
             candidate_data = dict(raw)
             if "fair_price" not in candidate_data and "fair_price_bps" in candidate_data:
@@ -140,19 +146,52 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
                 candidate_data["model_epoch"] = "v1_legacy"
                 candidate_data["calculation_version"] = "spread_v1_legacy"
                 candidate_data["economics_complete"] = False
-            _sanitize_candidate_numbers(candidate_data)
+            _sanitize_candidate_numbers(
+                candidate_data,
+                strict_literals=schema_version >= 4,
+            )
             candidates.append(SpreadReversionCandidate(**candidate_data))
+    raw_degraded_venues = data.get("degraded_venues", [])
+    if not isinstance(raw_degraded_venues, list):
+        raw_degraded_venues = []
+    raw_degraded_symbols = data.get("degraded_symbols", {})
+    if not isinstance(raw_degraded_symbols, dict):
+        raw_degraded_symbols = {}
+    raw_rejection_counts = data.get("rejection_counts", {})
+    if not isinstance(raw_rejection_counts, dict):
+        raw_rejection_counts = {}
+    raw_paper_rejection_counts = data.get("paper_admission_rejection_counts", {})
+    if not isinstance(raw_paper_rejection_counts, dict):
+        raw_paper_rejection_counts = {}
     return SpreadSnapshot(
         schema_version=schema_version,
+        decision_at_ms=_safe_int(data.get("decision_at_ms", 0)),
         published_at_ms=_safe_int(data.get("published_at_ms", 0)),
         market_observed_at_ms=_safe_int(data.get("market_observed_at_ms", 0)),
         snapshot_path=str(data.get("snapshot_path", "") or ""),
         source_mode=str(data.get("source_mode", "") or ""),
-        degraded_venues=list(data.get("degraded_venues", []) or []),
-        degraded_symbols=dict(data.get("degraded_symbols", {}) or {}),
+        degraded_venues=[str(value) for value in raw_degraded_venues],
+        degraded_symbols={
+            str(key): [str(value) for value in values]
+            for key, values in raw_degraded_symbols.items()
+            if isinstance(values, list)
+        },
+        input_quote_count=_safe_int(data.get("input_quote_count", 0)),
+        valid_quote_count=_safe_int(data.get("valid_quote_count", 0)),
+        evaluated_pair_count=_safe_int(data.get("evaluated_pair_count", 0)),
+        accepted_pair_count=_safe_int(data.get("accepted_pair_count", 0)),
+        paper_configured_enabled=data.get("paper_configured_enabled") is True,
+        paper_admission_enabled=data.get("paper_admission_enabled") is True,
+        paper_tracked_count=_safe_int(data.get("paper_tracked_count", 0)),
+        paper_refresh_status=str(data.get("paper_refresh_status", "") or ""),
+        paper_event_count=_safe_int(data.get("paper_event_count", 0)),
+        paper_last_success_at_ms=_safe_int(data.get("paper_last_success_at_ms", 0)),
         rejection_counts={
+            str(key): _safe_int(value) for key, value in raw_rejection_counts.items()
+        },
+        paper_admission_rejection_counts={
             str(key): _safe_int(value)
-            for key, value in dict(data.get("rejection_counts", {}) or {}).items()
+            for key, value in raw_paper_rejection_counts.items()
         },
         candidates=candidates,
     )
@@ -161,18 +200,31 @@ def load_spread_snapshot(path: str | Path) -> SpreadSnapshot | None:
 def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
     return {
         "schema_version": snapshot.schema_version,
+        "decision_at_ms": snapshot.decision_at_ms,
         "published_at_ms": snapshot.published_at_ms,
         "market_observed_at_ms": snapshot.market_observed_at_ms,
         "snapshot_path": snapshot.snapshot_path,
         "source_mode": snapshot.source_mode,
         "degraded_venues": list(snapshot.degraded_venues),
         "degraded_symbols": {
-            str(key): list(value)
-            for key, value in snapshot.degraded_symbols.items()
+            str(key): list(value) for key, value in snapshot.degraded_symbols.items()
         },
+        "input_quote_count": snapshot.input_quote_count,
+        "valid_quote_count": snapshot.valid_quote_count,
+        "evaluated_pair_count": snapshot.evaluated_pair_count,
+        "accepted_pair_count": snapshot.accepted_pair_count,
+        "paper_configured_enabled": snapshot.paper_configured_enabled,
+        "paper_admission_enabled": snapshot.paper_admission_enabled,
+        "paper_tracked_count": snapshot.paper_tracked_count,
+        "paper_refresh_status": snapshot.paper_refresh_status,
+        "paper_event_count": snapshot.paper_event_count,
+        "paper_last_success_at_ms": snapshot.paper_last_success_at_ms,
         "rejection_counts": {
+            str(key): int(value) for key, value in snapshot.rejection_counts.items()
+        },
+        "paper_admission_rejection_counts": {
             str(key): int(value)
-            for key, value in snapshot.rejection_counts.items()
+            for key, value in snapshot.paper_admission_rejection_counts.items()
         },
         "candidates": [
             {
@@ -247,14 +299,10 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
                 "economics_complete": c.economics_complete,
                 "fee_evidence_complete": c.fee_evidence_complete,
                 "account_fee_evidence_complete": c.account_fee_evidence_complete,
-                "account_fee_evidence_observed_at_ms": (
-                    c.account_fee_evidence_observed_at_ms
-                ),
+                "account_fee_evidence_observed_at_ms": (c.account_fee_evidence_observed_at_ms),
                 "account_fee_evidence_source": c.account_fee_evidence_source,
                 "account_fee_evidence_fingerprint": c.account_fee_evidence_fingerprint,
-                "account_fee_evidence_provenance": list(
-                    c.account_fee_evidence_provenance
-                ),
+                "account_fee_evidence_provenance": list(c.account_fee_evidence_provenance),
                 "research_sample_split": c.research_sample_split,
                 "volatility_regime": c.volatility_regime,
                 "net_edge_per_capital_hour_bps": c.net_edge_per_capital_hour_bps,
@@ -271,12 +319,19 @@ def _snapshot_to_dict(snapshot: SpreadSnapshot) -> dict:
     }
 
 
-def _sanitize_candidate_numbers(candidate_data: dict) -> None:
+def _sanitize_candidate_numbers(
+    candidate_data: dict,
+    *,
+    strict_literals: bool = False,
+) -> None:
     invalid_fields: list[str] = []
     for field in _SPREAD_FLOAT_CANDIDATE_FIELDS:
         if field not in candidate_data:
             continue
-        value = _safe_float(candidate_data[field])
+        value = _safe_float(
+            candidate_data[field],
+            strict_literal=strict_literals,
+        )
         if value is None:
             invalid_fields.append(field)
             candidate_data[field] = 0.0
@@ -285,7 +340,10 @@ def _sanitize_candidate_numbers(candidate_data: dict) -> None:
     for field in _SPREAD_INT_CANDIDATE_FIELDS:
         if field not in candidate_data:
             continue
-        value = _safe_int_or_none(candidate_data[field])
+        value = _safe_int_or_none(
+            candidate_data[field],
+            strict_literal=strict_literals,
+        )
         if value is None:
             invalid_fields.append(field)
             candidate_data[field] = 0
@@ -302,8 +360,10 @@ def _sanitize_candidate_numbers(candidate_data: dict) -> None:
     candidate_data["screening_reasons"] = reasons
 
 
-def _safe_float(value: object) -> float | None:
+def _safe_float(value: object, *, strict_literal: bool = False) -> float | None:
     if isinstance(value, bool):
+        return None
+    if strict_literal and type(value) not in (int, float):
         return None
     try:
         numeric = float(value)
@@ -316,9 +376,11 @@ def _safe_int(value: object) -> int:
     return _safe_int_or_none(value) or 0
 
 
-def _safe_int_or_none(value: object) -> int | None:
+def _safe_int_or_none(value: object, *, strict_literal: bool = False) -> int | None:
     if isinstance(value, bool):
         return None
+    if strict_literal:
+        return value if type(value) is int and value >= 0 else None
     try:
         numeric = float(value)
     except (TypeError, ValueError, OverflowError):

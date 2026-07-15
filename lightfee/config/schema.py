@@ -529,6 +529,12 @@ class StrategyConfig:
 class PersistenceConfig:
     event_log_path: str = "runtime/events.jsonl"
     spread_paper_event_log_path: str = "runtime/spread-paper-events.jsonl"
+    # Must be an absolute path on an independently retained failure domain
+    # (for example, a separately snapshotted/mounted state volume).  Spread
+    # paper admission fails closed when this is blank or shares the journal
+    # directory, because journal+head rollback is otherwise undetectable.
+    spread_paper_rollback_anchor_path: str = ""
+    spread_paper_event_log_hard_max_bytes: int = 67_108_864
     snapshot_path: str = "runtime/state.json"
     tuning_diagnostics_enabled: bool = True
     tuning_diagnostics_max_records: int = 10000

@@ -4,16 +4,19 @@ last-good fallback, and per-symbol degradation tracking (V1 parity)."""
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 import time
+from math import isfinite
 from pathlib import Path
 from typing import Optional
 
-from lightfee.config.schema import AppConfig
+from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.core.domain import PerpLiquiditySnapshot, Venue
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
+    SNAPSHOT_SCHEMA_VERSION,
     FundingLifecycle,
     LiquidityLifecycle,
     MarketLifecycle,
@@ -28,7 +31,9 @@ from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibra
 from lightfee.venues.specs import get_spec
 
 # V1 parity: per-domain timeout defaults (matching V1 sidecar_budget_ms configs)
-DEFAULT_FUNDING_TIMEOUT_S = 30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
+DEFAULT_FUNDING_TIMEOUT_S = (
+    30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
+)
 DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
@@ -47,6 +52,7 @@ class SidecarService:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self._venue_configs_by_name = _canonical_venue_configs(config.venues)
         self.snapshot_path = config.runtime.sidecar_snapshot_path
         self._forecast_calibrator = FundingForecastCalibrator(
             Path(self.snapshot_path).with_name(
@@ -68,17 +74,25 @@ class SidecarService:
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
-        for vc in config.venues:
-            venue = Venue.from_str(vc.venue)
+        # V1 parity: last-good fallback cache.  Initialise before reading the
+        # prior snapshot so a restart can retain still-valid per-key evidence.
+        self._last_good_quotes: dict[str, QuoteSnapshot] = {}
+        self._last_good_at_ms: int = 0
+        self._last_good_at_ms_by_key: dict[str, int] = {}
+        self._last_liquidity_publish_at_ms: int = 0
+        self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
+
+        for venue_name in self._venue_configs_by_name:
+            venue = Venue.from_str(venue_name)
             spec = get_spec(venue)
             rate_limiter = EndpointRateLimiter(1000, 8000, 50)
-            self._public_rate_limiters[vc.venue] = rate_limiter
-            self._exchange_sources[vc.venue] = ExchangeSource(
+            self._public_rate_limiters[venue_name] = rate_limiter
+            self._exchange_sources[venue_name] = ExchangeSource(
                 spec,
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
-            self._liquidity_sources[vc.venue] = LiquiditySource(
+            self._liquidity_sources[venue_name] = LiquiditySource(
                 spec,
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
@@ -101,12 +115,25 @@ class SidecarService:
                 quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
             for venue_name, source in self._exchange_sources.items():
                 source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
-
-        # V1 parity: last-good fallback cache
-        self._last_good_quotes: dict[str, QuoteSnapshot] = {}
-        self._last_good_at_ms: int = 0
-        self._last_liquidity_publish_at_ms: int = 0
-        self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
+            restored = _restorable_prior_last_good_quotes(
+                prior_snapshot,
+                configured_venues=set(self._venue_configs_by_name),
+                configured_symbols=_canonical_symbol_set(config.symbols),
+                now_ms=int(time.time() * 1000),
+                max_age_ms=max(
+                    int(runtime.live_scan_last_good_max_age_ms or 0),
+                    0,
+                ),
+            )
+            self._last_good_quotes = restored
+            self._last_good_at_ms_by_key = {
+                key: int(quote.observed_at_ms)
+                for key, quote in restored.items()
+            }
+            self._last_good_at_ms = max(
+                self._last_good_at_ms_by_key.values(),
+                default=0,
+            )
 
     async def close(self) -> None:
         for group_name, sources in (
@@ -127,9 +154,14 @@ class SidecarService:
     # ------------------------------------------------------------------
 
     async def refresh_once(self) -> SidecarSnapshot:
-        observed_ms = int(time.time() * 1000)
-        had_last_good_before_refresh = bool(self._last_good_quotes)
-        symbols = self.config.symbols
+        refresh_started_at_ms = int(time.time() * 1000)
+        symbols = list(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in self.config.symbols
+                if str(symbol).strip()
+            )
+        )
 
         quotes: dict[str, QuoteSnapshot] = {}
         funding_lifecycle: list[FundingLifecycle] = []
@@ -137,93 +169,293 @@ class SidecarService:
         liquidity_lifecycle: list[LiquidityLifecycle] = []
         degraded_venues: set[str] = set()
         degraded_symbols: dict[str, list[str]] = {}
+        fallback_used_keys: set[str] = set()
+        fresh_cacheable_quote_keys: set[str] = set()
+        market_quality_failed_symbols: dict[str, set[str]] = {}
         quote_liquidity_by_venue: dict[str, dict[str, PerpLiquiditySnapshot]] = {}
+        requested_symbol_count = len(_canonical_symbol_set(symbols))
 
         # --- Funding + Market fetch (per venue, funding timeout) ---
         funding_results = await self._fetch_all_venues(
-            symbols, timeout_s=self._funding_timeout_s,
+            symbols,
+            timeout_s=self._funding_timeout_s,
         )
 
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
             if error is not None:
                 degraded_venues.add(venue_name)
                 # V1 parity: last-good fallback — inject previous quotes
-                fallback = self._inject_last_good(venue_name, symbols)
+                raw_fallback = self._inject_last_good(
+                    venue_name,
+                    symbols,
+                    now_ms=refresh_started_at_ms,
+                )
+                fallback_market_failures = _market_failure_reasons(raw_fallback)
+                fallback_crossed_symbols = {
+                    symbol
+                    for symbol, reason in fallback_market_failures.items()
+                    if reason == "crossed BBO"
+                }
+                fallback_unpublishable_symbols = (
+                    set(fallback_market_failures) - fallback_crossed_symbols
+                )
+                fallback = {
+                    key: quote
+                    for key, quote in (raw_fallback or {}).items()
+                    if _snapshot_item_symbol(key, quote)
+                    not in fallback_unpublishable_symbols
+                }
                 if fallback:
+                    fallback_used_keys.update(fallback)
                     for key, q in fallback.items():
                         if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
                             q.observed_at_ms = int(self._last_good_at_ms or 0)
                         if not str(getattr(q, "source", "") or ""):
                             q.source = "sidecar_quote"
                         quotes[key] = q
-                funding_lifecycle.append(FundingLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
-                    coverage_usable=len(fallback), degraded_reason=str(error),
-                ))
-                market_lifecycle.append(MarketLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
-                    coverage_usable=len(fallback), degraded_reason=str(error),
-                ))
+                fallback_symbols = _snapshot_map_symbols(fallback)
+                fallback_funding_failures = _funding_failure_reasons(fallback)
+                fallback_funding_symbols = (
+                    fallback_symbols - set(fallback_funding_failures)
+                )
+                if fallback_market_failures:
+                    market_quality_failed_symbols[venue_name] = set(
+                        fallback_market_failures
+                    )
+                missing_fallback_symbols = (
+                    _canonical_symbol_set(symbols) - fallback_symbols
+                )
+                all_degraded_symbols = (
+                    missing_fallback_symbols
+                    | set(fallback_market_failures)
+                    | set(fallback_funding_failures)
+                )
+                if all_degraded_symbols:
+                    degraded_symbols[venue_name] = sorted(all_degraded_symbols)
+                fallback_market_reason = "; ".join(
+                    [
+                        str(error),
+                        *(
+                            f"{symbol}: fallback unavailable"
+                            for symbol in sorted(missing_fallback_symbols)
+                        ),
+                        *(
+                            f"{symbol}: {reason}"
+                            for symbol, reason in sorted(
+                                fallback_market_failures.items()
+                            )
+                        ),
+                    ]
+                )
+                fallback_funding_reason = "; ".join(
+                    [
+                        str(error),
+                        *(
+                            f"{symbol}: fallback unavailable"
+                            for symbol in sorted(missing_fallback_symbols)
+                        ),
+                        *(
+                            f"{symbol}: {reason}"
+                            for symbol, reason in sorted(
+                                fallback_funding_failures.items()
+                            )
+                        ),
+                        *(
+                            f"{symbol}: {reason}"
+                            for symbol, reason in sorted(
+                                fallback_market_failures.items()
+                            )
+                            if symbol in fallback_unpublishable_symbols
+                            and symbol not in fallback_funding_failures
+                        ),
+                    ]
+                )
+                funding_lifecycle.append(
+                    FundingLifecycle(
+                        venue=venue_name,
+                        observed_at_ms=refresh_started_at_ms,
+                        symbol_count=requested_symbol_count,
+                        coverage_usable=len(fallback_funding_symbols),
+                        degraded_reason=fallback_funding_reason,
+                    )
+                )
+                market_lifecycle.append(
+                    MarketLifecycle(
+                        venue=venue_name,
+                        observed_at_ms=refresh_started_at_ms,
+                        symbol_count=requested_symbol_count,
+                        coverage_usable=len(
+                            fallback_symbols - fallback_crossed_symbols
+                        ),
+                        degraded_reason=fallback_market_reason,
+                    )
+                )
                 continue
 
-            if failed_symbols:
-                degraded_symbols[venue_name] = list(failed_symbols)
-
-            count = len(venue_quotes) if venue_quotes else 0
-            usable = count - len(failed_symbols)
+            failed_symbols = {str(symbol).upper() for symbol in failed_symbols}
+            venue_quotes, identity_failures = _canonicalize_venue_quotes(
+                venue_name,
+                venue_quotes,
+                requested_symbols=_canonical_symbol_set(symbols),
+            )
+            market_failures = _market_failure_reasons(venue_quotes)
+            market_failures = {**identity_failures, **market_failures}
+            crossed_symbols = {
+                symbol
+                for symbol, reason in market_failures.items()
+                if reason == "crossed BBO"
+            }
+            unpublishable_symbols = (
+                (set(market_failures) - crossed_symbols) | failed_symbols
+            )
+            venue_quotes = {
+                key: quote
+                for key, quote in venue_quotes.items()
+                if _snapshot_item_symbol(key, quote) not in unpublishable_symbols
+            }
+            if market_failures:
+                market_quality_failed_symbols[venue_name] = set(market_failures)
+            returned_symbols = _snapshot_map_symbols(venue_quotes)
+            funding_failures = _funding_failure_reasons(venue_quotes)
+            fresh_cacheable_symbols = (
+                returned_symbols
+                - set(market_failures)
+                - set(funding_failures)
+                - failed_symbols
+            )
+            fresh_cacheable_quote_keys.update(
+                key
+                for key, quote in venue_quotes.items()
+                if _snapshot_item_symbol(key, quote) in fresh_cacheable_symbols
+                and _quote_cache_contract_eligible(quote)
+            )
+            all_degraded_symbols = (
+                failed_symbols | set(market_failures) | set(funding_failures)
+            )
+            if all_degraded_symbols:
+                degraded_symbols[venue_name] = sorted(all_degraded_symbols)
+            funding_usable = len(
+                returned_symbols - set(funding_failures) - failed_symbols
+            )
+            market_usable = len(
+                returned_symbols - crossed_symbols - failed_symbols
+            )
+            funding_reason = (
+                "; ".join(
+                    [
+                        *(f"{symbol}: fetch failed" for symbol in sorted(failed_symbols)),
+                        *(
+                            f"{symbol}: {reason}"
+                            for symbol, reason in sorted(funding_failures.items())
+                        ),
+                        *(
+                            f"{symbol}: {reason}"
+                            for symbol, reason in sorted(market_failures.items())
+                            if symbol in unpublishable_symbols
+                            and symbol not in funding_failures
+                        ),
+                    ]
+                )
+                if failed_symbols or funding_failures or unpublishable_symbols
+                else ("no usable funding quotes" if funding_usable <= 0 else "")
+            )
+            market_failures = [
+                *(f"{symbol}: fetch failed" for symbol in sorted(failed_symbols)),
+                *(
+                    f"{symbol}: {reason}"
+                    for symbol, reason in sorted(market_failures.items())
+                ),
+            ]
+            market_reason = "; ".join(market_failures) or (
+                "no usable market quotes" if market_usable <= 0 else ""
+            )
+            if funding_usable <= 0 or market_usable <= 0:
+                degraded_venues.add(venue_name)
 
             if venue_quotes:
                 derived_liquidity: dict[str, PerpLiquiditySnapshot] = {}
                 for key, q in venue_quotes.items():
+                    if _snapshot_item_symbol(key, q) in funding_failures:
+                        q = _diagnostic_quote_without_funding_truth(q)
                     if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
-                        q.observed_at_ms = observed_ms
+                        q.observed_at_ms = refresh_started_at_ms
                     if not str(getattr(q, "source", "") or ""):
                         q.source = "sidecar_quote"
                     quotes[key] = q
                     derived_liquidity[key] = PerpLiquiditySnapshot(
                         venue=Venue.from_str(getattr(q, "venue", venue_name) or venue_name),
                         symbol=getattr(q, "symbol", key.split(":", 1)[-1]),
-                        observed_at_ms=int(getattr(q, "observed_at_ms", 0) or observed_ms),
+                        observed_at_ms=int(
+                            getattr(q, "observed_at_ms", 0) or refresh_started_at_ms
+                        ),
                     )
                 quote_liquidity_by_venue[venue_name] = derived_liquidity
 
-            funding_lifecycle.append(FundingLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
-                coverage_usable=usable,
-                degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
-            ))
-            market_lifecycle.append(MarketLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
-                coverage_usable=usable,
-                degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
-            ))
+            funding_lifecycle.append(
+                FundingLifecycle(
+                    venue=venue_name,
+                    observed_at_ms=refresh_started_at_ms,
+                    symbol_count=requested_symbol_count,
+                    coverage_usable=funding_usable,
+                    degraded_reason=funding_reason,
+                )
+            )
+            market_lifecycle.append(
+                MarketLifecycle(
+                    venue=venue_name,
+                    observed_at_ms=refresh_started_at_ms,
+                    symbol_count=requested_symbol_count,
+                    coverage_usable=market_usable,
+                    degraded_reason=market_reason,
+                )
+            )
 
         # --- Liquidity fetch (independent domain, own timeout, own source) ---
         liquidity_results = await self._fetch_liquidity_all_venues(
             symbols,
             timeout_s=self._liquidity_timeout_s,
             quote_liquidity_by_venue=quote_liquidity_by_venue,
+            skip_venues=degraded_venues,
         )
         for venue_name, liq_data, liq_error, liq_failed_symbols in liquidity_results:
             if liq_error is not None:
                 degraded_venues.add(venue_name)
-                liquidity_lifecycle.append(LiquidityLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=0,
-                    coverage_usable=0, degraded_reason=str(liq_error),
-                ))
+                liquidity_lifecycle.append(
+                    LiquidityLifecycle(
+                        venue=venue_name,
+                        observed_at_ms=refresh_started_at_ms,
+                        symbol_count=requested_symbol_count,
+                        coverage_usable=0,
+                        degraded_reason=str(liq_error),
+                    )
+                )
                 continue
 
+            liq_failed_symbols = {
+                str(symbol).upper() for symbol in liq_failed_symbols
+            } | market_quality_failed_symbols.get(venue_name, set())
             if liq_failed_symbols:
                 existing = degraded_symbols.get(venue_name, [])
                 degraded_symbols[venue_name] = sorted(set(existing) | liq_failed_symbols)
 
-            count = len(liq_data) if liq_data else 0
-            usable = count - len(liq_failed_symbols)
-            liquidity_lifecycle.append(LiquidityLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
-                coverage_usable=max(0, usable),
-                degraded_reason="; ".join(f"{s}: fetch failed" for s in liq_failed_symbols) if liq_failed_symbols else "",
-            ))
+            returned_liquidity_symbols = _snapshot_map_symbols(liq_data)
+            usable = len(returned_liquidity_symbols - liq_failed_symbols)
+            coverage_reason = (
+                "; ".join(f"{s}: fetch failed" for s in liq_failed_symbols)
+                if liq_failed_symbols
+                else ("no usable perp liquidity evidence" if usable <= 0 else "")
+            )
+            if usable <= 0:
+                degraded_venues.add(venue_name)
+            liquidity_lifecycle.append(
+                LiquidityLifecycle(
+                    venue=venue_name,
+                    observed_at_ms=refresh_started_at_ms,
+                    symbol_count=requested_symbol_count,
+                    coverage_usable=max(0, usable),
+                    degraded_reason=coverage_reason,
+                )
+            )
 
         # Transfer/inventory preference is live-admission evidence, not a
         # public-sidecar resource.  No synthetic pairwise clients or inferred
@@ -233,21 +465,86 @@ class SidecarService:
         # This consumes only the already-fetched public payload: no extra REST
         # requests, and no sample is created unless the exchange advanced its
         # next settlement while exposing a confirmed previous settled rate.
-        self._ensure_forecast_calibrator().apply(quotes, now_ms=observed_ms)
+        candidate_build_observed_at_ms = int(time.time() * 1000)
+        future_quote_symbols_by_venue: dict[str, set[str]] = {}
+        future_market_counted_by_venue: dict[str, set[str]] = {}
+        future_funding_counted_by_venue: dict[str, set[str]] = {}
+        future_liquidity_counted_by_venue: dict[str, set[str]] = {}
+        future_quote_keys = {
+            key
+            for key, quote in quotes.items()
+            if int(getattr(quote, "observed_at_ms", 0) or 0)
+            > candidate_build_observed_at_ms
+        }
+        for key in sorted(future_quote_keys):
+            quote = quotes.pop(key)
+            venue = str(getattr(quote, "venue", "") or "").strip().lower()
+            symbol = _snapshot_item_symbol(key, quote)
+            if not venue or not symbol:
+                continue
+            future_quote_symbols_by_venue.setdefault(venue, set()).add(symbol)
+            if not _market_failure_reasons({key: quote}):
+                future_market_counted_by_venue.setdefault(venue, set()).add(symbol)
+                future_liquidity_counted_by_venue.setdefault(venue, set()).add(symbol)
+            if not _funding_failure_reasons({key: quote}):
+                future_funding_counted_by_venue.setdefault(venue, set()).add(symbol)
+            fresh_cacheable_quote_keys.discard(key)
+            fallback_used_keys.discard(key)
 
-        last_good_for_acquisition = self._last_good_quotes if had_last_good_before_refresh else {}
+        if future_quote_symbols_by_venue:
+            for venue, future_symbols in future_quote_symbols_by_venue.items():
+                degraded_venues.add(venue)
+                degraded_symbols[venue] = sorted(
+                    set(degraded_symbols.get(venue, [])) | future_symbols
+                )
+            _apply_future_quote_degradation(
+                funding_lifecycle,
+                future_quote_symbols_by_venue,
+                future_funding_counted_by_venue,
+            )
+            _apply_future_quote_degradation(
+                market_lifecycle,
+                future_quote_symbols_by_venue,
+                future_market_counted_by_venue,
+            )
+            _apply_future_quote_degradation(
+                liquidity_lifecycle,
+                future_quote_symbols_by_venue,
+                future_liquidity_counted_by_venue,
+            )
+
+        self._ensure_forecast_calibrator().apply(
+            quotes,
+            now_ms=candidate_build_observed_at_ms,
+        )
 
         # --- Build candidates ---
         # Fee schedules may be refreshed independently of market data.  Build
         # a new immutable candidate service for this snapshot so a verified
         # account tier is never silently retained past its evidence TTL.
-        self._candidate_service = self._new_candidate_service(now_ms=observed_ms)
+        self._candidate_service = self._new_candidate_service(now_ms=candidate_build_observed_at_ms)
+        candidate_build_diagnostics: dict[str, object] = {}
         candidates = self._ensure_candidate_service().build(
             quotes,
             symbols,
-            observed_at_ms=observed_ms,
+            observed_at_ms=candidate_build_observed_at_ms,
+            diagnostics=candidate_build_diagnostics,
         )
-        published_ms = int(time.time() * 1000)
+        candidate_build_diagnostics["quarantined_future_quote_count"] = len(
+            future_quote_keys
+        )
+        candidate_build_diagnostics["quarantined_future_quote_keys"] = sorted(
+            future_quote_keys
+        )
+        candidate_build_diagnostics["requested_venues"] = sorted(
+            self._configured_venue_names()
+        )
+        # Publication retains its established completion-time semantics.  It
+        # must not be overloaded as the earlier candidate decision watermark.
+        published_ms = max(
+            int(time.time() * 1000),
+            candidate_build_observed_at_ms,
+        )
         legacy_liquidity_publish_ms = int(getattr(self, "_last_liquidity_publish_at_ms", 0) or 0)
         liquidity_publish_by_key = getattr(self, "_last_liquidity_publish_at_ms_by_key", None)
         if not isinstance(liquidity_publish_by_key, dict):
@@ -266,9 +563,7 @@ class SidecarService:
             has_usable_publish = int(getattr(row, "coverage_usable", 0) or 0) > 0
             if has_usable_publish:
                 row.publish_interval_ms = (
-                    max(published_ms - previous_publish_ms, 0)
-                    if previous_publish_ms > 0
-                    else 0
+                    max(published_ms - previous_publish_ms, 0) if previous_publish_ms > 0 else 0
                 )
                 row.published_at_ms = published_ms
                 liquidity_publish_by_key[key] = published_ms
@@ -280,16 +575,22 @@ class SidecarService:
         if liquidity_successful_publish:
             self._last_liquidity_publish_at_ms = published_ms
 
-        self._attach_local_l2_depth_bridge(quotes, observed_ms)
+        self._attach_local_l2_depth_bridge(quotes, candidate_build_observed_at_ms)
 
         # --- Cache last-good quotes ---
-        if quotes:
-            self._last_good_quotes = dict(quotes)
-            self._last_good_at_ms = published_ms
+        self._update_last_good_quote_cache(
+            quotes,
+            fresh_cacheable_quote_keys,
+            published_at_ms=published_ms,
+        )
 
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,
-            market_observed_at_ms=observed_ms,
+            market_observed_at_ms=_latest_valid_quote_observation_ms(
+                quotes,
+                decision_at_ms=candidate_build_observed_at_ms,
+                fallback_ms=refresh_started_at_ms,
+            ),
             funding_lifecycle=funding_lifecycle,
             market_lifecycle=market_lifecycle,
             transfer_lifecycle=transfer_lifecycle,
@@ -298,13 +599,55 @@ class SidecarService:
             degraded_domains=[],
             degraded_symbols=degraded_symbols,
             source_mode="direct_market",
-            acquisition_mode=_resolve_acquisition_mode(degraded_venues, last_good_for_acquisition),
+            acquisition_mode=_resolve_acquisition_mode(
+                degraded_venues,
+                degraded_symbols,
+                fallback_used_keys,
+                has_usable_payload=bool(quotes),
+            ),
+            candidate_build_observed_at_ms=candidate_build_observed_at_ms,
+            candidate_build_diagnostics=candidate_build_diagnostics,
             quotes=quotes,
             candidates=candidates,
         )
 
         publish_snapshot(snapshot, self.snapshot_path)
         return snapshot
+
+    def _update_last_good_quote_cache(
+        self,
+        quotes: dict[str, QuoteSnapshot],
+        fresh_keys: set[str],
+        *,
+        published_at_ms: int,
+    ) -> None:
+        """Update per-key last-good truth without evicting unrelated venues.
+
+        Fallback and quarantined quotes are excluded by the caller, so a
+        partial refresh cannot refresh stale epochs or erase another venue's
+        last contract-valid record.
+        """
+        cache = getattr(self, "_last_good_quotes", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._last_good_quotes = cache
+        epochs = getattr(self, "_last_good_at_ms_by_key", None)
+        if not isinstance(epochs, dict):
+            epochs = {}
+            self._last_good_at_ms_by_key = epochs
+        updated = False
+        for key in sorted(fresh_keys):
+            quote = quotes.get(key)
+            if quote is None:
+                continue
+            cache[key] = replace(quote)
+            epochs[key] = int(published_at_ms)
+            updated = True
+        if updated:
+            self._last_good_at_ms = max(
+                int(getattr(self, "_last_good_at_ms", 0) or 0),
+                int(published_at_ms),
+            )
 
     def _attach_local_l2_depth_bridge(
         self,
@@ -343,28 +686,48 @@ class SidecarService:
     # ------------------------------------------------------------------
 
     async def _fetch_all_venues(
-        self, symbols: list[str], timeout_s: float,
+        self,
+        symbols: list[str],
+        timeout_s: float,
     ) -> list[tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]]:
         """Fetch quotes from all venues concurrently. Returns per-venue results
         with degraded symbol tracking."""
 
-        async def _fetch_one(venue_name: str) -> tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]:
+        async def _fetch_one(
+            venue_name: str,
+        ) -> tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]:
             source = self._exchange_sources.get(venue_name)
             if source is None:
-                return (venue_name, None, None, set())
+                requested = _canonical_symbol_set(symbols)
+                return (venue_name, None, None, requested)
             try:
                 result = await asyncio.wait_for(source.fetch_all(symbols), timeout=timeout_s)
-                return (venue_name, result, None, set())
+                requested = _canonical_symbol_set(symbols)
+                result = {
+                    key: quote
+                    for key, quote in (result or {}).items()
+                    if _snapshot_item_symbol(key, quote) in requested
+                }
+                failed_symbols = requested - _snapshot_map_symbols(result)
+                return (venue_name, result, None, failed_symbols)
             except asyncio.TimeoutError:
                 return (venue_name, None, TimeoutError(f"funding timeout {timeout_s}s"), set())
             except Exception as e:
                 return (venue_name, None, e, set())
 
         results = await asyncio.gather(
-            *[_fetch_one(vc.venue) for vc in self.config.venues],
+            *[_fetch_one(venue_name) for venue_name in self._configured_venue_names()],
             return_exceptions=False,
         )
         return list(results)
+
+    def _configured_venue_names(self) -> list[str]:
+        """Return the canonical, stable, unique operational venue scope."""
+        configured = getattr(self, "_venue_configs_by_name", None)
+        if not isinstance(configured, dict):
+            configured = _canonical_venue_configs(self.config.venues)
+            self._venue_configs_by_name = configured
+        return list(configured)
 
     def _ensure_forecast_calibrator(self) -> FundingForecastCalibrator:
         """Keep direct test/recovery construction compatible with the service."""
@@ -373,13 +736,9 @@ class SidecarService:
             snapshot_path = Path(self.snapshot_path)
             strategy = self.config.strategy
             calibrator = FundingForecastCalibrator(
-                snapshot_path.with_name(
-                    f"{snapshot_path.name}.funding-forecast-calibration.json"
-                ),
+                snapshot_path.with_name(f"{snapshot_path.name}.funding-forecast-calibration.json"),
                 min_samples=strategy.funding_forecast_min_samples,
-                max_quantile_drift_bps=(
-                    strategy.funding_forecast_stability_max_quantile_drift_bps
-                ),
+                max_quantile_drift_bps=(strategy.funding_forecast_stability_max_quantile_drift_bps),
             )
             self._forecast_calibrator = calibrator
         return calibrator
@@ -391,22 +750,26 @@ class SidecarService:
     ) -> FundingCandidateService:
         """Build the configuration-derived shortlist service once per runtime."""
         config = self.config
+        venue_configs = getattr(self, "_venue_configs_by_name", None)
+        if not isinstance(venue_configs, dict):
+            venue_configs = _canonical_venue_configs(config.venues)
+            self._venue_configs_by_name = venue_configs
         evidence = load_fee_evidence(
             config.runtime.fee_evidence_path,
             now_ms=int(now_ms if now_ms is not None else time.time() * 1000),
             max_age_ms=int(config.runtime.fee_evidence_max_age_ms),
         )
         configured_taker = {
-            str(venue.venue).lower(): float(venue.taker_fee_bps or 0.0)
-            for venue in config.venues
+            venue_name: float(venue.taker_fee_bps or 0.0)
+            for venue_name, venue in venue_configs.items()
         }
         configured_maker = {
-            str(venue.venue).lower(): float(
+            venue_name: float(
                 venue.maker_fee_bps
                 if venue.maker_fee_bps is not None
                 else venue.taker_fee_bps or 0.0
             )
-            for venue in config.venues
+            for venue_name, venue in venue_configs.items()
         }
         taker_fees, maker_fees = effective_fee_maps(
             configured_taker,
@@ -419,13 +782,14 @@ class SidecarService:
             venue_fee_bps=taker_fees,
             venue_maker_fee_bps=maker_fees,
             venue_notional_caps={
-                str(venue.venue).lower(): float(venue.max_notional or 0.0)
-                for venue in config.venues
+                venue_name: float(venue.max_notional or 0.0)
+                for venue_name, venue in venue_configs.items()
             },
-            passive_execution_enabled=(
-                str(config.runtime.mode or "").lower() == "live"
-            ),
+            passive_execution_enabled=(str(config.runtime.mode or "").lower() == "live"),
             fee_evidence=evidence,
+            expected_fee_identity_hashes=dict(
+                config.runtime.fee_evidence_account_identity_hashes
+            ),
         )
 
     def _ensure_candidate_service(self) -> FundingCandidateService:
@@ -451,27 +815,53 @@ class SidecarService:
         symbols: list[str],
         timeout_s: float,
         quote_liquidity_by_venue: Optional[dict[str, dict[str, PerpLiquiditySnapshot]]] = None,
+        skip_venues: Optional[set[str]] = None,
     ) -> list[tuple[str, Optional[dict], Optional[Exception], set[str]]]:
         """Fetch perp liquidity from all venues concurrently with independent timeout."""
         quote_liquidity_by_venue = quote_liquidity_by_venue or {}
+        skip_venues = {str(venue).lower() for venue in (skip_venues or set())}
 
-        async def _fetch_one(venue_name: str) -> tuple[str, Optional[dict], Optional[Exception], set[str]]:
+        async def _fetch_one(
+            venue_name: str,
+        ) -> tuple[str, Optional[dict], Optional[Exception], set[str]]:
+            if venue_name.lower() in skip_venues:
+                return (
+                    venue_name,
+                    None,
+                    RuntimeError("liquidity skipped after market data degradation"),
+                    set(),
+                )
             derived = quote_liquidity_by_venue.get(venue_name)
             if derived:
-                return (venue_name, derived, None, set())
+                missing = _canonical_symbol_set(symbols) - _snapshot_map_symbols(derived)
+                return (venue_name, derived, None, missing)
             source = self._liquidity_sources.get(venue_name)
             if source is None:
-                return (venue_name, None, None, set())
+                requested = _canonical_symbol_set(symbols)
+                return (venue_name, None, None, requested)
             try:
-                result = await asyncio.wait_for(source.fetch_perp_liquidity(symbols), timeout=timeout_s)
-                return (venue_name, result, None, set())
+                result = await asyncio.wait_for(
+                    source.fetch_perp_liquidity(symbols), timeout=timeout_s
+                )
+                requested = _canonical_symbol_set(symbols)
+                result = {
+                    key: value
+                    for key, value in (result or {}).items()
+                    if _snapshot_item_symbol(key, value) in requested
+                }
+                return (
+                    venue_name,
+                    result,
+                    None,
+                    requested - _snapshot_map_symbols(result),
+                )
             except asyncio.TimeoutError:
                 return (venue_name, None, TimeoutError(f"liquidity timeout {timeout_s}s"), set())
             except Exception as e:
                 return (venue_name, None, e, set())
 
         results = await asyncio.gather(
-            *[_fetch_one(vc.venue) for vc in self.config.venues],
+            *[_fetch_one(venue_name) for venue_name in self._configured_venue_names()],
             return_exceptions=False,
         )
         return list(results)
@@ -480,28 +870,406 @@ class SidecarService:
     # Last-good fallback
     # ------------------------------------------------------------------
 
-    def _inject_last_good(self, venue_name: str, symbols: list[str]) -> dict[str, QuoteSnapshot]:
-        """Return last-good quotes for a degraded venue."""
+    def _inject_last_good(
+        self,
+        venue_name: str,
+        symbols: list[str],
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, QuoteSnapshot]:
+        """Return only still-valid per-key last-good quotes for one venue."""
         result: dict[str, QuoteSnapshot] = {}
         if not self._last_good_quotes:
             return result
+        decision_at_ms = int(
+            now_ms if now_ms is not None else time.time() * 1000
+        )
+        runtime_config = getattr(getattr(self, "config", None), "runtime", None)
+        max_age_ms = max(
+            int(
+                getattr(
+                    runtime_config,
+                    "live_scan_last_good_max_age_ms",
+                    600_000,
+                )
+                or 0
+            ),
+            0,
+        )
+        epochs = getattr(self, "_last_good_at_ms_by_key", None)
+        if not isinstance(epochs, dict):
+            epochs = {}
         for sym in symbols:
-            key = f"{venue_name}:{sym.upper()}"
+            key = f"{str(venue_name).strip().lower()}:{str(sym).strip().upper()}"
             q = self._last_good_quotes.get(key)
-            if q is not None:
-                result[key] = q
+            if q is None:
+                continue
+            epoch_ms = int(
+                epochs.get(
+                    key,
+                    int(getattr(q, "observed_at_ms", 0) or 0)
+                    or int(getattr(self, "_last_good_at_ms", 0) or 0),
+                )
+                or 0
+            )
+            observed_at_ms = int(getattr(q, "observed_at_ms", 0) or 0)
+            evidence_at_ms = (
+                min(epoch_ms, observed_at_ms)
+                if epoch_ms > 0 and observed_at_ms > 0
+                else max(epoch_ms, observed_at_ms)
+            )
+            age_ms = decision_at_ms - evidence_at_ms
+            if evidence_at_ms <= 0 or age_ms < 0 or age_ms > max_age_ms:
+                continue
+            result[key] = replace(q)
         return result
 
 
-def _resolve_acquisition_mode(degraded_venues: set[str], last_good: dict) -> str:
+def _resolve_acquisition_mode(
+    degraded_venues: set[str],
+    degraded_symbols: dict[str, list[str]],
+    fallback_used_keys: set[str],
+    *,
+    has_usable_payload: bool = True,
+) -> str:
     """Resolve acquisition_mode matching V1 semantics.
 
     - No degradation → fresh_sidecar
-    - Degradation + last-good cache available → last_good_sidecar
-    - Degradation + no last-good cache → degraded_sidecar (not fresh!)
+    - No usable quote payload → unavailable
+    - Degradation + fallback records actually injected → last_good_sidecar
+    - Degradation without an injected fallback → degraded_sidecar (not fresh!)
     """
-    if not degraded_venues:
+    if not has_usable_payload:
+        return "unavailable"
+    if not degraded_venues and not any(degraded_symbols.values()):
         return "fresh_sidecar"
-    if last_good:
+    if fallback_used_keys:
         return "last_good_sidecar"
     return "degraded_sidecar"
+
+
+def _canonical_symbol_set(symbols: list[str]) -> set[str]:
+    return {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+
+
+def _quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
+    """Whether one quote is safe to advance per-leg funding last-good truth."""
+    if quote.contract_normalization_complete is not True:
+        return False
+    if str(quote.contract_type or "").strip().lower() != "linear":
+        return False
+    if str(quote.venue_status or "").strip().lower() != "active":
+        return False
+    if not all(
+        str(value or "").strip()
+        for value in (
+            quote.underlying,
+            quote.quote_currency,
+            quote.mark_index_source,
+        )
+    ):
+        return False
+    multiplier = quote.contract_multiplier
+    if (
+        isinstance(multiplier, bool)
+        or not isinstance(multiplier, (int, float))
+        or not isfinite(float(multiplier))
+        or float(multiplier) <= 0.0
+    ):
+        return False
+    precision_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (quote.price_precision, quote.quantity_precision)
+    )
+    exact_contract_valid = all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        and float(value) > 0.0
+        for value in (
+            quote.price_tick,
+            quote.quantity_step_base,
+            quote.min_quantity_base,
+        )
+    )
+    min_notional_valid = bool(
+        quote.min_notional_evidence_complete is True
+        and isinstance(quote.min_notional_quote, (int, float))
+        and not isinstance(quote.min_notional_quote, bool)
+        and isfinite(float(quote.min_notional_quote))
+        and float(quote.min_notional_quote) >= 0.0
+    )
+    schedule_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (quote.funding_timestamp_ms, quote.funding_interval_ms)
+    )
+    return precision_valid and exact_contract_valid and min_notional_valid and schedule_valid
+
+
+def _restorable_prior_last_good_quotes(
+    snapshot: SidecarSnapshot,
+    *,
+    configured_venues: set[str],
+    configured_symbols: set[str],
+    now_ms: int,
+    max_age_ms: int,
+) -> dict[str, QuoteSnapshot]:
+    """Restore only fresh direct-market evidence across a process restart."""
+    if (
+        snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION
+        or snapshot.acquisition_mode != "fresh_sidecar"
+        or snapshot.source_mode != "direct_market"
+        or snapshot.degraded_venues
+        or snapshot.degraded_domains
+        or any(snapshot.degraded_symbols.values())
+    ):
+        return {}
+    restored: dict[str, QuoteSnapshot] = {}
+    for quote in snapshot.quotes.values():
+        venue = str(quote.venue or "").strip().lower()
+        symbol = str(quote.symbol or "").strip().upper()
+        key = f"{venue}:{symbol}"
+        observed_at_ms = int(quote.observed_at_ms or 0)
+        age_ms = int(now_ms) - observed_at_ms
+        if (
+            venue not in configured_venues
+            or symbol not in configured_symbols
+            or observed_at_ms <= 0
+            or age_ms < 0
+            or age_ms > max_age_ms
+            or not _quote_cache_contract_eligible(quote)
+            or _market_failure_reasons({key: quote})
+            or _funding_failure_reasons({key: quote})
+        ):
+            continue
+        restored[key] = replace(quote)
+    return restored
+
+
+def _apply_future_quote_degradation(
+    lifecycle_rows: list[FundingLifecycle | MarketLifecycle | LiquidityLifecycle],
+    future_symbols_by_venue: dict[str, set[str]],
+    counted_symbols_by_venue: dict[str, set[str]],
+) -> None:
+    """Reconcile lifecycle proof after future-dated quote quarantine."""
+    for row in lifecycle_rows:
+        venue = str(row.venue).strip().lower()
+        future_symbols = future_symbols_by_venue.get(venue, set())
+        if not future_symbols:
+            continue
+        counted_symbols = counted_symbols_by_venue.get(venue, set())
+        row.coverage_usable = max(
+            0,
+            int(row.coverage_usable) - len(future_symbols & counted_symbols),
+        )
+        evidence = "; ".join(
+            f"{symbol}: observed_at_ms_after_candidate_build"
+            for symbol in sorted(future_symbols)
+        )
+        row.degraded_reason = "; ".join(
+            part for part in (str(row.degraded_reason or ""), evidence) if part
+        )
+
+
+def _canonical_venue_configs(venues: list[VenueConfig]) -> dict[str, VenueConfig]:
+    """Collapse case/whitespace aliases without duplicating venue side effects.
+
+    The first declaration is authoritative.  Fetching, lifecycle accounting,
+    and fee/sizing inputs therefore share one deterministic venue identity.
+    """
+    canonical: dict[str, VenueConfig] = {}
+    for venue in venues:
+        venue_name = str(venue.venue).strip().lower()
+        if venue_name and venue_name not in canonical:
+            canonical[venue_name] = venue
+    return canonical
+
+
+def _snapshot_item_symbol(key: object, value: object) -> str:
+    raw = getattr(value, "symbol", "") or str(key).split(":", 1)[-1]
+    return str(raw).strip().upper()
+
+
+def _snapshot_map_symbols(values: object) -> set[str]:
+    if not isinstance(values, dict):
+        return set()
+    return {
+        symbol
+        for key, value in values.items()
+        if (symbol := _snapshot_item_symbol(key, value))
+    }
+
+
+def _canonicalize_venue_quotes(
+    venue_name: str,
+    quotes: dict[str, QuoteSnapshot] | None,
+    *,
+    requested_symbols: set[str],
+) -> tuple[dict[str, QuoteSnapshot], dict[str, str]]:
+    """Canonicalize source-owned identities and quarantine local corruption.
+
+    Identity errors are per-symbol data-quality failures.  They must not reach
+    candidate construction or turn a single bad provider record into a failed
+    atomic publication of every healthy venue.
+    """
+    expected_venue = str(venue_name).strip().lower()
+    accepted: dict[str, QuoteSnapshot] = {}
+    identities_seen: set[tuple[str, str]] = set()
+    duplicate_identities: set[tuple[str, str]] = set()
+    failures: dict[str, str] = {}
+
+    for raw_key, quote in (quotes or {}).items():
+        quote_venue = str(getattr(quote, "venue", "") or "").strip().lower()
+        quote_symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
+        key_text = str(raw_key).strip()
+        key_venue, separator, key_symbol = key_text.partition(":")
+        key_venue = key_venue.strip().lower() if separator else expected_venue
+        key_symbol = (key_symbol if separator else key_text).strip().upper()
+        attributable_symbol = quote_symbol or key_symbol
+
+        reasons: list[str] = []
+        if not quote_symbol or quote_symbol not in requested_symbols:
+            reasons.append("quote_symbol_out_of_scope")
+        if quote_venue != expected_venue:
+            reasons.append("quote_source_venue_mismatch")
+        if key_venue != expected_venue or key_symbol != quote_symbol:
+            reasons.append("quote_key_identity_mismatch")
+        if reasons:
+            if attributable_symbol in requested_symbols:
+                failures[attributable_symbol] = ",".join(reasons)
+            continue
+
+        identity = (quote_venue, quote_symbol)
+        if identity in identities_seen:
+            duplicate_identities.add(identity)
+            continue
+        identities_seen.add(identity)
+        accepted[f"{quote_venue}:{quote_symbol}"] = replace(
+            quote,
+            venue=quote_venue,
+            symbol=quote_symbol,
+        )
+
+    for identity in duplicate_identities:
+        accepted.pop(f"{identity[0]}:{identity[1]}", None)
+        failures[identity[1]] = "duplicate_quote_identity"
+    return accepted, failures
+
+
+def _market_failure_reasons(
+    quotes: dict[str, QuoteSnapshot] | None,
+) -> dict[str, str]:
+    """Return per-symbol BBO failures; only crossed quotes remain publishable."""
+    failures: dict[str, str] = {}
+    for key, quote in (quotes or {}).items():
+        symbol = _snapshot_item_symbol(key, quote)
+        bid_raw = getattr(quote, "bid", None)
+        ask_raw = getattr(quote, "ask", None)
+        try:
+            bid = float(bid_raw)
+        except (TypeError, ValueError, OverflowError):
+            bid = float("nan")
+        try:
+            ask = float(ask_raw)
+        except (TypeError, ValueError, OverflowError):
+            ask = float("nan")
+        reasons: list[str] = []
+        observed_at_ms = getattr(quote, "observed_at_ms", None)
+        if (
+            isinstance(observed_at_ms, bool)
+            or not isinstance(observed_at_ms, int)
+            or observed_at_ms <= 0
+        ):
+            reasons.append("observed_at_ms_invalid")
+        if isinstance(bid_raw, bool) or not isfinite(bid):
+            reasons.append("bid_invalid")
+        elif bid <= 0:
+            reasons.append("bid_nonpositive")
+        if isinstance(ask_raw, bool) or not isfinite(ask):
+            reasons.append("ask_invalid")
+        elif ask <= 0:
+            reasons.append("ask_nonpositive")
+        if not reasons and bid > ask:
+            reasons.append("crossed BBO")
+        if reasons:
+            failures[symbol] = ",".join(reasons)
+    return failures
+
+
+def _crossed_quote_symbols(
+    quotes: dict[str, QuoteSnapshot] | None,
+) -> set[str]:
+    """Compatibility helper for callers interested only in crossed BBOs."""
+    return {
+        symbol
+        for symbol, reason in _market_failure_reasons(quotes).items()
+        if reason == "crossed BBO"
+    }
+
+
+def _funding_failure_reasons(
+    quotes: dict[str, QuoteSnapshot] | None,
+) -> dict[str, str]:
+    """Return per-symbol proof gaps that make funding data unusable."""
+    failures: dict[str, str] = {}
+    for key, quote in (quotes or {}).items():
+        reasons: list[str] = []
+        rate = getattr(quote, "funding_rate_bps", None)
+        try:
+            numeric_rate = float(rate)
+        except (TypeError, ValueError, OverflowError):
+            numeric_rate = float("nan")
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not isfinite(numeric_rate)
+        ):
+            reasons.append("funding_rate_invalid")
+        for field in ("predicted_funding_rate_bps", "settled_funding_rate_bps"):
+            value = getattr(quote, field, None)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                reasons.append(f"{field}_invalid")
+                continue
+            if not isfinite(float(value)):
+                reasons.append(f"{field}_invalid")
+        for field in ("funding_timestamp_ms", "funding_interval_ms"):
+            value = getattr(quote, field, None)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                reasons.append(f"{field}_invalid")
+        if reasons:
+            failures[_snapshot_item_symbol(key, quote)] = ",".join(reasons)
+    return failures
+
+
+def _diagnostic_quote_without_funding_truth(quote: QuoteSnapshot) -> QuoteSnapshot:
+    """Copy a BBO quote while revoking malformed funding/contract evidence."""
+    return replace(
+        quote,
+        funding_rate_bps=0.0,
+        funding_timestamp_ms=0,
+        funding_interval_ms=0,
+        predicted_funding_rate_bps=None,
+        funding_forecast_source="invalid_funding_quarantined",
+        funding_forecast_sample_count=0,
+        funding_forecast_uncertainty_bps=0.0,
+        funding_forecast_started_at_ms=0,
+        funding_forecast_distribution_stable=False,
+        funding_forecast_stability_reason="invalid_funding_quarantined",
+        funding_forecast_median_drift_bps=0.0,
+        funding_forecast_p90_drift_bps=0.0,
+        settled_funding_rate_bps=None,
+        contract_normalization_complete=False,
+    )
+
+
+def _latest_valid_quote_observation_ms(
+    quotes: dict[str, QuoteSnapshot],
+    *,
+    decision_at_ms: int,
+    fallback_ms: int,
+) -> int:
+    observations = [int(getattr(quote, "observed_at_ms", 0) or 0) for quote in quotes.values()]
+    valid = [value for value in observations if 0 < value <= decision_at_ms]
+    return max(valid, default=max(int(fallback_ms or 0), 0))

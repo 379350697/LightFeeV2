@@ -9570,19 +9570,109 @@ def _build_spread_sidecar_summary(
 ) -> dict[str, Any]:
     path = Path(runtime_dir) / "spread-opportunities-current.json"
     try:
+        raw_snapshot = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw_snapshot, dict):
+            raw_snapshot = None
         from lightfee.spread.publisher import load_spread_snapshot
 
         snapshot = load_spread_snapshot(path)
     except Exception:
+        raw_snapshot = None
         snapshot = None
     if snapshot is None:
         return {
             "available": False,
             "path": str(path),
             "spread_sidecar_source": "missing_or_malformed",
+            "diagnostic_contract_status": "missing_or_malformed",
             "candidate_count": 0,
             "degraded_venues": [],
+            "input_quote_count": 0,
+            "valid_quote_count": 0,
+            "evaluated_pair_count": 0,
+            "accepted_pair_count": 0,
+            "rejection_counts": {},
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "paper_admission_rejection_counts": {},
+            "top_paper_admission_rejection": None,
+            "blocking_reasons": ["spread_snapshot_missing_or_malformed"],
+            "next_actions": ["restore a valid spread sidecar snapshot"],
         }
+
+    def nonnegative_int(field: str) -> int:
+        value = getattr(snapshot, field, 0)
+        return value if type(value) is int and value >= 0 else 0
+
+    def stable_counts(field: str) -> dict[str, int]:
+        value = getattr(snapshot, field, {})
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(reason): count
+            for reason, count in value.items()
+            if str(reason).strip() and type(count) is int and count >= 0
+        }
+
+    from lightfee.ops.production_health import analyze_spread_snapshot
+
+    observed_now_ms = int(now_ms or time.time() * 1000)
+    spread_health = analyze_spread_snapshot(
+        raw_snapshot,
+        now_ms=observed_now_ms,
+        max_age_ms=sidecar_snapshot_max_age_ms,
+    )
+    health_fingerprints = list(spread_health.fingerprints)
+    contract_fingerprints = {
+        "spread_diagnostics_contract_missing",
+        "spread_diagnostics_contract_invalid",
+        "spread_diagnostics_count_invariant_invalid",
+        "spread_publication_watermark_invalid",
+    }
+    contract_valid = not any(
+        fingerprint in contract_fingerprints for fingerprint in health_fingerprints
+    )
+    input_quote_count = nonnegative_int("input_quote_count")
+    valid_quote_count = nonnegative_int("valid_quote_count")
+    evaluated_pair_count = nonnegative_int("evaluated_pair_count")
+    accepted_pair_count = nonnegative_int("accepted_pair_count")
+    paper_tracked_count = nonnegative_int("paper_tracked_count")
+    paper_event_count = nonnegative_int("paper_event_count")
+    paper_last_success_at_ms = nonnegative_int("paper_last_success_at_ms")
+    rejection_counts = stable_counts("rejection_counts")
+    paper_rejection_counts = stable_counts("paper_admission_rejection_counts")
+    paper_configured_enabled = getattr(snapshot, "paper_configured_enabled", None) is True
+    paper_admission_enabled = getattr(snapshot, "paper_admission_enabled", None) is True
+    paper_refresh_status = str(getattr(snapshot, "paper_refresh_status", "") or "")
+    top_paper_rejection = (
+        max(paper_rejection_counts.items(), key=lambda item: (item[1], item[0]))
+        if paper_rejection_counts
+        else None
+    )
+    blocking_reasons: list[str] = []
+    next_actions: list[str] = []
+    if not contract_valid:
+        blocking_reasons.append("spread_diagnostics_contract_invalid")
+        next_actions.append("repair the spread snapshot diagnostics contract")
+    if not paper_configured_enabled:
+        blocking_reasons.append("spread_paper_not_configured")
+        next_actions.append("enable spread_paper_enabled only after paper prerequisites are ready")
+    elif not paper_admission_enabled:
+        blocking_reasons.append("spread_paper_admission_disabled")
+        next_actions.append("restore paper journal, rollback anchor, and admission prerequisites")
+    elif accepted_pair_count > 0 and paper_tracked_count == 0:
+        if top_paper_rejection is not None:
+            blocking_reasons.append(top_paper_rejection[0])
+            next_actions.append(
+                f"resolve top paper admission blocker: {top_paper_rejection[0]}"
+            )
+        else:
+            blocking_reasons.append("spread_paper_admission_unexplained_zero")
+            next_actions.append("inspect paper admission because accepted signals produced no attribution")
     source = str(getattr(snapshot, "source_mode", "") or "unknown")
     source_state = "current_ok"
     current_degraded = False
@@ -9617,8 +9707,32 @@ def _build_spread_sidecar_summary(
         "spread_sidecar_source_state": source_state,
         "spread_sidecar_current_degraded": current_degraded,
         "main_sidecar_snapshot_age_ms": main_age_ms,
+        "diagnostic_contract_status": "complete" if contract_valid else "invalid",
+        "health_fingerprints": health_fingerprints,
         "candidate_count": len(getattr(snapshot, "candidates", []) or []),
         "degraded_venues": list(getattr(snapshot, "degraded_venues", []) or []),
+        "input_quote_count": input_quote_count,
+        "valid_quote_count": valid_quote_count,
+        "evaluated_pair_count": evaluated_pair_count,
+        "accepted_pair_count": accepted_pair_count,
+        "rejection_counts": rejection_counts,
+        "paper_configured_enabled": paper_configured_enabled,
+        "paper_admission_enabled": paper_admission_enabled,
+        "paper_tracked_count": paper_tracked_count,
+        "paper_refresh_status": paper_refresh_status,
+        "paper_event_count": paper_event_count,
+        "paper_last_success_at_ms": paper_last_success_at_ms,
+        "paper_admission_rejection_counts": paper_rejection_counts,
+        "top_paper_admission_rejection": (
+            {
+                "reason": top_paper_rejection[0],
+                "count": top_paper_rejection[1],
+            }
+            if top_paper_rejection is not None
+            else None
+        ),
+        "blocking_reasons": blocking_reasons,
+        "next_actions": next_actions,
     }
 
 def run_diagnose(

@@ -170,6 +170,9 @@ entry_ws_bbo_per_venue_budget = 10
 [persistence]
 event_log_path = "runtime/events.jsonl"
 spread_paper_event_log_path = "runtime/spread-paper-events.jsonl"
+# Put this on an independently retained/mounted state volume.  It must be an
+# absolute path outside the paper journal directory or admission fails closed.
+spread_paper_rollback_anchor_path = "/var/lib/lightfee-v2-rollback-anchor/spread-paper.epoch"
 snapshot_path = "runtime/state.json"
 tuning_diagnostics_enabled = true
 tuning_diagnostics_max_records = 10000

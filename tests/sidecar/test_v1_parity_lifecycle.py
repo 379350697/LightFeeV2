@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import sys
 
 import pytest
 
-from lightfee.config.schema import RuntimeConfig, StrategyConfig
+from lightfee.config.schema import RuntimeConfig, StrategyConfig, VenueConfig
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -26,30 +25,55 @@ class TestLifecycleCoverageDegradation:
     """Lifecycle dataclasses must carry coverage_usable and degraded_reason."""
 
     def test_funding_lifecycle_has_coverage_and_reason(self):
-        fl = FundingLifecycle(venue="binance", observed_at_ms=1000, symbol_count=5,
-                              coverage_usable=5, degraded_reason="")
+        fl = FundingLifecycle(
+            venue="binance",
+            observed_at_ms=1000,
+            symbol_count=5,
+            coverage_usable=5,
+            degraded_reason="",
+        )
         assert fl.coverage_usable == 5
         assert fl.degraded_reason == ""
 
     def test_funding_lifecycle_degraded(self):
-        fl = FundingLifecycle(venue="okx", observed_at_ms=1000, symbol_count=3,
-                              coverage_usable=0, degraded_reason="timeout")
+        fl = FundingLifecycle(
+            venue="okx",
+            observed_at_ms=1000,
+            symbol_count=3,
+            coverage_usable=0,
+            degraded_reason="timeout",
+        )
         assert fl.coverage_usable == 0
         assert fl.degraded_reason == "timeout"
 
     def test_market_lifecycle_has_coverage_and_reason(self):
-        ml = MarketLifecycle(venue="bybit", observed_at_ms=1000, symbol_count=3,
-                             coverage_usable=2, degraded_reason="BTCUSDT: fetch failed")
+        ml = MarketLifecycle(
+            venue="bybit",
+            observed_at_ms=1000,
+            symbol_count=3,
+            coverage_usable=2,
+            degraded_reason="BTCUSDT: fetch failed",
+        )
         assert ml.coverage_usable == 2
 
     def test_liquidity_lifecycle_has_coverage_and_reason(self):
-        ll = LiquidityLifecycle(venue="gate", observed_at_ms=1000, symbol_count=0,
-                                coverage_usable=0, degraded_reason="venue degraded")
+        ll = LiquidityLifecycle(
+            venue="gate",
+            observed_at_ms=1000,
+            symbol_count=0,
+            coverage_usable=0,
+            degraded_reason="venue degraded",
+        )
         assert ll.coverage_usable == 0
 
     def test_transfer_lifecycle_has_coverage_and_reason(self):
-        tl = TransferLifecycle(from_venue="binance", to_venue="okx", observed_at_ms=1000,
-                               coverage_usable=0, degraded_reason="")
+        tl = TransferLifecycle(
+            from_venue="binance",
+            to_venue="okx",
+            observed_at_ms=1000,
+            coverage_usable=0,
+            degraded_reason="",
+        )
         assert tl.coverage_usable == 0
 
 
@@ -67,9 +91,69 @@ class TestDegradedSymbols:
     def test_degraded_symbols_roundtrip(self):
         import tempfile
         from pathlib import Path
+
         s = SidecarSnapshot(
+            published_at_ms=1_000,
+            market_observed_at_ms=1_000,
+            candidate_build_observed_at_ms=1_000,
+            candidate_build_diagnostics={
+                "input_quote_count": 0,
+                "requested_symbol_count": 1,
+                "requested_symbols": ["BTCUSDT"],
+                "requested_venues": ["gate", "okx"],
+                "directional_pair_count": 0,
+                "output_candidate_count": 0,
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
             degraded_symbols={"okx": ["BTCUSDT"]},
             degraded_venues=["gate"],
+            source_mode="direct_market",
+            acquisition_mode="degraded_sidecar",
+            funding_lifecycle=[
+                FundingLifecycle(
+                    venue="gate",
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason="timeout",
+                ),
+                FundingLifecycle(
+                    venue="okx",
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason="BTCUSDT: fetch failed",
+                ),
+            ],
+            market_lifecycle=[
+                MarketLifecycle(
+                    venue=venue,
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason=(
+                        "BTCUSDT: market unavailable"
+                        if venue == "okx"
+                        else "market unavailable"
+                    ),
+                )
+                for venue in ("gate", "okx")
+            ],
+            liquidity_lifecycle=[
+                LiquidityLifecycle(
+                    venue=venue,
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=0,
+                    degraded_reason=(
+                        "BTCUSDT: liquidity unavailable"
+                        if venue == "okx"
+                        else "liquidity unavailable"
+                    ),
+                )
+                for venue in ("gate", "okx")
+            ],
         )
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "snap.json"
@@ -93,29 +177,34 @@ class TestLastGoodFallback:
 
     def test_inject_last_good_returns_previous_quotes(self):
         from lightfee.sidecar.service import SidecarService
+
         quotes = {
-            "binance:BTCUSDT": QuoteSnapshot(venue="binance", symbol="BTCUSDT",
-                                              bid=50000, ask=50001, funding_rate_bps=10),
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance", symbol="BTCUSDT", bid=50000, ask=50001, funding_rate_bps=10
+            ),
         }
         svc = object.__new__(SidecarService)
         svc._last_good_quotes = quotes
         svc._last_good_at_ms = 1000
 
-        result = svc._inject_last_good("binance", ["BTCUSDT"])
+        result = svc._inject_last_good("binance", ["BTCUSDT"], now_ms=1500)
         assert len(result) == 1
         assert result["binance:BTCUSDT"].bid == 50000
+        assert result["binance:BTCUSDT"] is not quotes["binance:BTCUSDT"]
 
     def test_inject_last_good_empty_when_no_cache(self):
         from lightfee.sidecar.service import SidecarService
+
         svc = object.__new__(SidecarService)
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
 
-        result = svc._inject_last_good("binance", ["BTCUSDT"])
+        result = svc._inject_last_good("binance", ["BTCUSDT"], now_ms=1500)
         assert len(result) == 0
 
     def test_inject_last_good_only_matching_venue(self):
         from lightfee.sidecar.service import SidecarService
+
         quotes = {
             "binance:BTCUSDT": QuoteSnapshot(venue="binance", symbol="BTCUSDT", bid=1, ask=2),
             "okx:BTCUSDT": QuoteSnapshot(venue="okx", symbol="BTCUSDT", bid=3, ask=4),
@@ -124,10 +213,45 @@ class TestLastGoodFallback:
         svc._last_good_quotes = quotes
         svc._last_good_at_ms = 1000
 
-        result = svc._inject_last_good("binance", ["BTCUSDT"])
+        result = svc._inject_last_good("binance", ["BTCUSDT"], now_ms=1500)
         assert len(result) == 1
         assert "binance:BTCUSDT" in result
         assert "okx:BTCUSDT" not in result
+
+    def test_inject_last_good_enforces_per_key_ttl_and_future_guard(self):
+        from lightfee.sidecar.service import SidecarService
+
+        svc = object.__new__(SidecarService)
+        svc.config = type(
+            "Config",
+            (),
+            {"runtime": RuntimeConfig(live_scan_last_good_max_age_ms=500)},
+        )()
+        svc._last_good_quotes = {
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance", symbol="BTCUSDT", bid=1, ask=2,
+                observed_at_ms=1_000,
+            ),
+            "binance:ETHUSDT": QuoteSnapshot(
+                venue="binance", symbol="ETHUSDT", bid=3, ask=4,
+                observed_at_ms=2_000,
+            ),
+        }
+        svc._last_good_at_ms = 0
+        svc._last_good_at_ms_by_key = {
+            "binance:BTCUSDT": 1_000,
+            "binance:ETHUSDT": 2_000,
+        }
+
+        exact = svc._inject_last_good(
+            "binance", ["BTCUSDT", "ETHUSDT"], now_ms=1_500
+        )
+        expired = svc._inject_last_good(
+            "binance", ["BTCUSDT", "ETHUSDT"], now_ms=1_501
+        )
+
+        assert list(exact) == ["binance:BTCUSDT"]
+        assert expired == {}
 
 
 class TestSidecarResourceLifecycle:
@@ -137,9 +261,13 @@ class TestSidecarResourceLifecycle:
         from lightfee.apps import sidecar as sidecar_app
 
         calls: list[str] = []
-        config = type("Config", (), {
-            "runtime": type("Runtime", (), {"sidecar_refresh_ms": 1})(),
-        })()
+        config = type(
+            "Config",
+            (),
+            {
+                "runtime": type("Runtime", (), {"sidecar_refresh_ms": 1})(),
+            },
+        )()
 
         class FakeService:
             def __init__(self, config):
@@ -220,23 +348,91 @@ class TestSnapshotRoundTripWithAllV1Fields:
     def test_round_trip_lifecycle_coverage(self):
         import tempfile
         from pathlib import Path
+
+        requested_symbols = [
+            "BTCUSDT",
+            "ETHUSDT",
+            *(f"SYM{index}USDT" for index in range(2, 10)),
+        ]
         s = SidecarSnapshot(
             published_at_ms=1000,
+            market_observed_at_ms=1000,
+            candidate_build_observed_at_ms=1000,
+            candidate_build_diagnostics={
+                "input_quote_count": 10,
+                "requested_symbol_count": 10,
+                "requested_symbols": requested_symbols,
+                "requested_venues": ["a", "b"],
+                "directional_pair_count": 0,
+                "output_candidate_count": 0,
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
             funding_lifecycle=[
-                FundingLifecycle(venue="a", observed_at_ms=1000, symbol_count=10,
-                                 coverage_usable=10, degraded_reason=""),
-                FundingLifecycle(venue="b", observed_at_ms=1000, symbol_count=0,
-                                 coverage_usable=0, degraded_reason="timeout"),
+                FundingLifecycle(
+                    venue="a",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=10,
+                    degraded_reason="",
+                ),
+                FundingLifecycle(
+                    venue="b",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=0,
+                    degraded_reason="timeout",
+                ),
             ],
             market_lifecycle=[
-                MarketLifecycle(venue="a", observed_at_ms=1000, symbol_count=10,
-                                coverage_usable=8, degraded_reason="BTCUSDT: fetch failed; ETHUSDT: fetch failed"),
+                MarketLifecycle(
+                    venue="a",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=8,
+                    degraded_reason="BTCUSDT: fetch failed; ETHUSDT: fetch failed",
+                ),
+                MarketLifecycle(
+                    venue="b",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=0,
+                    degraded_reason="market unavailable",
+                ),
             ],
             liquidity_lifecycle=[
-                LiquidityLifecycle(venue="a", observed_at_ms=1000, symbol_count=8,
-                                   coverage_usable=8, degraded_reason=""),
+                LiquidityLifecycle(
+                    venue="a",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=8,
+                    degraded_reason="BTCUSDT: unavailable; ETHUSDT: unavailable",
+                ),
+                LiquidityLifecycle(
+                    venue="b",
+                    observed_at_ms=1000,
+                    symbol_count=10,
+                    coverage_usable=0,
+                    degraded_reason="liquidity unavailable",
+                ),
             ],
             degraded_symbols={"a": ["BTCUSDT", "ETHUSDT"]},
+            degraded_venues=["b"],
+            source_mode="direct_market",
+            acquisition_mode="degraded_sidecar",
+            quotes={
+                f"a:{symbol}": QuoteSnapshot(
+                    venue="a",
+                    symbol=symbol,
+                    bid=100.0,
+                    ask=101.0,
+                    observed_at_ms=1_000,
+                    funding_rate_bps=1.0,
+                    funding_timestamp_ms=2_000,
+                    funding_interval_ms=28_800_000,
+                )
+                for symbol in requested_symbols
+            },
         )
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "snap.json"
@@ -263,21 +459,51 @@ class TestAcquisitionModeReflectsDegradation:
 
     def test_acquisition_mode_fresh_when_clean(self):
         from lightfee.sidecar.service import _resolve_acquisition_mode
-        assert _resolve_acquisition_mode(set(), {}) == "fresh_sidecar"
 
-    def test_acquisition_mode_last_good_when_degraded_with_cache(self):
+        assert _resolve_acquisition_mode(set(), {}, set()) == "fresh_sidecar"
+
+    def test_acquisition_mode_last_good_when_degraded_with_injected_fallback(self):
         from lightfee.sidecar.service import _resolve_acquisition_mode
-        assert _resolve_acquisition_mode({"okx"}, {"x": 1}) == "last_good_sidecar"
+
+        assert (
+            _resolve_acquisition_mode(
+                {"okx"}, {}, {"okx:BTCUSDT"}
+            )
+            == "last_good_sidecar"
+        )
 
     def test_acquisition_mode_degraded_when_first_partial_failure(self):
         """Critical: first partial failure with no cache → degraded_sidecar, NOT fresh."""
         from lightfee.sidecar.service import _resolve_acquisition_mode
-        assert _resolve_acquisition_mode({"binance"}, {}) == "degraded_sidecar"
+
+        assert _resolve_acquisition_mode({"binance"}, {}, set()) == "degraded_sidecar"
 
     def test_acquisition_mode_degraded_when_cache_empty_dict(self):
         """Empty dict is falsy → degraded_sidecar, not fresh."""
         from lightfee.sidecar.service import _resolve_acquisition_mode
-        assert _resolve_acquisition_mode({"binance"}, {}) != "fresh_sidecar"
+
+        assert _resolve_acquisition_mode({"binance"}, {}, set()) != "fresh_sidecar"
+
+    def test_acquisition_mode_unavailable_when_no_quote_payload(self):
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+
+        assert (
+            _resolve_acquisition_mode(
+                {"binance"},
+                {},
+                set(),
+                has_usable_payload=False,
+            )
+            == "unavailable"
+        )
+
+    def test_partial_symbol_failure_is_not_labeled_fresh(self):
+        from lightfee.sidecar.service import _resolve_acquisition_mode
+
+        assert (
+            _resolve_acquisition_mode(set(), {"okx": ["BTCUSDT"]}, set())
+            == "degraded_sidecar"
+        )
 
 
 class TestLiquiditySourceWiredIntoRefresh:
@@ -285,13 +511,24 @@ class TestLiquiditySourceWiredIntoRefresh:
 
     def test_fetch_liquidity_all_venues_method_exists(self):
         from lightfee.sidecar.service import SidecarService
+
         svc = object.__new__(SidecarService)
         assert hasattr(svc, "_fetch_liquidity_all_venues")
 
     def test_liquidity_timeout_s_read_from_runtime(self):
-        from lightfee.sidecar.service import SidecarService, DEFAULT_LIQUIDITY_TIMEOUT_S
+        from lightfee.sidecar.service import SidecarService
+
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": RuntimeConfig(sidecar_snapshot_path="/tmp"), "strategy": StrategyConfig(), "venues": [], "symbols": []})()
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(sidecar_snapshot_path="/tmp"),
+                "strategy": StrategyConfig(),
+                "venues": [VenueConfig(venue="binance")],
+                "symbols": [],
+            },
+        )()
         svc._liquidity_sources = {}
         svc._exchange_sources = {}
         svc._last_good_quotes = {}
@@ -301,10 +538,219 @@ class TestLiquiditySourceWiredIntoRefresh:
 
     def test_liquidity_timeout_default(self):
         from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
+
         assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
 
     @pytest.mark.asyncio
-    async def test_refresh_reuses_quote_snapshots_for_liquidity_without_second_public_fetch(self, tmp_path):
+    async def test_funding_fetch_reconciles_silent_symbol_omission(self):
+        from lightfee.sidecar.service import SidecarService
+
+        class SilentPartialSource:
+            async def fetch_all(self, symbols):
+                return {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=123,
+                    )
+                }
+
+        service = object.__new__(SidecarService)
+        service.config = type(
+            "Config",
+            (),
+            {"venues": [type("Venue", (), {"venue": "binance"})()]},
+        )()
+        service._exchange_sources = {"binance": SilentPartialSource()}
+
+        results = await service._fetch_all_venues(
+            ["BTCUSDT", "ETHUSDT"], timeout_s=1.0
+        )
+
+        venue, quotes, error, failed_symbols = results[0]
+        assert venue == "binance"
+        assert error is None
+        assert set(quotes or {}) == {"binance:BTCUSDT"}
+        assert failed_symbols == {"ETHUSDT"}
+
+    @pytest.mark.asyncio
+    async def test_refresh_binds_missing_and_crossed_symbols_to_lifecycle_proof(
+        self, tmp_path
+    ):
+        from lightfee.config.schema import AppConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        class MissingAndCrossedSource:
+            async def fetch_all(self, symbols):
+                return {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=101.0,
+                        ask=100.0,
+                        observed_at_ms=123,
+                        funding_rate_bps=1.0,
+                        funding_timestamp_ms=2_000,
+                        funding_interval_ms=28_800_000,
+                    )
+                }
+
+            async def close(self):
+                return None
+
+        snapshot_path = tmp_path / "sidecar.json"
+        config = AppConfig(
+            symbols=["BTCUSDT", "ETHUSDT"],
+            runtime=RuntimeConfig(sidecar_snapshot_path=str(snapshot_path)),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"] = MissingAndCrossedSource()
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        assert snapshot.degraded_venues == ["binance"]
+        assert snapshot.degraded_symbols == {
+            "binance": ["BTCUSDT", "ETHUSDT"]
+        }
+        assert snapshot.acquisition_mode == "degraded_sidecar"
+        assert snapshot.funding_lifecycle[0].symbol_count == 2
+        assert snapshot.funding_lifecycle[0].coverage_usable == 1
+        assert "ETHUSDT: fetch failed" in snapshot.funding_lifecycle[0].degraded_reason
+        assert snapshot.market_lifecycle[0].symbol_count == 2
+        assert snapshot.market_lifecycle[0].coverage_usable == 0
+        assert "BTCUSDT: crossed BBO" in snapshot.market_lifecycle[0].degraded_reason
+        assert snapshot.liquidity_lifecycle[0].symbol_count == 2
+        assert snapshot.liquidity_lifecycle[0].coverage_usable == 0
+        assert load_snapshot(snapshot_path) is not None
+
+    @pytest.mark.parametrize(
+        "invalid_bid",
+        [0.0, -1.0, float("nan"), float("inf"), "bad"],
+    )
+    @pytest.mark.asyncio
+    async def test_refresh_filters_invalid_bbo_without_losing_valid_symbol(
+        self, tmp_path, invalid_bid
+    ):
+        from lightfee.config.schema import AppConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        class InvalidBboSource:
+            async def fetch_all(self, symbols):
+                return {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=invalid_bid,
+                        ask=100.0,
+                        observed_at_ms=123,
+                        funding_rate_bps=1.0,
+                        funding_timestamp_ms=2_000,
+                        funding_interval_ms=28_800_000,
+                    ),
+                    "binance:ETHUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="ETHUSDT",
+                        bid=50.0,
+                        ask=51.0,
+                        observed_at_ms=123,
+                        funding_rate_bps=2.0,
+                        funding_timestamp_ms=2_000,
+                        funding_interval_ms=28_800_000,
+                    ),
+                }
+
+            async def close(self):
+                return None
+
+        snapshot_path = tmp_path / "sidecar.json"
+        config = AppConfig(
+            symbols=["BTCUSDT", "ETHUSDT"],
+            runtime=RuntimeConfig(sidecar_snapshot_path=str(snapshot_path)),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"] = InvalidBboSource()
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        assert set(snapshot.quotes) == {"binance:ETHUSDT"}
+        assert snapshot.degraded_symbols == {"binance": ["BTCUSDT"]}
+        assert snapshot.funding_lifecycle[0].coverage_usable == 1
+        assert snapshot.market_lifecycle[0].coverage_usable == 1
+        assert "BTCUSDT:" in snapshot.market_lifecycle[0].degraded_reason
+        assert snapshot.liquidity_lifecycle[0].coverage_usable == 1
+        assert load_snapshot(snapshot_path) is not None
+
+    @pytest.mark.asyncio
+    async def test_refresh_bad_funding_scalar_is_locally_degraded_not_aborted(
+        self, tmp_path
+    ):
+        from lightfee.config.schema import AppConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        class QuoteSource:
+            def __init__(self, venue, funding_rate):
+                self.venue = venue
+                self.funding_rate = funding_rate
+
+            async def fetch_all(self, symbols):
+                return {
+                    f"{self.venue}:BTCUSDT": QuoteSnapshot(
+                        venue=self.venue,
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        observed_at_ms=123,
+                        funding_rate_bps=self.funding_rate,
+                        funding_timestamp_ms=2_000,
+                        funding_interval_ms=28_800_000,
+                    )
+                }
+
+            async def close(self):
+                return None
+
+        snapshot_path = tmp_path / "sidecar.json"
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(sidecar_snapshot_path=str(snapshot_path)),
+            venues=[
+                VenueConfig(venue="binance"),
+                VenueConfig(venue="okx"),
+            ],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"] = QuoteSource("binance", "bad")
+        service._exchange_sources["okx"] = QuoteSource("okx", 2.0)
+
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        funding = {row.venue: row for row in snapshot.funding_lifecycle}
+        assert funding["binance"].coverage_usable == 0
+        assert "BTCUSDT: funding_rate_invalid" in funding["binance"].degraded_reason
+        assert snapshot.degraded_symbols == {"binance": ["BTCUSDT"]}
+        assert snapshot.candidates == []
+        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {
+            "invalid_trade_quote": 2
+        }
+        assert load_snapshot(snapshot_path) is not None
+
+    @pytest.mark.asyncio
+    async def test_refresh_reuses_quote_snapshots_for_liquidity_without_second_public_fetch(
+        self, tmp_path
+    ):
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
         from lightfee.sidecar.service import SidecarService
 
@@ -317,6 +763,9 @@ class TestLiquiditySourceWiredIntoRefresh:
                         bid=100.0,
                         ask=101.0,
                         observed_at_ms=123,
+                        funding_rate_bps=1.0,
+                        funding_timestamp_ms=2_000,
+                        funding_interval_ms=28_800_000,
                     )
                 }
 
@@ -360,7 +809,16 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(),
+                "symbols": ["BTCUSDT"],
+                "strategy": StrategyConfig(),
+                "venues": [VenueConfig(venue="binance")],
+            },
+        )()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
@@ -369,22 +827,48 @@ class TestRefreshPublicationSemantics:
         svc._last_liquidity_publish_at_ms = 1000
 
         async def fake_fetch_all_venues(symbols, timeout_s):
-            return [(
-                "binance",
-                {"binance:BTCUSDT": QuoteSnapshot(
-                    venue="binance", symbol="BTCUSDT", bid=50000, ask=50001,
-                    funding_rate_bps=1.0, funding_timestamp_ms=1000,
-                )},
-                None,
-                set(),
-            )]
+            return [
+                (
+                    "binance",
+                    {
+                        "binance:BTCUSDT": QuoteSnapshot(
+                            venue="binance",
+                            symbol="BTCUSDT",
+                            bid=50000,
+                            ask=50001,
+                            observed_at_ms=1000,
+                            funding_rate_bps=1.0,
+                            funding_timestamp_ms=1000,
+                            funding_interval_ms=28_800_000,
+                            underlying="BTC",
+                            quote_currency="USDT",
+                            contract_type="linear",
+                            contract_multiplier=1.0,
+                            mark_index_source="venue_index",
+                            price_precision=2,
+                            quantity_precision=3,
+                            price_tick=0.01,
+                            quantity_step_base=0.001,
+                            min_quantity_base=0.001,
+                            min_notional_quote=5.0,
+                            min_notional_evidence_complete=True,
+                            venue_status="active",
+                            contract_normalization_complete=True,
+                        )
+                    },
+                    None,
+                    set(),
+                )
+            ]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s, quote_liquidity_by_venue=None):
+        async def fake_fetch_liquidity_all_venues(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
             return [("binance", {"binance:BTCUSDT": object()}, None, set())]
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
-        times = iter([1.0, 7.0])
+        times = iter([1.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()
@@ -401,11 +885,22 @@ class TestRefreshPublicationSemantics:
         assert snapshot.liquidity_lifecycle[0].source == "sidecar_perp_liquidity"
 
     @pytest.mark.asyncio
-    async def test_liquidity_success_publish_interval_ignores_failed_refresh(self, monkeypatch, tmp_path):
+    async def test_liquidity_success_publish_interval_ignores_failed_refresh(
+        self, monkeypatch, tmp_path
+    ):
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(),
+                "symbols": ["BTCUSDT"],
+                "strategy": StrategyConfig(),
+                "venues": [VenueConfig(venue="binance")],
+            },
+        )()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
@@ -414,25 +909,39 @@ class TestRefreshPublicationSemantics:
         svc._last_liquidity_publish_at_ms = 1000
 
         async def fake_fetch_all_venues(symbols, timeout_s):
-            return [(
-                "binance",
-                {"binance:BTCUSDT": QuoteSnapshot(
-                    venue="binance", symbol="BTCUSDT", bid=50000, ask=50001,
-                    funding_rate_bps=1.0, funding_timestamp_ms=1000,
-                )},
-                None,
-                set(),
-            )]
+            return [
+                (
+                    "binance",
+                    {
+                        "binance:BTCUSDT": QuoteSnapshot(
+                            venue="binance",
+                            symbol="BTCUSDT",
+                            bid=50000,
+                            ask=50001,
+                            observed_at_ms=1000,
+                            funding_rate_bps=1.0,
+                            funding_timestamp_ms=1000,
+                            funding_interval_ms=28_800_000,
+                        )
+                    },
+                    None,
+                    set(),
+                )
+            ]
 
-        async def failed_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
+        async def failed_liquidity(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
             return [("binance", None, TimeoutError("liquidity timeout 10.0s"), set())]
 
-        async def successful_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
+        async def successful_liquidity(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
             return [("binance", {"binance:BTCUSDT": object()}, None, set())]
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = failed_liquidity
-        times = iter([2.0, 7.0])
+        times = iter([2.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         failed = await svc.refresh_once()
@@ -442,7 +951,7 @@ class TestRefreshPublicationSemantics:
         assert svc._last_liquidity_publish_at_ms == 1000
 
         svc._fetch_liquidity_all_venues = successful_liquidity
-        times = iter([8.0, 11.0])
+        times = iter([8.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         successful = await svc.refresh_once()
@@ -456,7 +965,19 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(),
+                "symbols": ["BTCUSDT"],
+                "strategy": StrategyConfig(),
+                "venues": [
+                    VenueConfig(venue="okx"),
+                    VenueConfig(venue="bybit"),
+                ],
+            },
+        )()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
@@ -470,17 +991,45 @@ class TestRefreshPublicationSemantics:
 
         async def fake_fetch_all_venues(symbols, timeout_s):
             return [
-                ("okx", {"okx:BTCUSDT": QuoteSnapshot(
-                    venue="okx", symbol="BTCUSDT", bid=50000, ask=50001,
-                    funding_rate_bps=1.0, funding_timestamp_ms=1000,
-                )}, None, set()),
-                ("bybit", {"bybit:BTCUSDT": QuoteSnapshot(
-                    venue="bybit", symbol="BTCUSDT", bid=50002, ask=50003,
-                    funding_rate_bps=2.0, funding_timestamp_ms=1000,
-                )}, None, set()),
+                (
+                    "okx",
+                    {
+                        "okx:BTCUSDT": QuoteSnapshot(
+                            venue="okx",
+                            symbol="BTCUSDT",
+                            bid=50000,
+                            ask=50001,
+                            observed_at_ms=1000,
+                            funding_rate_bps=1.0,
+                            funding_timestamp_ms=1000,
+                            funding_interval_ms=28_800_000,
+                        )
+                    },
+                    None,
+                    set(),
+                ),
+                (
+                    "bybit",
+                    {
+                        "bybit:BTCUSDT": QuoteSnapshot(
+                            venue="bybit",
+                            symbol="BTCUSDT",
+                            bid=50002,
+                            ask=50003,
+                            observed_at_ms=1000,
+                            funding_rate_bps=2.0,
+                            funding_timestamp_ms=1000,
+                            funding_interval_ms=28_800_000,
+                        )
+                    },
+                    None,
+                    set(),
+                ),
             ]
 
-        async def mixed_liquidity(symbols, timeout_s, quote_liquidity_by_venue=None):
+        async def mixed_liquidity(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
             return [
                 ("okx", {"okx:BTCUSDT": object()}, None, set()),
                 ("bybit", None, TimeoutError("liquidity timeout 10.0s"), set()),
@@ -488,7 +1037,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = mixed_liquidity
-        times = iter([8.0, 11.0])
+        times = iter([8.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()
@@ -500,12 +1049,18 @@ class TestRefreshPublicationSemantics:
         assert rows["bybit"].coverage_usable == 0
         assert rows["bybit"].publish_interval_ms == 0
         assert rows["bybit"].published_at_ms == 4000
-        assert svc._last_liquidity_publish_at_ms_by_key[
-            ("perp_liquidity", "sidecar_perp_liquidity", "okx")
-        ] == 11000
-        assert svc._last_liquidity_publish_at_ms_by_key[
-            ("perp_liquidity", "sidecar_perp_liquidity", "bybit")
-        ] == 4000
+        assert (
+            svc._last_liquidity_publish_at_ms_by_key[
+                ("perp_liquidity", "sidecar_perp_liquidity", "okx")
+            ]
+            == 11000
+        )
+        assert (
+            svc._last_liquidity_publish_at_ms_by_key[
+                ("perp_liquidity", "sidecar_perp_liquidity", "bybit")
+            ]
+            == 4000
+        )
 
     def test_candidate_sizing_liquidity_source_roundtrip(self, tmp_path):
         candidate = CandidateInput(
@@ -518,12 +1073,76 @@ class TestRefreshPublicationSemantics:
             worst_case_edge_bps=2.0,
             ranking_edge_bps=10.0,
             entry_notional_quote=50.0,
+            funding_timestamp_ms=2_000,
+            first_funding_timestamp_ms=2_000,
+            long_funding_timestamp_ms=2_000,
+            short_funding_timestamp_ms=2_000,
             sizing_liquidity_source="sidecar_perp_liquidity",
             forecast_shadow_age_ms=7 * 24 * 60 * 60 * 1000,
             forecast_sample_count=42,
             forecast_ready=True,
+            blocked=True,
+            blocked_reasons=["incomplete_v3_economics"],
+            economics_incomplete_reason="incomplete_v3_economics",
         )
-        snapshot = SidecarSnapshot(candidates=[candidate])
+        snapshot = SidecarSnapshot(
+            published_at_ms=1_000,
+            market_observed_at_ms=1_000,
+            candidate_build_observed_at_ms=1_000,
+            candidate_build_diagnostics={
+                "input_quote_count": 2,
+                "requested_symbol_count": 1,
+                "requested_symbols": ["BTCUSDT"],
+                "requested_venues": ["bybit", "okx"],
+                "directional_pair_count": 1,
+                "output_candidate_count": 1,
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
+            source_mode="direct_market",
+            acquisition_mode="fresh_sidecar",
+            funding_lifecycle=[
+                FundingLifecycle(
+                    venue=venue,
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=1,
+                )
+                for venue in ("bybit", "okx")
+            ],
+            market_lifecycle=[
+                MarketLifecycle(
+                    venue=venue,
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=1,
+                )
+                for venue in ("bybit", "okx")
+            ],
+            liquidity_lifecycle=[
+                LiquidityLifecycle(
+                    venue=venue,
+                    observed_at_ms=1_000,
+                    symbol_count=1,
+                    coverage_usable=1,
+                )
+                for venue in ("bybit", "okx")
+            ],
+            quotes={
+                f"{venue}:BTCUSDT": QuoteSnapshot(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=50_000,
+                    ask=50_001,
+                    observed_at_ms=1_000,
+                    funding_rate_bps=1.0,
+                    funding_timestamp_ms=2_000,
+                    funding_interval_ms=28_800_000,
+                )
+                for venue in ("bybit", "okx")
+            },
+            candidates=[candidate],
+        )
 
         path = tmp_path / "snapshot.json"
         publish_snapshot(snapshot, path)
@@ -540,7 +1159,19 @@ class TestRefreshPublicationSemantics:
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": RuntimeConfig(), "symbols": ["BTCUSDT"], "strategy": StrategyConfig(), "venues": []})()
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(),
+                "symbols": ["BTCUSDT"],
+                "strategy": StrategyConfig(),
+                "venues": [
+                    VenueConfig(venue="binance"),
+                    VenueConfig(venue="okx"),
+                ],
+            },
+        )()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
         svc._liquidity_timeout_s = 10.0
@@ -550,14 +1181,37 @@ class TestRefreshPublicationSemantics:
         async def fake_fetch_all_venues(symbols, timeout_s):
             return [
                 ("binance", None, TimeoutError("funding timeout 10.0s"), set()),
-                ("okx", {"okx:BTCUSDT": QuoteSnapshot(
-                    venue="okx", symbol="BTCUSDT", bid=50010, ask=50011,
-                    funding_rate_bps=2.0, funding_timestamp_ms=1000,
-                )}, None, set()),
+                (
+                    "okx",
+                    {
+                        "okx:BTCUSDT": QuoteSnapshot(
+                            venue="okx",
+                            symbol="BTCUSDT",
+                            bid=50010,
+                            ask=50011,
+                            observed_at_ms=1000,
+                            funding_rate_bps=2.0,
+                            funding_timestamp_ms=1000,
+                            funding_interval_ms=28_800_000,
+                        )
+                    },
+                    None,
+                    set(),
+                ),
             ]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s, quote_liquidity_by_venue=None):
-            return []
+        async def fake_fetch_liquidity_all_venues(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
+            return [
+                (
+                    "binance",
+                    None,
+                    RuntimeError("liquidity skipped after market data degradation"),
+                    set(),
+                ),
+                ("okx", {"okx:BTCUSDT": object()}, None, set()),
+            ]
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
@@ -566,3 +1220,51 @@ class TestRefreshPublicationSemantics:
 
         assert snapshot.degraded_venues == ["binance"]
         assert snapshot.acquisition_mode == "degraded_sidecar"
+
+    @pytest.mark.asyncio
+    async def test_all_venue_failure_without_cache_is_unavailable(self, tmp_path):
+        from lightfee.sidecar.service import SidecarService
+
+        svc = object.__new__(SidecarService)
+        svc.config = type(
+            "c",
+            (),
+            {
+                "runtime": RuntimeConfig(),
+                "symbols": ["BTCUSDT"],
+                "strategy": StrategyConfig(),
+                "venues": [
+                    VenueConfig(venue="binance"),
+                    VenueConfig(venue="okx"),
+                ],
+            },
+        )()
+        svc.snapshot_path = tmp_path / "sidecar.json"
+        svc._funding_timeout_s = 10.0
+        svc._liquidity_timeout_s = 10.0
+        svc._last_good_quotes = {}
+        svc._last_good_at_ms = 0
+
+        async def failed_market(symbols, timeout_s):
+            return [
+                (venue, None, TimeoutError("funding unavailable"), set())
+                for venue in ("binance", "okx")
+            ]
+
+        async def skipped_liquidity(
+            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
+        ):
+            return [
+                (venue, None, RuntimeError("market unavailable"), set())
+                for venue in ("binance", "okx")
+            ]
+
+        svc._fetch_all_venues = failed_market
+        svc._fetch_liquidity_all_venues = skipped_liquidity
+
+        snapshot = await svc.refresh_once()
+
+        assert snapshot.quotes == {}
+        assert snapshot.candidates == []
+        assert snapshot.acquisition_mode == "unavailable"
+        assert load_snapshot(svc.snapshot_path) is not None

@@ -19,7 +19,9 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
     SnapshotFreshness,
+    SnapshotFreshnessDecision,
     TransferLifecycle,
+    has_usable_funding_payload,
 )
 
 
@@ -52,6 +54,58 @@ class CapturingEntryExecutor:
             route=ExecutionRoute.PASSIVE_INCREMENTAL,
             state=EntryState.COMPLETED,
         )
+
+
+@pytest.mark.asyncio
+async def test_runtime_unavailable_snapshot_resets_streak_and_preserves_last_good(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="paper"),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    prior_last_good = SidecarSnapshot(
+        published_at_ms=900,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+            )
+        },
+    )
+    unavailable = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        candidate_build_observed_at_ms=1_000,
+        acquisition_mode="unavailable",
+        degraded_venues=["binance"],
+    )
+    runtime._last_good_snapshot = prior_last_good
+    runtime._live_scan_success_streak = 3
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: unavailable)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 1_050)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime._live_scan_success_streak == 0
+    assert runtime._last_good_snapshot is prior_last_good
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(record["kind"] == "runtime.snapshot_unavailable" for record in records)
 
 
 class OkxMetadataAdapter:
@@ -88,7 +142,12 @@ def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
         worst_case_edge_bps=2.0,
         ranking_edge_bps=10.0,
         entry_notional_quote=50.0,
+        funding_timestamp_ms=400000,
         first_funding_timestamp_ms=400000,
+        long_funding_timestamp_ms=400000,
+        short_funding_timestamp_ms=400000,
+        direction_consistent=True,
+        interval_aligned=True,
         forecast_worst_funding_edge_bps=200.0,
         economics_complete=True,
         economics_observed_at_ms=1,
@@ -96,6 +155,34 @@ def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
         model_epoch="v1_exact",
         taker_fee_evidence_complete=True,
     )
+
+
+def test_funding_payload_rejects_expired_candidate_schedule_at_snapshot_watermark() -> None:
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=400_000,
+        market_observed_at_ms=399_000,
+        candidate_build_observed_at_ms=398_000,
+        acquisition_mode="fresh_sidecar",
+        candidates=[candidate],
+    )
+
+    assert has_usable_funding_payload(snapshot) is False
+
+
+def test_funding_payload_rejects_two_expired_quote_schedules() -> None:
+    snapshot = SidecarSnapshot(
+        published_at_ms=400_000,
+        market_observed_at_ms=399_000,
+        candidate_build_observed_at_ms=398_000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote("okx", "BTCUSDT", 100.0, 101.0),
+            "bybit:BTCUSDT": _quote("bybit", "BTCUSDT", 100.0, 101.0),
+        },
+    )
+
+    assert has_usable_funding_payload(snapshot) is False
 
 
 def _mark_final_economics_ready(candidate: CandidateInput, observed_at_ms: int) -> None:
@@ -177,6 +264,8 @@ def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
         ask=ask,
         bid_size=100.0,
         ask_size=100.0,
+        funding_timestamp_ms=400_000,
+        funding_interval_ms=28_800_000,
         volume_24h_quote=10_000_000.0,
         open_interest=2_000_000.0,
     )
@@ -199,6 +288,8 @@ def _quote_with_liquidity(
         source="sidecar_quote",
         bid_size=100.0,
         ask_size=100.0,
+        funding_timestamp_ms=400_000,
+        funding_interval_ms=28_800_000,
         volume_24h_quote=volume_24h_quote,
         open_interest=open_interest,
     )
@@ -736,8 +827,11 @@ async def test_runtime_last_good_top_candidate_requires_entry_quote_truth(
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr(
-        "lightfee.engine.runtime.evaluate_snapshot_freshness",
-        lambda **_kwargs: SnapshotFreshness.LAST_GOOD_FALLBACK,
+        "lightfee.engine.runtime.decide_snapshot_freshness",
+        lambda **_kwargs: SnapshotFreshnessDecision(
+            SnapshotFreshness.LAST_GOOD_FALLBACK,
+            snapshot,
+        ),
     )
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_and_fill_cache)
@@ -2252,6 +2346,16 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
         market_observed_at_ms=69000,
         acquisition_mode="fresh_sidecar",
         candidates=candidates,
+        quotes={
+            f"{venue}:{candidate.symbol}": QuoteSnapshot(
+                venue=venue,
+                symbol=candidate.symbol,
+                bid=100.0,
+                ask=101.0,
+            )
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        },
         transfer_lifecycle=[
             TransferLifecycle(
                 from_venue="okx",
@@ -2466,7 +2570,7 @@ async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path,
     runtime = LiveRuntime(config)
     observed: dict[str, int | None] = {}
 
-    def fake_evaluate_snapshot_freshness(
+    def fake_decide_snapshot_freshness(
         *,
         snapshot,
         max_age_ms,
@@ -2474,15 +2578,16 @@ async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path,
         last_good=None,
         last_good_max_age_ms=None,
         market_max_age_ms=None,
+        usable_payload=None,
     ):
         observed["last_good_max_age_ms"] = last_good_max_age_ms
         observed["market_max_age_ms"] = market_max_age_ms
-        return SnapshotFreshness.MISSING
+        return SnapshotFreshnessDecision(SnapshotFreshness.MISSING, None)
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: None)
     monkeypatch.setattr(
-        "lightfee.engine.runtime.evaluate_snapshot_freshness",
-        fake_evaluate_snapshot_freshness,
+        "lightfee.engine.runtime.decide_snapshot_freshness",
+        fake_decide_snapshot_freshness,
     )
 
     runtime.journal.open()
@@ -2520,6 +2625,8 @@ async def test_runtime_last_good_fallback_emits_non_blocking_revalidate_diagnost
                 symbol="BTCUSDT",
                 bid=100.0,
                 ask=101.0,
+                funding_timestamp_ms=300_000,
+                funding_interval_ms=28_800_000,
             )
         },
         candidates=[
@@ -2531,17 +2638,23 @@ async def test_runtime_last_good_fallback_emits_non_blocking_revalidate_diagnost
                 funding_edge_bps=10.0,
                 expected_edge_bps=5.0,
                 worst_case_edge_bps=2.0,
-                ranking_edge_bps=10.0,
-                entry_notional_quote=50.0,
-                first_funding_timestamp_ms=300000,
+                    ranking_edge_bps=10.0,
+                    entry_notional_quote=50.0,
+                    funding_timestamp_ms=300000,
+                    first_funding_timestamp_ms=300000,
+                    long_funding_timestamp_ms=300000,
+                    short_funding_timestamp_ms=300000,
             )
         ],
     )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr(
-        "lightfee.engine.runtime.evaluate_snapshot_freshness",
-        lambda **_kwargs: SnapshotFreshness.LAST_GOOD_FALLBACK,
+        "lightfee.engine.runtime.decide_snapshot_freshness",
+        lambda **_kwargs: SnapshotFreshnessDecision(
+            SnapshotFreshness.LAST_GOOD_FALLBACK,
+            snapshot,
+        ),
     )
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 0)
 
@@ -2625,9 +2738,12 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
                 funding_edge_bps=10.0,
                 expected_edge_bps=5.0,
                 worst_case_edge_bps=2.0,
-                ranking_edge_bps=10.0,
-                entry_notional_quote=50.0,
-                first_funding_timestamp_ms=400000,
+                    ranking_edge_bps=10.0,
+                    entry_notional_quote=50.0,
+                    funding_timestamp_ms=400000,
+                    first_funding_timestamp_ms=400000,
+                    long_funding_timestamp_ms=400000,
+                    short_funding_timestamp_ms=400000,
                 economics_complete=True,
                 economics_observed_at_ms=60_000,
                 calculation_version="v1_exact",
@@ -2835,7 +2951,10 @@ async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entr
         worst_case_edge_bps=2.0,
             ranking_edge_bps=10.0,
             entry_notional_quote=50.0,
+            funding_timestamp_ms=400000,
             first_funding_timestamp_ms=400000,
+            long_funding_timestamp_ms=400000,
+            short_funding_timestamp_ms=400000,
             economics_complete=True,
             economics_observed_at_ms=65_000,
             calculation_version="v1_exact",
@@ -2948,7 +3067,10 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
         worst_case_edge_bps=2.0,
             ranking_edge_bps=10.0,
             entry_notional_quote=50.0,
+            funding_timestamp_ms=400000,
             first_funding_timestamp_ms=400000,
+            long_funding_timestamp_ms=400000,
+            short_funding_timestamp_ms=400000,
             economics_complete=True,
             economics_observed_at_ms=65_000,
             calculation_version="v1_exact",

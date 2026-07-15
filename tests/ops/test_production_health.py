@@ -9,11 +9,78 @@ from lightfee.ops.production_health import (
     analyze_current_state,
     analyze_resolver_config,
     analyze_sidecar_snapshot,
+    analyze_spread_snapshot,
+    analyze_strategy_entry_policy,
     analyze_systemd_unit,
     summarize_reports,
 )
 from scripts.diagnose_live import _build_state_consistency
 from scripts import verify_production_services as vps
+
+
+def _complete_quote_lifecycles(venues: list[str], observed_at_ms: int) -> dict:
+    def rows() -> list[dict]:
+        return [
+            {
+                "venue": venue,
+                "observed_at_ms": observed_at_ms,
+                "funding_rate_bps": 1.0,
+                "funding_timestamp_ms": observed_at_ms + 28_800_000,
+                "funding_interval_ms": 28_800_000,
+                "symbol_count": 1,
+                "coverage_usable": 1,
+                "degraded_reason": "",
+            }
+            for venue in venues
+        ]
+
+    return {
+        "funding_lifecycle": rows(),
+        "market_lifecycle": rows(),
+        "liquidity_lifecycle": rows(),
+    }
+
+
+def _fresh_seven_venue_snapshot() -> dict:
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    observed_at_ms = 1_778_786_998_000
+    return {
+        "schema_version": 4,
+        "published_at_ms": 1_778_786_999_000,
+        "market_observed_at_ms": observed_at_ms,
+        "candidate_build_observed_at_ms": 1_778_786_998_500,
+        "candidate_build_diagnostics": {
+            "input_quote_count": 7,
+            "requested_symbol_count": 1,
+            "requested_symbols": ["BTCUSDT"],
+            "requested_venues": venues,
+            "directional_pair_count": 0,
+            "output_candidate_count": 0,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+        },
+        "quotes": {
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65_000.0,
+                "ask": 65_001.0,
+                "observed_at_ms": observed_at_ms,
+                "funding_rate_bps": 1.0,
+                "funding_timestamp_ms": observed_at_ms + 28_800_000,
+                "funding_interval_ms": 28_800_000,
+            }
+            for venue in venues
+        },
+        "degraded_venues": [],
+        "degraded_domains": [],
+        "degraded_symbols": {},
+        **_complete_quote_lifecycles(venues, observed_at_ms),
+        "transfer_lifecycle": [],
+        "source_mode": "direct_market",
+        "acquisition_mode": "fresh_sidecar",
+        "candidates": [],
+    }
 
 
 def test_sidecar_unit_rejects_missing_config():
@@ -55,10 +122,20 @@ def test_snapshot_rejects_fixture_four_venue_shape():
     snapshot = {
         "market_observed_at_ms": 1710000075000,
         "quotes": {
-            "binance:BTCUSDT": {"venue": "binance", "symbol": "BTCUSDT", "bid": 100.0, "ask": 100.0},
+            "binance:BTCUSDT": {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "bid": 100.0,
+                "ask": 100.0,
+            },
             "okx:BTCUSDT": {"venue": "okx", "symbol": "BTCUSDT", "bid": 100.0, "ask": 100.0},
             "bybit:BTCUSDT": {"venue": "bybit", "symbol": "BTCUSDT", "bid": 100.0, "ask": 100.0},
-            "hyperliquid:BTCUSDT": {"venue": "hyperliquid", "symbol": "BTCUSDT", "bid": 100.0, "ask": 100.0},
+            "hyperliquid:BTCUSDT": {
+                "venue": "hyperliquid",
+                "symbol": "BTCUSDT",
+                "bid": 100.0,
+                "ask": 100.0,
+            },
         },
         "degraded_venues": [],
     }
@@ -69,17 +146,687 @@ def test_snapshot_rejects_fixture_four_venue_shape():
 
 
 def test_snapshot_accepts_fresh_seven_venue_shape():
+    snapshot = _fresh_seven_venue_snapshot()
+    report = analyze_sidecar_snapshot(snapshot, now_ms=1778787000000, max_age_ms=10_000)
+    assert report.ok
+
+
+def test_snapshot_transport_green_is_not_funding_ready_when_all_candidates_blocked():
+    snapshot = _fresh_seven_venue_snapshot()
+    funding_timestamp_ms = 1_778_815_798_000
+    snapshot["candidate_build_diagnostics"]["directional_pair_count"] = 1
+    snapshot["candidate_build_diagnostics"]["output_candidate_count"] = 1
+    snapshot["candidates"] = [
+        {
+            "long_venue": "binance",
+            "short_venue": "okx",
+            "symbol": "BTCUSDT",
+            "funding_diff_bps": 1.0,
+            "funding_edge_bps": 1.0,
+            "expected_edge_bps": 1.0,
+            "worst_case_edge_bps": 1.0,
+            "ranking_edge_bps": 1.0,
+            "funding_timestamp_ms": funding_timestamp_ms,
+            "first_funding_timestamp_ms": funding_timestamp_ms,
+            "long_funding_timestamp_ms": funding_timestamp_ms,
+            "short_funding_timestamp_ms": funding_timestamp_ms,
+            "blocked": True,
+            "blocked_reasons": ["long_contract_normalization_incomplete"],
+            "economics_complete": False,
+            "economics_incomplete_reason": "long_contract_normalization_incomplete",
+        }
+    ]
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.details["contract_errors"] == []
+    assert not report.ok
+    assert "funding_entry_readiness_no_unblocked_candidates" in report.fingerprints
+    assert report.details["candidate_count"] == 1
+    assert report.details["blocked_candidate_count"] == 1
+    assert report.details["unblocked_candidate_count"] == 0
+    assert report.details["funding_entry_ready"] is False
+    assert report.details["blocked_reason_counts"] == {
+        "economics_observation_missing": 1,
+        "long_contract_normalization_incomplete": 1,
+    }
+
+
+def test_snapshot_cannot_be_green_when_funding_coverage_is_unproved():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"]["binance:BTCUSDT"].pop("funding_interval_ms")
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "sidecar_diagnostics_contract_invalid" in report.fingerprints
+    assert "funding_interval_evidence_incomplete" in report.fingerprints
+    assert report.details["funding_interval_known_counts_by_venue"]["binance"] == 0
+    assert report.details["funding_interval_quote_counts_by_venue"]["binance"] == 1
+    assert report.details["funding_interval_missing_quote_keys"] == [
+        "binance:BTCUSDT"
+    ]
+    assert (
+        "lifecycle_coverage_exceeds_quote_symbols:funding:binance"
+        in report.details["contract_errors"]
+    )
+
+
+def test_snapshot_rejects_arbitrary_seven_venues_replacing_expected_venue():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"]["mexc:BTCUSDT"] = snapshot["quotes"].pop(
+        "aster:BTCUSDT"
+    )
+    snapshot["quotes"]["mexc:BTCUSDT"]["venue"] = "mexc"
+    for lifecycle_field in (
+        "funding_lifecycle",
+        "market_lifecycle",
+        "liquidity_lifecycle",
+    ):
+        for record in snapshot[lifecycle_field]:
+            if record["venue"] == "aster":
+                record["venue"] = "mexc"
+    snapshot["candidate_build_diagnostics"]["requested_venues"] = sorted(
+        {"mexc"}
+        | (
+            set(snapshot["candidate_build_diagnostics"]["requested_venues"])
+            - {"aster"}
+        )
+    )
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.details["contract_errors"] == []
+    assert not report.ok
+    assert report.details["missing_venues"] == ["aster"]
+    assert "quote_venue_count_lt_7" in report.fingerprints
+    assert "quote_venue_set_unexpected" in report.fingerprints
+    assert "requested_venue_set_mismatch" in report.fingerprints
+
+
+def test_snapshot_rejects_expected_venues_plus_unconfigured_extra_venue():
+    snapshot = _fresh_seven_venue_snapshot()
+    extra = dict(snapshot["quotes"]["binance:BTCUSDT"])
+    extra["venue"] = "mexc"
+    snapshot["quotes"]["mexc:BTCUSDT"] = extra
+    snapshot["candidate_build_diagnostics"]["input_quote_count"] = 8
+    snapshot["candidate_build_diagnostics"]["requested_venues"] = sorted(
+        [*snapshot["candidate_build_diagnostics"]["requested_venues"], "mexc"]
+    )
+    for lifecycle_field in (
+        "funding_lifecycle",
+        "market_lifecycle",
+        "liquidity_lifecycle",
+    ):
+        row = dict(snapshot[lifecycle_field][0])
+        row["venue"] = "mexc"
+        snapshot[lifecycle_field].append(row)
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.details["contract_errors"] == []
+    assert not report.ok
+    assert report.details["missing_venues"] == []
+    assert report.details["unexpected_venues"] == ["mexc"]
+    assert "quote_venue_set_unexpected" in report.fingerprints
+    assert "requested_venue_set_mismatch" in report.fingerprints
+
+
+def test_snapshot_unavailable_mode_is_never_production_green():
+    snapshot = _fresh_seven_venue_snapshot()
+    venues = snapshot["candidate_build_diagnostics"]["requested_venues"]
+    snapshot["quotes"] = {}
+    snapshot["candidate_build_diagnostics"]["input_quote_count"] = 0
+    snapshot["degraded_venues"] = list(venues)
+    snapshot["acquisition_mode"] = "unavailable"
+    for lifecycle_field in (
+        "funding_lifecycle",
+        "market_lifecycle",
+        "liquidity_lifecycle",
+    ):
+        for record in snapshot[lifecycle_field]:
+            record["coverage_usable"] = 0
+            record["degraded_reason"] = "venue unavailable"
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.details["contract_errors"] == []
+    assert not report.ok
+    assert "sidecar_snapshot_unavailable" in report.fingerprints
+
+
+def test_snapshot_declared_degradation_cannot_be_production_green():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"]["aster:BTCUSDT"]["bid"] = 65_002.0
+    snapshot["degraded_venues"] = ["aster"]
+    snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
+    snapshot["acquisition_mode"] = "degraded_sidecar"
+    aster_market = next(
+        row for row in snapshot["market_lifecycle"] if row["venue"] == "aster"
+    )
+    aster_market["coverage_usable"] = 0
+    aster_market["degraded_reason"] = "BTCUSDT: crossed BBO"
+    aster_liquidity = next(
+        row for row in snapshot["liquidity_lifecycle"] if row["venue"] == "aster"
+    )
+    aster_liquidity["coverage_usable"] = 0
+    aster_liquidity["degraded_reason"] = "BTCUSDT: crossed BBO"
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.details["contract_errors"] == []
+    assert not report.ok
+    assert "sidecar_snapshot_degraded" in report.fingerprints
+
+
+def test_sidecar_snapshot_rejects_unknown_schema_and_missing_proof() -> None:
+    report = analyze_sidecar_snapshot(
+        {
+            "schema_version": 999,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "quotes": {},
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "sidecar_diagnostics_contract_missing" in report.fingerprints
+
+
+def test_sidecar_snapshot_malformed_input_fails_closed_without_exception() -> None:
+    root_report = analyze_sidecar_snapshot(
+        [],
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+    malformed_report = analyze_sidecar_snapshot(
+        {
+            "schema_version": 4,
+            "published_at_ms": "bad",
+            "market_observed_at_ms": {},
+            "candidate_build_observed_at_ms": [],
+            "candidate_build_diagnostics": [],
+            "degraded_venues": 7,
+            "degraded_domains": None,
+            "degraded_symbols": "bad",
+            "quotes": [],
+            "candidates": {},
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert root_report.fingerprints == ["sidecar_snapshot_root_invalid"]
+    assert not malformed_report.ok
+    assert "sidecar_diagnostics_contract_invalid" in malformed_report.fingerprints
+
+
+def test_sidecar_health_rejects_quote_after_claimed_candidate_watermark() -> None:
+    snapshot = {
+        "schema_version": 4,
+        "published_at_ms": 1_000,
+        "market_observed_at_ms": 1_000,
+        "candidate_build_observed_at_ms": 1_000,
+        "candidate_build_diagnostics": {
+            "input_quote_count": 1,
+            "requested_symbol_count": 1,
+            "requested_symbols": ["BTCUSDT"],
+            "requested_venues": ["binance"],
+            "directional_pair_count": 0,
+            "output_candidate_count": 0,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+        },
+        **_complete_quote_lifecycles(["binance"], 1_000),
+        "transfer_lifecycle": [],
+        "degraded_venues": [],
+        "degraded_domains": [],
+        "degraded_symbols": {},
+        "source_mode": "direct_market",
+        "acquisition_mode": "fresh_sidecar",
+        "quotes": {
+            "binance:BTCUSDT": {
+                "venue": "binance",
+                "symbol": "BTCUSDT",
+                "bid": 50_000,
+                "ask": 50_001,
+                "observed_at_ms": 1_001,
+            }
+        },
+        "candidates": [],
+    }
+
+    report = analyze_sidecar_snapshot(snapshot, now_ms=1_000, max_age_ms=10_000)
+
+    assert not report.ok
+    assert "sidecar_diagnostics_contract_invalid" in report.fingerprints
+    assert any(
+        error.startswith("quote_after_candidate_watermark:")
+        for error in report.details["contract_errors"]
+    )
+
+
+def test_snapshot_rejects_candidate_builder_watermark_mismatch():
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
     snapshot = {
         "market_observed_at_ms": 1778786998000,
         "quotes": {
-            f"{venue}:BTCUSDT": {"venue": venue, "symbol": "BTCUSDT", "bid": 65000.0, "ask": 65001.0}
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65000.0,
+                "ask": 65001.0,
+            }
             for venue in venues
         },
-        "degraded_venues": [],
+        "candidate_build_diagnostics": {
+            "directional_pair_count": 42,
+            "output_candidate_count": 0,
+            "rejection_counts": {"quote_after_candidate_watermark": 42},
+        },
     }
-    report = analyze_sidecar_snapshot(snapshot, now_ms=1778787000000, max_age_ms=10_000)
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "candidate_build_watermark_rejected_quotes" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_stalled_input_pipeline():
+    report = analyze_spread_snapshot(
+        {
+            "published_at_ms": 1778786900000,
+            "market_observed_at_ms": 1778786900000,
+            "source_mode": "sidecar_snapshot_stale",
+            "input_quote_count": 100,
+            "valid_quote_count": 0,
+            "rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "spread_snapshot_stale" in report.fingerprints
+    assert "spread_input_pipeline_stalled" in report.fingerprints
+
+
+def test_spread_snapshot_accepts_fresh_explained_zero_candidates():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "degraded_venues": [],
+            "degraded_symbols": {},
+            "input_quote_count": 100,
+            "valid_quote_count": 100,
+            "evaluated_pair_count": 10,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {"insufficient_history": 10},
+            "paper_admission_rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
     assert report.ok
+
+
+def test_spread_snapshot_rejects_unexplained_zero_paper_admission() -> None:
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "degraded_venues": [],
+            "degraded_symbols": {},
+            "input_quote_count": 2,
+            "valid_quote_count": 2,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 1,
+            "paper_configured_enabled": True,
+            "paper_admission_enabled": True,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "success",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 1778786998500,
+            "rejection_counts": {},
+            "paper_admission_rejection_counts": {},
+            "candidates": [{}],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "spread_paper_admission_unexplained_zero" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_publication_before_decision():
+    report = analyze_spread_snapshot(
+        {
+            "decision_at_ms": 1778786999500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "input_quote_count": 2,
+            "valid_quote_count": 2,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 0,
+            "rejection_counts": {"insufficient_history_samples": 1},
+            "paper_admission_rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "spread_publication_watermark_invalid" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_legacy_schema_without_proof_contract():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 3,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "input_quote_count": 2,
+            "valid_quote_count": 2,
+            "rejection_counts": {"insufficient_history_samples": 1},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "spread_diagnostics_contract_missing" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_unknown_future_schema() -> None:
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 999,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "degraded_venues": [],
+            "degraded_symbols": {},
+            "input_quote_count": 0,
+            "valid_quote_count": 0,
+            "evaluated_pair_count": 0,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "spread_diagnostics_contract_missing" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_non_object_root_without_exception() -> None:
+    report = analyze_spread_snapshot(
+        [],
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert report.fingerprints == ["spread_snapshot_root_invalid"]
+
+
+def test_spread_snapshot_partial_input_is_warning_not_green():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot_partial",
+            "degraded_venues": [],
+            "degraded_symbols": {"rich": ["ETHUSDT"]},
+            "input_quote_count": 3,
+            "valid_quote_count": 2,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {"insufficient_history_samples": 1},
+            "paper_admission_rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert report.severity == "warning"
+    assert "spread_source_sidecar_snapshot_partial" in report.fingerprints
+    assert "spread_degraded_inputs" in report.fingerprints
+
+
+def test_spread_snapshot_rejects_invalid_count_invariants():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "degraded_venues": [],
+            "degraded_symbols": {},
+            "input_quote_count": 2,
+            "valid_quote_count": 3,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 2,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": -1,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {"bad": -1},
+            "candidates": [{}, {}, {}],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "spread_diagnostics_contract_invalid" in report.fingerprints
+    assert "spread_diagnostics_count_invariant_invalid" in report.fingerprints
+
+
+def test_spread_snapshot_malformed_degradation_returns_critical_not_exception():
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "sidecar_snapshot",
+            "degraded_venues": 1,
+            "degraded_symbols": {},
+            "input_quote_count": 0,
+            "valid_quote_count": 0,
+            "evaluated_pair_count": 0,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert report.severity == "critical"
+    assert "spread_diagnostics_contract_invalid" in report.fingerprints
+    assert report.details["degraded_venues"] == []
+
+
+def test_spread_snapshot_rejects_causal_and_state_misgreen_paths():
+    base = {
+        "schema_version": 4,
+        "decision_at_ms": 1778786998500,
+        "published_at_ms": 1778786999000,
+        "market_observed_at_ms": 1778786998000,
+        "source_mode": "sidecar_snapshot",
+        "degraded_venues": [],
+        "degraded_symbols": {},
+        "input_quote_count": 0,
+        "valid_quote_count": 0,
+        "evaluated_pair_count": 0,
+        "accepted_pair_count": 0,
+        "paper_configured_enabled": False,
+        "paper_admission_enabled": False,
+        "paper_tracked_count": 0,
+        "paper_refresh_status": "disabled",
+        "paper_event_count": 0,
+        "paper_last_success_at_ms": 0,
+        "rejection_counts": {},
+        "candidates": [],
+    }
+    cases = [
+        (
+            {"market_observed_at_ms": 1778786998600},
+            "spread_publication_watermark_invalid",
+        ),
+        (
+            {
+                "paper_configured_enabled": True,
+                "paper_admission_enabled": True,
+                "paper_refresh_status": "success",
+                "paper_last_success_at_ms": 1778786998400,
+            },
+            "spread_paper_refresh_not_proven",
+        ),
+        ({"source_mode": "mystery"}, "spread_source_mode_unknown"),
+        (
+            {"rejection_counts": {"impossible": 1}},
+            "spread_pair_attribution_incomplete",
+        ),
+        (
+            {
+                "paper_tracked_count": 1,
+                "paper_event_count": 1,
+                "paper_last_success_at_ms": 1778786998500,
+            },
+            "spread_paper_disabled_state_invalid",
+        ),
+    ]
+
+    for mutation, expected_fingerprint in cases:
+        report = analyze_spread_snapshot(
+            {**base, **mutation},
+            now_ms=1778787000000,
+            max_age_ms=10_000,
+        )
+        assert not report.ok, mutation
+        assert expected_fingerprint in report.fingerprints, mutation
+
+
+def test_strategy_entry_policy_reports_disabled_live_entries_without_hiding_state():
+    class Strategy:
+        funding_new_entries_enabled = False
+        funding_canary_enabled = False
+        spread_reversion_enabled = True
+        spread_paper_enabled = True
+        spread_live_enabled = False
+
+    report = analyze_strategy_entry_policy(Strategy(), runtime_mode="live")
+
+    assert report.ok
+    assert report.details["funding_live_entry_ready"] is False
+    assert report.details["spread_paper_ready"] is True
+    assert report.details["spread_execution_contract"] == "paper_only"
+
+    required = analyze_strategy_entry_policy(
+        Strategy(),
+        runtime_mode="live",
+        require_entry_enabled=True,
+    )
+    assert not required.ok
+    assert "funding_live_entry_disabled" in required.fingerprints
+
+
+def test_verifier_spread_ttl_uses_runtime_policy_unless_cli_overrides():
+    class Runtime:
+        sidecar_snapshot_max_age_ms = 10_000
+
+    class Config:
+        runtime = Runtime()
+
+    assert vps._resolve_spread_snapshot_max_age_ms(None, Config()) == 10_000
+    assert vps._resolve_spread_snapshot_max_age_ms(3_000, Config()) == 3_000
+    assert vps._resolve_spread_snapshot_max_age_ms(None, None) == 60_000
 
 
 def test_current_state_flags_stale_fail_closed_clean_state():
@@ -143,12 +890,7 @@ def test_current_state_blocks_only_active_pending_close_reconciliations():
         max_tick_age_ms=10_000,
     )
     assert terminal_flat_audit.ok
-    assert (
-        terminal_flat_audit.details[
-            "pending_close_reconciliation_terminal_flat_count"
-        ]
-        == 1
-    )
+    assert terminal_flat_audit.details["pending_close_reconciliation_terminal_flat_count"] == 1
 
 
 def test_current_state_preserves_recent_auto_fail_closed_recovery_as_detail_only():
@@ -359,13 +1101,15 @@ def test_current_state_local_open_exchange_leg_quantity_mismatch_is_critical():
         "open_position_count": 1,
         "pending_entry_count": 0,
         "pending_close_count": 0,
-        "open_positions": [{
-            "position_id": "pos-beat",
-            "symbol": "BEATUSDT",
-            "long_venue": "aster",
-            "short_venue": "bybit",
-            "quantity": 24.0,
-        }],
+        "open_positions": [
+            {
+                "position_id": "pos-beat",
+                "symbol": "BEATUSDT",
+                "long_venue": "aster",
+                "short_venue": "bybit",
+                "quantity": 24.0,
+            }
+        ],
         "last_scan": {"candidate_count": 10, "tradeable_count": 2},
         "exchange_truth": {
             "available": True,
@@ -450,13 +1194,15 @@ def test_diagnose_state_consistency_flags_local_open_live_leg_quantity_mismatch(
         "open_position_count": 1,
         "pending_entry_count": 0,
         "pending_close_count": 0,
-        "positions": [{
-            "position_id": "pos-beat",
-            "symbol": "BEATUSDT",
-            "long_venue": "aster",
-            "short_venue": "bybit",
-            "quantity": 24.0,
-        }],
+        "positions": [
+            {
+                "position_id": "pos-beat",
+                "symbol": "BEATUSDT",
+                "long_venue": "aster",
+                "short_venue": "bybit",
+                "quantity": 24.0,
+            }
+        ],
     }
     exchange_truth = {
         "available": True,
@@ -508,13 +1254,15 @@ def test_state_consistency_accepts_exchange_side_enum_labels_for_local_open_legs
         "open_position_count": 1,
         "pending_entry_count": 0,
         "pending_close_count": 0,
-        "positions": [{
-            "position_id": "pos-home",
-            "symbol": "HOMEUSDT",
-            "long_venue": "binance",
-            "short_venue": "bybit",
-            "quantity": 12.0,
-        }],
+        "positions": [
+            {
+                "position_id": "pos-home",
+                "symbol": "HOMEUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "quantity": 12.0,
+            }
+        ],
     }
     exchange_truth = {
         "available": True,
@@ -567,7 +1315,9 @@ def test_resolver_requires_okx_capable_priority():
 
 
 def test_summary_is_failed_when_any_report_critical():
-    bad = analyze_systemd_unit("lightfee-sidecar.service", "[Service]\nExecStart=lightfee-sidecar\n")
+    bad = analyze_systemd_unit(
+        "lightfee-sidecar.service", "[Service]\nExecStart=lightfee-sidecar\n"
+    )
     summary = summarize_reports([bad])
     assert not summary.ok
     assert summary.critical_count == 1
@@ -639,29 +1389,96 @@ def test_verify_production_services_cli_json_success(tmp_path):
     )
     snapshot = tmp_path / "snapshot.json"
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
-    snapshot.write_text(json.dumps({
-        "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
-        "degraded_venues": [],
-    }))
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "published_at_ms": 1778786999000,
+                "market_observed_at_ms": 1778786998000,
+                "candidate_build_observed_at_ms": 1778786998500,
+                "candidate_build_diagnostics": {
+                    "input_quote_count": 7,
+                    "requested_symbol_count": 1,
+                    "requested_symbols": ["BTCUSDT"],
+                    "requested_venues": venues,
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                "quotes": {
+                    f"{v}:BTCUSDT": {
+                        "venue": v,
+                        "symbol": "BTCUSDT",
+                        "bid": 65000,
+                        "ask": 65001,
+                        "observed_at_ms": 1778786998000,
+                        "funding_rate_bps": 1.0,
+                        "funding_timestamp_ms": 1778815798000,
+                        "funding_interval_ms": 28_800_000,
+                    }
+                    for v in venues
+                },
+                "degraded_venues": [],
+                "degraded_domains": [],
+                "degraded_symbols": {},
+                **_complete_quote_lifecycles(venues, 1778786998000),
+                "transfer_lifecycle": [],
+                "source_mode": "direct_market",
+                "acquisition_mode": "fresh_sidecar",
+                "candidates": [],
+            }
+        )
+    )
+    spread_snapshot = tmp_path / "spread-snapshot.json"
+    spread_snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "decision_at_ms": 1778786998500,
+                "published_at_ms": 1778786999000,
+                "market_observed_at_ms": 1778786998000,
+                "source_mode": "sidecar_snapshot",
+                "degraded_venues": [],
+                "degraded_symbols": {},
+                "input_quote_count": 7,
+                "valid_quote_count": 7,
+                "evaluated_pair_count": 3,
+                "accepted_pair_count": 0,
+                "paper_configured_enabled": False,
+                "paper_admission_enabled": False,
+                "paper_tracked_count": 0,
+                "paper_refresh_status": "disabled",
+                "paper_event_count": 0,
+                "paper_last_success_at_ms": 0,
+                    "rejection_counts": {"insufficient_history": 3},
+                    "paper_admission_rejection_counts": {},
+                    "candidates": [],
+            }
+        )
+    )
     current = tmp_path / "current.json"
-    current.write_text(json.dumps({
-        "lifecycle": "running",
-        "risk_mode": "running",
-        "last_tick_ms": 1778786999000,
-        "open_position_count": 0,
-        "pending_entry_count": 0,
-        "pending_close_count": 0,
-        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
-        "exchange_truth": {
-            "available": True,
-            "confidence": "high",
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "positions": {},
-            "open_orders": {},
-        },
-    }))
+    current.write_text(
+        json.dumps(
+            {
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "last_tick_ms": 1778786999000,
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+                "exchange_truth": {
+                    "available": True,
+                    "confidence": "high",
+                    "has_nonzero_position": False,
+                    "has_open_order": False,
+                    "positions": {},
+                    "open_orders": {},
+                },
+            }
+        )
+    )
     resolv = tmp_path / "resolv.conf"
     resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 
@@ -669,11 +1486,18 @@ def test_verify_production_services_cli_json_success(tmp_path):
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--snapshot", str(snapshot),
-            "--current-state", str(current),
-            "--resolv-conf", str(resolv),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--snapshot",
+            str(snapshot),
+            "--spread-snapshot",
+            str(spread_snapshot),
+            "--current-state",
+            str(current),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,
@@ -682,6 +1506,8 @@ def test_verify_production_services_cli_json_success(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
+    reports = {report["name"]: report for report in payload["reports"]}
+    assert reports["spread_snapshot"]["ok"] is True
 
 
 def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_path):
@@ -707,29 +1533,69 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
     )
     snapshot = tmp_path / "snapshot.json"
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
-    snapshot.write_text(json.dumps({
-        "market_observed_at_ms": 1778786955000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
-        "degraded_venues": [],
-    }))
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "published_at_ms": 1778786956000,
+                "market_observed_at_ms": 1778786955000,
+                "candidate_build_observed_at_ms": 1778786955500,
+                "candidate_build_diagnostics": {
+                    "input_quote_count": 7,
+                    "requested_symbol_count": 1,
+                    "requested_symbols": ["BTCUSDT"],
+                    "requested_venues": venues,
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                "quotes": {
+                    f"{v}:BTCUSDT": {
+                        "venue": v,
+                        "symbol": "BTCUSDT",
+                        "bid": 65000,
+                        "ask": 65001,
+                        "observed_at_ms": 1778786955000,
+                        "funding_rate_bps": 1.0,
+                        "funding_timestamp_ms": 1778815755000,
+                        "funding_interval_ms": 28_800_000,
+                    }
+                    for v in venues
+                },
+                "degraded_venues": [],
+                "degraded_domains": [],
+                "degraded_symbols": {},
+                **_complete_quote_lifecycles(venues, 1778786955000),
+                "transfer_lifecycle": [],
+                "source_mode": "direct_market",
+                "acquisition_mode": "fresh_sidecar",
+                "candidates": [],
+            }
+        )
+    )
     current = tmp_path / "current.json"
-    current.write_text(json.dumps({
-        "lifecycle": "running",
-        "risk_mode": "running",
-        "last_tick_ms": 1778786999000,
-        "open_position_count": 0,
-        "pending_entry_count": 0,
-        "pending_close_count": 0,
-        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
-        "exchange_truth": {
-            "available": True,
-            "confidence": "high",
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "positions": {},
-            "open_orders": {},
-        },
-    }))
+    current.write_text(
+        json.dumps(
+            {
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "last_tick_ms": 1778786999000,
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+                "exchange_truth": {
+                    "available": True,
+                    "confidence": "high",
+                    "has_nonzero_position": False,
+                    "has_open_order": False,
+                    "positions": {},
+                    "open_orders": {},
+                },
+            }
+        )
+    )
     resolv = tmp_path / "resolv.conf"
     resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 
@@ -737,11 +1603,16 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--snapshot", str(snapshot),
-            "--current-state", str(current),
-            "--resolv-conf", str(resolv),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--snapshot",
+            str(snapshot),
+            "--current-state",
+            str(current),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,
@@ -774,29 +1645,40 @@ def test_verify_production_services_cli_checks_spread_sidecar_unit(tmp_path):
     )
     snapshot = tmp_path / "snapshot.json"
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
-    snapshot.write_text(json.dumps({
-        "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
-        "degraded_venues": [],
-    }))
+    snapshot.write_text(
+        json.dumps(
+            {
+                "market_observed_at_ms": 1778786998000,
+                "quotes": {
+                    f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001}
+                    for v in venues
+                },
+                "degraded_venues": [],
+            }
+        )
+    )
     current = tmp_path / "current.json"
-    current.write_text(json.dumps({
-        "lifecycle": "running",
-        "risk_mode": "running",
-        "last_tick_ms": 1778786999000,
-        "open_position_count": 0,
-        "pending_entry_count": 0,
-        "pending_close_count": 0,
-        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
-        "exchange_truth": {
-            "available": True,
-            "confidence": "high",
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "positions": {},
-            "open_orders": {},
-        },
-    }))
+    current.write_text(
+        json.dumps(
+            {
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "last_tick_ms": 1778786999000,
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+                "exchange_truth": {
+                    "available": True,
+                    "confidence": "high",
+                    "has_nonzero_position": False,
+                    "has_open_order": False,
+                    "positions": {},
+                    "open_orders": {},
+                },
+            }
+        )
+    )
     resolv = tmp_path / "resolv.conf"
     resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 
@@ -804,11 +1686,16 @@ def test_verify_production_services_cli_checks_spread_sidecar_unit(tmp_path):
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--snapshot", str(snapshot),
-            "--current-state", str(current),
-            "--resolv-conf", str(resolv),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--snapshot",
+            str(snapshot),
+            "--current-state",
+            str(current),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,
@@ -845,23 +1732,34 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
     )
     snapshot = tmp_path / "snapshot.json"
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
-    snapshot.write_text(json.dumps({
-        "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
-        "degraded_venues": [],
-    }))
+    snapshot.write_text(
+        json.dumps(
+            {
+                "market_observed_at_ms": 1778786998000,
+                "quotes": {
+                    f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001}
+                    for v in venues
+                },
+                "degraded_venues": [],
+            }
+        )
+    )
     current = tmp_path / "current.json"
-    current.write_text(json.dumps({
-        "schema": "lightfee.current_state.v1",
-        "mode": "live",
-        "lifecycle": "running",
-        "risk_mode": "running",
-        "last_tick_ms": 1778786999000,
-        "open_position_count": 0,
-        "pending_entry_count": 0,
-        "pending_close_count": 0,
-        "last_scan": {"candidate_count": 10, "tradeable_count": 2},
-    }))
+    current.write_text(
+        json.dumps(
+            {
+                "schema": "lightfee.current_state.v1",
+                "mode": "live",
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "last_tick_ms": 1778786999000,
+                "open_position_count": 0,
+                "pending_entry_count": 0,
+                "pending_close_count": 0,
+                "last_scan": {"candidate_count": 10, "tradeable_count": 2},
+            }
+        )
+    )
     resolv = tmp_path / "resolv.conf"
     resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 
@@ -869,11 +1767,16 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--snapshot", str(snapshot),
-            "--current-state", str(current),
-            "--resolv-conf", str(resolv),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--snapshot",
+            str(snapshot),
+            "--current-state",
+            str(current),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,
@@ -882,28 +1785,24 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
 
     assert result.returncode == 1
     payload = json.loads(result.stdout)
-    current_report = [
-        report for report in payload["reports"]
-        if report["name"] == "current_state"
-    ][0]
+    current_report = [report for report in payload["reports"] if report["name"] == "current_state"][
+        0
+    ]
     assert "exchange_truth_missing" in current_report["fingerprints"]
     assert current_report["details"]["exchange_truth_required"] is True
-    assert (
-        current_report["details"]["recovery_decision"]["kind"]
-        == "RUNNING_WITH_EVIDENCE_GAP"
-    )
+    assert current_report["details"]["recovery_decision"]["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
 
 
 def test_verify_production_services_attaches_exchange_truth_from_systemd_env_file(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
     current_state = runtime_dir / "live-state-current.json"
     env_file = tmp_path / "lightfee.env"
     env_file.write_text(
-        "LIGHTFEE_BYBIT_API_KEY=key-from-file\n"
-        "LIGHTFEE_BYBIT_API_SECRET=secret-from-file\n"
+        "LIGHTFEE_BYBIT_API_KEY=key-from-file\nLIGHTFEE_BYBIT_API_SECRET=secret-from-file\n"
     )
     state = {
         "schema": "lightfee.current_state.v1",
@@ -936,10 +1835,7 @@ def test_verify_production_services_attaches_exchange_truth_from_systemd_env_fil
         state,
         current_state_path=current_state,
         unit_texts={
-            "lightfee-live.service": (
-                "[Service]\n"
-                f"EnvironmentFile={env_file}\n"
-            ),
+            "lightfee-live.service": (f"[Service]\nEnvironmentFile={env_file}\n"),
         },
         exchange_truth_builder=fake_exchange_truth,
     )
@@ -1071,7 +1967,8 @@ def test_verify_production_services_ignores_old_or_unrelated_jsonl_events(tmp_pa
 
 
 def test_verify_production_services_exchange_truth_probe_times_out(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
@@ -1169,9 +2066,7 @@ def test_verify_production_services_preserves_exchange_truth_probe_evidence(tmp_
     assert exchange_truth["probe_evidence"][0]["classification"] == (
         "open_order_probe_retryable_error"
     )
-    assert exchange_truth["probe_evidence"][0]["error"] == (
-        "HTTP 429 rate limit; retry after 1s"
-    )
+    assert exchange_truth["probe_evidence"][0]["error"] == ("HTTP 429 rate limit; retry after 1s")
 
 
 def test_production_gate_does_not_report_clean_when_open_orders_present():
@@ -1218,12 +2113,8 @@ def test_production_gate_does_not_report_clean_when_open_orders_present():
     assert report.severity == "critical"
     assert "exchange_truth_mismatch" in report.fingerprints
     assert "live_open_order" in report.fingerprints
-    assert report.details["recovery_decision"]["kind"] == (
-        "BLOCK_OR_FLATTEN_LIVE_ARTIFACT"
-    )
-    assert report.details["exchange_truth_mismatches"][0]["check"] == (
-        "unexpected_live_open_order"
-    )
+    assert report.details["recovery_decision"]["kind"] == ("BLOCK_OR_FLATTEN_LIVE_ARTIFACT")
+    assert report.details["exchange_truth_mismatches"][0]["check"] == ("unexpected_live_open_order")
 
 
 def test_current_state_weak_order_truth_gap_is_not_green_even_when_flat():
@@ -1283,8 +2174,10 @@ def test_verify_production_services_cli_json_failure(tmp_path):
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,
@@ -1738,11 +2631,16 @@ def test_cli_reports_missing_snapshot_and_current_state(tmp_path):
         [
             sys.executable,
             "scripts/verify_production_services.py",
-            "--unit-dir", str(unit_dir),
-            "--snapshot", str(snapshot),
-            "--current-state", str(current),
-            "--resolv-conf", str(resolv),
-            "--now-ms", "1778787000000",
+            "--unit-dir",
+            str(unit_dir),
+            "--snapshot",
+            str(snapshot),
+            "--current-state",
+            str(current),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
             "--json",
         ],
         text=True,

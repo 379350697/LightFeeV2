@@ -176,6 +176,7 @@ def binance_spec() -> VenueSpec:
         venue_scope="venue:binance",
         # V2 sidecar public endpoints
         funding_ticker_path="/fapi/v1/ticker/bookTicker",
+        funding_contracts_path="/fapi/v1/exchangeInfo",
         premium_index_path="/fapi/v1/premiumIndex",
         volume_24h_path="/fapi/v1/ticker/24hr",
         open_interest_path="/fapi/v1/openInterest",
@@ -268,6 +269,7 @@ def bybit_spec() -> VenueSpec:
         venue_scope="venue:bybit",
         # V2 sidecar public endpoints
         funding_ticker_path="/v5/market/tickers",
+        funding_contracts_path="/v5/market/instruments-info",
         ticker_includes_volume_oi=True,
         operation_contracts={
             VenueOperation.CREATE_ORDER: _contract("POST", "/v5/order/create"),
@@ -481,6 +483,7 @@ def aster_spec() -> VenueSpec:
         venue_scope="venue:aster",
         # V2 sidecar public endpoints (Binance-compatible)
         funding_ticker_path="/fapi/v1/ticker/bookTicker",
+        funding_contracts_path="/fapi/v1/exchangeInfo",
         premium_index_path="/fapi/v1/premiumIndex",
         volume_24h_path="/fapi/v1/ticker/24hr",
         open_interest_path="/fapi/v1/openInterest",

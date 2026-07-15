@@ -99,6 +99,11 @@ class ExchangeSource:
             mark_index_source=ft.mark_index_source,
             price_precision=ft.price_precision,
             quantity_precision=ft.quantity_precision,
+            price_tick=ft.price_tick,
+            quantity_step_base=ft.quantity_step_base,
+            min_quantity_base=ft.min_quantity_base,
+            min_notional_quote=ft.min_notional_quote,
+            min_notional_evidence_complete=ft.min_notional_evidence_complete,
             venue_status=ft.venue_status,
             contract_normalization_complete=ft.contract_normalization_complete,
         )

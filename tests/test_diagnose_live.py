@@ -250,10 +250,12 @@ def test_run_diagnose_reports_spread_sidecar_snapshot_source():
         })
         publish_spread_snapshot(
             SpreadSnapshot(
+                decision_at_ms=995,
                 published_at_ms=1_000,
                 market_observed_at_ms=990,
                 source_mode="sidecar_snapshot",
                 degraded_venues=["aster"],
+                paper_refresh_status="disabled",
                 candidates=[],
             ),
             os.path.join(d, "spread-opportunities-current.json"),
@@ -268,8 +270,27 @@ def test_run_diagnose_reports_spread_sidecar_snapshot_source():
             "spread_sidecar_source_state": "current_ok",
             "spread_sidecar_current_degraded": False,
             "main_sidecar_snapshot_age_ms": None,
+            "diagnostic_contract_status": "complete",
+            "health_fingerprints": ["spread_degraded_inputs"],
             "candidate_count": 0,
             "degraded_venues": ["aster"],
+            "input_quote_count": 0,
+            "valid_quote_count": 0,
+            "evaluated_pair_count": 0,
+            "accepted_pair_count": 0,
+            "rejection_counts": {},
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "paper_admission_rejection_counts": {},
+            "top_paper_admission_rejection": None,
+            "blocking_reasons": ["spread_paper_not_configured"],
+            "next_actions": [
+                "enable spread_paper_enabled only after paper prerequisites are ready"
+            ],
         }
     finally:
         import shutil
@@ -289,8 +310,20 @@ def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_
             SidecarSnapshot(
                 published_at_ms=10_000,
                 market_observed_at_ms=9_900,
-                source_mode="direct_market",
-                quotes={},
+                candidate_build_observed_at_ms=9_950,
+                candidate_build_diagnostics={
+                    "input_quote_count": 0,
+                    "requested_symbol_count": 0,
+                    "requested_symbols": [],
+                    "requested_venues": [],
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                    },
+                    source_mode="direct_market",
+                    acquisition_mode="fresh_sidecar",
+                    quotes={},
                 candidates=[],
             ),
             os.path.join(d, "opportunity-input-snapshot.json"),
@@ -314,6 +347,53 @@ def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_
         assert summary["main_sidecar_snapshot_age_ms"] == 500
     finally:
         import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_spread_sidecar_summary_exposes_top_paper_admission_rejection() -> None:
+    from lightfee.spread.models import SpreadSnapshot
+    from lightfee.spread.publisher import publish_spread_snapshot
+    import scripts.diagnose_live as diagnose_live
+
+    d = _make_tmpdir()
+    try:
+        publish_spread_snapshot(
+            SpreadSnapshot(
+                decision_at_ms=10_000,
+                published_at_ms=10_100,
+                market_observed_at_ms=9_900,
+                source_mode="sidecar_snapshot",
+                input_quote_count=2,
+                valid_quote_count=2,
+                evaluated_pair_count=1,
+                accepted_pair_count=1,
+                paper_configured_enabled=True,
+                paper_admission_enabled=True,
+                paper_refresh_status="success",
+                paper_event_count=1,
+                paper_last_success_at_ms=10_000,
+                paper_admission_rejection_counts={
+                    "paper_min_notional_not_met": 3,
+                    "paper_episode_cooldown": 1,
+                },
+                candidates=[],
+            ),
+            os.path.join(d, "spread-opportunities-current.json"),
+        )
+
+        summary = diagnose_live._build_spread_sidecar_summary(d, now_ms=10_500)
+
+        assert summary["diagnostic_contract_status"] == "complete"
+        assert summary["accepted_pair_count"] == 1
+        assert summary["paper_tracked_count"] == 0
+        assert summary["top_paper_admission_rejection"] == {
+            "reason": "paper_min_notional_not_met",
+            "count": 3,
+        }
+        assert summary["blocking_reasons"] == ["paper_min_notional_not_met"]
+    finally:
+        import shutil
+
         shutil.rmtree(d, ignore_errors=True)
 
 
