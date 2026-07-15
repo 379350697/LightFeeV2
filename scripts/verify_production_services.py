@@ -160,6 +160,24 @@ def _spread_bbo_runtime_report(
         }
         observed_venues = {quote.venue for quote in snapshot.quotes.values()}
         configured_venues = set(snapshot.configured_venues)
+        degraded_venues = sorted(
+            {
+                str(venue).strip().lower()
+                for venue in getattr(snapshot, "degraded_venues", [])
+                if str(venue).strip()
+            }
+        )
+        degraded_symbols = {
+            str(venue).strip().lower(): sorted(
+                {
+                    str(symbol).strip().upper()
+                    for symbol in symbols
+                    if str(symbol).strip()
+                }
+            )
+            for venue, symbols in getattr(snapshot, "degraded_symbols", {}).items()
+            if str(venue).strip() and symbols
+        }
         ttl_ms = max(
             int(getattr(getattr(app_config, "strategy", None), "spread_signal_ttl_ms", 0) or 0),
             1,
@@ -177,6 +195,8 @@ def _spread_bbo_runtime_report(
                 "quote_count": len(snapshot.quotes),
                 "configured_venues": sorted(configured_venues),
                 "observed_venues": sorted(observed_venues),
+                "degraded_venues": degraded_venues,
+                "degraded_symbols": degraded_symbols,
                 "max_quote_age_ms": max(quote_ages_ms, default=None),
                 "signal_ttl_ms": ttl_ms,
                 "checked_at_ms": checked_at_ms,
@@ -187,6 +207,10 @@ def _spread_bbo_runtime_report(
             fingerprints.append("spread_bbo_configured_venue_mismatch")
         if observed_venues != expected_venues:
             fingerprints.append("spread_bbo_venue_coverage_incomplete")
+        if degraded_venues:
+            fingerprints.append("spread_bbo_venue_degraded")
+        if degraded_symbols:
+            fingerprints.append("spread_bbo_symbol_degraded")
         if publish_age_ms < 0 or publish_age_ms > ttl_ms:
             fingerprints.append("spread_bbo_publication_stale")
         if any(age < 0 or age > ttl_ms for age in quote_ages_ms):

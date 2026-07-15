@@ -105,6 +105,7 @@ class SpreadBboDataPlane:
         self.active = False
         self._quotes_by_venue: dict[str, dict[str, QuoteSnapshot]] = {}
         self._request_started_at_ms: dict[str, int] = {}
+        self._accepted_request_started_at_ms: dict[str, int] = {}
         self._degraded_venues = set(sources)
         self._degraded_symbols: dict[str, set[str]] = {}
         self._last_error_by_venue: dict[str, str] = {}
@@ -331,6 +332,17 @@ class SpreadBboDataPlane:
             self._degraded_symbols.pop(venue_name, None)
         if accepted:
             self._quotes_by_venue[venue_name] = accepted
+            accepted_observed_at_ms = min(
+                int(quote.observed_at_ms or 0) for quote in accepted.values()
+            )
+            request_started_at_ms = int(
+                self._request_started_at_ms.get(venue_name, 0) or 0
+            )
+            self._accepted_request_started_at_ms[venue_name] = (
+                request_started_at_ms
+                if 0 < request_started_at_ms <= accepted_observed_at_ms
+                else accepted_observed_at_ms
+            )
             self._degraded_venues.discard(venue_name)
             self._last_error_by_venue.pop(venue_name, None)
         else:
@@ -342,20 +354,41 @@ class SpreadBboDataPlane:
         )
 
     def _build_snapshot(self) -> SpreadQuoteSnapshot | None:
-        quotes = {
-            key: quote
-            for venue_quotes in self._quotes_by_venue.values()
-            for key, quote in venue_quotes.items()
-        }
+        published_at_ms = int(time.time() * 1000)
+        signal_ttl_ms = max(
+            int(self.config.strategy.spread_signal_ttl_ms or 0),
+            1,
+        )
+        quotes: dict[str, QuoteSnapshot] = {}
+        fresh_venues: set[str] = set()
+        expired_symbols: dict[str, set[str]] = {}
+        for venue, venue_quotes in self._quotes_by_venue.items():
+            for key, quote in venue_quotes.items():
+                observed_at_ms = int(quote.observed_at_ms or 0)
+                quote_age_ms = published_at_ms - observed_at_ms
+                if 0 <= quote_age_ms <= signal_ttl_ms:
+                    quotes[key] = quote
+                    fresh_venues.add(venue)
+                    continue
+                expired_symbols.setdefault(venue, set()).add(
+                    str(quote.symbol).strip().upper()
+                )
         if not quotes:
             return None
         observed_at_ms = max(int(quote.observed_at_ms or 0) for quote in quotes.values())
-        published_at_ms = max(int(time.time() * 1000), observed_at_ms)
         starts = [
-            self._request_started_at_ms.get(venue, 0)
-            for venue in self._quotes_by_venue
+            self._accepted_request_started_at_ms.get(venue, 0)
+            for venue in fresh_venues
         ]
         starts = [int(value) for value in starts if int(value) > 0]
+        degraded_venues = set(self._degraded_venues)
+        degraded_venues.update(set(self._quotes_by_venue) - fresh_venues)
+        degraded_symbols = {
+            venue: set(symbols)
+            for venue, symbols in self._degraded_symbols.items()
+        }
+        for venue, symbols in expired_symbols.items():
+            degraded_symbols.setdefault(venue, set()).update(symbols)
         return SpreadQuoteSnapshot(
             published_at_ms=published_at_ms,
             market_observed_at_ms=observed_at_ms,
@@ -364,10 +397,10 @@ class SpreadBboDataPlane:
                 published_at_ms,
             ),
             configured_venues=sorted(self.sources),
-            degraded_venues=sorted(self._degraded_venues),
+            degraded_venues=sorted(degraded_venues),
             degraded_symbols={
                 venue: sorted(symbols)
-                for venue, symbols in self._degraded_symbols.items()
+                for venue, symbols in degraded_symbols.items()
                 if symbols
             },
             quotes=quotes,

@@ -1114,6 +1114,48 @@ def test_spread_bbo_runtime_samples_clock_after_snapshot_load(monkeypatch):
     assert report.details["checked_at_ms"] == 2_100
 
 
+def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
+    now_ms = 2_000
+    snapshot = SimpleNamespace(
+        published_at_ms=now_ms - 100,
+        batch_started_at_ms=now_ms - 200,
+        producer_generation_id="boot:42",
+        configured_venues=["binance", "okx"],
+        degraded_venues=["okx"],
+        degraded_symbols={"binance": ["ETHUSDT"]},
+        quotes={
+            "binance:BTCUSDT": SimpleNamespace(
+                venue="binance",
+                observed_at_ms=now_ms - 100,
+            ),
+            "okx:BTCUSDT": SimpleNamespace(
+                venue="okx",
+                observed_at_ms=now_ms - 100,
+            ),
+        },
+    )
+    config = SimpleNamespace(
+        venues=[SimpleNamespace(venue="binance"), SimpleNamespace(venue="okx")],
+        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=now_ms,
+    )
+
+    assert not report.ok
+    assert "spread_bbo_venue_degraded" in report.fingerprints
+    assert "spread_bbo_symbol_degraded" in report.fingerprints
+    assert report.details["degraded_venues"] == ["okx"]
+    assert report.details["degraded_symbols"] == {"binance": ["ETHUSDT"]}
+
+
 def test_current_state_flags_stale_fail_closed_clean_state():
     state = {
         "lifecycle": "running",

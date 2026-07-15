@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import threading
 import time
 
@@ -283,6 +284,128 @@ def test_identical_venue_update_does_not_trigger_a_new_generation(tmp_path):
 
     assert plane._accept_venue_update("binance", update) is True
     assert plane._accept_venue_update("binance", update) is False
+
+
+def test_snapshot_excludes_expired_quotes_without_blocking_fresh_venues(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[
+            VenueConfig(venue="binance"),
+            VenueConfig(venue="okx"),
+        ],
+    )
+    config.strategy.spread_signal_ttl_ms = 1_000
+    plane = SpreadBboDataPlane(
+        config,
+        sources={"binance": object(), "okx": object()},
+        metadata_quotes=lambda: {
+            "binance:BTCUSDT": _metadata_quote("binance"),
+            "okx:BTCUSDT": _metadata_quote("okx"),
+        },
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+    now_ms = int(time.time() * 1000)
+    plane._quotes_by_venue = {
+        "binance": {
+            "binance:BTCUSDT": _metadata_quote("binance"),
+        },
+        "okx": {
+            "okx:BTCUSDT": _metadata_quote("okx"),
+        },
+    }
+    plane._quotes_by_venue["binance"]["binance:BTCUSDT"].observed_at_ms = now_ms - 1_001
+    plane._quotes_by_venue["okx"]["okx:BTCUSDT"].observed_at_ms = now_ms
+    plane._degraded_venues.clear()
+
+    snapshot = plane._build_snapshot()
+
+    assert snapshot is not None
+    assert list(snapshot.quotes) == ["okx:BTCUSDT"]
+    assert snapshot.degraded_venues == ["binance"]
+    assert snapshot.degraded_symbols == {"binance": ["BTCUSDT"]}
+    assert snapshot.published_at_ms - snapshot.quotes["okx:BTCUSDT"].observed_at_ms <= 1_000
+
+
+def test_partial_venue_refresh_replaces_old_symbol_rows(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    metadata = {
+        "binance:BTCUSDT": _metadata_quote("binance"),
+        "binance:ETHUSDT": replace(_metadata_quote("binance"), symbol="ETHUSDT"),
+    }
+    plane = SpreadBboDataPlane(
+        config,
+        sources={"binance": object()},
+        metadata_quotes=lambda: metadata,
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+    now_ms = int(time.time() * 1000)
+
+    def top(symbol: str, received_at_ms: int) -> TopBookQuote:
+        return TopBookQuote(
+            venue="binance",
+            symbol=symbol,
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=received_at_ms,
+            received_at_ms=received_at_ms,
+        )
+
+    assert plane._accept_venue_update(
+        "binance",
+        {
+            "binance:BTCUSDT": top("BTCUSDT", now_ms - 10),
+            "binance:ETHUSDT": top("ETHUSDT", now_ms - 10),
+        },
+    )
+    assert plane._accept_venue_update(
+        "binance",
+        {"binance:BTCUSDT": top("BTCUSDT", now_ms)},
+    )
+
+    snapshot = plane._build_snapshot()
+    assert snapshot is not None
+    assert list(snapshot.quotes) == ["binance:BTCUSDT"]
+    assert snapshot.degraded_symbols == {"binance": ["ETHUSDT"]}
+
+
+def test_snapshot_batch_clock_uses_accepted_request_not_next_inflight_request(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    config.strategy.spread_signal_ttl_ms = 1_000
+    plane = SpreadBboDataPlane(
+        config,
+        sources={"binance": object()},
+        metadata_quotes=lambda: {
+            "binance:BTCUSDT": _metadata_quote("binance"),
+        },
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+    now_ms = int(time.time() * 1000)
+    plane._request_started_at_ms["binance"] = now_ms - 20
+    assert plane._accept_venue_update(
+        "binance",
+        {
+            "binance:BTCUSDT": TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+            )
+        },
+    )
+    plane._request_started_at_ms["binance"] = now_ms + 10
+
+    snapshot = plane._build_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.batch_started_at_ms == now_ms - 20
 
 
 @pytest.mark.asyncio
