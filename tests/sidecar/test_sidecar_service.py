@@ -447,7 +447,7 @@ async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
 
     service._fetch_all_venues = funding_results
     service._fetch_liquidity_all_venues = liquidity_results
-    clock = iter([1.0, 2.0, 3.0])
+    clock = iter([1.0, 1.5, 2.0, 3.0])
     monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
 
     snapshot = await service.refresh_once()

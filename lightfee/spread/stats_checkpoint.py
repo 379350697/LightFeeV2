@@ -10,7 +10,10 @@ from pathlib import Path
 from lightfee.spread.reversion import SpreadStatsTracker
 
 
-SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION = 1
+# Version 2 records one sample per unique market-evidence timestamp. Version 1
+# used scheduler decision time and could therefore contain duplicated samples
+# from repeated reads of an unchanged quote snapshot; it must cold-start.
+SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION = 2
 
 
 def restore_spread_stats_checkpoint(

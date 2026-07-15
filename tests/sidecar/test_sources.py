@@ -11,7 +11,7 @@ from lightfee.core.domain import Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
-from lightfee.venues.specs import binance_spec, okx_spec, get_spec
+from lightfee.venues.specs import binance_spec, okx_spec
 
 
 class TestExchangeSource:
@@ -237,7 +237,7 @@ class TestSidecarServiceRateLimitWiring:
                 ("bybit", {}, None, set()),
             ]
 
-        clock = iter((10.0, 10.25, 10.3))
+        clock = iter((10.0, 10.25, 10.3, 10.35))
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
         service._fetch_all_venues = fake_funding
         service._fetch_liquidity_all_venues = fake_liquidity
@@ -253,6 +253,57 @@ class TestSidecarServiceRateLimitWiring:
         assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 1
         assert snapshot.candidate_build_diagnostics["output_candidate_count"] == 1
         assert snapshot.candidate_build_diagnostics["rejection_counts"] == {}
+
+    @pytest.mark.asyncio
+    async def test_refresh_publishes_compact_spread_quotes_before_liquidity_work(
+        self, tmp_path, monkeypatch
+    ):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+        from lightfee.spread.quote_snapshot import (
+            load_spread_quote_snapshot,
+            spread_quote_snapshot_path,
+        )
+
+        sidecar_path = tmp_path / "sidecar.json"
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(sidecar_snapshot_path=str(sidecar_path)),
+                venues=[VenueConfig(venue="binance")],
+            )
+        )
+        quote = QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            bid_size=1.0,
+            ask_size=1.0,
+            observed_at_ms=1_100,
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_normalization_complete=True,
+        )
+
+        async def fake_funding(*_args, **_kwargs):
+            return [("binance", {"binance:BTCUSDT": quote}, None, set())]
+
+        async def fake_liquidity(*_args, **_kwargs):
+            compact = load_spread_quote_snapshot(spread_quote_snapshot_path(sidecar_path))
+            assert compact is not None
+            assert compact.quotes["binance:BTCUSDT"].observed_at_ms == 1_100
+            return [("binance", {}, None, set())]
+
+        clock = iter((1.0, 1.2, 1.3, 1.4))
+        monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
+        service._fetch_all_venues = fake_funding
+        service._fetch_liquidity_all_venues = fake_liquidity
+
+        try:
+            await service.refresh_once()
+        finally:
+            await service.close()
 
     @pytest.mark.asyncio
     async def test_liquidity_fetch_skips_venue_already_degraded_by_market_data(self, tmp_path):

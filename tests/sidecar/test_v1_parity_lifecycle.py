@@ -869,7 +869,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
-        times = iter([1.0, 6.0, 7.0])
+        times = iter([1.0, 5.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()
@@ -942,7 +942,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = failed_liquidity
-        times = iter([2.0, 6.0, 7.0])
+        times = iter([2.0, 5.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         failed = await svc.refresh_once()
@@ -952,7 +952,7 @@ class TestRefreshPublicationSemantics:
         assert svc._last_liquidity_publish_at_ms == 1000
 
         svc._fetch_liquidity_all_venues = successful_liquidity
-        times = iter([8.0, 10.0, 11.0])
+        times = iter([8.0, 9.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         successful = await svc.refresh_once()
@@ -1038,7 +1038,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = mixed_liquidity
-        times = iter([8.0, 10.0, 11.0])
+        times = iter([8.0, 9.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()

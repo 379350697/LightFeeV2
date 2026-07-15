@@ -4,6 +4,7 @@ import json
 
 from lightfee.spread.reversion import SpreadStatsTracker
 from lightfee.spread.stats_checkpoint import (
+    SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION,
     publish_spread_stats_checkpoint,
     restore_spread_stats_checkpoint,
 )
@@ -56,12 +57,40 @@ def test_stats_checkpoint_corruption_cold_starts(tmp_path) -> None:
     )
 
 
-def test_stats_checkpoint_rejects_nonfinite_rows_and_expired_state(tmp_path) -> None:
+def test_legacy_scheduler_time_checkpoint_cold_starts(tmp_path) -> None:
     path = tmp_path / "spread-stats.json"
     path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
+                "model_epoch": "v2_signed_reversion",
+                "saved_at_ms": 1_000,
+                "states": {
+                    "BTCUSDT|alpha|beta": {
+                        "samples": [[1_000, 1.0, 0.1]],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tracker = SpreadStatsTracker(window_ms=60_000)
+
+    assert not restore_spread_stats_checkpoint(
+        tracker,
+        path,
+        model_epoch="v2_signed_reversion",
+        now_ms=1_000,
+    )
+    assert tracker.snapshot("BTCUSDT", "alpha", "beta", now_ms=1_000) is None
+
+
+def test_stats_checkpoint_rejects_nonfinite_rows_and_expired_state(tmp_path) -> None:
+    path = tmp_path / "spread-stats.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION,
                 "model_epoch": "v2_signed_reversion",
                 "saved_at_ms": 1_000,
                 "states": {
@@ -86,7 +115,7 @@ def test_stats_checkpoint_rejects_nonfinite_rows_and_expired_state(tmp_path) -> 
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION,
                 "model_epoch": "v2_signed_reversion",
                 "saved_at_ms": 1_000,
                 "states": {},

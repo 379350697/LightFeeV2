@@ -24,6 +24,11 @@ from lightfee.sidecar.snapshot import (
     SidecarSnapshot,
     TransferLifecycle,
 )
+from lightfee.spread.quote_snapshot import (
+    SpreadQuoteSnapshot,
+    publish_spread_quote_snapshot,
+    spread_quote_snapshot_path,
+)
 from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
@@ -172,6 +177,7 @@ class SidecarService:
         fallback_used_keys: set[str] = set()
         fresh_cacheable_quote_keys: set[str] = set()
         market_quality_failed_symbols: dict[str, set[str]] = {}
+        spread_market_degraded_venues: set[str] = set()
         quote_liquidity_by_venue: dict[str, dict[str, PerpLiquiditySnapshot]] = {}
         requested_symbol_count = len(_canonical_symbol_set(symbols))
         listed_symbols_by_venue: dict[str, set[str]] = {}
@@ -185,6 +191,7 @@ class SidecarService:
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
             if error is not None:
                 degraded_venues.add(venue_name)
+                spread_market_degraded_venues.add(venue_name)
                 # V1 parity: last-good fallback — inject previous quotes
                 raw_fallback = self._inject_last_good(
                     venue_name,
@@ -374,6 +381,8 @@ class SidecarService:
             )
             if funding_usable <= 0 or market_usable <= 0:
                 degraded_venues.add(venue_name)
+            if market_usable <= 0:
+                spread_market_degraded_venues.add(venue_name)
 
             if venue_quotes:
                 derived_liquidity: dict[str, PerpLiquiditySnapshot] = {}
@@ -412,6 +421,59 @@ class SidecarService:
                     degraded_reason=market_reason,
                 )
             )
+
+        # Publish the spread-only market view before liquidity enrichment,
+        # funding candidate construction, and the much larger V4 snapshot.
+        # The view contains no private data and does not alter the V1/live
+        # opportunity-input contract consumed by the trading runtime.
+        # Capture the fast-path publication time as soon as the concurrent
+        # market fetch completes. The later candidate-build watermark remains
+        # separate because liquidity evidence is fetched after this point.
+        spread_quote_published_at_ms = int(time.time() * 1000)
+        spread_quotes = {
+            key: quote
+            for key, quote in quotes.items()
+            if 0 < int(getattr(quote, "observed_at_ms", 0) or 0)
+            <= spread_quote_published_at_ms
+        }
+        spread_future_symbols: dict[str, set[str]] = {}
+        for key, quote in quotes.items():
+            if key in spread_quotes:
+                continue
+            venue = str(getattr(quote, "venue", "") or "").strip().lower()
+            symbol = _snapshot_item_symbol(key, quote)
+            if venue and symbol:
+                spread_future_symbols.setdefault(venue, set()).add(symbol)
+        spread_degraded_symbols = {
+            venue: sorted(symbols)
+            for venue, symbols in market_quality_failed_symbols.items()
+            if symbols
+        }
+        for venue, symbols in spread_future_symbols.items():
+            spread_degraded_symbols[venue] = sorted(
+                set(spread_degraded_symbols.get(venue, [])) | symbols
+            )
+        try:
+            publish_spread_quote_snapshot(
+                SpreadQuoteSnapshot(
+                    published_at_ms=spread_quote_published_at_ms,
+                    market_observed_at_ms=_latest_valid_quote_observation_ms(
+                        spread_quotes,
+                        decision_at_ms=spread_quote_published_at_ms,
+                        fallback_ms=refresh_started_at_ms,
+                    ),
+                    batch_started_at_ms=refresh_started_at_ms,
+                    configured_venues=sorted(self._configured_venue_names()),
+                    degraded_venues=sorted(spread_market_degraded_venues),
+                    degraded_symbols=spread_degraded_symbols,
+                    quotes=spread_quotes,
+                ),
+                spread_quote_snapshot_path(self.snapshot_path),
+            )
+        except (OSError, TypeError, ValueError):
+            # Keep funding/live publication independent.  The spread reader
+            # will fail stale/closed if the previous compact view ages out.
+            logger.exception("spread quote fast-path publication failed")
 
         # --- Liquidity fetch (independent domain, own timeout, own source) ---
         liquidity_results = await self._fetch_liquidity_all_venues(

@@ -15,6 +15,10 @@ from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.persistence.journal import Journal
 from lightfee.spread.models import SpreadSnapshot
+from lightfee.spread.quote_snapshot import (
+    load_spread_quote_snapshot,
+    spread_quote_snapshot_path,
+)
 from lightfee.spread.paper import SpreadPaperConfig, SpreadPaperTracker
 from lightfee.spread.publisher import publish_spread_snapshot
 from lightfee.spread.research_manifest import (
@@ -335,6 +339,9 @@ class SpreadSidecarService:
         self.config = config
         self.snapshot_path = config.runtime.spread_sidecar_snapshot_path
         self.sidecar_snapshot_path = config.runtime.sidecar_snapshot_path
+        self.spread_quote_snapshot_path = spread_quote_snapshot_path(
+            self.sidecar_snapshot_path
+        )
         source_mode = str(config.runtime.spread_sidecar_source_mode).lower()
         if source_mode != "sidecar_snapshot" or config.runtime.spread_sidecar_direct_fetch_enabled:
             raise ValueError(
@@ -640,7 +647,16 @@ class SpreadSidecarService:
         dict[str, list[str]],
         int,
     ]:
-        snapshot = load_snapshot(self.sidecar_snapshot_path)
+        compact_path = Path(self.spread_quote_snapshot_path)
+        if compact_path.exists():
+            # Once the producer advertises the compact contract, a malformed
+            # file is an integrity failure.  Do not silently bypass it with
+            # the slower full snapshot.
+            snapshot = load_spread_quote_snapshot(compact_path)
+        else:
+            # Rolling-deploy and direct-test compatibility only.  Production
+            # naturally switches on the first compact Sidecar publication.
+            snapshot = load_snapshot(self.sidecar_snapshot_path)
         # In production the decision watermark is taken after the immutable
         # snapshot has been read and validated.  Otherwise a concurrent
         # sidecar publish can be newer than a timestamp captured before I/O,

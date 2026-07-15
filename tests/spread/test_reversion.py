@@ -167,6 +167,34 @@ def test_current_observation_is_not_in_its_own_zscore_and_direction_is_correct()
     assert after is not None and after.sample_count == before.sample_count + 1
 
 
+def test_repeated_scheduler_reads_do_not_manufacture_history_samples() -> None:
+    tracker = SpreadStatsTracker()
+    quotes = _quotes_for_signed_basis(1.0, now_ms=10_000)
+    config = _config(min_samples=100, min_history_ms=0)
+
+    assert build_spread_reversion_candidates(
+        quotes,
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=config,
+        now_ms=10_100,
+    ) == []
+    first = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000)
+    assert first is not None and first.sample_count == 1
+
+    assert build_spread_reversion_candidates(
+        quotes,
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=config,
+        now_ms=12_000,
+    ) == []
+    repeated = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=12_000)
+    assert repeated is not None
+    assert repeated.sample_count == 1
+    assert repeated.last_observed_ms == 10_000
+
+
 def test_negative_z_reverses_trade_direction_without_creating_a_second_series() -> None:
     tracker = SpreadStatsTracker()
     _prewarm(tracker)

@@ -463,6 +463,79 @@ async def test_spread_production_decision_clock_is_after_snapshot_read(
 
 
 @pytest.mark.asyncio
+async def test_spread_prefers_compact_quote_snapshot_over_full_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from lightfee.spread.quote_snapshot import (
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+            sidecar_snapshot_max_age_ms=1_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    source = _sidecar_snapshot(observed_at_ms=10_000)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=source.quotes,
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    monkeypatch.setattr(
+        "lightfee.spread.service.load_snapshot",
+        lambda _path: (_ for _ in ()).throw(AssertionError("full snapshot must not be read")),
+    )
+    service = SpreadSidecarService(config)
+
+    snapshot = await service.refresh_once(now_ms=10_000)
+
+    assert snapshot.source_mode == "sidecar_snapshot"
+    assert snapshot.valid_quote_count == 2
+
+
+@pytest.mark.asyncio
+async def test_spread_fails_closed_on_malformed_compact_snapshot(tmp_path) -> None:
+    from lightfee.spread.quote_snapshot import spread_quote_snapshot_path
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    publish_snapshot(_sidecar_snapshot(observed_at_ms=10_000), sidecar_path)
+    spread_quote_snapshot_path(sidecar_path).write_text("{malformed")
+    service = SpreadSidecarService(config)
+
+    snapshot = await service.refresh_once(now_ms=10_000)
+
+    assert snapshot.source_mode == "sidecar_snapshot_unavailable"
+    assert snapshot.valid_quote_count == 0
+
+
+@pytest.mark.asyncio
 async def test_spread_sidecar_drops_individually_stale_quotes(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar-current.json"
     spread_path = tmp_path / "spread-current.json"

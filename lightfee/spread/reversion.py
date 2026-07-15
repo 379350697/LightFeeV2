@@ -588,16 +588,28 @@ def _candidate_for_pair(
     reference_mid = (a_mid + b_mid) / 2.0
     signed_mid = ((a_mid - b_mid) / reference_mid) * 10_000.0
     observed_exit_half_spread = _two_leg_half_spread_bps(a, b, reference_mid)
+    # A rolling sample represents market evidence, not a scheduler tick.  Use
+    # the time at which both legs were observable so repeatedly reading one
+    # still-fresh snapshot cannot manufacture independent history samples.
+    pair_observed_at_ms = max(
+        int(a.observed_at_ms or 0),
+        int(b.observed_at_ms or 0),
+    )
 
     # No look-ahead: take a snapshot of the old window, then append the
     # current observation. The post-update snapshot only enforces a break.
-    stats = tracker.snapshot(a.symbol, a.venue, b.venue, now_ms=now_ms)
+    stats = tracker.snapshot(
+        a.symbol,
+        a.venue,
+        b.venue,
+        now_ms=pair_observed_at_ms,
+    )
     if stats is None:
         stats = SpreadStatsSnapshot(sample_count=0, mean_bps=0.0, std_bps=0.0)
     # A signal timestamp behind the restored/live rolling window is an
     # out-of-order market event.  Using its old price against newer samples is
     # look-ahead, so reject it and leave the state unchanged.
-    if stats.last_observed_ms > now_ms:
+    if stats.last_observed_ms > pair_observed_at_ms:
         _record_spread_rejection(rejection_counts, "out_of_order_stats_window")
         return None
     updated = tracker.update(
@@ -605,7 +617,7 @@ def _candidate_for_pair(
         a.venue,
         b.venue,
         signed_mid,
-        observed_at_ms=now_ms,
+        observed_at_ms=pair_observed_at_ms,
         exit_half_spread_bps=observed_exit_half_spread,
     )
     if updated.structural_break:
