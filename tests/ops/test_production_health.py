@@ -1051,13 +1051,16 @@ def test_systemd_active_report_fails_closed_on_inactive(monkeypatch):
 def test_spread_bbo_runtime_rejects_snapshot_from_previous_process(monkeypatch):
     now_ms = 1_778_787_000_000
     snapshot = SimpleNamespace(
+        schema_version=5,
         published_at_ms=now_ms - 100,
         batch_started_at_ms=now_ms - 10_000,
         producer_generation_id="boot:41",
         configured_venues=["okx"],
+        sampling_symbols=["BTCUSDT"],
         quotes={
             "okx:BTCUSDT": SimpleNamespace(
                 venue="okx",
+                symbol="BTCUSDT",
                 observed_at_ms=now_ms - 100,
             )
         },
@@ -1084,13 +1087,16 @@ def test_spread_bbo_runtime_rejects_snapshot_from_previous_process(monkeypatch):
 def test_spread_bbo_runtime_samples_clock_after_snapshot_load(monkeypatch):
     published_at_ms = 2_000
     snapshot = SimpleNamespace(
+        schema_version=5,
         published_at_ms=published_at_ms,
         batch_started_at_ms=1_900,
         producer_generation_id="boot:42",
         configured_venues=["okx"],
+        sampling_symbols=["BTCUSDT"],
         quotes={
             "okx:BTCUSDT": SimpleNamespace(
                 venue="okx",
+                symbol="BTCUSDT",
                 observed_at_ms=published_at_ms,
             )
         },
@@ -1164,19 +1170,23 @@ def test_spread_runtime_samples_clock_after_snapshot_load(monkeypatch):
 def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
     now_ms = 2_000
     snapshot = SimpleNamespace(
+        schema_version=5,
         published_at_ms=now_ms - 100,
         batch_started_at_ms=now_ms - 200,
         producer_generation_id="boot:42",
         configured_venues=["binance", "okx"],
+        sampling_symbols=["BTCUSDT", "ETHUSDT"],
         degraded_venues=["okx"],
         degraded_symbols={"binance": ["ETHUSDT"]},
         quotes={
             "binance:BTCUSDT": SimpleNamespace(
                 venue="binance",
+                symbol="BTCUSDT",
                 observed_at_ms=now_ms - 100,
             ),
             "okx:BTCUSDT": SimpleNamespace(
                 venue="okx",
+                symbol="BTCUSDT",
                 observed_at_ms=now_ms - 100,
             ),
         },
@@ -1201,6 +1211,51 @@ def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
     assert "spread_bbo_symbol_degraded" in report.fingerprints
     assert report.details["degraded_venues"] == ["okx"]
     assert report.details["degraded_symbols"] == {"binance": ["ETHUSDT"]}
+
+
+def test_spread_bbo_runtime_rejects_declared_budget_despite_missing_venues(monkeypatch):
+    now_ms = 2_000
+    venues = [f"v{index}" for index in range(7)]
+    symbols = [f"S{index}USDT" for index in range(30)]
+    quotes = {
+        f"{venue}:{symbol}": SimpleNamespace(
+            venue=venue,
+            symbol=symbol,
+            observed_at_ms=now_ms - 100,
+        )
+        for venue in venues[:2]
+        for symbol in symbols
+    }
+    snapshot = SimpleNamespace(
+        schema_version=5,
+        published_at_ms=now_ms - 100,
+        batch_started_at_ms=now_ms - 200,
+        producer_generation_id="boot:42",
+        configured_venues=venues,
+        degraded_venues=[],
+        degraded_symbols={},
+        sampling_symbols=symbols,
+        quotes=quotes,
+    )
+    config = SimpleNamespace(
+        venues=[SimpleNamespace(venue=venue) for venue in venues],
+        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=now_ms,
+    )
+
+    assert not report.ok
+    assert "spread_bbo_sampling_pair_budget_exceeded" in report.fingerprints
+    assert report.details["observed_pair_count"] == 30
+    assert report.details["evaluated_pair_bound"] == 630
 
 
 def test_current_state_flags_stale_fail_closed_clean_state():

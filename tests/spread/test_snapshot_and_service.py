@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -608,6 +609,7 @@ async def test_spread_v4_hot_quotes_overlay_exact_full_metadata(tmp_path) -> Non
             degraded_venues=[],
             degraded_symbols={},
             quotes=hot_quotes,
+            sampling_symbols=["BTCUSDT"],
         ),
         spread_quote_snapshot_path(sidecar_path),
     )
@@ -625,6 +627,81 @@ async def test_spread_v4_hot_quotes_overlay_exact_full_metadata(tmp_path) -> Non
     assert quotes["cheap:BTCUSDT"].underlying == "BTC"
     assert quotes["cheap:BTCUSDT"].contract_normalization_complete is True
     assert quotes["cheap:BTCUSDT"].bid_depth == ()
+
+
+@pytest.mark.asyncio
+async def test_spread_v4_consumer_uses_the_bounded_liquidity_universe(tmp_path) -> None:
+    from lightfee.spread.quote_snapshot import (
+        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_metadata_snapshot_path,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            sidecar_snapshot_max_age_ms=1_000,
+            live_scan_last_good_max_age_ms=60_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    config.runtime.daily_universe.enabled = True
+    config.runtime.daily_universe.path = str(tmp_path / "missing-daily.json")
+    config.runtime.daily_universe.max_symbols = 1
+    metadata = _sidecar_snapshot(observed_at_ms=10_000)
+    _make_spread_metadata_eligible(metadata)
+    for quote in metadata.quotes.values():
+        quote.volume_24h_quote = 1_000.0
+    eth_quotes = {
+        key.replace("BTCUSDT", "ETHUSDT"): replace(
+            quote,
+            symbol="ETHUSDT",
+            underlying="ETH",
+            volume_24h_quote=2_000.0,
+        )
+        for key, quote in metadata.quotes.items()
+    }
+    metadata.quotes.update(eth_quotes)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={"cheap": ["BTCUSDT", "ETHUSDT"]},
+            quotes=metadata.quotes,
+        ),
+        spread_metadata_snapshot_path(sidecar_path),
+    )
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={"cheap": ["ETHUSDT"]},
+            quotes=eth_quotes,
+            sampling_symbols=["ETHUSDT"],
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+
+    quotes, _, _, input_count, _, degraded_symbols, _ = await service._fetch_quotes(10_000)
+
+    assert service._spread_sampling_symbols == ("ETHUSDT",)
+    assert input_count == 2
+    assert {quote.symbol for quote in quotes.values()} == {"ETHUSDT"}
+    assert degraded_symbols == {"cheap": ["ETHUSDT"]}
 
 
 @pytest.mark.asyncio
@@ -655,6 +732,7 @@ async def test_spread_v4_missing_metadata_fails_closed_per_symbol(tmp_path) -> N
             degraded_venues=[],
             degraded_symbols={},
             quotes=hot.quotes,
+            sampling_symbols=["BTCUSDT"],
         ),
         spread_quote_snapshot_path(sidecar_path),
     )
@@ -706,6 +784,7 @@ async def test_spread_v4_overlay_and_freshness_share_one_decision_clock(
             degraded_venues=[],
             degraded_symbols={},
             quotes=hot.quotes,
+            sampling_symbols=["BTCUSDT"],
         ),
         spread_quote_snapshot_path(sidecar_path),
     )
@@ -729,6 +808,155 @@ async def test_spread_v4_overlay_and_freshness_share_one_decision_clock(
 
     assert observed_clocks == [result[-1]]
     assert wall_clock_calls["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_spread_consumer_adopts_only_a_new_producer_generation_universe(
+    tmp_path,
+) -> None:
+    from lightfee.spread.quote_snapshot import (
+        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_metadata_snapshot_path,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    config.runtime.daily_universe.enabled = True
+    config.runtime.daily_universe.path = str(tmp_path / "missing-daily.json")
+    hot = _sidecar_snapshot(observed_at_ms=10_000)
+    _make_spread_metadata_eligible(hot)
+    eth_quotes = {
+        key.replace("BTCUSDT", "ETHUSDT"): replace(
+            quote,
+            symbol="ETHUSDT",
+            underlying="ETH",
+        )
+        for key, quote in hot.quotes.items()
+    }
+    path = spread_quote_snapshot_path(sidecar_path)
+
+    def publish(symbol: str, generation: str, *, published_at_ms: int = 10_000) -> None:
+        quotes = hot.quotes if symbol == "BTCUSDT" else eth_quotes
+        publish_spread_quote_snapshot(
+            SpreadQuoteSnapshot(
+                schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+                published_at_ms=published_at_ms,
+                market_observed_at_ms=10_000,
+                batch_started_at_ms=9_900,
+                configured_venues=["cheap", "rich"],
+                degraded_venues=[],
+                degraded_symbols={},
+                quotes=quotes,
+                producer_generation_id=generation,
+            ),
+            spread_metadata_snapshot_path(sidecar_path),
+        )
+        publish_spread_quote_snapshot(
+            SpreadQuoteSnapshot(
+                published_at_ms=published_at_ms,
+                market_observed_at_ms=10_000,
+                batch_started_at_ms=9_900,
+                configured_venues=["cheap", "rich"],
+                degraded_venues=[],
+                degraded_symbols={},
+                quotes=quotes,
+                sampling_symbols=[symbol],
+                producer_generation_id=generation,
+            ),
+            path,
+        )
+
+    publish("BTCUSDT", "generation-a")
+    service = SpreadSidecarService(config)
+    await service._fetch_quotes(10_000)
+    assert service._spread_sampling_symbols == ("BTCUSDT",)
+    service.stats.update("BTCUSDT", "cheap", "rich", 1.0, observed_at_ms=9_999)
+
+    publish("ETHUSDT", "generation-b", published_at_ms=10_001)
+    _, _, source_mode, *_ = await service._fetch_quotes(10_000)
+    assert source_mode == "sidecar_snapshot_stale"
+    assert service._spread_sampling_symbols == ("BTCUSDT",)
+    assert service.stats.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000) is not None
+
+    publish("ETHUSDT", "generation-b")
+    await service._fetch_quotes(10_000)
+    assert service._spread_sampling_symbols == ("ETHUSDT",)
+    assert service.stats.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000) is None
+
+    publish("BTCUSDT", "generation-b")
+    quotes, _, source_mode, *_ = await service._fetch_quotes(10_000)
+    assert quotes == {}
+    assert source_mode == "sidecar_snapshot_unavailable"
+    assert service._spread_sampling_symbols == ("ETHUSDT",)
+
+
+@pytest.mark.asyncio
+async def test_spread_consumer_rejects_producer_universe_over_recovery_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from lightfee.spread.quote_snapshot import (
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_quote_snapshot_path,
+    )
+
+    symbols = [f"S{index}USDT" for index in range(19)]
+    venues = [f"v{index}" for index in range(7)]
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=symbols,
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue=venue) for venue in venues],
+    )
+    assert config.runtime.daily_universe.enabled is False
+    hot = _sidecar_snapshot(observed_at_ms=10_000)
+    quote = replace(
+        next(iter(hot.quotes.values())),
+        venue="v0",
+        symbol=symbols[0],
+    )
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=venues,
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes={f"v0:{symbols[0]}": quote},
+            sampling_symbols=symbols,
+            producer_generation_id="generation-over-budget",
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+    monkeypatch.setattr(
+        service._spread_metadata_cache,
+        "overlay_hot_quotes",
+        lambda *_args, **_kwargs: pytest.fail("over-budget snapshot reached metadata overlay"),
+    )
+
+    quotes, _, source_mode, *_ = await service._fetch_quotes(10_000)
+
+    assert quotes == {}
+    assert source_mode == "sidecar_snapshot_unavailable"
+    assert service._spread_sampling_symbols == ()
 
 
 @pytest.mark.asyncio

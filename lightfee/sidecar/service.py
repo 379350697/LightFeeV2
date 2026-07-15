@@ -27,10 +27,15 @@ from lightfee.sidecar.snapshot import (
 )
 from lightfee.spread.quote_snapshot import (
     FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     publish_spread_quote_snapshot,
     spread_metadata_snapshot_path,
     spread_quote_snapshot_path,
+)
+from lightfee.spread.universe import (
+    resolve_spread_sampling_symbols,
+    spread_sampling_selection_required,
 )
 from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
@@ -175,6 +180,7 @@ class SidecarService:
                 metadata_quotes=lambda: self._last_good_quotes,
                 metadata_quote_eligible=_quote_cache_contract_eligible,
                 snapshot_path=spread_quote_snapshot_path(self.snapshot_path),
+                snapshot_schema_version=SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
             )
             if self.embedded_spread_bbo_enabled
             else None
@@ -198,6 +204,28 @@ class SidecarService:
     async def run_spread_bbo_data_plane(self, stop_event: asyncio.Event) -> None:
         if self._spread_bbo_data_plane is None:
             raise RuntimeError("embedded spread BBO data plane is disabled")
+        if spread_sampling_selection_required(self.config):
+            while not stop_event.is_set():
+                sampling_symbols = resolve_spread_sampling_symbols(
+                    self.config,
+                    self._last_good_quotes,
+                    quote_eligible=_quote_cache_contract_eligible,
+                )
+                if sampling_symbols:
+                    self._spread_bbo_data_plane.set_sampling_symbols(sampling_symbols)
+                    logger.info(
+                        "embedded spread BBO sampling universe frozen: "
+                        "symbols=%d global_symbols=%d",
+                        len(sampling_symbols),
+                        len(self.config.symbols),
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+            if stop_event.is_set():
+                return
         thread_stop = threading.Event()
         runner = asyncio.create_task(
             asyncio.to_thread(
@@ -738,34 +766,37 @@ class SidecarService:
             fresh_cacheable_quote_keys,
             published_at_ms=published_ms,
         )
-        if not bool(getattr(self, "embedded_spread_bbo_enabled", True)):
-            try:
-                metadata_quotes = dict(self._last_good_quotes)
-                if metadata_quotes:
-                    publish_spread_quote_snapshot(
-                        SpreadQuoteSnapshot(
-                            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-                            published_at_ms=published_ms,
-                            market_observed_at_ms=_latest_valid_quote_observation_ms(
-                                metadata_quotes,
-                                decision_at_ms=published_ms,
-                                fallback_ms=refresh_started_at_ms,
-                            ),
-                            batch_started_at_ms=refresh_started_at_ms,
-                            configured_venues=sorted(self._configured_venue_names()),
-                            degraded_venues=sorted(degraded_venues),
-                            degraded_symbols={
-                                venue: list(symbols)
-                                for venue, symbols in degraded_symbols.items()
-                                if symbols
-                            },
-                            quotes=metadata_quotes,
+        # Both dedicated and embedded BBO modes publish hot-only v5 rows. The
+        # consumer therefore always needs the same full v3 metadata handoff;
+        # omitting it in embedded mode would turn every valid BBO into
+        # metadata_unavailable and create a permanent zero-sampling service.
+        try:
+            metadata_quotes = dict(self._last_good_quotes)
+            if metadata_quotes:
+                publish_spread_quote_snapshot(
+                    SpreadQuoteSnapshot(
+                        schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+                        published_at_ms=published_ms,
+                        market_observed_at_ms=_latest_valid_quote_observation_ms(
+                            metadata_quotes,
+                            decision_at_ms=published_ms,
+                            fallback_ms=refresh_started_at_ms,
                         ),
-                        spread_metadata_snapshot_path(self.snapshot_path),
-                        validate_contract=False,
-                    )
-            except (OSError, TypeError, ValueError):
-                logger.exception("spread metadata handoff publication failed")
+                        batch_started_at_ms=refresh_started_at_ms,
+                        configured_venues=sorted(self._configured_venue_names()),
+                        degraded_venues=sorted(degraded_venues),
+                        degraded_symbols={
+                            venue: list(symbols)
+                            for venue, symbols in degraded_symbols.items()
+                            if symbols
+                        },
+                        quotes=metadata_quotes,
+                    ),
+                    spread_metadata_snapshot_path(self.snapshot_path),
+                    validate_contract=False,
+                )
+        except (OSError, TypeError, ValueError):
+            logger.exception("spread metadata handoff publication failed")
 
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,

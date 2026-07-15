@@ -15,6 +15,7 @@ from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
 from lightfee.sidecar.spread_bbo_service import SpreadMetadataCache
 from lightfee.spread.quote_snapshot import (
     FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     load_spread_quote_snapshot,
     publish_spread_quote_snapshot,
@@ -104,6 +105,7 @@ async def test_external_bbo_metadata_cache_refreshes_and_retains_last_good(tmp_p
             degraded_venues=[],
             degraded_symbols={},
             quotes={"okx:BTCUSDT": stale_bbo_output},
+            sampling_symbols=["BTCUSDT"],
         ),
         spread_quote_snapshot_path(sidecar_path),
     )
@@ -158,7 +160,7 @@ def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):
 
     service = SpreadBboProcessService(config)
     assert service.metadata.max_age_ms == 600_000
-    assert service.data_plane.snapshot_schema_version == 4
+    assert service.data_plane.snapshot_schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
@@ -374,6 +376,63 @@ def test_partial_venue_refresh_replaces_old_symbol_rows(tmp_path):
     assert snapshot.degraded_symbols == {"binance": ["ETHUSDT"]}
 
 
+def test_bbo_sampling_universe_controls_fetch_and_missing_symbol_truth(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    metadata = {
+        "binance:BTCUSDT": _metadata_quote("binance"),
+        "binance:ETHUSDT": replace(_metadata_quote("binance"), symbol="ETHUSDT"),
+    }
+    plane = SpreadBboDataPlane(
+        config,
+        sources={"binance": object()},
+        metadata_quotes=lambda: metadata,
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+    plane.set_sampling_symbols(["BTCUSDT"])
+    now_ms = int(time.time() * 1000)
+
+    assert plane.sampling_symbols == ("BTCUSDT",)
+    assert plane._accept_venue_update(
+        "binance",
+        {
+            "binance:BTCUSDT": TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+            )
+        },
+    )
+    assert plane._degraded_symbols == {}
+
+    plane.active = True
+    with pytest.raises(RuntimeError, match="cannot change"):
+        plane.set_sampling_symbols(["ETHUSDT"])
+
+
+def test_bbo_rejects_universe_over_worst_case_recovery_budget(tmp_path):
+    venues = [f"v{index}" for index in range(7)]
+    symbols = [f"S{index}USDT" for index in range(19)]
+    config = AppConfig(
+        symbols=symbols,
+        venues=[VenueConfig(venue=venue) for venue in venues],
+    )
+    plane = SpreadBboDataPlane(
+        config,
+        sources={venue: object() for venue in venues},
+        metadata_quotes=dict,
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+
+    with pytest.raises(ValueError, match="exceeds worst-case pair budget"):
+        plane.set_sampling_symbols(symbols)
+
+
 def test_snapshot_batch_clock_uses_accepted_request_not_next_inflight_request(tmp_path):
     config = AppConfig(
         symbols=["BTCUSDT"],
@@ -422,6 +481,10 @@ async def test_sidecar_runs_bbo_on_an_independent_event_loop_thread():
             await stop_event.wait()
 
     service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
     service._spread_bbo_data_plane = FakePlane()
     service._spread_bbo_sources = {}
     stop_event = asyncio.Event()
@@ -433,6 +496,88 @@ async def test_sidecar_runs_bbo_on_an_independent_event_loop_thread():
     await task
 
     assert observed["thread_id"] != main_thread_id
+
+
+@pytest.mark.asyncio
+async def test_embedded_bbo_freezes_the_same_bounded_sampling_universe(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        venues=[VenueConfig(venue="binance"), VenueConfig(venue="okx")],
+    )
+    config.runtime.daily_universe.enabled = True
+    config.runtime.daily_universe.path = str(tmp_path / "missing-daily.json")
+    config.runtime.daily_universe.max_symbols = 1
+    selected: list[str] = []
+
+    class FakePlane:
+        def set_sampling_symbols(self, symbols):
+            selected.extend(symbols)
+
+        async def run(self, stop_event):
+            await stop_event.wait()
+
+    service = object.__new__(SidecarService)
+    service.config = config
+    service._spread_bbo_data_plane = FakePlane()
+    service._spread_bbo_sources = {}
+    service._last_good_quotes = {}
+    for symbol, volume in (("BTCUSDT", 1_000.0), ("ETHUSDT", 2_000.0)):
+        for venue in ("binance", "okx"):
+            quote = replace(_metadata_quote(venue), symbol=symbol)
+            quote.underlying = symbol.removesuffix("USDT")
+            quote.volume_24h_quote = volume
+            service._last_good_quotes[f"{venue}:{symbol}"] = quote
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(service.run_spread_bbo_data_plane(stop_event))
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while not selected and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    stop_event.set()
+    await task
+
+    assert selected == ["ETHUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_embedded_bbo_bounds_oversized_default_universe(tmp_path):
+    symbols = [f"S{index}USDT" for index in range(30)]
+    venues = [f"v{index}" for index in range(7)]
+    config = AppConfig(
+        symbols=symbols,
+        venues=[VenueConfig(venue=venue) for venue in venues],
+    )
+    selected: list[str] = []
+
+    class FakePlane:
+        def set_sampling_symbols(self, sampling_symbols):
+            selected.extend(sampling_symbols)
+
+        async def run(self, stop_event):
+            await stop_event.wait()
+
+    service = object.__new__(SidecarService)
+    service.config = config
+    service._spread_bbo_data_plane = FakePlane()
+    service._spread_bbo_sources = {}
+    service._last_good_quotes = {}
+    for symbol_index, symbol in enumerate(symbols):
+        for venue in venues[:2]:
+            quote = replace(_metadata_quote(venue), symbol=symbol)
+            quote.underlying = symbol.removesuffix("USDT")
+            quote.volume_24h_quote = 1_000_000.0 - symbol_index
+            service._last_good_quotes[f"{venue}:{symbol}"] = quote
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(service.run_spread_bbo_data_plane(stop_event))
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while not selected and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    stop_event.set()
+    await task
+
+    assert config.runtime.daily_universe.enabled is False
+    assert len(selected) == 18
 
 
 @pytest.mark.asyncio
@@ -448,6 +593,10 @@ async def test_sidecar_cancellation_waits_for_bbo_thread_shutdown():
                 thread_exited.set()
 
     service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
     service._spread_bbo_data_plane = FakePlane()
     service._spread_bbo_sources = {}
     task = asyncio.create_task(service.run_spread_bbo_data_plane(asyncio.Event()))

@@ -17,8 +17,13 @@ from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.persistence.journal import Journal
 from lightfee.spread.models import SpreadSnapshot
-from lightfee.spread.metadata_cache import SpreadMetadataSnapshotCache
+from lightfee.spread.metadata_cache import (
+    SpreadMetadataSnapshotCache,
+    quote_cache_contract_eligible,
+)
 from lightfee.spread.quote_snapshot import (
+    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+    HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS,
     SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     load_spread_quote_snapshot,
     spread_quote_snapshot_path,
@@ -37,6 +42,12 @@ from lightfee.spread.reversion import (
 from lightfee.spread.stats_checkpoint import (
     publish_spread_stats_checkpoint,
     restore_spread_stats_checkpoint,
+)
+from lightfee.spread.universe import (
+    SPREAD_SAMPLING_MAX_PAIR_COUNT,
+    resolve_spread_sampling_symbols,
+    spread_sampling_pair_bound,
+    spread_sampling_selection_required,
 )
 from lightfee.strategy.fee_evidence import (
     FeeEvidenceBook,
@@ -351,6 +362,19 @@ class SpreadSidecarService:
             self.sidecar_snapshot_path,
             max_age_ms=config.runtime.live_scan_last_good_max_age_ms,
         )
+        self._spread_sampling_selection_required = spread_sampling_selection_required(
+            config
+        )
+        self._spread_sampling_symbols = (
+            ()
+            if self._spread_sampling_selection_required
+            else resolve_spread_sampling_symbols(
+                config,
+                self._spread_metadata_cache.quotes,
+                quote_eligible=self._spread_metadata_cache.quote_eligible,
+            )
+        )
+        self._spread_sampling_producer_generation_id = ""
         source_mode = str(config.runtime.spread_sidecar_source_mode).lower()
         if source_mode != "sidecar_snapshot" or config.runtime.spread_sidecar_direct_fetch_enabled:
             raise ValueError(
@@ -487,7 +511,7 @@ class SpreadSidecarService:
         evaluation_diagnostics: dict[str, int] = {}
         candidates = self.signal_engine.build(
             quotes,
-            list(self.config.symbols),
+            list(self._spread_sampling_symbols or self.config.symbols),
             now_ms=decision_at_ms,
             rejection_counts=rejection_counts,
             diagnostics=evaluation_diagnostics,
@@ -539,12 +563,19 @@ class SpreadSidecarService:
     def _restore_stats_checkpoint_once(self, now_ms: int) -> None:
         if self._stats_checkpoint_loaded:
             return
+        if self._spread_sampling_selection_required and not self._spread_sampling_symbols:
+            return
         self._stats_checkpoint_loaded = True
         self._stats_checkpoint_restored = restore_spread_stats_checkpoint(
             self.stats,
             self.stats_checkpoint_path,
             model_epoch=self.signal_config.model_epoch,
             now_ms=now_ms,
+            allowed_symbols=(
+                set(self._spread_sampling_symbols)
+                if self._spread_sampling_selection_required
+                else None
+            ),
         )
         # Restoration establishes the durable baseline.  A new market sample
         # marks the tracker dirty through its monotonic revision; unchanged
@@ -704,7 +735,7 @@ class SpreadSidecarService:
         if (
             using_compact_snapshot
             and snapshot is not None
-            and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+            and snapshot.schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
         ):
             # Full metadata validation is a slow-lane operation. Keep it off
             # the event loop, then establish one immutable decision clock used
@@ -715,10 +746,107 @@ class SpreadSidecarService:
             if observed_ms is not None
             else int(time.time() * 1000)
         )
+        pending_sampling_symbols = self._spread_sampling_symbols
+        pending_producer_generation = self._spread_sampling_producer_generation_id
+        if snapshot is not None and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+            configured_symbols = {
+                str(symbol).strip().upper()
+                for symbol in self.config.symbols
+                if str(symbol).strip()
+            }
+            producer_symbols = tuple(snapshot.sampling_symbols)
+            producer_generation = str(snapshot.producer_generation_id or "")
+            producer_pair_bound = spread_sampling_pair_bound(
+                producer_symbols,
+                (venue.venue for venue in self.config.venues),
+            )
+            producer_universe_valid = bool(
+                producer_symbols
+                and set(producer_symbols) <= configured_symbols
+                and producer_generation
+                and producer_pair_bound <= SPREAD_SAMPLING_MAX_PAIR_COUNT
+            )
+            if not producer_universe_valid:
+                snapshot = None
+            elif self._spread_sampling_selection_required:
+                prior_generation = self._spread_sampling_producer_generation_id
+                if (
+                    pending_sampling_symbols
+                    and producer_symbols != pending_sampling_symbols
+                    and prior_generation == producer_generation
+                ):
+                    # One producer generation promises an immutable universe.
+                    # A contradictory snapshot is a corrupted process boundary.
+                    snapshot = None
+                else:
+                    pending_sampling_symbols = producer_symbols
+                    pending_producer_generation = producer_generation
+            elif producer_symbols != pending_sampling_symbols:
+                # When the configured universe already fits the hard budget,
+                # both processes must carry it exactly. A rolling/config
+                # mismatch is not safe evidence for partial sampling.
+                snapshot = None
+            else:
+                pending_producer_generation = producer_generation
+        if self._spread_sampling_selection_required and not pending_sampling_symbols:
+            if snapshot is None or snapshot.schema_version != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+                # Schema-v4/full-snapshot rolling compatibility has no
+                # producer-declared universe. Resolve locally and remain
+                # fail-closed if metadata is absent or stale.
+                if (
+                    snapshot is not None
+                    and snapshot.schema_version == FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+                ):
+                    metadata_quotes = snapshot.quotes
+
+                    def metadata_quote_eligible(quote: QuoteSnapshot) -> bool:
+                        observed_at_ms = int(quote.observed_at_ms or 0)
+                        return bool(
+                            quote_cache_contract_eligible(quote)
+                            and 0 < observed_at_ms <= decision_at_ms
+                            and decision_at_ms - observed_at_ms
+                            <= self.config.runtime.live_scan_last_good_max_age_ms
+                        )
+                else:
+                    metadata_quotes = self._spread_metadata_cache.quotes
+
+                    def metadata_quote_eligible(quote: QuoteSnapshot) -> bool:
+                        return self._spread_metadata_cache.quote_eligible(
+                            quote,
+                            now_ms=decision_at_ms,
+                        )
+                pending_sampling_symbols = resolve_spread_sampling_symbols(
+                    self.config,
+                    metadata_quotes,
+                    quote_eligible=metadata_quote_eligible,
+                )
+        if self._spread_sampling_selection_required:
+            allowed_symbols = set(pending_sampling_symbols)
+            if not allowed_symbols:
+                snapshot = None
+            elif snapshot is not None:
+                snapshot = replace(
+                    snapshot,
+                    quotes={
+                        key: quote
+                        for key, quote in snapshot.quotes.items()
+                        if str(quote.symbol or "").strip().upper() in allowed_symbols
+                    },
+                    degraded_symbols={
+                        venue: [
+                            symbol
+                            for symbol in symbols
+                            if str(symbol).strip().upper() in allowed_symbols
+                        ]
+                        for venue, symbols in snapshot.degraded_symbols.items()
+                        if isinstance(symbols, list)
+                    },
+                )
+            snapshot_input_quote_count = len(snapshot.quotes) if snapshot is not None else 0
         if (
             using_compact_snapshot
             and snapshot is not None
-            and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+            and snapshot.schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
         ):
             merged_quotes, metadata_unavailable = self._spread_metadata_cache.overlay_hot_quotes(
                 snapshot.quotes,
@@ -846,6 +974,13 @@ class SpreadSidecarService:
             (int(quote.observed_at_ms or 0) for quote in quotes.values()),
             default=0,
         )
+        if self._spread_sampling_selection_required:
+            if pending_sampling_symbols != self._spread_sampling_symbols:
+                self._spread_sampling_symbols = pending_sampling_symbols
+                self.stats.retain_symbols(set(pending_sampling_symbols))
+            self._spread_sampling_producer_generation_id = pending_producer_generation
+        elif pending_producer_generation:
+            self._spread_sampling_producer_generation_id = pending_producer_generation
         return (
             quotes,
             degraded_venues,

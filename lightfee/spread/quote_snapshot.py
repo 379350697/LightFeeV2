@@ -20,11 +20,19 @@ import orjson
 from lightfee.sidecar.snapshot import QuoteSnapshot, _quote_field_contract_errors
 
 
-SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION = 4
+SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION = 5
 FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION = 3
-LEGACY_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+LEGACY_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS = frozenset(
+    {4, SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION}
+)
 _OBJECT_ROW_SCHEMA_VERSIONS = frozenset({1})
-_POSITIONAL_ROW_SCHEMA_VERSIONS = frozenset({2, 3, SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION})
+_POSITIONAL_ROW_SCHEMA_VERSIONS = frozenset(
+    {2, 3, *HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS}
+)
+_GENERATION_ID_SCHEMA_VERSIONS = frozenset(
+    {FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION, *HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS}
+)
 _QUOTE_FIELD_NAMES = tuple(field.name for field in fields(QuoteSnapshot))
 _HOT_QUOTE_FIELD_NAMES = (
     "venue",
@@ -47,6 +55,7 @@ class SpreadQuoteSnapshot:
     degraded_venues: list[str]
     degraded_symbols: dict[str, list[str]]
     quotes: dict[str, QuoteSnapshot]
+    sampling_symbols: list[str] = field(default_factory=list)
     schema_version: int = SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
     source_mode: str = "sidecar_market_fast_path"
     producer_generation_id: str = field(default_factory=lambda: producer_generation_id())
@@ -187,6 +196,7 @@ def load_spread_quote_snapshot(path: str | Path) -> SpreadQuoteSnapshot | None:
                 venue: list(symbols) for venue, symbols in data["degraded_symbols"].items()
             },
             quotes=quotes,
+            sampling_symbols=list(data.get("sampling_symbols") or []),
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return None
@@ -219,11 +229,10 @@ def _validate_spread_quote_snapshot_contract_and_decode(
     schema_version = raw.get("schema_version")
     if schema_version in _POSITIONAL_ROW_SCHEMA_VERSIONS:
         required.add("quote_fields")
-    if schema_version in {
-        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-        SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    }:
+    if schema_version in _GENERATION_ID_SCHEMA_VERSIONS:
         required.add("producer_generation_id")
+    if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        required.add("sampling_symbols")
     errors = [f"missing:{name}" for name in sorted(required - raw.keys())]
     errors.extend(f"unknown:{name}" for name in sorted(raw.keys() - required))
     if schema_version not in (
@@ -232,20 +241,34 @@ def _validate_spread_quote_snapshot_contract_and_decode(
         errors.append("schema_version_unsupported")
     expected_quote_fields = (
         _HOT_QUOTE_FIELD_NAMES
-        if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+        if schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
         else _QUOTE_FIELD_NAMES
     )
     if schema_version in _POSITIONAL_ROW_SCHEMA_VERSIONS and raw.get("quote_fields") != list(
         expected_quote_fields
     ):
         errors.append("quote_fields_invalid")
-    if schema_version in {
-        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-        SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    }:
+    if schema_version in _GENERATION_ID_SCHEMA_VERSIONS:
         generation_id = raw.get("producer_generation_id")
         if not isinstance(generation_id, str) or not generation_id.strip():
             errors.append("producer_generation_id_invalid")
+    sampling_symbols = raw.get("sampling_symbols")
+    sampling_set: set[str] = set()
+    if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        if (
+            not isinstance(sampling_symbols, list)
+            or not sampling_symbols
+            or any(
+                not isinstance(symbol, str)
+                or not symbol
+                or symbol != symbol.strip().upper()
+                for symbol in sampling_symbols
+            )
+            or len(set(sampling_symbols)) != len(sampling_symbols)
+        ):
+            errors.append("sampling_symbols_invalid")
+        else:
+            sampling_set = set(sampling_symbols)
 
     timestamps = {
         name: raw.get(name)
@@ -304,6 +327,8 @@ def _validate_spread_quote_snapshot_contract_and_decode(
                 or len(set(symbols)) != len(symbols)
             ):
                 errors.append(f"degraded_symbols_invalid:{venue}")
+            elif sampling_set and any(symbol not in sampling_set for symbol in symbols):
+                errors.append(f"degraded_symbol_not_sampled:{venue}")
 
     quotes = raw.get("quotes")
     if not isinstance(quotes, dict) or not quotes:
@@ -319,7 +344,7 @@ def _validate_spread_quote_snapshot_contract_and_decode(
         if not isinstance(key, str):
             errors.append(f"quote_invalid:{key}")
             continue
-        if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        if schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS:
             errors.extend(_hot_quote_contract_errors(quote, key=key))
         else:
             errors.extend(_quote_field_contract_errors(quote, key=key))
@@ -333,6 +358,8 @@ def _validate_spread_quote_snapshot_contract_and_decode(
         )
         if not identity_valid:
             errors.append(f"quote_identity_invalid:{key}")
+        elif sampling_set and symbol not in sampling_set:
+            errors.append(f"quote_symbol_not_sampled:{key}")
         bid = quote.get("bid")
         ask = quote.get("ask")
         if not (
@@ -396,6 +423,21 @@ def _hot_path_snapshot_errors(snapshot: SpreadQuoteSnapshot) -> list[str]:
         errors.append("configured_venues_invalid")
     if any(venue not in configured for venue in snapshot.degraded_venues):
         errors.append("degraded_venues_invalid")
+    sampling_set = set(snapshot.sampling_symbols)
+    if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION and (
+        not sampling_set
+        or len(sampling_set) != len(snapshot.sampling_symbols)
+        or any(
+            symbol != str(symbol).strip().upper() or not symbol
+            for symbol in snapshot.sampling_symbols
+        )
+    ):
+        errors.append("sampling_symbols_invalid")
+    for venue, symbols in snapshot.degraded_symbols.items():
+        if venue not in configured or not symbols:
+            errors.append(f"degraded_symbols_invalid:{venue}")
+        elif sampling_set and any(symbol not in sampling_set for symbol in symbols):
+            errors.append(f"degraded_symbol_not_sampled:{venue}")
 
     observed: list[int] = []
     for key, quote in snapshot.quotes.items():
@@ -410,6 +452,8 @@ def _hot_path_snapshot_errors(snapshot: SpreadQuoteSnapshot) -> list[str]:
         )
         if key != f"{venue}:{symbol}" or venue not in configured:
             errors.append(f"quote_identity_invalid:{key}")
+        if sampling_set and symbol not in sampling_set:
+            errors.append(f"quote_symbol_not_sampled:{key}")
         if (
             venue != venue.strip().lower()
             or symbol != symbol.strip().upper()
@@ -444,7 +488,7 @@ def _snapshot_to_dict(snapshot: SpreadQuoteSnapshot) -> dict[str, object]:
         payload: dict[str, object] = {}
         emitted_field_names = (
             _HOT_QUOTE_FIELD_NAMES
-            if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+            if snapshot.schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
             else _QUOTE_FIELD_NAMES
         )
         for quote_field in quote_fields:
@@ -477,14 +521,13 @@ def _snapshot_to_dict(snapshot: SpreadQuoteSnapshot) -> dict[str, object]:
         # only volatile BBO evidence and is joined to the v3 metadata handoff.
         result["quote_fields"] = list(
             _HOT_QUOTE_FIELD_NAMES
-            if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+            if snapshot.schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
             else _QUOTE_FIELD_NAMES
         )
-    if snapshot.schema_version in {
-        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-        SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    }:
+    if snapshot.schema_version in _GENERATION_ID_SCHEMA_VERSIONS:
         result["producer_generation_id"] = snapshot.producer_generation_id
+    if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        result["sampling_symbols"] = list(snapshot.sampling_symbols)
     return result
 
 
@@ -502,7 +545,7 @@ def _quote_payloads(raw: dict[str, object]) -> dict[str, dict[str, object]] | No
         return None
     expected_quote_fields = (
         _HOT_QUOTE_FIELD_NAMES
-        if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+        if schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
         else _QUOTE_FIELD_NAMES
     )
     quote_fields = raw.get("quote_fields")

@@ -15,6 +15,7 @@ from lightfee.spread.quote_snapshot import (
     SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     spread_quote_snapshot_path,
 )
+from lightfee.spread.universe import resolve_spread_sampling_symbols
 from lightfee.venues.specs import get_spec
 from lightfee.venues.transport import EndpointRateLimiter
 
@@ -47,6 +48,9 @@ class SpreadMetadataCache:
 
     def quote_eligible(self, quote) -> bool:
         return self._cache.quote_eligible(quote)
+
+    async def refresh_once(self) -> bool:
+        return await asyncio.to_thread(self._cache.refresh)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -91,6 +95,27 @@ class SpreadBboProcessService:
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await self.metadata.refresh_once()
+            sampling_symbols = resolve_spread_sampling_symbols(
+                self.config,
+                self.metadata.quotes,
+                quote_eligible=self.metadata.quote_eligible,
+            )
+            if sampling_symbols:
+                self.data_plane.set_sampling_symbols(sampling_symbols)
+                logger.info(
+                    "spread BBO sampling universe frozen: symbols=%d global_symbols=%d",
+                    len(sampling_symbols),
+                    len(self.config.symbols),
+                )
+                break
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+        if stop_event.is_set():
+            return
         metadata_task = asyncio.create_task(self.metadata.run(stop_event))
         data_plane_task = asyncio.create_task(self.data_plane.run(stop_event))
         try:

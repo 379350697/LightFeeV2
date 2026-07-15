@@ -218,6 +218,24 @@ class SpreadStatsTracker:
         """Monotonic generation for economically relevant state changes."""
         return self._revision
 
+    def retain_symbols(self, symbols: set[str]) -> int:
+        """Drop state that cannot be sampled by the active producer universe."""
+
+        allowed = {
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip()
+        }
+        removed = 0
+        for key in tuple(self._states):
+            if key[0] in allowed:
+                continue
+            self._states.pop(key, None)
+            removed += 1
+        if removed:
+            self._revision += 1
+        return removed
+
     def configure(self, config: SpreadReversionConfig) -> None:
         self.window_ms = max(int(config.stats_window_ms or 0), 1)
         self.max_samples = max(int(config.stats_max_samples or 0), 1)

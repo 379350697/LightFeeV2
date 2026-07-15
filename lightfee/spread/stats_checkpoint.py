@@ -23,6 +23,7 @@ def restore_spread_stats_checkpoint(
     *,
     model_epoch: str,
     now_ms: int,
+    allowed_symbols: set[str] | None = None,
 ) -> bool:
     """Restore only a matching, bounded checkpoint; otherwise cold-start.
 
@@ -45,6 +46,17 @@ def restore_spread_stats_checkpoint(
     states = raw.get("states")
     if not isinstance(states, dict):
         return False
+    if allowed_symbols is not None:
+        allowed = {
+            str(symbol).strip().upper()
+            for symbol in allowed_symbols
+            if str(symbol).strip()
+        }
+        states = {
+            packed_key: state
+            for packed_key, state in states.items()
+            if str(packed_key).partition("|")[0].upper() in allowed
+        }
     try:
         restored_at_ms = max(int(now_ms or 0), 0)
         saved_at_ms = int(raw.get("saved_at_ms", 0) or 0)

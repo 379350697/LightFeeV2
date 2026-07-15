@@ -32,9 +32,14 @@ from lightfee.ops.production_health import (
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 from lightfee.spread.quote_snapshot import (
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     load_spread_quote_snapshot,
     producer_generation_id,
     spread_quote_snapshot_path,
+)
+from lightfee.spread.universe import (
+    SPREAD_SAMPLING_MAX_PAIR_COUNT,
+    spread_sampling_pair_bound,
 )
 from scripts.diagnose_live import _build_stale_risk_state_alignment_summary
 
@@ -165,7 +170,22 @@ def _spread_bbo_runtime_report(
             if str(venue.venue or "").strip()
         }
         observed_venues = {quote.venue for quote in snapshot.quotes.values()}
+        venues_by_symbol: dict[str, set[str]] = {}
+        for quote in snapshot.quotes.values():
+            symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
+            venue = str(getattr(quote, "venue", "") or "").strip().lower()
+            if symbol and venue:
+                venues_by_symbol.setdefault(symbol, set()).add(venue)
+        observed_pair_count = sum(
+            len(venues) * (len(venues) - 1) // 2
+            for venues in venues_by_symbol.values()
+        )
+        sampling_symbols = list(getattr(snapshot, "sampling_symbols", []) or [])
         configured_venues = set(snapshot.configured_venues)
+        evaluated_pair_bound = spread_sampling_pair_bound(
+            sampling_symbols,
+            configured_venues,
+        )
         degraded_venues = sorted(
             {
                 str(venue).strip().lower()
@@ -207,8 +227,19 @@ def _spread_bbo_runtime_report(
                 "signal_ttl_ms": ttl_ms,
                 "checked_at_ms": checked_at_ms,
                 "producer_generation_id": snapshot.producer_generation_id,
+                "schema_version": getattr(snapshot, "schema_version", 0),
+                "sampling_symbol_count": len(sampling_symbols),
+                "observed_pair_count": observed_pair_count,
+                "evaluated_pair_bound": evaluated_pair_bound,
+                "evaluated_pair_limit": SPREAD_SAMPLING_MAX_PAIR_COUNT,
             }
         )
+        if getattr(snapshot, "schema_version", 0) != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+            fingerprints.append("spread_bbo_sampling_contract_unavailable")
+        if not sampling_symbols:
+            fingerprints.append("spread_bbo_sampling_universe_empty")
+        if evaluated_pair_bound > SPREAD_SAMPLING_MAX_PAIR_COUNT:
+            fingerprints.append("spread_bbo_sampling_pair_budget_exceeded")
         if configured_venues != expected_venues:
             fingerprints.append("spread_bbo_configured_venue_mismatch")
         if observed_venues != expected_venues:

@@ -47,6 +47,30 @@ def test_stats_checkpoint_restores_only_the_matching_epoch(tmp_path) -> None:
     assert wrong_epoch.snapshot("BTCUSDT", "alpha", "beta", now_ms=3_000) is None
 
 
+def test_stats_checkpoint_restores_only_the_frozen_sampling_universe(tmp_path) -> None:
+    path = tmp_path / "spread-stats.json"
+    original = SpreadStatsTracker(window_ms=60_000, max_samples=10)
+    original.update("BTCUSDT", "alpha", "beta", 1.0, observed_at_ms=1_000)
+    original.update("ETHUSDT", "alpha", "beta", 2.0, observed_at_ms=1_000)
+    publish_spread_stats_checkpoint(
+        original,
+        path,
+        model_epoch="v2_signed_reversion",
+        now_ms=1_000,
+    )
+
+    restored = SpreadStatsTracker(window_ms=60_000, max_samples=10)
+    assert restore_spread_stats_checkpoint(
+        restored,
+        path,
+        model_epoch="v2_signed_reversion",
+        now_ms=1_000,
+        allowed_symbols={"BTCUSDT"},
+    )
+    assert restored.snapshot("BTCUSDT", "alpha", "beta", now_ms=1_000) is not None
+    assert restored.snapshot("ETHUSDT", "alpha", "beta", now_ms=1_000) is None
+
+
 def test_stats_checkpoint_corruption_cold_starts(tmp_path) -> None:
     path = tmp_path / "spread-stats.json"
     path.write_text("not-json", encoding="utf-8")

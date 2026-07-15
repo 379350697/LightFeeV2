@@ -15,11 +15,16 @@ from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.quote_snapshot import (
     FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     publish_spread_quote_snapshot,
 )
 from lightfee.spread.metadata_cache import (
     quote_cache_contract_eligible as _quote_cache_contract_eligible,
+)
+from lightfee.spread.universe import (
+    SPREAD_SAMPLING_MAX_PAIR_COUNT,
+    spread_sampling_pair_bound,
 )
 
 logger = logging.getLogger("lightfee.sidecar.spread_bbo")
@@ -59,10 +64,49 @@ class SpreadBboDataPlane:
         self._degraded_venues = set(sources)
         self._degraded_symbols: dict[str, set[str]] = {}
         self._last_error_by_venue: dict[str, str] = {}
+        self._sampling_symbols = tuple(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in config.symbols
+                if str(symbol).strip()
+            )
+        )
+
+    @property
+    def sampling_symbols(self) -> tuple[str, ...]:
+        return self._sampling_symbols
+
+    def set_sampling_symbols(self, symbols: list[str] | tuple[str, ...]) -> None:
+        """Freeze the spread-only universe before transport workers start."""
+
+        if self.active:
+            raise RuntimeError("spread BBO sampling universe cannot change while running")
+        normalized = tuple(
+            dict.fromkeys(
+                str(symbol).strip().upper()
+                for symbol in symbols
+                if str(symbol).strip()
+            )
+        )
+        if not normalized:
+            raise ValueError("spread BBO sampling universe must not be empty")
+        self._require_sampling_budget(normalized)
+        self._sampling_symbols = normalized
+
+    def _require_sampling_budget(self, symbols: tuple[str, ...]) -> None:
+        if not symbols:
+            raise ValueError("spread BBO sampling universe must not be empty")
+        pair_bound = spread_sampling_pair_bound(symbols, self.sources)
+        if pair_bound > SPREAD_SAMPLING_MAX_PAIR_COUNT:
+            raise ValueError(
+                "spread BBO sampling universe exceeds worst-case pair budget: "
+                f"{pair_bound}>{SPREAD_SAMPLING_MAX_PAIR_COUNT}"
+            )
 
     async def run(self, stop_event: asyncio.Event) -> None:
         if self.active:
             raise RuntimeError("spread BBO data plane already running")
+        self._require_sampling_budget(self._sampling_symbols)
         self.active = True
         update_event = asyncio.Event()
         workers = [
@@ -96,13 +140,7 @@ class SpreadBboDataPlane:
         update_event: asyncio.Event,
     ) -> None:
         source = self.sources[venue]
-        symbols = list(
-            dict.fromkeys(
-                str(symbol).strip().upper()
-                for symbol in self.config.symbols
-                if str(symbol).strip()
-            )
-        )
+        symbols = list(self._sampling_symbols)
         interval_s = max(
             int(self.config.runtime.spread_sidecar_refresh_ms or 0) / 1000.0,
             0.05,
@@ -226,7 +264,7 @@ class SpreadBboDataPlane:
         before_symbols = self._degraded_symbols.get(venue_name)
         requested = {
             str(symbol).strip().upper()
-            for symbol in self.config.symbols
+            for symbol in self._sampling_symbols
             if str(symbol).strip()
         }
         metadata = self.metadata_quotes()
@@ -273,6 +311,7 @@ class SpreadBboDataPlane:
             str(quote.symbol).strip().upper()
             for quote in metadata.values()
             if str(quote.venue).strip().lower() == venue_name
+            and str(quote.symbol).strip().upper() in requested
             and self.metadata_quote_eligible(quote)
         }
         missing = expected_symbols - returned_symbols
@@ -355,4 +394,9 @@ class SpreadBboDataPlane:
                 if symbols
             },
             quotes=quotes,
+            sampling_symbols=(
+                list(self._sampling_symbols)
+                if self.snapshot_schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+                else []
+            ),
         )

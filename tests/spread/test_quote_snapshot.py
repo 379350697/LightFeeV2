@@ -45,10 +45,11 @@ def _snapshot(
         degraded_venues=[],
         degraded_symbols={},
         quotes={"binance:BTCUSDT": _quote(observed_at_ms=observed_at_ms)},
+        sampling_symbols=["BTCUSDT"],
     )
 
 
-def test_spread_quote_snapshot_v4_round_trip_contains_only_hot_bbo_fields(tmp_path) -> None:
+def test_spread_quote_snapshot_v5_round_trip_contains_only_hot_bbo_fields(tmp_path) -> None:
     path = tmp_path / "quotes.json"
 
     publish_spread_quote_snapshot(_snapshot(), path)
@@ -59,8 +60,9 @@ def test_spread_quote_snapshot_v4_round_trip_contains_only_hot_bbo_fields(tmp_pa
     assert loaded.quotes["binance:BTCUSDT"].bid == 100.0
     payload = json.loads(path.read_text())
     assert "candidates" not in payload
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert payload["producer_generation_id"]
+    assert payload["sampling_symbols"] == ["BTCUSDT"]
     assert isinstance(payload["quotes"]["binance:BTCUSDT"], list)
     assert payload["quote_fields"] == [
         "venue",
@@ -179,6 +181,28 @@ def test_spread_quote_snapshot_v4_rejects_unknown_row_field(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.pop("sampling_symbols"),
+        lambda payload: payload.update(sampling_symbols=[]),
+        lambda payload: payload.update(sampling_symbols=["btcusdt"]),
+        lambda payload: payload.update(sampling_symbols=["ETHUSDT"]),
+    ],
+)
+def test_spread_quote_snapshot_v5_rejects_invalid_sampling_contract(
+    tmp_path,
+    mutate,
+) -> None:
+    path = tmp_path / "quotes.json"
+    publish_spread_quote_snapshot(_snapshot(), path)
+    payload = json.loads(path.read_text())
+    mutate(payload)
+    path.write_text(json.dumps(payload))
+
+    assert load_spread_quote_snapshot(path) is None
+
+
+@pytest.mark.parametrize(
     "schema_version",
     [4, FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION],
 )
@@ -221,6 +245,7 @@ def test_spread_quote_snapshot_accepts_last_good_quote_predating_batch(tmp_path)
         degraded_venues=["binance"],
         degraded_symbols={},
         quotes={"binance:BTCUSDT": _quote(observed_at_ms=1_100)},
+        sampling_symbols=["BTCUSDT"],
     )
 
     publish_spread_quote_snapshot(snapshot, path)
