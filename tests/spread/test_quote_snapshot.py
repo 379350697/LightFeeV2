@@ -48,7 +48,11 @@ def test_spread_quote_snapshot_round_trip_is_compact_and_complete(tmp_path) -> N
     assert loaded is not None
     assert loaded.market_observed_at_ms == 1_100
     assert loaded.quotes["binance:BTCUSDT"].bid == 100.0
-    assert "candidates" not in json.loads(path.read_text())
+    payload = json.loads(path.read_text())
+    assert "candidates" not in payload
+    assert payload["schema_version"] == 2
+    assert isinstance(payload["quotes"]["binance:BTCUSDT"], list)
+    assert loaded.quotes["binance:BTCUSDT"] == _quote()
 
 
 def test_spread_quote_snapshot_rejects_future_quote_without_replacing_last_good(
@@ -73,7 +77,8 @@ def test_spread_quote_snapshot_rejects_unknown_or_mismatched_identity(tmp_path) 
     path = tmp_path / "quotes.json"
     publish_spread_quote_snapshot(_snapshot(), path)
     payload = json.loads(path.read_text())
-    payload["quotes"]["binance:BTCUSDT"]["venue"] = "bybit"
+    venue_index = payload["quote_fields"].index("venue")
+    payload["quotes"]["binance:BTCUSDT"][venue_index] = "bybit"
     path.write_text(json.dumps(payload))
 
     assert load_spread_quote_snapshot(path) is None
@@ -100,5 +105,28 @@ def test_spread_quote_snapshot_accepts_last_good_quote_predating_batch(tmp_path)
 
 def test_spread_quote_snapshot_path_is_a_sibling_contract() -> None:
     assert str(spread_quote_snapshot_path("runtime/opportunity-input-snapshot.json")) == (
-        "runtime/opportunity-input-snapshot.spread-quotes.v1.json"
+        "runtime/opportunity-input-snapshot.spread-quotes.v2.json"
     )
+
+
+def test_spread_quote_snapshot_v1_remains_readable(tmp_path) -> None:
+    path = tmp_path / "legacy-quotes.json"
+    quote = _quote()
+    payload = {
+        "schema_version": 1,
+        "published_at_ms": 1_200,
+        "market_observed_at_ms": 1_100,
+        "batch_started_at_ms": 1_000,
+        "source_mode": "sidecar_market_fast_path",
+        "configured_venues": ["binance"],
+        "degraded_venues": [],
+        "degraded_symbols": {},
+        "quotes": {"binance:BTCUSDT": quote.__dict__},
+    }
+    path.write_text(json.dumps(payload))
+
+    loaded = load_spread_quote_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.schema_version == 1
+    assert loaded.quotes["binance:BTCUSDT"] == quote

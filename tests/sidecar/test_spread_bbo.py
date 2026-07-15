@@ -143,7 +143,7 @@ def test_exchange_event_timestamp_cannot_masquerade_as_receipt_time(tmp_path):
         snapshot_path=tmp_path / "spread-quotes.json",
     )
 
-    plane._accept_venue_update(
+    changed = plane._accept_venue_update(
         "binance",
         {
             "binance:BTCUSDT": TopBookQuote(
@@ -158,5 +158,35 @@ def test_exchange_event_timestamp_cannot_masquerade_as_receipt_time(tmp_path):
         },
     )
 
+    assert changed is True
     assert plane._build_snapshot() is None
     assert plane._degraded_venues == {"binance"}
+
+
+def test_identical_venue_update_does_not_trigger_a_new_generation(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    plane = SpreadBboDataPlane(
+        config,
+        sources={"binance": object()},
+        metadata_quotes=lambda: {
+            "binance:BTCUSDT": _metadata_quote("binance"),
+        },
+        snapshot_path=tmp_path / "spread-quotes.json",
+    )
+    received_at_ms = int(time.time() * 1000)
+    update = {
+        "binance:BTCUSDT": TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=received_at_ms,
+            received_at_ms=received_at_ms,
+        )
+    }
+
+    assert plane._accept_venue_update("binance", update) is True
+    assert plane._accept_venue_update("binance", update) is False

@@ -47,6 +47,7 @@ class SpreadBboDataPlane:
         self._request_started_at_ms: dict[str, int] = {}
         self._degraded_venues = set(sources)
         self._degraded_symbols: dict[str, set[str]] = {}
+        self._last_error_by_venue: dict[str, str] = {}
 
     async def run(self, stop_event: asyncio.Event) -> None:
         if self.active:
@@ -95,9 +96,13 @@ class SpreadBboDataPlane:
             int(self.config.runtime.spread_sidecar_refresh_ms or 0) / 1000.0,
             0.05,
         )
+        # Transport latency and quote freshness are different clocks.  A slow
+        # response is timestamped only when received, so cancelling it at the
+        # quote TTL creates needless permanent degradation.  Per-venue workers
+        # remain isolated while this bounded transport timeout is in flight.
         timeout_s = max(
-            min(int(self.config.strategy.spread_signal_ttl_ms or 0) / 1000.0, 1.0),
-            0.1,
+            min(float(self.config.runtime.spread_sidecar_fetch_timeout_s or 0.0), 3.0),
+            0.25,
         )
         loop = asyncio.get_running_loop()
         while not stop_event.is_set():
@@ -108,19 +113,21 @@ class SpreadBboDataPlane:
                     source.fetch_spread_bbo(symbols),
                     timeout=timeout_s,
                 )
-                self._accept_venue_update(venue, raw)
+                changed = self._accept_venue_update(venue, raw)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                changed = venue not in self._degraded_venues
                 self._degraded_venues.add(venue)
-                logger.warning(
-                    "spread BBO venue refresh degraded",
-                    extra={
-                        "venue": venue,
-                        "error": f"{type(exc).__name__}: {exc}"[:240],
-                    },
-                )
-            finally:
+                error = f"{type(exc).__name__}: {exc}"[:240]
+                if self._last_error_by_venue.get(venue) != error:
+                    self._last_error_by_venue[venue] = error
+                    logger.warning(
+                        "spread BBO venue refresh degraded: venue=%s error=%s",
+                        venue,
+                        error,
+                    )
+            if changed:
                 update_event.set()
 
             remaining_s = interval_s - (loop.time() - cycle_started)
@@ -137,6 +144,13 @@ class SpreadBboDataPlane:
         stop_event: asyncio.Event,
         update_event: asyncio.Event,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        refresh_s = max(
+            int(self.config.runtime.spread_sidecar_refresh_ms or 0) / 1000.0,
+            0.05,
+        )
+        publish_interval_s = min(max(refresh_s, 0.1), 0.25)
+        next_publish_at = 0.0
         while not stop_event.is_set():
             update_task = asyncio.create_task(update_event.wait())
             stop_task = asyncio.create_task(stop_event.wait())
@@ -156,13 +170,23 @@ class SpreadBboDataPlane:
                 )
             if stop_task in done and stop_event.is_set():
                 break
+            # Clear before coalescing so an update arriving during the wait is
+            # retained for the next generation instead of being lost.
+            update_event.clear()
+            remaining_s = next_publish_at - loop.time()
+            if remaining_s > 0.0:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=remaining_s)
+                except asyncio.TimeoutError:
+                    pass
+            if stop_event.is_set():
+                break
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.025)
             except asyncio.TimeoutError:
                 pass
             if stop_event.is_set():
                 break
-            update_event.clear()
             snapshot = self._build_snapshot()
             if snapshot is None:
                 continue
@@ -172,6 +196,7 @@ class SpreadBboDataPlane:
                     snapshot,
                     self.snapshot_path,
                 )
+                next_publish_at = loop.time() + publish_interval_s
             except (OSError, TypeError, ValueError):
                 logger.exception("spread BBO snapshot publication failed")
 
@@ -179,8 +204,11 @@ class SpreadBboDataPlane:
         self,
         venue_name: str,
         raw_quotes: dict[str, TopBookQuote] | None,
-    ) -> None:
+    ) -> bool:
         venue_name = str(venue_name).strip().lower()
+        before_quotes = self._quotes_by_venue.get(venue_name)
+        before_degraded = venue_name in self._degraded_venues
+        before_symbols = self._degraded_symbols.get(venue_name)
         requested = {
             str(symbol).strip().upper()
             for symbol in self.config.symbols
@@ -240,8 +268,14 @@ class SpreadBboDataPlane:
         if accepted:
             self._quotes_by_venue[venue_name] = accepted
             self._degraded_venues.discard(venue_name)
+            self._last_error_by_venue.pop(venue_name, None)
         else:
             self._degraded_venues.add(venue_name)
+        return (
+            before_quotes != self._quotes_by_venue.get(venue_name)
+            or before_degraded != (venue_name in self._degraded_venues)
+            or before_symbols != self._degraded_symbols.get(venue_name)
+        )
 
     def _build_snapshot(self) -> SpreadQuoteSnapshot | None:
         quotes = {

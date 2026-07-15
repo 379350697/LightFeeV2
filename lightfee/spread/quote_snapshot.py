@@ -19,7 +19,9 @@ import tempfile
 from lightfee.sidecar.snapshot import QuoteSnapshot, _quote_field_contract_errors
 
 
-SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION = 1
+SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION = 2
+LEGACY_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1})
+_QUOTE_FIELD_NAMES = tuple(field.name for field in fields(QuoteSnapshot))
 
 
 @dataclass(frozen=True)
@@ -40,7 +42,7 @@ def spread_quote_snapshot_path(sidecar_snapshot_path: str | Path) -> Path:
     path = Path(sidecar_snapshot_path)
     suffix = path.suffix or ".json"
     stem = path.name[: -len(path.suffix)] if path.suffix else path.name
-    return path.with_name(f"{stem}.spread-quotes.v1{suffix}")
+    return path.with_name(f"{stem}.spread-quotes.v2{suffix}")
 
 
 def publish_spread_quote_snapshot(
@@ -62,7 +64,11 @@ def publish_spread_quote_snapshot(
         with open(tmp, "w") as handle:
             json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
             handle.flush()
-            os.fsync(handle.fileno())
+        # This is an ephemeral, fail-closed market-data view which is replaced
+        # several times per second.  Atomic rename protects readers from torn
+        # JSON; forcing every generation to stable storage only adds latency
+        # and write pressure.  A host crash may lose the latest generation,
+        # which is safe because the consumer rejects stale/missing snapshots.
         tmp.replace(target)
     except Exception:
         if tmp.exists():
@@ -82,6 +88,9 @@ def load_spread_quote_snapshot(path: str | Path) -> SpreadQuoteSnapshot | None:
     if validate_spread_quote_snapshot_contract(data):
         return None
     try:
+        quote_payloads = _quote_payloads(data)
+        if quote_payloads is None:
+            return None
         quotes = {
             key: QuoteSnapshot(
                 **{
@@ -90,7 +99,7 @@ def load_spread_quote_snapshot(path: str | Path) -> SpreadQuoteSnapshot | None:
                     "ask_depth": tuple(tuple(level) for level in raw.get("ask_depth", [])),
                 }
             )
-            for key, raw in data["quotes"].items()
+            for key, raw in quote_payloads.items()
         }
         return SpreadQuoteSnapshot(
             schema_version=data["schema_version"],
@@ -124,10 +133,20 @@ def validate_spread_quote_snapshot_contract(raw: object) -> list[str]:
         "degraded_symbols",
         "quotes",
     }
+    schema_version = raw.get("schema_version")
+    if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        required.add("quote_fields")
     errors = [f"missing:{name}" for name in sorted(required - raw.keys())]
     errors.extend(f"unknown:{name}" for name in sorted(raw.keys() - required))
-    if raw.get("schema_version") != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+    if schema_version not in (
+        LEGACY_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
+        | {SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION}
+    ):
         errors.append("schema_version_unsupported")
+    if schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION and raw.get(
+        "quote_fields"
+    ) != list(_QUOTE_FIELD_NAMES):
+        errors.append("quote_fields_invalid")
 
     timestamps = {
         name: raw.get(name)
@@ -192,10 +211,14 @@ def validate_spread_quote_snapshot_contract(raw: object) -> list[str]:
     if not isinstance(quotes, dict) or not quotes:
         errors.append("quotes_invalid")
         return errors
+    quote_payloads = _quote_payloads(raw)
+    if quote_payloads is None:
+        errors.append("quote_rows_invalid")
+        return errors
     observed: list[int] = []
     published_at_ms = timestamps.get("published_at_ms")
-    for key, quote in quotes.items():
-        if not isinstance(key, str) or not isinstance(quote, dict):
+    for key, quote in quote_payloads.items():
+        if not isinstance(key, str):
             errors.append(f"quote_invalid:{key}")
             continue
         errors.extend(_quote_field_contract_errors(quote, key=key))
@@ -225,7 +248,7 @@ def validate_spread_quote_snapshot_contract(raw: object) -> list[str]:
 
 def _snapshot_to_dict(snapshot: SpreadQuoteSnapshot) -> dict[str, object]:
     quote_fields = fields(QuoteSnapshot)
-    quotes: dict[str, dict[str, object]] = {}
+    quotes: dict[str, object] = {}
     for key, quote in snapshot.quotes.items():
         payload: dict[str, object] = {}
         for quote_field in quote_fields:
@@ -233,8 +256,11 @@ def _snapshot_to_dict(snapshot: SpreadQuoteSnapshot) -> dict[str, object]:
             if quote_field.name in {"bid_depth", "ask_depth"}:
                 value = [list(level) for level in value]
             payload[quote_field.name] = value
-        quotes[key] = payload
-    return {
+        if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+            quotes[key] = [payload[name] for name in _QUOTE_FIELD_NAMES]
+        else:
+            quotes[key] = payload
+    result: dict[str, object] = {
         "schema_version": snapshot.schema_version,
         "published_at_ms": snapshot.published_at_ms,
         "market_observed_at_ms": snapshot.market_observed_at_ms,
@@ -248,3 +274,34 @@ def _snapshot_to_dict(snapshot: SpreadQuoteSnapshot) -> dict[str, object]:
         },
         "quotes": quotes,
     }
+    if snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        # Field names are emitted once for the whole file instead of once per
+        # quote.  This preserves every QuoteSnapshot value while removing the
+        # dominant repeated-key overhead from thousands of symbols.
+        result["quote_fields"] = list(_QUOTE_FIELD_NAMES)
+    return result
+
+
+def _quote_payloads(raw: dict[str, object]) -> dict[str, dict[str, object]] | None:
+    """Decode v1 object rows or v2 positional rows without coercing values."""
+    quotes = raw.get("quotes")
+    if not isinstance(quotes, dict):
+        return None
+    schema_version = raw.get("schema_version")
+    if schema_version in LEGACY_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS:
+        if any(not isinstance(value, dict) for value in quotes.values()):
+            return None
+        return {str(key): dict(value) for key, value in quotes.items()}
+    if schema_version != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        return None
+    quote_fields = raw.get("quote_fields")
+    if quote_fields != list(_QUOTE_FIELD_NAMES):
+        return None
+    decoded: dict[str, dict[str, object]] = {}
+    for key, row in quotes.items():
+        if not isinstance(key, str) or not isinstance(row, list):
+            return None
+        if len(row) != len(_QUOTE_FIELD_NAMES):
+            return None
+        decoded[key] = dict(zip(_QUOTE_FIELD_NAMES, row, strict=True))
+    return decoded
