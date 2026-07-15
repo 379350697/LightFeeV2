@@ -1018,14 +1018,15 @@ def test_strategy_entry_policy_reports_disabled_live_entries_without_hiding_stat
     assert "funding_live_entry_disabled" in required.fingerprints
 
 
-def test_verifier_spread_ttl_uses_runtime_policy_unless_cli_overrides():
+def test_verifier_spread_ttl_uses_strictest_runtime_and_signal_policy():
     class Runtime:
         sidecar_snapshot_max_age_ms = 10_000
 
     class Config:
         runtime = Runtime()
+        strategy = SimpleNamespace(spread_signal_ttl_ms=1_000)
 
-    assert vps._resolve_spread_snapshot_max_age_ms(None, Config()) == 10_000
+    assert vps._resolve_spread_snapshot_max_age_ms(None, Config()) == 1_000
     assert vps._resolve_spread_snapshot_max_age_ms(3_000, Config()) == 3_000
     assert vps._resolve_spread_snapshot_max_age_ms(None, None) == 60_000
 

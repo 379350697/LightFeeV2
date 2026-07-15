@@ -438,6 +438,33 @@ async def test_spread_sidecar_future_main_snapshot_is_degraded_not_fresh(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_spread_sidecar_snapshot_uses_strictest_signal_ttl(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+            sidecar_snapshot_max_age_ms=30_000,
+        ),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_signal_ttl_ms=1_000,
+        ),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    publish_snapshot(_sidecar_snapshot(observed_at_ms=10_000), sidecar_path)
+    service = SpreadSidecarService(config)
+
+    snapshot = await service.refresh_once(now_ms=11_001)
+
+    assert snapshot.candidates == []
+    assert snapshot.source_mode == "sidecar_snapshot_stale"
+    assert snapshot.degraded_venues == ["cheap", "rich"]
+
+
+@pytest.mark.asyncio
 async def test_spread_production_decision_clock_is_after_snapshot_read(
     tmp_path,
     monkeypatch,
@@ -738,9 +765,12 @@ async def test_spread_sidecar_drops_individually_stale_quotes(tmp_path) -> None:
         runtime=RuntimeConfig(
             sidecar_snapshot_path=str(sidecar_path),
             spread_sidecar_snapshot_path=str(spread_path),
-            sidecar_snapshot_max_age_ms=1_000,
+            sidecar_snapshot_max_age_ms=30_000,
         ),
-        strategy=StrategyConfig(spread_reversion_enabled=True),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_signal_ttl_ms=1_000,
+        ),
         venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
     )
     snapshot = _sidecar_snapshot(observed_at_ms=10_000)
@@ -767,9 +797,12 @@ async def test_spread_sidecar_uses_per_quote_freshness_when_global_market_waterm
         runtime=RuntimeConfig(
             sidecar_snapshot_path=str(sidecar_path),
             spread_sidecar_snapshot_path=str(spread_path),
-            sidecar_snapshot_max_age_ms=1_000,
+            sidecar_snapshot_max_age_ms=30_000,
         ),
-        strategy=StrategyConfig(spread_reversion_enabled=True),
+        strategy=StrategyConfig(
+            spread_reversion_enabled=True,
+            spread_signal_ttl_ms=1_000,
+        ),
         venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
     )
     snapshot = _sidecar_snapshot(observed_at_ms=10_000)

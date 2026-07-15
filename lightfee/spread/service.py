@@ -758,7 +758,10 @@ class SpreadSidecarService:
                 decision_at_ms,
             )
 
-        max_age_ms = int(self.config.runtime.sidecar_snapshot_max_age_ms)
+        max_age_ms = min(
+            int(self.config.runtime.sidecar_snapshot_max_age_ms),
+            max(int(self.config.strategy.spread_signal_ttl_ms or 0), 1),
+        )
         published_at_ms = int(snapshot.published_at_ms or 0)
         if (
             published_at_ms <= 0

@@ -63,13 +63,19 @@ def _resolve_spread_snapshot_max_age_ms(
 ) -> int:
     if explicit_max_age_ms is not None:
         return max(int(explicit_max_age_ms), 0)
-    runtime = getattr(app_config, "runtime", None)
-    configured = getattr(runtime, "sidecar_snapshot_max_age_ms", None)
-    try:
-        if configured is not None and int(configured) > 0:
-            return int(configured)
-    except (TypeError, ValueError):
-        pass
+    candidates: list[int] = []
+    for owner, name in (
+        (getattr(app_config, "runtime", None), "sidecar_snapshot_max_age_ms"),
+        (getattr(app_config, "strategy", None), "spread_signal_ttl_ms"),
+    ):
+        configured = getattr(owner, name, None)
+        try:
+            if configured is not None and int(configured) > 0:
+                candidates.append(int(configured))
+        except (TypeError, ValueError):
+            continue
+    if candidates:
+        return min(candidates)
     return DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS
 
 
