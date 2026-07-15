@@ -137,14 +137,78 @@ async def test_external_bbo_metadata_cache_refreshes_and_retains_last_good(tmp_p
         await asyncio.sleep(0.01)
     assert cache.quotes["okx:BTCUSDT"].funding_rate_bps == 2.0
     assert cache.quote_eligible(cache.quotes["okx:BTCUSDT"]) is True
-    cache.quotes["okx:BTCUSDT"].observed_at_ms = now_ms - 60_001
-    assert cache.quote_eligible(cache.quotes["okx:BTCUSDT"]) is False
+    assert cache.quote_eligible(
+        cache.quotes["okx:BTCUSDT"],
+        now_ms=now_ms + 60_001,
+    ) is False
 
     spread_metadata_snapshot_path(sidecar_path).write_text("not-json")
     await asyncio.sleep(0.55)
     stop_event.set()
     await task
     assert cache.quotes["okx:BTCUSDT"].funding_rate_bps == 2.0
+
+
+def test_metadata_overlay_captures_one_atomic_generation(tmp_path, monkeypatch):
+    sidecar_path = tmp_path / "sidecar.json"
+    metadata_path = spread_metadata_snapshot_path(sidecar_path)
+    now_ms = int(time.time() * 1000)
+
+    def publish_generation(funding_rate_bps: float) -> None:
+        quotes = {
+            f"{venue}:BTCUSDT": replace(
+                _metadata_quote(venue),
+                funding_rate_bps=funding_rate_bps,
+                observed_at_ms=now_ms,
+            )
+            for venue in ("binance", "okx")
+        }
+        publish_spread_quote_snapshot(
+            SpreadQuoteSnapshot(
+                schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+                published_at_ms=now_ms,
+                market_observed_at_ms=now_ms,
+                batch_started_at_ms=now_ms,
+                configured_venues=["binance", "okx"],
+                degraded_venues=[],
+                degraded_symbols={},
+                quotes=quotes,
+            ),
+            metadata_path,
+        )
+
+    publish_generation(1.0)
+    cache = SpreadMetadataCache(sidecar_path, max_age_ms=60_000)._cache
+    hot_quotes = {
+        key: replace(quote, bid=100.0, ask=101.0, observed_at_ms=now_ms)
+        for key, quote in cache.quotes.items()
+    }
+    original_eligible = cache.quote_eligible
+    interleaved = False
+
+    def interleaving_eligible(quote, *, now_ms=None, generation=None):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            publish_generation(9.0)
+            assert cache.refresh() is True
+        return original_eligible(
+            quote,
+            now_ms=now_ms,
+            generation=generation,
+        )
+
+    monkeypatch.setattr(cache, "quote_eligible", interleaving_eligible)
+    merged, unavailable = cache.overlay_hot_quotes(hot_quotes, now_ms=now_ms)
+
+    assert unavailable == {}
+    assert {quote.funding_rate_bps for quote in merged.values()} == {1.0}
+    merged_next, unavailable_next = cache.overlay_hot_quotes(
+        hot_quotes,
+        now_ms=now_ms,
+    )
+    assert unavailable_next == {}
+    assert {quote.funding_rate_bps for quote in merged_next.values()} == {9.0}
 
 
 def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):

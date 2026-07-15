@@ -7,7 +7,7 @@ from dataclasses import replace
 from math import isfinite
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from lightfee.config.schema import AppConfig
@@ -20,6 +20,7 @@ from lightfee.spread.quote_snapshot import (
     publish_spread_quote_snapshot,
 )
 from lightfee.spread.metadata_cache import (
+    SpreadMetadataGeneration,
     quote_cache_contract_eligible as _quote_cache_contract_eligible,
 )
 from lightfee.spread.universe import (
@@ -42,8 +43,10 @@ class SpreadBboDataPlane:
         config: AppConfig,
         *,
         sources: dict[str, object],
-        metadata_quotes: Callable[[], dict[str, QuoteSnapshot]],
-        metadata_quote_eligible: Callable[[QuoteSnapshot], bool] | None = None,
+        metadata_quotes: Callable[
+            [], Mapping[str, QuoteSnapshot] | SpreadMetadataGeneration
+        ],
+        metadata_quote_eligible: Callable[..., bool] | None = None,
         snapshot_path: str | Path,
         snapshot_schema_version: int = FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     ) -> None:
@@ -267,7 +270,20 @@ class SpreadBboDataPlane:
             for symbol in self._sampling_symbols
             if str(symbol).strip()
         }
-        metadata = self.metadata_quotes()
+        metadata_state = self.metadata_quotes()
+        if isinstance(metadata_state, SpreadMetadataGeneration):
+            metadata = metadata_state.quotes
+
+            def metadata_eligible(quote: QuoteSnapshot) -> bool:
+                return self.metadata_quote_eligible(
+                    quote,
+                    generation=metadata_state,
+                )
+        else:
+            # Compatibility for embedded callers/tests that provide a stable
+            # plain mapping rather than the external cache generation object.
+            metadata = metadata_state
+            metadata_eligible = self.metadata_quote_eligible
         accepted: dict[str, QuoteSnapshot] = {}
         returned_symbols: set[str] = set()
         for raw_key, top in (raw_quotes or {}).items():
@@ -292,7 +308,7 @@ class SpreadBboDataPlane:
             if bid <= 0.0 or ask <= 0.0 or bid > ask or bid_size < 0.0 or ask_size < 0.0:
                 continue
             base = metadata.get(key)
-            if base is None or not self.metadata_quote_eligible(base):
+            if base is None or not metadata_eligible(base):
                 continue
             accepted[key] = replace(
                 base,
@@ -312,7 +328,7 @@ class SpreadBboDataPlane:
             for quote in metadata.values()
             if str(quote.venue).strip().lower() == venue_name
             and str(quote.symbol).strip().upper() in requested
-            and self.metadata_quote_eligible(quote)
+            and metadata_eligible(quote)
         }
         missing = expected_symbols - returned_symbols
         if missing:

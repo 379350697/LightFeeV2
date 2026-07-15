@@ -362,6 +362,7 @@ class SpreadSidecarService:
             self.sidecar_snapshot_path,
             max_age_ms=config.runtime.live_scan_last_good_max_age_ms,
         )
+        self._spread_metadata_refresh_task: asyncio.Task[bool] | None = None
         self._spread_sampling_selection_required = spread_sampling_selection_required(
             config
         )
@@ -481,6 +482,20 @@ class SpreadSidecarService:
                 self._paper_tracker.invalidate_replay()
 
     async def close(self) -> None:
+        metadata_refresh_task = getattr(self, "_spread_metadata_refresh_task", None)
+        close_cancelled = False
+        if metadata_refresh_task is not None:
+            try:
+                await metadata_refresh_task
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                close_cancelled = bool(
+                    current_task is not None and current_task.cancelling()
+                )
+            except Exception:
+                logger.exception("final spread metadata refresh failed")
+            finally:
+                self._spread_metadata_refresh_task = None
         if hasattr(self, "stats"):
             try:
                 self._checkpoint_stats_if_due(int(time.time() * 1000), force=True)
@@ -493,6 +508,8 @@ class SpreadSidecarService:
                 logger.exception("spread sidecar journal close failed; continuing resource cleanup")
             finally:
                 self._paper_journal = None
+        if close_cancelled:
+            raise asyncio.CancelledError
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
         requested_decision_at_ms = int(now_ms) if now_ms is not None else None
@@ -737,10 +754,14 @@ class SpreadSidecarService:
             and snapshot is not None
             and snapshot.schema_version in HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS
         ):
-            # Full metadata validation is a slow-lane operation. Keep it off
-            # the event loop, then establish one immutable decision clock used
-            # by metadata TTL, BBO freshness and all later signal checks.
-            await asyncio.to_thread(self._spread_metadata_cache.refresh)
+            # A full metadata generation contains the global funding universe
+            # and takes hundreds of milliseconds to validate on the production
+            # VM.  It is an independent slow lane: awaiting it here ages the
+            # already-received BBO before the decision clock is even captured.
+            # The cache constructor establishes the initial last-good value;
+            # later generations refresh in one non-overlapping background task
+            # and become visible atomically on a subsequent hot cycle.
+            self._schedule_spread_metadata_refresh()
         decision_at_ms = (
             int(observed_ms)
             if observed_ms is not None
@@ -808,12 +829,14 @@ class SpreadSidecarService:
                             <= self.config.runtime.live_scan_last_good_max_age_ms
                         )
                 else:
-                    metadata_quotes = self._spread_metadata_cache.quotes
+                    metadata_generation = self._spread_metadata_cache.generation
+                    metadata_quotes = metadata_generation.quotes
 
                     def metadata_quote_eligible(quote: QuoteSnapshot) -> bool:
                         return self._spread_metadata_cache.quote_eligible(
                             quote,
                             now_ms=decision_at_ms,
+                            generation=metadata_generation,
                         )
                 pending_sampling_symbols = resolve_spread_sampling_symbols(
                     self.config,
@@ -989,6 +1012,29 @@ class SpreadSidecarService:
             market_observed_at_ms,
             degraded_symbols,
             decision_at_ms,
+        )
+
+    def _schedule_spread_metadata_refresh(self) -> None:
+        """Refresh slow metadata without putting full validation on the BBO clock."""
+
+        task = self._spread_metadata_refresh_task
+        if task is not None:
+            if not task.done():
+                return
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                # Cancellation belongs to the retired metadata task, not the
+                # caller's quote-decision task.  Drop it and schedule a fresh
+                # attempt without poisoning the hot path.
+                pass
+            except Exception:
+                # Keep the already validated last-good generation. Eligibility
+                # still expires against its own evidence watermark.
+                logger.exception("spread metadata background refresh failed")
+            self._spread_metadata_refresh_task = None
+        self._spread_metadata_refresh_task = asyncio.create_task(
+            asyncio.to_thread(self._spread_metadata_cache.refresh)
         )
 
     def _load_fee_evidence(self, now_ms: int) -> FeeEvidenceBook:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import asyncio
 import json
+import threading
 
 import pytest
 
@@ -291,6 +293,26 @@ async def test_spread_sidecar_close_continues_after_cleanup_errors() -> None:
 
     service = object.__new__(SpreadSidecarService)
     service._paper_journal = FailingJournal()
+
+    await service.close()
+
+    assert closed == ["journal"]
+    assert service._paper_journal is None
+
+
+@pytest.mark.asyncio
+async def test_spread_sidecar_close_continues_after_refresh_task_cancelled() -> None:
+    closed: list[str] = []
+
+    class Journal:
+        def close(self):
+            closed.append("journal")
+
+    refresh_task = asyncio.create_task(asyncio.sleep(60))
+    refresh_task.cancel()
+    service = object.__new__(SpreadSidecarService)
+    service._spread_metadata_refresh_task = refresh_task
+    service._paper_journal = Journal()
 
     await service.close()
 
@@ -811,6 +833,102 @@ async def test_spread_v4_overlay_and_freshness_share_one_decision_clock(
 
 
 @pytest.mark.asyncio
+async def test_spread_metadata_validation_never_blocks_hot_quote_decision(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from lightfee.spread.quote_snapshot import (
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            sidecar_snapshot_max_age_ms=1_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    hot = _sidecar_snapshot(observed_at_ms=10_000)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=hot.quotes,
+            sampling_symbols=["BTCUSDT"],
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_refresh() -> bool:
+        started.set()
+        release.wait(timeout=2.0)
+        return False
+
+    monkeypatch.setattr(service._spread_metadata_cache, "refresh", blocking_refresh)
+    result = await asyncio.wait_for(service._fetch_quotes(10_000), timeout=0.25)
+
+    assert result[2] != "sidecar_snapshot_unavailable"
+    for _ in range(50):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+    assert service._spread_metadata_refresh_task is not None
+    assert not service._spread_metadata_refresh_task.done()
+
+    release.set()
+    await service._spread_metadata_refresh_task
+
+
+@pytest.mark.asyncio
+async def test_cancelled_metadata_refresh_never_cancels_hot_quote_decision(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(tmp_path / "sidecar-current.json"),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    service = SpreadSidecarService(config)
+    cancelled = asyncio.create_task(asyncio.sleep(60))
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    service._spread_metadata_refresh_task = cancelled
+    refreshed = asyncio.Event()
+
+    def refresh() -> bool:
+        refreshed.set()
+        return False
+
+    monkeypatch.setattr(service._spread_metadata_cache, "refresh", refresh)
+
+    service._schedule_spread_metadata_refresh()
+
+    assert service._spread_metadata_refresh_task is not cancelled
+    await service._spread_metadata_refresh_task
+    assert refreshed.is_set()
+
+
+@pytest.mark.asyncio
 async def test_spread_consumer_adopts_only_a_new_producer_generation_universe(
     tmp_path,
 ) -> None:
@@ -888,8 +1006,13 @@ async def test_spread_consumer_adopts_only_a_new_producer_generation_universe(
     assert source_mode == "sidecar_snapshot_stale"
     assert service._spread_sampling_symbols == ("BTCUSDT",)
     assert service.stats.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000) is not None
+    if service._spread_metadata_refresh_task is not None:
+        await service._spread_metadata_refresh_task
 
     publish("ETHUSDT", "generation-b")
+    await service._fetch_quotes(10_000)
+    if service._spread_metadata_refresh_task is not None:
+        await service._spread_metadata_refresh_task
     await service._fetch_quotes(10_000)
     assert service._spread_sampling_symbols == ("ETHUSDT",)
     assert service.stats.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000) is None

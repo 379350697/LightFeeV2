@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 import time
+from types import MappingProxyType
 
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.quote_snapshot import (
@@ -70,17 +72,40 @@ def quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
     return precision_valid and exact_contract_valid and min_notional_valid and schedule_valid
 
 
+@dataclass(frozen=True)
+class SpreadMetadataGeneration:
+    """One atomically published, read-only metadata generation."""
+
+    quotes: Mapping[str, QuoteSnapshot]
+    published_at_ms: int
+    accepted_mtime_ns: int
+
+
 class SpreadMetadataSnapshotCache:
     """Load each metadata generation once and retain only a valid last good."""
 
     def __init__(self, sidecar_snapshot_path: str | Path, *, max_age_ms: int) -> None:
         self.metadata_path = spread_metadata_snapshot_path(sidecar_snapshot_path)
-        self.quotes: dict[str, QuoteSnapshot] = {}
-        self.published_at_ms = 0
+        self._generation = SpreadMetadataGeneration(
+            quotes=MappingProxyType({}),
+            published_at_ms=0,
+            accepted_mtime_ns=0,
+        )
         self.max_age_ms = max(int(max_age_ms or 0), 1)
-        self._accepted_mtime_ns = 0
         self._attempted_mtime_ns = 0
         self.refresh()
+
+    @property
+    def generation(self) -> SpreadMetadataGeneration:
+        return self._generation
+
+    @property
+    def quotes(self) -> Mapping[str, QuoteSnapshot]:
+        return self._generation.quotes
+
+    @property
+    def published_at_ms(self) -> int:
+        return self._generation.published_at_ms
 
     def refresh(self) -> bool:
         """Accept a changed full snapshot or retain the prior generation."""
@@ -96,18 +121,30 @@ class SpreadMetadataSnapshotCache:
             or not snapshot.quotes
         ):
             return False
-        self.quotes = dict(snapshot.quotes)
-        self.published_at_ms = int(snapshot.published_at_ms or 0)
-        self._accepted_mtime_ns = mtime_ns
+        generation = SpreadMetadataGeneration(
+            quotes=MappingProxyType(dict(snapshot.quotes)),
+            published_at_ms=int(snapshot.published_at_ms or 0),
+            accepted_mtime_ns=mtime_ns,
+        )
+        # One reference assignment is the publication boundary. Readers either
+        # retain the complete old generation or capture the complete new one.
+        self._generation = generation
         return True
 
-    def quote_eligible(self, quote: QuoteSnapshot, *, now_ms: int | None = None) -> bool:
+    def quote_eligible(
+        self,
+        quote: QuoteSnapshot,
+        *,
+        now_ms: int | None = None,
+        generation: SpreadMetadataGeneration | None = None,
+    ) -> bool:
         checked_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        captured = generation or self._generation
         quote_observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
         return bool(
-            self.published_at_ms > 0
-            and self.published_at_ms <= checked_at_ms
-            and checked_at_ms - self.published_at_ms <= self.max_age_ms
+            captured.published_at_ms > 0
+            and captured.published_at_ms <= checked_at_ms
+            and checked_at_ms - captured.published_at_ms <= self.max_age_ms
             and quote_observed_at_ms > 0
             and quote_observed_at_ms <= checked_at_ms
             and checked_at_ms - quote_observed_at_ms <= self.max_age_ms
@@ -122,13 +159,18 @@ class SpreadMetadataSnapshotCache:
     ) -> tuple[dict[str, QuoteSnapshot], dict[str, set[str]]]:
         """Join volatile BBO evidence to eligible slow metadata by exact key."""
 
+        generation = self._generation
         merged: dict[str, QuoteSnapshot] = {}
         unavailable: dict[str, set[str]] = {}
         for key, hot in hot_quotes.items():
             venue = str(hot.venue or "").strip().lower()
             symbol = str(hot.symbol or "").strip().upper()
-            base = self.quotes.get(key)
-            if base is None or not self.quote_eligible(base, now_ms=now_ms):
+            base = generation.quotes.get(key)
+            if base is None or not self.quote_eligible(
+                base,
+                now_ms=now_ms,
+                generation=generation,
+            ):
                 if venue and symbol:
                     unavailable.setdefault(venue, set()).add(symbol)
                 continue

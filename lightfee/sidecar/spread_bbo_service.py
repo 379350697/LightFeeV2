@@ -43,11 +43,19 @@ class SpreadMetadataCache:
         return self._cache.quotes
 
     @property
+    def generation(self):
+        return self._cache.generation
+
+    @property
     def max_age_ms(self) -> int:
         return self._cache.max_age_ms
 
-    def quote_eligible(self, quote) -> bool:
-        return self._cache.quote_eligible(quote)
+    def quote_eligible(self, quote, *, now_ms=None, generation=None) -> bool:
+        return self._cache.quote_eligible(
+            quote,
+            now_ms=now_ms,
+            generation=generation,
+        )
 
     async def refresh_once(self) -> bool:
         return await asyncio.to_thread(self._cache.refresh)
@@ -88,7 +96,7 @@ class SpreadBboProcessService:
         self.data_plane = SpreadBboDataPlane(
             config,
             sources=self.sources,
-            metadata_quotes=lambda: self.metadata.quotes,
+            metadata_quotes=lambda: self.metadata.generation,
             metadata_quote_eligible=self.metadata.quote_eligible,
             snapshot_path=spread_quote_snapshot_path(config.runtime.sidecar_snapshot_path),
             snapshot_schema_version=SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
@@ -97,10 +105,14 @@ class SpreadBboProcessService:
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             await self.metadata.refresh_once()
+            metadata_generation = self.metadata.generation
             sampling_symbols = resolve_spread_sampling_symbols(
                 self.config,
-                self.metadata.quotes,
-                quote_eligible=self.metadata.quote_eligible,
+                metadata_generation.quotes,
+                quote_eligible=lambda quote: self.metadata.quote_eligible(
+                    quote,
+                    generation=metadata_generation,
+                ),
             )
             if sampling_symbols:
                 self.data_plane.set_sampling_symbols(sampling_symbols)
