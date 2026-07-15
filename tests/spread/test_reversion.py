@@ -124,6 +124,47 @@ def test_signed_basis_pair_identity_does_not_flip_at_zero_crossing() -> None:
     assert state.first_observed_ms == 1_000
 
 
+def test_stats_snapshot_is_computed_once_per_accepted_observation(monkeypatch) -> None:
+    import lightfee.spread.reversion as reversion
+
+    calls = 0
+    original = reversion._robust_location_scale
+
+    def counted(values):
+        nonlocal calls
+        calls += 1
+        return original(values)
+
+    monkeypatch.setattr(reversion, "_robust_location_scale", counted)
+    tracker = SpreadStatsTracker(window_ms=1_000)
+
+    first = tracker.update(
+        "BTCUSDT",
+        "cheap",
+        "rich",
+        1.0,
+        observed_at_ms=1_000,
+    )
+    assert calls == 1
+    assert tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=1_000) == first
+    assert calls == 1
+
+    second = tracker.update(
+        "BTCUSDT",
+        "cheap",
+        "rich",
+        2.0,
+        observed_at_ms=2_000,
+    )
+    assert calls == 2
+    assert tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=2_000) == second
+    assert calls == 2
+
+    expired = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=3_001)
+    assert expired is not None
+    assert expired.sample_count == 0
+
+
 def test_out_of_order_observation_cannot_contaminate_rolling_state_or_signal() -> None:
     tracker = SpreadStatsTracker()
     tracker.update("BTCUSDT", "cheap", "rich", -1.0, observed_at_ms=1_000)

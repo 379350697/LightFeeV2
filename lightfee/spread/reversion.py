@@ -189,6 +189,7 @@ class _RollingState:
     samples: Deque[_Sample] = field(default_factory=deque)
     cooldown_until_ms: int = 0
     break_consecutive: int = 0
+    cached_snapshot: SpreadStatsSnapshot | None = None
 
 
 class SpreadStatsTracker:
@@ -353,10 +354,23 @@ class SpreadStatsTracker:
                 exit_half,
             )
         )
+        state.cached_snapshot = None
         self._evict(state, observed_ms)
-        structural_break = self._detect_structural_break(state, observed_ms)
+        # Compute the post-observation statistics once.  They are the exact
+        # no-look-ahead window consumed on the next market observation and the
+        # same robust center/scale required by structural-break detection.
+        # Retaining this immutable snapshot avoids rebuilding median, MAD,
+        # percentile and AR(1) twice per pair per cycle.
+        post_update_snapshot = self._snapshot(state, now_ms=observed_ms)
+        structural_break = self._detect_structural_break(
+            state,
+            observed_ms,
+            center=post_update_snapshot.median_bps,
+            scale=post_update_snapshot.robust_scale_bps,
+        )
         if structural_break:
             state.samples.clear()
+            state.cached_snapshot = None
             state.cooldown_until_ms = observed_ms + self.structural_break_cooldown_ms
             state.break_consecutive = 0
         self._revision += 1
@@ -475,16 +489,26 @@ class SpreadStatsTracker:
 
     def _evict(self, state: _RollingState, now_ms: int) -> None:
         cutoff = max(int(now_ms or 0) - self.window_ms, 0)
+        evicted = False
         while state.samples and state.samples[0].observed_at_ms < cutoff:
             state.samples.popleft()
+            evicted = True
         while len(state.samples) > self.max_samples:
             state.samples.popleft()
+            evicted = True
+        if evicted:
+            state.cached_snapshot = None
 
-    def _detect_structural_break(self, state: _RollingState, now_ms: int) -> bool:
+    def _detect_structural_break(
+        self,
+        state: _RollingState,
+        now_ms: int,
+        *,
+        center: float,
+        scale: float,
+    ) -> bool:
         if len(state.samples) < 2 or self.structural_break_sigma <= 0.0:
             return False
-        values = [sample.value_bps for sample in state.samples]
-        center, scale = _robust_location_scale(values)
         short_values = [
             sample.value_bps
             for sample in state.samples
@@ -498,22 +522,27 @@ class SpreadStatsTracker:
     def _snapshot(
         self, state: _RollingState, *, now_ms: int, structural_break: bool = False
     ) -> SpreadStatsSnapshot:
+        if state.cached_snapshot is not None and not structural_break:
+            return state.cached_snapshot
         samples = list(state.samples)
         if not samples:
-            return SpreadStatsSnapshot(
+            snapshot = SpreadStatsSnapshot(
                 sample_count=0,
                 mean_bps=0.0,
                 std_bps=0.0,
                 cooldown_until_ms=state.cooldown_until_ms,
                 structural_break=structural_break,
             )
+            if not structural_break:
+                state.cached_snapshot = snapshot
+            return snapshot
         values = [sample.value_bps for sample in samples]
         median, robust_scale = _robust_location_scale(values)
         phi, half_life = _ar1_residual_quality(samples, median)
         exit_half_spreads = [
             sample.exit_half_spread_bps for sample in samples if sample.exit_half_spread_bps >= 0.0
         ]
-        return SpreadStatsSnapshot(
+        snapshot = SpreadStatsSnapshot(
             sample_count=len(values),
             mean_bps=median,
             std_bps=robust_scale,
@@ -527,6 +556,9 @@ class SpreadStatsTracker:
             cooldown_until_ms=state.cooldown_until_ms,
             structural_break=structural_break,
         )
+        if not structural_break:
+            state.cached_snapshot = snapshot
+        return snapshot
 
 
 @dataclass(frozen=True)
