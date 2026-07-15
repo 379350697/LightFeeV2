@@ -12,7 +12,7 @@ from lightfee.config.schema import (
     VenueConfig,
 )
 from lightfee.persistence.journal import Journal
-from lightfee.sidecar.publisher import publish_snapshot
+from lightfee.sidecar.publisher import load_snapshot as load_sidecar_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     FundingLifecycle,
     LiquidityLifecycle,
@@ -420,6 +420,49 @@ async def test_spread_sidecar_future_main_snapshot_is_degraded_not_fresh(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_spread_production_decision_clock_is_after_snapshot_read(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    sidecar_path = tmp_path / "sidecar-current.json"
+    spread_path = tmp_path / "spread-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(spread_path),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    publish_snapshot(_sidecar_snapshot(observed_at_ms=10_200), sidecar_path)
+    service = SpreadSidecarService(config)
+    real_load_snapshot = load_sidecar_snapshot
+    clock = {"read_complete": False, "post_read_calls": 0}
+
+    def delayed_load_snapshot(path):
+        loaded = real_load_snapshot(path)
+        clock["read_complete"] = True
+        return loaded
+
+    def fake_time() -> float:
+        if not clock["read_complete"]:
+            return 10.0
+        clock["post_read_calls"] += 1
+        return 10.2 + 0.1 * clock["post_read_calls"]
+
+    monkeypatch.setattr("lightfee.spread.service.load_snapshot", delayed_load_snapshot)
+    monkeypatch.setattr("lightfee.spread.service.time.time", fake_time)
+
+    snapshot = await service.refresh_once()
+
+    assert snapshot.source_mode != "sidecar_snapshot_stale"
+    assert snapshot.decision_at_ms >= 10_200
+    assert snapshot.published_at_ms >= snapshot.decision_at_ms
+    assert clock["post_read_calls"] == 2
+
+
+@pytest.mark.asyncio
 async def test_spread_sidecar_drops_individually_stale_quotes(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar-current.json"
     spread_path = tmp_path / "spread-current.json"
@@ -576,7 +619,9 @@ async def test_spread_sidecar_excludes_degraded_venues_and_symbols(tmp_path) -> 
     publish_snapshot(snapshot, sidecar_path)
     service = SpreadSidecarService(config)
 
-    quotes, degraded, mode, input_count, _, degraded_symbols = await service._fetch_quotes(10_000)
+    quotes, degraded, mode, input_count, _, degraded_symbols, _ = (
+        await service._fetch_quotes(10_000)
+    )
 
     assert input_count == 5
     assert set(quotes) == {"cheap:BTCUSDT", "rich:BTCUSDT", "cheap:ETHUSDT"}
@@ -643,7 +688,9 @@ async def test_spread_quote_filter_is_order_independent_per_symbol(tmp_path) -> 
     publish_snapshot(snapshot, sidecar_path)
     service = SpreadSidecarService(config)
 
-    quotes, degraded_venues, mode, _, _, degraded_symbols = await service._fetch_quotes(10_000)
+    quotes, degraded_venues, mode, _, _, degraded_symbols, _ = (
+        await service._fetch_quotes(10_000)
+    )
 
     assert "rich:BTCUSDT" in quotes
     assert "rich:ETHUSDT" not in quotes

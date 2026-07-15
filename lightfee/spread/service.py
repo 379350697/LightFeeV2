@@ -448,9 +448,7 @@ class SpreadSidecarService:
                 self._paper_journal = None
 
     async def refresh_once(self, *, now_ms: int | None = None) -> SpreadSnapshot:
-        decision_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        self._refresh_fee_evidence(decision_at_ms)
-        self._restore_stats_checkpoint_once(decision_at_ms)
+        requested_decision_at_ms = int(now_ms) if now_ms is not None else None
         (
             quotes,
             degraded_venues,
@@ -458,7 +456,10 @@ class SpreadSidecarService:
             input_quote_count,
             market_observed_at_ms,
             degraded_symbols,
-        ) = await self._fetch_quotes(decision_at_ms)
+            decision_at_ms,
+        ) = await self._fetch_quotes(requested_decision_at_ms)
+        self._refresh_fee_evidence(decision_at_ms)
+        self._restore_stats_checkpoint_once(decision_at_ms)
         rejection_counts: dict[str, int] = {}
         evaluation_diagnostics: dict[str, int] = {}
         candidates = self.signal_engine.build(
@@ -629,7 +630,7 @@ class SpreadSidecarService:
 
     async def _fetch_quotes(
         self,
-        observed_ms: int,
+        observed_ms: int | None,
     ) -> tuple[
         dict[str, QuoteSnapshot],
         set[str],
@@ -637,20 +638,39 @@ class SpreadSidecarService:
         int,
         int,
         dict[str, list[str]],
+        int,
     ]:
         snapshot = load_snapshot(self.sidecar_snapshot_path)
+        # In production the decision watermark is taken after the immutable
+        # snapshot has been read and validated.  Otherwise a concurrent
+        # sidecar publish can be newer than a timestamp captured before I/O,
+        # making current evidence look future/stale.  Explicit test/replay
+        # clocks remain authoritative and never advance from wall time.
+        decision_at_ms = (
+            int(observed_ms)
+            if observed_ms is not None
+            else int(time.time() * 1000)
+        )
         configured_venues = {
             str(vc.venue or "").lower() for vc in self.config.venues if str(vc.venue or "").strip()
         }
         if snapshot is None:
-            return {}, configured_venues, "sidecar_snapshot_unavailable", 0, 0, {}
+            return (
+                {},
+                configured_venues,
+                "sidecar_snapshot_unavailable",
+                0,
+                0,
+                {},
+                decision_at_ms,
+            )
 
         max_age_ms = int(self.config.runtime.sidecar_snapshot_max_age_ms)
         published_at_ms = int(snapshot.published_at_ms or 0)
         if (
             published_at_ms <= 0
-            or published_at_ms > observed_ms
-            or observed_ms - published_at_ms > max_age_ms
+            or published_at_ms > decision_at_ms
+            or decision_at_ms - published_at_ms > max_age_ms
         ):
             return (
                 {},
@@ -659,6 +679,7 @@ class SpreadSidecarService:
                 len(snapshot.quotes),
                 0,
                 {},
+                decision_at_ms,
             )
 
         quotes: dict[str, QuoteSnapshot] = {}
@@ -678,7 +699,7 @@ class SpreadSidecarService:
                 continue
             if not _quote_is_valid_for_spread_sidecar(
                 quote,
-                observed_ms=observed_ms,
+                observed_ms=decision_at_ms,
                 max_age_ms=max_age_ms,
             ):
                 invalid_quote_keys.add(str(key))
@@ -721,6 +742,7 @@ class SpreadSidecarService:
                 len(snapshot.quotes),
                 0,
                 degraded_symbols,
+                decision_at_ms,
             )
 
         source_mode = "sidecar_snapshot_partial" if dropped_count else "sidecar_snapshot"
@@ -735,6 +757,7 @@ class SpreadSidecarService:
             len(snapshot.quotes),
             market_observed_at_ms,
             degraded_symbols,
+            decision_at_ms,
         )
 
     def _load_fee_evidence(self, now_ms: int) -> FeeEvidenceBook:
