@@ -642,20 +642,25 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
                 errors.append(f"degraded_symbol_evidence_unproved:{venue}:{symbol}")
     crossed_quote_keys = {key for key, _venue, _symbol in crossed_quotes}
     candidate_identities: set[tuple[str, str, str]] = set()
+    # Candidate contract evidence is identity-bound and duplicate-sensitive,
+    # but scanning every quote for every candidate makes publication O(C*Q).
+    # Build the exact same fail-closed identity proof once and reuse it.
+    from lightfee.sidecar.publisher import (
+        _v3_economics_contract_reason,
+        _v3_quote_contract_evidence_index,
+    )
+
+    quote_evidence_index = _v3_quote_contract_evidence_index(quotes)
     if isinstance(candidates, list):
         for index, candidate in enumerate(candidates):
             if not isinstance(candidate, dict):
                 continue
             errors.extend(_candidate_field_contract_errors(candidate, index=index))
             if candidate.get("economics_complete") is True:
-                # Import lazily to keep the dataclass/schema module independent
-                # during module initialization while still using the exact same
-                # economics and contract proof as publish/load enrichment.
-                from lightfee.sidecar.publisher import _v3_economics_contract_reason
-
                 economics_reason = _v3_economics_contract_reason(
                     candidate,
                     quotes_raw=quotes,
+                    quote_evidence_index=quote_evidence_index,
                 )
                 if economics_reason:
                     errors.append(

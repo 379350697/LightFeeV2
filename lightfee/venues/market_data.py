@@ -1427,7 +1427,10 @@ class MarketDataClient:
                 ] = evidence
         interval_evidence.update(
             await self._fetch_binance_style_funding_intervals(
-                venue_sym_to_canon,
+                {
+                    venue_sym: venue_sym_to_canon[venue_sym]
+                    for venue_sym in pi_map
+                },
                 observed_at_ms=now_ms,
             )
         )

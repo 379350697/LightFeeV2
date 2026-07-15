@@ -618,6 +618,85 @@ class TestPublisher:
             "ambiguous_v3_contract_evidence:long_quote"
         )
 
+    def test_v4_contract_quote_evidence_scan_is_linear_in_quotes(self):
+        class CountingQuotes(dict):
+            values_calls = 0
+
+            def values(self):
+                self.values_calls += 1
+                return super().values()
+
+        quotes = CountingQuotes(self._complete_v3_contract_quotes())
+        for index, quote in enumerate(quotes.values()):
+            quote["observed_at_ms"] = 10_000
+            quote["funding_rate_bps"] = float(index + 1)
+        quotes.values_calls = 0
+        candidates = [deepcopy(self._complete_v3_candidate()) for _ in range(32)]
+        lifecycle = [
+            {
+                "venue": venue,
+                "observed_at_ms": 10_000,
+                "symbol_count": 1,
+                "coverage_usable": 1,
+                "degraded_reason": "",
+            }
+            for venue in ("binance", "okx")
+        ]
+        raw = {
+            "schema_version": 4,
+            "published_at_ms": 10_000,
+            "market_observed_at_ms": 10_000,
+            "candidate_build_observed_at_ms": 10_000,
+            "candidate_build_diagnostics": {
+                "input_quote_count": 2,
+                "requested_symbol_count": 1,
+                "requested_symbols": ["BTCUSDT"],
+                "requested_venues": ["binance", "okx"],
+                "directional_pair_count": len(candidates),
+                "output_candidate_count": len(candidates),
+                "future_input_quote_count": 0,
+                "rejection_counts": {},
+            },
+            "funding_lifecycle": deepcopy(lifecycle),
+            "market_lifecycle": deepcopy(lifecycle),
+            "liquidity_lifecycle": deepcopy(lifecycle),
+            "transfer_lifecycle": [],
+            "degraded_venues": [],
+            "degraded_domains": [],
+            "degraded_symbols": {},
+            "source_mode": "direct_market",
+            "acquisition_mode": "fresh_sidecar",
+            "quotes": quotes,
+            "candidates": candidates,
+        }
+
+        errors = validate_v4_snapshot_contract(raw)
+
+        assert not any("candidate_economics_contract_invalid" in error for error in errors)
+        assert quotes.values_calls <= 4
+
+    def test_v4_loader_quote_evidence_scan_is_linear_in_quotes(self):
+        class CountingQuotes(dict):
+            values_calls = 0
+
+            def values(self):
+                self.values_calls += 1
+                return super().values()
+
+        quotes = CountingQuotes(self._complete_v3_contract_quotes())
+        candidates = [deepcopy(self._complete_v3_candidate()) for _ in range(32)]
+
+        snapshot = _dict_to_snapshot(
+            {
+                "schema_version": 4,
+                "quotes": quotes,
+                "candidates": candidates,
+            }
+        )
+
+        assert all(candidate.economics_complete for candidate in snapshot.candidates)
+        assert quotes.values_calls <= 2
+
     def test_schema_v1_rejects_truthy_lifecycle_flags(self):
         from lightfee.sidecar.v1_compat import convert_v1_snapshot_to_v2
 

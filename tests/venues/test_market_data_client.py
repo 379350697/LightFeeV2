@@ -2010,6 +2010,40 @@ class TestProductionSidecarParserRegressions:
         assert ticker.funding_interval_observed_at_ms > 0
 
     @pytest.mark.asyncio
+    async def test_binance_interval_history_only_queries_bulk_listed_symbols(self):
+        funding_history_symbols: list[str] = []
+
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{
+                        "symbol": "BTCUSDT",
+                        "lastFundingRate": "0.0001",
+                        "markPrice": "100.5",
+                        "indexPrice": "100.4",
+                        "nextFundingTime": "4100007200000",
+                    }]
+                if path == "/fapi/v1/fundingRate":
+                    funding_history_symbols.append(str((params or {}).get("symbol", "")))
+                    return [
+                        {"fundingTime": "4099978400000"},
+                        {"fundingTime": "4100007200000"},
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "1000000"}]
+                if path == "/fapi/v1/openInterest":
+                    return {"symbol": "BTCUSDT", "openInterest": "10"}
+                return {}
+
+        await FakeBinanceClient(binance_spec()).fetch_funding_tickers(
+            ["BTCUSDT", "ETHUSDT"]
+        )
+
+        assert funding_history_symbols == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
     async def test_okx_contract_counts_are_converted_to_base_and_interval_is_proved(self):
         class FakeOkxClient(MarketDataClient):
             async def _public_get(self, path, params=None):

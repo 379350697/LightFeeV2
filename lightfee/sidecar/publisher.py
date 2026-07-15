@@ -57,6 +57,9 @@ def _v3_economics_contract_reason(
     candidate: dict,
     *,
     quotes_raw: object,
+    quote_evidence_index: dict[
+        tuple[str, str], tuple[dict | None, str]
+    ] | None = None,
 ) -> str:
     """Return a fail-closed reason for a claimed-complete V3 candidate.
 
@@ -220,10 +223,21 @@ def _v3_economics_contract_reason(
         abs_tol=1e-9,
     ):
         return "v3_edge_formula_mismatch:expected_edge_bps"
-    return _v3_candidate_contract_reason(candidate, quotes_raw)
+    return _v3_candidate_contract_reason(
+        candidate,
+        quotes_raw,
+        quote_evidence_index=quote_evidence_index,
+    )
 
 
-def _v3_candidate_contract_reason(candidate: dict, quotes_raw: object) -> str:
+def _v3_candidate_contract_reason(
+    candidate: dict,
+    quotes_raw: object,
+    *,
+    quote_evidence_index: dict[
+        tuple[str, str], tuple[dict | None, str]
+    ] | None = None,
+) -> str:
     """Verify that a V3 candidate is backed by compatible quote contracts.
 
     Candidate economics are serialised separately from quote metadata.  A
@@ -240,16 +254,26 @@ def _v3_candidate_contract_reason(candidate: dict, quotes_raw: object) -> str:
     short_venue = str(candidate.get("short_venue", "") or "").lower()
     if not symbol or not long_venue or not short_venue or long_venue == short_venue:
         return "invalid_v3_contract_evidence:candidate_identity"
-    long_quote, long_quote_reason = _v3_quote_for_contract_evidence(
-        quotes_raw,
-        long_venue,
-        symbol,
-    )
-    short_quote, short_quote_reason = _v3_quote_for_contract_evidence(
-        quotes_raw,
-        short_venue,
-        symbol,
-    )
+    if quote_evidence_index is None:
+        long_quote, long_quote_reason = _v3_quote_for_contract_evidence(
+            quotes_raw,
+            long_venue,
+            symbol,
+        )
+        short_quote, short_quote_reason = _v3_quote_for_contract_evidence(
+            quotes_raw,
+            short_venue,
+            symbol,
+        )
+    else:
+        long_quote, long_quote_reason = quote_evidence_index.get(
+            (long_venue, symbol),
+            (None, "missing"),
+        )
+        short_quote, short_quote_reason = quote_evidence_index.get(
+            (short_venue, symbol),
+            (None, "missing"),
+        )
     if long_quote is None:
         return f"{long_quote_reason}_v3_contract_evidence:long_quote"
     if short_quote is None:
@@ -301,6 +325,27 @@ def _v3_quote_for_contract_evidence(
                 return None, "ambiguous"
             match = raw
     return (match, "") if match is not None else (None, "missing")
+
+
+def _v3_quote_contract_evidence_index(
+    quotes_raw: object,
+) -> dict[tuple[str, str], tuple[dict | None, str]]:
+    """Index quote identity once while preserving duplicate fail-closed proof."""
+    if not isinstance(quotes_raw, dict):
+        return {}
+    index: dict[tuple[str, str], tuple[dict | None, str]] = {}
+    for raw in quotes_raw.values():
+        if not isinstance(raw, dict):
+            continue
+        identity = (
+            str(raw.get("venue", "") or "").lower(),
+            str(raw.get("symbol", "") or "").upper(),
+        )
+        if identity in index:
+            index[identity] = (None, "ambiguous")
+        else:
+            index[identity] = (raw, "")
+    return index
 
 
 def _v3_normalised_contract_fields(raw: dict) -> tuple[str, str, float] | None:
@@ -689,6 +734,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
     )
 
     quotes_raw = d.get("quotes", {})
+    quote_evidence_index = _v3_quote_contract_evidence_index(quotes_raw)
 
     def _enrich_candidate(c: dict) -> CandidateInput:
         """Enrich a candidate dict with V1-required identity + prewarm fields.
@@ -716,7 +762,11 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
             default=0,
         )
         contract_reason = (
-            _v3_economics_contract_reason(c, quotes_raw=quotes_raw)
+            _v3_economics_contract_reason(
+                c,
+                quotes_raw=quotes_raw,
+                quote_evidence_index=quote_evidence_index,
+            )
             if schema_version >= 3 and complete_economics
             else ""
         )
