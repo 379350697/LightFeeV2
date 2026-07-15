@@ -142,6 +142,50 @@ def test_out_of_order_observation_cannot_contaminate_rolling_state_or_signal() -
     ) == []
 
 
+def test_control_only_stats_observation_preserves_full_update_state() -> None:
+    kwargs = {
+        "window_ms": 15_000,
+        "max_samples": 3,
+        "short_window_ms": 100,
+        "structural_break_sigma": 2.0,
+        "structural_break_consecutive": 1,
+        "structural_break_cooldown_ms": 1_000,
+    }
+    full = SpreadStatsTracker(**kwargs)
+    control_only = SpreadStatsTracker(**kwargs)
+
+    for observed_at_ms, value in (
+        (1_000, -1.0),
+        (2_000, 0.0),
+        (3_000, 1.0),
+        (10_000, 100.0),
+    ):
+        full_snapshot = full.update(
+            "BTCUSDT",
+            "cheap",
+            "rich",
+            value,
+            observed_at_ms=observed_at_ms,
+            exit_half_spread_bps=2.0,
+        )
+        control = control_only.observe(
+            "BTCUSDT",
+            "cheap",
+            "rich",
+            value,
+            observed_at_ms=observed_at_ms,
+            exit_half_spread_bps=2.0,
+        )
+
+        assert control.accepted is True
+        assert control.structural_break is full_snapshot.structural_break
+        assert control.cooldown_until_ms == full_snapshot.cooldown_until_ms
+        assert control_only.checkpoint(now_ms=observed_at_ms) == full.checkpoint(
+            now_ms=observed_at_ms
+        )
+        assert control_only.revision == full.revision
+
+
 def test_current_observation_is_not_in_its_own_zscore_and_direction_is_correct() -> None:
     tracker = SpreadStatsTracker()
     _prewarm(tracker)

@@ -169,6 +169,15 @@ class SpreadStatsSnapshot:
 
 
 @dataclass(frozen=True)
+class SpreadStatsUpdate:
+    """Control-plane result for a state update that skips derived statistics."""
+
+    accepted: bool
+    structural_break: bool
+    cooldown_until_ms: int
+
+
+@dataclass(frozen=True)
 class _Sample:
     observed_at_ms: int
     value_bps: float
@@ -227,29 +236,97 @@ class SpreadStatsTracker:
         observed_at_ms: int = 0,
         exit_half_spread_bps: float = 0.0,
     ) -> SpreadStatsSnapshot:
+        state, snapshot_at_ms, control = self._append_observation(
+            symbol,
+            venue_a,
+            venue_b,
+            signed_basis_bps,
+            observed_at_ms=observed_at_ms,
+            exit_half_spread_bps=exit_half_spread_bps,
+        )
+        return self._snapshot(
+            state,
+            now_ms=snapshot_at_ms,
+            structural_break=control.structural_break,
+        )
+
+    def observe(
+        self,
+        symbol: str,
+        venue_a: str,
+        venue_b: str,
+        signed_basis_bps: float,
+        *,
+        observed_at_ms: int = 0,
+        exit_half_spread_bps: float = 0.0,
+    ) -> SpreadStatsUpdate:
+        """Append evidence without recomputing statistics unused by the caller.
+
+        Signal generation already snapshots the prior window to preserve the
+        no-look-ahead boundary.  It only needs structural-break and cooldown
+        state after appending the current observation, so rebuilding median,
+        MAD, percentile and AR(1) a second time is pure scheduler latency.
+        """
+
+        _state, _snapshot_at_ms, control = self._append_observation(
+            symbol,
+            venue_a,
+            venue_b,
+            signed_basis_bps,
+            observed_at_ms=observed_at_ms,
+            exit_half_spread_bps=exit_half_spread_bps,
+        )
+        return control
+
+    def _append_observation(
+        self,
+        symbol: str,
+        venue_a: str,
+        venue_b: str,
+        signed_basis_bps: float,
+        *,
+        observed_at_ms: int,
+        exit_half_spread_bps: float,
+    ) -> tuple[_RollingState, int, SpreadStatsUpdate]:
         key = _key(symbol, venue_a, venue_b)
         state = self._states.setdefault(key, _RollingState())
         observed_ms = max(int(observed_at_ms or 0), 0)
         if observed_ms <= 0:
-            return self._snapshot(state, now_ms=0)
+            return state, 0, SpreadStatsUpdate(
+                accepted=False,
+                structural_break=False,
+                cooldown_until_ms=state.cooldown_until_ms,
+            )
         try:
             value = float(signed_basis_bps)
             exit_half = float(exit_half_spread_bps or 0.0)
         except (TypeError, ValueError):
-            return self._snapshot(state, now_ms=observed_ms)
+            return state, observed_ms, SpreadStatsUpdate(
+                accepted=False,
+                structural_break=False,
+                cooldown_until_ms=state.cooldown_until_ms,
+            )
         # This is both an online statistics boundary and a checkpoint source.
         # A NaN entered here would poison median/MAD/AR(1) and could be
         # serialized into the next process.  It is a bad market observation,
         # not a zero-basis observation, so preserve the old window unchanged.
         if not math.isfinite(value) or not math.isfinite(exit_half) or exit_half < 0.0:
-            return self._snapshot(state, now_ms=observed_ms)
+            return state, observed_ms, SpreadStatsUpdate(
+                accepted=False,
+                structural_break=False,
+                cooldown_until_ms=state.cooldown_until_ms,
+            )
         # The deque is chronological by contract.  Appending a late source
         # sample would make both rolling eviction and AR(1) use future data.
         # Ignore it rather than retrospectively rewriting a live signal
         # window; the signal caller separately rejects the corresponding
         # out-of-order observation.
         if state.samples and observed_ms <= state.samples[-1].observed_at_ms:
-            return self._snapshot(state, now_ms=state.samples[-1].observed_at_ms)
+            return state, state.samples[-1].observed_at_ms, SpreadStatsUpdate(
+                accepted=False,
+                structural_break=False,
+                cooldown_until_ms=state.cooldown_until_ms,
+            )
         self._evict(state, observed_ms)
         state.samples.append(
             _Sample(
@@ -265,7 +342,11 @@ class SpreadStatsTracker:
             state.cooldown_until_ms = observed_ms + self.structural_break_cooldown_ms
             state.break_consecutive = 0
         self._revision += 1
-        return self._snapshot(state, now_ms=observed_ms, structural_break=structural_break)
+        return state, observed_ms, SpreadStatsUpdate(
+            accepted=True,
+            structural_break=structural_break,
+            cooldown_until_ms=state.cooldown_until_ms,
+        )
 
     def snapshot(
         self,
@@ -525,10 +606,6 @@ def build_spread_reversion_candidates(
         sorted_quotes = sorted(symbol_quotes, key=lambda q: str(q.venue).lower())
         for venue_a, venue_b in combinations(sorted_quotes, 2):
             evaluated_pair_count += 1
-            compatibility = _contract_compatibility(venue_a, venue_b)
-            if not compatibility.compatible:
-                _record_spread_rejection(rejection_counts, compatibility.reason)
-                continue
             candidate = _candidate_for_pair(
                 venue_a,
                 venue_b,
@@ -620,7 +697,7 @@ def _candidate_for_pair(
     if stats.last_observed_ms > pair_observed_at_ms:
         _record_spread_rejection(rejection_counts, "out_of_order_stats_window")
         return None
-    updated = tracker.update(
+    updated = tracker.observe(
         a.symbol,
         a.venue,
         b.venue,

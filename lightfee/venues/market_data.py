@@ -296,10 +296,15 @@ BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
 BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S = 2.0
 BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000
 BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
-# V1 parity: per-symbol OKX funding-rate concurrency limit
+# V1 parity: per-symbol OKX funding-rate concurrency limit.  The batch endpoint
+# returns the full swap universe and is the production fast path.  Its timeout
+# must cover a realistic full payload; the bounded fallback prevents a failed
+# batch from turning one refresh into hundreds of requests.
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
-OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S = 0.2
+_OKX_FUNDING_RATE_BATCH_TIMEOUT_S = 1.0
+_OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S = 0.5
+_OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS = 64
 _FUNDING_INTERVAL_HISTORY_SEMAPHORE = 8
 _FUNDING_INTERVAL_HISTORY_BUDGET_S = 3.0
 
@@ -387,6 +392,13 @@ class MarketDataClient:
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
         self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
         self._funding_cache_observed_at_ms: int = 0
+        # OKX cache provenance is a time pair, not merely the next settlement.
+        # Keep it separate from the cross-venue rate cache so cache hits retain
+        # the same explicit interval source and receipt time as fresh rows.
+        self._okx_funding_time_pair_by_key: dict[
+            str, tuple[int, int, int]
+        ] = {}
+        self._okx_funding_fallback_cursor: int = 0
         # Per-symbol next-settlement observations.  An interval is only
         # inferred after the exchange itself advances the next timestamp; a
         # cold process remains explicitly interval-unknown.
@@ -1863,17 +1875,66 @@ class MarketDataClient:
         # absent from the batch response.  Per-symbol fan-out alone cannot
         # finish a production-sized universe inside the enrichment budget.
         funding_map: dict[str, dict] = {}
+        funding_observed_at_ms: dict[str, int] = {}
+
+        def _accept_funding_row(
+            venue_sym: str,
+            item: object,
+            *,
+            received_at_ms: int,
+        ) -> bool:
+            if not isinstance(item, dict):
+                return False
+            returned_symbol = str(item.get("instId", "") or "")
+            if returned_symbol != venue_sym:
+                return False
+            funding_map[venue_sym] = item
+            funding_observed_at_ms[venue_sym] = received_at_ms
+            cache_key = f"{venue_str}:{venue_sym_to_canon[venue_sym]}"
+            rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
+            funding_time_ms = _funding_timestamp_ms_or_seconds(
+                item.get("fundingTime", 0)
+            )
+            next_funding_time_ms = _funding_timestamp_ms(item)
+            if next_funding_time_ms > 0:
+                self._funding_cache[cache_key] = (
+                    rate_bps,
+                    next_funding_time_ms,
+                    received_at_ms,
+                )
+            if next_funding_time_ms > funding_time_ms > 0:
+                self._okx_funding_time_pair_by_key[cache_key] = (
+                    funding_time_ms,
+                    next_funding_time_ms,
+                    received_at_ms,
+                )
+            else:
+                self._okx_funding_time_pair_by_key.pop(cache_key, None)
+            return True
+
         if spec.funding_rate_path:
             # Separate symbols into cache-hit (fresh) and cache-miss (need fetch)
             symbols_to_fetch: list[str] = []
             for venue_sym in venue_sym_to_canon:
                 cache_key = f"{venue_str}:{venue_sym_to_canon[venue_sym]}"
                 if self._funding_rate_is_fresh(cache_key, now_ms):
-                    rate_bps, ts_ms, _ = self._funding_cache[cache_key]
-                    funding_map[venue_sym] = {
+                    rate_bps, ts_ms, observed_at_ms = self._funding_cache[cache_key]
+                    cached_row = {
+                        "instId": venue_sym,
                         "fundingRate": str(rate_bps / 10000.0),
                         "nextFundingTime": str(ts_ms),
                     }
+                    cached_pair = self._okx_funding_time_pair_by_key.get(
+                        cache_key
+                    )
+                    if (
+                        cached_pair is not None
+                        and cached_pair[1] == ts_ms
+                        and cached_pair[2] == observed_at_ms
+                    ):
+                        cached_row["fundingTime"] = str(cached_pair[0])
+                    funding_map[venue_sym] = cached_row
+                    funding_observed_at_ms[venue_sym] = observed_at_ms
                 else:
                     symbols_to_fetch.append(venue_sym)
 
@@ -1884,10 +1945,11 @@ class MarketDataClient:
                             spec.funding_rate_path,
                             params={"instId": "ANY"},
                         ),
-                        timeout=OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S,
+                        timeout=_OKX_FUNDING_RATE_BATCH_TIMEOUT_S,
                     )
                 except (PublicTransportError, asyncio.TimeoutError):
                     batch = {}
+                batch_received_at_ms = _now_ms()
                 batch_rows = batch.get("data", []) if isinstance(batch, dict) else []
                 for item in batch_rows if isinstance(batch_rows, list) else []:
                     if not isinstance(item, dict):
@@ -1895,16 +1957,11 @@ class MarketDataClient:
                     venue_sym = str(item.get("instId", "") or "")
                     if venue_sym not in venue_sym_to_canon:
                         continue
-                    funding_map[venue_sym] = item
-                    cache_key = f"{venue_str}:{venue_sym_to_canon[venue_sym]}"
-                    rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
-                    ts_ms = _funding_timestamp_ms(item)
-                    if ts_ms > 0:
-                        self._funding_cache[cache_key] = (
-                            rate_bps,
-                            ts_ms,
-                            now_ms,
-                        )
+                    _accept_funding_row(
+                        venue_sym,
+                        item,
+                        received_at_ms=batch_received_at_ms,
+                    )
                 symbols_to_fetch = [
                     venue_sym
                     for venue_sym in symbols_to_fetch
@@ -1927,25 +1984,43 @@ class MarketDataClient:
                             )
                         except (PublicTransportError, asyncio.TimeoutError):
                             return
+                        if not isinstance(fr, dict):
+                            return
                         fr_data = fr.get("data", [])
-                        if isinstance(fr_data, list) and fr_data:
-                            item = fr_data[0]
-                            funding_map[venue_sym] = item
-                            # V1 parity: update cache
-                            cache_key = f"{venue_str}:{venue_sym_to_canon.get(venue_sym, venue_sym)}"
-                            rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
-                            ts_ms = _funding_timestamp_ms(item)
-                            if ts_ms > 0:
-                                self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
+                        if not isinstance(fr_data, list) or not fr_data:
+                            return
+                        _accept_funding_row(
+                            venue_sym,
+                            fr_data[0],
+                            received_at_ms=_now_ms(),
+                        )
 
+                # One failed batch must not fan out across the full production
+                # universe.  Fresh cache rows are removed above, so successive
+                # cycles can still hydrate a cold cache in bounded chunks.
+                fallback_limit = max(
+                    int(_OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS),
+                    1,
+                )
+                if len(symbols_to_fetch) > fallback_limit:
+                    start = self._okx_funding_fallback_cursor % len(
+                        symbols_to_fetch
+                    )
+                    rotated = symbols_to_fetch[start:] + symbols_to_fetch[:start]
+                    symbols_to_fetch = rotated[:fallback_limit]
+                    self._okx_funding_fallback_cursor = (
+                        start + fallback_limit
+                    ) % len(rotated)
+                else:
+                    self._okx_funding_fallback_cursor = 0
                 tasks = [
                     asyncio.create_task(_fetch_funding(sym))
                     for sym in symbols_to_fetch
                 ]
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*tasks),
-                        timeout=OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S,
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=_OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S,
                     )
                 except asyncio.TimeoutError:
                     for task in tasks:
@@ -2069,7 +2144,9 @@ class MarketDataClient:
                     "okx_funding_time_pair" if explicit_interval_ms > 0 else ""
                 ),
                 funding_interval_observed_at_ms=(
-                    now_ms if explicit_interval_ms > 0 else 0
+                    funding_observed_at_ms.get(venue_sym, 0)
+                    if explicit_interval_ms > 0
+                    else 0
                 ),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
                 open_interest_quote=oi_map.get(venue_sym, 0.0),

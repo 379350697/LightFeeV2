@@ -1275,6 +1275,256 @@ class TestProductionSidecarParserRegressions:
         assert result["okx:BTCUSDT"].funding_interval_ms == 28_800_000
 
     @pytest.mark.asyncio
+    async def test_okx_batch_funding_budget_accepts_realistic_bulk_latency(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.funding_requests: list[str] = []
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"{symbol}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                            for symbol in ("BTC", "ETH")
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
+                    self.funding_requests.append(inst_id)
+                    assert inst_id == "ANY"
+                    # Cloud measurements put this bulk endpoint around 350-420 ms.
+                    await asyncio.sleep(0.35)
+                    return {
+                        "data": [
+                            {
+                                "instId": f"{symbol}-USDT-SWAP",
+                                "fundingRate": rate,
+                                "fundingTime": "1778784000000",
+                                "nextFundingTime": "1778812800000",
+                            }
+                            for symbol, rate in (("BTC", "0.0001"), ("ETH", "0.0002"))
+                        ]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        result = await asyncio.wait_for(
+            client._fetch_okx_style(["BTCUSDT", "ETHUSDT"]),
+            timeout=0.8,
+        )
+
+        assert client.funding_requests == ["ANY"]
+        assert result["okx:BTCUSDT"].funding_rate_bps == pytest.approx(1.0)
+        assert result["okx:ETHUSDT"].funding_rate_bps == pytest.approx(2.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_funding_observation_uses_response_receipt_time(self, monkeypatch):
+        import lightfee.venues.market_data as market_data
+
+        times = iter((1_000, 2_000))
+        monkeypatch.setattr(market_data, "_now_ms", lambda: next(times))
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "fundingRate": "0.0001",
+                                "fundingTime": "1778784000000",
+                                "nextFundingTime": "1778812800000",
+                            }
+                        ]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(["BTCUSDT"])
+
+        assert result["okx:BTCUSDT"].funding_interval_observed_at_ms == 2_000
+
+    @pytest.mark.asyncio
+    async def test_okx_batch_failure_bounds_per_symbol_fallback(self, monkeypatch):
+        import lightfee.venues.market_data as market_data
+
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_BATCH_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS", 3)
+        symbols = [f"S{i}USDT" for i in range(10)]
+
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.symbol_funding_requests: list[str] = []
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"S{i}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                            for i in range(10)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
+                    if inst_id == "ANY":
+                        await asyncio.sleep(1.0)
+                        return {"data": []}
+                    self.symbol_funding_requests.append(inst_id)
+                    return {
+                        "data": [
+                            {
+                                "instId": inst_id,
+                                "fundingRate": "0.0001",
+                                "fundingTime": "1778784000000",
+                                "nextFundingTime": "1778812800000",
+                            }
+                        ]
+                    }
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        result = await client._fetch_okx_style(symbols)
+
+        assert len(client.symbol_funding_requests) == 3
+        assert sum(ticker.funding_rate_bps > 0.0 for ticker in result.values()) == 3
+
+    @pytest.mark.asyncio
+    async def test_okx_fallback_rotates_past_persistently_failed_symbols(self, monkeypatch):
+        import lightfee.venues.market_data as market_data
+
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_BATCH_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS", 3)
+        symbols = [f"S{i}USDT" for i in range(6)]
+
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.symbol_funding_requests: list[str] = []
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"S{i}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                            for i in range(6)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
+                    if inst_id == "ANY":
+                        await asyncio.sleep(1.0)
+                        return {"data": []}
+                    self.symbol_funding_requests.append(inst_id)
+                    return {"data": []}
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        client = FakeOkxClient()
+        await client._fetch_okx_style(symbols)
+        await client._fetch_okx_style(symbols)
+
+        assert client.symbol_funding_requests == [
+            "S0-USDT-SWAP",
+            "S1-USDT-SWAP",
+            "S2-USDT-SWAP",
+            "S3-USDT-SWAP",
+            "S4-USDT-SWAP",
+            "S5-USDT-SWAP",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_okx_malformed_fallback_rows_are_isolated_and_identity_checked(
+        self,
+        monkeypatch,
+    ):
+        import lightfee.venues.market_data as market_data
+
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_BATCH_TIMEOUT_S", 0.01)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S", 0.2)
+        monkeypatch.setattr(market_data, "_OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS", 5)
+        symbols = [f"S{i}USDT" for i in range(5)]
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "instId": f"S{i}-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                            for i in range(5)
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
+                    if inst_id == "ANY":
+                        await asyncio.sleep(1.0)
+                        return {"data": []}
+                    if inst_id == "S0-USDT-SWAP":
+                        return None
+                    if inst_id == "S1-USDT-SWAP":
+                        return []
+                    if inst_id == "S2-USDT-SWAP":
+                        return {"data": [None]}
+                    if inst_id == "S3-USDT-SWAP":
+                        return {"data": [{
+                            "instId": "WRONG-USDT-SWAP",
+                            "fundingRate": "0.0009",
+                            "fundingTime": "1778784000000",
+                            "nextFundingTime": "1778812800000",
+                        }]}
+                    return {"data": [{
+                        "instId": inst_id,
+                        "fundingRate": "0.0001",
+                        "fundingTime": "1778784000000",
+                        "nextFundingTime": "1778812800000",
+                    }]}
+                if path == "/api/v5/public/open-interest":
+                    return {"data": []}
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(symbols)
+
+        assert [
+            result[f"okx:S{i}USDT"].funding_rate_bps for i in range(4)
+        ] == [0.0, 0.0, 0.0, 0.0]
+        assert result["okx:S4USDT"].funding_rate_bps == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
     async def test_okx_open_interest_uses_usd_value_and_missing_data_is_unavailable(self):
         class FakeOkxClient(MarketDataClient):
             async def _public_get(self, path, params=None):
@@ -1781,8 +2031,10 @@ class TestProductionSidecarParserRegressions:
                     self.max_active_funding = max(self.max_active_funding, self.active_funding)
                     await asyncio.sleep(0.005)
                     self.active_funding -= 1
+                    inst_id = str((params or {}).get("instId", ""))
                     return {
                         "data": [{
+                            "instId": inst_id,
                             "fundingRate": "0.0002",
                             "fundingTime": "1700000000000",
                         }]
@@ -1817,7 +2069,7 @@ class TestProductionSidecarParserRegressions:
         assert client.max_active_funding > 1
 
     @pytest.mark.asyncio
-    async def test_okx_slow_funding_enrichment_does_not_block_quote_return(self):
+    async def test_okx_slow_funding_enrichment_remains_bounded(self):
         symbols = [f"S{i}USDT" for i in range(64)]
 
         class FakeOkxClient(MarketDataClient):
@@ -1835,9 +2087,11 @@ class TestProductionSidecarParserRegressions:
                         ]
                     }
                 if path == "/api/v5/public/funding-rate":
+                    inst_id = str((params or {}).get("instId", ""))
                     await asyncio.sleep(1.0)
                     return {
                         "data": [{
+                            "instId": inst_id,
                             "fundingRate": "0.0003",
                             "fundingTime": "1700000000000",
                         }]
@@ -1858,7 +2112,9 @@ class TestProductionSidecarParserRegressions:
 
         result = await asyncio.wait_for(
             FakeOkxClient(okx_spec())._fetch_okx_style(symbols),
-            timeout=0.5,
+            # Funding/metadata runs outside the dedicated BBO publication path.
+            # Allow the realistic bulk timeout plus the bounded fallback budget.
+            timeout=1.7,
         )
 
         assert len(result) == len(symbols)
@@ -1895,6 +2151,7 @@ class TestProductionSidecarParserRegressions:
                         )
                     return {
                         "data": [{
+                            "instId": inst_id,
                             "fundingRate": "0.0003",
                             "fundingTime": "1700000000000",
                         }]
@@ -2121,6 +2378,7 @@ class TestProductionSidecarParserRegressions:
                     }]}
                 if path == "/api/v5/public/funding-rate":
                     return {"data": [{
+                        "instId": "BTC-USDT-SWAP",
                         "fundingRate": "0.0001",
                         "fundingTime": "4099978400000",
                         "nextFundingTime": "4100007200000",
@@ -2205,6 +2463,12 @@ class TestProductionSidecarParserRegressions:
         assert second.contract_normalization_complete is True
         assert second.mark_price == pytest.approx(100.5)
         assert second.index_price == pytest.approx(100.4)
+        assert second.funding_interval_ms == first.funding_interval_ms
+        assert second.funding_interval_source == first.funding_interval_source
+        assert (
+            second.funding_interval_observed_at_ms
+            == first.funding_interval_observed_at_ms
+        )
 
     @pytest.mark.asyncio
     async def test_bybit_first_fetch_uses_instrument_interval_and_steps(self):
