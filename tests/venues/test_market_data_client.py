@@ -364,6 +364,46 @@ class TestRateLimitScopesForNewEndpoints:
         assert snap is not None
         assert snap["cooldown_until_ms"] > 0
 
+    @pytest.mark.asyncio
+    async def test_reserved_bbo_budget_propagates_429_without_consuming_tokens(self):
+        import httpx
+
+        from lightfee.rate_limit.config import RateLimitConfigManager
+        from lightfee.rate_limit.engine import (
+            RateLimitRuntime,
+            global_rate_limit_runtime,
+            install_global_rate_limit_runtime,
+        )
+        from lightfee.venues.transport import EndpointRateLimiter
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, text="too many requests")
+
+        previous = global_rate_limit_runtime()
+        runtime = RateLimitRuntime(
+            config_manager=RateLimitConfigManager(config_path=None)
+        )
+        install_global_rate_limit_runtime(runtime)
+        limiter = EndpointRateLimiter(1000, 8000, 250)
+        client = MarketDataClient(
+            aster_spec(),
+            rate_limiter=limiter,
+            consume_global_rate_limit_budget=False,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(PublicTransportError):
+                await client._public_get("/fapi/v1/ticker/bookTicker")
+            global_snapshot = runtime.engine.bucket_snapshot("venue:aster")
+        finally:
+            await client.close()
+            install_global_rate_limit_runtime(previous)
+
+        assert global_snapshot is not None
+        assert global_snapshot["cooldown_until_ms"] > 0
+        assert global_snapshot["tokens"] == global_snapshot["capacity"]
+        assert limiter._cooldown_remaining_ms_for_scopes(["venue:aster"]) is not None
+
 
 class TestParserFixtures:
     """Parser-level coverage for all 7 venues with fixture-style data."""

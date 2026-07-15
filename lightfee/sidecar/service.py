@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import logging
+import threading
 import time
 from math import isfinite
 from pathlib import Path
@@ -80,6 +81,7 @@ class SidecarService:
         from lightfee.venues.transport import EndpointRateLimiter
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
+        self._spread_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
         # V1 parity: last-good fallback cache.  Initialise before reading the
         # prior snapshot so a restart can retain still-valid per-key evidence.
@@ -99,12 +101,17 @@ class SidecarService:
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
-            # Isolate BBO connection capacity from funding/OI while retaining
-            # the venue-wide public rate-limit budget.
+            # BBO owns a reserved, per-venue public budget.  It still paces
+            # requests and honours any 429 it receives, but funding/OI cannot
+            # consume its slots or bind it to the main event loop's cooldown
+            # runtime.  Four bulk requests/sec is deliberately conservative.
+            bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
+            self._spread_bbo_rate_limiters[venue_name] = bbo_rate_limiter
             self._spread_bbo_sources[venue_name] = ExchangeSource(
                 spec,
-                rate_limiter=rate_limiter,
+                rate_limiter=bbo_rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+                consume_global_rate_limit_budget=False,
             )
             self._spread_bbo_sources[
                 venue_name
@@ -178,7 +185,36 @@ class SidecarService:
                     )
 
     async def run_spread_bbo_data_plane(self, stop_event: asyncio.Event) -> None:
-        await self._spread_bbo_data_plane.run(stop_event)
+        thread_stop = threading.Event()
+        runner = asyncio.create_task(
+            asyncio.to_thread(
+                _run_spread_bbo_in_thread,
+                self._spread_bbo_data_plane,
+                list(self._spread_bbo_sources.values()),
+                thread_stop,
+            )
+        )
+        stop_task = asyncio.create_task(stop_event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {runner, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if runner in done and not stop_event.is_set():
+                await runner
+                raise RuntimeError("spread BBO thread exited unexpectedly")
+            thread_stop.set()
+            await runner
+        finally:
+            thread_stop.set()
+            if not stop_task.done():
+                stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            # ``asyncio.to_thread`` cancellation cannot stop the underlying
+            # thread.  Keep service shutdown from racing ``close()`` against
+            # BBO clients that still belong to the thread's event loop.
+            if not runner.done():
+                await asyncio.shield(runner)
 
     # ------------------------------------------------------------------
     # Main refresh
@@ -730,14 +766,10 @@ class SidecarService:
         partial refresh cannot refresh stale epochs or erase another venue's
         last contract-valid record.
         """
-        cache = getattr(self, "_last_good_quotes", None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._last_good_quotes = cache
-        epochs = getattr(self, "_last_good_at_ms_by_key", None)
-        if not isinstance(epochs, dict):
-            epochs = {}
-            self._last_good_at_ms_by_key = epochs
+        current_cache = getattr(self, "_last_good_quotes", None)
+        cache = dict(current_cache) if isinstance(current_cache, dict) else {}
+        current_epochs = getattr(self, "_last_good_at_ms_by_key", None)
+        epochs = dict(current_epochs) if isinstance(current_epochs, dict) else {}
         updated = False
         for key in sorted(fresh_keys):
             quote = quotes.get(key)
@@ -747,6 +779,10 @@ class SidecarService:
             epochs[key] = int(published_at_ms)
             updated = True
         if updated:
+            # Atomic reference replacement gives the independent BBO thread a
+            # stable metadata generation without a cross-thread async lock.
+            self._last_good_quotes = cache
+            self._last_good_at_ms_by_key = epochs
             self._last_good_at_ms = max(
                 int(getattr(self, "_last_good_at_ms", 0) or 0),
                 int(published_at_ms),
@@ -1030,6 +1066,36 @@ class SidecarService:
                 continue
             result[key] = replace(q)
         return result
+
+
+def _run_spread_bbo_in_thread(
+    data_plane: SpreadBboDataPlane,
+    sources: list[ExchangeSource],
+    thread_stop: threading.Event,
+) -> None:
+    """Own the BBO event loop and HTTP clients outside the heavy sidecar loop."""
+
+    async def run() -> None:
+        local_stop = asyncio.Event()
+
+        async def bridge_stop() -> None:
+            while not thread_stop.is_set():
+                await asyncio.sleep(0.05)
+            local_stop.set()
+
+        bridge_task = asyncio.create_task(bridge_stop())
+        try:
+            await data_plane.run(local_stop)
+        finally:
+            bridge_task.cancel()
+            await asyncio.gather(bridge_task, return_exceptions=True)
+            for source in sources:
+                try:
+                    await source.close()
+                except Exception:
+                    logger.exception("spread BBO thread source close failed")
+
+    asyncio.run(run())
 
 
 def _resolve_acquisition_mode(

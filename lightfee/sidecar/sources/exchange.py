@@ -23,11 +23,13 @@ class ExchangeSource:
         spec: VenueSpec,
         rate_limiter: Optional[object] = None,
         http_max_connections: int | None = None,
+        consume_global_rate_limit_budget: bool = True,
     ) -> None:
         self._client = MarketDataClient(
             spec,
             rate_limiter=rate_limiter,
             http_max_connections=http_max_connections,
+            consume_global_rate_limit_budget=consume_global_rate_limit_budget,
         )
         self.venue = spec.venue_id.value
 
@@ -37,11 +39,13 @@ class ExchangeSource:
         venue: Venue,
         rate_limiter: Optional[object] = None,
         http_max_connections: int | None = None,
+        consume_global_rate_limit_budget: bool = True,
     ) -> ExchangeSource:
         return cls(
             get_spec(venue),
             rate_limiter=rate_limiter,
             http_max_connections=http_max_connections,
+            consume_global_rate_limit_budget=consume_global_rate_limit_budget,
         )
 
     async def close(self) -> None:

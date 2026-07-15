@@ -221,6 +221,8 @@ def test_partial_refresh_updates_last_good_cache_per_key() -> None:
         "binance:BTCUSDT": 1_100,
         "okx:BTCUSDT": 1_100,
     }
+    previous_quotes = service._last_good_quotes
+    previous_epochs = service._last_good_at_ms_by_key
 
     service._update_last_good_quote_cache(
         {"binance:BTCUSDT": fresh_binance},
@@ -234,6 +236,10 @@ def test_partial_refresh_updates_last_good_cache_per_key() -> None:
         "binance:BTCUSDT": 2_100,
         "okx:BTCUSDT": 1_100,
     }
+    assert service._last_good_quotes is not previous_quotes
+    assert service._last_good_at_ms_by_key is not previous_epochs
+    assert previous_quotes["binance:BTCUSDT"].bid == 99.0
+    assert previous_epochs["binance:BTCUSDT"] == 1_100
 
 
 def test_incomplete_contract_cannot_advance_last_good_cache() -> None:

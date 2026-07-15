@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -59,7 +60,8 @@ async def test_sidecar_bbo_transport_isolated_but_contract_cache_shared(tmp_path
             heavy._okx_contract_metadata_by_key
             is bbo._okx_contract_metadata_by_key
         )
-        assert heavy._rate_limiter is bbo._rate_limiter
+        assert heavy._rate_limiter is not bbo._rate_limiter
+        assert bbo._consume_global_rate_limit_budget is False
     finally:
         await service.close()
 
@@ -190,3 +192,53 @@ def test_identical_venue_update_does_not_trigger_a_new_generation(tmp_path):
 
     assert plane._accept_venue_update("binance", update) is True
     assert plane._accept_venue_update("binance", update) is False
+
+
+@pytest.mark.asyncio
+async def test_sidecar_runs_bbo_on_an_independent_event_loop_thread():
+    main_thread_id = threading.get_ident()
+    observed: dict[str, int] = {}
+
+    class FakePlane:
+        async def run(self, stop_event):
+            observed["thread_id"] = threading.get_ident()
+            await stop_event.wait()
+
+    service = object.__new__(SidecarService)
+    service._spread_bbo_data_plane = FakePlane()
+    service._spread_bbo_sources = {}
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(service.run_spread_bbo_data_plane(stop_event))
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while "thread_id" not in observed and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    stop_event.set()
+    await task
+
+    assert observed["thread_id"] != main_thread_id
+
+
+@pytest.mark.asyncio
+async def test_sidecar_cancellation_waits_for_bbo_thread_shutdown():
+    thread_exited = threading.Event()
+
+    class FakePlane:
+        async def run(self, stop_event):
+            try:
+                await stop_event.wait()
+            finally:
+                await asyncio.sleep(0.02)
+                thread_exited.set()
+
+    service = object.__new__(SidecarService)
+    service._spread_bbo_data_plane = FakePlane()
+    service._spread_bbo_sources = {}
+    task = asyncio.create_task(
+        service.run_spread_bbo_data_plane(asyncio.Event())
+    )
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert thread_exited.is_set()

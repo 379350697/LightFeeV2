@@ -372,12 +372,16 @@ class MarketDataClient:
         rate_limiter: Optional[object] = None,
         http_max_connections: int | None = None,
         http_max_keepalive_connections: int = 4,
+        consume_global_rate_limit_budget: bool = True,
     ) -> None:
         self._spec = spec
         self._exchange_http_timeout_ms = exchange_http_timeout_ms
         self._rate_limiter = rate_limiter
         self._http_max_connections = http_max_connections
         self._http_max_keepalive_connections = http_max_keepalive_connections
+        self._consume_global_rate_limit_budget = bool(
+            consume_global_rate_limit_budget
+        )
         self._client: Optional[httpx.AsyncClient] = None
         # V1 parity: per-symbol funding rate cache (OKX, etc.)
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
@@ -558,7 +562,7 @@ class MarketDataClient:
 
         from lightfee.rate_limit.engine import global_rate_limit_runtime as _get_global_rt
         global_rt = _get_global_rt()
-        if global_rt is not None:
+        if self._consume_global_rate_limit_budget and global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
 
         url = base_url + path
