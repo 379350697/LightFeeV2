@@ -12,7 +12,10 @@ from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.service import SidecarService
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
-from lightfee.sidecar.spread_bbo_service import SpreadMetadataCache
+from lightfee.sidecar.spread_bbo_service import (
+    HyperliquidSpreadBboSource,
+    SpreadMetadataCache,
+)
 from lightfee.spread.quote_snapshot import (
     FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
@@ -225,6 +228,129 @@ def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):
     service = SpreadBboProcessService(config)
     assert service.metadata.max_age_ms == 600_000
     assert service.data_plane.snapshot_schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+
+
+@pytest.mark.asyncio
+async def test_bbo_process_routes_hyperliquid_to_l2_websocket_not_rest(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[
+            VenueConfig(venue="hyperliquid"),
+            VenueConfig(venue="binance"),
+        ],
+    )
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "sidecar.json")
+
+    from lightfee.sidecar.spread_bbo_service import SpreadBboProcessService
+
+    service = SpreadBboProcessService(config)
+    try:
+        source = service.sources["hyperliquid"]
+        assert source is service.hyperliquid_source
+        assert isinstance(source, HyperliquidSpreadBboSource)
+        assert not isinstance(source, type(service.sources["binance"]))
+        client = source._new_client("BTCUSDT")
+        assert client.build_subscribe_message() == {
+            "method": "subscribe",
+            "subscription": {"type": "l2Book", "coin": "BTC"},
+        }
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_preserves_receipt_clock_contract() -> None:
+    now_ms = int(time.time() * 1000)
+    source = HyperliquidSpreadBboSource(max_age_ms=100)
+    assert source._cache.update_quote(
+        TopBookQuote(
+            venue="hyperliquid",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=101.0,
+            bid_size=2.0,
+            ask_size=3.0,
+            observed_at_ms=now_ms - 500,
+            received_at_ms=now_ms - 5,
+            source="hyperliquid_l2_book_top",
+        )
+    )
+
+    quotes = await source.fetch_spread_bbo(["BTCUSDT"])
+
+    quote = quotes["hyperliquid:BTCUSDT"]
+    assert quote.observed_at_ms == now_ms - 5
+    assert quote.received_at_ms == now_ms - 5
+    assert quote.exchange_event_at_ms == now_ms - 500
+    assert quote.source == "hyperliquid_l2_book_top"
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_starts_the_complete_bounded_universe(
+    monkeypatch,
+) -> None:
+    from lightfee.sidecar import spread_bbo_service
+
+    started: list[str] = []
+
+    async def start(client) -> None:
+        started.append(client.symbol)
+
+    monkeypatch.setattr(
+        spread_bbo_service._HyperliquidL2BookBboWsClient,
+        "start",
+        start,
+    )
+    source = HyperliquidSpreadBboSource(max_age_ms=1_000)
+
+    await source.start(["BTCUSDT", "NOTLISTEDUSDT"])
+
+    assert started == ["BTCUSDT", "NOTLISTEDUSDT"]
+    assert set(source._clients) == {"BTCUSDT", "NOTLISTEDUSDT"}
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_rejects_stale_cached_quote() -> None:
+    now_ms = int(time.time() * 1000)
+    source = HyperliquidSpreadBboSource(max_age_ms=100)
+    assert source._cache.update_quote(
+        TopBookQuote(
+            venue="hyperliquid",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=101.0,
+            observed_at_ms=now_ms - 5,
+            received_at_ms=now_ms - 500,
+            source="hyperliquid_l2_book_top",
+        )
+    )
+
+    assert await source.fetch_spread_bbo(["BTCUSDT"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_close_attempts_all_and_retains_failures() -> None:
+    class StubClient:
+        def __init__(self, failure: Exception | None = None) -> None:
+            self.failure = failure
+            self.stop_calls = 0
+
+        async def stop(self) -> None:
+            self.stop_calls += 1
+            if self.failure is not None:
+                raise self.failure
+
+    source = HyperliquidSpreadBboSource(max_age_ms=100)
+    stopped = StubClient()
+    failed = StubClient(RuntimeError("stop failed"))
+    source._clients = {"BTCUSDT": stopped, "ETHUSDT": failed}
+
+    with pytest.raises(ExceptionGroup, match="client shutdown failed"):
+        await source.close()
+
+    assert stopped.stop_calls == 1
+    assert failed.stop_calls == 1
+    assert source._clients == {"ETHUSDT": failed}
 
 
 @pytest.mark.asyncio

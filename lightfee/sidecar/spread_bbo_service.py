@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import logging
 from pathlib import Path
+import time
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
+from lightfee.marketdata.ws_bbo import (
+    HyperliquidBboWsClient,
+    TopBookQuote,
+    VenueBboCache,
+)
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
 from lightfee.spread.metadata_cache import SpreadMetadataSnapshotCache
@@ -21,6 +28,111 @@ from lightfee.venues.transport import EndpointRateLimiter
 
 
 logger = logging.getLogger("lightfee.sidecar.spread_bbo_service")
+
+
+class _HyperliquidL2BookBboWsClient(HyperliquidBboWsClient):
+    """Use the periodic L2 snapshot stream, not the 20-weight REST payload."""
+
+    def build_subscribe_message(self) -> dict:
+        return {
+            "method": "subscribe",
+            "subscription": {"type": "l2Book", "coin": self.wire_symbol},
+        }
+
+
+class HyperliquidSpreadBboSource:
+    """Fresh Hyperliquid BBOs backed only by official L2 WebSocket streams."""
+
+    venue = "hyperliquid"
+
+    def __init__(self, *, max_age_ms: int) -> None:
+        self.max_age_ms = max(int(max_age_ms or 0), 1)
+        self._cache = VenueBboCache()
+        self._clients: dict[str, _HyperliquidL2BookBboWsClient] = {}
+        self._spec = get_spec(Venue.HYPERLIQUID)
+
+    def _new_client(self, symbol: str) -> _HyperliquidL2BookBboWsClient:
+        canonical = str(symbol or "").strip().upper()
+        venue_symbol = canonical
+        if self._spec.symbol_to_venue is not None:
+            venue_symbol = self._spec.symbol_to_venue(canonical)
+        return _HyperliquidL2BookBboWsClient(
+            venue=self.venue,
+            symbol=canonical,
+            venue_symbol=str(venue_symbol or canonical),
+            cache=self._cache,
+        )
+
+    async def start(self, symbols: list[str]) -> None:
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol or "").strip().upper()
+            if not symbol or symbol in self._clients:
+                continue
+            client = self._new_client(symbol)
+            self._clients[symbol] = client
+            await client.start()
+
+    async def fetch_spread_bbo(
+        self,
+        symbols: list[str],
+    ) -> dict[str, TopBookQuote]:
+        now_ms = int(time.time() * 1000)
+        quotes: dict[str, TopBookQuote] = {}
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol or "").strip().upper()
+            quote = self._cache.get_quote(self.venue, symbol)
+            if quote is None:
+                continue
+            received_at_ms = int(quote.received_at_ms or 0)
+            if (
+                received_at_ms <= 0
+                or received_at_ms > now_ms
+                or now_ms - received_at_ms > self.max_age_ms
+            ):
+                continue
+            # The spread producer contract uses the local receipt timestamp as
+            # its anti-skew decision clock. The exchange event timestamp stays
+            # available separately on TopBookQuote.
+            quotes[f"{self.venue}:{symbol}"] = replace(
+                quote,
+                observed_at_ms=received_at_ms,
+                received_at_ms=received_at_ms,
+                exchange_event_at_ms=int(
+                    quote.exchange_event_at_ms or quote.observed_at_ms or 0
+                ),
+            )
+        return quotes
+
+    async def close(self) -> None:
+        clients = list(self._clients.items())
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(client.stop() for _symbol, client in clients),
+            return_exceptions=True,
+        )
+        failures: list[Exception] = []
+        for (symbol, client), result in zip(clients, results, strict=True):
+            if isinstance(result, BaseException):
+                failure = (
+                    result
+                    if isinstance(result, Exception)
+                    else RuntimeError(f"{type(result).__name__}: {result}")
+                )
+                failures.append(failure)
+                logger.error(
+                    "Hyperliquid spread BBO client stop failed: symbol=%s",
+                    symbol,
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                )
+                continue
+            if self._clients.get(symbol) is client:
+                self._clients.pop(symbol, None)
+        if failures:
+            raise ExceptionGroup(
+                "Hyperliquid spread BBO client shutdown failed",
+                failures,
+            )
 
 
 class SpreadMetadataCache:
@@ -81,10 +193,17 @@ class SpreadBboProcessService:
             # sub-second BBO publication TTL.
             max_age_ms=config.runtime.live_scan_last_good_max_age_ms,
         )
-        self.sources: dict[str, ExchangeSource] = {}
+        self.sources: dict[str, object] = {}
+        self.hyperliquid_source: HyperliquidSpreadBboSource | None = None
         for venue_config in config.venues:
             venue_name = str(venue_config.venue or "").strip().lower()
             if not venue_name or venue_name in self.sources:
+                continue
+            if venue_name == Venue.HYPERLIQUID.value:
+                self.hyperliquid_source = HyperliquidSpreadBboSource(
+                    max_age_ms=config.strategy.spread_signal_ttl_ms,
+                )
+                self.sources[venue_name] = self.hyperliquid_source
                 continue
             spec = get_spec(Venue.from_str(venue_name))
             self.sources[venue_name] = ExchangeSource(
@@ -116,10 +235,22 @@ class SpreadBboProcessService:
             )
             if sampling_symbols:
                 self.data_plane.set_sampling_symbols(sampling_symbols)
+                if self.hyperliquid_source is not None:
+                    # Start the complete bounded producer universe.  Filtering
+                    # by the current metadata generation would make a
+                    # transiently missing Hyperliquid generation permanent:
+                    # the source would own no stream when metadata later
+                    # recovered. Unsupported symbols simply produce no cached
+                    # quote and are not expected unless metadata contains them.
+                    await self.hyperliquid_source.start(sampling_symbols)
                 logger.info(
-                    "spread BBO sampling universe frozen: symbols=%d global_symbols=%d",
+                    "spread BBO sampling universe frozen: symbols=%d "
+                    "global_symbols=%d hyperliquid_ws_symbols=%d",
                     len(sampling_symbols),
                     len(self.config.symbols),
+                    len(sampling_symbols)
+                    if self.hyperliquid_source is not None
+                    else 0,
                 )
                 break
             try:
