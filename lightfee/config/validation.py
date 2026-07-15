@@ -521,8 +521,12 @@ def validate_config(config: AppConfig) -> list[str]:
         )
     if config.strategy.spread_signal_ttl_ms <= 0:
         issues.append("strategy.spread_signal_ttl_ms must be > 0")
+    if config.strategy.spread_signal_ttl_ms > 1_000:
+        issues.append("strategy.spread_signal_ttl_ms must be <= 1000")
     if config.strategy.spread_quote_skew_ms <= 0:
         issues.append("strategy.spread_quote_skew_ms must be > 0")
+    if config.strategy.spread_quote_skew_ms > 250:
+        issues.append("strategy.spread_quote_skew_ms must be <= 250")
     if not 0 < config.strategy.spread_stats_short_window_ms <= config.strategy.spread_stats_window_ms:
         issues.append(
             "strategy.spread_stats_short_window_ms must be within (0, spread_stats_window_ms]"

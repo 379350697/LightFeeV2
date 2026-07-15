@@ -54,22 +54,35 @@ async def _run(
 ) -> None:
     stop_event = asyncio.Event()
     cleanup_shutdown_handlers = install_shutdown_handlers(stop_event)
+    bbo_task: asyncio.Task[None] | None = None
 
     async def refresh_once_until_stop() -> bool:
         refresh_task = asyncio.create_task(service.refresh_once())
         stop_task = asyncio.create_task(stop_event.wait())
         try:
-            await asyncio.wait(
-                {refresh_task, stop_task},
+            waiters: set[asyncio.Task] = {refresh_task, stop_task}
+            if bbo_task is not None:
+                waiters.add(bbo_task)
+            done, _pending = await asyncio.wait(
+                waiters,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if stop_task.done() and not refresh_task.done():
-                refresh_task.cancel()
-                try:
-                    await refresh_task
-                except asyncio.CancelledError:
-                    pass
+            if stop_event.is_set():
+                if not refresh_task.done():
+                    refresh_task.cancel()
+                    try:
+                        await refresh_task
+                    except asyncio.CancelledError:
+                        pass
                 return False
+            if bbo_task is not None and bbo_task in done:
+                if not refresh_task.done():
+                    refresh_task.cancel()
+                    try:
+                        await refresh_task
+                    except asyncio.CancelledError:
+                        pass
+                await bbo_task
             await refresh_task
             return True
         except asyncio.CancelledError:
@@ -92,17 +105,52 @@ async def _run(
         if once:
             await refresh_once_until_stop()
             return
+        bbo_runner = getattr(service, "run_spread_bbo_data_plane", None)
+        if callable(bbo_runner):
+            bbo_task = asyncio.create_task(bbo_runner(stop_event))
+            # Establish compact-snapshot ownership before the slower metadata
+            # loop can publish its one-shot compatibility view.
+            await asyncio.sleep(0)
         while not stop_event.is_set():
             completed_refresh = await refresh_once_until_stop()
             if stop_event.is_set():
                 break
             if not completed_refresh:
                 break
+            if bbo_task is None:
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=refresh_interval_s,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                break
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=refresh_interval_s)
-            except asyncio.TimeoutError:
-                continue
+                stop_task = asyncio.create_task(stop_event.wait())
+                done, _pending = await asyncio.wait(
+                    {stop_task, bbo_task},
+                    timeout=refresh_interval_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if bbo_task in done:
+                    await bbo_task
+                if stop_task in done:
+                    break
+            finally:
+                if not stop_task.done():
+                    stop_task.cancel()
+                    try:
+                        await stop_task
+                    except asyncio.CancelledError:
+                        pass
     finally:
+        stop_event.set()
+        if bbo_task is not None:
+            if not bbo_task.done():
+                await bbo_task
+            else:
+                bbo_task.exception()
         cleanup_shutdown_handlers()
         await service.close()
 

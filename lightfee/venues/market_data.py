@@ -16,12 +16,15 @@ import random
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import httpx
 
 from lightfee.core.domain import Venue
 from lightfee.venues.specs import VenueSpec
+
+if TYPE_CHECKING:
+    from lightfee.marketdata.ws_bbo import TopBookQuote
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +310,7 @@ _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
 # avoids using a just-expired timestamp.
 _FUNDING_CACHE_MIN_FUTURE_MS = 30_000  # 30 seconds
 _GATE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
+_OKX_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
 _BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
 
 
@@ -393,6 +397,9 @@ class MarketDataClient:
         self._gate_contract_metadata_by_key: dict[
             str, tuple[dict[str, Any], int]
         ] = {}
+        self._okx_contract_metadata_by_key: dict[
+            str, tuple[dict[str, Any], int]
+        ] = {}
         self._binance_style_contract_metadata_by_key: dict[
             str, tuple[dict[str, Any], int]
         ] = {}
@@ -416,6 +423,16 @@ class MarketDataClient:
     @property
     def spec(self) -> VenueSpec:
         return self._spec
+
+    def share_contract_metadata_cache_from(self, other: "MarketDataClient") -> None:
+        """Share public contract evidence, never HTTP transport state."""
+        if self.venue != other.venue:
+            raise ValueError("contract metadata cache venue mismatch")
+        self._gate_contract_metadata_by_key = other._gate_contract_metadata_by_key
+        self._okx_contract_metadata_by_key = other._okx_contract_metadata_by_key
+        self._binance_style_contract_metadata_by_key = (
+            other._binance_style_contract_metadata_by_key
+        )
 
     # ------------------------------------------------------------------
     # HTTP lifecycle
@@ -484,13 +501,31 @@ class MarketDataClient:
                 scopes.append(f"group:{group_name}")
         return scopes
 
-    async def _public_get(self, path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    async def _public_get(self, path: str, params: Optional[dict[str, Any]] = None) -> Any:
         """Execute a public GET request with rate-limit pacing."""
         return await self._public_request("GET", path, params=params)
 
-    async def _public_post(self, path: str, body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    async def _public_post(self, path: str, body: Optional[dict[str, Any]] = None) -> Any:
         """Execute a public POST request with rate-limit pacing."""
         return await self._public_request("POST", path, body=body)
+
+    async def _public_get_with_received_at(
+        self,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+    ) -> tuple[Any, int]:
+        return await self._public_request_with_received_at(
+            "GET", path, params=params
+        )
+
+    async def _public_post_with_received_at(
+        self,
+        path: str,
+        body: Optional[dict[str, Any]] = None,
+    ) -> tuple[Any, int]:
+        return await self._public_request_with_received_at(
+            "POST", path, body=body
+        )
 
     async def _public_request(
         self,
@@ -498,8 +533,21 @@ class MarketDataClient:
         path: str,
         params: Optional[dict[str, Any]] = None,
         body: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Send a public HTTP request with scoped rate limiting."""
+        payload, _received_at_ms = await self._public_request_with_received_at(
+            method, path, params=params, body=body
+        )
+        return payload
+
+    async def _public_request_with_received_at(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
+    ) -> tuple[Any, int]:
+        """Send a request and watermark it immediately after response receipt."""
         client = await self._get_client()
         base_url = self._spec.public_base_url
         scopes = self._public_rate_limit_scopes(method, path)
@@ -521,6 +569,7 @@ class MarketDataClient:
                 resp = await client.post(url, json=body)
             else:
                 raise ValueError(f"unsupported method: {method}")
+            received_at_ms = _now_ms()
 
             if resp.status_code >= 400:
                 if resp.status_code in (429, 418):
@@ -545,12 +594,21 @@ class MarketDataClient:
                 self._rate_limiter.record_success_for_scopes(scopes)
 
             if not resp.text:
-                return {}
-            return resp.json()
+                return {}, received_at_ms
+            return resp.json(), received_at_ms
         except httpx.TimeoutException:
             raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"timeout: {method} {path}")
         except httpx.NetworkError as e:
             raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"network: {method} {path}: {e}")
+
+    async def fetch_top_book_quotes(
+        self,
+        symbols: list[str],
+    ) -> dict[str, "TopBookQuote"]:
+        """Fetch one lightweight venue-wide BBO payload without funding/OI."""
+        from lightfee.marketdata.bulk_bbo import fetch_top_book_quotes
+
+        return await fetch_top_book_quotes(self, symbols)
 
     # ------------------------------------------------------------------
     # Funding ticker fetch — main sidecar entry point
@@ -1743,6 +1801,11 @@ class MarketDataClient:
             instrument_id = str(instrument.get("instId", "") or "")
             if instrument_id in venue_sym_to_canon:
                 instrument_map[instrument_id] = instrument
+                canonical = venue_sym_to_canon[instrument_id]
+                self._okx_contract_metadata_by_key[f"{venue_str}:{canonical}"] = (
+                    dict(instrument),
+                    now_ms,
+                )
 
         # Funding-rate responses and the local funding cache do not prove the
         # current mark or index price.  Fetch both from their dedicated OKX

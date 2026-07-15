@@ -32,6 +32,7 @@ from lightfee.spread.quote_snapshot import (
 from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
+from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.venues.specs import get_spec
 
@@ -74,6 +75,7 @@ class SidecarService:
         self._candidate_service = self._new_candidate_service()
 
         self._exchange_sources: dict[str, ExchangeSource] = {}
+        self._spread_bbo_sources: dict[str, ExchangeSource] = {}
         self._liquidity_sources: dict[str, LiquiditySource] = {}
         from lightfee.venues.transport import EndpointRateLimiter
 
@@ -96,6 +98,18 @@ class SidecarService:
                 spec,
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+            )
+            # Isolate BBO connection capacity from funding/OI while retaining
+            # the venue-wide public rate-limit budget.
+            self._spread_bbo_sources[venue_name] = ExchangeSource(
+                spec,
+                rate_limiter=rate_limiter,
+                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+            )
+            self._spread_bbo_sources[
+                venue_name
+            ].share_contract_metadata_cache_from(
+                self._exchange_sources[venue_name]
             )
             self._liquidity_sources[venue_name] = LiquiditySource(
                 spec,
@@ -140,10 +154,19 @@ class SidecarService:
                 default=0,
             )
 
+        self._spread_bbo_data_plane = SpreadBboDataPlane(
+            config,
+            sources=self._spread_bbo_sources,
+            metadata_quotes=lambda: self._last_good_quotes,
+            metadata_quote_eligible=_quote_cache_contract_eligible,
+            snapshot_path=spread_quote_snapshot_path(self.snapshot_path),
+        )
+
     async def close(self) -> None:
         for group_name, sources in (
-            ("exchange", list(self._exchange_sources.values())),
-            ("liquidity", list(self._liquidity_sources.values())),
+            ("exchange", list(getattr(self, "_exchange_sources", {}).values())),
+            ("spread_bbo", list(getattr(self, "_spread_bbo_sources", {}).values())),
+            ("liquidity", list(getattr(self, "_liquidity_sources", {}).values())),
         ):
             for src in sources:
                 try:
@@ -153,6 +176,9 @@ class SidecarService:
                         "sidecar source close failed; continuing resource cleanup",
                         extra={"source_group": group_name},
                     )
+
+    async def run_spread_bbo_data_plane(self, stop_event: asyncio.Event) -> None:
+        await self._spread_bbo_data_plane.run(stop_event)
 
     # ------------------------------------------------------------------
     # Main refresh
@@ -453,27 +479,29 @@ class SidecarService:
             spread_degraded_symbols[venue] = sorted(
                 set(spread_degraded_symbols.get(venue, [])) | symbols
             )
-        try:
-            publish_spread_quote_snapshot(
-                SpreadQuoteSnapshot(
-                    published_at_ms=spread_quote_published_at_ms,
-                    market_observed_at_ms=_latest_valid_quote_observation_ms(
-                        spread_quotes,
-                        decision_at_ms=spread_quote_published_at_ms,
-                        fallback_ms=refresh_started_at_ms,
+        data_plane = getattr(self, "_spread_bbo_data_plane", None)
+        if not bool(getattr(data_plane, "active", False)):
+            try:
+                publish_spread_quote_snapshot(
+                    SpreadQuoteSnapshot(
+                        published_at_ms=spread_quote_published_at_ms,
+                        market_observed_at_ms=_latest_valid_quote_observation_ms(
+                            spread_quotes,
+                            decision_at_ms=spread_quote_published_at_ms,
+                            fallback_ms=refresh_started_at_ms,
+                        ),
+                        batch_started_at_ms=refresh_started_at_ms,
+                        configured_venues=sorted(self._configured_venue_names()),
+                        degraded_venues=sorted(spread_market_degraded_venues),
+                        degraded_symbols=spread_degraded_symbols,
+                        quotes=spread_quotes,
                     ),
-                    batch_started_at_ms=refresh_started_at_ms,
-                    configured_venues=sorted(self._configured_venue_names()),
-                    degraded_venues=sorted(spread_market_degraded_venues),
-                    degraded_symbols=spread_degraded_symbols,
-                    quotes=spread_quotes,
-                ),
-                spread_quote_snapshot_path(self.snapshot_path),
-            )
-        except (OSError, TypeError, ValueError):
-            # Keep funding/live publication independent.  The spread reader
-            # will fail stale/closed if the previous compact view ages out.
-            logger.exception("spread quote fast-path publication failed")
+                    spread_quote_snapshot_path(self.snapshot_path),
+                )
+            except (OSError, TypeError, ValueError):
+                # One-shot/recovery compatibility only.  The normal service
+                # gives compact publication ownership to the BBO data plane.
+                logger.exception("spread quote compatibility publication failed")
 
         # --- Liquidity fetch (independent domain, own timeout, own source) ---
         liquidity_results = await self._fetch_liquidity_all_venues(
