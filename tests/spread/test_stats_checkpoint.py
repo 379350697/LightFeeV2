@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
+import lightfee.spread.service as service_module
 from lightfee.spread.reversion import SpreadStatsTracker
+from lightfee.spread.service import SpreadSidecarService
 from lightfee.spread.stats_checkpoint import (
     SPREAD_STATS_CHECKPOINT_SCHEMA_VERSION,
     publish_spread_stats_checkpoint,
@@ -138,3 +141,64 @@ def test_stats_tracker_rejects_nonfinite_online_observation() -> None:
     state = tracker.snapshot("BTCUSDT", "alpha", "beta", now_ms=1_000)
     assert state is not None
     assert state.sample_count == 0
+    assert tracker.revision == 0
+
+
+def test_stats_tracker_revision_only_advances_for_new_market_evidence() -> None:
+    tracker = SpreadStatsTracker()
+
+    tracker.update("BTCUSDT", "alpha", "beta", 1.0, observed_at_ms=1_000)
+    assert tracker.revision == 1
+
+    tracker.update("BTCUSDT", "alpha", "beta", 2.0, observed_at_ms=1_000)
+    assert tracker.revision == 1
+
+    checkpoint = tracker.checkpoint(now_ms=1_000)
+    restored = SpreadStatsTracker()
+    assert restored.restore(checkpoint, now_ms=1_000)
+    assert restored.revision == 0
+
+
+def test_service_checkpoints_only_dirty_state_at_bounded_intervals(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SpreadSidecarService)
+    service.stats = SpreadStatsTracker()
+    service.stats_checkpoint_path = tmp_path / "spread-stats.json"
+    service.signal_config = SimpleNamespace(model_epoch="test-epoch")
+    service._stats_checkpoint_persisted_revision = service.stats.revision
+    service._stats_checkpoint_last_attempt_ms = 1_000
+    calls: list[tuple[int, int]] = []
+
+    def record_checkpoint(tracker, _path, *, model_epoch, now_ms) -> None:
+        assert model_epoch == "test-epoch"
+        calls.append((tracker.revision, now_ms))
+
+    monkeypatch.setattr(
+        service_module,
+        "publish_spread_stats_checkpoint",
+        record_checkpoint,
+    )
+
+    assert not service._checkpoint_stats_if_due(31_000)
+    service.stats.update(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        1.0,
+        observed_at_ms=31_001,
+    )
+    assert service._checkpoint_stats_if_due(31_001)
+    assert calls == [(1, 31_001)]
+
+    service.stats.update(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        2.0,
+        observed_at_ms=31_002,
+    )
+    assert not service._checkpoint_stats_if_due(31_002)
+    assert service._checkpoint_stats_if_due(31_002, force=True)
+    assert calls == [(1, 31_001), (2, 31_002)]

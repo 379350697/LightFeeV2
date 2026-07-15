@@ -48,6 +48,7 @@ _PAPER_JOURNAL_EPOCH_VERSION = 2
 _PAPER_JOURNAL_GENESIS_PURPOSE = "spread_paper_genesis"
 _PAPER_JOURNAL_EVENT_PURPOSE = "spread_paper_events"
 _PAPER_JOURNAL_MIN_HARD_MAX_BYTES = 16_384
+_STATS_CHECKPOINT_MIN_INTERVAL_MS = 30_000
 
 
 def _paper_journal_head_path(journal_path: str | Path) -> Path:
@@ -361,6 +362,8 @@ class SpreadSidecarService:
         self.stats_checkpoint_path = config.runtime.spread_stats_checkpoint_path
         self._stats_checkpoint_loaded = False
         self._stats_checkpoint_restored = False
+        self._stats_checkpoint_persisted_revision = self.stats.revision
+        self._stats_checkpoint_last_attempt_ms = 0
         self._paper_journal: Journal | None = None
         self._paper_tracker = SpreadPaperTracker(
             self._paper_config(config, fee_evidence=self._fee_evidence)
@@ -446,6 +449,11 @@ class SpreadSidecarService:
                 self._paper_tracker.invalidate_replay()
 
     async def close(self) -> None:
+        if hasattr(self, "stats"):
+            try:
+                self._checkpoint_stats_if_due(int(time.time() * 1000), force=True)
+            except OSError:
+                logger.exception("final spread stats checkpoint publish failed")
         if self._paper_journal is not None:
             try:
                 self._paper_journal.close()
@@ -477,12 +485,7 @@ class SpreadSidecarService:
             diagnostics=evaluation_diagnostics,
         )
         try:
-            publish_spread_stats_checkpoint(
-                self.stats,
-                self.stats_checkpoint_path,
-                model_epoch=self.signal_config.model_epoch,
-                now_ms=decision_at_ms,
-            )
+            self._checkpoint_stats_if_due(decision_at_ms)
         except OSError:
             # The next process starts cold if this fails, which is safe because
             # `SpreadStatsTracker` refuses entries until it has fresh samples.
@@ -535,6 +538,37 @@ class SpreadSidecarService:
             model_epoch=self.signal_config.model_epoch,
             now_ms=now_ms,
         )
+        # Restoration establishes the durable baseline.  A new market sample
+        # marks the tracker dirty through its monotonic revision; unchanged
+        # state must never trigger a multi-megabyte rewrite on every quote
+        # refresh.
+        self._stats_checkpoint_persisted_revision = self.stats.revision
+        self._stats_checkpoint_last_attempt_ms = max(int(now_ms or 0), 0)
+
+    def _checkpoint_stats_if_due(self, now_ms: int, *, force: bool = False) -> bool:
+        revision = self.stats.revision
+        if revision == self._stats_checkpoint_persisted_revision:
+            return False
+        observed_ms = max(int(now_ms or 0), 0)
+        if (
+            not force
+            and self._stats_checkpoint_last_attempt_ms > 0
+            and observed_ms - self._stats_checkpoint_last_attempt_ms
+            < _STATS_CHECKPOINT_MIN_INTERVAL_MS
+        ):
+            return False
+        # Rate-limit failures as well as successes.  A full or temporarily
+        # unwritable disk must not turn the 250 ms signal loop into a tight
+        # checkpoint retry loop.
+        self._stats_checkpoint_last_attempt_ms = observed_ms
+        publish_spread_stats_checkpoint(
+            self.stats,
+            self.stats_checkpoint_path,
+            model_epoch=self.signal_config.model_epoch,
+            now_ms=observed_ms,
+        )
+        self._stats_checkpoint_persisted_revision = revision
+        return True
 
     async def _refresh_paper(
         self,

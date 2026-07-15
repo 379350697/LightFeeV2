@@ -202,6 +202,12 @@ class SpreadStatsTracker:
         self.structural_break_consecutive = max(int(structural_break_consecutive or 0), 1)
         self.structural_break_cooldown_ms = max(int(structural_break_cooldown_ms or 0), 0)
         self._states: dict[tuple[str, str, str], _RollingState] = {}
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        """Monotonic generation for economically relevant state changes."""
+        return self._revision
 
     def configure(self, config: SpreadReversionConfig) -> None:
         self.window_ms = max(int(config.stats_window_ms or 0), 1)
@@ -258,6 +264,7 @@ class SpreadStatsTracker:
             state.samples.clear()
             state.cooldown_until_ms = observed_ms + self.structural_break_cooldown_ms
             state.break_consecutive = 0
+        self._revision += 1
         return self._snapshot(state, now_ms=observed_ms, structural_break=structural_break)
 
     def snapshot(
@@ -304,6 +311,7 @@ class SpreadStatsTracker:
         whole checkpoint rather than skipping individual rows.
         """
         self._states.clear()
+        self._revision = 0
         if not isinstance(checkpoint, dict):
             return False
         restore_now = max(int(now_ms or 0), 0)

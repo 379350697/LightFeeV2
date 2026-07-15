@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from pathlib import Path
+
+import orjson
 
 from lightfee.spread.reversion import SpreadStatsTracker
 
@@ -32,8 +33,8 @@ def restore_spread_stats_checkpoint(
 
     source = Path(path)
     try:
-        raw = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        raw = orjson.loads(source.read_bytes())
+    except (OSError, orjson.JSONDecodeError):
         return False
     if not isinstance(raw, dict):
         return False
@@ -89,17 +90,20 @@ def publish_spread_stats_checkpoint(
     os.close(fd)
     temporary = Path(tmp_name)
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(
-                payload,
-                handle,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
+        content = orjson.dumps(payload)
+        with temporary.open("wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(target)
+        directory_fd = os.open(
+            target.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         if temporary.exists():
             temporary.unlink()
