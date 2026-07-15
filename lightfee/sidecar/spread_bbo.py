@@ -191,10 +191,14 @@ class SpreadBboDataPlane:
             if snapshot is None:
                 continue
             try:
+                # _accept_venue_update is this transport's trust boundary.
+                # Re-running the generic 51-field JSON validator here costs
+                # more than the entire freshness budget on the production VM.
                 await asyncio.to_thread(
                     publish_spread_quote_snapshot,
                     snapshot,
                     self.snapshot_path,
+                    validate_contract=False,
                 )
                 next_publish_at = loop.time() + publish_interval_s
             except (OSError, TypeError, ValueError):

@@ -10,11 +10,12 @@ observation before it can be sampled.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-import json
 from math import isfinite
 import os
 from pathlib import Path
 import tempfile
+
+import orjson
 
 from lightfee.sidecar.snapshot import QuoteSnapshot, _quote_field_contract_errors
 
@@ -48,21 +49,43 @@ def spread_quote_snapshot_path(sidecar_snapshot_path: str | Path) -> Path:
 def publish_spread_quote_snapshot(
     snapshot: SpreadQuoteSnapshot,
     path: str | Path,
+    *,
+    validate_contract: bool = True,
 ) -> None:
+    """Atomically publish JSON; only a fully checked producer may skip validation.
+
+    The independent BBO producer validates identity, receipt timestamps and
+    BBO numerics, then overlays them only on the main producer's typed,
+    contract-eligible last-good cache.  Avoiding a second 51-field Python
+    validation pass keeps that trusted hot path below its freshness budget.
+    All other callers retain the strict default, and every consumer validates
+    the file again.
+    """
+
     data = _snapshot_to_dict(snapshot)
-    errors = validate_spread_quote_snapshot_contract(data)
-    if errors:
-        raise ValueError(
-            "refusing to publish invalid spread quote snapshot: " + "; ".join(errors)
-        )
+    if validate_contract:
+        errors = validate_spread_quote_snapshot_contract(data)
+        if errors:
+            raise ValueError(
+                "refusing to publish invalid spread quote snapshot: "
+                + "; ".join(errors)
+            )
+    else:
+        errors = _hot_path_snapshot_errors(snapshot)
+        if errors:
+            raise ValueError(
+                "refusing to publish invalid prevalidated spread quote snapshot: "
+                + "; ".join(errors)
+            )
+    payload = orjson.dumps(data)
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".spread-quotes-")
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        with open(tmp, "w") as handle:
-            json.dump(data, handle, ensure_ascii=False, separators=(",", ":"))
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
             handle.flush()
         # This is an ephemeral, fail-closed market-data view which is replaced
         # several times per second.  Atomic rename protects readers from torn
@@ -81,9 +104,8 @@ def load_spread_quote_snapshot(path: str | Path) -> SpreadQuoteSnapshot | None:
     if not target.exists():
         return None
     try:
-        with open(target) as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
+        data = orjson.loads(target.read_bytes())
+    except (OSError, orjson.JSONDecodeError, TypeError, ValueError, OverflowError):
         return None
     if validate_spread_quote_snapshot_contract(data):
         return None
@@ -242,6 +264,64 @@ def validate_spread_quote_snapshot_contract(raw: object) -> list[str]:
             if type(published_at_ms) is int and quote_observed_at_ms > published_at_ms:
                 errors.append(f"quote_from_future:{key}")
     if observed and timestamps.get("market_observed_at_ms") != max(observed):
+        errors.append("market_observed_at_ms_mismatch")
+    return errors
+
+
+def _hot_path_snapshot_errors(snapshot: SpreadQuoteSnapshot) -> list[str]:
+    """Check volatile trust-boundary invariants without revalidating metadata."""
+
+    errors: list[str] = []
+    published_at_ms = int(snapshot.published_at_ms or 0)
+    market_observed_at_ms = int(snapshot.market_observed_at_ms or 0)
+    batch_started_at_ms = int(snapshot.batch_started_at_ms or 0)
+    if not (
+        0 < batch_started_at_ms <= published_at_ms
+        and 0 < market_observed_at_ms <= published_at_ms
+    ):
+        errors.append("watermark_order_invalid")
+    configured = set(snapshot.configured_venues)
+    if not configured or len(configured) != len(snapshot.configured_venues):
+        errors.append("configured_venues_invalid")
+    if any(venue not in configured for venue in snapshot.degraded_venues):
+        errors.append("degraded_venues_invalid")
+
+    observed: list[int] = []
+    for key, quote in snapshot.quotes.items():
+        venue = str(quote.venue or "")
+        symbol = str(quote.symbol or "")
+        quote_observed_at_ms = int(quote.observed_at_ms or 0)
+        numeric = (
+            quote.bid,
+            quote.ask,
+            quote.bid_size,
+            quote.ask_size,
+        )
+        if key != f"{venue}:{symbol}" or venue not in configured:
+            errors.append(f"quote_identity_invalid:{key}")
+        if (
+            venue != venue.strip().lower()
+            or symbol != symbol.strip().upper()
+            or not venue
+            or not symbol
+        ):
+            errors.append(f"quote_identity_not_canonical:{key}")
+        if not all(type(value) in (int, float) and isfinite(float(value)) for value in numeric):
+            errors.append(f"quote_bbo_type_invalid:{key}")
+        elif not (
+            float(quote.bid) > 0.0
+            and float(quote.ask) >= float(quote.bid)
+            and float(quote.bid_size) >= 0.0
+            and float(quote.ask_size) >= 0.0
+        ):
+            errors.append(f"quote_bbo_invalid:{key}")
+        if quote_observed_at_ms <= 0 or quote_observed_at_ms > published_at_ms:
+            errors.append(f"quote_from_future:{key}")
+        else:
+            observed.append(quote_observed_at_ms)
+    if not observed:
+        errors.append("quotes_invalid")
+    elif market_observed_at_ms != max(observed):
         errors.append("market_observed_at_ms_mismatch")
     return errors
 

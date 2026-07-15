@@ -73,6 +73,25 @@ def test_spread_quote_snapshot_rejects_future_quote_without_replacing_last_good(
     assert path.read_bytes() == before
 
 
+def test_prevalidated_hot_path_still_rejects_future_quote(tmp_path) -> None:
+    path = tmp_path / "quotes.json"
+    publish_spread_quote_snapshot(_snapshot(), path)
+    before = path.read_bytes()
+
+    try:
+        publish_spread_quote_snapshot(
+            _snapshot(observed_at_ms=1_300),
+            path,
+            validate_contract=False,
+        )
+    except ValueError as exc:
+        assert "quote_from_future" in str(exc) or "watermark_order_invalid" in str(exc)
+    else:
+        raise AssertionError("prevalidated hot path must fail closed")
+
+    assert path.read_bytes() == before
+
+
 def test_spread_quote_snapshot_rejects_unknown_or_mismatched_identity(tmp_path) -> None:
     path = tmp_path / "quotes.json"
     publish_spread_quote_snapshot(_snapshot(), path)
