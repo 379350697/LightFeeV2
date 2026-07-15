@@ -37,7 +37,10 @@ def test_spread_reversion_config_defaults_are_disabled_and_small() -> None:
     assert strategy.spread_stats_window_ms == 21_600_000
     assert strategy.spread_stats_max_samples == 7_200
     assert strategy.spread_paper_bot_ids == ["tt_conservative"]
-    assert strategy.spread_paper_research_manifest_path == "config/research/spread_v2_signed_reversion.json"
+    assert (
+        strategy.spread_paper_research_manifest_path
+        == "config/research/spread_v2_signed_reversion.json"
+    )
     assert strategy.spread_paper_primary_fill_model == "taker_taker"
     assert strategy.spread_paper_require_taker_taker is True
     assert strategy.spread_paper_markout_secs == [60, 300, 900, 1800]
@@ -136,7 +139,10 @@ venue = "okx"
     assert config.strategy.spread_live_enabled is False
     assert config.strategy.spread_model_epoch == "v2_signed_reversion"
     assert config.strategy.spread_paper_bot_ids == ["tt_conservative"]
-    assert config.strategy.spread_paper_research_manifest_path == "config/research/spread_v2_signed_reversion.json"
+    assert (
+        config.strategy.spread_paper_research_manifest_path
+        == "config/research/spread_v2_signed_reversion.json"
+    )
     assert config.strategy.spread_paper_primary_fill_model == "taker_taker"
     assert config.strategy.spread_paper_require_taker_taker is True
     assert config.strategy.spread_paper_markout_secs == [10, 20]
@@ -179,3 +185,16 @@ def test_singleton_counts_spread_sidecar_separately() -> None:
     assert len(sidecars) == 1
     assert len(spread_sidecars) == 1
     assert len(lives) == 1
+
+
+def test_strict_singleton_requires_one_process(capsys) -> None:
+    assert singleton.check_singleton("spread-bbo", [], min_required=1) is False
+    assert (
+        singleton.check_singleton(
+            "spread-bbo",
+            [{"pid": 7, "command": "python -m lightfee.apps.spread_bbo"}],
+            min_required=1,
+        )
+        is True
+    )
+    assert "VIOLATION" in capsys.readouterr().out

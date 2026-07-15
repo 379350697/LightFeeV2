@@ -28,12 +28,16 @@ from lightfee.sidecar.snapshot import (
 from lightfee.spread.quote_snapshot import (
     SpreadQuoteSnapshot,
     publish_spread_quote_snapshot,
+    spread_metadata_snapshot_path,
     spread_quote_snapshot_path,
 )
 from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
-from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
+from lightfee.sidecar.spread_bbo import (
+    SpreadBboDataPlane,
+    quote_cache_contract_eligible as _quote_cache_contract_eligible,
+)
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.venues.specs import get_spec
 
@@ -57,8 +61,9 @@ class SidecarService:
     quotes for that venue so candidates are not lost.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, enable_spread_bbo: bool = True) -> None:
         self.config = config
+        self.embedded_spread_bbo_enabled = bool(enable_spread_bbo)
         self._venue_configs_by_name = _canonical_venue_configs(config.venues)
         self.snapshot_path = config.runtime.sidecar_snapshot_path
         self._forecast_calibrator = FundingForecastCalibrator(
@@ -105,19 +110,20 @@ class SidecarService:
             # requests and honours any 429 it receives, but funding/OI cannot
             # consume its slots or bind it to the main event loop's cooldown
             # runtime.  Four bulk requests/sec is deliberately conservative.
-            bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
-            self._spread_bbo_rate_limiters[venue_name] = bbo_rate_limiter
-            self._spread_bbo_sources[venue_name] = ExchangeSource(
-                spec,
-                rate_limiter=bbo_rate_limiter,
-                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-                consume_global_rate_limit_budget=False,
-            )
-            self._spread_bbo_sources[
-                venue_name
-            ].share_contract_metadata_cache_from(
-                self._exchange_sources[venue_name]
-            )
+            if self.embedded_spread_bbo_enabled:
+                bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
+                self._spread_bbo_rate_limiters[venue_name] = bbo_rate_limiter
+                self._spread_bbo_sources[venue_name] = ExchangeSource(
+                    spec,
+                    rate_limiter=bbo_rate_limiter,
+                    http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+                    consume_global_rate_limit_budget=False,
+                )
+                self._spread_bbo_sources[
+                    venue_name
+                ].share_contract_metadata_cache_from(
+                    self._exchange_sources[venue_name]
+                )
             self._liquidity_sources[venue_name] = LiquiditySource(
                 spec,
                 rate_limiter=rate_limiter,
@@ -161,12 +167,16 @@ class SidecarService:
                 default=0,
             )
 
-        self._spread_bbo_data_plane = SpreadBboDataPlane(
-            config,
-            sources=self._spread_bbo_sources,
-            metadata_quotes=lambda: self._last_good_quotes,
-            metadata_quote_eligible=_quote_cache_contract_eligible,
-            snapshot_path=spread_quote_snapshot_path(self.snapshot_path),
+        self._spread_bbo_data_plane = (
+            SpreadBboDataPlane(
+                config,
+                sources=self._spread_bbo_sources,
+                metadata_quotes=lambda: self._last_good_quotes,
+                metadata_quote_eligible=_quote_cache_contract_eligible,
+                snapshot_path=spread_quote_snapshot_path(self.snapshot_path),
+            )
+            if self.embedded_spread_bbo_enabled
+            else None
         )
 
     async def close(self) -> None:
@@ -185,6 +195,8 @@ class SidecarService:
                     )
 
     async def run_spread_bbo_data_plane(self, stop_event: asyncio.Event) -> None:
+        if self._spread_bbo_data_plane is None:
+            raise RuntimeError("embedded spread BBO data plane is disabled")
         thread_stop = threading.Event()
         runner = asyncio.create_task(
             asyncio.to_thread(
@@ -516,7 +528,9 @@ class SidecarService:
                 set(spread_degraded_symbols.get(venue, [])) | symbols
             )
         data_plane = getattr(self, "_spread_bbo_data_plane", None)
-        if not bool(getattr(data_plane, "active", False)):
+        if bool(getattr(self, "embedded_spread_bbo_enabled", True)) and not bool(
+            getattr(data_plane, "active", False)
+        ):
             try:
                 publish_spread_quote_snapshot(
                     SpreadQuoteSnapshot(
@@ -722,6 +736,33 @@ class SidecarService:
             fresh_cacheable_quote_keys,
             published_at_ms=published_ms,
         )
+        if not bool(getattr(self, "embedded_spread_bbo_enabled", True)):
+            try:
+                metadata_quotes = dict(self._last_good_quotes)
+                if metadata_quotes:
+                    publish_spread_quote_snapshot(
+                        SpreadQuoteSnapshot(
+                            published_at_ms=published_ms,
+                            market_observed_at_ms=_latest_valid_quote_observation_ms(
+                                metadata_quotes,
+                                decision_at_ms=published_ms,
+                                fallback_ms=refresh_started_at_ms,
+                            ),
+                            batch_started_at_ms=refresh_started_at_ms,
+                            configured_venues=sorted(self._configured_venue_names()),
+                            degraded_venues=sorted(degraded_venues),
+                            degraded_symbols={
+                                venue: list(symbols)
+                                for venue, symbols in degraded_symbols.items()
+                                if symbols
+                            },
+                            quotes=metadata_quotes,
+                        ),
+                        spread_metadata_snapshot_path(self.snapshot_path),
+                        validate_contract=False,
+                    )
+            except (OSError, TypeError, ValueError):
+                logger.exception("spread metadata handoff publication failed")
 
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,
@@ -1123,60 +1164,6 @@ def _resolve_acquisition_mode(
 
 def _canonical_symbol_set(symbols: list[str]) -> set[str]:
     return {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
-
-
-def _quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
-    """Whether one quote is safe to advance per-leg funding last-good truth."""
-    if quote.contract_normalization_complete is not True:
-        return False
-    if str(quote.contract_type or "").strip().lower() != "linear":
-        return False
-    if str(quote.venue_status or "").strip().lower() != "active":
-        return False
-    if not all(
-        str(value or "").strip()
-        for value in (
-            quote.underlying,
-            quote.quote_currency,
-            quote.mark_index_source,
-        )
-    ):
-        return False
-    multiplier = quote.contract_multiplier
-    if (
-        isinstance(multiplier, bool)
-        or not isinstance(multiplier, (int, float))
-        or not isfinite(float(multiplier))
-        or float(multiplier) <= 0.0
-    ):
-        return False
-    precision_valid = all(
-        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        for value in (quote.price_precision, quote.quantity_precision)
-    )
-    exact_contract_valid = all(
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and isfinite(float(value))
-        and float(value) > 0.0
-        for value in (
-            quote.price_tick,
-            quote.quantity_step_base,
-            quote.min_quantity_base,
-        )
-    )
-    min_notional_valid = bool(
-        quote.min_notional_evidence_complete is True
-        and isinstance(quote.min_notional_quote, (int, float))
-        and not isinstance(quote.min_notional_quote, bool)
-        and isfinite(float(quote.min_notional_quote))
-        and float(quote.min_notional_quote) >= 0.0
-    )
-    schedule_valid = all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in (quote.funding_timestamp_ms, quote.funding_interval_ms)
-    )
-    return precision_valid and exact_contract_valid and min_notional_valid and schedule_valid
 
 
 def _restorable_prior_last_good_quotes(

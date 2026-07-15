@@ -1,7 +1,7 @@
 [Unit]
-Description=LightFee V2 Sidecar
-After=network-online.target
-Wants=network-online.target
+Description=LightFee V2 Dedicated Spread BBO Data Plane
+After=network-online.target lightfee-sidecar.service
+Wants=network-online.target lightfee-sidecar.service
 
 [Service]
 Type=simple
@@ -9,8 +9,7 @@ User=root
 WorkingDirectory=/opt/lightfee-v2
 EnvironmentFile=/etc/lightfee/lightfee.env
 Environment=LIGHTFEE_PRODUCTION_GUARD=1
-Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1
-ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml
+ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml
 LimitNOFILE=65536
 Restart=always
 RestartSec=5

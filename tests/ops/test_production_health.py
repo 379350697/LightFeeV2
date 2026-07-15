@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from lightfee.ops.production_health import (
     analyze_current_state,
@@ -282,9 +283,7 @@ def test_snapshot_cannot_be_green_when_funding_coverage_is_unproved():
     assert "funding_interval_evidence_incomplete" in report.fingerprints
     assert report.details["funding_interval_known_counts_by_venue"]["binance"] == 0
     assert report.details["funding_interval_quote_counts_by_venue"]["binance"] == 1
-    assert report.details["funding_interval_missing_quote_keys"] == [
-        "binance:BTCUSDT"
-    ]
+    assert report.details["funding_interval_missing_quote_keys"] == ["binance:BTCUSDT"]
     assert (
         "lifecycle_coverage_exceeds_quote_symbols:funding:binance"
         in report.details["contract_errors"]
@@ -302,10 +301,7 @@ def test_snapshot_rejects_lifecycle_total_above_requested_universe():
     )
 
     assert not report.ok
-    assert (
-        "lifecycle_requested_count_exceeded:funding:aster"
-        in report.details["contract_errors"]
-    )
+    assert "lifecycle_requested_count_exceeded:funding:aster" in report.details["contract_errors"]
 
 
 def test_snapshot_rejects_lifecycle_total_below_returned_quote_universe():
@@ -327,17 +323,12 @@ def test_snapshot_rejects_lifecycle_total_below_returned_quote_universe():
     )
 
     assert not report.ok
-    assert (
-        "lifecycle_total_below_quote_symbols:funding:aster"
-        in report.details["contract_errors"]
-    )
+    assert "lifecycle_total_below_quote_symbols:funding:aster" in report.details["contract_errors"]
 
 
 def test_snapshot_rejects_arbitrary_seven_venues_replacing_expected_venue():
     snapshot = _fresh_seven_venue_snapshot()
-    snapshot["quotes"]["mexc:BTCUSDT"] = snapshot["quotes"].pop(
-        "aster:BTCUSDT"
-    )
+    snapshot["quotes"]["mexc:BTCUSDT"] = snapshot["quotes"].pop("aster:BTCUSDT")
     snapshot["quotes"]["mexc:BTCUSDT"]["venue"] = "mexc"
     for lifecycle_field in (
         "funding_lifecycle",
@@ -348,11 +339,7 @@ def test_snapshot_rejects_arbitrary_seven_venues_replacing_expected_venue():
             if record["venue"] == "aster":
                 record["venue"] = "mexc"
     snapshot["candidate_build_diagnostics"]["requested_venues"] = sorted(
-        {"mexc"}
-        | (
-            set(snapshot["candidate_build_diagnostics"]["requested_venues"])
-            - {"aster"}
-        )
+        {"mexc"} | (set(snapshot["candidate_build_diagnostics"]["requested_venues"]) - {"aster"})
     )
 
     report = analyze_sidecar_snapshot(
@@ -434,9 +421,7 @@ def test_snapshot_declared_degradation_cannot_be_production_green():
     snapshot["degraded_venues"] = ["aster"]
     snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
     snapshot["acquisition_mode"] = "degraded_sidecar"
-    aster_market = next(
-        row for row in snapshot["market_lifecycle"] if row["venue"] == "aster"
-    )
+    aster_market = next(row for row in snapshot["market_lifecycle"] if row["venue"] == "aster")
     aster_market["coverage_usable"] = 0
     aster_market["degraded_reason"] = "BTCUSDT: crossed BBO"
     aster_liquidity = next(
@@ -462,9 +447,7 @@ def test_snapshot_scoped_symbol_degradation_keeps_healthy_candidates_green():
     snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
     snapshot["acquisition_mode"] = "degraded_sidecar"
     for lifecycle_name in ("market_lifecycle", "liquidity_lifecycle"):
-        lifecycle = next(
-            row for row in snapshot[lifecycle_name] if row["venue"] == "aster"
-        )
+        lifecycle = next(row for row in snapshot[lifecycle_name] if row["venue"] == "aster")
         lifecycle["coverage_usable"] = 0
         lifecycle["degraded_reason"] = "BTCUSDT: crossed BBO"
     snapshot["candidate_build_diagnostics"].update(
@@ -493,9 +476,7 @@ def test_snapshot_unscoped_interval_gap_remains_critical_with_healthy_candidates
     snapshot = _fresh_seven_venue_snapshot()
     snapshot["quotes"]["okx:BTCUSDT"]["funding_interval_ms"] = 0
     snapshot["funding_lifecycle"][-1]["coverage_usable"] = 0
-    snapshot["funding_lifecycle"][-1]["degraded_reason"] = (
-        "BTCUSDT: funding_interval_ms_invalid"
-    )
+    snapshot["funding_lifecycle"][-1]["degraded_reason"] = "BTCUSDT: funding_interval_ms_invalid"
     snapshot["candidate_build_diagnostics"].update(
         {"directional_pair_count": 1, "output_candidate_count": 1}
     )
@@ -1049,6 +1030,90 @@ def test_verifier_spread_ttl_uses_runtime_policy_unless_cli_overrides():
     assert vps._resolve_spread_snapshot_max_age_ms(None, None) == 60_000
 
 
+def test_systemd_active_report_fails_closed_on_inactive(monkeypatch):
+    monkeypatch.setattr(
+        vps.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=3,
+            stdout="inactive\n",
+            stderr="",
+        ),
+    )
+
+    report = vps._systemd_active_report("lightfee-spread-bbo.service")
+
+    assert not report.ok
+    assert "systemd_service_not_active" in report.fingerprints
+
+
+def test_spread_bbo_runtime_rejects_snapshot_from_previous_process(monkeypatch):
+    now_ms = 1_778_787_000_000
+    snapshot = SimpleNamespace(
+        published_at_ms=now_ms - 100,
+        batch_started_at_ms=now_ms - 10_000,
+        producer_generation_id="boot:41",
+        configured_venues=["okx"],
+        quotes={
+            "okx:BTCUSDT": SimpleNamespace(
+                venue="okx",
+                observed_at_ms=now_ms - 100,
+            )
+        },
+    )
+    config = SimpleNamespace(
+        venues=[SimpleNamespace(venue="okx")],
+        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: now_ms - 1_000)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=now_ms,
+    )
+
+    assert not report.ok
+    assert "spread_bbo_snapshot_generation_mismatch" in report.fingerprints
+
+
+def test_spread_bbo_runtime_samples_clock_after_snapshot_load(monkeypatch):
+    published_at_ms = 2_000
+    snapshot = SimpleNamespace(
+        published_at_ms=published_at_ms,
+        batch_started_at_ms=1_900,
+        producer_generation_id="boot:42",
+        configured_venues=["okx"],
+        quotes={
+            "okx:BTCUSDT": SimpleNamespace(
+                venue="okx",
+                observed_at_ms=published_at_ms,
+            )
+        },
+    )
+    config = SimpleNamespace(
+        venues=[SimpleNamespace(venue="okx")],
+        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps.time, "time", lambda: 2.1)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_800)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=None,
+    )
+
+    assert report.ok
+    assert report.details["checked_at_ms"] == 2_100
+
+
 def test_current_state_flags_stale_fail_closed_clean_state():
     state = {
         "lifecycle": "running",
@@ -1592,10 +1657,18 @@ def test_verify_production_services_cli_json_success(tmp_path):
     (unit_dir / "lightfee-sidecar.service").write_text(
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1\n"
         "ExecStart=/root/projects/LightFee/target/release/opportunity_input_sidecar --config /root/projects/LightFee/config/live.auto.toml\n"
         "LimitNOFILE=65536\n"
     )
+    (unit_dir / "lightfee-spread-bbo.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
+        "LimitNOFILE=65536\n"
+    )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
+        "[Unit]\nWants=lightfee-spread-bbo.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -1671,9 +1744,9 @@ def test_verify_production_services_cli_json_success(tmp_path):
                 "paper_refresh_status": "disabled",
                 "paper_event_count": 0,
                 "paper_last_success_at_ms": 0,
-                    "rejection_counts": {"insufficient_history": 3},
-                    "paper_admission_rejection_counts": {},
-                    "candidates": [],
+                "rejection_counts": {"insufficient_history": 3},
+                "paper_admission_rejection_counts": {},
+                "candidates": [],
             }
         )
     )
@@ -1736,10 +1809,18 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
     (unit_dir / "lightfee-sidecar.service").write_text(
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
+    (unit_dir / "lightfee-spread-bbo.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
+        "LimitNOFILE=65536\n"
+    )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
+        "[Unit]\nWants=lightfee-spread-bbo.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -2410,9 +2491,11 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
+    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
     spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
+    assert analyze_systemd_unit("lightfee-spread-bbo.service", spread_bbo).ok
     assert analyze_systemd_unit("lightfee-spread-sidecar.service", spread_sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
 

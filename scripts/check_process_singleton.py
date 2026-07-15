@@ -38,6 +38,12 @@ SPREAD_SIDECAR_PATTERNS = [
     "spread_sidecar",
 ]
 
+SPREAD_BBO_PATTERNS = [
+    "lightfee.apps.spread_bbo",
+    "lightfee-spread-bbo",
+    "lightfee_spread_bbo",
+]
+
 LIVE_PATTERNS = [
     "lightfee.apps.live",
     "lightfee-live",
@@ -52,7 +58,8 @@ def get_process_list() -> list[dict]:
         # Use ps to get all processes
         result = subprocess.run(
             ["ps", "aux"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         lines = result.stdout.strip().split("\n")
         if len(lines) < 2:
@@ -63,13 +70,15 @@ def get_process_list() -> list[dict]:
             parts = line.split(None, 10)
             if len(parts) < 11:
                 continue
-            processes.append({
-                "user": parts[0],
-                "pid": int(parts[1]),
-                "cpu": parts[2],
-                "mem": parts[3],
-                "command": parts[10],
-            })
+            processes.append(
+                {
+                    "user": parts[0],
+                    "pid": int(parts[1]),
+                    "cpu": parts[2],
+                    "mem": parts[3],
+                    "command": parts[10],
+                }
+            )
         return processes
     except Exception as e:
         print(f"ERROR: ps aux failed: {e}", file=sys.stderr)
@@ -89,7 +98,8 @@ def check_lsof_snapshot_writers() -> list[int]:
         try:
             result = subprocess.run(
                 ["lsof", "-t", sp],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             for line in result.stdout.strip().split("\n"):
                 if line.strip().isdigit():
@@ -111,9 +121,17 @@ def count_matching(processes: list[dict], patterns: list[str]) -> list[dict]:
     return matches
 
 
-def check_singleton(label: str, matches: list[dict], max_allowed: int = 1) -> bool:
-    """Check that at most max_allowed processes match."""
+def check_singleton(
+    label: str,
+    matches: list[dict],
+    max_allowed: int = 1,
+    min_required: int = 0,
+) -> bool:
+    """Check a bounded process count, optionally requiring the service alive."""
     count = len(matches)
+    if count < min_required:
+        print(f"  {label}: {count} processes (VIOLATION — min {min_required})")
+        return False
     if count == 0:
         print(f"  {label}: 0 processes (not running)")
         return True
@@ -148,21 +166,20 @@ def kill_extras(label: str, matches: list[dict], keep_count: int = 1) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Process singleton enforcement for LightFeeV2"
+    parser = argparse.ArgumentParser(description="Process singleton enforcement for LightFeeV2")
+    parser.add_argument(
+        "--strict", action="store_true", help="Exit with error if any violation found"
     )
     parser.add_argument(
-        "--strict", action="store_true",
-        help="Exit with error if any violation found"
+        "--kill-extra",
+        action="store_true",
+        help="Kill extra processes beyond the singleton limit (DANGEROUS)",
     )
     parser.add_argument(
-        "--kill-extra", action="store_true",
-        help="Kill extra processes beyond the singleton limit (DANGEROUS)"
-    )
-    parser.add_argument(
-        "--snapshot-path", type=str,
+        "--snapshot-path",
+        type=str,
         default="runtime/opportunity-input-snapshot.json",
-        help="Path to check for snapshot file writers"
+        help="Path to check for snapshot file writers",
     )
     args = parser.parse_args()
 
@@ -176,17 +193,24 @@ def main() -> None:
     # Check sidecar processes
     print("\n--- Sidecar Processes ---")
     sidecars = count_matching(processes, SIDECAR_PATTERNS)
-    sidecar_ok = check_singleton("sidecar", sidecars)
+    min_required = 1 if args.strict else 0
+    sidecar_ok = check_singleton("sidecar", sidecars, min_required=min_required)
 
     # Check spread sidecar processes
     print("\n--- Spread Sidecar Processes ---")
     spread_sidecars = count_matching(processes, SPREAD_SIDECAR_PATTERNS)
-    spread_sidecar_ok = check_singleton("spread-sidecar", spread_sidecars)
+    spread_sidecar_ok = check_singleton(
+        "spread-sidecar", spread_sidecars, min_required=min_required
+    )
+
+    print("\n--- Spread BBO Processes ---")
+    spread_bbos = count_matching(processes, SPREAD_BBO_PATTERNS)
+    spread_bbo_ok = check_singleton("spread-bbo", spread_bbos, min_required=min_required)
 
     # Check live runtime processes
     print("\n--- Live Runtime Processes ---")
     lives = count_matching(processes, LIVE_PATTERNS)
-    live_ok = check_singleton("live", lives)
+    live_ok = check_singleton("live", lives, min_required=min_required)
 
     # Check snapshot writers
     print("\n--- Snapshot Writers ---")
@@ -203,10 +227,11 @@ def main() -> None:
 
     # Summary
     print("\n=== Summary ===")
-    all_ok = sidecar_ok and spread_sidecar_ok and live_ok
+    all_ok = sidecar_ok and spread_bbo_ok and spread_sidecar_ok and live_ok
     status = "PASS" if all_ok else "FAIL"
     print(f"Status: {status}")
     print(f"  sidecar processes:        {len(sidecars)} (limit: 1)")
+    print(f"  spread-bbo processes:     {len(spread_bbos)} (limit: 1)")
     print(f"  spread-sidecar processes: {len(spread_sidecars)} (limit: 1)")
     print(f"  live processes:           {len(lives)} (limit: 1)")
     print(f"  snapshot writers:         {len(writers)}")
@@ -218,6 +243,8 @@ def main() -> None:
             kill_extras("sidecar", sidecars)
         if len(spread_sidecars) > 1:
             kill_extras("spread-sidecar", spread_sidecars)
+        if len(spread_bbos) > 1:
+            kill_extras("spread-bbo", spread_bbos)
         if len(lives) > 1:
             kill_extras("live", lives)
 
@@ -226,10 +253,21 @@ def main() -> None:
         processes2 = get_process_list()
         sidecars2 = count_matching(processes2, SIDECAR_PATTERNS)
         spread_sidecars2 = count_matching(processes2, SPREAD_SIDECAR_PATTERNS)
+        spread_bbos2 = count_matching(processes2, SPREAD_BBO_PATTERNS)
         lives2 = count_matching(processes2, LIVE_PATTERNS)
-        all_ok = len(sidecars2) <= 1 and len(spread_sidecars2) <= 1 and len(lives2) <= 1
+        required_counts = {1} if args.strict else {0, 1}
+        all_ok = all(
+            count in required_counts
+            for count in (
+                len(sidecars2),
+                len(spread_bbos2),
+                len(spread_sidecars2),
+                len(lives2),
+            )
+        )
         print(
             f"\nAfter cleanup: sidecar={len(sidecars2)}, "
+            f"spread-bbo={len(spread_bbos2)}, "
             f"spread-sidecar={len(spread_sidecars2)}, live={len(lives2)}"
         )
         print(f"Status: {'PASS' if all_ok else 'FAIL (manual intervention needed)'}")

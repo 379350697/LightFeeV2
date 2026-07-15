@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from collections.abc import Callable
@@ -106,7 +107,8 @@ async def _run(
             await refresh_once_until_stop()
             return
         bbo_runner = getattr(service, "run_spread_bbo_data_plane", None)
-        if callable(bbo_runner):
+        embedded_bbo_enabled = bool(getattr(service, "embedded_spread_bbo_enabled", True))
+        if embedded_bbo_enabled and callable(bbo_runner):
             bbo_task = asyncio.create_task(bbo_runner(stop_event))
             # Establish compact-snapshot ownership before the slower metadata
             # loop can publish its one-shot compatibility view.
@@ -169,13 +171,20 @@ def main() -> None:
 
     logger.info("loading config from %s", args.config)
     config = load_config(args.config)
-    service = SidecarService(config)
+    external_spread_bbo = os.environ.get("LIGHTFEE_EXTERNAL_SPREAD_BBO", "") == "1"
+    service = (
+        SidecarService(config, enable_spread_bbo=False)
+        if external_spread_bbo
+        else SidecarService(config)
+    )
 
-    asyncio.run(_run(
-        service,
-        once=args.once,
-        refresh_interval_s=config.runtime.sidecar_refresh_ms / 1000.0,
-    ))
+    asyncio.run(
+        _run(
+            service,
+            once=args.once,
+            refresh_interval_s=config.runtime.sidecar_refresh_ms / 1000.0,
+        )
+    )
 
 
 if __name__ == "__main__":

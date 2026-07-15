@@ -32,7 +32,9 @@ def test_trade_optimization_timer_assets_are_deploy_critical():
 
 
 def _stub_manifest_generation(monkeypatch):
-    monkeypatch.setattr(manifest, "build_manifest", lambda root: {"lightfee/engine/runtime.py": "abc"})
+    monkeypatch.setattr(
+        manifest, "build_manifest", lambda root: {"lightfee/engine/runtime.py": "abc"}
+    )
 
     def fake_run(*args, **kwargs):
         return SimpleNamespace(stdout="abc123\n", returncode=0)
@@ -52,7 +54,7 @@ def test_generate_deploy_script_uses_ssh_port_2222(tmp_path, monkeypatch):
 
     assert 'SSH_OPTS="-p 2222 -o BatchMode=yes -o ConnectTimeout=10"' in script
     assert 'SCP_OPTS="-P 2222 -o BatchMode=yes -o ConnectTimeout=10"' in script
-    assert 'rsync -avz --delete' in script
+    assert "rsync -avz --delete" in script
     assert '-e "ssh $SSH_OPTS"' in script
     assert "scp $SCP_OPTS" in script
 
@@ -68,15 +70,34 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
     )
 
     assert 'REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"' in script
-    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"' in script
-    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict' in script
-    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json' in script
-    assert 'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy' in script
-    assert "env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json" in script
-    assert "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
+    assert (
+        'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_deploy_manifest.py --check "$REMOTE_PATH"'
+        in script
+    )
+    assert (
+        'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict'
+        in script
+    )
+    assert (
+        'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json'
+        in script
+    )
+    assert (
+        'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy'
+        in script
+    )
+    assert (
+        "env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"
+        in script
+    )
+    assert (
+        "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
+    )
 
 
-def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execution(tmp_path, monkeypatch):
+def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execution(
+    tmp_path, monkeypatch
+):
     _stub_manifest_generation(monkeypatch)
 
     script = manifest.generate_deploy_script(
@@ -94,9 +115,12 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert (
         "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer "
         "&& systemctl restart lightfee-sidecar.service "
+        "&& systemctl enable lightfee-spread-bbo.service "
+        "&& systemctl restart lightfee-spread-bbo.service "
         "&& systemctl restart lightfee-spread-sidecar.service "
         "&& systemctl restart lightfee-live.service"
     ) in script
+    assert "sleep 12" in script
 
 
 def test_generate_deploy_script_computes_deploy_version_at_runtime(tmp_path, monkeypatch):
@@ -111,7 +135,10 @@ def test_generate_deploy_script_computes_deploy_version_at_runtime(tmp_path, mon
 
     assert 'DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse HEAD)"' in script
     assert 'echo "$DEPLOY_VERSION" > "$REMOTE_PATH/.deploy_version"' in script
-    assert 'echo "$DEPLOY_VERSION" | ssh $SSH_OPTS root@38.60.253.248 "cat > /opt/lightfee-v2/.deploy_version"' in script
+    assert (
+        'echo "$DEPLOY_VERSION" | ssh $SSH_OPTS root@38.60.253.248 "cat > /opt/lightfee-v2/.deploy_version"'
+        in script
+    )
     assert 'echo "abc123" > "$REMOTE_PATH/.deploy_version"' not in script
 
 
@@ -128,8 +155,8 @@ def test_generate_deploy_script_reports_post_deploy_metadata(tmp_path, monkeypat
     assert 'echo "=== Verifying deploy metadata ==="' in script
     assert 'REMOTE_GIT_HEAD="$(git -C "$REMOTE_PATH" rev-parse HEAD)"' in script
     assert 'REMOTE_DEPLOY_VERSION="$(cat "$REMOTE_PATH/.deploy_version")"' in script
-    assert 'deploy_metadata git_head=%s deploy_version=%s expected=%s\\n' in script
-    assert 'deploy metadata mismatch' in script
+    assert "deploy_metadata git_head=%s deploy_version=%s expected=%s\\n" in script
+    assert "deploy metadata mismatch" in script
     assert (
         "git_head=\\$(git -C /opt/lightfee-v2 rev-parse HEAD) "
         "deploy_version=\\$(cat /opt/lightfee-v2/.deploy_version)"
@@ -146,8 +173,14 @@ def test_generate_deploy_script_installs_trade_optimization_timer(tmp_path, monk
         ssh_port=2222,
     )
 
-    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.service" /etc/systemd/system/lightfee-trade-optimization-report.service' in script
-    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.timer" /etc/systemd/system/lightfee-trade-optimization-report.timer' in script
+    assert (
+        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.service" /etc/systemd/system/lightfee-trade-optimization-report.service'
+        in script
+    )
+    assert (
+        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.timer" /etc/systemd/system/lightfee-trade-optimization-report.timer'
+        in script
+    )
     assert "systemctl enable --now lightfee-trade-optimization-report.timer" in script
     assert "systemctl restart lightfee-trade-optimization-report.service" not in script
 

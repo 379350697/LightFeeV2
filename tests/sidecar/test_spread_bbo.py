@@ -11,7 +11,14 @@ from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.service import SidecarService
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
-from lightfee.spread.quote_snapshot import load_spread_quote_snapshot
+from lightfee.sidecar.spread_bbo_service import SpreadMetadataCache
+from lightfee.spread.quote_snapshot import (
+    SpreadQuoteSnapshot,
+    load_spread_quote_snapshot,
+    publish_spread_quote_snapshot,
+    spread_metadata_snapshot_path,
+    spread_quote_snapshot_path,
+)
 
 
 def _metadata_quote(venue: str) -> QuoteSnapshot:
@@ -56,14 +63,98 @@ async def test_sidecar_bbo_transport_isolated_but_contract_cache_shared(tmp_path
         assert heavy is not bbo
         assert heavy._client is None
         assert bbo._client is None
-        assert (
-            heavy._okx_contract_metadata_by_key
-            is bbo._okx_contract_metadata_by_key
-        )
+        assert heavy._okx_contract_metadata_by_key is bbo._okx_contract_metadata_by_key
         assert heavy._rate_limiter is not bbo._rate_limiter
         assert bbo._consume_global_rate_limit_budget is False
     finally:
         await service.close()
+
+
+@pytest.mark.asyncio
+async def test_external_bbo_mode_removes_transports_from_heavy_sidecar(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="okx")],
+    )
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "sidecar.json")
+    service = SidecarService(config, enable_spread_bbo=False)
+    try:
+        assert service.embedded_spread_bbo_enabled is False
+        assert service._spread_bbo_sources == {}
+        assert service._spread_bbo_rate_limiters == {}
+        assert service._spread_bbo_data_plane is None
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_external_bbo_metadata_cache_refreshes_and_retains_last_good(tmp_path):
+    sidecar_path = tmp_path / "sidecar.json"
+    now_ms = int(time.time() * 1000)
+    stale_bbo_output = _metadata_quote("okx")
+    stale_bbo_output.observed_at_ms = now_ms
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=now_ms,
+            market_observed_at_ms=now_ms,
+            batch_started_at_ms=now_ms - 1,
+            configured_venues=["okx"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes={"okx:BTCUSDT": stale_bbo_output},
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    cache = SpreadMetadataCache(sidecar_path, max_age_ms=60_000)
+    # BBO output is never trusted as metadata input: its receipt timestamp was
+    # refreshed by the previous producer and cannot prove metadata freshness.
+    assert cache.quotes == {}
+
+    refreshed = _metadata_quote("okx")
+    refreshed.funding_rate_bps = 2.0
+    refreshed.observed_at_ms = now_ms
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=now_ms,
+            market_observed_at_ms=now_ms,
+            batch_started_at_ms=now_ms,
+            configured_venues=["okx"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes={"okx:BTCUSDT": refreshed},
+        ),
+        spread_metadata_snapshot_path(sidecar_path),
+    )
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(cache.run(stop_event))
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while cache.quotes.get("okx:BTCUSDT") is None and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    assert cache.quotes["okx:BTCUSDT"].funding_rate_bps == 2.0
+    assert cache.quote_eligible(cache.quotes["okx:BTCUSDT"]) is True
+    cache.quotes["okx:BTCUSDT"].observed_at_ms = now_ms - 60_001
+    assert cache.quote_eligible(cache.quotes["okx:BTCUSDT"]) is False
+
+    spread_metadata_snapshot_path(sidecar_path).write_text("not-json")
+    await asyncio.sleep(0.55)
+    stop_event.set()
+    await task
+    assert cache.quotes["okx:BTCUSDT"].funding_rate_bps == 2.0
+
+
+def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="okx")],
+    )
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "sidecar.json")
+    config.runtime.sidecar_snapshot_max_age_ms = 10_000
+    config.runtime.live_scan_last_good_max_age_ms = 600_000
+
+    from lightfee.sidecar.spread_bbo_service import SpreadBboProcessService
+
+    service = SpreadBboProcessService(config)
+    assert service.metadata.max_age_ms == 600_000
 
 
 @pytest.mark.asyncio
@@ -233,9 +324,7 @@ async def test_sidecar_cancellation_waits_for_bbo_thread_shutdown():
     service = object.__new__(SidecarService)
     service._spread_bbo_data_plane = FakePlane()
     service._spread_bbo_sources = {}
-    task = asyncio.create_task(
-        service.run_spread_bbo_data_plane(asyncio.Event())
-    )
+    task = asyncio.create_task(service.run_spread_bbo_data_plane(asyncio.Event()))
     await asyncio.sleep(0.02)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

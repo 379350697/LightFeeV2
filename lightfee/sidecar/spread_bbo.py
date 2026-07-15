@@ -21,6 +21,66 @@ from lightfee.spread.quote_snapshot import (
 logger = logging.getLogger("lightfee.sidecar.spread_bbo")
 
 
+def quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
+    """Return whether slow metadata is complete enough for spread BBO overlay.
+
+    The BBO process is allowed to replace only volatile book fields and the
+    receipt timestamp. Funding cadence, contract normalization and executable
+    increments must already have passed the full sidecar's trust boundary.
+    """
+
+    if quote.contract_normalization_complete is not True:
+        return False
+    if str(quote.contract_type or "").strip().lower() != "linear":
+        return False
+    if str(quote.venue_status or "").strip().lower() != "active":
+        return False
+    if not all(
+        str(value or "").strip()
+        for value in (
+            quote.underlying,
+            quote.quote_currency,
+            quote.mark_index_source,
+        )
+    ):
+        return False
+    multiplier = quote.contract_multiplier
+    if (
+        isinstance(multiplier, bool)
+        or not isinstance(multiplier, (int, float))
+        or not isfinite(float(multiplier))
+        or float(multiplier) <= 0.0
+    ):
+        return False
+    precision_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (quote.price_precision, quote.quantity_precision)
+    )
+    exact_contract_valid = all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        and float(value) > 0.0
+        for value in (
+            quote.price_tick,
+            quote.quantity_step_base,
+            quote.min_quantity_base,
+        )
+    )
+    min_notional_valid = bool(
+        quote.min_notional_evidence_complete is True
+        and isinstance(quote.min_notional_quote, (int, float))
+        and not isinstance(quote.min_notional_quote, bool)
+        and isfinite(float(quote.min_notional_quote))
+        and float(quote.min_notional_quote) >= 0.0
+    )
+    schedule_valid = all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (quote.funding_timestamp_ms, quote.funding_interval_ms)
+    )
+    return precision_valid and exact_contract_valid and min_notional_valid and schedule_valid
+
+
 class SpreadBboDataPlane:
     """Own isolated venue workers; no slowest-venue gather exists here."""
 

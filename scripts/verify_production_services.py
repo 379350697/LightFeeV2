@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from collections import deque
@@ -30,11 +31,22 @@ from lightfee.ops.production_health import (
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+from lightfee.spread.quote_snapshot import (
+    load_spread_quote_snapshot,
+    producer_generation_id,
+    spread_quote_snapshot_path,
+)
 from scripts.diagnose_live import _build_stale_risk_state_alignment_summary
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS = 60_000
+PRODUCTION_SERVICE_NAMES = (
+    "lightfee-sidecar.service",
+    "lightfee-spread-bbo.service",
+    "lightfee-spread-sidecar.service",
+    "lightfee-live.service",
+)
 
 
 def _read_json(path: str) -> dict:
@@ -59,6 +71,151 @@ def _resolve_spread_snapshot_max_age_ms(
     except (TypeError, ValueError):
         pass
     return DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS
+
+
+def _systemd_active_report(name: str) -> HealthReport:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return HealthReport(
+            name=f"systemd_active:{name}",
+            ok=False,
+            severity="critical",
+            fingerprints=["systemd_active_check_failed"],
+            details={"error": str(exc)[:500]},
+        )
+    state = result.stdout.strip()
+    ok = result.returncode == 0 and state == "active"
+    return HealthReport(
+        name=f"systemd_active:{name}",
+        ok=ok,
+        severity="critical" if not ok else "info",
+        fingerprints=[] if ok else ["systemd_service_not_active"],
+        details={"state": state or "unknown", "returncode": result.returncode},
+    )
+
+
+def _systemd_main_pid(name: str) -> int:
+    result = subprocess.run(
+        ["systemctl", "show", name, "--property=MainPID", "--value"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0:
+        return 0
+    try:
+        return int(result.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def _process_started_at_ms(pid: int) -> int:
+    """Resolve Linux process start wall time without locale-dependent parsing."""
+
+    if pid <= 0:
+        return 0
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        stat_tail = stat_text.rsplit(")", 1)[1].strip().split()
+        start_ticks = int(stat_tail[19])  # field 22; tail starts at field 3
+        btime_line = next(
+            line
+            for line in Path("/proc/stat").read_text().splitlines()
+            if line.startswith("btime ")
+        )
+        boot_epoch_s = int(btime_line.split()[1])
+        ticks_per_s = int(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return 0
+    if ticks_per_s <= 0:
+        return 0
+    return int((boot_epoch_s + start_ticks / ticks_per_s) * 1000)
+
+
+def _spread_bbo_runtime_report(
+    path: str | Path,
+    *,
+    app_config,
+    now_ms: int | None,
+) -> HealthReport:
+    fingerprints: list[str] = []
+    details: dict[str, object] = {"path": str(path)}
+    snapshot = load_spread_quote_snapshot(path)
+    if snapshot is None:
+        fingerprints.append("spread_bbo_snapshot_missing_or_invalid")
+    else:
+        checked_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        expected_venues = {
+            str(venue.venue or "").strip().lower()
+            for venue in getattr(app_config, "venues", [])
+            if str(venue.venue or "").strip()
+        }
+        observed_venues = {quote.venue for quote in snapshot.quotes.values()}
+        configured_venues = set(snapshot.configured_venues)
+        ttl_ms = max(
+            int(getattr(getattr(app_config, "strategy", None), "spread_signal_ttl_ms", 0) or 0),
+            1,
+        )
+        publish_age_ms = checked_at_ms - int(snapshot.published_at_ms or 0)
+        quote_ages_ms = [
+            checked_at_ms - int(quote.observed_at_ms or 0)
+            for quote in snapshot.quotes.values()
+        ]
+        details.update(
+            {
+                "published_at_ms": snapshot.published_at_ms,
+                "publish_age_ms": publish_age_ms,
+                "batch_started_at_ms": snapshot.batch_started_at_ms,
+                "quote_count": len(snapshot.quotes),
+                "configured_venues": sorted(configured_venues),
+                "observed_venues": sorted(observed_venues),
+                "max_quote_age_ms": max(quote_ages_ms, default=None),
+                "signal_ttl_ms": ttl_ms,
+                "checked_at_ms": checked_at_ms,
+                "producer_generation_id": snapshot.producer_generation_id,
+            }
+        )
+        if configured_venues != expected_venues:
+            fingerprints.append("spread_bbo_configured_venue_mismatch")
+        if observed_venues != expected_venues:
+            fingerprints.append("spread_bbo_venue_coverage_incomplete")
+        if publish_age_ms < 0 or publish_age_ms > ttl_ms:
+            fingerprints.append("spread_bbo_publication_stale")
+        if any(age < 0 or age > ttl_ms for age in quote_ages_ms):
+            fingerprints.append("spread_bbo_quote_stale")
+
+        try:
+            main_pid = _systemd_main_pid("lightfee-spread-bbo.service")
+            process_started_at_ms = _process_started_at_ms(main_pid)
+        except (OSError, subprocess.SubprocessError):
+            main_pid = 0
+            process_started_at_ms = 0
+        details["main_pid"] = main_pid
+        details["process_started_at_ms"] = process_started_at_ms
+        expected_generation_id = producer_generation_id(main_pid) if main_pid > 0 else ""
+        details["expected_generation_id"] = expected_generation_id
+        if process_started_at_ms <= 0:
+            fingerprints.append("spread_bbo_process_start_unavailable")
+        if not expected_generation_id or (
+            snapshot.producer_generation_id != expected_generation_id
+        ):
+            fingerprints.append("spread_bbo_snapshot_generation_mismatch")
+
+    return HealthReport(
+        name="spread_bbo_runtime",
+        ok=not fingerprints,
+        severity="critical" if fingerprints else "info",
+        fingerprints=fingerprints,
+        details=details,
+    )
 
 
 def _read_jsonl_tail(path: Path, max_records: int = 1000) -> list[dict]:
@@ -310,6 +467,7 @@ def main() -> None:
         "--snapshot", default="/opt/lightfee-v2/runtime/opportunity-input-snapshot.json"
     )
     parser.add_argument("--spread-snapshot", default=None)
+    parser.add_argument("--spread-bbo-snapshot", default=None)
     parser.add_argument("--config", default=None)
     parser.add_argument("--current-state", default=default_current_state)
     parser.add_argument("--resolv-conf", default="/etc/resolv.conf")
@@ -331,6 +489,12 @@ def main() -> None:
         action="store_true",
         help="Fail readiness when the live funding canary entry policy is disabled.",
     )
+    parser.add_argument(
+        "--require-active-services",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Require all four production systemd services and current BBO output.",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -338,11 +502,7 @@ def main() -> None:
     reports = []
     unit_texts: dict[str, str] = {}
     unit_dir = Path(args.unit_dir)
-    for name in (
-        "lightfee-sidecar.service",
-        "lightfee-spread-sidecar.service",
-        "lightfee-live.service",
-    ):
+    for name in PRODUCTION_SERVICE_NAMES:
         path = unit_dir / name
         if path.exists():
             unit_text = path.read_text()
@@ -351,6 +511,36 @@ def main() -> None:
         else:
             unit_texts[name] = ""
             reports.append(analyze_systemd_unit(name, ""))
+
+    require_active_services = (
+        args.require_active_services
+        if args.require_active_services is not None
+        else (
+            unit_dir == Path("/etc/systemd/system") and args.current_state == default_current_state
+        )
+    )
+    if require_active_services:
+        reports.extend(_systemd_active_report(name) for name in PRODUCTION_SERVICE_NAMES)
+
+    ownership_fingerprints: list[str] = []
+    sidecar_unit = unit_texts.get("lightfee-sidecar.service", "")
+    spread_bbo_unit = unit_texts.get("lightfee-spread-bbo.service", "")
+    spread_sidecar_unit = unit_texts.get("lightfee-spread-sidecar.service", "")
+    if "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1" not in sidecar_unit:
+        ownership_fingerprints.append("embedded_spread_bbo_not_disabled")
+    if "-m lightfee.apps.spread_bbo" not in spread_bbo_unit:
+        ownership_fingerprints.append("dedicated_spread_bbo_entrypoint_missing")
+    if "lightfee-spread-bbo.service" not in spread_sidecar_unit:
+        ownership_fingerprints.append("spread_consumer_dependency_missing")
+    reports.append(
+        HealthReport(
+            name="spread_bbo_ownership",
+            ok=not ownership_fingerprints,
+            severity="critical" if ownership_fingerprints else "info",
+            fingerprints=ownership_fingerprints,
+            details={"writer_model": "dedicated_process"},
+        )
+    )
 
     if Path(args.snapshot).exists():
         reports.append(
@@ -394,6 +584,29 @@ def main() -> None:
                     app_config.strategy,
                     runtime_mode=app_config.runtime.mode,
                     require_entry_enabled=args.require_entry_enabled,
+                )
+            )
+
+    if require_active_services:
+        spread_bbo_snapshot = args.spread_bbo_snapshot or str(
+            spread_quote_snapshot_path(args.snapshot)
+        )
+        if app_config is None:
+            reports.append(
+                HealthReport(
+                    name="spread_bbo_runtime",
+                    ok=False,
+                    severity="critical",
+                    fingerprints=["spread_bbo_runtime_config_unavailable"],
+                    details={"path": spread_bbo_snapshot},
+                )
+            )
+        else:
+            reports.append(
+                _spread_bbo_runtime_report(
+                    spread_bbo_snapshot,
+                    app_config=app_config,
+                    now_ms=args.now_ms or None,
                 )
             )
 

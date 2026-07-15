@@ -92,6 +92,7 @@ DEFAULT_MAX_EVENTS = 50_000
 SERVICE_NAMES = [
     "lightfee-live.service",
     "lightfee-sidecar.service",
+    "lightfee-spread-bbo.service",
     "lightfee-spread-sidecar.service",
 ]
 DEFAULT_EXCHANGE_TRUTH_VENUES = [

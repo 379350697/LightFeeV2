@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import lightfee.spread.quote_snapshot as quote_snapshot_module
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.quote_snapshot import (
     SpreadQuoteSnapshot,
@@ -50,7 +51,8 @@ def test_spread_quote_snapshot_round_trip_is_compact_and_complete(tmp_path) -> N
     assert loaded.quotes["binance:BTCUSDT"].bid == 100.0
     payload = json.loads(path.read_text())
     assert "candidates" not in payload
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
+    assert payload["producer_generation_id"]
     assert isinstance(payload["quotes"]["binance:BTCUSDT"], list)
     assert loaded.quotes["binance:BTCUSDT"] == _quote()
 
@@ -149,3 +151,37 @@ def test_spread_quote_snapshot_v1_remains_readable(tmp_path) -> None:
     assert loaded is not None
     assert loaded.schema_version == 1
     assert loaded.quotes["binance:BTCUSDT"] == quote
+
+
+def test_spread_quote_snapshot_v2_remains_readable(tmp_path) -> None:
+    path = tmp_path / "legacy-v2-quotes.json"
+    publish_spread_quote_snapshot(_snapshot(), path)
+    payload = json.loads(path.read_text())
+    payload["schema_version"] = 2
+    payload.pop("producer_generation_id")
+    path.write_text(json.dumps(payload))
+
+    loaded = load_spread_quote_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.schema_version == 2
+    assert loaded.producer_generation_id == ""
+
+
+def test_producer_generation_distinguishes_reused_pid(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quote_snapshot_module,
+        "process_start_ticks",
+        lambda pid: 100,
+    )
+    first = quote_snapshot_module.producer_generation_id(42)
+    monkeypatch.setattr(
+        quote_snapshot_module,
+        "process_start_ticks",
+        lambda pid: 200,
+    )
+    second = quote_snapshot_module.producer_generation_id(42)
+
+    assert first != second
+    assert first.endswith(":42:100")
+    assert second.endswith(":42:200")
