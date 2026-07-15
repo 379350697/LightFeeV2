@@ -179,8 +179,10 @@ tuning_diagnostics_max_records = 10000
 
 [[venues]]
 venue = "binance"
-taker_fee_bps = 0.5
-maker_fee_bps = 0.5
+# Conservative non-VIP fallback floors. Official paper/live admission still
+# requires fresh signed account-fee evidence for the actual account tier.
+taker_fee_bps = 5.0
+maker_fee_bps = 2.0
 max_notional = 1000.0
 [venues.live.trade_credentials]
 api_key_env = "LIGHTFEE_BINANCE_API_KEY"
@@ -189,8 +191,8 @@ permission_mode = "trade"
 
 [[venues]]
 venue = "okx"
-taker_fee_bps = 0.5
-maker_fee_bps = 0.5
+taker_fee_bps = 5.0
+maker_fee_bps = 2.0
 max_notional = 1000.0
 [venues.live.trade_credentials]
 api_key_env = "LIGHTFEE_OKX_API_KEY"
@@ -200,14 +202,14 @@ permission_mode = "trade"
 
 [[venues]]
 venue = "bybit"
-taker_fee_bps = 0.6
-maker_fee_bps = 0.6
+taker_fee_bps = 5.5
+maker_fee_bps = 2.0
 max_notional = 1000.0
 
 [[venues]]
 venue = "hyperliquid"
-taker_fee_bps = 0.3
-maker_fee_bps = 0.3
+taker_fee_bps = 4.5
+maker_fee_bps = 1.5
 max_notional = 1000.0
 [venues.live.trade_credentials]
 wallet_private_key_env = "LIGHTFEE_HYPERLIQUID_WALLET_PRIVATE_KEY"
@@ -215,18 +217,18 @@ permission_mode = "trade"
 
 [[venues]]
 venue = "bitget"
-taker_fee_bps = 0.6
-maker_fee_bps = 0.6
+taker_fee_bps = 6.0
+maker_fee_bps = 2.0
 max_notional = 1000.0
 
 [[venues]]
 venue = "gate"
-taker_fee_bps = 0.6
-maker_fee_bps = 0.6
+taker_fee_bps = 7.5
+maker_fee_bps = 2.0
 max_notional = 1000.0
 
 [[venues]]
 venue = "aster"
-taker_fee_bps = 0.6
-maker_fee_bps = 0.6
+taker_fee_bps = 4.0
+maker_fee_bps = 0.0
 max_notional = 1000.0
