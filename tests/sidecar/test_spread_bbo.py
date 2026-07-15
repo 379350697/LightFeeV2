@@ -14,6 +14,7 @@ from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
 from lightfee.sidecar.spread_bbo_service import SpreadMetadataCache
 from lightfee.spread.quote_snapshot import (
+    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     load_spread_quote_snapshot,
     publish_spread_quote_snapshot,
@@ -116,6 +117,7 @@ async def test_external_bbo_metadata_cache_refreshes_and_retains_last_good(tmp_p
     refreshed.observed_at_ms = now_ms
     publish_spread_quote_snapshot(
         SpreadQuoteSnapshot(
+            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
             published_at_ms=now_ms,
             market_observed_at_ms=now_ms,
             batch_started_at_ms=now_ms,
@@ -156,6 +158,7 @@ def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):
 
     service = SpreadBboProcessService(config)
     assert service.metadata.max_age_ms == 600_000
+    assert service.data_plane.snapshot_schema_version == 4
 
 
 @pytest.mark.asyncio

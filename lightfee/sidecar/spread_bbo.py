@@ -14,71 +14,19 @@ from lightfee.config.schema import AppConfig
 from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.spread.quote_snapshot import (
+    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     publish_spread_quote_snapshot,
+)
+from lightfee.spread.metadata_cache import (
+    quote_cache_contract_eligible as _quote_cache_contract_eligible,
 )
 
 logger = logging.getLogger("lightfee.sidecar.spread_bbo")
 
-
-def quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
-    """Return whether slow metadata is complete enough for spread BBO overlay.
-
-    The BBO process is allowed to replace only volatile book fields and the
-    receipt timestamp. Funding cadence, contract normalization and executable
-    increments must already have passed the full sidecar's trust boundary.
-    """
-
-    if quote.contract_normalization_complete is not True:
-        return False
-    if str(quote.contract_type or "").strip().lower() != "linear":
-        return False
-    if str(quote.venue_status or "").strip().lower() != "active":
-        return False
-    if not all(
-        str(value or "").strip()
-        for value in (
-            quote.underlying,
-            quote.quote_currency,
-            quote.mark_index_source,
-        )
-    ):
-        return False
-    multiplier = quote.contract_multiplier
-    if (
-        isinstance(multiplier, bool)
-        or not isinstance(multiplier, (int, float))
-        or not isfinite(float(multiplier))
-        or float(multiplier) <= 0.0
-    ):
-        return False
-    precision_valid = all(
-        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        for value in (quote.price_precision, quote.quantity_precision)
-    )
-    exact_contract_valid = all(
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and isfinite(float(value))
-        and float(value) > 0.0
-        for value in (
-            quote.price_tick,
-            quote.quantity_step_base,
-            quote.min_quantity_base,
-        )
-    )
-    min_notional_valid = bool(
-        quote.min_notional_evidence_complete is True
-        and isinstance(quote.min_notional_quote, (int, float))
-        and not isinstance(quote.min_notional_quote, bool)
-        and isfinite(float(quote.min_notional_quote))
-        and float(quote.min_notional_quote) >= 0.0
-    )
-    schedule_valid = all(
-        isinstance(value, int) and not isinstance(value, bool) and value > 0
-        for value in (quote.funding_timestamp_ms, quote.funding_interval_ms)
-    )
-    return precision_valid and exact_contract_valid and min_notional_valid and schedule_valid
+# Compatibility export for existing sidecar callers; the implementation lives
+# in the shared metadata trust-boundary module used by producer and consumer.
+quote_cache_contract_eligible = _quote_cache_contract_eligible
 
 
 class SpreadBboDataPlane:
@@ -92,6 +40,7 @@ class SpreadBboDataPlane:
         metadata_quotes: Callable[[], dict[str, QuoteSnapshot]],
         metadata_quote_eligible: Callable[[QuoteSnapshot], bool] | None = None,
         snapshot_path: str | Path,
+        snapshot_schema_version: int = FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     ) -> None:
         self.config = config
         self.sources = sources
@@ -102,6 +51,7 @@ class SpreadBboDataPlane:
             else lambda quote: quote.contract_normalization_complete is True
         )
         self.snapshot_path = Path(snapshot_path)
+        self.snapshot_schema_version = int(snapshot_schema_version)
         self.active = False
         self._quotes_by_venue: dict[str, dict[str, QuoteSnapshot]] = {}
         self._request_started_at_ms: dict[str, int] = {}
@@ -390,6 +340,7 @@ class SpreadBboDataPlane:
         for venue, symbols in expired_symbols.items():
             degraded_symbols.setdefault(venue, set()).update(symbols)
         return SpreadQuoteSnapshot(
+            schema_version=self.snapshot_schema_version,
             published_at_ms=published_at_ms,
             market_observed_at_ms=observed_at_ms,
             batch_started_at_ms=min(

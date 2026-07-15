@@ -5,18 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-import time
 
 from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.sidecar.sources.exchange import ExchangeSource
-from lightfee.sidecar.spread_bbo import (
-    SpreadBboDataPlane,
-    quote_cache_contract_eligible,
-)
+from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
+from lightfee.spread.metadata_cache import SpreadMetadataSnapshotCache
 from lightfee.spread.quote_snapshot import (
-    load_spread_quote_snapshot,
-    spread_metadata_snapshot_path,
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     spread_quote_snapshot_path,
 )
 from lightfee.venues.specs import get_spec
@@ -36,52 +32,25 @@ class SpreadMetadataCache:
         max_age_ms: int,
     ) -> None:
         self.sidecar_snapshot_path = Path(sidecar_snapshot_path)
-        self.metadata_path = spread_metadata_snapshot_path(self.sidecar_snapshot_path)
-        self.quotes = {}
-        self._metadata_mtime_ns = 0
-        self._attempted_metadata_mtime_ns = 0
-        self._published_at_ms = 0
-        self.max_age_ms = max(int(max_age_ms or 0), 1)
-        self._bootstrap()
+        self._cache = SpreadMetadataSnapshotCache(
+            self.sidecar_snapshot_path,
+            max_age_ms=max_age_ms,
+        )
 
-    def _bootstrap(self) -> None:
-        snapshot = load_spread_quote_snapshot(self.metadata_path)
-        if snapshot is None or not snapshot.quotes:
-            return
-        self.quotes = dict(snapshot.quotes)
-        self._published_at_ms = int(snapshot.published_at_ms or 0)
-        self._metadata_mtime_ns = _mtime_ns(self.metadata_path)
-        self._attempted_metadata_mtime_ns = self._metadata_mtime_ns
+    @property
+    def quotes(self):
+        return self._cache.quotes
+
+    @property
+    def max_age_ms(self) -> int:
+        return self._cache.max_age_ms
 
     def quote_eligible(self, quote) -> bool:
-        published_at_ms = int(self._published_at_ms or 0)
-        quote_observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-        now_ms = int(time.time() * 1000)
-        return bool(
-            published_at_ms > 0
-            and published_at_ms <= now_ms
-            and now_ms - published_at_ms <= self.max_age_ms
-            and quote_observed_at_ms > 0
-            and quote_observed_at_ms <= now_ms
-            and now_ms - quote_observed_at_ms <= self.max_age_ms
-            and quote_cache_contract_eligible(quote)
-        )
+        return self._cache.quote_eligible(quote)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
-            mtime_ns = _mtime_ns(self.metadata_path)
-            if mtime_ns > 0 and mtime_ns != self._attempted_metadata_mtime_ns:
-                self._attempted_metadata_mtime_ns = mtime_ns
-                snapshot = await asyncio.to_thread(
-                    load_spread_quote_snapshot,
-                    self.metadata_path,
-                )
-                if snapshot is None or not snapshot.quotes:
-                    logger.warning("spread metadata handoff rejected; retaining last good cache")
-                else:
-                    self.quotes = dict(snapshot.quotes)
-                    self._published_at_ms = int(snapshot.published_at_ms or 0)
-                    self._metadata_mtime_ns = mtime_ns
+            await asyncio.to_thread(self._cache.refresh)
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -118,6 +87,7 @@ class SpreadBboProcessService:
             metadata_quotes=lambda: self.metadata.quotes,
             metadata_quote_eligible=self.metadata.quote_eligible,
             snapshot_path=spread_quote_snapshot_path(config.runtime.sidecar_snapshot_path),
+            snapshot_schema_version=SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
         )
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -150,10 +120,3 @@ class SpreadBboProcessService:
                 await source.close()
             except Exception:
                 logger.exception("spread BBO source close failed")
-
-
-def _mtime_ns(path: Path) -> int:
-    try:
-        return path.stat().st_mtime_ns
-    except OSError:
-        return 0

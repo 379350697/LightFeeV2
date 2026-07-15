@@ -26,6 +26,7 @@ from lightfee.sidecar.snapshot import (
     TransferLifecycle,
 )
 from lightfee.spread.quote_snapshot import (
+    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     SpreadQuoteSnapshot,
     publish_spread_quote_snapshot,
     spread_metadata_snapshot_path,
@@ -534,6 +535,7 @@ class SidecarService:
             try:
                 publish_spread_quote_snapshot(
                     SpreadQuoteSnapshot(
+                        schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
                         published_at_ms=spread_quote_published_at_ms,
                         market_observed_at_ms=_latest_valid_quote_observation_ms(
                             spread_quotes,
@@ -742,6 +744,7 @@ class SidecarService:
                 if metadata_quotes:
                     publish_spread_quote_snapshot(
                         SpreadQuoteSnapshot(
+                            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
                             published_at_ms=published_ms,
                             market_observed_at_ms=_latest_valid_quote_observation_ms(
                                 metadata_quotes,

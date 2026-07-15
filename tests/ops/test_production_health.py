@@ -1114,6 +1114,52 @@ def test_spread_bbo_runtime_samples_clock_after_snapshot_load(monkeypatch):
     assert report.details["checked_at_ms"] == 2_100
 
 
+def test_spread_runtime_samples_clock_after_snapshot_load(monkeypatch):
+    snapshot = {
+        "schema_version": 4,
+        "decision_at_ms": 2_000,
+        "published_at_ms": 2_050,
+        "market_observed_at_ms": 2_000,
+        "source_mode": "sidecar_snapshot",
+        "degraded_venues": [],
+        "degraded_symbols": {},
+        "input_quote_count": 2,
+        "valid_quote_count": 2,
+        "evaluated_pair_count": 1,
+        "accepted_pair_count": 0,
+        "paper_configured_enabled": False,
+        "paper_admission_enabled": False,
+        "paper_tracked_count": 0,
+        "paper_refresh_status": "disabled",
+        "paper_event_count": 0,
+        "paper_last_success_at_ms": 0,
+        "rejection_counts": {"insufficient_history": 1},
+        "paper_admission_rejection_counts": {},
+        "candidates": [],
+    }
+    read_completed = {"value": False}
+
+    def delayed_read(_path):
+        read_completed["value"] = True
+        return snapshot
+
+    monkeypatch.setattr(vps, "_read_json", delayed_read)
+    monkeypatch.setattr(
+        vps.time,
+        "time",
+        lambda: 2.1 if read_completed["value"] else 1.9,
+    )
+
+    report = vps._spread_snapshot_runtime_report(
+        "/tmp/spread.json",
+        max_age_ms=1_000,
+        now_ms=None,
+    )
+
+    assert report.ok
+    assert report.details["publish_age_ms"] == 50
+
+
 def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
     now_ms = 2_000
     snapshot = SimpleNamespace(

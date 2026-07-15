@@ -128,6 +128,24 @@ def _sidecar_snapshot(*, observed_at_ms: int = 10_000) -> SidecarSnapshot:
     )
 
 
+def _make_spread_metadata_eligible(snapshot: SidecarSnapshot) -> None:
+    for quote in snapshot.quotes.values():
+        quote.underlying = "BTC"
+        quote.quote_currency = "USDT"
+        quote.contract_type = "linear"
+        quote.contract_multiplier = 1.0
+        quote.mark_index_source = "venue_index"
+        quote.price_precision = 2
+        quote.quantity_precision = 3
+        quote.price_tick = 0.01
+        quote.quantity_step_base = 0.001
+        quote.min_quantity_base = 0.001
+        quote.min_notional_quote = 1.0
+        quote.min_notional_evidence_complete = True
+        quote.venue_status = "active"
+        quote.contract_normalization_complete = True
+
+
 def test_spread_snapshot_v4_round_trips_signed_economics_and_proof(tmp_path) -> None:
     path = tmp_path / "spread.json"
     publish_spread_snapshot(
@@ -468,6 +486,7 @@ async def test_spread_prefers_compact_quote_snapshot_over_full_snapshot(
     monkeypatch,
 ) -> None:
     from lightfee.spread.quote_snapshot import (
+        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
         SpreadQuoteSnapshot,
         publish_spread_quote_snapshot,
         spread_quote_snapshot_path,
@@ -488,6 +507,7 @@ async def test_spread_prefers_compact_quote_snapshot_over_full_snapshot(
     source = _sidecar_snapshot(observed_at_ms=10_000)
     publish_spread_quote_snapshot(
         SpreadQuoteSnapshot(
+            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
             published_at_ms=10_000,
             market_observed_at_ms=10_000,
             batch_started_at_ms=9_900,
@@ -508,6 +528,180 @@ async def test_spread_prefers_compact_quote_snapshot_over_full_snapshot(
 
     assert snapshot.source_mode == "sidecar_snapshot"
     assert snapshot.valid_quote_count == 2
+
+
+@pytest.mark.asyncio
+async def test_spread_v4_hot_quotes_overlay_exact_full_metadata(tmp_path) -> None:
+    from lightfee.spread.quote_snapshot import (
+        FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_metadata_snapshot_path,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            sidecar_snapshot_max_age_ms=1_000,
+            live_scan_last_good_max_age_ms=60_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    metadata = _sidecar_snapshot(observed_at_ms=10_000)
+    _make_spread_metadata_eligible(metadata)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=metadata.quotes,
+        ),
+        spread_metadata_snapshot_path(sidecar_path),
+    )
+    hot_quotes = dict(metadata.quotes)
+    for quote in hot_quotes.values():
+        quote.observed_at_ms = 10_100
+    hot_quotes["cheap:BTCUSDT"].bid = 100.5
+    hot_quotes["cheap:BTCUSDT"].ask = 100.6
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_100,
+            market_observed_at_ms=10_100,
+            batch_started_at_ms=10_000,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=hot_quotes,
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+
+    quotes, degraded, source_mode, input_count, _, degraded_symbols, _ = (
+        await service._fetch_quotes(10_100)
+    )
+
+    assert input_count == 2
+    assert source_mode == "sidecar_snapshot"
+    assert degraded == set()
+    assert degraded_symbols == {}
+    assert quotes["cheap:BTCUSDT"].bid == 100.5
+    assert quotes["cheap:BTCUSDT"].underlying == "BTC"
+    assert quotes["cheap:BTCUSDT"].contract_normalization_complete is True
+    assert quotes["cheap:BTCUSDT"].bid_depth == ()
+
+
+@pytest.mark.asyncio
+async def test_spread_v4_missing_metadata_fails_closed_per_symbol(tmp_path) -> None:
+    from lightfee.spread.quote_snapshot import (
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    hot = _sidecar_snapshot(observed_at_ms=10_000)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=hot.quotes,
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+
+    quotes, degraded, source_mode, input_count, _, degraded_symbols, _ = (
+        await service._fetch_quotes(10_000)
+    )
+
+    assert quotes == {}
+    assert input_count == 2
+    assert source_mode == "sidecar_snapshot_degraded"
+    assert degraded == {"cheap", "rich"}
+    assert degraded_symbols == {
+        "cheap": ["BTCUSDT"],
+        "rich": ["BTCUSDT"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_spread_v4_overlay_and_freshness_share_one_decision_clock(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from lightfee.spread.quote_snapshot import (
+        SpreadQuoteSnapshot,
+        publish_spread_quote_snapshot,
+        spread_quote_snapshot_path,
+    )
+
+    sidecar_path = tmp_path / "sidecar-current.json"
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(
+            sidecar_snapshot_path=str(sidecar_path),
+            spread_sidecar_snapshot_path=str(tmp_path / "spread-current.json"),
+            sidecar_snapshot_max_age_ms=1_000,
+        ),
+        strategy=StrategyConfig(spread_reversion_enabled=True),
+        venues=[VenueConfig(venue="cheap"), VenueConfig(venue="rich")],
+    )
+    hot = _sidecar_snapshot(observed_at_ms=10_000)
+    publish_spread_quote_snapshot(
+        SpreadQuoteSnapshot(
+            published_at_ms=10_000,
+            market_observed_at_ms=10_000,
+            batch_started_at_ms=9_900,
+            configured_venues=["cheap", "rich"],
+            degraded_venues=[],
+            degraded_symbols={},
+            quotes=hot.quotes,
+        ),
+        spread_quote_snapshot_path(sidecar_path),
+    )
+    service = SpreadSidecarService(config)
+    observed_clocks: list[int] = []
+
+    def overlay(quotes, *, now_ms):
+        observed_clocks.append(now_ms)
+        return quotes, {}
+
+    monkeypatch.setattr(service._spread_metadata_cache, "overlay_hot_quotes", overlay)
+    wall_clock_calls = {"count": 0}
+
+    def wall_clock() -> float:
+        wall_clock_calls["count"] += 1
+        return 10.1 + wall_clock_calls["count"] * 0.01
+
+    monkeypatch.setattr("lightfee.spread.service.time.time", wall_clock)
+
+    result = await service._fetch_quotes(None)
+
+    assert observed_clocks == [result[-1]]
+    assert wall_clock_calls["count"] == 1
 
 
 @pytest.mark.asyncio

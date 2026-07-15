@@ -242,6 +242,23 @@ def _spread_bbo_runtime_report(
     )
 
 
+def _spread_snapshot_runtime_report(
+    path: str | Path,
+    *,
+    max_age_ms: int,
+    now_ms: int | None,
+) -> HealthReport:
+    """Read first, then sample wall time so a concurrent publish is not future."""
+
+    snapshot = _read_json(path)
+    checked_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    return analyze_spread_snapshot(
+        snapshot,
+        now_ms=checked_at_ms,
+        max_age_ms=max_age_ms,
+    )
+
+
 def _read_jsonl_tail(path: Path, max_records: int = 1000) -> list[dict]:
     if not path.exists():
         return []
@@ -640,9 +657,9 @@ def main() -> None:
     if spread_snapshot_path:
         if Path(spread_snapshot_path).exists():
             reports.append(
-                analyze_spread_snapshot(
-                    _read_json(spread_snapshot_path),
-                    now_ms=now_ms,
+                _spread_snapshot_runtime_report(
+                    spread_snapshot_path,
+                    now_ms=args.now_ms or None,
                     max_age_ms=_resolve_spread_snapshot_max_age_ms(
                         args.spread_snapshot_max_age_ms,
                         app_config,

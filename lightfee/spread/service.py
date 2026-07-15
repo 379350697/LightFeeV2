@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 import json
 import logging
 import math
@@ -15,7 +17,9 @@ from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.persistence.journal import Journal
 from lightfee.spread.models import SpreadSnapshot
+from lightfee.spread.metadata_cache import SpreadMetadataSnapshotCache
 from lightfee.spread.quote_snapshot import (
+    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     load_spread_quote_snapshot,
     spread_quote_snapshot_path,
 )
@@ -342,6 +346,10 @@ class SpreadSidecarService:
         self.sidecar_snapshot_path = config.runtime.sidecar_snapshot_path
         self.spread_quote_snapshot_path = spread_quote_snapshot_path(
             self.sidecar_snapshot_path
+        )
+        self._spread_metadata_cache = SpreadMetadataSnapshotCache(
+            self.sidecar_snapshot_path,
+            max_age_ms=config.runtime.live_scan_last_good_max_age_ms,
         )
         source_mode = str(config.runtime.spread_sidecar_source_mode).lower()
         if source_mode != "sidecar_snapshot" or config.runtime.spread_sidecar_direct_fetch_enabled:
@@ -682,7 +690,8 @@ class SpreadSidecarService:
         int,
     ]:
         compact_path = Path(self.spread_quote_snapshot_path)
-        if compact_path.exists():
+        using_compact_snapshot = compact_path.exists()
+        if using_compact_snapshot:
             # Once the producer advertises the compact contract, a malformed
             # file is an integrity failure.  Do not silently bypass it with
             # the slower full snapshot.
@@ -691,16 +700,50 @@ class SpreadSidecarService:
             # Rolling-deploy and direct-test compatibility only.  Production
             # naturally switches on the first compact Sidecar publication.
             snapshot = load_snapshot(self.sidecar_snapshot_path)
-        # In production the decision watermark is taken after the immutable
-        # snapshot has been read and validated.  Otherwise a concurrent
-        # sidecar publish can be newer than a timestamp captured before I/O,
-        # making current evidence look future/stale.  Explicit test/replay
-        # clocks remain authoritative and never advance from wall time.
+        snapshot_input_quote_count = len(snapshot.quotes) if snapshot is not None else 0
+        if (
+            using_compact_snapshot
+            and snapshot is not None
+            and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+        ):
+            # Full metadata validation is a slow-lane operation. Keep it off
+            # the event loop, then establish one immutable decision clock used
+            # by metadata TTL, BBO freshness and all later signal checks.
+            await asyncio.to_thread(self._spread_metadata_cache.refresh)
         decision_at_ms = (
             int(observed_ms)
             if observed_ms is not None
             else int(time.time() * 1000)
         )
+        if (
+            using_compact_snapshot
+            and snapshot is not None
+            and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+        ):
+            merged_quotes, metadata_unavailable = self._spread_metadata_cache.overlay_hot_quotes(
+                snapshot.quotes,
+                now_ms=decision_at_ms,
+            )
+            merged_degraded_symbols = {
+                str(venue).lower(): set(symbols)
+                for venue, symbols in snapshot.degraded_symbols.items()
+            }
+            for venue, symbols in metadata_unavailable.items():
+                merged_degraded_symbols.setdefault(venue, set()).update(symbols)
+            snapshot = replace(
+                snapshot,
+                quotes=merged_quotes,
+                degraded_symbols={
+                    venue: sorted(symbols)
+                    for venue, symbols in merged_degraded_symbols.items()
+                    if symbols
+                },
+            )
+        # In production the decision watermark is taken after the immutable
+        # snapshot has been read and validated.  Otherwise a concurrent
+        # sidecar publish can be newer than a timestamp captured before I/O,
+        # making current evidence look future/stale.  Explicit test/replay
+        # clocks remain authoritative and never advance from wall time.
         configured_venues = {
             str(vc.venue or "").lower() for vc in self.config.venues if str(vc.venue or "").strip()
         }
@@ -726,7 +769,7 @@ class SpreadSidecarService:
                 {},
                 configured_venues,
                 "sidecar_snapshot_stale",
-                len(snapshot.quotes),
+                snapshot_input_quote_count,
                 0,
                 {},
                 decision_at_ms,
@@ -775,7 +818,7 @@ class SpreadSidecarService:
         degraded_symbols = {
             venue: sorted(symbols) for venue, symbols in degraded_symbol_sets.items() if symbols
         }
-        dropped_count = len(snapshot.quotes) - len(quotes)
+        dropped_count = snapshot_input_quote_count - len(quotes)
 
         if dropped_count and not quotes:
             if not degraded_venues:
@@ -789,7 +832,7 @@ class SpreadSidecarService:
                 {},
                 degraded_venues,
                 source_mode,
-                len(snapshot.quotes),
+                snapshot_input_quote_count,
                 0,
                 degraded_symbols,
                 decision_at_ms,
@@ -804,7 +847,7 @@ class SpreadSidecarService:
             quotes,
             degraded_venues,
             source_mode,
-            len(snapshot.quotes),
+            snapshot_input_quote_count,
             market_observed_at_ms,
             degraded_symbols,
             decision_at_ms,
