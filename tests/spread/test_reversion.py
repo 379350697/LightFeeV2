@@ -171,6 +171,60 @@ def test_stats_snapshot_is_computed_once_per_accepted_observation(monkeypatch) -
     assert expired.sample_count == 0
 
 
+def test_robust_model_recompute_is_phase_staggered_across_pairs(monkeypatch) -> None:
+    import lightfee.spread.reversion as reversion
+
+    calls = 0
+    original = reversion._robust_location_scale
+
+    def counted(values):
+        nonlocal calls
+        calls += 1
+        return original(values)
+
+    monkeypatch.setattr(reversion, "_robust_location_scale", counted)
+    tracker = SpreadStatsTracker()
+    for index in range(254):
+        for sample_index in range(3):
+            tracker.update(
+                f"S{index:03d}",
+                "alpha",
+                "beta",
+                float(sample_index),
+                observed_at_ms=90_000 + sample_index * 3_000,
+            )
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    started_at_ms = 100_000
+    for index in range(254):
+        tracker.snapshot(
+            f"S{index:03d}",
+            "alpha",
+            "beta",
+            now_ms=started_at_ms,
+        )
+    calls = 0
+
+    calls_per_refresh: list[int] = []
+    for offset_ms in range(250, 15_001, 250):
+        before = calls
+        for index in range(254):
+            tracker.snapshot(
+                f"S{index:03d}",
+                "alpha",
+                "beta",
+                now_ms=started_at_ms + offset_ms,
+            )
+        calls_per_refresh.append(calls - before)
+
+    assert sum(calls_per_refresh) == 254
+    assert max(calls_per_refresh) <= 12
+
+
 def test_configured_stats_sampling_represents_full_window_and_staggers_pairs() -> None:
     tracker = SpreadStatsTracker()
     tracker.configure(
@@ -209,6 +263,134 @@ def test_configured_stats_sampling_represents_full_window_and_staggers_pairs() -
 
     assert sum(accepted_per_refresh) == pair_count
     assert max(accepted_per_refresh) <= 32
+
+
+def test_robust_model_recompute_is_bounded_without_dropping_samples(monkeypatch) -> None:
+    import lightfee.spread.reversion as reversion
+
+    calls = 0
+    input_sizes: list[int] = []
+    original = reversion._robust_location_scale
+
+    def counted(values):
+        nonlocal calls
+        calls += 1
+        input_sizes.append(len(values))
+        return original(values)
+
+    monkeypatch.setattr(reversion, "_robust_location_scale", counted)
+    tracker = SpreadStatsTracker()
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    assert tracker.sample_interval_ms == 3_000
+    assert tracker.stats_recompute_interval_ms == 15_000
+
+    for index in range(10):
+        tracker.update(
+            "BTCUSDT",
+            "cheap",
+            "rich",
+            float(index),
+            observed_at_ms=100_000 + index * 3_000,
+        )
+
+    snapshot = tracker.snapshot(
+        "BTCUSDT",
+        "cheap",
+        "rich",
+        now_ms=127_000,
+    )
+    assert snapshot is not None
+    # The public statistics snapshot is one coherent model generation. It
+    # never advertises newer evidence bounds beside older robust metrics.
+    assert snapshot.sample_count == input_sizes[-1]
+    assert snapshot.sample_count < 10
+    assert snapshot.last_observed_ms == 100_000 + (snapshot.sample_count - 1) * 3_000
+    assert snapshot.computed_at_ms > 0
+    assert snapshot.evidence_sample_count == 10
+    assert snapshot.evidence_last_observed_ms == 127_000
+    assert snapshot.conservative_sample_count == snapshot.sample_count
+    assert len(tracker.checkpoint(now_ms=127_000)["BTCUSDT|cheap|rich"]["samples"]) == 10
+    assert calls == 2
+
+    rejection_counts: dict[str, int] = {}
+    assert build_spread_reversion_candidates(
+        _quotes_for_signed_basis(20.0, now_ms=127_500),
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+            min_samples=10,
+            min_history_ms=0,
+            fair_price_min_venues=2,
+        ),
+        now_ms=127_500,
+        rejection_counts=rejection_counts,
+    ) == []
+    assert rejection_counts == {"insufficient_history_samples": 1}
+
+
+def test_cached_model_cannot_fail_open_after_current_evidence_eviction() -> None:
+    tracker = SpreadStatsTracker()
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    key = ("BTCUSDT", "cheap", "rich")
+    phase_ms = tracker._stats_recompute_phase(key)
+    computed_at_ms = phase_ms + 20 * tracker.stats_recompute_interval_ms + 5_000
+    oldest_ms = computed_at_ms - tracker.window_ms
+    for index in range(12):
+        tracker.update(
+            *key,
+            float(index),
+            observed_at_ms=oldest_ms + index * tracker.sample_interval_ms,
+        )
+
+    state = tracker._states[key]
+    with state.lock:
+        state.cached_snapshot = None
+        state.last_stats_computed_ms = 0
+    model = tracker.snapshot(*key, now_ms=computed_at_ms)
+    assert model is not None
+    assert model.sample_count == 12
+    assert model.evidence_sample_count == 12
+
+    # The next millisecond expires the oldest observation but remains inside
+    # the same robust-model bucket. Metrics stay one coherent as-of generation;
+    # exact evidence bounds move independently and entry gates take the minimum.
+    cached = tracker.snapshot(*key, now_ms=computed_at_ms + 1)
+    assert cached is not None
+    assert cached.sample_count == 12
+    assert cached.first_observed_ms == oldest_ms
+    assert cached.evidence_sample_count == 11
+    assert cached.evidence_first_observed_ms == oldest_ms + tracker.sample_interval_ms
+    assert cached.conservative_sample_count == 11
+    assert cached.conservative_history_age_ms < cached.history_age_ms
+
+    rejection_counts: dict[str, int] = {}
+    assert build_spread_reversion_candidates(
+        _quotes_for_signed_basis(20.0, now_ms=computed_at_ms + 500),
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+            min_samples=12,
+            min_history_ms=0,
+            fair_price_min_venues=2,
+        ),
+        now_ms=computed_at_ms + 500,
+        rejection_counts=rejection_counts,
+    ) == []
+    assert rejection_counts == {"insufficient_history_samples": 1}
 
 
 def test_configure_resamples_oversampled_history_without_lookahead() -> None:
@@ -441,7 +623,14 @@ def test_current_observation_is_not_in_its_own_zscore_and_direction_is_correct()
     assert candidate.long_venue == "rich"
     assert candidate.short_venue == "cheap"
     after = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=31_000)
-    assert after is not None and after.sample_count == before.sample_count + 1
+    assert after.sample_count == before.sample_count
+    assert after.first_observed_ms == before.first_observed_ms
+    assert after.last_observed_ms == before.last_observed_ms
+    assert after.median_bps == before.median_bps
+    assert after.robust_scale_bps == before.robust_scale_bps
+    assert after.evidence_sample_count == 31
+    assert after.evidence_last_observed_ms == 31_000
+    assert len(tracker.checkpoint(now_ms=31_000)["BTCUSDT|cheap|rich"]["samples"]) == 31
 
     duplicate_rejections: dict[str, int] = {}
     assert build_spread_reversion_candidates(
@@ -467,8 +656,8 @@ def test_repeated_scheduler_reads_do_not_manufacture_history_samples() -> None:
         config=config,
         now_ms=10_100,
     ) == []
-    first = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=10_000)
-    assert first is not None and first.sample_count == 1
+    first = tracker.checkpoint(now_ms=10_000)["BTCUSDT|cheap|rich"]
+    assert len(first["samples"]) == 1
 
     assert build_spread_reversion_candidates(
         quotes,
@@ -477,10 +666,9 @@ def test_repeated_scheduler_reads_do_not_manufacture_history_samples() -> None:
         config=config,
         now_ms=12_000,
     ) == []
-    repeated = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=12_000)
-    assert repeated is not None
-    assert repeated.sample_count == 1
-    assert repeated.last_observed_ms == 10_000
+    repeated = tracker.checkpoint(now_ms=12_000)["BTCUSDT|cheap|rich"]
+    assert len(repeated["samples"]) == 1
+    assert repeated["samples"][0][0] == 10_000
 
 
 def test_negative_z_reverses_trade_direction_without_creating_a_second_series() -> None:

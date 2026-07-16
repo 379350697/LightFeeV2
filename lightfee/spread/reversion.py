@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 import statistics
+import threading
 import zlib
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from typing import Deque
 
@@ -161,12 +162,45 @@ class SpreadStatsSnapshot:
     half_life_ms: int = 0
     cooldown_until_ms: int = 0
     structural_break: bool = False
+    computed_at_ms: int = 0
+    evidence_sample_count: int | None = None
+    evidence_first_observed_ms: int | None = None
+    evidence_last_observed_ms: int | None = None
 
     @property
     def history_age_ms(self) -> int:
         if self.first_observed_ms <= 0 or self.last_observed_ms <= 0:
             return 0
         return max(self.last_observed_ms - self.first_observed_ms, 0)
+
+    @property
+    def evidence_history_age_ms(self) -> int:
+        first_ms = (
+            self.first_observed_ms
+            if self.evidence_first_observed_ms is None
+            else self.evidence_first_observed_ms
+        )
+        last_ms = (
+            self.last_observed_ms
+            if self.evidence_last_observed_ms is None
+            else self.evidence_last_observed_ms
+        )
+        if first_ms <= 0 or last_ms <= 0:
+            return 0
+        return max(last_ms - first_ms, 0)
+
+    @property
+    def conservative_sample_count(self) -> int:
+        evidence_count = (
+            self.sample_count
+            if self.evidence_sample_count is None
+            else max(int(self.evidence_sample_count), 0)
+        )
+        return min(max(int(self.sample_count), 0), evidence_count)
+
+    @property
+    def conservative_history_age_ms(self) -> int:
+        return min(self.history_age_ms, self.evidence_history_age_ms)
 
 
 @dataclass(frozen=True)
@@ -195,6 +229,13 @@ class _RollingState:
     shock_consecutive: int = 0
     last_evidence_observed_ms: int = 0
     cached_snapshot: SpreadStatsSnapshot | None = None
+    last_stats_computed_ms: int = 0
+    stats_recompute_phase_ms: int = 0
+    lock: threading.RLock = field(
+        default_factory=threading.RLock,
+        repr=False,
+        compare=False,
+    )
 
 
 class SpreadStatsTracker:
@@ -220,6 +261,7 @@ class SpreadStatsTracker:
         # contract until a strategy configuration is applied.  Production
         # always calls ``configure`` before restoring or sampling state.
         self.sample_interval_ms = 0
+        self.stats_recompute_interval_ms = 0
         self._states: dict[tuple[str, str, str], _RollingState] = {}
         self._revision = 0
 
@@ -264,24 +306,46 @@ class SpreadStatsTracker:
         self.structural_break_consecutive = max(int(config.structural_break_consecutive or 0), 1)
         self.structural_break_cooldown_ms = max(int(config.structural_break_cooldown_ms or 0), 0)
         self.sample_interval_ms = sample_interval_ms
+        # The long-window evidence cadence and the expensive robust-model
+        # cadence are different contracts. Keep every phase-due sample, but
+        # refresh median/MAD/percentile/AR(1) at most once per five samples.
+        # A five-sample lag is bounded to 0.07% of the 7,200-sample horizon;
+        # every unique quote still traverses the immediate shock lane.
+        stats_recompute_interval_ms = max(sample_interval_ms * 5, sample_interval_ms)
+        recompute_interval_changed = (
+            stats_recompute_interval_ms != self.stats_recompute_interval_ms
+        )
+        self.stats_recompute_interval_ms = stats_recompute_interval_ms
         if interval_changed and self._states:
             changed = False
             for key, state in self._states.items():
-                before = tuple(state.samples)
-                counters_changed = bool(
-                    state.break_consecutive or state.shock_consecutive
-                )
-                self._resample_state(key, state)
-                self._evict(state, state.samples[-1].observed_at_ms if state.samples else 0)
-                # A consecutive counter is meaningful only at the cadence
-                # that produced it. Never combine the old scheduler cadence
-                # with the new phase-aligned statistical cadence.
-                state.break_consecutive = 0
-                state.shock_consecutive = 0
-                state.cached_snapshot = None
-                changed = changed or counters_changed or tuple(state.samples) != before
+                with state.lock:
+                    before = tuple(state.samples)
+                    counters_changed = bool(
+                        state.break_consecutive or state.shock_consecutive
+                    )
+                    self._resample_state(key, state)
+                    self._evict(
+                        state,
+                        state.samples[-1].observed_at_ms if state.samples else 0,
+                    )
+                    # A consecutive counter is meaningful only at the cadence
+                    # that produced it. Never combine the old scheduler cadence
+                    # with the new phase-aligned statistical cadence.
+                    state.break_consecutive = 0
+                    state.shock_consecutive = 0
+                    state.cached_snapshot = None
+                    state.last_stats_computed_ms = 0
+                    state.stats_recompute_phase_ms = self._stats_recompute_phase(key)
+                    changed = changed or counters_changed or tuple(state.samples) != before
             if changed:
                 self._revision += 1
+        elif recompute_interval_changed:
+            for key, state in self._states.items():
+                with state.lock:
+                    state.cached_snapshot = None
+                    state.last_stats_computed_ms = 0
+                    state.stats_recompute_phase_ms = self._stats_recompute_phase(key)
 
     def update(
         self,
@@ -301,11 +365,12 @@ class SpreadStatsTracker:
             observed_at_ms=observed_at_ms,
             exit_half_spread_bps=exit_half_spread_bps,
         )
-        return self._snapshot(
-            state,
-            now_ms=snapshot_at_ms,
-            structural_break=control.structural_break,
-        )
+        with state.lock:
+            return self._snapshot(
+                state,
+                now_ms=snapshot_at_ms,
+                structural_break=control.structural_break,
+            )
 
     def observe(
         self,
@@ -347,7 +412,30 @@ class SpreadStatsTracker:
         exit_half_spread_bps: float,
     ) -> tuple[_RollingState, int, SpreadStatsUpdate]:
         key = _key(symbol, venue_a, venue_b)
-        state = self._states.setdefault(key, _RollingState())
+        state = self._states.get(key)
+        if state is None:
+            state = _RollingState(
+                stats_recompute_phase_ms=self._stats_recompute_phase(key),
+            )
+            self._states[key] = state
+        with state.lock:
+            return self._append_observation_for_state(
+                key,
+                state,
+                signed_basis_bps,
+                observed_at_ms=observed_at_ms,
+                exit_half_spread_bps=exit_half_spread_bps,
+            )
+
+    def _append_observation_for_state(
+        self,
+        key: tuple[str, str, str],
+        state: _RollingState,
+        signed_basis_bps: float,
+        *,
+        observed_at_ms: int,
+        exit_half_spread_bps: float,
+    ) -> tuple[_RollingState, int, SpreadStatsUpdate]:
         observed_ms = max(int(observed_at_ms or 0), 0)
         if observed_ms <= 0:
             return state, 0, SpreadStatsUpdate(
@@ -393,8 +481,8 @@ class SpreadStatsTracker:
             )
         state.last_evidence_observed_ms = observed_ms
         self._evict(state, observed_ms)
+        causal_baseline = self._snapshot(state, now_ms=observed_ms)
         if state.samples:
-            causal_baseline = self._snapshot(state, now_ms=observed_ms)
             immediate_break = self._detect_immediate_shock(
                 state,
                 value=value,
@@ -407,6 +495,7 @@ class SpreadStatsTracker:
                 state.cooldown_until_ms = observed_ms + self.structural_break_cooldown_ms
                 state.break_consecutive = 0
                 state.shock_consecutive = 0
+                state.last_stats_computed_ms = 0
                 self._revision += 1
                 return state, observed_ms, SpreadStatsUpdate(
                     accepted=False,
@@ -435,26 +524,32 @@ class SpreadStatsTracker:
                 exit_half,
             )
         )
-        state.cached_snapshot = None
         self._evict(state, observed_ms)
-        # Compute the post-observation statistics once.  They are the exact
-        # no-look-ahead window consumed on the next market observation and the
-        # same robust center/scale required by structural-break detection.
-        # Retaining this immutable snapshot avoids rebuilding median, MAD,
-        # percentile and AR(1) twice per pair per cycle.
-        post_update_snapshot = self._snapshot(state, now_ms=observed_ms)
-        structural_break = self._detect_structural_break(
-            state,
-            observed_ms,
-            center=post_update_snapshot.median_bps,
-            scale=post_update_snapshot.robust_scale_bps,
-        )
+        self._refresh_cached_evidence_bounds(state)
+        if self.stats_recompute_interval_ms <= 1:
+            state.cached_snapshot = None
+            state.last_stats_computed_ms = 0
+        # Structural-break control uses the causal long-window baseline from
+        # before this sample. The short-window center includes the new sample,
+        # while long robust metrics are refreshed on their independent bounded
+        # cadence by the next signal lookup.
+        if causal_baseline.sample_count >= 3:
+            structural_break = self._detect_structural_break(
+                state,
+                observed_ms,
+                center=causal_baseline.median_bps,
+                scale=causal_baseline.robust_scale_bps,
+            )
+        else:
+            state.break_consecutive = 0
+            structural_break = False
         if structural_break:
             state.samples.clear()
             state.cached_snapshot = None
             state.cooldown_until_ms = observed_ms + self.structural_break_cooldown_ms
             state.break_consecutive = 0
             state.shock_consecutive = 0
+            state.last_stats_computed_ms = 0
         self._revision += 1
         return state, observed_ms, SpreadStatsUpdate(
             accepted=True,
@@ -473,30 +568,45 @@ class SpreadStatsTracker:
         state = self._states.get(_key(symbol, venue_a, venue_b))
         if state is None:
             return None
-        if now_ms > 0:
-            self._evict(state, now_ms)
-        return self._snapshot(state, now_ms=now_ms)
-
-    def checkpoint(self, *, now_ms: int = 0) -> dict[str, dict]:
-        """Bounded serialisable checkpoint; callers may persist it atomically."""
-        payload: dict[str, dict] = {}
-        for key, state in self._states.items():
+        with state.lock:
             if now_ms > 0:
                 self._evict(state, now_ms)
-            payload["|".join(key)] = {
-                "samples": [
-                    [
-                        sample.observed_at_ms,
-                        sample.value_bps,
-                        sample.exit_half_spread_bps,
-                    ]
-                    for sample in state.samples
-                ],
-                "cooldown_until_ms": state.cooldown_until_ms,
-                "break_consecutive": state.break_consecutive,
-                "shock_consecutive": state.shock_consecutive,
-                "last_evidence_observed_ms": state.last_evidence_observed_ms,
-            }
+            return self._snapshot(state, now_ms=now_ms)
+
+    def checkpoint(self, *, now_ms: int = 0) -> dict[str, dict]:
+        """Bounded pair-local checkpoint safe to serialize off the hot path.
+
+        Each venue-pair state is independent, so the background publisher may
+        observe neighbouring pairs at adjacent market instants. A deque copy
+        gives one internally ordered pair image without mutating live eviction
+        or cached statistics from the persistence thread.
+        """
+
+        payload: dict[str, dict] = {}
+        cutoff = max(int(now_ms or 0) - self.window_ms, 0) if now_ms > 0 else 0
+        for key, state in list(self._states.items()):
+            with state.lock:
+                samples = state.samples.copy()
+                if cutoff > 0:
+                    samples = deque(
+                        sample for sample in samples if sample.observed_at_ms >= cutoff
+                    )
+                while len(samples) > self.max_samples:
+                    samples.popleft()
+                payload["|".join(key)] = {
+                    "samples": [
+                        [
+                            sample.observed_at_ms,
+                            sample.value_bps,
+                            sample.exit_half_spread_bps,
+                        ]
+                        for sample in samples
+                    ],
+                    "cooldown_until_ms": state.cooldown_until_ms,
+                    "break_consecutive": state.break_consecutive,
+                    "shock_consecutive": state.shock_consecutive,
+                    "last_evidence_observed_ms": state.last_evidence_observed_ms,
+                }
         return payload
 
     def restore(self, checkpoint: dict[str, dict], *, now_ms: int) -> bool:
@@ -541,6 +651,9 @@ class SpreadStatsTracker:
                 break_consecutive=break_consecutive,
                 shock_consecutive=shock_consecutive,
                 last_evidence_observed_ms=last_evidence_observed_ms,
+                stats_recompute_phase_ms=self._stats_recompute_phase(
+                    (parts[0].upper(), parts[1].lower(), parts[2].lower())
+                ),
             )
             restored_samples: list[_Sample] = []
             rows = raw.get("samples", [])
@@ -605,6 +718,13 @@ class SpreadStatsTracker:
         phase_ms = zlib.crc32(packed) % interval_ms
         return (max(int(observed_at_ms or 0), 0) - phase_ms) // interval_ms
 
+    def _stats_recompute_phase(self, key: tuple[str, str, str]) -> int:
+        interval_ms = max(int(self.stats_recompute_interval_ms or 0), 1)
+        if interval_ms <= 1:
+            return 0
+        packed = ("|".join(key) + "|robust-stats").encode("utf-8")
+        return zlib.crc32(packed) % interval_ms
+
     def _resample_state(
         self,
         key: tuple[str, str, str],
@@ -638,7 +758,28 @@ class SpreadStatsTracker:
             state.samples.popleft()
             evicted = True
         if evicted:
-            state.cached_snapshot = None
+            if self.stats_recompute_interval_ms <= 1 or not state.samples:
+                state.cached_snapshot = None
+                state.last_stats_computed_ms = 0
+            else:
+                self._refresh_cached_evidence_bounds(state)
+
+    @staticmethod
+    def _refresh_cached_evidence_bounds(state: _RollingState) -> None:
+        """Refresh exact gate evidence without relabelling cached model metrics."""
+
+        if state.cached_snapshot is None:
+            return
+        state.cached_snapshot = replace(
+            state.cached_snapshot,
+            evidence_sample_count=len(state.samples),
+            evidence_first_observed_ms=(
+                state.samples[0].observed_at_ms if state.samples else 0
+            ),
+            evidence_last_observed_ms=(
+                state.samples[-1].observed_at_ms if state.samples else 0
+            ),
+        )
 
     def _detect_structural_break(
         self,
@@ -682,7 +823,25 @@ class SpreadStatsTracker:
     def _snapshot(
         self, state: _RollingState, *, now_ms: int, structural_break: bool = False
     ) -> SpreadStatsSnapshot:
-        if state.cached_snapshot is not None and not structural_break:
+        recompute_bucket_advanced = False
+        if (
+            self.stats_recompute_interval_ms > 1
+            and state.last_stats_computed_ms > 0
+            and now_ms > 0
+        ):
+            phase_ms = state.stats_recompute_phase_ms
+            recompute_bucket_advanced = (
+                (now_ms - phase_ms) // self.stats_recompute_interval_ms
+                > (state.last_stats_computed_ms - phase_ms)
+                // self.stats_recompute_interval_ms
+            )
+        recompute_due = bool(
+            state.cached_snapshot is None
+            or state.last_stats_computed_ms <= 0
+            or now_ms <= 0
+            or recompute_bucket_advanced
+        )
+        if state.cached_snapshot is not None and not structural_break and not recompute_due:
             return state.cached_snapshot
         samples = list(state.samples)
         if not samples:
@@ -692,9 +851,14 @@ class SpreadStatsTracker:
                 std_bps=0.0,
                 cooldown_until_ms=state.cooldown_until_ms,
                 structural_break=structural_break,
+                computed_at_ms=max(int(now_ms or 0), 0),
+                evidence_sample_count=0,
+                evidence_first_observed_ms=0,
+                evidence_last_observed_ms=0,
             )
             if not structural_break:
                 state.cached_snapshot = snapshot
+                state.last_stats_computed_ms = max(int(now_ms or 0), 0)
             return snapshot
         values = [sample.value_bps for sample in samples]
         median, robust_scale = _robust_location_scale(values)
@@ -715,9 +879,14 @@ class SpreadStatsTracker:
             half_life_ms=half_life,
             cooldown_until_ms=state.cooldown_until_ms,
             structural_break=structural_break,
+            computed_at_ms=max(int(now_ms or 0), 0),
+            evidence_sample_count=len(samples),
+            evidence_first_observed_ms=samples[0].observed_at_ms,
+            evidence_last_observed_ms=samples[-1].observed_at_ms,
         )
         if not structural_break:
             state.cached_snapshot = snapshot
+            state.last_stats_computed_ms = max(int(now_ms or 0), 0)
         return snapshot
 
 
@@ -956,10 +1125,10 @@ def _candidate_for_pair(
 
     is_dislocation = opportunity_label == "single_venue_dislocation"
     if not is_dislocation:
-        if stats.sample_count < max(int(config.min_samples or 0), 1):
+        if stats.conservative_sample_count < max(int(config.min_samples or 0), 1):
             _record_spread_rejection(rejection_counts, "insufficient_history_samples")
             return None
-        if stats.history_age_ms < max(int(config.min_history_ms or 0), 0):
+        if stats.conservative_history_age_ms < max(int(config.min_history_ms or 0), 0):
             _record_spread_rejection(rejection_counts, "insufficient_history_age")
             return None
         if stats.std_bps < max(float(config.mean_reversion_min_std_bps or 0.0), 0.0):

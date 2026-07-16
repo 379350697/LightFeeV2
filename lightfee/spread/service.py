@@ -397,6 +397,7 @@ class SpreadSidecarService:
         self._stats_checkpoint_restored = False
         self._stats_checkpoint_persisted_revision = self.stats.revision
         self._stats_checkpoint_last_attempt_ms = 0
+        self._stats_checkpoint_task: asyncio.Task[None] | None = None
         self._paper_journal: Journal | None = None
         self._paper_tracker = SpreadPaperTracker(
             self._paper_config(config, fee_evidence=self._fee_evidence)
@@ -497,10 +498,25 @@ class SpreadSidecarService:
             finally:
                 self._spread_metadata_refresh_task = None
         if hasattr(self, "stats"):
-            try:
-                self._checkpoint_stats_if_due(int(time.time() * 1000), force=True)
-            except OSError:
-                logger.exception("final spread stats checkpoint publish failed")
+            checkpoint_task = getattr(self, "_stats_checkpoint_task", None)
+            if checkpoint_task is not None:
+                try:
+                    await asyncio.shield(checkpoint_task)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    close_cancelled = close_cancelled or bool(
+                        current_task is not None and current_task.cancelling()
+                    )
+            self._checkpoint_stats_if_due(int(time.time() * 1000), force=True)
+            checkpoint_task = getattr(self, "_stats_checkpoint_task", None)
+            if checkpoint_task is not None:
+                try:
+                    await asyncio.shield(checkpoint_task)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    close_cancelled = close_cancelled or bool(
+                        current_task is not None and current_task.cancelling()
+                    )
         if self._paper_journal is not None:
             try:
                 self._paper_journal.close()
@@ -533,15 +549,7 @@ class SpreadSidecarService:
             rejection_counts=rejection_counts,
             diagnostics=evaluation_diagnostics,
         )
-        try:
-            self._checkpoint_stats_if_due(decision_at_ms)
-        except OSError:
-            # The next process starts cold if this fails, which is safe because
-            # `SpreadStatsTracker` refuses entries until it has fresh samples.
-            logger.exception(
-                "spread stats checkpoint publish failed; next restart will cold-start",
-                extra={"checkpoint_path": self.stats_checkpoint_path},
-            )
+        self._checkpoint_stats_if_due(decision_at_ms)
         paper_result = await self._refresh_paper(
             candidates,
             quotes,
@@ -602,6 +610,9 @@ class SpreadSidecarService:
         self._stats_checkpoint_last_attempt_ms = max(int(now_ms or 0), 0)
 
     def _checkpoint_stats_if_due(self, now_ms: int, *, force: bool = False) -> bool:
+        active_task = getattr(self, "_stats_checkpoint_task", None)
+        if active_task is not None and not active_task.done():
+            return False
         revision = self.stats.revision
         if revision == self._stats_checkpoint_persisted_revision:
             return False
@@ -617,14 +628,48 @@ class SpreadSidecarService:
         # unwritable disk must not turn the 250 ms signal loop into a tight
         # checkpoint retry loop.
         self._stats_checkpoint_last_attempt_ms = observed_ms
-        publish_spread_stats_checkpoint(
-            self.stats,
-            self.stats_checkpoint_path,
-            model_epoch=self.signal_config.model_epoch,
-            now_ms=observed_ms,
+        self._stats_checkpoint_task = asyncio.create_task(
+            self._publish_stats_checkpoint_in_background(
+                revision=revision,
+                observed_ms=observed_ms,
+            )
         )
-        self._stats_checkpoint_persisted_revision = revision
         return True
+
+    async def _publish_stats_checkpoint_in_background(
+        self,
+        *,
+        revision: int,
+        observed_ms: int,
+    ) -> None:
+        """Persist a large rolling window without blocking signal publication."""
+
+        try:
+            await asyncio.to_thread(
+                publish_spread_stats_checkpoint,
+                self.stats,
+                self.stats_checkpoint_path,
+                model_epoch=self.signal_config.model_epoch,
+                now_ms=observed_ms,
+            )
+        except Exception:
+            # The next process safely cold-starts if the durable snapshot is
+            # unavailable. Keep the live signal loop available and retry only
+            # after the normal checkpoint interval.
+            logger.exception(
+                "spread stats checkpoint publish failed; next restart will cold-start",
+                extra={"checkpoint_path": self.stats_checkpoint_path},
+            )
+        else:
+            # Mark only the revision that was scheduled. Evidence accepted
+            # while the thread was writing remains dirty for the next pass.
+            self._stats_checkpoint_persisted_revision = max(
+                self._stats_checkpoint_persisted_revision,
+                revision,
+            )
+        finally:
+            if self._stats_checkpoint_task is asyncio.current_task():
+                self._stats_checkpoint_task = None
 
     async def _refresh_paper(
         self,
