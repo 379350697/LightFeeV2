@@ -735,9 +735,9 @@ class TestSidecarPairingV2:
 class TestSidecarSnapshotV2:
     """Snapshot must include all V2 candidate identity fields."""
 
-    def test_schema_is_v4(self):
+    def test_schema_is_v5(self):
         s = SidecarSnapshot()
-        assert s.schema_version == 4
+        assert s.schema_version == 5
 
     def test_candidate_has_v2_fields(self):
         c = CandidateInput(

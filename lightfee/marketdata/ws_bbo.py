@@ -61,7 +61,13 @@ class VenueBboCache:
     def _key(venue: str, symbol: str) -> tuple[str, str]:
         return str(venue or "").strip().lower(), str(symbol or "").strip().upper()
 
-    def update_quote(self, quote: TopBookQuote) -> bool:
+    def update_quote(
+        self,
+        quote: TopBookQuote,
+        *,
+        now_ms: int = 0,
+        current_max_age_ms: int = 0,
+    ) -> bool:
         if quote.bid <= 0.0 or quote.ask <= 0.0 or quote.bid >= quote.ask:
             return False
         venue, symbol = self._key(quote.venue, quote.symbol)
@@ -69,8 +75,51 @@ class VenueBboCache:
             return False
         normalized = replace(quote, venue=venue, symbol=symbol)
         current = self._quotes.get((venue, symbol))
-        if current is not None and quote.observed_at_ms > 0:
-            if current.observed_at_ms > quote.observed_at_ms:
+        if current is not None:
+            # Exchange event time and local receipt time are different clocks.
+            # Compare exchange sequence time only when both observations expose
+            # it; otherwise fall back to the comparable local receipt clock.
+            current_event_ms = int(current.exchange_event_at_ms or 0)
+            incoming_event_ms = int(normalized.exchange_event_at_ms or 0)
+            current_received_ms = int(
+                current.received_at_ms or current.observed_at_ms or 0
+            )
+            incoming_received_ms = int(
+                normalized.received_at_ms or normalized.observed_at_ms or 0
+            )
+            incoming_is_rest = "rest" in str(normalized.source or "").lower()
+            if (
+                current_event_ms > 0
+                and incoming_event_ms <= 0
+                and incoming_is_rest
+            ):
+                # A REST receipt timestamp cannot prove that its market event
+                # is newer than a WS event timestamp.  Keep the comparable WS
+                # observation while its local lease is still valid.  Callers
+                # that know the lease TTL may explicitly allow REST to replace
+                # an expired observation; callers without that context remain
+                # conservative.
+                current_is_fresh = True
+                if now_ms > 0 and current_max_age_ms > 0:
+                    current_observed_ms = int(
+                        current.observed_at_ms or current.received_at_ms or 0
+                    )
+                    current_is_fresh = bool(
+                        current_observed_ms > 0
+                        and current_observed_ms <= now_ms
+                        and now_ms - current_observed_ms <= current_max_age_ms
+                    )
+                if current_is_fresh:
+                    return False
+            if current_event_ms > 0 and incoming_event_ms > 0:
+                if incoming_event_ms < current_event_ms:
+                    return False
+                if (
+                    incoming_event_ms == current_event_ms
+                    and current_received_ms > incoming_received_ms
+                ):
+                    return False
+            elif current_received_ms > incoming_received_ms > 0:
                 return False
         self._quotes[(venue, symbol)] = normalized
         return True
@@ -156,22 +205,157 @@ class RestTopBookQuoteRefresher:
         "hyperliquid",
     }
     MIN_ATTEMPT_INTERVAL_MS = 1_000
+    GLOBAL_ASYNC_CONCURRENCY = 12
+    VENUE_ASYNC_CONCURRENCY = 2
 
     def __init__(
         self,
         *,
         client: httpx.Client | None = None,
+        async_client: httpx.AsyncClient | None = None,
         timeout_ms: int = 750,
     ) -> None:
         self._client = client
         self._owns_client = client is None
+        self._async_client = async_client
+        self._owns_async_client = async_client is None
         self._timeout_s = max(min(int(timeout_ms or 750), 1_000), 100) / 1000.0
         self._last_attempt_ms: dict[tuple[str, str], int] = {}
+        self._global_async_semaphore = asyncio.Semaphore(
+            self.GLOBAL_ASYNC_CONCURRENCY
+        )
+        self._venue_async_semaphores = {
+            venue: asyncio.Semaphore(self.VENUE_ASYNC_CONCURRENCY)
+            for venue in self.SUPPORTED_VENUES
+        }
+        self._async_inflight: dict[
+            tuple[str, str], asyncio.Task[RestTopBookQuoteResult]
+        ] = {}
+        self._async_inflight_waiters: dict[tuple[str, str], int] = {}
 
     def close(self) -> None:
         if self._owns_client and self._client is not None:
             self._client.close()
             self._client = None
+
+    async def aclose(self) -> None:
+        inflight = list(self._async_inflight.values())
+        self._async_inflight.clear()
+        self._async_inflight_waiters.clear()
+        for task in inflight:
+            if not task.done():
+                task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        if self._owns_async_client and self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
+
+    async def arefresh_quote_result(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+    ) -> RestTopBookQuoteResult:
+        """Refresh one quote without blocking the event loop."""
+
+        venue_key = str(venue or "").strip().lower()
+        symbol_key = str(symbol or "").strip().upper()
+        key = (venue_key, symbol_key)
+        task = self._async_inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                self._arefresh_quote_result_once(
+                    venue_key,
+                    symbol_key,
+                    now_ms=now_ms,
+                )
+            )
+            self._async_inflight[key] = task
+
+            def _clear_inflight(
+                completed: asyncio.Task[RestTopBookQuoteResult],
+            ) -> None:
+                if self._async_inflight.get(key) is completed:
+                    self._async_inflight.pop(key, None)
+
+            task.add_done_callback(_clear_inflight)
+
+        self._async_inflight_waiters[key] = (
+            self._async_inflight_waiters.get(key, 0) + 1
+        )
+        try:
+            # One cancelled waiter must not cancel work still shared by another
+            # waiter.  The final waiter, however, owns cancellation below.
+            return await asyncio.shield(task)
+        finally:
+            remaining_waiters = self._async_inflight_waiters.get(key, 1) - 1
+            if remaining_waiters > 0:
+                self._async_inflight_waiters[key] = remaining_waiters
+            else:
+                self._async_inflight_waiters.pop(key, None)
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                if self._async_inflight.get(key) is task:
+                    self._async_inflight.pop(key, None)
+
+    async def _arefresh_quote_result_once(
+        self,
+        venue_key: str,
+        symbol_key: str,
+        *,
+        now_ms: int,
+    ) -> RestTopBookQuoteResult:
+        metadata = self._quote_request_metadata(venue_key, symbol_key)
+        rejected = self._begin_attempt(
+            venue_key,
+            symbol_key,
+            now_ms=now_ms,
+            metadata=metadata,
+        )
+        if rejected is not None:
+            return rejected
+        try:
+            method, url, request_kwargs = self._quote_request(
+                venue_key,
+                symbol_key,
+            )
+            client = self._async_client
+            if client is None:
+                client = httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_s))
+                self._async_client = client
+            venue_semaphore = self._venue_async_semaphores[venue_key]
+            async with self._global_async_semaphore, venue_semaphore:
+                response = await client.request(
+                    method,
+                    url,
+                    timeout=self._timeout_s,
+                    **request_kwargs,
+                )
+            response.raise_for_status()
+            raw = response.json()
+            received_at_ms = int(time.time() * 1000)
+            quote = self._quote_from_raw(
+                venue_key,
+                symbol_key,
+                raw,
+                received_at_ms=received_at_ms,
+            )
+        except Exception as exc:
+            return self._error_result(
+                venue_key,
+                symbol_key,
+                metadata=metadata,
+                exc=exc,
+            )
+        return self._resolved_result(
+            venue_key,
+            symbol_key,
+            metadata=metadata,
+            quote=quote,
+        )
 
     def refresh_quote(
         self,
@@ -191,23 +375,52 @@ class RestTopBookQuoteRefresher:
     ) -> RestTopBookQuoteResult:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
-        if venue_key not in self.SUPPORTED_VENUES or not symbol_key:
+        metadata = self._quote_request_metadata(venue_key, symbol_key)
+        rejected = self._begin_attempt(
+            venue_key,
+            symbol_key,
+            now_ms=now_ms,
+            metadata=metadata,
+        )
+        if rejected is not None:
+            return rejected
+
+        try:
+            quote = self._refresh_quote_uncached(venue_key, symbol_key, now_ms)
+        except Exception as exc:
+            return self._error_result(
+                venue_key,
+                symbol_key,
+                metadata=metadata,
+                exc=exc,
+            )
+        return self._resolved_result(
+            venue_key,
+            symbol_key,
+            metadata=metadata,
+            quote=quote,
+        )
+
+    def _begin_attempt(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        metadata: dict[str, str],
+    ) -> RestTopBookQuoteResult | None:
+        if venue not in self.SUPPORTED_VENUES or not symbol:
             return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
+                venue=venue,
+                symbol=symbol,
                 outcome="unsupported_symbol",
             )
-
-        key = (venue_key, symbol_key)
-        metadata = self._quote_request_metadata(venue_key, symbol_key)
+        key = (venue, symbol)
         last_attempt_ms = int(self._last_attempt_ms.get(key, 0) or 0)
-        if (
-            last_attempt_ms > 0
-            and now_ms - last_attempt_ms < self.MIN_ATTEMPT_INTERVAL_MS
-        ):
+        if last_attempt_ms > 0 and now_ms - last_attempt_ms < self.MIN_ATTEMPT_INTERVAL_MS:
             return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
+                venue=venue,
+                symbol=symbol,
                 venue_symbol=metadata.get("venue_symbol", ""),
                 endpoint=metadata.get("endpoint", ""),
                 url=metadata.get("url", ""),
@@ -215,60 +428,55 @@ class RestTopBookQuoteRefresher:
                 attempt_interval_outcome="min_interval_not_elapsed",
             )
         self._last_attempt_ms[key] = now_ms
+        return None
 
-        try:
-            quote = self._refresh_quote_uncached(venue_key, symbol_key, now_ms)
-        except httpx.HTTPStatusError as exc:
-            response = exc.response
-            status = int(response.status_code if response is not None else 0)
-            body = _response_body_excerpt(response)
-            return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
-                venue_symbol=metadata.get("venue_symbol", ""),
-                endpoint=metadata.get("endpoint", ""),
-                url=metadata.get("url", ""),
-                http_status=status,
-                body_excerpt=body,
-                outcome=(
-                    "unsupported_symbol"
-                    if _looks_like_unsupported_symbol(status, body)
-                    else "http_error"
-                ),
-                error=str(exc)[:240],
-            )
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
-                venue_symbol=metadata.get("venue_symbol", ""),
-                endpoint=metadata.get("endpoint", ""),
-                url=metadata.get("url", ""),
-                outcome="parse_error",
-                error=f"{type(exc).__name__}: {exc}"[:240],
-            )
-        except Exception as exc:
-            return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
-                venue_symbol=metadata.get("venue_symbol", ""),
-                endpoint=metadata.get("endpoint", ""),
-                url=metadata.get("url", ""),
-                outcome="http_error",
-                error=f"{type(exc).__name__}: {exc}"[:240],
-            )
+    @staticmethod
+    def _error_result(
+        venue: str,
+        symbol: str,
+        *,
+        metadata: dict[str, str],
+        exc: Exception,
+    ) -> RestTopBookQuoteResult:
+        response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+        status = int(response.status_code if response is not None else 0)
+        body = _response_body_excerpt(response)
+        parse_error = isinstance(exc, (ValueError, TypeError, json.JSONDecodeError))
+        outcome = "parse_error" if parse_error else "http_error"
+        if isinstance(exc, httpx.HTTPStatusError) and _looks_like_unsupported_symbol(status, body):
+            outcome = "unsupported_symbol"
+        return RestTopBookQuoteResult(
+            venue=venue,
+            symbol=symbol,
+            venue_symbol=metadata.get("venue_symbol", ""),
+            endpoint=metadata.get("endpoint", ""),
+            url=metadata.get("url", ""),
+            http_status=status,
+            body_excerpt=body,
+            outcome=outcome,
+            error=f"{type(exc).__name__}: {exc}"[:240],
+        )
+
+    @staticmethod
+    def _resolved_result(
+        venue: str,
+        symbol: str,
+        *,
+        metadata: dict[str, str],
+        quote: TopBookQuote | None,
+    ) -> RestTopBookQuoteResult:
         if quote is None:
             return RestTopBookQuoteResult(
-                venue=venue_key,
-                symbol=symbol_key,
+                venue=venue,
+                symbol=symbol,
                 venue_symbol=metadata.get("venue_symbol", ""),
                 endpoint=metadata.get("endpoint", ""),
                 url=metadata.get("url", ""),
                 outcome="invalid_quote",
             )
         return RestTopBookQuoteResult(
-            venue=venue_key,
-            symbol=symbol_key,
+            venue=venue,
+            symbol=symbol,
             quote=quote,
             venue_symbol=metadata.get("venue_symbol", ""),
             endpoint=metadata.get("endpoint", ""),
@@ -307,6 +515,55 @@ class RestTopBookQuoteRefresher:
         symbol: str,
         now_ms: int,
     ) -> TopBookQuote | None:
+        method, url, request_kwargs = self._quote_request(venue, symbol)
+        if method == "POST":
+            raw = self._post_json(url, json=request_kwargs["json"])
+        else:
+            raw = self._get_json(url, params=request_kwargs["params"])
+        # The synchronous compatibility API treats its injected clock as the
+        # receipt clock.  The live async path records the actual arrival time.
+        received_at_ms = int(now_ms)
+        return self._quote_from_raw(
+            venue,
+            symbol,
+            raw,
+            received_at_ms=received_at_ms,
+        )
+
+    def _quote_request(
+        self,
+        venue: str,
+        symbol: str,
+    ) -> tuple[str, str, dict[str, Any]]:
+        from lightfee.core.domain import Venue
+        from lightfee.venues.specs import get_spec
+
+        venue_enum = Venue.from_str(venue)
+        spec = get_spec(venue_enum)
+        venue_symbol = spec.symbol_to_venue(symbol) if spec.symbol_to_venue else symbol
+        url = spec.public_base_url + spec.market_snapshot_path
+        if venue in {"binance", "aster"}:
+            return "GET", url, {"params": {"symbol": venue_symbol}}
+        if venue == "bybit":
+            return "GET", url, {"params": {"category": "linear", "symbol": venue_symbol}}
+        if venue == "okx":
+            return "GET", spec.public_base_url + "/api/v5/market/ticker", {"params": {"instId": venue_symbol}}
+        if venue == "bitget":
+            return "GET", url, {"params": {"productType": "USDT-FUTURES", "symbol": venue_symbol}}
+        if venue == "gate":
+            return "GET", url, {"params": {"contract": venue_symbol}}
+        if venue == "hyperliquid":
+            return "POST", url, {"json": {"type": "l2Book", "coin": venue_symbol}}
+        raise ValueError(f"unsupported venue: {venue}")
+
+    def _quote_from_raw(
+        self,
+        venue: str,
+        symbol: str,
+        raw: Any,
+        *,
+        received_at_ms: int,
+    ) -> TopBookQuote | None:
         from lightfee.core.domain import Venue
         from lightfee.venues.specs import get_spec
 
@@ -315,10 +572,6 @@ class RestTopBookQuoteRefresher:
         venue_symbol = spec.symbol_to_venue(symbol) if spec.symbol_to_venue else symbol
 
         if venue in {"binance", "aster"}:
-            raw = self._get_json(
-                spec.public_base_url + spec.market_snapshot_path,
-                params={"symbol": venue_symbol},
-            )
             row = self._select_row(raw, venue_symbol)
             exchange_event_at_ms = _int_ms(
                 row.get("time"),
@@ -332,16 +585,12 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("askPrice"), row.get("a")),
                 bid_size=_float_value(row.get("bidQty"), row.get("B")),
                 ask_size=_float_value(row.get("askQty"), row.get("A")),
-                observed_at_ms=now_ms,
-                received_at_ms=now_ms,
+                observed_at_ms=received_at_ms,
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=exchange_event_at_ms,
             )
 
         if venue == "bybit":
-            raw = self._get_json(
-                spec.public_base_url + spec.market_snapshot_path,
-                params={"category": "linear", "symbol": venue_symbol},
-            )
             result = raw.get("result") if isinstance(raw, dict) else {}
             rows = result.get("list") if isinstance(result, dict) else []
             row = self._select_row(rows, venue_symbol)
@@ -352,16 +601,12 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("ask1Price"), row.get("askPrice")),
                 bid_size=_float_value(row.get("bid1Size"), row.get("bidSize")),
                 ask_size=_float_value(row.get("ask1Size"), row.get("askSize")),
-                observed_at_ms=_int_ms(row.get("ts"), raw.get("time"), now_ms),
-                received_at_ms=now_ms,
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("time"), received_at_ms),
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("time")),
             )
 
         if venue == "okx":
-            raw = self._get_json(
-                spec.public_base_url + "/api/v5/market/ticker",
-                params={"instId": venue_symbol},
-            )
             row = self._select_row(
                 raw.get("data") if isinstance(raw, dict) else [],
                 venue_symbol,
@@ -373,16 +618,12 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("askPx")),
                 bid_size=_float_value(row.get("bidSz")),
                 ask_size=_float_value(row.get("askSz")),
-                observed_at_ms=_int_ms(row.get("ts"), raw.get("ts"), now_ms),
-                received_at_ms=now_ms,
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("ts"), received_at_ms),
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("ts")),
             )
 
         if venue == "bitget":
-            raw = self._get_json(
-                spec.public_base_url + spec.market_snapshot_path,
-                params={"productType": "USDT-FUTURES", "symbol": venue_symbol},
-            )
             rows = raw.get("data") if isinstance(raw, dict) else raw
             row = self._select_row(rows, venue_symbol)
             return self._make_rest_quote(
@@ -392,16 +633,12 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("askPr"), row.get("ask1Price")),
                 bid_size=_float_value(row.get("bidSz"), row.get("bid1Size")),
                 ask_size=_float_value(row.get("askSz"), row.get("ask1Size")),
-                observed_at_ms=_int_ms(row.get("ts"), raw.get("requestTime"), now_ms),
-                received_at_ms=now_ms,
+                observed_at_ms=_int_ms(row.get("ts"), raw.get("requestTime"), received_at_ms),
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=_int_ms(row.get("ts"), raw.get("requestTime")),
             )
 
         if venue == "gate":
-            raw = self._get_json(
-                spec.public_base_url + spec.market_snapshot_path,
-                params={"contract": venue_symbol},
-            )
             row = self._select_row(raw, venue_symbol)
             return self._make_rest_quote(
                 venue=venue,
@@ -410,16 +647,12 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(row.get("lowest_ask"), row.get("ask")),
                 bid_size=_float_value(row.get("highest_size"), row.get("bid_size")),
                 ask_size=_float_value(row.get("lowest_size"), row.get("ask_size")),
-                observed_at_ms=_int_ms(row.get("time_ms"), row.get("time"), now_ms),
-                received_at_ms=now_ms,
+                observed_at_ms=_int_ms(row.get("time_ms"), row.get("time"), received_at_ms),
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=_int_ms(row.get("time_ms"), row.get("time")),
             )
 
         if venue == "hyperliquid":
-            raw = self._post_json(
-                spec.public_base_url + spec.market_snapshot_path,
-                json={"type": "l2Book", "coin": venue_symbol},
-            )
             levels = raw.get("levels") if isinstance(raw, dict) else []
             bids = levels[0] if isinstance(levels, list) and len(levels) > 0 else []
             asks = levels[1] if isinstance(levels, list) and len(levels) > 1 else []
@@ -432,8 +665,8 @@ class RestTopBookQuoteRefresher:
                 ask=_float_value(ask_row.get("px"), ask_row.get("price")),
                 bid_size=_float_value(bid_row.get("sz"), bid_row.get("size")),
                 ask_size=_float_value(ask_row.get("sz"), ask_row.get("size")),
-                observed_at_ms=_int_ms(raw.get("time"), now_ms),
-                received_at_ms=now_ms,
+                observed_at_ms=_int_ms(raw.get("time"), received_at_ms),
+                received_at_ms=received_at_ms,
                 exchange_event_at_ms=_int_ms(raw.get("time")),
             )
 
@@ -494,7 +727,9 @@ class RestTopBookQuoteRefresher:
             ask=ask,
             bid_size=bid_size,
             ask_size=ask_size,
-            observed_at_ms=observed_at_ms or received_at_ms,
+            # Freshness is measured on the local receipt clock.  Exchange
+            # event time remains available separately for ordering/auditing.
+            observed_at_ms=received_at_ms or observed_at_ms,
             received_at_ms=received_at_ms,
             exchange_event_at_ms=exchange_event_at_ms,
             source=f"{venue}_rest_top_book",
@@ -781,8 +1016,10 @@ class BboWsClient(ABC):
             ask=ask,
             bid_size=bid_size,
             ask_size=ask_size,
-            observed_at_ms=observed_at_ms or received_at_ms,
+            # Never mix venue event clocks with local freshness clocks.
+            observed_at_ms=received_at_ms or observed_at_ms,
             received_at_ms=received_at_ms,
+            exchange_event_at_ms=observed_at_ms,
             source=source,
         )
         if quote.bid <= 0.0 or quote.ask <= 0.0 or quote.bid >= quote.ask:
@@ -1129,6 +1366,50 @@ class VenueBboDataPlane:
                 client._connected = False
                 client._ws = None
         self._clients.clear()
+
+    async def reconcile_ws_streams(
+        self,
+        tracked: set[tuple[str, str]],
+        *,
+        per_client_timeout_s: float = 1.0,
+    ) -> int:
+        """Stop and forget clients outside the current generation budget."""
+
+        tracked_keys = {self._key(venue, symbol) for venue, symbol in tracked}
+        stale_clients = [
+            (key, client)
+            for key, client in list(self._clients.items())
+            if key not in tracked_keys
+        ]
+
+        async def _stop_one(
+            key: tuple[str, str],
+            client: BboWsClient,
+        ) -> None:
+            try:
+                await asyncio.wait_for(
+                    client.stop(),
+                    timeout=per_client_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                task = getattr(client, "_task", None)
+                if task is not None and not task.done():
+                    task.cancel()
+                client._closed = True
+                client._connected = False
+                client._ws = None
+            finally:
+                if self._clients.get(key) is client:
+                    self._clients.pop(key, None)
+
+        if stale_clients:
+            await asyncio.gather(
+                *(
+                    _stop_one(key, client)
+                    for key, client in stale_clients
+                )
+            )
+        return len(stale_clients)
 
     @property
     def active_ws_stream_count(self) -> int:

@@ -7,6 +7,7 @@ Do not change market-data business conditions while extracting it.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import Counter
 from typing import Any
 
@@ -17,6 +18,84 @@ from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
+from lightfee.marketdata.open_interest import (
+    normalize_open_interest_status,
+    open_interest_sample_id,
+)
+
+
+def _targeted_open_interest_observed_proof_valid(
+    *,
+    venue: str,
+    symbol: str,
+    result: dict[str, Any],
+) -> bool:
+    """Validate the full economic/sample identity before mutating a quote."""
+
+    def _finite_number(value: object, *, positive: bool = False) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed) or parsed < (0.0 if not positive else 1e-300):
+            return None
+        return parsed
+
+    value_quote = _finite_number(result.get("open_interest_quote"))
+    raw_value = _finite_number(result.get("raw_open_interest"))
+    if value_quote is None or raw_value is None:
+        return False
+    raw_unit = str(result.get("raw_open_interest_unit") or "")
+    mark = _finite_number(
+        result.get("open_interest_conversion_mark_price"),
+        positive=True,
+    )
+    multiplier = _finite_number(
+        result.get("open_interest_contract_multiplier"),
+        positive=True,
+    )
+    if raw_unit == "quote":
+        expected_quote = raw_value
+    elif raw_unit == "base" and mark is not None:
+        expected_quote = raw_value * mark
+    elif raw_unit == "contracts" and mark is not None and multiplier is not None:
+        expected_quote = raw_value * multiplier * mark
+    else:
+        return False
+    if not math.isfinite(expected_quote) or abs(value_quote - expected_quote) > max(
+        1e-6,
+        abs(expected_quote) * 1e-9,
+    ):
+        return False
+    try:
+        observed_at_ms = int(result.get("open_interest_observed_at_ms") or 0)
+        received_at_ms = int(result.get("open_interest_received_at_ms") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (
+        isinstance(result.get("open_interest_observed_at_ms"), bool)
+        or isinstance(result.get("open_interest_received_at_ms"), bool)
+        or observed_at_ms <= 0
+        or received_at_ms < observed_at_ms
+    ):
+        return False
+    source = str(result.get("open_interest_source") or "").strip()
+    venue_symbol = str(result.get("open_interest_venue_symbol") or "").strip()
+    sample_id = str(result.get("open_interest_sample_id") or "").strip()
+    if not source or not venue_symbol or not sample_id:
+        return False
+    expected_sample_id = open_interest_sample_id(
+        venue=venue,
+        canonical_symbol=symbol,
+        venue_symbol=venue_symbol,
+        observed_at_ms=observed_at_ms,
+        source=source,
+        raw_value=raw_value,
+        value_quote=value_quote,
+    )
+    return sample_id == expected_sample_id
 
 
 class EntryOpenInterestRefresher:
@@ -73,7 +152,7 @@ class EntryOpenInterestRefresher:
         symbol_key = str(symbol or "").strip().upper()
         if not symbol_key:
             return {
-                "open_interest_quote": 0.0,
+                "open_interest_quote": None,
                 "open_interest_evidence_status": "unsupported",
                 "open_interest_evidence_reason": "unsupported_targeted_refresh",
             }
@@ -101,7 +180,7 @@ class EntryOpenInterestRefresher:
         if venue_key not in self.SUPPORTED_VENUES:
             return {
                 symbol: {
-                    "open_interest_quote": 0.0,
+                    "open_interest_quote": None,
                     "open_interest_evidence_status": "unsupported",
                     "open_interest_evidence_reason": "unsupported_targeted_refresh",
                 }
@@ -112,11 +191,14 @@ class EntryOpenInterestRefresher:
         try:
             result = await self._client_for_venue(
                 venue_key
-            ).fetch_entry_open_interest_evidence(symbol_keys)
+            ).fetch_entry_open_interest_evidence(
+                symbol_keys,
+                force_refresh=True,
+            )
         except Exception as exc:
             return {
                 symbol: {
-                    "open_interest_quote": 0.0,
+                    "open_interest_quote": None,
                     "open_interest_evidence_status": "timeout",
                     "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
                 }
@@ -127,21 +209,44 @@ class EntryOpenInterestRefresher:
             ticker = result.get(f"{venue_key}:{symbol_key}")
             if ticker is None:
                 payloads[symbol_key] = {
-                    "open_interest_quote": 0.0,
+                    "open_interest_quote": None,
                     "open_interest_evidence_status": "parse_error",
                     "open_interest_evidence_reason": "missing_targeted_ticker",
                 }
                 continue
             payloads[symbol_key] = {
-                "open_interest_quote": float(
-                    getattr(ticker, "open_interest_quote", 0.0) or 0.0
-                ),
-                "open_interest_evidence_status": str(
-                    getattr(ticker, "open_interest_evidence_status", "") or "unavailable"
+                "open_interest_quote": getattr(ticker, "open_interest_quote", None),
+                "open_interest_evidence_status": normalize_open_interest_status(
+                    getattr(ticker, "open_interest_evidence_status", "unavailable")
                 ),
                 "open_interest_evidence_reason": str(
                     getattr(ticker, "open_interest_evidence_reason", "")
                     or "targeted_refresh"
+                ),
+                "open_interest_observed_at_ms": int(
+                    getattr(ticker, "open_interest_observed_at_ms", 0) or 0
+                ),
+                "open_interest_received_at_ms": int(
+                    getattr(ticker, "open_interest_received_at_ms", 0) or 0
+                ),
+                "open_interest_source": str(
+                    getattr(ticker, "open_interest_source", "") or ""
+                ),
+                "open_interest_sample_id": str(
+                    getattr(ticker, "open_interest_sample_id", "") or ""
+                ),
+                "open_interest_venue_symbol": str(
+                    getattr(ticker, "open_interest_venue_symbol", "") or ""
+                ),
+                "raw_open_interest": getattr(ticker, "raw_open_interest", None),
+                "raw_open_interest_unit": str(
+                    getattr(ticker, "raw_open_interest_unit", "") or ""
+                ),
+                "open_interest_contract_multiplier": getattr(
+                    ticker, "open_interest_contract_multiplier", None
+                ),
+                "open_interest_conversion_mark_price": getattr(
+                    ticker, "open_interest_conversion_mark_price", None
                 ),
                 "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
                 "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
@@ -164,6 +269,18 @@ class MarketDataRuntime:
         self.ctx = ctx
         self._last_local_l2_depth_bridge_publish_ms = 0
         self._last_local_l2_depth_bridge_error_ms = 0
+
+    def _current_wall_clock_ms(self) -> int:
+        """Read the owner runtime clock so tests and production share one clock.
+
+        The value is deliberately fetched on every call.  Entry evidence must
+        not keep using the tick-start wall clock after an ``await``.
+        """
+
+        provider = getattr(self.ctx, "_entry_wall_clock_now_ms", None)
+        if callable(provider):
+            return int(provider())
+        return int(wall_clock_now_ms())
 
     @property
     def ws_bbo_rest_refresher(self):
@@ -886,11 +1003,25 @@ class MarketDataRuntime:
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
+            reconcile_streams = getattr(
+                self.ctx.ws_bbo_data_plane,
+                "reconcile_ws_streams",
+                None,
+            )
+            if callable(reconcile_streams):
+                await reconcile_streams(set(), per_client_timeout_s=0.05)
             return
         if self.ctx.config.runtime.mode == "paper":
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
+            reconcile_streams = getattr(
+                self.ctx.ws_bbo_data_plane,
+                "reconcile_ws_streams",
+                None,
+            )
+            if callable(reconcile_streams):
+                await reconcile_streams(set(), per_client_timeout_s=0.05)
             return
 
         needed: dict[str, list[str]] = {}
@@ -951,6 +1082,13 @@ class MarketDataRuntime:
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
+            reconcile_streams = getattr(
+                self.ctx.ws_bbo_data_plane,
+                "reconcile_ws_streams",
+                None,
+            )
+            if callable(reconcile_streams):
+                await reconcile_streams(set(), per_client_timeout_s=0.05)
             self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
                 tracked_keys,
                 now_ms,
@@ -970,6 +1108,19 @@ class MarketDataRuntime:
         self._entry_bbo_subscription_budgeted_keys = budgeted_keys
         self._entry_bbo_subscription_budget_excluded_keys = budget_excluded_keys
         self._entry_bbo_subscription_per_venue_budget = per_venue_budget
+
+        # Reconcile before registering replacements so the number of live WS
+        # clients never grows beyond the current generation's venue budgets.
+        reconcile_streams = getattr(
+            self.ctx.ws_bbo_data_plane,
+            "reconcile_ws_streams",
+            None,
+        )
+        if callable(reconcile_streams):
+            await reconcile_streams(
+                budgeted_keys,
+                per_client_timeout_s=0.05,
+            )
 
         registered_total = 0
         registered_venues: set[str] = set()
@@ -1046,6 +1197,7 @@ class MarketDataRuntime:
             "rest_resolved_count": 0,
             "rest_failed_count": 0,
             "rest_throttled_count": 0,
+            "entry_evidence_deadline_exceeded_count": 0,
             "wait_budget_ms": 0,
             "wait_elapsed_ms": 0,
             "resolved_count": 0,
@@ -1115,6 +1267,9 @@ class MarketDataRuntime:
         )
         self.ctx.state.last_scan["quote_truth_rest_throttled_count"] = int(
             stats.get("rest_throttled_count", 0) or 0
+        )
+        self.ctx.state.last_scan["entry_evidence_deadline_exceeded_count"] = int(
+            stats.get("entry_evidence_deadline_exceeded_count", 0) or 0
         )
         self.ctx.state.last_scan["budget_excluded_without_rest_count"] = int(
             stats.get("budget_excluded_without_rest_count", 0) or 0
@@ -1496,9 +1651,12 @@ class MarketDataRuntime:
         candidate_scope: str = "",
         skipped_untracked_count: int = 0,
         evidence_role: str = "entry_execution",
+        activation_candidates: list | None = None,
     ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
         overlay: dict[tuple[str, str], Any] = {}
         stats = self._entry_quote_truth_empty_stats()
+        loop = asyncio.get_running_loop()
+        evidence_started_monotonic = loop.time()
         stats["candidate_scope"] = candidate_scope
         stats["evidence_role"] = evidence_role
         stats["candidate_count"] = len(candidates or [])
@@ -1517,7 +1675,24 @@ class MarketDataRuntime:
                 )
             return overlay, stats
 
-        await self._call_ensure_entry_bbo_active_for_candidates(candidates, now_ms)
+        activation_budget_s = max(
+            min(0.100, 0.750 - (loop.time() - evidence_started_monotonic)),
+            0.0,
+        )
+        if activation_budget_s > 0.0:
+            try:
+                await asyncio.wait_for(
+                    self._call_ensure_entry_bbo_active_for_candidates(
+                        candidates
+                        if activation_candidates is None
+                        else activation_candidates,
+                        now_ms,
+                    ),
+                    timeout=activation_budget_s,
+                )
+            except asyncio.TimeoutError:
+                stats["ws_activation_deadline_exceeded_count"] = len(candidates)
+        now_ms = self._current_wall_clock_ms()
         all_targets = self._entry_quote_revalidate_targets(
             candidates,
             snapshot=snapshot,
@@ -1598,11 +1773,12 @@ class MarketDataRuntime:
         }
 
         def collect_fresh_from_cache(stage: str) -> None:
+            validation_now_ms = self._current_wall_clock_ms()
             for key, target in list(unresolved.items()):
                 quote = self._entry_quote_truth_fresh_quote(
                     target["venue"],
                     target["symbol"],
-                    now_ms=now_ms,
+                    now_ms=validation_now_ms,
                 )
                 if quote is None:
                     continue
@@ -1615,7 +1791,9 @@ class MarketDataRuntime:
                 stats["ws_resolved_count"] += 1
 
         collect_fresh_from_cache("initial")
-        wait_budget_ms = min(self._entry_quote_lease_max_age_ms(), 750)
+        # Keep a small WS handoff window, leaving most of the shared 750ms
+        # evidence deadline for concurrent REST fallback.
+        wait_budget_ms = min(self._entry_quote_lease_max_age_ms(), 100)
         stats["wait_budget_ms"] = wait_budget_ms
         elapsed_ms = 0
         while unresolved and elapsed_ms < wait_budget_ms:
@@ -1625,58 +1803,135 @@ class MarketDataRuntime:
         stats["wait_elapsed_ms"] = elapsed_ms
 
         refresher = self._entry_quote_truth_refresher()
+        arefresh_quote_result = getattr(refresher, "arefresh_quote_result", None)
+        arefresh_quote = getattr(refresher, "arefresh_quote", None)
         refresh_quote_result = getattr(refresher, "refresh_quote_result", None)
         refresh_quote = getattr(refresher, "refresh_quote", None)
-        if callable(refresh_quote_result) or callable(refresh_quote):
-            for key, target in list(unresolved.items()):
-                stats["rest_attempt_count"] += 1
-                target["rest_revalidate_attempted"] = True
+        if any(
+            callable(method)
+            for method in (
+                arefresh_quote_result,
+                arefresh_quote,
+                refresh_quote_result,
+                refresh_quote,
+            )
+        ):
+            async def _refresh_target(
+                key: tuple[str, str],
+                target: dict[str, Any],
+            ) -> tuple[tuple[str, str], dict[str, Any], Any, Any, str]:
                 refreshed = None
+                result = None
+                error = ""
                 try:
-                    if callable(refresh_quote_result):
-                        result = refresh_quote_result(
-                            target["venue"],
-                            target["symbol"],
-                            now_ms=now_ms,
+                    request_now_ms = self._current_wall_clock_ms()
+                    if callable(arefresh_quote_result):
+                        result = await arefresh_quote_result(
+                            target["venue"], target["symbol"], now_ms=request_now_ms
                         )
                         refreshed = getattr(result, "quote", None)
-                        rest_outcome = str(getattr(result, "outcome", "") or "")
-                        target["rest_outcome"] = rest_outcome
-                        target["venue_symbol"] = str(
-                            getattr(result, "venue_symbol", "") or ""
+                    elif callable(arefresh_quote):
+                        refreshed = await arefresh_quote(
+                            target["venue"], target["symbol"], now_ms=request_now_ms
                         )
-                        target["url"] = str(getattr(result, "url", "") or "")
-                        target["endpoint"] = str(
-                            getattr(result, "endpoint", "") or "rest_topbook"
-                        )
-                        target["http_status"] = int(
-                            getattr(result, "http_status", 0) or 0
-                        )
-                        target["body_excerpt"] = str(
-                            getattr(result, "body_excerpt", "") or ""
-                        )
-                        target["attempt_interval_outcome"] = str(
-                            getattr(result, "attempt_interval_outcome", "") or ""
-                        )
-                        target["rest_error"] = str(getattr(result, "error", "") or "")
-                        if rest_outcome == "throttled":
-                            stats["rest_throttled_count"] += 1
-                    else:
-                        refreshed = refresh_quote(
+                    elif callable(refresh_quote_result):
+                        result = await asyncio.to_thread(
+                            refresh_quote_result,
                             target["venue"],
                             target["symbol"],
-                            now_ms=now_ms,
+                            now_ms=request_now_ms,
                         )
-                        target["rest_outcome"] = (
-                            "resolved" if refreshed is not None else "missing_quote"
+                        refreshed = getattr(result, "quote", None)
+                    else:
+                        refreshed = await asyncio.to_thread(
+                            refresh_quote,
+                            target["venue"],
+                            target["symbol"],
+                            now_ms=request_now_ms,
                         )
                 except Exception as exc:  # pragma: no cover - defensive telemetry
-                    target["rest_error"] = f"{type(exc).__name__}: {exc}"[:240]
+                    error = f"{type(exc).__name__}: {exc}"[:240]
+                return key, target, result, refreshed, error
+
+            task_by_key = {
+                key: asyncio.create_task(_refresh_target(key, target))
+                for key, target in list(unresolved.items())
+            }
+            stats["rest_attempt_count"] += len(task_by_key)
+            for target in unresolved.values():
+                target["rest_revalidate_attempted"] = True
+            if task_by_key:
+                try:
+                    done, pending = await asyncio.wait(
+                        set(task_by_key.values()),
+                        timeout=max(
+                            0.750 - (loop.time() - evidence_started_monotonic),
+                            0.0,
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    for task in task_by_key.values():
+                        task.cancel()
+                    await asyncio.gather(
+                        *task_by_key.values(),
+                        return_exceptions=True,
+                    )
+                    raise
+            else:
+                done, pending = set(), set()
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+                stats["entry_evidence_deadline_exceeded_count"] = len(pending)
+                pending_tasks = set(pending)
+                for key, task in task_by_key.items():
+                    if task in pending_tasks:
+                        unresolved[key]["rest_outcome"] = (
+                            "entry_evidence_deadline_exceeded"
+                        )
+            completed = await asyncio.gather(*done, return_exceptions=True)
+            for completed_item in completed:
+                if isinstance(completed_item, BaseException):
+                    continue
+                key, target, result, refreshed, refresh_error = completed_item
+                if result is not None:
+                    rest_outcome = str(getattr(result, "outcome", "") or "")
+                    target["rest_outcome"] = rest_outcome
+                    target["venue_symbol"] = str(
+                        getattr(result, "venue_symbol", "") or ""
+                    )
+                    target["url"] = str(getattr(result, "url", "") or "")
+                    target["endpoint"] = str(
+                        getattr(result, "endpoint", "") or "rest_topbook"
+                    )
+                    target["http_status"] = int(
+                        getattr(result, "http_status", 0) or 0
+                    )
+                    target["body_excerpt"] = str(
+                        getattr(result, "body_excerpt", "") or ""
+                    )
+                    target["attempt_interval_outcome"] = str(
+                        getattr(result, "attempt_interval_outcome", "") or ""
+                    )
+                    target["rest_error"] = str(getattr(result, "error", "") or "")
+                    if rest_outcome == "throttled":
+                        stats["rest_throttled_count"] += 1
+                else:
+                    target["rest_outcome"] = (
+                        "resolved" if refreshed is not None else "missing_quote"
+                    )
+                if refresh_error:
+                    target["rest_error"] = refresh_error
                     target["rest_outcome"] = "http_error"
                     refreshed = None
+                validation_now_ms = max(
+                    self._current_wall_clock_ms(),
+                    int(getattr(refreshed, "received_at_ms", 0) or 0),
+                )
                 reject_reason = self._entry_quote_truth_reject_reason(
                     refreshed,
-                    now_ms=now_ms,
+                    now_ms=validation_now_ms,
                 )
                 if refreshed is not None:
                     observed_at_ms = int(getattr(refreshed, "observed_at_ms", 0) or 0)
@@ -1688,7 +1943,7 @@ class MarketDataRuntime:
                     target["rest_quote_received_at_ms"] = received_at_ms
                     target["rest_quote_exchange_event_at_ms"] = exchange_event_at_ms
                     target["rest_quote_age_ms"] = (
-                        max(now_ms - observed_at_ms, 0)
+                        max(validation_now_ms - observed_at_ms, 0)
                         if observed_at_ms > 0
                         else None
                     )
@@ -1704,7 +1959,35 @@ class MarketDataRuntime:
                     continue
                 cache = self.ctx.ws_bbo_cache
                 if cache is not None and hasattr(cache, "update_quote"):
-                    cache.update_quote(refreshed)
+                    accepted = bool(
+                        cache.update_quote(
+                            refreshed,
+                            now_ms=validation_now_ms,
+                            current_max_age_ms=(
+                                self._entry_quote_lease_max_age_ms()
+                            ),
+                        )
+                    )
+                    if not accepted:
+                        # A WS update may have arrived after this REST request
+                        # started.  Never return the delayed REST payload as an
+                        # execution overlay when cache ordering rejected it.
+                        current_quote = self._entry_quote_truth_fresh_quote(
+                            target["venue"],
+                            target["symbol"],
+                            now_ms=validation_now_ms,
+                        )
+                        if current_quote is not None:
+                            target["rest_outcome"] = (
+                                "superseded_by_newer_cache_quote"
+                            )
+                            overlay[key] = current_quote
+                            unresolved.pop(key, None)
+                            stats["cache_wait_hit_count"] += 1
+                            stats["ws_resolved_count"] += 1
+                        else:
+                            stats["rest_failed_count"] += 1
+                        continue
                 overlay[key] = refreshed
                 unresolved.pop(key, None)
                 stats["rest_resolved_count"] += 1
@@ -1783,6 +2066,11 @@ class MarketDataRuntime:
                 bucket = "budget_excluded_without_rest"
                 reason_bucket = "budget_excluded_without_rest"
                 reason_family = reason_bucket
+            elif rest_outcome == "entry_evidence_deadline_exceeded":
+                outcome = "entry_evidence_deadline_exceeded"
+                bucket = "entry_evidence_deadline_exceeded"
+                reason_bucket = "entry_evidence_deadline_exceeded"
+                reason_family = "entry_evidence_deadline_exceeded"
             elif rest_outcome == "throttled":
                 outcome = "rest_attempt_throttled"
                 bucket = "rest_topbook_attempt_throttled"
@@ -2526,6 +2814,7 @@ class MarketDataRuntime:
             "failed_count": 0,
             "unsupported_count": 0,
             "timeout_count": 0,
+            "entry_evidence_deadline_exceeded_count": 0,
             "blocked_after_targeted_refresh_count": 0,
             "targets": [],
         }
@@ -2540,6 +2829,23 @@ class MarketDataRuntime:
             self.ctx.state.last_scan = {}
 
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
+        structural_probe_due: set[tuple[str, str]] = set()
+        for record in (
+            getattr(self.ctx.state, "entry_liquidity_qualification_records", []) or []
+        ):
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("last_class", "")) != "structural_ineligibility":
+                continue
+            last_probe_ms = int(record.get("last_structural_probe_at_ms", 0) or 0)
+            if last_probe_ms > 0 and now_ms - last_probe_ms < 60_000:
+                continue
+            structural_probe_due.add(
+                (
+                    str(record.get("venue", "") or "").lower(),
+                    str(record.get("symbol", "") or "").upper(),
+                )
+            )
         targets: list[tuple[str, str, Any, str]] = []
         seen: set[tuple[str, str]] = set()
         for candidate in list(candidates or []):
@@ -2563,11 +2869,33 @@ class MarketDataRuntime:
                 quote = quote_lookup.get(key)
                 if quote is None:
                     continue
-                evidence_status = str(
-                    getattr(quote, "open_interest_evidence_status", "available")
-                    or "available"
-                ).lower()
-                if evidence_status == "available":
+                evidence_status = normalize_open_interest_status(
+                    getattr(quote, "open_interest_evidence_status", "unavailable")
+                )
+                observed_at_ms = int(
+                    getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                )
+                oi_max_age_ms = max(
+                    int(
+                        getattr(
+                            self.ctx.config.runtime,
+                            "sidecar_perp_liquidity_budget_ms",
+                            30_000,
+                        )
+                        or 0
+                    ),
+                    1,
+                )
+                evidence_is_fresh = bool(
+                    observed_at_ms > 0
+                    and observed_at_ms <= now_ms
+                    and now_ms - observed_at_ms <= oi_max_age_ms
+                )
+                if (
+                    evidence_status == "observed"
+                    and evidence_is_fresh
+                    and key not in structural_probe_due
+                ):
                     continue
                 seen.add(key)
                 targets.append((venue, symbol, quote, evidence_status))
@@ -2628,17 +2956,31 @@ class MarketDataRuntime:
                 )
                 or 0
             )
-            status = str(
+            status = normalize_open_interest_status(
                 (result or {}).get("open_interest_evidence_status")
                 or "unavailable"
-            ).lower()
+            )
             reason = str(
                 (result or {}).get("open_interest_evidence_reason")
                 or status
             )
-            open_interest_quote = float(
-                (result or {}).get("open_interest_quote", 0.0) or 0.0
-            )
+            open_interest_raw = (result or {}).get("open_interest_quote")
+            try:
+                open_interest_quote = (
+                    float(open_interest_raw)
+                    if open_interest_raw is not None
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                open_interest_quote = None
+            if status == "observed" and not _targeted_open_interest_observed_proof_valid(
+                venue=venue,
+                symbol=symbol,
+                result=result or {},
+            ):
+                status = "parse_error"
+                reason = "targeted_observed_oi_proof_invalid"
+                open_interest_quote = None
             payload = {
                 "venue": venue,
                 "symbol": symbol,
@@ -2651,10 +2993,23 @@ class MarketDataRuntime:
                 "evidence_role": evidence_role,
                 "ts_ms": now_ms,
             }
-            if status == "available":
+            if status == "observed" and open_interest_quote is not None:
                 quote.open_interest = open_interest_quote
-                quote.open_interest_evidence_status = "available"
+                quote.open_interest_evidence_status = "observed"
                 quote.open_interest_evidence_reason = reason or "targeted_refresh"
+                for field in (
+                    "open_interest_observed_at_ms",
+                    "open_interest_received_at_ms",
+                    "open_interest_source",
+                    "open_interest_sample_id",
+                    "open_interest_venue_symbol",
+                    "raw_open_interest",
+                    "raw_open_interest_unit",
+                    "open_interest_contract_multiplier",
+                    "open_interest_conversion_mark_price",
+                ):
+                    if field in (result or {}):
+                        setattr(quote, field, (result or {}).get(field))
                 for field in (
                     "oi_candidate_count",
                     "oi_cache_hit_count",
@@ -2673,12 +3028,15 @@ class MarketDataRuntime:
                     payload,
                 )
             else:
+                quote.open_interest = None
                 quote.open_interest_evidence_status = status
                 quote.open_interest_evidence_reason = reason
                 stats["failed_count"] += 1
                 stats["blocked_after_targeted_refresh_count"] += 1
                 if status == "timeout":
                     stats["timeout_count"] += 1
+                    if reason == "entry_evidence_deadline_exceeded":
+                        stats["entry_evidence_deadline_exceeded_count"] += 1
                 if status == "unsupported":
                     stats["unsupported_count"] += 1
                 self.ctx.journal.append(
@@ -2690,26 +3048,58 @@ class MarketDataRuntime:
             grouped: dict[str, list[tuple[str, Any, str]]] = {}
             for venue, symbol, quote, previous_status in targets:
                 grouped.setdefault(venue, []).append((symbol, quote, previous_status))
-            for venue, entries in grouped.items():
+
+            async def _refresh_venue_batch(
+                venue: str,
+                entries: list[tuple[str, Any, str]],
+            ) -> tuple[str, list[tuple[str, Any, str]], dict[str, Any], int]:
                 symbols = [symbol for symbol, _quote, _status in entries]
-                started_ms = wall_clock_now_ms()
+                loop = asyncio.get_running_loop()
+                started_monotonic = loop.time()
                 try:
-                    batch_results = await batch_refresh(venue, symbols, now_ms=now_ms)
+                    batch_results = await asyncio.wait_for(
+                        batch_refresh(
+                            venue,
+                            symbols,
+                            now_ms=wall_clock_now_ms(),
+                        ),
+                        timeout=0.750,
+                    )
+                except asyncio.TimeoutError:
+                    batch_results = {
+                        symbol: {
+                            "open_interest_quote": None,
+                            "open_interest_evidence_status": "timeout",
+                            "open_interest_evidence_reason": (
+                                "entry_evidence_deadline_exceeded"
+                            ),
+                        }
+                        for symbol in symbols
+                    }
                 except Exception as exc:  # pragma: no cover - defensive telemetry
                     batch_results = {
                         symbol: {
-                            "open_interest_quote": 0.0,
+                            "open_interest_quote": None,
                             "open_interest_evidence_status": "timeout",
                             "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
                         }
                         for symbol in symbols
                     }
-                elapsed_ms = max(wall_clock_now_ms() - started_ms, 0)
+                elapsed_ms = max(int((loop.time() - started_monotonic) * 1_000), 0)
+                return venue, entries, batch_results or {}, elapsed_ms
+
+            venue_batches = await asyncio.gather(
+                *(
+                    _refresh_venue_batch(venue, entries)
+                    for venue, entries in grouped.items()
+                )
+            )
+            for venue, entries, batch_results, elapsed_ms in venue_batches:
                 for symbol, quote, previous_status in entries:
                     result = (batch_results or {}).get(symbol)
                     if result is None:
                         result = {
-                            "open_interest_quote": 0.0,
+                            "open_interest_quote": None,
                             "open_interest_evidence_status": "parse_error",
                             "open_interest_evidence_reason": "missing_targeted_ticker",
                         }
@@ -2722,23 +3112,76 @@ class MarketDataRuntime:
                         default_elapsed_ms=elapsed_ms,
                     )
         else:
-            for venue, symbol, quote, previous_status in targets:
-                started_ms = wall_clock_now_ms()
+            async def _refresh_single_target(
+                venue: str,
+                symbol: str,
+                quote,
+                previous_status: str,
+            ) -> tuple[str, str, Any, str, dict[str, Any] | None, int]:
+                loop = asyncio.get_running_loop()
+                started_monotonic = loop.time()
                 try:
-                    result = await refresh(venue, symbol, now_ms=now_ms)
+                    result = await asyncio.wait_for(
+                        refresh(
+                            venue,
+                            symbol,
+                            now_ms=wall_clock_now_ms(),
+                        ),
+                        timeout=0.750,
+                    )
+                except asyncio.TimeoutError:
+                    result = {
+                        "open_interest_quote": None,
+                        "open_interest_evidence_status": "timeout",
+                        "open_interest_evidence_reason": (
+                            "entry_evidence_deadline_exceeded"
+                        ),
+                    }
                 except Exception as exc:  # pragma: no cover - defensive telemetry
                     result = {
-                        "open_interest_quote": 0.0,
+                        "open_interest_quote": None,
                         "open_interest_evidence_status": "timeout",
                         "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
                     }
+                elapsed_ms = max(
+                    int((loop.time() - started_monotonic) * 1_000),
+                    0,
+                )
+                return (
+                    venue,
+                    symbol,
+                    quote,
+                    previous_status,
+                    result,
+                    elapsed_ms,
+                )
+
+            target_results = await asyncio.gather(
+                *(
+                    _refresh_single_target(
+                        venue,
+                        symbol,
+                        quote,
+                        previous_status,
+                    )
+                    for venue, symbol, quote, previous_status in targets
+                )
+            )
+            for (
+                venue,
+                symbol,
+                quote,
+                previous_status,
+                result,
+                elapsed_ms,
+            ) in target_results:
                 _apply_refresh_result(
                     venue=venue,
                     symbol=symbol,
                     quote=quote,
                     previous_status=previous_status,
                     result=result,
-                    default_elapsed_ms=max(wall_clock_now_ms() - started_ms, 0),
+                    default_elapsed_ms=elapsed_ms,
                 )
 
         if evidence_role == "prewarm_only":
@@ -2777,6 +3220,9 @@ class MarketDataRuntime:
             self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
                 "timeout_count"
             ]
+            self.ctx.state.last_scan[
+                "oi_entry_evidence_deadline_exceeded_count"
+            ] = stats["entry_evidence_deadline_exceeded_count"]
             self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
                 "unsupported_count"
             ]

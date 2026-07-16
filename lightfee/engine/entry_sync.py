@@ -12,8 +12,10 @@ Rust references:
 from __future__ import annotations
 
 import inspect
+import math
 import time
 from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
@@ -115,6 +117,285 @@ class EntrySyncExecutor:
         # conservative: complete the hedge rather than leaving naked delta.
         self.post_first_fill_decider = overrides.get("post_first_fill_decider")
 
+    @staticmethod
+    def _funding_canary_request_invariant_reason(
+        ctx: EntryContext,
+        request: OrderRequest,
+    ) -> str:
+        if not ctx.funding_canary_enabled_at_entry:
+            return ""
+        try:
+            cap = float(ctx.funding_canary_hard_max_entry_notional_quote or 0.0)
+            price = float(request.price or 0.0)
+            quantity = float(request.quantity or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return "funding_canary_final_notional_invariant_breached"
+        if price <= 0.0:
+            try:
+                price = float(
+                    ctx.long_price_hint
+                    if request.venue == ctx.long_venue
+                    else ctx.short_price_hint
+                )
+            except (TypeError, ValueError, OverflowError):
+                return "funding_canary_final_notional_invariant_breached"
+        notional = quantity * price
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (cap, quantity, price, notional)
+            )
+            or isinstance(ctx.funding_canary_hard_max_entry_notional_quote, bool)
+            or isinstance(request.quantity, bool)
+            or isinstance(request.price, bool)
+            or cap <= 0.0
+            or quantity <= 0.0
+            or price <= 0.0
+            or notional > cap + 1e-9
+        ):
+            return "funding_canary_final_notional_invariant_breached"
+        return ""
+
+    def _journal_funding_canary_request_breach(
+        self,
+        ctx: EntryContext,
+        request: OrderRequest,
+        *,
+        leg: str,
+        now_ms: int,
+    ) -> None:
+        self.journal.append(
+            "funding_canary_final_notional_invariant_breached",
+            {
+                "position_id": ctx.entry_id,
+                "candidate_revision_id": ctx.candidate_revision_id,
+                "symbol": request.symbol,
+                "venue": request.venue.value,
+                "leg": leg,
+                "quantity": request.quantity,
+                "price": request.price,
+                "funding_canary_hard_max_entry_notional_quote": (
+                    ctx.funding_canary_hard_max_entry_notional_quote
+                ),
+                "reason": "funding_canary_final_notional_invariant_breached",
+                "ts_ms": now_ms,
+            },
+        )
+
+    @staticmethod
+    def _align_quantity_down_on_frozen_grid(
+        quantity: float,
+        step: float,
+    ) -> float:
+        """Floor a base quantity on the immutable entry-time decimal grid."""
+
+        try:
+            raw = Decimal(str(quantity))
+            grid = Decimal(str(step))
+        except (InvalidOperation, TypeError, ValueError):
+            return 0.0
+        if (
+            not raw.is_finite()
+            or not grid.is_finite()
+            or raw <= 0
+            or grid <= 0
+        ):
+            return 0.0
+        return float(
+            (raw / grid).to_integral_value(rounding=ROUND_FLOOR) * grid
+        )
+
+    @staticmethod
+    def _entry_context_frozen_symbol_rule_contract(
+        ctx: EntryContext,
+        venue: Venue,
+    ) -> tuple[dict[str, Any], float, str]:
+        """Validate one leg of the immutable entry-time symbol-rule contract."""
+
+        if venue == ctx.long_venue:
+            raw_rule = ctx.long_symbol_rule_at_entry
+        elif venue == ctx.short_venue:
+            raw_rule = ctx.short_symbol_rule_at_entry
+        else:
+            return {}, 0.0, "direct_hedge_route_invariant_breached"
+        if not raw_rule:
+            return {}, 0.0, "direct_hedge_symbol_rule_evidence_missing"
+        if not isinstance(raw_rule, dict):
+            return {}, 0.0, "direct_hedge_symbol_rule_evidence_invalid"
+        rule = dict(raw_rule)
+        try:
+            common_step = float(
+                ctx.common_base_quantity_step_at_entry or 0.0
+            )
+            quantity_step = float(
+                rule.get("quantity_step_base", 0.0) or 0.0
+            )
+            min_quantity = float(rule.get("min_quantity_base", 0.0) or 0.0)
+            min_notional = float(rule.get("min_notional_quote", -1.0))
+        except (TypeError, ValueError):
+            return rule, 0.0, "direct_hedge_symbol_rule_evidence_invalid"
+        if (
+            rule.get("evidence_complete") is not True
+            or list(rule.get("missing_fields") or [])
+            or str(rule.get("quantity_units") or "") != "base"
+            or str(rule.get("venue") or "") != venue.value
+            or str(rule.get("symbol") or "") != str(ctx.symbol)
+            or not math.isfinite(common_step)
+            or not math.isfinite(quantity_step)
+            or not math.isfinite(min_quantity)
+            or not math.isfinite(min_notional)
+            or common_step <= 1e-12
+            or quantity_step <= 1e-12
+            or min_quantity <= 0.0
+            or min_notional < 0.0
+        ):
+            return (
+                rule,
+                common_step,
+                "direct_hedge_symbol_rule_evidence_invalid",
+            )
+        grid_ratio = common_step / quantity_step
+        if abs(grid_ratio - round(grid_ratio)) > 1e-8:
+            return rule, common_step, "direct_hedge_common_quantity_grid_invalid"
+        return rule, common_step, ""
+
+    def _plan_direct_hedge_quantity(
+        self,
+        *,
+        ctx: EntryContext,
+        maker_fill: OrderFill,
+        hedge_request: OrderRequest,
+    ) -> dict[str, Any]:
+        """Plan a legal hedge from the actual first fill and frozen rules.
+
+        Legacy callers that predate entry-time symbol-rule freezing keep their
+        old behavior only when *all* three contract fields are absent.  A
+        partially populated contract fails closed; new live dispatches always
+        populate the two rules and common grid together.
+        """
+
+        maker_quantity = float(maker_fill.quantity or 0.0)
+        contract_present = bool(
+            ctx.long_symbol_rule_at_entry
+            or ctx.short_symbol_rule_at_entry
+            or ctx.common_base_quantity_step_at_entry
+        )
+        try:
+            common_step_evidence = float(
+                ctx.common_base_quantity_step_at_entry or 0.0
+            )
+        except (TypeError, ValueError):
+            common_step_evidence = 0.0
+        try:
+            hedge_price_evidence = float(hedge_request.price or 0.0)
+        except (TypeError, ValueError):
+            hedge_price_evidence = 0.0
+        evidence: dict[str, Any] = {
+            "maker_fill_venue": maker_fill.venue.value,
+            "maker_fill_side": maker_fill.side.value,
+            "maker_filled_quantity": maker_quantity,
+            "hedge_venue": hedge_request.venue.value,
+            "hedge_side": hedge_request.side.value,
+            "hedge_price": hedge_price_evidence,
+            "common_base_quantity_step_at_entry": common_step_evidence,
+            "contract_present": contract_present,
+        }
+        if not contract_present:
+            evidence.update(
+                {
+                    "hedge_quantity": maker_quantity,
+                    "off_grid_remainder_quantity": 0.0,
+                    "contract_mode": "legacy_unfrozen",
+                }
+            )
+            return {
+                "hedge_quantity": maker_quantity,
+                "remainder_quantity": 0.0,
+                "blocked_reason": "",
+                "evidence": evidence,
+            }
+
+        maker_is_long = ctx.maker_leg == Side.BUY
+        expected_maker_venue = (
+            ctx.long_venue if maker_is_long else ctx.short_venue
+        )
+        expected_maker_side = Side.BUY if maker_is_long else Side.SELL
+        expected_hedge_venue = (
+            ctx.short_venue if maker_is_long else ctx.long_venue
+        )
+        expected_hedge_side = Side.SELL if maker_is_long else Side.BUY
+        if (
+            maker_fill.venue != expected_maker_venue
+            or maker_fill.side != expected_maker_side
+            or hedge_request.venue != expected_hedge_venue
+            or hedge_request.side != expected_hedge_side
+        ):
+            return {
+                "hedge_quantity": 0.0,
+                "remainder_quantity": maker_quantity,
+                "blocked_reason": "direct_hedge_route_invariant_breached",
+                "evidence": evidence,
+            }
+
+        rules: dict[str, dict[str, Any]] = {}
+        common_step = 0.0
+        for venue in (ctx.long_venue, ctx.short_venue):
+            rule, venue_common_step, reason = (
+                self._entry_context_frozen_symbol_rule_contract(ctx, venue)
+            )
+            rules[venue.value] = rule
+            common_step = venue_common_step or common_step
+            if reason:
+                evidence["frozen_symbol_rules"] = rules
+                return {
+                    "hedge_quantity": 0.0,
+                    "remainder_quantity": maker_quantity,
+                    "blocked_reason": reason,
+                    "evidence": evidence,
+                }
+
+        hedge_rule = rules[hedge_request.venue.value]
+        aligned_quantity = self._align_quantity_down_on_frozen_grid(
+            maker_quantity,
+            common_step,
+        )
+        remainder_quantity = max(maker_quantity - aligned_quantity, 0.0)
+        min_quantity = float(hedge_rule["min_quantity_base"])
+        min_notional = float(hedge_rule["min_notional_quote"])
+        hedge_price = float(hedge_request.price or 0.0)
+        notional = aligned_quantity * hedge_price
+        evidence.update(
+            {
+                "frozen_symbol_rules": rules,
+                "common_base_quantity_step_at_entry": common_step,
+                "hedge_quantity": aligned_quantity,
+                "off_grid_remainder_quantity": remainder_quantity,
+                "min_quantity_base": min_quantity,
+                "min_notional_quote": min_notional,
+                "hedge_notional_quote": notional,
+                "contract_mode": "frozen_entry_rules",
+            }
+        )
+        blocked_reason = ""
+        if aligned_quantity <= 1e-9:
+            blocked_reason = (
+                "direct_hedge_quantity_below_frozen_common_grid"
+            )
+        elif aligned_quantity + 1e-12 < min_quantity:
+            blocked_reason = "direct_hedge_quantity_below_frozen_minimum"
+        elif hedge_price <= 0.0 and min_notional > 0.0:
+            blocked_reason = (
+                "direct_hedge_price_missing_for_frozen_min_notional"
+            )
+        elif notional + 1e-9 < min_notional:
+            blocked_reason = "direct_hedge_notional_below_frozen_minimum"
+        return {
+            "hedge_quantity": aligned_quantity,
+            "remainder_quantity": remainder_quantity,
+            "blocked_reason": blocked_reason,
+            "evidence": evidence,
+        }
+
     # ------------------------------------------------------------------
     # Main execution entry point
     # ------------------------------------------------------------------
@@ -190,6 +471,22 @@ class EntrySyncExecutor:
 
         # Build order requests with clientOrderId, TIF, reduce_only
         maker_req, hedge_req = build_entry_orders(ctx)
+
+        maker_canary_reason = self._funding_canary_request_invariant_reason(
+            ctx,
+            maker_req,
+        )
+        if maker_canary_reason:
+            self._journal_funding_canary_request_breach(
+                ctx,
+                maker_req,
+                leg="maker",
+                now_ms=now_ms,
+            )
+            result.state = EntryState.FAILED
+            result.route = ExecutionRoute.REJECTED
+            result.reject_reason = maker_canary_reason
+            return result
 
         # --- Phase 1: Submit maker ---
         maker_submitted_at_ms = int(time.time() * 1000)
@@ -276,9 +573,106 @@ class EntrySyncExecutor:
         hedge_price = float(post_fill.get("hedge_price", 0.0) or 0.0)
         hedge_req = replace(
             hedge_req,
-            quantity=maker_fill.quantity,
             price=hedge_price if hedge_price > 0.0 else hedge_req.price,
         )
+        try:
+            direct_hedge_plan = self._plan_direct_hedge_quantity(
+                ctx=ctx,
+                maker_fill=maker_fill,
+                hedge_request=hedge_req,
+            )
+        except Exception as exc:
+            # No validation/planning defect is allowed to escape after the
+            # first leg has filled.  Fail closed into the V1 flatten path.
+            direct_hedge_plan = {
+                "hedge_quantity": 0.0,
+                "remainder_quantity": float(maker_fill.quantity or 0.0),
+                "blocked_reason": "direct_hedge_quantity_planner_error",
+                "evidence": {
+                    "maker_filled_quantity": float(
+                        maker_fill.quantity or 0.0
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:300],
+                },
+            }
+        direct_hedge_blocked_reason = str(
+            direct_hedge_plan.get("blocked_reason", "") or ""
+        )
+        direct_hedge_evidence = dict(
+            direct_hedge_plan.get("evidence", {}) or {}
+        )
+        if direct_hedge_blocked_reason:
+            result.reject_evidence = {
+                "reason": direct_hedge_blocked_reason,
+                **direct_hedge_evidence,
+            }
+            self.journal.append(
+                "entry.direct_hedge_quantity_blocked",
+                {
+                    "position_id": ctx.entry_id,
+                    "reason": direct_hedge_blocked_reason,
+                    **direct_hedge_evidence,
+                },
+            )
+            return await self._unwind_first_leg_after_fill(
+                result=result,
+                ctx=ctx,
+                maker_request=maker_req,
+                maker_fill=maker_fill,
+                decision={
+                    "action": "unwind_first_leg",
+                    "reason": direct_hedge_blocked_reason,
+                    "complete_hedge_loss_quote": float(
+                        post_fill.get("complete_hedge_loss_quote", 0.0) or 0.0
+                    ),
+                    "unwind_first_leg_loss_quote": float(
+                        post_fill.get("unwind_first_leg_loss_quote", 0.0) or 0.0
+                    ),
+                    "market_evidence": {
+                        **dict(post_fill.get("market_evidence", {}) or {}),
+                        "direct_hedge_quantity_plan": direct_hedge_evidence,
+                    },
+                },
+                now_ms=now_ms,
+            )
+        hedge_req = replace(
+            hedge_req,
+            quantity=float(direct_hedge_plan["hedge_quantity"]),
+        )
+        if float(direct_hedge_plan.get("remainder_quantity", 0.0) or 0.0) > 1e-9:
+            self.journal.append(
+                "entry.direct_hedge_quantity_aligned_down",
+                {
+                    "position_id": ctx.entry_id,
+                    **direct_hedge_evidence,
+                },
+            )
+        hedge_canary_reason = self._funding_canary_request_invariant_reason(
+            ctx,
+            hedge_req,
+        )
+        if hedge_canary_reason:
+            self._journal_funding_canary_request_breach(
+                ctx,
+                hedge_req,
+                leg="hedge_after_first_fill",
+                now_ms=now_ms,
+            )
+            return await self._unwind_first_leg_after_fill(
+                result=result,
+                ctx=ctx,
+                maker_request=maker_req,
+                maker_fill=maker_fill,
+                decision={
+                    "action": "unwind_first_leg",
+                    "reason": hedge_canary_reason,
+                    "market_evidence": dict(
+                        post_fill.get("market_evidence", {}) or {}
+                    ),
+                },
+                now_ms=now_ms,
+            )
         self.journal.append(
             "entry.post_first_fill_decision",
             {
@@ -295,6 +689,7 @@ class EntrySyncExecutor:
                     post_fill.get("unwind_first_leg_loss_quote", 0.0) or 0.0
                 ),
                 "market_evidence": dict(post_fill.get("market_evidence", {}) or {}),
+                "quantity_rule_evidence": direct_hedge_evidence,
             },
         )
 
@@ -637,8 +1032,11 @@ class EntrySyncExecutor:
             long_venue=ctx.long_venue,
             short_venue=ctx.short_venue,
             target_quantity=ctx.long_quantity,
-            long_side=Side.BUY if maker_is_long else Side.SELL,
-            short_side=Side.SELL if maker_is_long else Side.BUY,
+            # These fields identify the economic legs, not maker/hedge order
+            # sequence.  Recovery derives maker_side()/hedge_side() from
+            # maker_leg; reversing them for a short maker reverses both orders.
+            long_side=Side.BUY,
+            short_side=Side.SELL,
             created_at_ms=now_ms,
             maker_order_id=maker_order_id,
             hedge_order_id=hedge_order_id,
@@ -689,6 +1087,19 @@ class EntrySyncExecutor:
             entry_depth_shortfall_quantity=ctx.entry_depth_shortfall_quantity,
             entry_max_executable_notional_quote=ctx.entry_max_executable_notional_quote,
             entry_depth_capped_at_entry=ctx.entry_depth_capped_at_entry,
+            candidate_revision_id=ctx.candidate_revision_id,
+            entry_max_leg_notional_quote=ctx.entry_max_leg_notional_quote,
+            funding_canary_enabled_at_entry=ctx.funding_canary_enabled_at_entry,
+            funding_canary_fee_assurance_tier=ctx.funding_canary_fee_assurance_tier,
+            funding_canary_hard_max_entry_notional_quote=(
+                ctx.funding_canary_hard_max_entry_notional_quote
+            ),
+            funding_canary_size_constrained=ctx.funding_canary_size_constrained,
+            long_symbol_rule_at_entry=dict(ctx.long_symbol_rule_at_entry or {}),
+            short_symbol_rule_at_entry=dict(ctx.short_symbol_rule_at_entry or {}),
+            common_base_quantity_step_at_entry=(
+                ctx.common_base_quantity_step_at_entry
+            ),
             advisories=list(ctx.advisories),
             blocked_reasons=list(ctx.blocked_reasons),
             exit_after_first_stage=ctx.exit_after_first_stage,

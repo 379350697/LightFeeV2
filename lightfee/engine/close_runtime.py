@@ -503,28 +503,52 @@ class CloseRuntime:
             if accepted:
                 cache = self.ctx.ws_bbo_cache
                 if cache is not None and hasattr(cache, "update_quote"):
-                    cache.update_quote(refreshed)
-                overlay[key] = refreshed
-                unresolved.discard(key)
-                self.ctx.journal.append(
-                    "runtime.close_price_evidence_rest_rewarm_succeeded",
-                    {
-                        "venue": key[0],
-                        "symbol": key[1],
-                        "source": str(getattr(refreshed, "source", "") or "rest_topbook"),
-                        "observed_at_ms": int(getattr(refreshed, "observed_at_ms", 0) or 0),
-                        "age_ms": max(
-                            now_ms - int(getattr(refreshed, "observed_at_ms", 0) or 0),
-                            0,
-                        ),
-                        "budget_ms": budget_ms,
-                        "wait_budget_ms": wait_budget_ms,
-                        "endpoint": "rest_topbook",
-                        "outcome": "rest_topbook_rewarm_succeeded",
-                        "ts_ms": now_ms,
-                    },
-                )
-                continue
+                    cache_accepted = cache.update_quote(
+                        refreshed,
+                        now_ms=now_ms,
+                        current_max_age_ms=budget_ms,
+                    )
+                    if not cache_accepted:
+                        # A fresh comparable WS event outranks a REST payload
+                        # that carries only a local receipt timestamp.
+                        refreshed = cache.fresh_quote(
+                            key[0],
+                            key[1],
+                            now_ms=now_ms,
+                            max_age_ms=budget_ms,
+                        )
+                        accepted = refreshed is not None
+                if not accepted:
+                    rest_error = "rest_quote_superseded_without_fresh_cache_quote"
+                else:
+                    overlay[key] = refreshed
+                    unresolved.discard(key)
+                    self.ctx.journal.append(
+                        "runtime.close_price_evidence_rest_rewarm_succeeded",
+                        {
+                            "venue": key[0],
+                            "symbol": key[1],
+                            "source": str(
+                                getattr(refreshed, "source", "") or "rest_topbook"
+                            ),
+                            "observed_at_ms": int(
+                                getattr(refreshed, "observed_at_ms", 0) or 0
+                            ),
+                            "age_ms": max(
+                                now_ms
+                                - int(
+                                    getattr(refreshed, "observed_at_ms", 0) or 0
+                                ),
+                                0,
+                            ),
+                            "budget_ms": budget_ms,
+                            "wait_budget_ms": wait_budget_ms,
+                            "endpoint": "rest_topbook",
+                            "outcome": "rest_topbook_rewarm_succeeded",
+                            "ts_ms": now_ms,
+                        },
+                    )
+                    continue
             self.ctx.journal.append(
                 "runtime.close_price_evidence_rewarm_failed",
                 {

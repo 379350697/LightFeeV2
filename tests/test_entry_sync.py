@@ -9,6 +9,9 @@ Rust references:
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 
 from lightfee.core.domain import OrderFill, OrderRequest, Side, Venue
@@ -29,6 +32,7 @@ from lightfee.engine.entry_sync import (
     execute_entry,
 )
 from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
 from lightfee.engine.residual import (
     ResidualExposureTask,
     ResidualOrigin,
@@ -117,6 +121,26 @@ def _fake_fill(
     return OF(venue=venue, symbol=symbol, side=side, quantity=quantity,
               price=price, order_id=order_id, fee_quote=fee_quote,
               filled_at_ms=filled_at_ms)
+
+
+def _frozen_symbol_rule(
+    venue: Venue,
+    *,
+    step: float,
+    min_quantity: float,
+    min_notional: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "venue": venue.value,
+        "symbol": "BTCUSDT",
+        "venue_symbol": "BTCUSDT",
+        "quantity_units": "base",
+        "quantity_step_base": step,
+        "min_quantity_base": min_quantity,
+        "min_notional_quote": min_notional,
+        "missing_fields": [],
+        "evidence_complete": True,
+    }
 
 
 @pytest.fixture
@@ -333,6 +357,132 @@ class TestEntrySyncHedgeRejectAfterMakerFill:
 
 class TestEntrySyncPostFirstFillDecision:
     @pytest.mark.asyncio
+    async def test_canary_rejects_oversized_first_request_before_submit(
+        self, adapters, journal, btc_context
+    ):
+        ctx = replace(
+            btc_context,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=15.0,
+            candidate_revision_id="canary-revision-1",
+        )
+        executor = EntrySyncExecutor(adapters=adapters, journal=journal)
+
+        result = await executor.execute(ctx)
+
+        assert result.state == EntryState.FAILED
+        assert result.reject_reason == (
+            "funding_canary_final_notional_invariant_breached"
+        )
+        assert adapters[Venue.BINANCE].place_order_call_count == 0
+        assert adapters[Venue.OKX].place_order_call_count == 0
+        assert any(
+            record["kind"]
+            == "funding_canary_final_notional_invariant_breached"
+            for record in journal.read_all()
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_field", ["cap", "quantity", "price"])
+    async def test_canary_rejects_non_finite_first_request_before_submit(
+        self,
+        adapters,
+        journal,
+        btc_context,
+        invalid_field,
+    ):
+        quantity = 0.0002
+        cap = 15.0
+        long_price = btc_context.long_price_hint
+        if invalid_field == "cap":
+            cap = float("nan")
+        elif invalid_field == "quantity":
+            quantity = float("nan")
+        else:
+            long_price = float("inf")
+        ctx = replace(
+            btc_context,
+            long_quantity=quantity,
+            short_quantity=quantity,
+            long_price_hint=long_price,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=cap,
+            candidate_revision_id="canary-non-finite",
+        )
+
+        result = await EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+        ).execute(ctx)
+
+        assert result.state == EntryState.FAILED
+        assert result.reject_reason == (
+            "funding_canary_final_notional_invariant_breached"
+        )
+        assert adapters[Venue.BINANCE].place_order_call_count == 0
+        assert adapters[Venue.OKX].place_order_call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_canary_hedge_reprice_breach_unwinds_first_fill(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        quantity = 0.0002
+        binance_ada.place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.BUY,
+                quantity,
+                50_000.0,
+                "m-canary",
+            ),
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.SELL,
+                quantity,
+                50_000.0,
+                "u-canary",
+            ),
+        ]
+        ctx = replace(
+            btc_context,
+            long_quantity=quantity,
+            short_quantity=quantity,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=15.0,
+            candidate_revision_id="canary-revision-2",
+        )
+        executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+            config_overrides={
+                "post_first_fill_decider": lambda **_: {
+                    "action": "complete_hedge",
+                    "reason": "fresh_l2_complete_hedge",
+                    "hedge_price": 80_000.0,
+                }
+            },
+        )
+
+        result = await executor.execute(ctx)
+
+        assert result.state == EntryState.FAILED
+        assert result.reject_reason == "unwound_after_first_fill"
+        assert binance_ada.place_order_call_count == 2
+        assert binance_ada.last_request.reduce_only is True
+        assert okx_ada.place_order_call_count == 0
+        breaches = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"]
+            == "funding_canary_final_notional_invariant_breached"
+        ]
+        assert breaches[-1]["leg"] == "hedge_after_first_fill"
+
+    @pytest.mark.asyncio
     async def test_reprices_hedge_and_uses_actual_first_fill_quantity(
         self, adapters, journal, btc_context
     ):
@@ -368,6 +518,124 @@ class TestEntrySyncPostFirstFillDecision:
             if record["kind"] == "entry.post_first_fill_decision"
         ]
         assert decision[-1]["payload"]["action"] == "complete_hedge"
+
+    @pytest.mark.asyncio
+    async def test_off_grid_partial_fill_is_unwound_without_illegal_hedge(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.BUY,
+                0.003,
+                50000.0,
+                "maker-off-grid",
+            ),
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.SELL,
+                0.003,
+                50000.0,
+                "unwind-off-grid",
+            ),
+        ]
+        ctx = replace(
+            btc_context,
+            long_quantity=0.02,
+            short_quantity=0.02,
+            long_symbol_rule_at_entry=_frozen_symbol_rule(
+                Venue.BINANCE,
+                step=0.001,
+                min_quantity=0.001,
+            ),
+            short_symbol_rule_at_entry=_frozen_symbol_rule(
+                Venue.OKX,
+                step=0.01,
+                min_quantity=0.01,
+            ),
+            common_base_quantity_step_at_entry=0.01,
+        )
+
+        result = await EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+        ).execute(ctx)
+
+        assert result.state is EntryState.FAILED
+        assert result.reject_reason == "unwound_after_first_fill"
+        assert result.residual_task is None
+        assert binance_ada.place_order_call_count == 2
+        assert binance_ada.last_request.reduce_only is True
+        assert binance_ada.last_request.quantity == pytest.approx(0.003)
+        assert okx_ada.place_order_call_count == 0
+        blocked = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "entry.direct_hedge_quantity_blocked"
+        ]
+        assert blocked[-1]["reason"] == (
+            "direct_hedge_quantity_below_frozen_common_grid"
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_is_aligned_down_and_remainder_becomes_residual(
+        self, adapters, journal, btc_context
+    ):
+        binance_ada = adapters[Venue.BINANCE]
+        okx_ada = adapters[Venue.OKX]
+        binance_ada.place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.BUY,
+                0.013,
+                50000.0,
+                "maker-partial-grid",
+            ),
+        ]
+        okx_ada.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.SELL,
+                0.01,
+                50000.0,
+                "hedge-aligned-grid",
+            ),
+        ]
+        ctx = replace(
+            btc_context,
+            long_quantity=0.02,
+            short_quantity=0.02,
+            long_symbol_rule_at_entry=_frozen_symbol_rule(
+                Venue.BINANCE,
+                step=0.001,
+                min_quantity=0.001,
+            ),
+            short_symbol_rule_at_entry=_frozen_symbol_rule(
+                Venue.OKX,
+                step=0.01,
+                min_quantity=0.01,
+            ),
+            common_base_quantity_step_at_entry=0.01,
+        )
+
+        result = await EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+        ).execute(ctx)
+
+        assert okx_ada.place_order_call_count == 1
+        assert okx_ada.last_request.quantity == pytest.approx(0.01)
+        assert result.state is EntryState.FAILED_WITH_RESIDUAL
+        assert result.residual_task is not None
+        assert result.residual_task.exposure_venue is Venue.BINANCE
+        assert result.residual_task.exposure_side is Side.SELL
+        assert result.residual_task.exposure_quantity == pytest.approx(0.003)
 
     @pytest.mark.asyncio
     async def test_full_unwind_is_terminal_and_never_submits_hedge(
@@ -666,7 +934,139 @@ class TestExecuteEntryConvenience:
 
 
 class TestPassiveMakerLifecycle:
+    @pytest.mark.asyncio
+    async def test_short_maker_pending_sides_remain_true_long_and_short_legs(
+        self, adapters, journal, btc_context
+    ):
+        ctx = replace(
+            btc_context,
+            entry_id="short-maker-direction",
+            maker_leg=Side.SELL,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+
+        result = await EntrySyncExecutor(
+            adapters=adapters,
+            journal=journal,
+        ).execute(ctx)
+
+        pending = result.pending_entry
+        assert pending is not None
+        assert adapters[Venue.OKX].last_request.side is Side.SELL
+        assert pending.maker_leg == "short"
+        assert pending.long_side is Side.BUY
+        assert pending.short_side is Side.SELL
+        assert pending.maker_side() is Side.SELL
+        assert pending.hedge_side() is Side.BUY
+
+        restored = PendingEntry.from_dict(pending.to_dict())
+        assert restored.long_side is Side.BUY
+        assert restored.short_side is Side.SELL
+        assert restored.maker_side() is Side.SELL
+        assert restored.hedge_side() is Side.BUY
+
+        legacy_payload = pending.to_dict()
+        legacy_payload["long_side"] = Side.SELL.value
+        legacy_payload["short_side"] = Side.BUY.value
+        migrated = PendingEntry.from_dict(legacy_payload)
+        assert migrated.long_side is Side.BUY
+        assert migrated.short_side is Side.SELL
+        assert migrated.maker_side() is Side.SELL
+        assert migrated.hedge_side() is Side.BUY
+
     """Task 8: Maker post_only must use submit_passive_order not place_order."""
+
+    @pytest.mark.asyncio
+    async def test_canary_passive_reprice_breach_stops_before_cancel_replace(
+        self,
+        journal,
+    ):
+        calls = []
+
+        async def reprice_override(*args):
+            calls.append(args)
+
+        runtime = PassiveMakerRuntime(
+            SimpleNamespace(
+                journal=journal,
+                _reprice_passive_maker=reprice_override,
+            )
+        )
+        pending = SimpleNamespace(
+            symbol="BTCUSDT",
+            target_quantity=0.1,
+            long_quantity=0.1,
+            short_quantity=0.1,
+            entry_target_quantity=0.1,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=15.0,
+            candidate_revision_id="canary-passive-revision",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="funding_canary_final_notional_invariant_breached",
+        ):
+            await runtime._call_reprice_passive_maker(
+                pending,
+                160.0,
+                140.0,
+                "reprice",
+                2_000,
+                "entry-canary-passive",
+            )
+
+        assert calls == []
+        breach = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"]
+            == "funding_canary_final_notional_invariant_breached"
+        ][-1]
+        assert breach["entry_max_leg_notional_quote"] == pytest.approx(16.0)
+        assert breach["funding_canary_hard_max_entry_notional_quote"] == 15.0
+
+    @pytest.mark.asyncio
+    async def test_canary_passive_reprice_rejects_non_finite_cap(
+        self,
+        journal,
+    ):
+        calls = []
+
+        async def reprice_override(*args):
+            calls.append(args)
+
+        runtime = PassiveMakerRuntime(
+            SimpleNamespace(
+                journal=journal,
+                _reprice_passive_maker=reprice_override,
+            )
+        )
+        pending = SimpleNamespace(
+            symbol="BTCUSDT",
+            target_quantity=0.1,
+            long_quantity=0.1,
+            short_quantity=0.1,
+            entry_target_quantity=0.1,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=float("inf"),
+            candidate_revision_id="canary-passive-non-finite",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="funding_canary_final_notional_invariant_breached",
+        ):
+            await runtime._call_reprice_passive_maker(
+                pending,
+                100.0,
+                100.0,
+                "reprice",
+                2_000,
+                "entry-canary-passive-non-finite",
+            )
+
+        assert calls == []
 
     @pytest.mark.asyncio
     async def test_entry_maker_uses_submit_passive_order_not_place_order(self):
@@ -730,6 +1130,12 @@ class TestPassiveMakerLifecycle:
             entry_depth_shortfall_quantity=0.0004,
             entry_max_executable_notional_quote=80.0,
             entry_depth_capped_at_entry=True,
+            candidate_revision_id="canary-persisted-revision",
+            entry_max_leg_notional_quote=50.0,
+            funding_canary_enabled_at_entry=True,
+            funding_canary_fee_assurance_tier="account",
+            funding_canary_hard_max_entry_notional_quote=50.0,
+            funding_canary_size_constrained=False,
             advisories=["thin_book"],
             blocked_reasons=["capacity_cap"],
         )
@@ -774,6 +1180,15 @@ class TestPassiveMakerLifecycle:
         assert result.pending_entry.entry_depth_shortfall_quantity == pytest.approx(0.0004)
         assert result.pending_entry.entry_max_executable_notional_quote == pytest.approx(80.0)
         assert result.pending_entry.entry_depth_capped_at_entry is True
+        assert result.pending_entry.candidate_revision_id == "canary-persisted-revision"
+        assert result.pending_entry.entry_max_leg_notional_quote == 50.0
+        assert result.pending_entry.funding_canary_enabled_at_entry is True
+        assert result.pending_entry.funding_canary_fee_assurance_tier == "account"
+        assert (
+            result.pending_entry.funding_canary_hard_max_entry_notional_quote
+            == 50.0
+        )
+        assert result.pending_entry.funding_canary_size_constrained is False
         assert result.pending_entry.advisories == ["thin_book"]
         assert result.pending_entry.blocked_reasons == ["capacity_cap"]
         assert result.state == EntryState.MAKER_RESTING

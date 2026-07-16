@@ -13,6 +13,7 @@ import ast
 import inspect
 import tempfile
 import textwrap
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 
 import pytest
@@ -489,3 +490,259 @@ class TestSnapshotRecovery:
         assert pending.hedge_client_order_id == "hedge-client-1"
         assert pending.maker_leg_filled == 0.4
         assert pending.hedge_leg_filled == 0.1
+
+    def test_runtime_pending_registration_replays_full_canary_and_order_identity(
+        self,
+        tmp_path,
+    ):
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        journal_path = tmp_path / "journal.jsonl"
+        snap.write({"lifecycle": "running", "run_id": "test-run"})
+        journal = Journal(journal_path)
+        journal.open()
+        try:
+            journal.append(
+                "runtime.pending_entry_registered",
+                {
+                    "pending_id": "entry-canary-runtime",
+                    "symbol": "BTC-USDT",
+                    "long_venue": "binance",
+                    "short_venue": "okx",
+                    "target_quantity": 0.0003,
+                    "long_quantity": 0.0003,
+                    "short_quantity": 0.0003,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "created_at_ms": 1234,
+                    "maker_leg": "long",
+                    "maker_order_id": "maker-order-canary",
+                    "maker_client_order_id": "maker-client-canary",
+                    "hedge_order_id": "hedge-order-canary",
+                    "hedge_client_order_id": "hedge-client-canary",
+                    "maker_leg_filled": 0.0001,
+                    "hedge_leg_filled": 0.0,
+                    "candidate_revision_id": "revision-canary-1",
+                    "entry_max_leg_notional_quote": 15.0,
+                    "funding_canary_enabled_at_entry": True,
+                    "funding_canary_fee_assurance_tier": "account",
+                    "funding_canary_hard_max_entry_notional_quote": 15.0,
+                    "funding_canary_size_constrained": True,
+                    "passive_order": {
+                        "order_id": "maker-order-canary",
+                        "client_order_id": "maker-client-canary",
+                        "limit_price": 50_000.0,
+                        "target_quantity": 0.0003,
+                        "accepted_at_ms": 1234,
+                        "timeout_at_ms": 7234,
+                        "last_progress_state": "open",
+                    },
+                },
+                flush=True,
+                ts_ms=1300,
+            )
+        finally:
+            journal.close()
+
+        state = recover_from_snapshot(snap, Journal(journal_path))
+        pending = state.pending_entries["entry-canary-runtime"]
+        assert pending.target_quantity == pytest.approx(0.0003)
+        assert pending.maker_client_order_id == "maker-client-canary"
+        assert pending.hedge_client_order_id == "hedge-client-canary"
+        assert pending.candidate_revision_id == "revision-canary-1"
+        assert pending.funding_canary_enabled_at_entry is True
+        assert pending.funding_canary_hard_max_entry_notional_quote == 15.0
+        assert pending.funding_canary_size_constrained is True
+        assert pending.passive_order is not None
+        assert pending.passive_order.order_id == "maker-order-canary"
+        assert pending.passive_order.target_quantity == pytest.approx(0.0003)
+
+
+def test_pending_entry_authoritative_contract_covers_and_round_trips_every_field():
+    from lightfee.core.domain import Side, Venue
+
+    pending = PendingEntry(
+        pending_id="entry-contract",
+        symbol="BTC-USDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.03,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=1_000,
+        fallback_route="standard_taker",
+        hedge_attempt_count=7,
+        run_id="run-contract",
+        entry_route="passive_incremental",
+        repost_count=4,
+        zero_fill_since_ms=1_234,
+        long_symbol_rule_at_entry={
+            "venue": "binance",
+            "symbol": "BTC-USDT",
+            "venue_symbol": "BTCUSDT",
+            "quantity_units": "base",
+            "quantity_step_base": 0.001,
+            "min_quantity_base": 0.001,
+            "min_notional_quote": 5.0,
+            "missing_fields": [],
+            "evidence_complete": True,
+        },
+        short_symbol_rule_at_entry={
+            "venue": "okx",
+            "symbol": "BTC-USDT",
+            "venue_symbol": "BTC-USDT-SWAP",
+            "quantity_units": "base",
+            "quantity_step_base": 0.01,
+            "min_quantity_base": 0.01,
+            "min_notional_quote": 5.0,
+            "missing_fields": [],
+            "evidence_complete": True,
+        },
+        common_base_quantity_step_at_entry=0.01,
+        hedge_inflight=HedgeInflight(
+            client_order_id="hedge-contract-7",
+            venue=Venue.OKX,
+            side=Side.SELL,
+            quantity=0.02,
+            attempt=7,
+            submitted_at_ms=1_100,
+        ),
+    )
+
+    payload = pending.to_dict()
+
+    assert set(payload) == {field.name for field in dataclass_fields(PendingEntry)}
+    assert PendingEntry.from_dict(payload).to_dict() == payload
+
+
+def test_journal_only_pending_hedge_attempt_replay_preserves_cid_sequence(tmp_path):
+    from lightfee.core.domain import Side, Venue
+
+    pending = PendingEntry(
+        pending_id="entry-attempt",
+        symbol="BTC-USDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.03,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=1_000,
+        fallback_route="standard_taker",
+        run_id="run-attempt",
+        entry_route="passive_incremental",
+        repost_count=2,
+        zero_fill_since_ms=900,
+        long_symbol_rule_at_entry={"evidence_complete": True},
+        short_symbol_rule_at_entry={"evidence_complete": True},
+        common_base_quantity_step_at_entry=0.01,
+    )
+    snapshot = SnapshotStore(tmp_path / "snapshot.json")
+    snapshot.write({"lifecycle": "running", "run_id": "test-run"})
+    journal_path = tmp_path / "journal.jsonl"
+    journal = Journal(journal_path)
+    journal.open()
+    try:
+        journal.append(
+            "runtime.pending_entry_registered",
+            pending.to_dict(),
+            flush=True,
+            ts_ms=1_100,
+        )
+        journal.append(
+            "pending_entry.hedge_submit_attempt",
+            {
+                "entry_id": pending.pending_id,
+                "symbol": pending.symbol,
+                "hedge_venue": "okx",
+                "hedge_side": "sell",
+                "hedge_quantity": 0.02,
+                "hedge_client_order_id": "hedge-attempt-3",
+                "hedge_attempt": 3,
+                "submitted_at_ms": 1_200,
+            },
+            flush=True,
+            ts_ms=1_200,
+        )
+    finally:
+        journal.close()
+
+    restored = recover_from_snapshot(snapshot, Journal(journal_path)).pending_entries[
+        pending.pending_id
+    ]
+
+    assert restored.fallback_route == "standard_taker"
+    assert restored.run_id == "run-attempt"
+    assert restored.entry_route == "passive_incremental"
+    assert restored.repost_count == 2
+    assert restored.zero_fill_since_ms == 900
+    assert restored.common_base_quantity_step_at_entry == pytest.approx(0.01)
+    assert restored.hedge_attempt_count == 3
+    assert restored.hedge_client_order_id == "hedge-attempt-3"
+    assert restored.hedge_inflight is not None
+    assert restored.hedge_inflight.attempt == 3
+
+
+def test_journal_only_terminal_hedge_result_clears_inflight_and_restores_repair(
+    tmp_path,
+):
+    from lightfee.core.domain import Side, Venue
+
+    pending = PendingEntry(
+        pending_id="entry-terminal-result",
+        symbol="BTC-USDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.03,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=1_000,
+    )
+    snapshot = SnapshotStore(tmp_path / "snapshot.json")
+    snapshot.write({"lifecycle": "running", "run_id": "test-run"})
+    journal_path = tmp_path / "journal.jsonl"
+    journal = Journal(journal_path)
+    journal.open()
+    try:
+        journal.append(
+            "runtime.pending_entry_registered",
+            pending.to_dict(),
+            flush=True,
+            ts_ms=1_100,
+        )
+        journal.append(
+            "pending_entry.hedge_submit_attempt",
+            {
+                "entry_id": pending.pending_id,
+                "hedge_venue": "okx",
+                "hedge_side": "sell",
+                "hedge_quantity": 0.03,
+                "hedge_client_order_id": "hedge-terminal-4",
+                "hedge_attempt": 4,
+                "submitted_at_ms": 1_200,
+            },
+            flush=True,
+            ts_ms=1_200,
+        )
+        journal.append(
+            "pending_entry.hedge_submit_result",
+            {
+                "entry_id": pending.pending_id,
+                "outcome": "error",
+                "hedge_client_order_id": "hedge-terminal-4",
+                "hedge_attempt": 4,
+                "clear_hedge_inflight": True,
+                "repair_state": "non_retryable_auth_signing_failure",
+            },
+            flush=True,
+            ts_ms=1_300,
+        )
+    finally:
+        journal.close()
+
+    restored = recover_from_snapshot(snapshot, Journal(journal_path)).pending_entries[
+        pending.pending_id
+    ]
+
+    assert restored.hedge_attempt_count == 4
+    assert restored.hedge_client_order_id == "hedge-terminal-4"
+    assert restored.hedge_inflight is None
+    assert restored.repair_state == "non_retryable_auth_signing_failure"

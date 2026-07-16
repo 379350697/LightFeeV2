@@ -46,6 +46,120 @@ def test_ws_bbo_cache_rejects_future_timestamp_as_non_executable():
     assert cache.fresh_quote("binance", "BTCUSDT", now_ms=1_000, max_age_ms=1_000) is None
 
 
+def test_ws_bbo_cache_rejects_delayed_rest_older_than_ws_event():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    assert cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            observed_at_ms=2_000,
+            received_at_ms=2_000,
+            exchange_event_at_ms=1_000,
+            source="binance_book_ticker",
+        )
+    )
+
+    assert not cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=99.1,
+            observed_at_ms=2_100,
+            received_at_ms=2_100,
+            exchange_event_at_ms=900,
+            source="binance_rest_top_book",
+        )
+    )
+    assert cache.get_quote("binance", "BTCUSDT").bid == 100.0
+
+    assert cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=101.0,
+            ask=101.1,
+            observed_at_ms=2_200,
+            received_at_ms=2_200,
+            exchange_event_at_ms=1_100,
+            source="binance_book_ticker",
+        )
+    )
+    assert cache.get_quote("binance", "BTCUSDT").bid == 101.0
+
+
+def test_ws_bbo_cache_rejects_timestamp_less_rest_over_fresh_ws_event():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    assert cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            observed_at_ms=2_000,
+            received_at_ms=2_000,
+            exchange_event_at_ms=1_000,
+            source="binance_book_ticker",
+        )
+    )
+
+    assert not cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=99.1,
+            observed_at_ms=2_100,
+            received_at_ms=2_100,
+            exchange_event_at_ms=0,
+            source="binance_rest_top_book",
+        ),
+        now_ms=2_100,
+        current_max_age_ms=500,
+    )
+    assert cache.get_quote("binance", "BTCUSDT").bid == 100.0
+
+
+def test_ws_bbo_cache_allows_timestamp_less_rest_after_ws_lease_expires():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    assert cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            observed_at_ms=1_000,
+            received_at_ms=1_000,
+            exchange_event_at_ms=900,
+            source="binance_book_ticker",
+        )
+    )
+
+    assert cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=101.0,
+            ask=101.1,
+            observed_at_ms=2_100,
+            received_at_ms=2_100,
+            exchange_event_at_ms=0,
+            source="binance_rest_top_book",
+        ),
+        now_ms=2_100,
+        current_max_age_ms=500,
+    )
+    assert cache.get_quote("binance", "BTCUSDT").bid == 101.0
+
+
 def test_binance_book_ticker_parser_uses_best_bid_and_ask():
     from lightfee.marketdata.ws_bbo import BinanceBboWsClient, VenueBboCache
 
@@ -68,7 +182,9 @@ def test_binance_book_ticker_parser_uses_best_bid_and_ask():
     assert quote.symbol == "BTCUSDT"
     assert quote.bid == 25.3519
     assert quote.ask == 25.3652
-    assert quote.observed_at_ms == 1568014460893
+    assert quote.observed_at_ms == 1568014460900
+    assert quote.received_at_ms == 1568014460900
+    assert quote.exchange_event_at_ms == 1568014460893
 
 
 def test_binance_bbo_url_uses_official_public_route():
@@ -110,7 +226,9 @@ def test_okx_tickers_parser_uses_venue_symbol_mapping():
     assert quote.symbol == "BTCUSDT"
     assert quote.bid == 8888.88
     assert quote.ask == 8889.99
-    assert quote.observed_at_ms == 1597026383085
+    assert quote.observed_at_ms == 1597026383090
+    assert quote.received_at_ms == 1597026383090
+    assert quote.exchange_event_at_ms == 1597026383085
 
 
 def test_bybit_ticker_delta_keeps_previous_bid_or_ask_until_both_present():
@@ -388,7 +506,8 @@ def test_rest_top_book_refresher_fetches_bybit_linear_ticker():
     assert quote.venue == "bybit"
     assert quote.bid == 0.0391
     assert quote.ask == 0.0393
-    assert quote.observed_at_ms == 1778985599900
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599900
     assert str(requests[0].url) == (
         "https://api.bybit.com/v5/market/tickers?category=linear&symbol=ARIAUSDT"
     )
@@ -427,7 +546,8 @@ def test_rest_top_book_refresher_fetches_okx_ticker_with_venue_symbol():
     assert quote.symbol == "ARIAUSDT"
     assert quote.bid == 0.0390
     assert quote.ask == 0.0392
-    assert quote.observed_at_ms == 1778985599980
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599980
     assert str(requests[0].url) == (
         "https://www.okx.com/api/v5/market/ticker?instId=ARIA-USDT-SWAP"
     )
@@ -466,7 +586,8 @@ def test_rest_top_book_refresher_fetches_bitget_ticker():
     assert quote.symbol == "ARIAUSDT"
     assert quote.bid == 0.0390
     assert quote.ask == 0.0392
-    assert quote.observed_at_ms == 1778985599980
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599980
     assert str(requests[0].url) == (
         "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES&symbol=ARIAUSDT"
     )
@@ -502,7 +623,8 @@ def test_rest_top_book_refresher_fetches_gate_futures_ticker():
     assert quote.symbol == "ARIAUSDT"
     assert quote.bid == 0.0390
     assert quote.ask == 0.0392
-    assert quote.observed_at_ms == 1778985599980
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599980
     assert str(requests[0].url) == (
         "https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=ARIA_USDT"
     )
@@ -543,7 +665,8 @@ def test_rest_top_book_refresher_fetches_hyperliquid_l2_top():
     assert quote.symbol == "ARIAUSDT"
     assert quote.bid == 0.0390
     assert quote.ask == 0.0392
-    assert quote.observed_at_ms == 1778985599980
+    assert quote.observed_at_ms == 1778985600000
+    assert quote.exchange_event_at_ms == 1778985599980
     assert str(requests[0].url) == "https://api.hyperliquid.xyz/info"
 
 
@@ -611,6 +734,172 @@ def test_rest_top_book_refresher_reports_structured_resolved_and_throttled_resul
     assert throttled.outcome == "throttled"
     assert throttled.attempt_interval_outcome == "min_interval_not_elapsed"
     assert throttled.quote is None
+
+
+@pytest.mark.asyncio
+async def test_rest_top_book_refresher_async_path_uses_shared_async_client():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "BTCUSDT",
+                "bidPrice": "100.0",
+                "askPrice": "100.1",
+                "bidQty": "5",
+                "askQty": "6",
+                "time": 1_000,
+            },
+        )
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(
+        async_client=async_client,
+        timeout_ms=250,
+    )
+    try:
+        result = await refresher.arefresh_quote_result(
+            "binance",
+            "BTCUSDT",
+            now_ms=1_000,
+        )
+    finally:
+        await async_client.aclose()
+
+    assert result.outcome == "resolved"
+    assert result.quote is not None
+    assert result.quote.received_at_ms >= 1_000
+    assert len(requests) == 1
+    assert refresher._async_client is async_client
+
+
+@pytest.mark.asyncio
+async def test_rest_top_book_singleflight_keeps_request_for_remaining_waiter():
+    import asyncio
+
+    import httpx
+
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return httpx.Response(
+            200,
+            json={
+                "symbol": "BTCUSDT",
+                "bidPrice": "100.0",
+                "askPrice": "100.1",
+                "time": 1_000,
+            },
+        )
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(
+        async_client=async_client,
+        timeout_ms=250,
+    )
+    first = asyncio.create_task(
+        refresher.arefresh_quote_result("binance", "BTCUSDT", now_ms=1_000)
+    )
+    await started.wait()
+    second = asyncio.create_task(
+        refresher.arefresh_quote_result("binance", "BTCUSDT", now_ms=1_000)
+    )
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not cancelled.is_set()
+
+    release.set()
+    result = await second
+    await async_client.aclose()
+
+    assert result.outcome == "resolved"
+    assert request_count == 1
+    assert refresher._async_inflight == {}
+    assert refresher._async_inflight_waiters == {}
+
+
+@pytest.mark.asyncio
+async def test_rest_top_book_singleflight_cancels_request_after_last_waiter():
+    import asyncio
+
+    import httpx
+
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(
+        async_client=async_client,
+        timeout_ms=250,
+    )
+    waiter = asyncio.create_task(
+        refresher.arefresh_quote_result("binance", "BTCUSDT", now_ms=1_000)
+    )
+    await started.wait()
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.wait_for(cancelled.wait(), timeout=0.25)
+    await asyncio.sleep(0)
+    await async_client.aclose()
+
+    assert refresher._async_inflight == {}
+    assert refresher._async_inflight_waiters == {}
+    assert (
+        refresher._global_async_semaphore._value
+        == refresher.GLOBAL_ASYNC_CONCURRENCY
+    )
+
+
+@pytest.mark.asyncio
+async def test_bbo_data_plane_reconciles_and_stops_untracked_clients():
+    import asyncio
+
+    from lightfee.marketdata.ws_bbo import VenueBboCache, VenueBboDataPlane
+
+    plane = VenueBboDataPlane(VenueBboCache())
+    assert plane.start_ws_streams("binance", ["BTCUSDT", "ETHUSDT"]) == 2
+    old_client = plane._clients[("binance", "BTCUSDT")]
+    old_client._task = asyncio.create_task(asyncio.Event().wait())
+
+    stopped = await plane.reconcile_ws_streams({("binance", "ETHUSDT")})
+
+    assert stopped == 1
+    assert set(plane._clients) == {("binance", "ETHUSDT")}
+    assert old_client._closed is True
+    assert old_client._task is None
 
 
 def test_rest_top_book_refresher_reports_unsupported_symbol_separately():

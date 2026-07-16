@@ -16,11 +16,18 @@ import random
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Optional
 
 import httpx
 
 from lightfee.core.domain import Venue
+from lightfee.marketdata.open_interest import (
+    OpenInterestEvidence,
+    OpenInterestEvidenceStatus,
+    normalize_open_interest_status,
+    open_interest_sample_id,
+    validated_open_interest_evidence,
+)
 from lightfee.venues.specs import VenueSpec
 
 if TYPE_CHECKING:
@@ -59,9 +66,18 @@ class FundingTicker:
     funding_interval_source: str = ""
     funding_interval_observed_at_ms: int = 0
     volume_24h_quote: float = 0.0
-    open_interest_quote: float = 0.0
-    open_interest_evidence_status: str = "available"
+    open_interest_quote: float | None = None
+    open_interest_evidence_status: str = "unavailable"
     open_interest_evidence_reason: str = ""
+    open_interest_observed_at_ms: int = 0
+    open_interest_received_at_ms: int = 0
+    open_interest_source: str = ""
+    open_interest_sample_id: str = ""
+    open_interest_venue_symbol: str = ""
+    raw_open_interest: float | None = None
+    raw_open_interest_unit: str = ""
+    open_interest_contract_multiplier: float | None = None
+    open_interest_conversion_mark_price: float | None = None
     oi_candidate_count: int = 0
     oi_cache_hit_count: int = 0
     oi_cache_miss_count: int = 0
@@ -243,8 +259,220 @@ def _first_present_float(
 ) -> tuple[float, bool, str]:
     for key in keys:
         if _has_nonempty_field(item, key):
-            return _safe_float(item.get(key), default=default), True, key
+            value = item.get(key)
+            if isinstance(value, bool):
+                return default, False, key
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default, False, key
+            if not math.isfinite(parsed) or parsed < 0.0:
+                return default, False, key
+            return parsed, True, key
     return default, False, ""
+
+
+def _bybit_total_open_interest(
+    item: dict[str, Any],
+) -> tuple[float | None, float | None, str, str, str]:
+    """Return Bybit OI on the configured total-open-interest basis.
+
+    ``singleOpenInterestValue`` is deliberately not a fallback for
+    ``openInterestValue``.  It is a different economic measure and Bybit does
+    not publish a contract guaranteeing a lossless conversion to total OI.
+    """
+    total_value, total_valid, total_key = _first_present_float(
+        item,
+        "openInterestValue",
+    )
+    if total_valid:
+        return total_value, total_value, "quote", "observed", total_key
+    if total_key:
+        return None, None, "", "parse_error", f"invalid_{total_key}"
+
+    single_value, single_valid, single_key = _first_present_float(
+        item,
+        "singleOpenInterestValue",
+    )
+    if single_valid:
+        return (
+            None,
+            single_value,
+            "single_side_quote",
+            "unsupported",
+            "singleOpenInterestValue_is_not_total_open_interest",
+        )
+    if single_key:
+        return None, None, "", "parse_error", f"invalid_{single_key}"
+    return None, None, "", "parse_error", "missing_open_interest_value"
+
+
+_ENTRY_OI_RATE_LIMIT_CODES: dict[Venue, frozenset[str]] = {
+    Venue.OKX: frozenset({"429", "50011", "50040"}),
+    Venue.BYBIT: frozenset({"429", "10006", "10429"}),
+    Venue.BITGET: frozenset({"429", "40010", "40725"}),
+    Venue.GATE: frozenset({"429", "TOO_BUSY", "TOO_MANY_REQUESTS"}),
+    Venue.HYPERLIQUID: frozenset({"429", "TOO_MANY_REQUESTS"}),
+}
+
+
+def _entry_oi_application_error(
+    venue: Venue,
+    payload: Any,
+) -> tuple[str, str] | None:
+    """Classify HTTP-200 exchange errors without inventing mapping failures."""
+    code: object | None = None
+    message: object | None = None
+
+    if venue == Venue.OKX and isinstance(payload, dict) and "code" in payload:
+        code = payload.get("code")
+        if str(code or "").strip() in {"", "0"}:
+            return None
+        message = payload.get("msg")
+    elif venue == Venue.BYBIT and isinstance(payload, dict) and "retCode" in payload:
+        code = payload.get("retCode")
+        if str(code or "").strip() in {"", "0"}:
+            return None
+        message = payload.get("retMsg")
+    elif venue == Venue.BITGET and isinstance(payload, dict) and "code" in payload:
+        code = payload.get("code")
+        if str(code or "").strip() in {"", "0", "00000"}:
+            return None
+        message = payload.get("msg") or payload.get("message")
+    elif venue == Venue.GATE and isinstance(payload, dict) and (
+        "label" in payload
+        or "error" in payload
+        or ("code" in payload and "message" in payload)
+        or str(payload.get("status") or "").strip().lower()
+        in {"error", "failed", "fail"}
+    ):
+        code = payload.get("label") or payload.get("code") or payload.get("status")
+        message = payload.get("message") or payload.get("error")
+    elif venue == Venue.HYPERLIQUID and isinstance(payload, dict) and (
+        "error" in payload
+        or str(payload.get("status") or "").strip().lower()
+        in {"error", "err", "failed", "fail"}
+    ):
+        code = payload.get("code") or payload.get("status") or "error"
+        message = payload.get("error") or payload.get("response") or payload.get("message")
+    else:
+        return None
+
+    code_s = str(code or "unknown").strip()
+    message_s = str(message or "application_error").strip()
+    normalized = f"{code_s} {message_s}".lower()
+    rate_limited = (
+        code_s.upper() in _ENTRY_OI_RATE_LIMIT_CODES.get(venue, frozenset())
+        or any(
+            hint in normalized
+            for hint in (
+                "rate limit",
+                "rate-limit",
+                "too many",
+                "too frequent",
+                "frequency limit",
+                "limit reached",
+            )
+        )
+    )
+    status = "rate_limited" if rate_limited else "http_error"
+    reason = f"{venue.value}_application_error:{code_s}:{message_s}"[:200]
+    return status, reason
+
+
+def _open_interest_fields(
+    *,
+    venue: str,
+    canonical_symbol: str,
+    venue_symbol: str,
+    value_quote: float | None,
+    raw_value: float | None,
+    raw_unit: str,
+    contract_multiplier: float | None,
+    conversion_mark_price: float | None,
+    observed_at_ms: int,
+    received_at_ms: int,
+    source: str,
+    status: str,
+    reason: str,
+) -> dict[str, object]:
+    normalized_status = normalize_open_interest_status(status)
+    sample_id = ""
+    if normalized_status == OpenInterestEvidenceStatus.OBSERVED.value:
+        sample_id = open_interest_sample_id(
+            venue=venue,
+            canonical_symbol=canonical_symbol,
+            venue_symbol=venue_symbol,
+            observed_at_ms=observed_at_ms,
+            source=source,
+            raw_value=raw_value,
+            value_quote=value_quote,
+        )
+    evidence = validated_open_interest_evidence(
+        OpenInterestEvidence(
+            canonical_symbol=canonical_symbol,
+            venue_symbol=venue_symbol,
+            value_quote=value_quote,
+            raw_value=raw_value,
+            raw_unit=raw_unit,
+            contract_multiplier=contract_multiplier,
+            conversion_mark_price=conversion_mark_price,
+            observed_at_ms=observed_at_ms or None,
+            received_at_ms=received_at_ms,
+            source=source,
+            status=normalized_status,
+            reason=reason,
+            sample_id=sample_id,
+        )
+    )
+    return {
+        "open_interest_quote": evidence.value_quote,
+        "open_interest_evidence_status": evidence.status,
+        "open_interest_evidence_reason": evidence.reason,
+        "open_interest_observed_at_ms": int(evidence.observed_at_ms or 0),
+        "open_interest_received_at_ms": int(evidence.received_at_ms or 0),
+        "open_interest_source": evidence.source,
+        "open_interest_sample_id": evidence.sample_id,
+        "open_interest_venue_symbol": evidence.venue_symbol,
+        "raw_open_interest": evidence.raw_value,
+        "raw_open_interest_unit": evidence.raw_unit,
+        "open_interest_contract_multiplier": evidence.contract_multiplier,
+        "open_interest_conversion_mark_price": evidence.conversion_mark_price,
+    }
+
+
+def _entry_oi_observed_at_ms(
+    native_timestamp: object,
+    *,
+    received_at_ms: int,
+    field_name: str,
+) -> tuple[int, str | None, str | None]:
+    """Resolve exchange observation time without refreshing stale evidence.
+
+    A genuinely absent vendor timestamp falls back to the local receipt time.
+    A present-but-invalid or future timestamp fails closed instead of minting a
+    fresh sample identity from the receipt clock.
+    """
+    if native_timestamp is None or (
+        isinstance(native_timestamp, str) and not native_timestamp.strip()
+    ):
+        return int(received_at_ms), None, None
+    if isinstance(native_timestamp, bool):
+        return 0, "parse_error", f"invalid_{field_name}"
+    try:
+        parsed = Decimal(str(native_timestamp).strip())
+    except (InvalidOperation, ValueError):
+        return 0, "parse_error", f"invalid_{field_name}"
+    if (
+        not parsed.is_finite()
+        or parsed <= 0
+        or parsed != parsed.to_integral_value()
+    ):
+        return 0, "parse_error", f"invalid_{field_name}"
+    observed_at_ms = int(parsed)
+    if observed_at_ms > int(received_at_ms):
+        return 0, "stale", f"future_{field_name}"
+    return observed_at_ms, None, None
 
 
 def _http_error_reason(exc: Exception) -> str:
@@ -929,6 +1157,8 @@ class MarketDataClient:
     async def fetch_entry_open_interest_evidence(
         self,
         symbols: list[str],
+        *,
+        force_refresh: bool = True,
     ) -> dict[str, FundingTicker]:
         """Fetch candidate-scoped OI evidence without widening sidecar scope.
 
@@ -946,8 +1176,598 @@ class MarketDataClient:
             return {}
         deduped = list(dict.fromkeys(scoped_symbols))
         if self._spec.venue_id in (Venue.BINANCE, Venue.ASTER):
-            return await self._fetch_binance_style_entry_open_interest(deduped)
-        return await self.fetch_funding_tickers(deduped)
+            return await self._fetch_binance_style_entry_open_interest(
+                deduped,
+                force_refresh=force_refresh,
+            )
+        if self._spec.venue_id == Venue.OKX:
+            return await self._fetch_okx_entry_open_interest(deduped)
+        if self._spec.venue_id == Venue.BYBIT:
+            return await self._fetch_bybit_entry_open_interest(deduped)
+        if self._spec.venue_id == Venue.BITGET:
+            return await self._fetch_bitget_entry_open_interest(deduped)
+        if self._spec.venue_id == Venue.GATE:
+            return await self._fetch_gate_entry_open_interest(deduped)
+        if self._spec.venue_id == Venue.HYPERLIQUID:
+            return await self._fetch_hyperliquid_entry_open_interest(deduped)
+        return {}
+
+    def _entry_oi_ticker(
+        self,
+        *,
+        canonical_symbol: str,
+        venue_symbol: str,
+        value_quote: float | None,
+        raw_value: float | None,
+        raw_unit: str,
+        contract_multiplier: float | None,
+        conversion_mark_price: float | None,
+        observed_at_ms: int,
+        received_at_ms: int,
+        source: str,
+        status: str,
+        reason: str,
+    ) -> FundingTicker:
+        venue = self._spec.venue_id.value
+        return FundingTicker(
+            venue=venue,
+            symbol=canonical_symbol,
+            bid=0.0,
+            ask=0.0,
+            **_open_interest_fields(
+                venue=venue,
+                canonical_symbol=canonical_symbol,
+                venue_symbol=venue_symbol,
+                value_quote=value_quote,
+                raw_value=raw_value,
+                raw_unit=raw_unit,
+                contract_multiplier=contract_multiplier,
+                conversion_mark_price=conversion_mark_price,
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                source=source,
+                status=status,
+                reason=reason,
+            ),
+        )
+
+    def _entry_oi_unavailable_result(
+        self,
+        canonical_symbol: str,
+        *,
+        source: str,
+        status: str,
+        reason: str,
+        received_at_ms: int | None = None,
+    ) -> tuple[str, FundingTicker]:
+        venue = self._spec.venue_id.value
+        venue_symbol = self._to_venue_symbol(canonical_symbol)
+        return f"{venue}:{canonical_symbol}", self._entry_oi_ticker(
+            canonical_symbol=canonical_symbol,
+            venue_symbol=venue_symbol,
+            value_quote=None,
+            raw_value=None,
+            raw_unit="",
+            contract_multiplier=None,
+            conversion_mark_price=None,
+            observed_at_ms=0,
+            received_at_ms=received_at_ms or _now_ms(),
+            source=source,
+            status=status,
+            reason=reason,
+        )
+
+    async def _run_isolated_entry_oi_request(
+        self,
+        canonical_symbol: str,
+        *,
+        source: str,
+        fetch_one: Callable[[str], Awaitable[tuple[str, FundingTicker]]],
+    ) -> tuple[str, FundingTicker]:
+        """Keep one failed contract from poisoning the venue's whole batch."""
+        try:
+            return await fetch_one(canonical_symbol)
+        except Exception as exc:
+            status = self._binance_style_oi_status_from_error(exc)
+            if isinstance(exc, (ValueError, TypeError, KeyError)):
+                status = "parse_error"
+            return self._entry_oi_unavailable_result(
+                canonical_symbol,
+                source=source,
+                status=status,
+                reason=_http_error_reason(exc),
+            )
+
+    async def _fetch_okx_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        async def _one(canonical: str) -> tuple[str, FundingTicker]:
+            venue_symbol = self._to_venue_symbol(canonical)
+            raw = await self._public_get(
+                self._spec.open_interest_path,
+                params={"instType": "SWAP", "instId": venue_symbol},
+            )
+            received_at_ms = _now_ms()
+            application_error = _entry_oi_application_error(Venue.OKX, raw)
+            if application_error is not None:
+                status, reason = application_error
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="okx_public_open_interest",
+                    status=status,
+                    reason=reason,
+                    received_at_ms=received_at_ms,
+                )
+            if not isinstance(raw, dict) or not isinstance(raw.get("data"), list):
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="okx_public_open_interest",
+                    status="parse_error",
+                    reason="invalid_open_interest_response_shape",
+                    received_at_ms=received_at_ms,
+                )
+            rows = raw.get("data", []) if isinstance(raw, dict) else []
+            rows = rows if isinstance(rows, list) else []
+            observed_at_ms = 0
+            matches = [
+                row for row in rows
+                if isinstance(row, dict) and str(row.get("instId") or "") == venue_symbol
+            ]
+            if len(matches) > 1:
+                status, reason = "ambiguous_mapping", "duplicate_instId"
+                value = raw_value = None
+                raw_unit = ""
+            elif not matches:
+                status, reason = "symbol_not_listed", "instId_not_found"
+                value = raw_value = None
+                raw_unit = ""
+            else:
+                row = matches[0]
+                value, valid, key = _first_present_float(row, "oiUsd")
+                if valid:
+                    status, reason = "observed", key
+                    raw_value, raw_unit = value, "quote"
+                    (
+                        observed_at_ms,
+                        timestamp_status,
+                        timestamp_reason,
+                    ) = _entry_oi_observed_at_ms(
+                        row.get("ts"),
+                        received_at_ms=received_at_ms,
+                        field_name="okx_open_interest_ts",
+                    )
+                    if timestamp_status is not None:
+                        status = timestamp_status
+                        reason = timestamp_reason or timestamp_status
+                else:
+                    status, reason = "parse_error", (
+                        f"invalid_{key}" if key else "missing_oiUsd"
+                    )
+                    value = raw_value = None
+                    raw_unit = ""
+            return f"okx:{canonical}", self._entry_oi_ticker(
+                canonical_symbol=canonical,
+                venue_symbol=venue_symbol,
+                value_quote=value,
+                raw_value=raw_value,
+                raw_unit=raw_unit,
+                contract_multiplier=1.0 if status == "observed" else None,
+                conversion_mark_price=None,
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                source="okx_public_open_interest",
+                status=status,
+                reason=reason,
+            )
+        return dict(await asyncio.gather(*(
+            self._run_isolated_entry_oi_request(
+                symbol,
+                source="okx_public_open_interest",
+                fetch_one=_one,
+            )
+            for symbol in symbols
+        )))
+
+    async def _fetch_bybit_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        async def _one(canonical: str) -> tuple[str, FundingTicker]:
+            venue_symbol = self._to_venue_symbol(canonical)
+            raw = await self._public_get(
+                self._spec.funding_ticker_path or self._spec.market_snapshot_path,
+                params={"category": "linear", "symbol": venue_symbol},
+            )
+            received_at_ms = _now_ms()
+            application_error = _entry_oi_application_error(Venue.BYBIT, raw)
+            if application_error is not None:
+                status, reason = application_error
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="bybit_tickers",
+                    status=status,
+                    reason=reason,
+                    received_at_ms=received_at_ms,
+                )
+            payload = raw.get("result", {}) if isinstance(raw, dict) else {}
+            if not isinstance(payload, dict) or not isinstance(payload.get("list"), list):
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="bybit_tickers",
+                    status="parse_error",
+                    reason="invalid_ticker_response_shape",
+                    received_at_ms=received_at_ms,
+                )
+            rows = payload.get("list", []) if isinstance(payload, dict) else []
+            rows = rows if isinstance(rows, list) else []
+            observed_at_ms = 0
+            matches = [
+                row for row in rows
+                if isinstance(row, dict) and str(row.get("symbol") or "") == venue_symbol
+            ]
+            if len(matches) > 1:
+                status, reason = "ambiguous_mapping", "duplicate_symbol"
+                value = raw_value = None
+                raw_unit = ""
+            elif not matches:
+                status, reason = "symbol_not_listed", "symbol_not_found"
+                value = raw_value = None
+                raw_unit = ""
+            else:
+                value, raw_value, raw_unit, status, reason = (
+                    _bybit_total_open_interest(matches[0])
+                )
+                if status == "observed":
+                    (
+                        observed_at_ms,
+                        timestamp_status,
+                        timestamp_reason,
+                    ) = _entry_oi_observed_at_ms(
+                        raw.get("time") if isinstance(raw, dict) else None,
+                        received_at_ms=received_at_ms,
+                        field_name="bybit_response_time",
+                    )
+                    if timestamp_status is not None:
+                        status = timestamp_status
+                        reason = timestamp_reason or timestamp_status
+            return f"bybit:{canonical}", self._entry_oi_ticker(
+                canonical_symbol=canonical,
+                venue_symbol=venue_symbol,
+                value_quote=value,
+                raw_value=raw_value,
+                raw_unit=raw_unit,
+                contract_multiplier=1.0 if status == "observed" else None,
+                conversion_mark_price=None,
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                source="bybit_tickers",
+                status=status,
+                reason=reason,
+            )
+        return dict(await asyncio.gather(*(
+            self._run_isolated_entry_oi_request(
+                symbol,
+                source="bybit_tickers",
+                fetch_one=_one,
+            )
+            for symbol in symbols
+        )))
+
+    async def _fetch_bitget_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        async def _one(canonical: str) -> tuple[str, FundingTicker]:
+            venue_symbol = self._to_venue_symbol(canonical)
+            oi_raw, ticker_raw = await asyncio.gather(
+                self._public_get(
+                    "/api/v3/market/open-interest",
+                    params={
+                        "category": "USDT-FUTURES",
+                        "symbol": venue_symbol,
+                    },
+                ),
+                self._public_get(
+                    self._spec.market_snapshot_path,
+                    params={
+                        "productType": "USDT-FUTURES",
+                        "symbol": venue_symbol,
+                    },
+                ),
+            )
+            received_at_ms = _now_ms()
+            for response in (oi_raw, ticker_raw):
+                application_error = _entry_oi_application_error(
+                    Venue.BITGET,
+                    response,
+                )
+                if application_error is not None:
+                    status, reason = application_error
+                    return self._entry_oi_unavailable_result(
+                        canonical,
+                        source="bitget_tickers",
+                        status=status,
+                        reason=reason,
+                        received_at_ms=received_at_ms,
+                    )
+            oi_data = oi_raw.get("data", {}) if isinstance(oi_raw, dict) else {}
+            if not isinstance(oi_data, dict) or not isinstance(oi_data.get("list"), list):
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="bitget_tickers",
+                    status="parse_error",
+                    reason="invalid_open_interest_response_shape",
+                    received_at_ms=received_at_ms,
+                )
+            oi_rows = oi_data.get("list", []) if isinstance(oi_data, dict) else []
+            oi_rows = oi_rows if isinstance(oi_rows, list) else []
+            ticker_data = (
+                ticker_raw.get("data", []) if isinstance(ticker_raw, dict) else []
+            )
+            if not isinstance(ticker_data, (list, dict)):
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="bitget_tickers",
+                    status="parse_error",
+                    reason="invalid_ticker_response_shape",
+                    received_at_ms=received_at_ms,
+                )
+            ticker_rows = (
+                ticker_data
+                if isinstance(ticker_data, list)
+                else [ticker_data] if isinstance(ticker_data, dict) else []
+            )
+            matches = [
+                row for row in oi_rows
+                if isinstance(row, dict) and str(row.get("symbol") or "") == venue_symbol
+            ]
+            ticker_matches = [
+                row for row in ticker_rows
+                if isinstance(row, dict) and str(row.get("symbol") or "") == venue_symbol
+            ]
+            value = raw_value = mark = None
+            observed_at_ms = 0
+            if len(matches) > 1 or len(ticker_matches) > 1:
+                status, reason = "ambiguous_mapping", "duplicate_symbol"
+            elif not matches or not ticker_matches:
+                status, reason = "symbol_not_listed", "symbol_not_found"
+            else:
+                raw_value, valid, key = _first_present_float(
+                    matches[0], "openInterest"
+                )
+                mark_value = _safe_float(ticker_matches[0].get("markPrice", 0))
+                if valid and mark_value > 0.0:
+                    mark = mark_value
+                    value = raw_value * mark
+                    status, reason = "observed", f"{key}_times_mark"
+                    (
+                        observed_at_ms,
+                        timestamp_status,
+                        timestamp_reason,
+                    ) = _entry_oi_observed_at_ms(
+                        oi_data.get("ts"),
+                        received_at_ms=received_at_ms,
+                        field_name="bitget_open_interest_ts",
+                    )
+                    if timestamp_status is not None:
+                        status = timestamp_status
+                        reason = timestamp_reason or timestamp_status
+                else:
+                    status = "parse_error"
+                    reason = "missing_mark_price" if valid else (
+                        f"invalid_{key}" if key else "missing_openInterest"
+                    )
+                    raw_value = None
+            return f"bitget:{canonical}", self._entry_oi_ticker(
+                canonical_symbol=canonical,
+                venue_symbol=venue_symbol,
+                value_quote=value,
+                raw_value=raw_value,
+                raw_unit="base" if status == "observed" else "",
+                contract_multiplier=1.0 if status == "observed" else None,
+                conversion_mark_price=mark,
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                source="bitget_tickers",
+                status=status,
+                reason=reason,
+            )
+        return dict(await asyncio.gather(*(
+            self._run_isolated_entry_oi_request(
+                symbol,
+                source="bitget_tickers",
+                fetch_one=_one,
+            )
+            for symbol in symbols
+        )))
+
+    async def _fetch_gate_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        async def _one(canonical: str) -> tuple[str, FundingTicker]:
+            venue_symbol = self._to_venue_symbol(canonical)
+            ticker_raw, contract_raw = await asyncio.gather(
+                self._public_get(
+                    self._spec.market_snapshot_path,
+                    params={"contract": venue_symbol},
+                ),
+                self._public_get(
+                    f"{self._spec.funding_contracts_path.rstrip('/')}"
+                    f"/{venue_symbol}"
+                ),
+            )
+            received_at_ms = _now_ms()
+            for response in (ticker_raw, contract_raw):
+                application_error = _entry_oi_application_error(
+                    Venue.GATE,
+                    response,
+                )
+                if application_error is not None:
+                    status, reason = application_error
+                    return self._entry_oi_unavailable_result(
+                        canonical,
+                        source="gate_tickers",
+                        status=status,
+                        reason=reason,
+                        received_at_ms=received_at_ms,
+                    )
+            if not isinstance(ticker_raw, list) or not isinstance(contract_raw, dict):
+                return self._entry_oi_unavailable_result(
+                    canonical,
+                    source="gate_tickers",
+                    status="parse_error",
+                    reason="invalid_open_interest_response_shape",
+                    received_at_ms=received_at_ms,
+                )
+            ticker_rows = ticker_raw if isinstance(ticker_raw, list) else []
+            contract_rows = [contract_raw] if isinstance(contract_raw, dict) else []
+            matches = [
+                row for row in ticker_rows
+                if isinstance(row, dict) and str(row.get("contract") or "") == venue_symbol
+            ]
+            contract_matches = [
+                row for row in contract_rows
+                if isinstance(row, dict) and str(row.get("name") or "") == venue_symbol
+            ]
+            value = raw_value = multiplier = mark = None
+            if len(matches) > 1 or len(contract_matches) > 1:
+                status, reason = "ambiguous_mapping", "duplicate_contract"
+            elif not matches or not contract_matches:
+                status, reason = "symbol_not_listed", "contract_not_found"
+            else:
+                row = matches[0]
+                raw_value, valid, key = _first_present_float(row, "total_size")
+                multiplier_value = _positive_exchange_number(
+                    contract_matches[0].get("quanto_multiplier")
+                )
+                mark_value = _safe_float(row.get("mark_price", 0))
+                if valid and multiplier_value > 0.0 and mark_value > 0.0:
+                    multiplier, mark = multiplier_value, mark_value
+                    value = raw_value * multiplier * mark
+                    status, reason = "observed", f"{key}_times_quanto_mark"
+                else:
+                    status = "parse_error"
+                    if not valid:
+                        reason = f"invalid_{key}" if key else "missing_total_size"
+                    elif multiplier_value <= 0.0:
+                        reason = "missing_contract_multiplier"
+                    else:
+                        reason = "missing_mark_price"
+                    raw_value = None
+            return f"gate:{canonical}", self._entry_oi_ticker(
+                canonical_symbol=canonical,
+                venue_symbol=venue_symbol,
+                value_quote=value,
+                raw_value=raw_value,
+                raw_unit="contracts" if status == "observed" else "",
+                contract_multiplier=multiplier,
+                conversion_mark_price=mark,
+                observed_at_ms=received_at_ms if status == "observed" else 0,
+                received_at_ms=received_at_ms,
+                source="gate_tickers",
+                status=status,
+                reason=reason,
+            )
+        return dict(await asyncio.gather(*(
+            self._run_isolated_entry_oi_request(
+                symbol,
+                source="gate_tickers",
+                fetch_one=_one,
+            )
+            for symbol in symbols
+        )))
+
+    async def _fetch_hyperliquid_entry_open_interest(
+        self,
+        symbols: list[str],
+    ) -> dict[str, FundingTicker]:
+        raw = await self._public_post(
+            self._spec.market_snapshot_path,
+            body={"type": "metaAndAssetCtxs"},
+        )
+        received_at_ms = _now_ms()
+        application_error = _entry_oi_application_error(Venue.HYPERLIQUID, raw)
+        if application_error is not None:
+            status, reason = application_error
+            return dict(
+                self._entry_oi_unavailable_result(
+                    canonical,
+                    source="hyperliquid_meta_and_asset_ctxs",
+                    status=status,
+                    reason=reason,
+                    received_at_ms=received_at_ms,
+                )
+                for canonical in symbols
+            )
+        if (
+            not isinstance(raw, list)
+            or len(raw) < 2
+            or not isinstance(raw[0], dict)
+            or not isinstance(raw[1], list)
+        ):
+            return dict(
+                self._entry_oi_unavailable_result(
+                    canonical,
+                    source="hyperliquid_meta_and_asset_ctxs",
+                    status="parse_error",
+                    reason="invalid_meta_and_asset_contexts_shape",
+                    received_at_ms=received_at_ms,
+                )
+                for canonical in symbols
+            )
+        meta = raw[0] if isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], dict) else {}
+        contexts = raw[1] if isinstance(raw, list) and len(raw) > 1 and isinstance(raw[1], list) else []
+        universe = meta.get("universe", []) if isinstance(meta, dict) else []
+        rows: dict[str, dict[str, Any]] = {}
+        for index, item in enumerate(universe if isinstance(universe, list) else []):
+            if not isinstance(item, dict):
+                continue
+            venue_symbol = str(item.get("name") or "")
+            if not venue_symbol or index >= len(contexts) or not isinstance(contexts[index], dict):
+                continue
+            if venue_symbol in rows:
+                rows[venue_symbol] = {"_ambiguous": True}
+            else:
+                rows[venue_symbol] = contexts[index]
+        result: dict[str, FundingTicker] = {}
+        for canonical in symbols:
+            venue_symbol = self._to_venue_symbol(canonical)
+            ctx = rows.get(venue_symbol)
+            value = raw_value = mark = None
+            if ctx is None:
+                status, reason = "symbol_not_listed", "asset_not_found"
+            elif ctx.get("_ambiguous"):
+                status, reason = "ambiguous_mapping", "duplicate_asset"
+            else:
+                raw_value, valid, key = _first_present_float(ctx, "openInterest")
+                mark_value = _safe_float(ctx.get("markPx", ctx.get("oraclePx", 0)))
+                if valid and mark_value > 0.0:
+                    mark = mark_value
+                    value = raw_value * mark
+                    status, reason = "observed", f"{key}_times_mark"
+                else:
+                    status = "parse_error"
+                    reason = "missing_mark_price" if valid else (
+                        f"invalid_{key}" if key else "missing_openInterest"
+                    )
+                    raw_value = None
+            result[f"hyperliquid:{canonical}"] = self._entry_oi_ticker(
+                canonical_symbol=canonical,
+                venue_symbol=venue_symbol,
+                value_quote=value,
+                raw_value=raw_value,
+                raw_unit="base" if status == "observed" else "",
+                contract_multiplier=1.0 if status == "observed" else None,
+                conversion_mark_price=mark,
+                observed_at_ms=received_at_ms if status == "observed" else 0,
+                received_at_ms=received_at_ms,
+                source="hyperliquid_meta_and_asset_ctxs",
+                status=status,
+                reason=reason,
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Per-symbol L2 snapshot
@@ -1057,7 +1877,7 @@ class MarketDataClient:
             or "symbol not found" in message
             or "-1121" in message
         ):
-            return "unsupported"
+            return "symbol_not_listed"
         return "http_error"
 
     def _binance_style_oi_cache_key(self, venue_sym: str) -> str:
@@ -1069,7 +1889,7 @@ class MarketDataClient:
         *,
         mark_price: float | None,
         now_ms: int,
-    ) -> tuple[float, str, str] | None:
+    ) -> tuple[float, int, str, str] | None:
         entry = self._binance_style_open_interest_cache.get(
             self._binance_style_oi_cache_key(venue_sym)
         )
@@ -1082,7 +1902,7 @@ class MarketDataClient:
             return None
         if mark_price is not None and mark_price <= 0.0:
             return None
-        return open_interest_quote, status, reason
+        return open_interest_quote, int(observed_at_ms), status, reason
 
     def _binance_style_store_open_interest(
         self,
@@ -1094,7 +1914,14 @@ class MarketDataClient:
         status: str,
         reason: str,
     ) -> None:
-        if status != "available" or open_interest_quote <= 0.0 or mark_price <= 0.0:
+        if (
+            normalize_open_interest_status(status)
+            != OpenInterestEvidenceStatus.OBSERVED.value
+            or not math.isfinite(open_interest_quote)
+            or open_interest_quote < 0.0
+            or mark_price <= 0.0
+            or observed_at_ms <= 0
+        ):
             return
         self._binance_style_open_interest_cache[
             self._binance_style_oi_cache_key(venue_sym)
@@ -1117,16 +1944,21 @@ class MarketDataClient:
             items = raw
         else:
             return None
-        fallback: dict[str, Any] | None = None
+        symbol_free_items: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if fallback is None:
-                fallback = item
             symbol = str(item.get("symbol", "") or item.get("s", "") or "")
             if symbol == venue_sym:
                 return item
-        return fallback
+            if not symbol:
+                symbol_free_items.append(item)
+        # A per-symbol endpoint is allowed to omit the symbol only when its
+        # response is unambiguously a single row.  Never bind the first row of
+        # a multi-symbol response to the requested contract.
+        if len(items) == 1 and len(symbol_free_items) == 1:
+            return symbol_free_items[0]
+        return None
 
     @staticmethod
     def _binance_style_parse_required_float(
@@ -1136,10 +1968,16 @@ class MarketDataClient:
         for key in keys:
             if not _has_nonempty_field(item, key):
                 continue
-            try:
-                return float(item.get(key)), True, key
-            except (TypeError, ValueError):
+            value = item.get(key)
+            if isinstance(value, bool):
                 return 0.0, False, key
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0, False, key
+            if not math.isfinite(parsed) or parsed < 0.0:
+                return 0.0, False, key
+            return parsed, True, key
         return 0.0, False, ""
 
     async def _fetch_binance_style_open_interest_probe(
@@ -1163,13 +2001,13 @@ class MarketDataClient:
                     )
                 except Exception as exc:
                     status = self._binance_style_oi_status_from_error(exc)
-                    if status == "unsupported":
+                    if status == "symbol_not_listed":
                         return (
                             venue_sym,
                             0.0,
                             0.0,
                             observed_at_ms,
-                            "symbol_not_listed_before_http",
+                            "symbol_not_listed",
                             "premium_index_symbol_rejected_before_oi_http",
                         )
                     return (
@@ -1187,7 +2025,7 @@ class MarketDataClient:
                         0.0,
                         0.0,
                         observed_at_ms,
-                        "symbol_not_listed_before_http",
+                        "symbol_not_listed",
                         "missing_symbol_mark_before_http",
                     )
                 resolved_mark, mark_ok, _mark_key = self._binance_style_parse_required_float(
@@ -1230,13 +2068,14 @@ class MarketDataClient:
                     self._binance_style_oi_status_from_error(exc),
                     _http_error_reason(exc),
                 )
+            response_received_at_ms = _now_ms()
             oi_item = self._binance_style_first_symbol_item(raw_oi, venue_sym)
             if oi_item is None:
                 return (
                     venue_sym,
                     0.0,
                     resolved_mark,
-                    observed_at_ms,
+                    response_received_at_ms,
                     "parse_error",
                     "missing_open_interest",
                 )
@@ -1252,7 +2091,7 @@ class MarketDataClient:
                     venue_sym,
                     0.0,
                     resolved_mark,
-                    observed_at_ms,
+                    response_received_at_ms,
                     "parse_error",
                     f"invalid_{oi_key or 'open_interest'}",
                 )
@@ -1260,8 +2099,8 @@ class MarketDataClient:
                 venue_sym,
                 open_interest * resolved_mark,
                 resolved_mark,
-                observed_at_ms,
-                "available",
+                response_received_at_ms,
+                "observed",
                 "fresh_refresh",
             )
 
@@ -1320,6 +2159,8 @@ class MarketDataClient:
     async def _fetch_binance_style_entry_open_interest(
         self,
         symbols: list[str],
+        *,
+        force_refresh: bool = True,
     ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
@@ -1341,23 +2182,26 @@ class MarketDataClient:
                 )
             return result
 
-        oi_map: dict[str, tuple[float, float, str, str]] = {}
+        oi_map: dict[str, tuple[float, float, int, str, str]] = {}
         pending_status: dict[str, tuple[str, str]] = {}
         tasks: list[asyncio.Task[tuple[str, float, float, int, str, str]]] = []
         for venue_sym in venue_sym_to_canon:
-            cached = self._binance_style_cached_open_interest(
-                venue_sym,
-                mark_price=None,
-                now_ms=now_ms,
-            )
+            cached = None
+            if not force_refresh:
+                cached = self._binance_style_cached_open_interest(
+                    venue_sym,
+                    mark_price=None,
+                    now_ms=now_ms,
+                )
             if cached is not None:
-                open_interest_quote, status, reason = cached
+                open_interest_quote, observed_at_ms, status, reason = cached
                 cached_mark = self._binance_style_open_interest_cache[
                     self._binance_style_oi_cache_key(venue_sym)
                 ][1]
                 oi_map[venue_sym] = (
                     open_interest_quote,
                     cached_mark,
+                    observed_at_ms,
                     status,
                     reason or "cache_hit",
                 )
@@ -1383,15 +2227,16 @@ class MarketDataClient:
             done, pending = await asyncio.wait(tasks, timeout=max(budget_s, 0.0))
             for task in done:
                 try:
-                    venue_sym, open_interest_quote, mark_price, _observed, status, reason = (
+                    venue_sym, open_interest_quote, mark_price, observed_at_ms, status, reason = (
                         task.result()
                     )
                 except Exception:
                     continue
-                if status == "available":
+                if normalize_open_interest_status(status) == "observed":
                     oi_map[venue_sym] = (
                         open_interest_quote,
                         mark_price,
+                        observed_at_ms,
                         status,
                         reason or "fresh_refresh",
                     )
@@ -1407,23 +2252,45 @@ class MarketDataClient:
         filtered_before_http_count = sum(
             1
             for status_reason in pending_status.values()
-            if status_reason[0] == "symbol_not_listed_before_http"
+            if normalize_open_interest_status(status_reason[0]) == "symbol_not_listed"
         )
         oi_refresh_attempt_count = max(len(tasks) - filtered_before_http_count, 0)
         for venue_sym, canon in venue_sym_to_canon.items():
-            open_interest_quote, mark_price, status, reason = oi_map.get(
+            open_interest_quote, mark_price, observed_at_ms, status, reason = oi_map.get(
                 venue_sym,
-                (0.0, 0.0, *pending_status.get(venue_sym, ("unavailable", "not_refreshed"))),
+                (0.0, 0.0, 0, *pending_status.get(venue_sym, ("unavailable", "not_refreshed"))),
             )
+            received_at_ms = observed_at_ms or now_ms
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
                 bid=0.0,
                 ask=0.0,
                 mark_price=mark_price,
-                open_interest_quote=open_interest_quote,
-                open_interest_evidence_status=status,
-                open_interest_evidence_reason=reason,
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=venue_sym,
+                    value_quote=(
+                        open_interest_quote
+                        if normalize_open_interest_status(status) == "observed"
+                        else None
+                    ),
+                    raw_value=(
+                        open_interest_quote / mark_price
+                        if mark_price > 0.0
+                        and normalize_open_interest_status(status) == "observed"
+                        else None
+                    ),
+                    raw_unit="base",
+                    contract_multiplier=1.0,
+                    conversion_mark_price=mark_price if mark_price > 0.0 else None,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=received_at_ms,
+                    source="binance_style_open_interest",
+                    status=status,
+                    reason=reason,
+                ),
                 oi_candidate_count=candidate_count,
                 oi_cache_hit_count=cache_hit_count,
                 oi_cache_miss_count=len(tasks),
@@ -1577,6 +2444,8 @@ class MarketDataClient:
         # This endpoint is evidence-only here: slow/error/cooldown OI must not
         # hold quote coverage hostage.
         oi_map: dict[str, float] = {}
+        oi_observed_at_ms: dict[str, int] = {}
+        oi_mark_price: dict[str, float] = {}
         oi_evidence_status: dict[str, str] = {
             venue_sym: "unavailable" if spec.open_interest_path else "unsupported"
             for venue_sym in venue_sym_to_canon
@@ -1597,11 +2466,11 @@ class MarketDataClient:
             oi_symbols: list[str] = []
             for sym in venue_sym_to_canon:
                 if sym not in pi_map:
-                    oi_evidence_status[sym] = "symbol_not_listed_before_http"
+                    oi_evidence_status[sym] = "symbol_not_listed"
                     oi_evidence_reason[sym] = "missing_bulk_premium_index"
                     continue
                 if sym not in ticker_map:
-                    oi_evidence_status[sym] = "symbol_not_listed_before_http"
+                    oi_evidence_status[sym] = "symbol_not_listed"
                     oi_evidence_reason[sym] = "missing_bulk_book_ticker"
                     continue
                 oi_candidate_count += 1
@@ -1613,8 +2482,12 @@ class MarketDataClient:
                 )
                 if cached is not None:
                     oi_cache_hit_count += 1
-                    oi_value, status, reason = cached
+                    oi_value, cached_observed_at_ms, status, reason = cached
                     oi_map[sym] = oi_value
+                    oi_observed_at_ms[sym] = cached_observed_at_ms
+                    oi_mark_price[sym] = self._binance_style_open_interest_cache[
+                        self._binance_style_oi_cache_key(sym)
+                    ][1]
                     oi_evidence_status[sym] = status
                     oi_evidence_reason[sym] = reason or "cache_hit"
                     continue
@@ -1690,8 +2563,10 @@ class MarketDataClient:
                     oi_evidence_reason[venue_sym] = reason or status
                     if status == "timeout":
                         oi_timeout_count += 1
-                    if status == "available":
+                    if normalize_open_interest_status(status) == "observed":
                         oi_map[venue_sym] = open_interest_quote
+                        oi_observed_at_ms[venue_sym] = observed_at_ms
+                        oi_mark_price[venue_sym] = mark_price
                         self._binance_style_store_open_interest(
                             venue_sym,
                             open_interest_quote=open_interest_quote,
@@ -1776,12 +2651,29 @@ class MarketDataClient:
                 funding_interval_source=interval_source,
                 funding_interval_observed_at_ms=interval_observed_at_ms,
                 volume_24h_quote=vol_map.get(venue_sym, 0.0),
-                open_interest_quote=oi_map.get(venue_sym, 0.0),
-                open_interest_evidence_status=oi_evidence_status.get(
-                    venue_sym,
-                    "unavailable" if spec.open_interest_path else "unsupported",
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=venue_sym,
+                    value_quote=oi_map.get(venue_sym),
+                    raw_value=(
+                        oi_map[venue_sym] / oi_mark_price[venue_sym]
+                        if venue_sym in oi_map
+                        and oi_mark_price.get(venue_sym, 0.0) > 0.0
+                        else None
+                    ),
+                    raw_unit="base",
+                    contract_multiplier=1.0,
+                    conversion_mark_price=oi_mark_price.get(venue_sym) or None,
+                    observed_at_ms=oi_observed_at_ms.get(venue_sym, 0),
+                    received_at_ms=oi_observed_at_ms.get(venue_sym, now_ms),
+                    source="binance_style_open_interest",
+                    status=oi_evidence_status.get(
+                        venue_sym,
+                        "unavailable" if spec.open_interest_path else "unsupported",
+                    ),
+                    reason=oi_evidence_reason.get(venue_sym, ""),
                 ),
-                open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
                 oi_candidate_count=oi_candidate_count,
                 oi_cache_hit_count=oi_cache_hit_count,
                 oi_cache_miss_count=oi_cache_miss_count,
@@ -1821,10 +2713,10 @@ class MarketDataClient:
     async def _fetch_okx_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
-        venue_sym_to_canon: dict[str, str] = {}
+        canonical_by_venue_symbol: dict[str, set[str]] = {}
         for s in symbols:
             venue_sym = self._to_venue_symbol(s)
-            venue_sym_to_canon[venue_sym] = s.upper()
+            canonical_by_venue_symbol.setdefault(venue_sym, set()).add(s.upper())
             # V1 parity: OKX drops 1000/1000000 prefix from some contracts
             # e.g. 1000BONKUSDT → BONK-USDT-SWAP (not 1000BONK-USDT-SWAP)
             for prefix in ("1000000", "1000"):
@@ -1832,8 +2724,20 @@ class MarketDataClient:
                     stripped_sym = s.upper()[len(prefix):]
                     stripped_venue = self._to_venue_symbol(stripped_sym)
                     if stripped_venue != venue_sym:
-                        venue_sym_to_canon[stripped_venue] = s.upper()
+                        canonical_by_venue_symbol.setdefault(
+                            stripped_venue, set()
+                        ).add(s.upper())
                     break  # only strip the longest matching prefix
+        ambiguous_mappings = {
+            venue_symbol: canonical_symbols
+            for venue_symbol, canonical_symbols in canonical_by_venue_symbol.items()
+            if len(canonical_symbols) > 1
+        }
+        venue_sym_to_canon = {
+            venue_symbol: next(iter(canonical_symbols))
+            for venue_symbol, canonical_symbols in canonical_by_venue_symbol.items()
+            if len(canonical_symbols) == 1
+        }
 
         now_ms = _now_ms()
 
@@ -2087,6 +2991,10 @@ class MarketDataClient:
 
         # 3. open-interest?instType=SWAP
         oi_map: dict[str, float] = {}
+        oi_raw_map: dict[str, float] = {}
+        oi_raw_unit: dict[str, str] = {}
+        oi_conversion_mark: dict[str, float | None] = {}
+        oi_observed_at_ms: dict[str, int] = {}
         oi_evidence_status: dict[str, str] = {
             venue_sym: "unavailable" if spec.open_interest_path else "unsupported"
             for venue_sym in venue_sym_to_canon
@@ -2098,6 +3006,7 @@ class MarketDataClient:
         if spec.open_interest_path:
             try:
                 oi_raw = await self._public_get(spec.open_interest_path, params={"instType": "SWAP"})
+                oi_received_at_ms = _now_ms()
                 oi_data = oi_raw.get("data", [])
                 items_oi = oi_data if isinstance(oi_data, list) else [oi_data]
                 for item in items_oi:
@@ -2108,7 +3017,11 @@ class MarketDataClient:
                         quote_oi, has_quote_oi, quote_key = _first_present_float(item, "oiUsd")
                         if has_quote_oi:
                             oi_map[sym] = quote_oi
-                            oi_evidence_status[sym] = "available"
+                            oi_raw_map[sym] = quote_oi
+                            oi_raw_unit[sym] = "quote"
+                            oi_conversion_mark[sym] = None
+                            oi_observed_at_ms[sym] = oi_received_at_ms
+                            oi_evidence_status[sym] = "observed"
                             oi_evidence_reason[sym] = quote_key
                             continue
                         raw_oi, has_raw_oi, raw_key = _first_present_float(
@@ -2119,11 +3032,18 @@ class MarketDataClient:
                         mark = mark_price_map.get(sym, 0.0)
                         if has_raw_oi and mark > 0.0:
                             oi_map[sym] = raw_oi * mark
-                            oi_evidence_status[sym] = "available"
+                            oi_raw_map[sym] = raw_oi
+                            oi_raw_unit[sym] = "base"
+                            oi_conversion_mark[sym] = mark
+                            oi_observed_at_ms[sym] = oi_received_at_ms
+                            oi_evidence_status[sym] = "observed"
                             oi_evidence_reason[sym] = f"{raw_key}_times_mark"
                         elif has_raw_oi:
-                            oi_evidence_status[sym] = "unavailable"
+                            oi_evidence_status[sym] = "parse_error"
                             oi_evidence_reason[sym] = "missing_mark_price"
+                        elif raw_key:
+                            oi_evidence_status[sym] = "parse_error"
+                            oi_evidence_reason[sym] = f"invalid_{raw_key}"
                 for venue_sym in venue_sym_to_canon:
                     if venue_sym not in oi_map and oi_evidence_status.get(venue_sym) == "unavailable":
                         oi_evidence_reason[venue_sym] = "missing_open_interest"
@@ -2206,12 +3126,24 @@ class MarketDataClient:
                     else 0
                 ),
                 volume_24h_quote=vol_ccy * last if vol_ccy > 0 and last > 0 else vol_ccy,
-                open_interest_quote=oi_map.get(venue_sym, 0.0),
-                open_interest_evidence_status=oi_evidence_status.get(
-                    venue_sym,
-                    "unavailable" if spec.open_interest_path else "unsupported",
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=venue_sym,
+                    value_quote=oi_map.get(venue_sym),
+                    raw_value=oi_raw_map.get(venue_sym),
+                    raw_unit=oi_raw_unit.get(venue_sym, ""),
+                    contract_multiplier=1.0,
+                    conversion_mark_price=oi_conversion_mark.get(venue_sym),
+                    observed_at_ms=oi_observed_at_ms.get(venue_sym, 0),
+                    received_at_ms=oi_observed_at_ms.get(venue_sym, now_ms),
+                    source="okx_public_open_interest",
+                    status=oi_evidence_status.get(
+                        venue_sym,
+                        "unavailable" if spec.open_interest_path else "unsupported",
+                    ),
+                    reason=oi_evidence_reason.get(venue_sym, ""),
                 ),
-                open_interest_evidence_reason=oi_evidence_reason.get(venue_sym, ""),
                 base_quantity_evidence=metadata_complete,
                 price_tick=(
                     _safe_float(instrument.get("tickSz", 0))
@@ -2233,6 +3165,33 @@ class MarketDataClient:
                 ),
                 min_notional_evidence_complete=metadata_complete,
             )
+        for venue_sym, canonical_symbols in ambiguous_mappings.items():
+            for canon in sorted(canonical_symbols):
+                result[f"{venue_str}:{canon}"] = FundingTicker(
+                    venue=venue_str,
+                    symbol=canon,
+                    bid=0.0,
+                    ask=0.0,
+                    mark_price=0.0,
+                    index_price=0.0,
+                    funding_rate_bps=0.0,
+                    funding_timestamp_ms=0,
+                    **_open_interest_fields(
+                        venue=venue_str,
+                        canonical_symbol=canon,
+                        venue_symbol=venue_sym,
+                        value_quote=None,
+                        raw_value=None,
+                        raw_unit="",
+                        contract_multiplier=None,
+                        conversion_mark_price=None,
+                        observed_at_ms=0,
+                        received_at_ms=now_ms,
+                        source="okx_contract_mapping",
+                        status="ambiguous_mapping",
+                        reason="multiple_canonical_symbols_for_venue_symbol",
+                    ),
+                )
         return result
 
     # -- Bybit -------------------------------------------------------------
@@ -2304,17 +3263,16 @@ class MarketDataClient:
             canon = venue_sym_to_canon.get(sym)
             if canon is None:
                 continue
-            open_interest_quote, has_open_interest_quote, oi_key = _first_present_float(
-                item,
-                "openInterestValue",
-                "singleOpenInterestValue",
+            (
+                open_interest_quote,
+                raw_open_interest,
+                raw_open_interest_unit,
+                oi_status,
+                oi_reason,
+            ) = _bybit_total_open_interest(
+                item
             )
-            if has_open_interest_quote:
-                oi_status = "available"
-                oi_reason = oi_key
-            else:
-                oi_status = "unavailable"
-                oi_reason = "missing_open_interest_value"
+            has_open_interest_quote = oi_status == "observed"
             instrument = instrument_map.get(sym, {})
             price_filter = instrument.get("priceFilter", {})
             lot_size_filter = instrument.get("lotSizeFilter", {})
@@ -2381,9 +3339,23 @@ class MarketDataClient:
                     now_ms if explicit_interval_ms > 0 else 0
                 ),
                 volume_24h_quote=_safe_float(item.get("turnover24h", 0)),
-                open_interest_quote=open_interest_quote,
-                open_interest_evidence_status=oi_status,
-                open_interest_evidence_reason=oi_reason,
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=sym,
+                    value_quote=(
+                        open_interest_quote if has_open_interest_quote else None
+                    ),
+                    raw_value=raw_open_interest,
+                    raw_unit=raw_open_interest_unit,
+                    contract_multiplier=1.0 if has_open_interest_quote else None,
+                    conversion_mark_price=None,
+                    observed_at_ms=(now_ms if has_open_interest_quote else 0),
+                    received_at_ms=now_ms,
+                    source="bybit_tickers",
+                    status=oi_status,
+                    reason=oi_reason,
+                ),
                 base_quantity_evidence=metadata_complete,
                 price_tick=(
                     _safe_float(price_filter.get("tickSize", 0))
@@ -2485,14 +3457,18 @@ class MarketDataClient:
             )
             if has_holding_amount and mark > 0.0:
                 open_interest_quote = holding_amount * mark
-                oi_status = "available"
+                oi_status = "observed"
                 oi_reason = f"{oi_key}_times_mark"
             elif has_holding_amount:
-                open_interest_quote = 0.0
-                oi_status = "unavailable"
+                open_interest_quote = None
+                oi_status = "parse_error"
                 oi_reason = "missing_mark_price"
+            elif oi_key:
+                open_interest_quote = None
+                oi_status = "parse_error"
+                oi_reason = f"invalid_{oi_key}"
             else:
-                open_interest_quote = 0.0
+                open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
             funding_item = funding_map.get(sym, {})
@@ -2576,9 +3552,21 @@ class MarketDataClient:
                 volume_24h_quote=_safe_float(
                     item.get("usdtVolume", item.get("quoteVolume", 0))
                 ),
-                open_interest_quote=open_interest_quote,
-                open_interest_evidence_status=oi_status,
-                open_interest_evidence_reason=oi_reason,
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=sym,
+                    value_quote=open_interest_quote,
+                    raw_value=(holding_amount if has_holding_amount else None),
+                    raw_unit="base" if has_holding_amount else "",
+                    contract_multiplier=1.0 if has_holding_amount else None,
+                    conversion_mark_price=(mark if mark > 0.0 else None),
+                    observed_at_ms=(now_ms if oi_status == "observed" else 0),
+                    received_at_ms=now_ms,
+                    source="bitget_tickers",
+                    status=oi_status,
+                    reason=oi_reason,
+                ),
                 base_quantity_evidence=metadata_complete,
                 price_tick=price_tick if metadata_complete else 0.0,
                 quantity_step_base=(
@@ -2696,18 +3684,22 @@ class MarketDataClient:
             )
             if has_oi_contracts and quanto > 0 and mark > 0:
                 open_interest_quote = oi_contracts * quanto * mark
-                oi_status = "available"
+                oi_status = "observed"
                 oi_reason = f"{oi_key}_times_quanto_mark"
             elif has_oi_contracts:
-                open_interest_quote = 0.0
-                oi_status = "unavailable"
+                open_interest_quote = None
+                oi_status = "parse_error"
                 oi_reason = (
                     "missing_contract_multiplier"
                     if quanto <= 0
                     else "missing_mark_price"
                 )
+            elif oi_key:
+                open_interest_quote = None
+                oi_status = "parse_error"
+                oi_reason = f"invalid_{oi_key}"
             else:
-                open_interest_quote = 0.0
+                open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
             funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
@@ -2770,9 +3762,21 @@ class MarketDataClient:
                 volume_24h_quote=_safe_float(
                     item.get("volume_24h_quote", item.get("volume_24h", 0))
                 ),
-                open_interest_quote=open_interest_quote,
-                open_interest_evidence_status=oi_status,
-                open_interest_evidence_reason=oi_reason,
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon,
+                    venue_symbol=sym,
+                    value_quote=open_interest_quote,
+                    raw_value=(oi_contracts if has_oi_contracts else None),
+                    raw_unit="contracts" if has_oi_contracts else "",
+                    contract_multiplier=(quanto if quanto > 0.0 else None),
+                    conversion_mark_price=(mark if mark > 0.0 else None),
+                    observed_at_ms=(now_ms if oi_status == "observed" else 0),
+                    received_at_ms=now_ms,
+                    source="gate_tickers",
+                    status=oi_status,
+                    reason=oi_reason,
+                ),
                 base_quantity_evidence=metadata_complete,
                 price_tick=(order_price_round if metadata_complete else 0.0),
                 quantity_step_base=(
@@ -2877,14 +3881,18 @@ class MarketDataClient:
             )
             if has_open_interest and mark > 0.0:
                 open_interest_quote = open_interest * mark
-                oi_status = "available"
+                oi_status = "observed"
                 oi_reason = f"{oi_key}_times_mark"
             elif has_open_interest:
-                open_interest_quote = 0.0
-                oi_status = "unavailable"
+                open_interest_quote = None
+                oi_status = "parse_error"
                 oi_reason = "missing_mark_price"
+            elif oi_key:
+                open_interest_quote = None
+                oi_status = "parse_error"
+                oi_reason = f"invalid_{oi_key}"
             else:
-                open_interest_quote = 0.0
+                open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
 
@@ -2906,9 +3914,23 @@ class MarketDataClient:
                 funding_interval_observed_at_ms=observed_at_ms,
                 funding_forecast_source="quoted_rate_hourly_protocol",
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
-                open_interest_quote=open_interest_quote,
-                open_interest_evidence_status=oi_status,
-                open_interest_evidence_reason=oi_reason,
+                **_open_interest_fields(
+                    venue=venue_str,
+                    canonical_symbol=canon.upper(),
+                    venue_symbol=name,
+                    value_quote=open_interest_quote,
+                    raw_value=(open_interest if has_open_interest else None),
+                    raw_unit="base" if has_open_interest else "",
+                    contract_multiplier=1.0 if has_open_interest else None,
+                    conversion_mark_price=(mark if mark > 0.0 else None),
+                    observed_at_ms=(
+                        observed_at_ms if oi_status == "observed" else 0
+                    ),
+                    received_at_ms=observed_at_ms,
+                    source="hyperliquid_meta_and_asset_ctxs",
+                    status=oi_status,
+                    reason=oi_reason,
+                ),
                 base_quantity_evidence=metadata_complete,
                 price_tick=price_tick if metadata_complete else 0.0,
                 quantity_step_base=(
@@ -2936,7 +3958,7 @@ class MarketDataClient:
                 venue=ft.venue,
                 symbol=ft.symbol,
                 volume_24h_quote=ft.volume_24h_quote,
-                open_interest_quote=ft.open_interest_quote,
+                open_interest_quote=float(ft.open_interest_quote or 0.0),
                 observed_at_ms=now_ms,
             )
         return result

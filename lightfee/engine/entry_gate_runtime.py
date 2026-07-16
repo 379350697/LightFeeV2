@@ -85,6 +85,15 @@ def _first_sample_value(samples: list[dict[str, Any]], key: str) -> Any:
     return None
 
 
+def _safe_evidence_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _normalize_aster_max_notional_evidence(payload: dict[str, Any]) -> None:
     venue = str(payload.get("venue") or "").lower()
     reason = str(payload.get("reason") or "")
@@ -1375,10 +1384,10 @@ class EntryGateRuntime:
         eligibility_class: str,
         observed_volume_24h_quote: float,
         min_volume_24h_quote: float,
-        observed_open_interest_quote: float,
+        observed_open_interest_quote: float | None,
         min_open_interest_quote: float,
         state_record: dict | None = None,
-        open_interest_evidence_status: str = "available",
+        open_interest_evidence_status: str = "unavailable",
     ) -> dict:
         observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
         age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
@@ -1405,17 +1414,44 @@ class EntryGateRuntime:
             "open_interest_evidence_reason": str(
                 getattr(quote, "open_interest_evidence_reason", "") or ""
             ),
-            "oi_candidate_count": int(getattr(quote, "oi_candidate_count", 0) or 0),
-            "oi_cache_hit_count": int(getattr(quote, "oi_cache_hit_count", 0) or 0),
-            "oi_cache_miss_count": int(getattr(quote, "oi_cache_miss_count", 0) or 0),
-            "oi_refresh_attempt_count": int(
-                getattr(quote, "oi_refresh_attempt_count", 0) or 0
+            "open_interest_observed_at_ms": _safe_evidence_int(
+                getattr(quote, "open_interest_observed_at_ms", 0)
             ),
-            "oi_refresh_cap": int(getattr(quote, "oi_refresh_cap", 0) or 0),
-            "oi_deferred_count": int(getattr(quote, "oi_deferred_count", 0) or 0),
-            "oi_timeout_count": int(getattr(quote, "oi_timeout_count", 0) or 0),
-            "oi_refresh_elapsed_ms": int(
-                getattr(quote, "oi_refresh_elapsed_ms", 0) or 0
+            "open_interest_received_at_ms": _safe_evidence_int(
+                getattr(quote, "open_interest_received_at_ms", 0)
+            ),
+            "open_interest_source": str(
+                getattr(quote, "open_interest_source", "") or ""
+            ),
+            "open_interest_sample_id": str(
+                getattr(quote, "open_interest_sample_id", "") or ""
+            ),
+            "open_interest_venue_symbol": str(
+                getattr(quote, "open_interest_venue_symbol", "") or ""
+            ),
+            "oi_candidate_count": _safe_evidence_int(
+                getattr(quote, "oi_candidate_count", 0)
+            ),
+            "oi_cache_hit_count": _safe_evidence_int(
+                getattr(quote, "oi_cache_hit_count", 0)
+            ),
+            "oi_cache_miss_count": _safe_evidence_int(
+                getattr(quote, "oi_cache_miss_count", 0)
+            ),
+            "oi_refresh_attempt_count": _safe_evidence_int(
+                getattr(quote, "oi_refresh_attempt_count", 0)
+            ),
+            "oi_refresh_cap": _safe_evidence_int(
+                getattr(quote, "oi_refresh_cap", 0)
+            ),
+            "oi_deferred_count": _safe_evidence_int(
+                getattr(quote, "oi_deferred_count", 0)
+            ),
+            "oi_timeout_count": _safe_evidence_int(
+                getattr(quote, "oi_timeout_count", 0)
+            ),
+            "oi_refresh_elapsed_ms": _safe_evidence_int(
+                getattr(quote, "oi_refresh_elapsed_ms", 0)
             ),
             "eligibility_class": eligibility_class,
             "floor": min_open_interest_quote,
@@ -1423,6 +1459,9 @@ class EntryGateRuntime:
             "targeted_revalidate_required": reason in {
                 "perp_open_interest_structural",
                 "oi_evidence_unavailable",
+                "oi_evidence_unsupported",
+                "oi_symbol_mapping_invalid",
+                "oi_refresh_failed",
             },
             "targeted_revalidate_scope": "entry_candidate",
         }
@@ -1458,6 +1497,7 @@ class EntryGateRuntime:
             ENTRY_LIQUIDITY_STRUCTURAL_PROBE_INTERVAL_MS,
             EntryLiquidityEligibilityClass,
         )
+        from lightfee.marketdata.open_interest import normalize_open_interest_status
 
         state = self._entry_liquidity_qualification_state()
         decisions: list[dict] = []
@@ -1477,29 +1517,109 @@ class EntryGateRuntime:
             if bid <= 0.0 or ask <= 0.0:
                 continue
 
-            observed_at_ms = self._snapshot_quote_observed_at_ms(snapshot, quote)
             volume_24h_quote = float(getattr(quote, "volume_24h_quote", 0.0) or 0.0)
-            open_interest_quote = float(getattr(quote, "open_interest", 0.0) or 0.0)
-            open_interest_evidence_status = str(
-                getattr(quote, "open_interest_evidence_status", "available")
-                or "available"
-            ).lower()
+            open_interest_raw = getattr(quote, "open_interest", None)
+            try:
+                parsed_open_interest_quote = (
+                    float(open_interest_raw)
+                    if open_interest_raw is not None
+                    and not isinstance(open_interest_raw, bool)
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                parsed_open_interest_quote = None
+            open_interest_quote = (
+                parsed_open_interest_quote
+                if parsed_open_interest_quote is not None
+                and isfinite(parsed_open_interest_quote)
+                and parsed_open_interest_quote >= 0.0
+                else None
+            )
+            open_interest_evidence_status = normalize_open_interest_status(
+                getattr(quote, "open_interest_evidence_status", "unavailable")
+            )
+            oi_observed_at_ms = _safe_evidence_int(
+                getattr(quote, "open_interest_observed_at_ms", 0)
+            )
+            oi_received_at_ms = _safe_evidence_int(
+                getattr(quote, "open_interest_received_at_ms", 0)
+            )
+            oi_sample_id = str(
+                getattr(quote, "open_interest_sample_id", "") or ""
+            ).strip()
+            oi_source = str(getattr(quote, "open_interest_source", "") or "").strip()
+            oi_venue_symbol = str(
+                getattr(quote, "open_interest_venue_symbol", "") or ""
+            ).strip()
+            oi_budget_ms = max(self._snapshot_domain_budget_ms("liquidity"), 0)
+            open_interest_value_valid = bool(
+                open_interest_quote is not None
+                and isfinite(open_interest_quote)
+                and open_interest_quote >= 0.0
+            )
+            observed_proof_valid = bool(
+                open_interest_evidence_status == "observed"
+                and open_interest_value_valid
+                and oi_observed_at_ms > 0
+                and oi_received_at_ms >= oi_observed_at_ms
+                and oi_observed_at_ms <= now_ms
+                and oi_received_at_ms <= now_ms
+                and oi_sample_id
+                and oi_source
+                and oi_venue_symbol
+            )
+            if observed_proof_valid and (
+                oi_budget_ms > 0 and now_ms - oi_observed_at_ms > oi_budget_ms
+            ):
+                open_interest_evidence_status = "stale"
+                observed_proof_valid = False
+            elif open_interest_evidence_status == "observed" and not observed_proof_valid:
+                open_interest_evidence_status = (
+                    "stale"
+                    if oi_observed_at_ms > now_ms or oi_received_at_ms > now_ms
+                    else "parse_error"
+                )
             volume_floor = self._entry_liquidity_volume_floor_quote(venue)
             open_interest_floor = self._entry_liquidity_open_interest_floor_quote(venue)
             current_class = state.current_class(venue, symbol, now_ms=now_ms)
 
-            if record_result and open_interest_evidence_status == "available":
+            if record_result and observed_proof_valid:
                 state.note_open_interest_observation(
                     venue,
                     symbol,
                     open_interest_quote,
-                    observed_at_ms=observed_at_ms,
+                    observed_at_ms=oi_observed_at_ms,
+                    sample_id=oi_sample_id,
                 )
 
             if (
                 open_interest_floor > 0.0
-                and open_interest_evidence_status != "available"
+                and not observed_proof_valid
             ):
+                if open_interest_evidence_status == "unsupported":
+                    unavailable_reason = "oi_evidence_unsupported"
+                elif open_interest_evidence_status in {
+                    "symbol_not_listed",
+                    "symbol_mismatch",
+                    "ambiguous_mapping",
+                }:
+                    unavailable_reason = "oi_symbol_mapping_invalid"
+                elif open_interest_evidence_status in {
+                    "timeout",
+                    "rate_limited",
+                    "http_error",
+                    "deferred",
+                }:
+                    unavailable_reason = "oi_refresh_failed"
+                else:
+                    unavailable_reason = "oi_evidence_unavailable"
+                if record_result:
+                    state.record_result(
+                        venue,
+                        symbol,
+                        EntryLiquidityEligibilityClass.DATA_UNAVAILABLE,
+                        now_ms=now_ms,
+                    )
                 decisions.append(
                     self._entry_liquidity_decision_payload(
                         venue=venue,
@@ -1508,11 +1628,11 @@ class EntryGateRuntime:
                         snapshot=snapshot,
                         now_ms=now_ms,
                         fallback_source=fallback_source,
-                        reason="oi_evidence_unavailable",
+                        reason=unavailable_reason,
                         decision="skip_entry",
                         event_kind="execution.entry_liquidity_blocked",
                         eligibility_class=(
-                            EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR.value
+                            EntryLiquidityEligibilityClass.DATA_UNAVAILABLE.value
                         ),
                         observed_volume_24h_quote=volume_24h_quote,
                         min_volume_24h_quote=volume_floor,
@@ -1590,13 +1710,18 @@ class EntryGateRuntime:
                     )
                 )
 
-            if open_interest_floor > 0.0 and open_interest_quote < open_interest_floor:
+            if (
+                open_interest_floor > 0.0
+                and open_interest_quote is not None
+                and open_interest_quote < open_interest_floor
+            ):
                 if record_result:
                     result_class = state.record_result(
                         venue,
                         symbol,
                         EntryLiquidityEligibilityClass.TEMPORARY_BELOW_FLOOR,
                         now_ms=now_ms,
+                        sample_id=oi_sample_id,
                     )
                 else:
                     result_class = (

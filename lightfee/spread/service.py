@@ -22,7 +22,6 @@ from lightfee.spread.metadata_cache import (
     quote_cache_contract_eligible,
 )
 from lightfee.spread.quote_snapshot import (
-    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     HOT_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSIONS,
     SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     load_spread_quote_snapshot,
@@ -814,7 +813,11 @@ class SpreadSidecarService:
         )
         pending_sampling_symbols = self._spread_sampling_symbols
         pending_producer_generation = self._spread_sampling_producer_generation_id
-        if snapshot is not None and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+        if (
+            using_compact_snapshot
+            and snapshot is not None
+            and snapshot.schema_version == SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+        ):
             configured_symbols = {
                 str(symbol).strip().upper()
                 for symbol in self.config.symbols
@@ -855,13 +858,17 @@ class SpreadSidecarService:
             else:
                 pending_producer_generation = producer_generation
         if self._spread_sampling_selection_required and not pending_sampling_symbols:
-            if snapshot is None or snapshot.schema_version != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
+            if (
+                snapshot is None
+                or not using_compact_snapshot
+                or snapshot.schema_version != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+            ):
                 # Schema-v4/full-snapshot rolling compatibility has no
                 # producer-declared universe. Resolve locally and remain
                 # fail-closed if metadata is absent or stale.
                 if (
                     snapshot is not None
-                    and snapshot.schema_version == FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
+                    and not using_compact_snapshot
                 ):
                     metadata_quotes = snapshot.quotes
 

@@ -7,7 +7,7 @@ import json
 import math
 from copy import deepcopy
 
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from enum import Enum
 from typing import Any, Optional
 
@@ -531,6 +531,20 @@ class PendingEntry:
     entry_depth_shortfall_quantity: float = 0.0
     entry_max_executable_notional_quote: float = 0.0
     entry_depth_capped_at_entry: bool = False
+    candidate_revision_id: str = ""
+    entry_max_leg_notional_quote: float = 0.0
+    funding_canary_enabled_at_entry: bool = False
+    funding_canary_fee_assurance_tier: str = ""
+    funding_canary_hard_max_entry_notional_quote: float = 0.0
+    funding_canary_size_constrained: bool = False
+    # Immutable, entry-time executable symbol rules.  Quantities are already
+    # converted to canonical base units by the dispatch boundary.  Pending
+    # hedge/repost/recovery must consume these exact values instead of asking a
+    # static VenueSpec (or a newly refreshed rule) to reinterpret an existing
+    # maker fill.
+    long_symbol_rule_at_entry: dict[str, Any] = field(default_factory=dict)
+    short_symbol_rule_at_entry: dict[str, Any] = field(default_factory=dict)
+    common_base_quantity_step_at_entry: float = 0.0
     advisories: list[str] = field(default_factory=list)
     blocked_reasons: list[str] = field(default_factory=list)
     exit_after_first_stage: bool = False
@@ -588,6 +602,12 @@ class PendingEntry:
 
     def __post_init__(self) -> None:
         """Migrate legacy string hedge_inflight to HedgeInflight | None."""
+        # ``long_side``/``short_side`` identify economic position legs.  A
+        # historical EntrySync factory accidentally reversed both fields when
+        # the passive maker was the short leg.  Normalize old snapshots before
+        # any recovery/repost helper derives maker_side()/hedge_side().
+        self.long_side = Side.BUY
+        self.short_side = Side.SELL
         if self.repost_count == 0 and self.repost_attempt_count:
             self.repost_count = self.repost_attempt_count
         if isinstance(self.hedge_inflight, str):
@@ -613,6 +633,169 @@ class PendingEntry:
             else PendingEntryRemainderSlice.from_dict(item)
             for item in (self.maker_remainder_slices or [])
         ]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the single persistent/journal contract for PendingEntry.
+
+        The field-driven encoder deliberately makes adding a dataclass field
+        impossible to forget in one of EngineState, snapshot or journal
+        persistence.  Nested state retains its own explicit version-tolerant
+        contract; legacy ``hedge_inflight == ""`` remains wire-compatible.
+        """
+
+        payload: dict[str, Any] = {}
+        for item in fields(self):
+            name = item.name
+            value = getattr(self, name)
+            if isinstance(value, (Venue, Side, PassiveOrderState)):
+                payload[name] = value.value
+            elif name == "phase_state":
+                payload[name] = value.to_dict() if value is not None else None
+            elif name == "passive_manager_runtime":
+                payload[name] = (
+                    value.to_dict() if hasattr(value, "to_dict") else {}
+                )
+            elif name == "maker_remainder_slices":
+                payload[name] = [
+                    slice_.to_dict()
+                    if hasattr(slice_, "to_dict")
+                    else dict(slice_)
+                    for slice_ in (value or [])
+                ]
+            elif name == "hedge_inflight":
+                payload[name] = value.to_dict() if value is not None else ""
+            elif name == "passive_order":
+                payload[name] = value.to_dict() if value is not None else None
+            else:
+                payload[name] = deepcopy(value)
+        return payload
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Any,
+        *,
+        pending_id: str | None = None,
+    ) -> "PendingEntry":
+        """Restore the authoritative contract, including legacy snapshots."""
+
+        if not isinstance(data, dict):
+            raise TypeError("pending entry payload must be a mapping")
+
+        def _venue(value: Any, default: Venue) -> Venue:
+            if isinstance(value, Venue):
+                return value
+            try:
+                return Venue.from_str(str(value or ""))
+            except (AttributeError, ValueError):
+                return default
+
+        def _side(value: Any, default: Side) -> Side:
+            if isinstance(value, Side):
+                return value
+            try:
+                return Side(str(value or ""))
+            except ValueError:
+                return default
+
+        def _bool(value: Any) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
+
+        required = {
+            "pending_id": str(
+                pending_id
+                or data.get("pending_id")
+                or data.get("position_id")
+                or data.get("entry_id")
+                or ""
+            ),
+            "symbol": str(data.get("symbol", "") or ""),
+            "long_venue": _venue(data.get("long_venue"), Venue.BINANCE),
+            "short_venue": _venue(data.get("short_venue"), Venue.OKX),
+            "target_quantity": float(data.get("target_quantity", 0.0) or 0.0),
+            "long_side": _side(data.get("long_side"), Side.BUY),
+            "short_side": _side(data.get("short_side"), Side.SELL),
+            "created_at_ms": int(data.get("created_at_ms", 0) or 0),
+        }
+        kwargs: dict[str, Any] = dict(required)
+        special = {
+            *required,
+            "phase_state",
+            "passive_manager_runtime",
+            "maker_remainder_slices",
+            "hedge_inflight",
+            "passive_order",
+        }
+        for item in fields(cls):
+            name = item.name
+            if name in special or name not in data:
+                continue
+            value = data.get(name)
+            if item.default is not MISSING:
+                default = item.default
+            elif item.default_factory is not MISSING:  # type: ignore[comparison-overlap]
+                default = item.default_factory()
+            else:
+                continue
+            try:
+                if isinstance(default, bool):
+                    value = _bool(value)
+                elif isinstance(default, int):
+                    value = int(value or 0)
+                elif isinstance(default, float):
+                    value = float(value or 0.0)
+                elif isinstance(default, str):
+                    value = str(value or "")
+                elif isinstance(default, list):
+                    value = list(value or [])
+                elif isinstance(default, dict):
+                    value = dict(value or {})
+            except (TypeError, ValueError):
+                value = deepcopy(default)
+            kwargs[name] = deepcopy(value)
+
+        kwargs["phase_state"] = PendingEntryPassivePhaseState.from_dict(
+            data.get("phase_state")
+        )
+        kwargs["passive_manager_runtime"] = PassiveOrderManagerRuntime.from_dict(
+            data.get("passive_manager_runtime")
+        )
+        kwargs["maker_remainder_slices"] = [
+            PendingEntryRemainderSlice.from_dict(item)
+            for item in list(data.get("maker_remainder_slices", []) or [])
+        ]
+        hedge_inflight = data.get("hedge_inflight", "")
+        kwargs["hedge_inflight"] = (
+            HedgeInflight.from_dict(hedge_inflight)
+            if isinstance(hedge_inflight, dict)
+            else str(hedge_inflight or "")
+        )
+        kwargs["passive_order"] = PendingPassiveOrder.from_dict(
+            data.get("passive_order")
+        )
+        # Older journal records used ``repost_count`` as the only persisted
+        # retry counter.  Preserve that lifecycle position when restoring the
+        # newer authoritative contract; ``__post_init__`` only performs the
+        # opposite (new -> legacy) compatibility copy.
+        if "repost_attempt_count" not in data and "repost_count" in data:
+            try:
+                kwargs["repost_attempt_count"] = int(
+                    data.get("repost_count", 0) or 0
+                )
+            except (TypeError, ValueError):
+                kwargs["repost_attempt_count"] = 0
+        return cls(**kwargs)
+
+    def symbol_rule_at_entry(self, venue: Venue) -> dict[str, Any]:
+        """Return the frozen rule for a leg without consulting live metadata."""
+
+        if venue == self.long_venue:
+            return dict(self.long_symbol_rule_at_entry or {})
+        if venue == self.short_venue:
+            return dict(self.short_symbol_rule_at_entry or {})
+        return {}
 
     @staticmethod
     def _fill_timestamp_quality_rank(quality: str) -> int:
@@ -1993,99 +2176,8 @@ class EngineState:
                 for pid, pos in self.open_positions.items()
             },
             "pending_entries": {
-                pid: {
-                    "pending_id": p.pending_id,
-                    "symbol": p.symbol,
-                    "long_venue": p.long_venue.value,
-                    "short_venue": p.short_venue.value,
-                    "target_quantity": p.target_quantity,
-                    "long_side": p.long_side.value,
-                    "short_side": p.short_side.value,
-                    "created_at_ms": p.created_at_ms,
-                    "metadata": p.metadata,
-                    "maker_order_id": p.maker_order_id,
-                    "hedge_order_id": p.hedge_order_id,
-                    "maker_client_order_id": p.maker_client_order_id,
-                    "hedge_client_order_id": p.hedge_client_order_id,
-                    "maker_leg_filled": p.maker_leg_filled,
-                    "hedge_leg_filled": p.hedge_leg_filled,
-                    "maker_leg_filled_at_ms": p.maker_leg_filled_at_ms,
-                    "hedge_leg_filled_at_ms": p.hedge_leg_filled_at_ms,
-                    "maker_fill_timestamp_quality": p.maker_fill_timestamp_quality,
-                    "hedge_fill_timestamp_quality": p.hedge_fill_timestamp_quality,
-                    "deadline_ms": p.deadline_ms,
-                    "uncertain_outcome": p.uncertain_outcome,
-                    "reconcile_attempt": p.reconcile_attempt,
-                    "reconcile_next_attempt_ms": p.reconcile_next_attempt_ms,
-                    "entry_type": p.entry_type,
-                    "maker_price": p.maker_price,
-                    "maker_fill_price": p.maker_fill_price,
-                    "hedge_fill_price": p.hedge_fill_price,
-                    "hedge_inflight": p.hedge_inflight.to_dict() if p.hedge_inflight else "",
-                    "repair_state": p.repair_state,
-                    "long_quantity": p.long_quantity,
-                    "short_quantity": p.short_quantity,
-                    "maker_leg": p.maker_leg,
-                    "outcome": p.outcome,
-                    "opportunity_type": p.opportunity_type,
-                    "funding_timestamp_ms": p.funding_timestamp_ms,
-                    "first_funding_timestamp_ms": p.first_funding_timestamp_ms,
-                    "long_funding_timestamp_ms": p.long_funding_timestamp_ms,
-                    "short_funding_timestamp_ms": p.short_funding_timestamp_ms,
-                    "second_funding_timestamp_ms": p.second_funding_timestamp_ms,
-                    "first_funding_leg": p.first_funding_leg,
-                    "funding_edge_bps_entry": p.funding_edge_bps_entry,
-                    "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
-                    "expected_edge_bps_entry": p.expected_edge_bps_entry,
-                    "worst_case_edge_bps_entry": p.worst_case_edge_bps_entry,
-                    "expected_shortfall_bps_entry": p.expected_shortfall_bps_entry,
-                    "entry_maker_leg": p.entry_maker_leg,
-                    "exit_maker_leg": p.exit_maker_leg,
-                    "entry_cross_bps_entry": p.entry_cross_bps_entry,
-                    "fee_bps_entry": p.fee_bps_entry,
-                    "entry_slippage_bps_entry": p.entry_slippage_bps_entry,
-                    "transfer_bias_bps_entry": p.transfer_bias_bps_entry,
-                    "transfer_state_at_entry": p.transfer_state_at_entry,
-                    "entry_liquidity_source_at_entry": p.entry_liquidity_source_at_entry,
-                    "long_volume_24h_quote_at_entry": p.long_volume_24h_quote_at_entry,
-                    "short_volume_24h_quote_at_entry": p.short_volume_24h_quote_at_entry,
-                    "long_open_interest_quote_at_entry": p.long_open_interest_quote_at_entry,
-                    "short_open_interest_quote_at_entry": p.short_open_interest_quote_at_entry,
-                    "long_entry_vwap": p.long_entry_vwap,
-                    "short_entry_vwap": p.short_entry_vwap,
-                    "entry_capacity_constrained": p.entry_capacity_constrained,
-                    "entry_target_quantity": p.entry_target_quantity,
-                    "long_max_executable_quantity": p.long_max_executable_quantity,
-                    "short_max_executable_quantity": p.short_max_executable_quantity,
-                    "entry_max_executable_quantity": p.entry_max_executable_quantity,
-                    "entry_depth_shortfall_quantity": p.entry_depth_shortfall_quantity,
-                    "entry_max_executable_notional_quote": p.entry_max_executable_notional_quote,
-                    "entry_depth_capped_at_entry": p.entry_depth_capped_at_entry,
-                    "advisories": p.advisories,
-                    "blocked_reasons": p.blocked_reasons,
-                    "exit_after_first_stage": p.exit_after_first_stage,
-                    "phase_state": p.phase_state.to_dict() if p.phase_state else None,
-                    "passive_manager_runtime": (
-                        p.passive_manager_runtime.to_dict()
-                        if hasattr(p.passive_manager_runtime, "to_dict")
-                        else {}
-                    ),
-                    "created_cycle": p.created_cycle,
-                    "repost_attempt_count": p.repost_attempt_count,
-                    "passive_attempt_count": p.passive_attempt_count,
-                    "passive_ops_total": p.passive_ops_total,
-                    "maker_remainder_slices": [
-                        item.to_dict() if hasattr(item, "to_dict") else dict(item)
-                        for item in p.maker_remainder_slices
-                    ],
-                    "lifetime_exhausted_logged_final_reason": (
-                        p.lifetime_exhausted_logged_final_reason
-                    ),
-                    "frozen_candidate": p.frozen_candidate,
-                    "passive_order": p.passive_order.to_dict() if p.passive_order else None,
-                    "next_progress_poll_ms": p.next_progress_poll_ms,
-                }
-                for pid, p in self.pending_entries.items()
+                pid: pending.to_dict()
+                for pid, pending in self.pending_entries.items()
             },
             "pending_closes": {
                 cid: {

@@ -114,6 +114,7 @@ class QuoteLease:
     created_at_ms: int
     expires_at_ms: int
     provider: str = "quote_lease"
+    candidate_revision_id: str = ""
     # Filled only by the final local-L2 revalidator. BBO-only evidence must
     # never be mistaken for a depth-confirmed executable price.
     long_buy_vwap: float = 0.0
@@ -340,6 +341,9 @@ class QuoteLeaseEntryReadinessProvider(RestTopBookEntryReadinessProvider):
             created_at_ms=now_ms,
             expires_at_ms=now_ms + ttl_ms,
             provider=self.provider_name,
+            candidate_revision_id=str(
+                getattr(candidate, "candidate_revision_id", "") or ""
+            ),
         )
 
 
@@ -654,7 +658,11 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
 
         cache = getattr(self._runtime, "ws_bbo_cache", None)
         if cache is not None and hasattr(cache, "update_quote"):
-            if cache.update_quote(refreshed):
+            if cache.update_quote(
+                refreshed,
+                now_ms=now_ms,
+                current_max_age_ms=self._quote_lease_age_budget_ms(),
+            ):
                 evidence["outcome"] = "cache_updated"
                 evidence["observed_at_ms"] = int(
                     getattr(refreshed, "observed_at_ms", 0) or 0

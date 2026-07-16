@@ -7,6 +7,7 @@ Each test validates a specific root cause identified after deployment 021178e.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -2103,6 +2104,9 @@ def _make_open_runtime(tmp_path, **strategy_overrides):
 
 
 def _make_pending_entry_for_hedge_delta(**overrides) -> PendingEntry:
+    frozen_hedge_min_notional_quote = float(
+        overrides.pop("frozen_hedge_min_notional_quote", 0.0) or 0.0
+    )
     values = {
         "pending_id": "entry-v1-hedge-runtime",
         "symbol": "BTCUSDT",
@@ -2142,10 +2146,186 @@ def _make_pending_entry_for_hedge_delta(**overrides) -> PendingEntry:
         ],
     }
     values.update(overrides)
+    symbol = str(values["symbol"])
+    long_venue = values["long_venue"]
+    short_venue = values["short_venue"]
+    maker_leg = str(values.get("maker_leg") or "long")
+
+    def frozen_rule(venue: Venue, min_notional_quote: float) -> dict:
+        return {
+            "venue": venue.value,
+            "symbol": symbol,
+            "venue_symbol": symbol,
+            "quantity_units": "base",
+            "quantity_step_base": 0.001,
+            "min_quantity_base": 0.001,
+            "min_notional_quote": min_notional_quote,
+            "source": "test_symbol_rule",
+            "rule_source": "test",
+            "missing_fields": [],
+            "evidence_complete": True,
+        }
+
+    long_min_notional = (
+        frozen_hedge_min_notional_quote if maker_leg == "short" else 0.0
+    )
+    short_min_notional = (
+        frozen_hedge_min_notional_quote if maker_leg != "short" else 0.0
+    )
+    values.setdefault(
+        "long_symbol_rule_at_entry",
+        frozen_rule(long_venue, long_min_notional),
+    )
+    values.setdefault(
+        "short_symbol_rule_at_entry",
+        frozen_rule(short_venue, short_min_notional),
+    )
+    values.setdefault("common_base_quantity_step_at_entry", 0.001)
     return PendingEntry(**values)
 
 
+def _attach_complete_frozen_symbol_rules(
+    pending: PendingEntry,
+    *,
+    quantity_step_base: float = 0.001,
+    min_quantity_base: float = 0.001,
+    min_notional_quote: float = 0.0,
+) -> PendingEntry:
+    """Give legacy-path fixtures the entry-time executable rule contract.
+
+    These tests exercise hedge/reconciliation behavior, not the separate
+    fail-closed branch for missing entry-time evidence.
+    """
+
+    def rule(venue: Venue) -> dict:
+        return {
+            "venue": venue.value,
+            "symbol": pending.symbol,
+            "venue_symbol": pending.symbol,
+            "quantity_units": "base",
+            "quantity_step_base": quantity_step_base,
+            "min_quantity_base": min_quantity_base,
+            "min_notional_quote": min_notional_quote,
+            "source": "test_symbol_rule",
+            "rule_source": "test",
+            "missing_fields": [],
+            "evidence_complete": True,
+        }
+
+    pending.long_symbol_rule_at_entry = rule(pending.long_venue)
+    pending.short_symbol_rule_at_entry = rule(pending.short_venue)
+    pending.common_base_quantity_step_at_entry = quantity_step_base
+    return pending
+
+
 class TestV1PendingEntryHedgeDeltaRuntimeClosure:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("recovery", [False, True])
+    async def test_canary_cap_breach_flattens_maker_before_later_hedge_submit(
+        self,
+        tmp_path,
+        recovery,
+    ):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=2.0,
+                    notional_quote=40.0,
+                    fill_at_ms=1_100,
+                )
+            ],
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=5.0,
+            candidate_revision_id="canary-revision-lifecycle",
+        )
+        aborted: list[str] = []
+
+        async def abort_pending(_pending, _entry_id, reason):
+            aborted.append(reason)
+            return True
+
+        runtime._abort_pending_entry = abort_pending
+        runtime._pending_entry_post_first_fill_decision = lambda *args, **kwargs: {
+            "action": "complete_hedge",
+            "reason": "complete_pair_is_safer",
+            "hedge_price": 20.0,
+            "unwind_price": 20.0,
+            "complete_hedge_loss_quote": 0.0,
+            "unwind_first_leg_loss_quote": 0.0,
+            "market_evidence": {},
+        }
+
+        if recovery:
+            driven = await runtime._recover_drive_missing_hedge(
+                pending,
+                "startup_recovery",
+            )
+        else:
+            driven = await runtime._drive_missing_hedge_live(
+                pending,
+                pending.pending_id,
+                2_000,
+            )
+
+        assert driven is False
+        assert aborted == ["funding_canary_final_notional_invariant_breached"]
+        assert hedge_adapter._place_order_calls == []
+        breach = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"]
+            == "funding_canary_final_notional_invariant_breached"
+        ][-1]
+        assert breach["stage"] == (
+            "recovery_missing_hedge" if recovery else "normal_missing_hedge"
+        )
+        assert breach["entry_max_leg_notional_quote"] == pytest.approx(40.0)
+        assert breach["funding_canary_hard_max_entry_notional_quote"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_canary_cap_breach_blocks_pending_passive_repost_before_io(
+        self,
+        tmp_path,
+    ):
+        class PassiveAdapter:
+            def __init__(self):
+                self.requests: list[OrderRequest] = []
+
+            async def submit_passive_order(self, request):
+                self.requests.append(request)
+                raise AssertionError("cap breach must stop before venue IO")
+
+        runtime = _make_open_runtime(tmp_path)
+        pending = _make_pending_entry_for_hedge_delta(
+            funding_canary_enabled_at_entry=True,
+            funding_canary_hard_max_entry_notional_quote=5.0,
+            candidate_revision_id="canary-revision-repost",
+        )
+        runtime._pending_entry_post_only_price_hint_at_attempt = (
+            lambda *args, **kwargs: 20.0
+        )
+        adapter = PassiveAdapter()
+
+        with pytest.raises(
+            Exception,
+            match="funding_canary_final_notional_invariant_breached",
+        ):
+            await runtime._submit_pending_entry_passive_order_with_retries(
+                pending=pending,
+                entry_id=pending.pending_id,
+                adapter=adapter,
+                quantity=0.5,
+                price=20.0,
+                stage_prefix="maker_repost",
+            )
+
+        assert adapter.requests == []
+
     def test_adaptive_hedge_deadline_enforcement_uses_started_deadline(self, tmp_path):
         runtime = _make_open_runtime(
             tmp_path,
@@ -2189,7 +2369,9 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
         hedge_adapter.min_notional_quote = 25.0
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
-        pending = _make_pending_entry_for_hedge_delta()
+        pending = _make_pending_entry_for_hedge_delta(
+            frozen_hedge_min_notional_quote=25.0,
+        )
 
         driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2_000)
 
@@ -2201,6 +2383,176 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         assert events[-1]["kind"] == "execution.pending_entry_hedge_chunk_buffering"
         assert pending.phase_state is not None
         assert pending.phase_state.small_fill_min_notional_attempts == 0
+
+    @pytest.mark.asyncio
+    async def test_frozen_common_step_blocks_sub_grid_fill_without_submit(
+        self,
+        tmp_path,
+    ):
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_entry_progress_poll_ms=250,
+            passive_small_fill_buffer_notional_quote=25.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=0.003,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=0.003,
+                    notional_quote=0.06,
+                    fill_at_ms=1_100,
+                )
+            ],
+        )
+        pending.short_symbol_rule_at_entry["quantity_step_base"] = 0.01
+        pending.short_symbol_rule_at_entry["min_quantity_base"] = 0.01
+        pending.common_base_quantity_step_at_entry = 0.01
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            2_000,
+        )
+
+        assert driven is False
+        assert hedge_adapter.normalize_quantity_calls == []
+        assert hedge_adapter._place_order_calls == []
+        assert pending.next_progress_poll_ms == 2_250
+
+    @pytest.mark.asyncio
+    async def test_missing_frozen_rule_aborts_before_hedge_io(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(
+                    quantity=2.0,
+                    notional_quote=40.0,
+                    fill_at_ms=1_100,
+                )
+            ],
+            long_symbol_rule_at_entry={},
+            short_symbol_rule_at_entry={},
+            common_base_quantity_step_at_entry=0.0,
+        )
+        aborted: list[str] = []
+
+        async def abort_pending(_pending, _entry_id, reason):
+            aborted.append(reason)
+            return True
+
+        runtime._abort_pending_entry = abort_pending
+        runtime._pending_entry_post_first_fill_decision = lambda *args, **kwargs: {
+            "action": "complete_hedge",
+            "reason": "complete_pair_is_safer",
+            "hedge_price": 20.0,
+            "unwind_price": 20.0,
+            "complete_hedge_loss_quote": 0.0,
+            "unwind_first_leg_loss_quote": 0.0,
+            "market_evidence": {},
+        }
+
+        driven = await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            2_000,
+        )
+
+        assert driven is False
+        assert aborted == ["pending_entry_symbol_rule_evidence_missing"]
+        assert hedge_adapter.normalize_quantity_calls == []
+        assert hedge_adapter._place_order_calls == []
+
+    @pytest.mark.asyncio
+    async def test_repost_missing_frozen_rule_fails_before_venue_io(self, tmp_path):
+        class PassiveAdapter:
+            def __init__(self):
+                self.requests: list[OrderRequest] = []
+
+            async def submit_passive_order(self, request):
+                self.requests.append(request)
+                raise AssertionError("missing frozen rule must stop before venue IO")
+
+        runtime = _make_open_runtime(tmp_path)
+        pending = _make_pending_entry_for_hedge_delta(
+            long_symbol_rule_at_entry={},
+            short_symbol_rule_at_entry={},
+            common_base_quantity_step_at_entry=0.0,
+        )
+        runtime._pending_entry_post_only_price_hint_at_attempt = (
+            lambda *args, **kwargs: 20.0
+        )
+        adapter = PassiveAdapter()
+
+        with pytest.raises(
+            Exception,
+            match="pending_entry_symbol_rule_evidence_missing",
+        ):
+            await runtime._submit_pending_entry_passive_order_with_retries(
+                pending=pending,
+                entry_id=pending.pending_id,
+                adapter=adapter,
+                quantity=0.5,
+                price=20.0,
+                stage_prefix="maker_repost",
+            )
+
+        assert adapter.requests == []
+
+    @pytest.mark.asyncio
+    async def test_terminal_fallback_missing_frozen_rule_fails_before_executor_io(
+        self,
+        tmp_path,
+    ):
+        class EntryExecutor:
+            def __init__(self):
+                self.contexts = []
+
+            async def execute(self, context):
+                self.contexts.append(context)
+                raise AssertionError(
+                    "missing frozen rule must stop before dual-taker IO"
+                )
+
+        runtime = _make_open_runtime(tmp_path)
+        executor = EntryExecutor()
+        runtime.entry_executor = executor
+        pending = _make_pending_entry_for_hedge_delta(
+            long_symbol_rule_at_entry={},
+            short_symbol_rule_at_entry={},
+            common_base_quantity_step_at_entry=0.0,
+        )
+        runtime._apply_terminal_taker_runtime_entry_guards = (
+            lambda _candidate, _pending, _now_ms: SimpleNamespace(
+                blocked=False,
+                blocked_reasons=[],
+                entry_notional_quote=10.0,
+                long_price_hint=20.0,
+                short_price_hint=20.0,
+            )
+        )
+
+        executed = await runtime._execute_pending_entry_terminal_taker_fallback(
+            pending,
+            pending.pending_id,
+            2_000,
+            "maker_entry_rest_timeout",
+        )
+
+        assert executed is False
+        assert executor.contexts == []
+        skipped = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"] == "execution.entry_fallback_to_taker_skipped"
+        ][-1]
+        assert skipped["reason"] == "pending_entry_symbol_rule_evidence_missing"
+        assert skipped["leg"] == "long"
 
     @pytest.mark.asyncio
     async def test_live_drive_missing_hedge_sets_hedge_deadline_before_submit(
@@ -2286,6 +2638,7 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
                     fill_at_ms=1_100,
                 ),
             ],
+            frozen_hedge_min_notional_quote=230.0,
         )
 
         driven = await runtime._drive_missing_hedge_live(
@@ -2319,10 +2672,12 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
 
         normal_pending = _make_pending_entry_for_hedge_delta(
-            pending_id="entry-normal-small-fill"
+            pending_id="entry-normal-small-fill",
+            frozen_hedge_min_notional_quote=25.0,
         )
         recovery_pending = _make_pending_entry_for_hedge_delta(
-            pending_id="entry-recovery-small-fill"
+            pending_id="entry-recovery-small-fill",
+            frozen_hedge_min_notional_quote=25.0,
         )
 
         normal = await runtime._drive_missing_hedge_live(
@@ -2390,6 +2745,7 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
                     fill_at_ms=1_100,
                 ),
             ],
+            frozen_hedge_min_notional_quote=230.0,
         )
 
         driven = await runtime._recover_drive_missing_hedge(
@@ -2428,6 +2784,7 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
             maker_remainder_slices=[
                 PendingEntryRemainderSlice(quantity=2.0, notional_quote=40.0, fill_at_ms=1_100),
             ],
+            frozen_hedge_min_notional_quote=1_000.0,
         )
         runtime.state.pending_entries[pending.pending_id] = pending
 
@@ -2563,6 +2920,7 @@ class TestRealPathAbortCleanupDeadline:
             maker_order_id="maker-oid-1",
             maker_client_order_id="maker-cid-1",
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
 
@@ -2618,6 +2976,7 @@ class TestRealPathAbortCleanupDeadline:
             maker_order_id="maker-oid-space",
             maker_client_order_id="maker-cid-space",
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
 
@@ -2684,6 +3043,7 @@ class TestRealPathAbortCleanupDeadline:
             maker_order_id="maker-oid-velvet",
             maker_client_order_id="maker-cid-velvet",
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
 
@@ -2775,6 +3135,7 @@ class TestRealPathAbortCleanupDeadline:
             hedge_leg_filled=0.0,
             uncertain_outcome=True,
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
         hedge_adapter.open_orders = [{"orderId": "ack-open-order"}]
@@ -2817,6 +3178,7 @@ class TestRealPathAbortCleanupDeadline:
             hedge_leg_filled=0.0,
             uncertain_outcome=True,
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
         runtime.state.pending_entries[pending.pending_id] = pending
 
         await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
@@ -2867,6 +3229,7 @@ class TestRealPathAbortCleanupDeadline:
             hedge_leg_filled=0.0,
             uncertain_outcome=True,
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
         hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
@@ -2925,6 +3288,7 @@ class TestRealPathAbortCleanupDeadline:
             hedge_leg_filled=0.0,
             uncertain_outcome=True,
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
         first_cid = pending.hedge_client_order_id
@@ -2969,6 +3333,7 @@ class TestRealPathAbortCleanupDeadline:
             maker_order_id="maker-oid",
             maker_client_order_id="maker-cid",
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         first = await runtime._drive_missing_hedge_live(pending, "entry-hl-auth", now_ms)
         second = await runtime._drive_missing_hedge_live(pending, "entry-hl-auth", now_ms + 1)
@@ -3008,6 +3373,7 @@ class TestRealPathAbortCleanupDeadline:
             maker_order_id="maker-oid-1",
             maker_client_order_id="maker-cid-1",
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
 
         first = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2000)
         first_cid = pending.hedge_client_order_id
@@ -5655,6 +6021,7 @@ class TestRealPathAbortCleanupDeadline:
                 )
             ],
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
         runtime.state.pending_entries[pending.pending_id] = pending
 
         handled = await runtime._force_terminalize_pending_entry_if_budget_exhausted(
@@ -6915,6 +7282,7 @@ class TestStartupZeroFillNoDirectPop:
             hedge_leg_filled=0.0,
             uncertain_outcome=True,
         )
+        pending = _attach_complete_frozen_symbol_rules(pending)
         runtime.state.pending_entries["entry-extension-retained"] = pending
 
         await runtime._reconcile_pending_state(now_ms)

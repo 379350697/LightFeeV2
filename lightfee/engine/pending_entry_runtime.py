@@ -2704,6 +2704,15 @@ class PendingEntryRuntime:
             entry_depth_shortfall_quantity=pending.entry_depth_shortfall_quantity,
             entry_max_executable_notional_quote=pending.entry_max_executable_notional_quote,
             entry_depth_capped_at_entry=pending.entry_depth_capped_at_entry,
+            long_symbol_rule_at_entry=dict(
+                pending.long_symbol_rule_at_entry or {}
+            ),
+            short_symbol_rule_at_entry=dict(
+                pending.short_symbol_rule_at_entry or {}
+            ),
+            common_base_quantity_step_at_entry=(
+                pending.common_base_quantity_step_at_entry
+            ),
             advisories=list(pending.advisories),
             blocked_reasons=list(pending.blocked_reasons),
             exit_after_first_stage=pending.exit_after_first_stage,

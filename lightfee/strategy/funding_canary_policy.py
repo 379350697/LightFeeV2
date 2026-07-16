@@ -81,16 +81,23 @@ def canary_fee_assurance_tier(candidate: object, strategy: object) -> str:
 
 
 def canary_notional_cap(candidate: object, strategy: object) -> float:
-    configured = float(
-        getattr(strategy, "funding_canary_max_entry_notional_quote", 0.0)
+    return canary_notional_cap_for_tier(
+        canary_fee_assurance_tier(candidate, strategy), strategy
     )
-    if canary_fee_assurance_tier(candidate, strategy) != "conservative":
+
+
+def canary_notional_cap_for_tier(tier: str, strategy: object) -> float:
+    configured = max(
+        float(getattr(strategy, "funding_canary_max_entry_notional_quote", 0.0)),
+        0.0,
+    )
+    if str(tier or "").lower() != "conservative":
         return configured
-    fallback = float(
+    fallback = max(float(
         getattr(
             strategy,
             "funding_canary_conservative_fee_max_entry_notional_quote",
             0.0,
         )
-    )
+    ), 0.0)
     return min(configured, fallback)

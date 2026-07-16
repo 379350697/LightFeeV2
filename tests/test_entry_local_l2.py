@@ -26,6 +26,7 @@ from lightfee.engine.entry_local_l2 import (
     select_tracked_opportunities,
     shadow_promotion_is_eligible,
 )
+from lightfee.marketdata.open_interest import open_interest_sample_id
 
 if TYPE_CHECKING:
     from lightfee.sidecar.snapshot import CandidateInput
@@ -103,6 +104,8 @@ def _complete_v3_contract_quote(
     **market_fields: float | int | str,
 ) -> dict[str, float | int | str | bool]:
     """Quote evidence required for a V3 live candidate's common base unit."""
+    observed_at_ms = int(market_fields.get("observed_at_ms", 0) or 0)
+    open_interest = float(market_fields.get("open_interest", 0.0) or 0.0)
     return {
         "venue": venue,
         "symbol": symbol,
@@ -121,6 +124,25 @@ def _complete_v3_contract_quote(
         "min_notional_evidence_complete": True,
         "venue_status": "active",
         "contract_normalization_complete": True,
+        "open_interest_evidence_status": "observed",
+        "open_interest_evidence_reason": "test_fixture",
+        "open_interest_observed_at_ms": observed_at_ms,
+        "open_interest_received_at_ms": observed_at_ms,
+        "open_interest_source": "test_fixture",
+        "open_interest_sample_id": open_interest_sample_id(
+            venue=venue,
+            canonical_symbol=symbol,
+            venue_symbol=symbol,
+            observed_at_ms=observed_at_ms,
+            source="test_fixture",
+            raw_value=open_interest,
+            value_quote=open_interest,
+        ),
+        "open_interest_venue_symbol": symbol,
+        "raw_open_interest": open_interest,
+        "raw_open_interest_unit": "quote",
+        "open_interest_contract_multiplier": 1.0,
+        "open_interest_conversion_mark_price": None,
         **market_fields,
     }
 
@@ -1682,7 +1704,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         snapshot_path = tmp_path / "sidecar.json"
         event_path = tmp_path / "events.jsonl"
         snapshot_path.write_text(json.dumps({
-            "schema_version": 3,
+            "schema_version": 5,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
             **_v3_candidate_build_proof(
@@ -1848,7 +1870,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         snapshot_path = tmp_path / "sidecar.json"
         event_path = tmp_path / "events.jsonl"
         snapshot_path.write_text(json.dumps({
-            "schema_version": 3,
+            "schema_version": 5,
             "published_at_ms": now_ms,
             "market_observed_at_ms": now_ms,
             **_v3_candidate_build_proof(

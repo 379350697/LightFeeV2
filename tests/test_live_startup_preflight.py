@@ -232,6 +232,10 @@ def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
     runtime.config.strategy.entry_readiness_provider = "quote_lease"
     runtime.config.strategy.entry_quote_lease_ttl_ms = 5_000
     runtime.entry_readiness_provider = _StaticFinalQuoteLeaseProvider()
+    # Dispatch deliberately re-reads wall time immediately before submit.
+    # Pin that clock to the fixture's lease epoch so these admission tests do
+    # not become stale merely because wall time advances.
+    runtime._entry_wall_clock_now_ms = lambda: 1778787000000
     return runtime
 
 

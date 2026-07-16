@@ -13,6 +13,7 @@ from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.sidecar.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     validate_v4_snapshot_contract,
+    validate_v5_snapshot_contract,
 )
 
 
@@ -149,7 +150,13 @@ def analyze_sidecar_snapshot(
             details={"root_type": type(snapshot).__name__},
         )
     fingerprints: list[str] = []
-    shared_contract_errors = validate_v4_snapshot_contract(snapshot)
+    raw_schema_version = snapshot.get("schema_version")
+    if raw_schema_version == SNAPSHOT_SCHEMA_VERSION:
+        shared_contract_errors = validate_v5_snapshot_contract(snapshot)
+    elif raw_schema_version == 4:
+        shared_contract_errors = validate_v4_snapshot_contract(snapshot)
+    else:
+        shared_contract_errors = ["schema_version_unsupported"]
     required_snapshot_fields = {
         "schema_version",
         "published_at_ms",
@@ -162,7 +169,6 @@ def analyze_sidecar_snapshot(
         "quotes",
         "candidates",
     }
-    raw_schema_version = snapshot.get("schema_version")
     raw_published_at_ms = snapshot.get("published_at_ms")
     raw_market_observed_at_ms = snapshot.get("market_observed_at_ms")
     raw_candidate_build_at_ms = snapshot.get("candidate_build_observed_at_ms")
@@ -295,7 +301,7 @@ def analyze_sidecar_snapshot(
                 blocked_reason_counts[reason] = blocked_reason_counts.get(reason, 0) + 1
     unblocked_candidate_count = max(candidate_count - blocked_candidate_count, 0)
     if (
-        raw_schema_version != SNAPSHOT_SCHEMA_VERSION
+        raw_schema_version not in {SNAPSHOT_SCHEMA_VERSION, 4}
         or missing_contract_fields
         or missing_diagnostic_fields
     ):

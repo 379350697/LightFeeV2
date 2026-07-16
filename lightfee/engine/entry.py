@@ -120,6 +120,15 @@ class EntryContext:
     entry_depth_shortfall_quantity: float = 0.0
     entry_max_executable_notional_quote: float = 0.0
     entry_depth_capped_at_entry: bool = False
+    candidate_revision_id: str = ""
+    entry_max_leg_notional_quote: float = 0.0
+    funding_canary_enabled_at_entry: bool = False
+    funding_canary_fee_assurance_tier: str = ""
+    funding_canary_hard_max_entry_notional_quote: float = 0.0
+    funding_canary_size_constrained: bool = False
+    long_symbol_rule_at_entry: dict[str, object] = field(default_factory=dict)
+    short_symbol_rule_at_entry: dict[str, object] = field(default_factory=dict)
+    common_base_quantity_step_at_entry: float = 0.0
     advisories: list[str] = field(default_factory=list)
     blocked_reasons: list[str] = field(default_factory=list)
     exit_after_first_stage: bool = False

@@ -8,6 +8,9 @@ Venue endpoints:
 - Binance/Aster: GET /fapi/v1/exchangeInfo → PRICE_FILTER, LOT_SIZE, MIN_NOTIONAL
 - Bybit: GET /v5/market/instruments-info?category=linear&symbol=X
 - OKX: GET /api/v5/public/instruments?instType=SWAP&instId=X
+- Bitget: GET /api/v2/mix/market/contracts?productType=USDT-FUTURES
+- Gate: GET /api/v4/futures/usdt/contracts/X
+- Hyperliquid: POST /info {"type": "meta"}
 """
 
 from __future__ import annotations
@@ -69,6 +72,10 @@ class SymbolRulesCache:
             return await self._fetch_okx(transport, venue_symbol)
         elif venue == Venue.GATE:
             return await self._fetch_gate(transport, venue_symbol)
+        elif venue == Venue.BITGET:
+            return await self._fetch_bitget(transport, venue_symbol)
+        elif venue == Venue.HYPERLIQUID:
+            return await self._fetch_hyperliquid(transport, venue_symbol)
         else:
             return self._spec_fallback(transport, venue_symbol)
 
@@ -273,7 +280,90 @@ class SymbolRulesCache:
             rule_source="gate_contracts",
         )
 
+    async def _fetch_bitget(
+        self, transport: Any, venue_symbol: str,
+    ) -> SymbolRule:
+        metadata = self._symbol_metadata_from_cache(transport, venue_symbol)
+        required_fields = ("sizeMultiplier", "minTradeNum", "minTradeUSDT")
+        if not all(_positive_float(metadata.get(field)) > 0.0 for field in required_fields):
+            try:
+                raw = await transport._public_get(
+                    "/api/v2/mix/market/contracts",
+                    params={"productType": "USDT-FUTURES"},
+                )
+                rows = raw.get("data", raw) if isinstance(raw, dict) else raw
+                rows = rows if isinstance(rows, list) else [rows]
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    row_symbol = str(row.get("symbol", ""))
+                    if not row_symbol:
+                        continue
+                    transport._symbol_metadata[row_symbol] = dict(row)
+                    if row_symbol.upper() == venue_symbol.upper():
+                        metadata = dict(row)
+            except Exception:
+                metadata = {}
+        if not metadata:
+            return self._spec_fallback(transport, venue_symbol)
+
+        spec = transport._spec
+        qty_step = _positive_float(metadata.get("sizeMultiplier"))
+        min_qty = _positive_float(metadata.get("minTradeNum"))
+        min_notional = _positive_float(
+            metadata.get("minTradeUSDT", metadata.get("minTradeUsdt"))
+        )
+        price_place = _non_negative_int(metadata.get("pricePlace"))
+        price_end_step = _positive_float(metadata.get("priceEndStep"))
+        if qty_step <= 0.0 or min_qty <= 0.0 or min_notional <= 0.0:
+            return self._spec_fallback(transport, venue_symbol)
+        tick_size = (
+            price_end_step * (10.0 ** -price_place)
+            if price_place is not None and price_end_step > 0.0
+            else 0.0
+        )
+
+        return SymbolRule(
+            tick_size=tick_size or float(spec.price_tick or 0.0),
+            qty_step=qty_step,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            rule_source="bitget_contracts",
+        )
+
+    async def _fetch_hyperliquid(
+        self, transport: Any, venue_symbol: str,
+    ) -> SymbolRule:
+        try:
+            metadata = await transport._hl_resolve_asset_meta(venue_symbol)
+        except Exception:
+            return self._spec_fallback(transport, venue_symbol)
+
+        try:
+            sz_decimals = int(metadata.get("sz_decimals", 0))
+        except (TypeError, ValueError):
+            return self._spec_fallback(transport, venue_symbol)
+        if sz_decimals < 0:
+            return self._spec_fallback(transport, venue_symbol)
+
+        qty_step = 10.0 ** -sz_decimals
+        spec = transport._spec
+        return SymbolRule(
+            # Hyperliquid price validity is significant-figure based, not a
+            # constant tick. Its submit path uses price_decimals separately.
+            tick_size=0.0,
+            qty_step=qty_step,
+            min_qty=qty_step,
+            min_notional=float(spec.min_notional or 0.0),
+            rule_source="hyperliquid_meta",
+        )
+
     def _gate_metadata_from_cache(
+        self, transport: Any, venue_symbol: str,
+    ) -> dict[str, Any]:
+        return self._symbol_metadata_from_cache(transport, venue_symbol)
+
+    def _symbol_metadata_from_cache(
         self, transport: Any, venue_symbol: str,
     ) -> dict[str, Any]:
         metadata_cache = getattr(transport, "_symbol_metadata", {}) or {}
@@ -324,3 +414,11 @@ def _positive_float(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return parsed if parsed > 0.0 else 0.0
+
+
+def _non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None

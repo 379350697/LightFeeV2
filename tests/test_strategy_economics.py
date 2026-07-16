@@ -2877,6 +2877,113 @@ def test_funding_canary_runtime_supports_non_statement_venues_with_conservative_
     )
 
 
+def test_funding_canary_pairing_clamps_conservative_size_by_more_expensive_leg() -> None:
+    common = {
+        "symbol": "BTCUSDT",
+        "funding_timestamp_ms": 1_000_000,
+        "funding_interval_ms": 28_800_000,
+        "bid_size": 10.0,
+        "ask_size": 10.0,
+        "underlying": "BTC",
+        "quote_currency": "USDT",
+        "contract_type": "linear",
+        "contract_multiplier": 1.0,
+        "mark_index_source": "venue_index",
+        "price_precision": 2,
+        "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
+        "venue_status": "active",
+        "contract_normalization_complete": True,
+    }
+    quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap", bid=99.0, ask=100.0, funding_rate_bps=1.0, **common
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich", bid=110.0, ask=111.0, funding_rate_bps=20.0, **common
+        ),
+    }
+    strategy = StrategyConfig(
+        entry_notional_cap_quote=50.0,
+        live_entry_notional_cap_quote=50.0,
+        funding_missing_margin_fallback_notional_quote=50.0,
+        max_top_book_usage_ratio=1.0,
+        funding_canary_enabled=True,
+        funding_canary_require_account_fee_evidence=False,
+        funding_canary_max_entry_notional_quote=50.0,
+        funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+        funding_canary_conservative_fee_buffer_bps=0.0,
+    )
+
+    candidate = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        strategy=strategy,
+        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
+        observed_at_ms=10,
+    )[0]
+
+    assert candidate.funding_canary_fee_assurance_tier == "conservative"
+    assert candidate.funding_canary_hard_max_entry_notional_quote == 15.0
+    assert candidate.entry_max_leg_notional_quote <= 15.0 + 1e-9
+    assert candidate.entry_notional_quote == pytest.approx(
+        candidate.entry_target_quantity * (100.0 + 110.0) / 2.0
+    )
+    assert candidate.funding_canary_size_constrained is True
+
+
+def test_funding_canary_final_clamp_never_exceeds_cap_under_price_and_step_changes() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_new_entries_enabled=True,
+                funding_canary_enabled=True,
+                funding_canary_require_account_fee_evidence=False,
+                funding_canary_max_entry_notional_quote=50.0,
+                funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+            ),
+            runtime=SimpleNamespace(mode="live"),
+        ),
+        journal=SimpleNamespace(
+            append=lambda kind, payload: events.append((kind, payload))
+        ),
+    )
+    candidate = _candidate(
+        taker_fee_evidence_complete=True,
+        account_fee_evidence_complete=False,
+        entry_target_quantity=1.0,
+    )
+
+    for long_price, short_price, step in (
+        (100.0, 110.0, 0.001),
+        (250.0, 200.0, 0.01),
+        (9_999.0, 10_001.0, 0.0001),
+        (0.25, 0.30, 1.0),
+    ):
+        clamped, reason = dispatch._funding_canary_clamp_quantity(
+            candidate,
+            1_000,
+            quantity=1_000.0,
+            long_price=long_price,
+            short_price=short_price,
+            common_step=step,
+        )
+        assert reason == ""
+        assert clamped <= 1_000.0
+        assert clamped * max(long_price, short_price) <= 15.0 + 1e-9
+        assert candidate.entry_notional_quote == pytest.approx(
+            clamped * (long_price + short_price) / 2.0
+        )
+
+    assert any(kind == "runtime.funding_canary_size_clamped" for kind, _ in events)
+
+
 def test_funding_canary_conservative_gate_prices_mixed_symbol_authority_per_leg(
     tmp_path,
 ) -> None:

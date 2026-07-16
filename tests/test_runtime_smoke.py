@@ -712,6 +712,9 @@ class TestRuntimeLaneScheduling:
         runtime.journal.open()
         try:
             await runtime.tick()
+            background_export = runtime._current_state_export_task
+            if background_export is not None:
+                await background_export
         finally:
             runtime.journal.close()
 
@@ -789,6 +792,9 @@ class TestRuntimeLaneScheduling:
         exported_during_scan: dict[str, object] = {}
 
         async def observe_exported_progress(now_ms_arg: int, *, scan_promoted: bool = False):
+            background_export = runtime._current_state_export_task
+            if background_export is not None:
+                await background_export
             with open(current_state_export_path(config)) as f:
                 exported_during_scan.update(json.load(f))
 

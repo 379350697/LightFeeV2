@@ -86,7 +86,11 @@ def discover_tradeable_candidates(
             reasons.append(BlockReason.FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE)
         if (
             canary_venue_filter_enabled
-            and c.entry_notional_quote
+            and (
+                c.entry_max_leg_notional_quote
+                if c.entry_max_leg_notional_quote > 0.0
+                else c.entry_notional_quote
+            )
             > canary_notional_cap(c, config)
         ):
             reasons.append(BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED)

@@ -1182,6 +1182,81 @@ async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
 
 
 @pytest.mark.asyncio
+async def test_selected_submit_deadline_does_not_wait_for_slow_cancel_cleanup(
+    config, tmp_journal
+):
+    from lightfee.sidecar.snapshot import CandidateInput
+
+    class SlowCancelCleanupExecutor:
+        def __init__(self) -> None:
+            self.cancelled = False
+            self.cleanup_finished = asyncio.Event()
+
+        async def execute(self, _ctx):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                await asyncio.sleep(0.15)
+                self.cleanup_finished.set()
+                raise
+
+    config.strategy.max_concurrent_positions = 8
+    config.strategy.min_scan_minutes_before_funding = 0
+    config.strategy.selected_submit_deadline_ms = 20
+    binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+    bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+    )
+    runtime.journal = tmp_journal
+    executor = SlowCancelCleanupExecutor()
+    runtime.entry_executor = executor
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+
+    now_ms = 1_000_000
+    candidate = CandidateInput(
+        long_venue="binance",
+        short_venue="bybit",
+        symbol="SLOWCANCELUSDT",
+        funding_diff_bps=10.0,
+        funding_edge_bps=8.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=2.0,
+        ranking_edge_bps=8.0,
+        entry_notional_quote=500.0,
+        first_funding_timestamp_ms=now_ms + 300_000,
+        funding_timestamp_ms=now_ms + 300_000,
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0)
+    elapsed_s = loop.time() - started
+
+    cleanup_tasks = (
+        runtime.entry_dispatch_runtime._selected_submit_cancel_cleanup_tasks
+    )
+    assert dispatched is False
+    assert executor.cancelled is True
+    assert elapsed_s < 0.08
+    assert cleanup_tasks
+    records_at_return = runtime.journal.read_all()
+    assert any(
+        record["kind"] == "runtime.entry_selected_submit_deadline_exceeded"
+        for record in records_at_return
+    )
+
+    await asyncio.wait_for(executor.cleanup_finished.wait(), timeout=0.3)
+    await asyncio.sleep(0)
+
+    assert not cleanup_tasks
+    assert runtime.journal.read_all() == records_at_return
+
+
+@pytest.mark.asyncio
 async def test_dispatch_entry_keeps_order_truth_path_when_submit_evidence_exists(
     config, tmp_journal
 ):
@@ -2369,8 +2444,21 @@ class TestPlannerDispatchIntegration:
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1_000
         config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        quantity_metadata = {
+            "min_notional": 10.0,
+            "min_quantity": 0.0001,
+            "quantity_step": 0.0001,
+        }
+        binance = FakeVenueAdapter(
+            Venue.BINANCE,
+            _min_notional_quote=10.0,
+            passive_metadata_payload=quantity_metadata,
+        )
+        okx = FakeVenueAdapter(
+            Venue.OKX,
+            _min_notional_quote=10.0,
+            passive_metadata_payload=quantity_metadata,
+        )
         binance.available_margin_quote = 1_000.0
         okx.available_margin_quote = 1_000.0
         inspected = EntryLeverageEvidence(
@@ -3195,6 +3283,7 @@ class TestPlannerDispatchIntegration:
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
         runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime._entry_wall_clock_now_ms = lambda: 5000
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         candidate = self._candidate()
@@ -3243,6 +3332,7 @@ class TestPlannerDispatchIntegration:
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
         runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime._entry_wall_clock_now_ms = lambda: 5100
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         candidate = self._candidate()
@@ -3309,6 +3399,7 @@ class TestPlannerDispatchIntegration:
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
         runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime._entry_wall_clock_now_ms = lambda: 7001
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         candidate = self._candidate()
@@ -3361,6 +3452,81 @@ class TestPlannerDispatchIntegration:
             if record["kind"] == "runtime.entry_blocked_quote_lease"
         ]
         assert blocked == []
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_rechecks_lease_immediately_before_executor_submit(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        clock = {"now_ms": 5_000}
+        runtime._entry_wall_clock_now_ms = lambda: clock["now_ms"]
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(
+            adapters=adapters,
+            journal=tmp_journal,
+        )
+        candidate = self._candidate()
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5_000,
+                    received_at_ms=5_000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 5_000)
+        assert readiness.allowed
+
+        def expire_during_pre_submit_window(_ctx):
+            clock["now_ms"] = 6_500
+            return None
+
+        monkeypatch.setattr(
+            runtime.entry_dispatch_runtime,
+            "_capture_entry_execution_benchmark_receipt",
+            expire_during_pre_submit_window,
+        )
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5_000,
+            price_hint=12345.0,
+        )
+
+        assert dispatched is False
+        assert binance.last_request is None
+        blocked = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+            and record["payload"].get("source")
+            == "executor_submit_quote_lease"
+        ]
+        assert blocked[-1]["reason"] in {
+            "expired_quote_lease",
+            "expired_final_quote_lease",
+        }
+        assert blocked[-1]["source"] == "executor_submit_quote_lease"
 
     @pytest.mark.asyncio
     async def test_ws_bbo_post_only_guard_uses_quote_lease_age_budget(
@@ -3660,6 +3826,485 @@ class TestPlannerDispatchIntegration:
         assert payload["venue_quantity_steps"]["okx"] == pytest.approx(100.0)
         assert payload["venue_quantity_steps"]["bybit"] == pytest.approx(0.001)
         assert payload["venue_quantity_metadata"]["okx"]["quantity_step"] == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_entry_symbol_rule_converts_gate_contract_grid_to_base_units(
+        self,
+        config,
+        monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        gate = FakeVenueAdapter(Venue.GATE)
+        gate._transport = SimpleNamespace(
+            mode="live",
+            _venue_symbol=lambda symbol: symbol.replace("USDT", "_USDT"),
+        )
+        runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate})
+
+        class RulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert transport is gate._transport
+                assert venue == Venue.GATE
+                assert venue_symbol == "TINY_USDT"
+                return SymbolRule(
+                    tick_size=0.0001,
+                    qty_step=1.0,
+                    min_qty=2.0,
+                    min_notional=7.0,
+                    contract_multiplier=0.01,
+                    rule_source="gate_contracts",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: RulesCache(),
+        )
+
+        evidence = await runtime.entry_dispatch_runtime._entry_symbol_order_metadata(
+            Venue.GATE,
+            "TINYUSDT",
+        )
+
+        assert evidence["missing_fields"] == []
+        assert evidence["source"] == "symbol_rule:gate_contracts"
+        assert evidence["quantity_step"] == pytest.approx(0.01)
+        assert evidence["min_quantity"] == pytest.approx(0.02)
+        assert evidence["min_notional"] == pytest.approx(7.0)
+        assert evidence["contract_step"] == pytest.approx(1.0)
+        assert evidence["contract_multiplier"] == pytest.approx(0.01)
+
+    @pytest.mark.asyncio
+    async def test_symbol_rules_cache_uses_bitget_contract_metadata(self):
+        from lightfee.venues.specs import bitget_spec
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        async def public_get(path, *, params=None):
+            assert path == "/api/v2/mix/market/contracts"
+            assert params == {"productType": "USDT-FUTURES"}
+            return {
+                "data": [
+                    {
+                        "symbol": "TINYUSDT",
+                        "sizeMultiplier": "0.01",
+                        "minTradeNum": "0.02",
+                        "minTradeUSDT": "7",
+                        "pricePlace": "4",
+                        "priceEndStep": "1",
+                    }
+                ]
+            }
+
+        transport = SimpleNamespace(
+            _spec=bitget_spec(),
+            # Startup's compatibility catalog used to retain only these two
+            # fields. Entry rules must refresh the full row, not mistake this
+            # partial cache for complete min-notional/tick evidence.
+            _symbol_metadata={
+                "TINYUSDT": {
+                    "sizeMultiplier": "0.001",
+                    "minTradeNum": "0.001",
+                }
+            },
+            _public_get=public_get,
+        )
+
+        rule = await SymbolRulesCache().get(
+            transport,
+            Venue.BITGET,
+            "TINYUSDT",
+        )
+
+        assert rule.rule_source == "bitget_contracts"
+        assert rule.qty_step == pytest.approx(0.01)
+        assert rule.min_qty == pytest.approx(0.02)
+        assert rule.min_notional == pytest.approx(7.0)
+        assert rule.tick_size == pytest.approx(0.0001)
+
+    @pytest.mark.asyncio
+    async def test_symbol_rules_cache_uses_hyperliquid_size_decimals(self):
+        from lightfee.venues.specs import hyperliquid_spec
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        async def resolve_asset_meta(asset_name):
+            assert asset_name == "BTC"
+            return {
+                "asset_index": 0,
+                "sz_decimals": 5,
+                "price_decimals": 1,
+            }
+
+        transport = SimpleNamespace(
+            _spec=hyperliquid_spec(),
+            _hl_resolve_asset_meta=resolve_asset_meta,
+        )
+
+        rule = await SymbolRulesCache().get(
+            transport,
+            Venue.HYPERLIQUID,
+            "BTC",
+        )
+
+        assert rule.rule_source == "hyperliquid_meta"
+        assert rule.qty_step == pytest.approx(0.00001)
+        assert rule.min_qty == pytest.approx(0.00001)
+        assert rule.min_notional == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_live_entry_invalidates_spec_fallback_and_blocks_first_leg(
+        self,
+        config,
+        monkeypatch,
+    ):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        bybit._transport = SimpleNamespace(
+            mode="live",
+            _venue_symbol=lambda symbol: symbol,
+        )
+        runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+
+        class RulesCache:
+            invalidated = []
+
+            async def get(self, _transport, _venue, _venue_symbol):
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="spec_fallback",
+                )
+
+            def invalidate(self, venue, venue_symbol):
+                self.invalidated.append((venue, venue_symbol))
+
+        rules_cache = RulesCache()
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: rules_cache,
+        )
+
+        evidence = await runtime.entry_dispatch_runtime._entry_symbol_order_metadata(
+            Venue.BYBIT,
+            "NEWUSDT",
+        )
+
+        assert evidence["source"] == "dynamic_symbol_rule_unavailable"
+        assert evidence["missing_fields"] == ["dynamic_symbol_rule"]
+        assert rules_cache.invalidated == [(Venue.BYBIT, "NEWUSDT")]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_dynamic_hedge_minimum_blocks_before_maker_fill(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.sidecar.snapshot import CandidateInput
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        config.strategy.min_entry_leg_notional_quote = 1.0
+        gate = FakeVenueAdapter(Venue.GATE)
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        gate._transport = SimpleNamespace(
+            mode="live",
+            _venue_symbol=lambda symbol: symbol.replace("USDT", "_USDT"),
+        )
+        bybit._transport = SimpleNamespace(
+            mode="live",
+            _venue_symbol=lambda symbol: symbol,
+        )
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.GATE: gate, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+
+        class RulesCache:
+            async def get(self, _transport, venue, _venue_symbol):
+                if venue == Venue.GATE:
+                    return SymbolRule(
+                        tick_size=0.0001,
+                        qty_step=1.0,
+                        min_qty=1.0,
+                        min_notional=1.0,
+                        contract_multiplier=0.01,
+                        rule_source="gate_contracts",
+                    )
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=100.0,
+                    rule_source="instruments-info",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.symbol_rules.get_symbol_rules_cache",
+            lambda: RulesCache(),
+        )
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, _ctx):
+                self.called = True
+                raise AssertionError("dynamic hedge minimum must block first leg")
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+        candidate = CandidateInput(
+            long_venue="gate",
+            short_venue="bybit",
+            symbol="TINYUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=50.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        assert await runtime._dispatch_entry(candidate, 5_000, price_hint=1.0) is False
+        assert executor.called is False
+        blocked = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+            and record["payload"].get("source") == "entry_pair_minimum"
+        ]
+        assert blocked[-1]["reason"] == "entry_pair_minimum_not_met"
+        short_failure = next(
+            failure
+            for failure in blocked[-1]["pair_minimum_failures"]
+            if failure["leg"] == "short"
+        )
+        assert short_failure["min_notional_quote"] == pytest.approx(100.0)
+
+    @pytest.mark.asyncio
+    async def test_passive_canary_resize_rebuilds_l2_for_new_quantity_before_revalidation(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        config.strategy.max_liquidity_snapshot_age_ms = 1_000
+        config.strategy.min_entry_leg_notional_quote = 1.0
+        config.strategy.maker_initial_slice_ratio = 0.2
+        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
+        config.strategy.max_single_venue_exposure_quote = 10_000.0
+        config.strategy.max_symbol_exposure_quote = 10_000.0
+        config.strategy.funding_max_venue_pair_exposure_quote = 10_000.0
+        config.strategy.funding_max_global_gross_exposure_quote = 20_000.0
+        config.strategy.funding_max_settlement_bucket_exposure_quote = 20_000.0
+        config.strategy.funding_max_correlation_group_exposure_quote = 20_000.0
+        quantity_metadata = {
+            "quantity_step": 0.1,
+            "min_quantity": 0.1,
+            "min_notional": 1.0,
+        }
+        binance = FakeVenueAdapter(
+            Venue.BINANCE,
+            passive_metadata_payload=quantity_metadata,
+        )
+        bybit = FakeVenueAdapter(
+            Venue.BYBIT,
+            passive_metadata_payload=quantity_metadata,
+        )
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+        self._install_hot_book(
+            runtime,
+            "binance",
+            "BTCUSDT",
+            bid=99.0,
+            ask=100.0,
+            observed_at_ms=5_000,
+        )
+        self._install_hot_book(
+            runtime,
+            "bybit",
+            "BTCUSDT",
+            bid=101.0,
+            ask=102.0,
+            observed_at_ms=5_000,
+        )
+        candidate = self._binance_bybit_candidate()
+        candidate.entry_target_quantity = 1.0
+        candidate.entry_max_executable_quantity = 1.0
+        candidate.entry_notional_quote = 100.5
+        candidate.economics_observed_at_ms = 5_000
+        initial_lease = QuoteLease(
+            pair_id="BTCUSDT:binance:bybit",
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="bybit",
+            long_bid=99.0,
+            long_ask=100.0,
+            short_bid=101.0,
+            short_ask=102.0,
+            long_observed_at_ms=5_000,
+            short_observed_at_ms=5_000,
+            created_at_ms=5_000,
+            expires_at_ms=6_000,
+            long_buy_vwap=100.0,
+            short_sell_vwap=101.0,
+            long_l2_capacity_quantity=10.0,
+            short_l2_capacity_quantity=10.0,
+            l2_vwap_quantity=1.0,
+            l2_vwap_complete=True,
+        )
+        dispatch = runtime.entry_dispatch_runtime
+        monkeypatch.setattr(dispatch, "_entry_initial_gate_blocked", lambda *_: False)
+        monkeypatch.setattr(
+            dispatch,
+            "_entry_price_resolution",
+            lambda *_: (100.5, 99.0, 101.0, initial_lease),
+        )
+
+        async def fixed_quantity_resolution(**_kwargs):
+            return (
+                1.0,
+                1.0,
+                0.0,
+                0.1,
+                0.1,
+                dict(quantity_metadata),
+                dict(quantity_metadata),
+            )
+
+        monkeypatch.setattr(
+            dispatch,
+            "_resolve_entry_quantity_steps",
+            fixed_quantity_resolution,
+        )
+        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: SimpleNamespace(
+                expected_shortfall_bps=1.0,
+                sample_count=100,
+                return_count=99,
+                history_ms=300_000,
+                confidence=1.0,
+                evidence_complete=True,
+                reason="",
+                model_version="test",
+            )
+        )
+
+        async def leverage_inspection(**_kwargs):
+            return True, {}
+
+        async def margin_resolution(**kwargs):
+            return kwargs["current_quantity"], False
+
+        async def leverage_prepare(**_kwargs):
+            return True, {}
+
+        async def precheck(**_kwargs):
+            return True
+
+        monkeypatch.setattr(
+            dispatch,
+            "_inspect_live_entry_leverage_for_candidate",
+            leverage_inspection,
+        )
+        monkeypatch.setattr(
+            dispatch,
+            "_resolve_live_margin_quantity",
+            margin_resolution,
+        )
+        monkeypatch.setattr(
+            dispatch,
+            "_prepare_live_entry_leverage_for_candidate",
+            leverage_prepare,
+        )
+        monkeypatch.setattr(dispatch, "_precheck_entry_admission", precheck)
+        monkeypatch.setattr(
+            dispatch,
+            "_entry_quote_lease_execution_check",
+            lambda *_: ("", initial_lease, {}),
+        )
+        monkeypatch.setattr(dispatch, "_final_quote_lease_reason", lambda *_: "")
+
+        clamp_calls = 0
+
+        def clamp(_candidate, _now_ms, *, quantity, **_kwargs):
+            nonlocal clamp_calls
+            clamp_calls += 1
+            return (quantity, "") if clamp_calls == 1 else (0.5, "")
+
+        monkeypatch.setattr(dispatch, "_funding_canary_clamp_quantity", clamp)
+        original_l2_builder = dispatch._local_l2_final_quote_lease
+        rebuilt_quantities: list[float] = []
+
+        def rebuilding_l2(candidate_arg, now_ms_arg, *, target_quantity=None):
+            rebuilt_quantities.append(float(target_quantity or 0.0))
+            return original_l2_builder(
+                candidate_arg,
+                now_ms_arg,
+                target_quantity=target_quantity,
+            )
+
+        monkeypatch.setattr(dispatch, "_local_l2_final_quote_lease", rebuilding_l2)
+        revalidations: list[tuple[str, float, float]] = []
+
+        def revalidate(*, quote_lease, required_base_quantity, source, **_kwargs):
+            revalidations.append(
+                (
+                    source,
+                    float(required_base_quantity),
+                    float(getattr(quote_lease, "l2_vwap_quantity", 0.0) or 0.0),
+                )
+            )
+            return True
+
+        monkeypatch.setattr(dispatch, "_revalidate_final_entry_economics", revalidate)
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+        runtime._entry_wall_clock_now_ms = lambda: 5_000
+
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=100.5)
+        assert dispatched is True, [
+            (
+                record["kind"],
+                record["payload"].get("reason"),
+                record["payload"].get("source"),
+            )
+            for record in tmp_journal.read_all()
+        ]
+        assert rebuilt_quantities == [pytest.approx(0.5)]
+        assert (
+            "final_passive_reprice_canary",
+            pytest.approx(0.5),
+            pytest.approx(0.5),
+        ) in revalidations
+        assert executor.ctx is not None
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_allows_hedgeable_plan_when_fill_increment_uses_small_fill_buffer(
@@ -5068,9 +5713,15 @@ class TestPlannerDispatchIntegration:
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
 
         records = runtime.journal.read_all()
-        kinds = [r["kind"] for r in records]
-        # Should be rejected by planner (target_below_min_hedgeable_chunk or similar)
-        assert "runtime.entry_skipped_planner_rejected" in kinds or "runtime.entry_skipped_no_quote" in kinds
+        # Venue minimums are now checked before route construction so the
+        # failure keeps its exact economic meaning instead of being collapsed
+        # into a generic planner rejection.
+        blocked = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "entry.dispatch_viability_blocked"
+        ]
+        assert blocked[-1]["reason"] == "entry_pair_minimum_not_met"
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_skips_no_quote(self, config, tmp_journal):

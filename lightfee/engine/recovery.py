@@ -657,144 +657,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     if isinstance(pend_dict, dict):
         for pend_id, pdata in pend_dict.items():
             if isinstance(pdata, dict):
-                from lightfee.core.domain import Side as DomainSide, Venue
-
-                long_venue_str = str(pdata.get("long_venue", "binance"))
-                short_venue_str = str(pdata.get("short_venue", "okx"))
-                try:
-                    long_venue = Venue.from_str(long_venue_str)
-                except (ValueError, AttributeError):
-                    long_venue = Venue.BINANCE
-                try:
-                    short_venue = Venue.from_str(short_venue_str)
-                except (ValueError, AttributeError):
-                    short_venue = Venue.OKX
-
-                long_side_str = pdata.get("long_side", "buy")
-                short_side_str = pdata.get("short_side", "sell")
-                try:
-                    long_side = DomainSide(long_side_str)
-                except ValueError:
-                    long_side = DomainSide.BUY
-                try:
-                    short_side = DomainSide(short_side_str)
-                except ValueError:
-                    short_side = DomainSide.SELL
-
-                state.pending_entries[pend_id] = PendingEntry(
-                    pending_id=pdata.get("pending_id", pend_id),
-                    symbol=pdata.get("symbol", ""),
-                    long_venue=long_venue,
-                    short_venue=short_venue,
-                    target_quantity=float(pdata.get("target_quantity", 0)),
-                    long_side=long_side,
-                    short_side=short_side,
-                    created_at_ms=int(pdata.get("created_at_ms", 0)),
-                    metadata=pdata.get("metadata", {}),
-                    maker_order_id=str(pdata.get("maker_order_id", "")),
-                    hedge_order_id=str(pdata.get("hedge_order_id", "")),
-                    maker_client_order_id=str(pdata.get("maker_client_order_id", "")),
-                    hedge_client_order_id=str(pdata.get("hedge_client_order_id", "")),
-                    maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
-                    hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
-                    maker_leg_filled_at_ms=int(pdata.get("maker_leg_filled_at_ms", 0) or 0),
-                    hedge_leg_filled_at_ms=int(pdata.get("hedge_leg_filled_at_ms", 0) or 0),
-                    maker_fill_timestamp_quality=str(
-                        pdata.get("maker_fill_timestamp_quality", "") or ""
-                    ),
-                    hedge_fill_timestamp_quality=str(
-                        pdata.get("hedge_fill_timestamp_quality", "") or ""
-                    ),
-                    deadline_ms=int(pdata.get("deadline_ms", 0)),
-                    fallback_route=str(pdata.get("fallback_route", "")),
-                    uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
-                    reconcile_attempt=int(pdata.get("reconcile_attempt", 0)),
-                    reconcile_next_attempt_ms=int(pdata.get("reconcile_next_attempt_ms", 0)),
-                    entry_type=str(pdata.get("entry_type", "")),
-                    maker_price=float(pdata.get("maker_price", 0)),
-                    maker_fill_price=float(pdata.get("maker_fill_price", 0)),
-                    hedge_fill_price=float(pdata.get("hedge_fill_price", 0)),
-                    hedge_inflight=_restore_hedge_inflight(pdata.get("hedge_inflight", "")),
-                    hedge_attempt_count=int(pdata.get("hedge_attempt_count", 0)),
-                    repair_state=str(pdata.get("repair_state", "")),
-                    long_quantity=float(pdata.get("long_quantity", 0)),
-                    short_quantity=float(pdata.get("short_quantity", 0)),
-                    run_id=str(pdata.get("run_id", "")),
-                    entry_route=str(pdata.get("entry_route", "")),
-                    outcome=str(pdata.get("outcome", "")),
-                    opportunity_type=str(pdata.get("opportunity_type", "aligned") or "aligned"),
-                    funding_timestamp_ms=int(pdata.get("funding_timestamp_ms", 0)),
-                    first_funding_timestamp_ms=int(pdata.get("first_funding_timestamp_ms", 0)),
-                    long_funding_timestamp_ms=int(pdata.get("long_funding_timestamp_ms", 0)),
-                    short_funding_timestamp_ms=int(pdata.get("short_funding_timestamp_ms", 0)),
-                    second_funding_timestamp_ms=int(pdata.get("second_funding_timestamp_ms", 0)),
-                    first_funding_leg=str(pdata.get("first_funding_leg", "")),
-                    funding_edge_bps_entry=float(pdata.get("funding_edge_bps_entry", 0.0)),
-                    total_funding_edge_bps_entry=float(pdata.get("total_funding_edge_bps_entry", 0.0)),
-                    expected_edge_bps_entry=float(pdata.get("expected_edge_bps_entry", 0.0)),
-                    worst_case_edge_bps_entry=float(pdata.get("worst_case_edge_bps_entry", 0.0)),
-                    expected_shortfall_bps_entry=float(pdata.get("expected_shortfall_bps_entry", 0.0)),
-                    entry_maker_leg=str(pdata.get("entry_maker_leg", "")),
-                    exit_maker_leg=str(pdata.get("exit_maker_leg", "")),
-                    entry_cross_bps_entry=float(pdata.get("entry_cross_bps_entry", 0.0)),
-                    fee_bps_entry=float(pdata.get("fee_bps_entry", 0.0)),
-                    entry_slippage_bps_entry=float(pdata.get("entry_slippage_bps_entry", 0.0)),
-                    transfer_bias_bps_entry=float(pdata.get("transfer_bias_bps_entry", 0.0)),
-                    transfer_state_at_entry=pdata.get("transfer_state_at_entry"),
-                    entry_liquidity_source_at_entry=pdata.get("entry_liquidity_source_at_entry"),
-                    long_volume_24h_quote_at_entry=float(pdata.get("long_volume_24h_quote_at_entry", 0.0)),
-                    short_volume_24h_quote_at_entry=float(pdata.get("short_volume_24h_quote_at_entry", 0.0)),
-                    long_open_interest_quote_at_entry=float(pdata.get("long_open_interest_quote_at_entry", 0.0)),
-                    short_open_interest_quote_at_entry=float(pdata.get("short_open_interest_quote_at_entry", 0.0)),
-                    long_entry_vwap=pdata.get("long_entry_vwap"),
-                    short_entry_vwap=pdata.get("short_entry_vwap"),
-                    entry_capacity_constrained=bool(pdata.get("entry_capacity_constrained", False)),
-                    entry_target_quantity=float(pdata.get("entry_target_quantity", 0.0)),
-                    long_max_executable_quantity=float(pdata.get("long_max_executable_quantity", 0.0)),
-                    short_max_executable_quantity=float(pdata.get("short_max_executable_quantity", 0.0)),
-                    entry_max_executable_quantity=float(pdata.get("entry_max_executable_quantity", 0.0)),
-                    entry_depth_shortfall_quantity=float(pdata.get("entry_depth_shortfall_quantity", 0.0)),
-                    entry_max_executable_notional_quote=float(pdata.get("entry_max_executable_notional_quote", 0.0)),
-                    entry_depth_capped_at_entry=bool(pdata.get("entry_depth_capped_at_entry", False)),
-                    advisories=list(pdata.get("advisories", [])),
-                    blocked_reasons=list(pdata.get("blocked_reasons", [])),
-                    exit_after_first_stage=bool(pdata.get("exit_after_first_stage", False)),
-                    phase_state=PendingEntryPassivePhaseState.from_dict(
-                        pdata.get("phase_state")
-                    ),
-                    passive_manager_runtime=PassiveOrderManagerRuntime.from_dict(
-                        pdata.get("passive_manager_runtime")
-                    ),
-                    created_cycle=int(pdata.get("created_cycle", 0) or 0),
-                    repost_attempt_count=int(
-                        pdata.get(
-                            "repost_attempt_count",
-                            pdata.get("repost_count", 0),
-                        ) or 0
-                    ),
-                    passive_attempt_count=int(pdata.get("passive_attempt_count", 0) or 0),
-                    passive_ops_total=int(pdata.get("passive_ops_total", 0) or 0),
-                    maker_remainder_slices=[
-                        PendingEntryRemainderSlice.from_dict(item)
-                        for item in list(pdata.get("maker_remainder_slices", []) or [])
-                    ],
-                    lifetime_exhausted_logged_final_reason=pdata.get(
-                        "lifetime_exhausted_logged_final_reason"
-                    ),
-                    frozen_candidate=(
-                        dict(pdata.get("frozen_candidate"))
-                        if isinstance(pdata.get("frozen_candidate"), dict)
-                        else None
-                    ),
-                    repost_count=int(pdata.get("repost_count", 0)),
-                    zero_fill_since_ms=int(pdata.get("zero_fill_since_ms", 0)),
-                    maker_leg=str(pdata.get("maker_leg", "long")),
-                    passive_order=PendingPassiveOrder.from_dict(
-                        pdata.get("passive_order")
-                    ),
-                    next_progress_poll_ms=int(
-                        pdata.get("next_progress_poll_ms", 0) or 0
-                    ),
+                state.pending_entries[pend_id] = PendingEntry.from_dict(
+                    pdata,
+                    pending_id=str(pend_id),
                 )
 
     # Restore pending closes
@@ -939,7 +804,10 @@ def _apply_journal_replay_to_state(
                 state.open_positions[pid] = _deserialize_open_position(payload)
 
         # V1: entry.pending_registered — recreate pending entry from journal
-        elif kind == "entry.pending_registered":
+        elif kind in (
+            "entry.pending_registered",
+            "runtime.pending_entry_registered",
+        ):
             pid = (
                 payload.get("position_id")
                 or payload.get("pending_id")
@@ -950,6 +818,155 @@ def _apply_journal_replay_to_state(
                 pe = _restore_pending_entry_from_journal(payload)
                 if pe is not None:
                     state.pending_entries[pid] = pe
+
+        elif kind == "pending_entry.hedge_submit_attempt":
+            pid = str(payload.get("entry_id") or payload.get("pending_id") or "")
+            pending = state.pending_entries.get(pid)
+            if pending is not None:
+                attempt = int(payload.get("hedge_attempt", 0) or 0)
+                client_order_id = str(
+                    payload.get("hedge_client_order_id") or ""
+                )
+                try:
+                    venue = Venue.from_str(str(payload.get("hedge_venue") or ""))
+                except (AttributeError, ValueError):
+                    venue = pending.hedge_venue()
+                try:
+                    side = Side(str(payload.get("hedge_side") or ""))
+                except ValueError:
+                    side = pending.hedge_side()
+                pending.hedge_attempt_count = max(
+                    int(pending.hedge_attempt_count or 0),
+                    attempt,
+                )
+                if client_order_id:
+                    pending.hedge_client_order_id = client_order_id
+                    pending.hedge_inflight = HedgeInflight(
+                        client_order_id=client_order_id,
+                        venue=venue,
+                        side=side,
+                        quantity=float(payload.get("hedge_quantity", 0.0) or 0.0),
+                        attempt=attempt,
+                        submitted_at_ms=int(
+                            payload.get("submitted_at_ms")
+                            or record.get("ts_ms")
+                            or 0
+                        ),
+                    )
+
+        elif kind == "pending_entry.hedge_submit_result":
+            pid = str(payload.get("entry_id") or payload.get("pending_id") or "")
+            pending = state.pending_entries.get(pid)
+            if pending is not None:
+                attempt = int(payload.get("hedge_attempt", 0) or 0)
+                pending.hedge_attempt_count = max(
+                    int(pending.hedge_attempt_count or 0),
+                    attempt,
+                )
+                client_order_id = str(
+                    payload.get("hedge_client_order_id") or ""
+                )
+                if client_order_id:
+                    pending.hedge_client_order_id = client_order_id
+                outcome = str(payload.get("outcome") or "")
+                explicit_clear = payload.get("clear_hedge_inflight") is True
+                if outcome == "filled":
+                    restored_total = float(
+                        payload.get("hedge_leg_filled", 0.0) or 0.0
+                    )
+                    if restored_total > 0.0:
+                        pending.hedge_leg_filled = max(
+                            pending.hedge_leg_filled,
+                            restored_total,
+                        )
+                    pending.hedge_fill_price = float(
+                        payload.get("hedge_fill_price", pending.hedge_fill_price)
+                        or pending.hedge_fill_price
+                    )
+                    pending.hedge_order_id = str(
+                        payload.get("hedge_order_id")
+                        or payload.get("order_id")
+                        or pending.hedge_order_id
+                    )
+                    pending.hedge_inflight = None
+                elif outcome == "zero_fill" or (
+                    outcome == "error" and payload.get("is_rejected") is True
+                ) or explicit_clear:
+                    pending.hedge_inflight = None
+                repair_state = str(payload.get("repair_state") or "")
+                if repair_state:
+                    pending.repair_state = repair_state
+
+        elif kind == "pending_entry.hedge_admission_blocked":
+            pid = str(payload.get("entry_id") or payload.get("pending_id") or "")
+            pending = state.pending_entries.get(pid)
+            if pending is not None:
+                attempt = int(payload.get("hedge_attempt", 0) or 0)
+                pending.hedge_attempt_count = max(
+                    int(pending.hedge_attempt_count or 0),
+                    attempt,
+                )
+                client_order_id = str(
+                    payload.get("hedge_client_order_id") or ""
+                )
+                if client_order_id:
+                    pending.hedge_client_order_id = client_order_id
+                pending.hedge_inflight = None
+                repair_state = str(payload.get("repair_state") or "")
+                if not repair_state:
+                    reason = str(payload.get("reason") or "unknown")
+                    repair_prefix = (
+                        "single_leg_exposure_recovery"
+                        if payload.get("cleanup_action")
+                        == "single_leg_exposure_recovery"
+                        or payload.get("venue_private_health_status")
+                        else "hedge_admission_blocked"
+                    )
+                    repair_state = f"{repair_prefix}:{reason}"
+                pending.repair_state = repair_state
+
+        elif kind in (
+            "pending_entry.removed_by_v1_lifecycle_closure",
+            "entry.aborted",
+            "pending_entry.terminalized_after_single_leg_recovery",
+        ):
+            pid = str(payload.get("entry_id") or payload.get("pending_id") or "")
+            if pid:
+                # The persisted terminal event is the replay-time terminality
+                # proof.  Keep removal behind the same single authority used
+                # by live runtime paths instead of mutating the mapping here.
+                replay_terminal_decision = PendingEntryTerminalDecision(
+                    outcome="journal_terminal_event_replayed",
+                    reason=kind,
+                    terminal=True,
+                    allows_pending_removal=True,
+                    healthy=True,
+                )
+                PendingEntryTerminalizer.remove_if_allowed(
+                    state.pending_entries,
+                    pid,
+                    replay_terminal_decision,
+                )
+
+        elif kind == "recovery.hedge_submit_error":
+            pid = str(payload.get("entry_id") or payload.get("pending_id") or "")
+            pending = state.pending_entries.get(pid)
+            if pending is not None:
+                attempt = int(payload.get("hedge_attempt", 0) or 0)
+                pending.hedge_attempt_count = max(
+                    int(pending.hedge_attempt_count or 0),
+                    attempt,
+                )
+                client_order_id = str(
+                    payload.get("hedge_client_order_id") or ""
+                )
+                if client_order_id:
+                    pending.hedge_client_order_id = client_order_id
+                if (
+                    payload.get("is_rejected") is True
+                    or payload.get("clear_hedge_inflight") is True
+                ):
+                    pending.hedge_inflight = None
 
         elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
             pid = payload.get("position_id", "")
@@ -1045,132 +1062,55 @@ def _apply_journal_replay_to_state(
 
 
 def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
-    """V1: restore PendingEntry from journal replay payload."""
+    """Restore current and legacy registration events through one decoder."""
+
     try:
-        def venue_from(value: Any, default: Venue) -> Venue:
-            if isinstance(value, Venue):
-                return value
-            try:
-                return Venue.from_str(str(value))
-            except (ValueError, AttributeError, TypeError):
-                return default
-
-        def side_from(value: Any, default: Side) -> Side:
-            if isinstance(value, Side):
-                return value
-            try:
-                return Side(str(value).strip().lower())
-            except (ValueError, TypeError):
-                return default
-
-        def float_from(value: Any, default: float = 0.0) -> float:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        def int_from(value: Any, default: int = 0) -> int:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return default
-
-        long_venue = venue_from(
-            payload.get("long_venue", payload.get("maker_venue", "binance")),
-            Venue.BINANCE,
-        )
-        short_venue = venue_from(
-            payload.get("short_venue", payload.get("hedge_venue", "okx")),
-            Venue.OKX,
-        )
-        long_side = side_from(payload.get("long_side", "buy"), Side.BUY)
-        short_side = side_from(payload.get("short_side", "sell"), Side.SELL)
-        maker_venue = venue_from(payload.get("maker_venue", long_venue), long_venue)
-        maker_leg = str(
-            payload.get("maker_leg", payload.get("entry_maker_leg", "")) or ""
-        ).lower()
-        if maker_leg not in ("long", "short"):
-            maker_leg = "short" if maker_venue == short_venue else "long"
-        hedge_venue = short_venue if maker_leg == "long" else long_venue
-        hedge_side = short_side if maker_leg == "long" else long_side
-
-        target_quantity = float_from(payload.get("target_quantity"), 0.0)
-        if target_quantity <= 0.0:
-            target_quantity = max(
-                float_from(payload.get("long_quantity"), 0.0),
-                float_from(payload.get("short_quantity"), 0.0),
-            )
-
-        hedge_inflight = None
-        hi_data = payload.get("hedge_inflight")
-        if isinstance(hi_data, dict):
-            hedge_inflight = HedgeInflight(
-                client_order_id=str(hi_data.get("client_order_id", "")),
-                venue=venue_from(hi_data.get("venue", hedge_venue), hedge_venue),
-                side=side_from(hi_data.get("side", hedge_side.value), hedge_side),
-                quantity=float_from(hi_data.get("quantity"), 0.0),
-                attempt=int_from(hi_data.get("attempt"), 0),
-                submitted_at_ms=int_from(hi_data.get("submitted_at_ms"), 0),
-                soft_deadline_logged=bool(hi_data.get("soft_deadline_logged", False)),
-            )
-        elif hi_data:
-            hedge_inflight = HedgeInflight(
-                client_order_id=str(hi_data),
-                venue=hedge_venue,
-                side=hedge_side,
-                quantity=0.0,
-            )
-
+        normalized = dict(payload)
         pending_id = str(
-            payload.get("pending_id")
-            or payload.get("position_id")
-            or payload.get("entry_id")
+            normalized.get("pending_id")
+            or normalized.get("position_id")
+            or normalized.get("entry_id")
             or ""
         )
-        metadata = payload.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
+        if not pending_id:
+            return None
 
-        return PendingEntry(
-            pending_id=pending_id,
-            symbol=str(payload.get("symbol", "")),
-            long_venue=long_venue,
-            short_venue=short_venue,
-            target_quantity=target_quantity,
-            long_side=long_side,
-            short_side=short_side,
-            created_at_ms=int_from(payload.get("created_at_ms"), 0),
-            metadata=metadata,
-            maker_order_id=str(payload.get("maker_order_id", "")),
-            hedge_order_id=str(payload.get("hedge_order_id", "")),
-            maker_client_order_id=str(payload.get("maker_client_order_id", "")),
-            hedge_client_order_id=str(payload.get("hedge_client_order_id", "")),
-            maker_leg_filled=float_from(payload.get("maker_leg_filled"), 0.0),
-            hedge_leg_filled=float_from(payload.get("hedge_leg_filled"), 0.0),
-            deadline_ms=int_from(payload.get("deadline_ms"), 0),
-            fallback_route=str(payload.get("fallback_route", "")),
-            uncertain_outcome=bool(payload.get("uncertain_outcome", False)),
-            reconcile_attempt=int_from(payload.get("reconcile_attempt"), 0),
-            reconcile_next_attempt_ms=int_from(payload.get("reconcile_next_attempt_ms"), 0),
-            entry_type=str(payload.get("entry_type", "")),
-            maker_price=float_from(payload.get("maker_price"), 0.0),
-            long_quantity=float_from(payload.get("long_quantity"), target_quantity),
-            short_quantity=float_from(payload.get("short_quantity"), target_quantity),
-            run_id=str(payload.get("run_id", "")),
-            entry_route=str(payload.get("entry_route", "")),
-            outcome=str(payload.get("outcome", "")),
-            opportunity_type=str(
-                payload.get("opportunity_type", "aligned") or "aligned"
-            ),
-            maker_leg=maker_leg,
-            hedge_inflight=hedge_inflight,
-            hedge_attempt_count=int_from(payload.get("hedge_attempt_count"), 0),
-            maker_fill_price=float_from(payload.get("maker_fill_price"), 0.0),
-            hedge_fill_price=float_from(payload.get("hedge_fill_price"), 0.0),
+        # Pre-contract V1 events described the maker/hedge legs instead of the
+        # canonical long/short pair.  Adapt only their field names here; the
+        # actual object construction and defaults remain PendingEntry.from_dict.
+        normalized.setdefault(
+            "long_venue",
+            normalized.get("maker_venue", Venue.BINANCE.value),
         )
-    except Exception:
-        return None
+        normalized.setdefault(
+            "short_venue",
+            normalized.get("hedge_venue", Venue.OKX.value),
+        )
+        normalized.setdefault("long_side", Side.BUY.value)
+        normalized.setdefault("short_side", Side.SELL.value)
+        target_quantity = float(normalized.get("target_quantity", 0.0) or 0.0)
+        if target_quantity <= 0.0:
+            target_quantity = max(
+                float(normalized.get("long_quantity", 0.0) or 0.0),
+                float(normalized.get("short_quantity", 0.0) or 0.0),
+            )
+        normalized["target_quantity"] = target_quantity
+        normalized.setdefault("long_quantity", target_quantity)
+        normalized.setdefault("short_quantity", target_quantity)
 
+        maker_leg = str(
+            normalized.get("maker_leg")
+            or normalized.get("entry_maker_leg")
+            or ""
+        ).lower()
+        if maker_leg not in {"long", "short"}:
+            maker_venue = str(normalized.get("maker_venue") or "")
+            short_venue = str(normalized.get("short_venue") or "")
+            maker_leg = "short" if maker_venue == short_venue else "long"
+        normalized["maker_leg"] = maker_leg
+        return PendingEntry.from_dict(normalized, pending_id=pending_id)
+    except (TypeError, ValueError):
+        return None
 
 def recover_from_snapshot(
     snapshot_store: SnapshotStore,
@@ -1352,105 +1292,10 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
         for pid, pos in state.open_positions.items()
     }
 
-    # Add pending entry details
+    # Pending entries use the authoritative PendingEntry wire contract.
     view["pending_entries"] = {
-        pid: {
-            "pending_id": p.pending_id,
-            "symbol": p.symbol,
-            "long_venue": p.long_venue.value if hasattr(p.long_venue, "value") else str(p.long_venue),
-            "short_venue": p.short_venue.value if hasattr(p.short_venue, "value") else str(p.short_venue),
-            "target_quantity": p.target_quantity,
-            "long_side": p.long_side.value if hasattr(p.long_side, "value") else str(p.long_side),
-            "short_side": p.short_side.value if hasattr(p.short_side, "value") else str(p.short_side),
-            "created_at_ms": p.created_at_ms,
-            "metadata": p.metadata,
-            "maker_order_id": p.maker_order_id,
-            "hedge_order_id": p.hedge_order_id,
-            "maker_client_order_id": p.maker_client_order_id,
-            "hedge_client_order_id": p.hedge_client_order_id,
-            "maker_leg_filled": p.maker_leg_filled,
-            "hedge_leg_filled": p.hedge_leg_filled,
-            "maker_leg_filled_at_ms": p.maker_leg_filled_at_ms,
-            "hedge_leg_filled_at_ms": p.hedge_leg_filled_at_ms,
-            "maker_fill_timestamp_quality": p.maker_fill_timestamp_quality,
-            "hedge_fill_timestamp_quality": p.hedge_fill_timestamp_quality,
-            "deadline_ms": p.deadline_ms,
-            "fallback_route": p.fallback_route,
-            "uncertain_outcome": p.uncertain_outcome,
-            "reconcile_attempt": p.reconcile_attempt,
-            "reconcile_next_attempt_ms": p.reconcile_next_attempt_ms,
-            "entry_type": p.entry_type,
-            "maker_price": p.maker_price,
-            "maker_fill_price": p.maker_fill_price,
-            "hedge_fill_price": p.hedge_fill_price,
-            "hedge_inflight": p.hedge_inflight.to_dict() if p.hedge_inflight else "",
-            "hedge_attempt_count": p.hedge_attempt_count,
-            "repair_state": p.repair_state,
-            "maker_leg": p.maker_leg,
-            "long_quantity": p.long_quantity,
-            "short_quantity": p.short_quantity,
-            "run_id": p.run_id,
-            "entry_route": p.entry_route,
-            "outcome": p.outcome,
-            "opportunity_type": p.opportunity_type,
-            "funding_timestamp_ms": p.funding_timestamp_ms,
-            "first_funding_timestamp_ms": p.first_funding_timestamp_ms,
-            "long_funding_timestamp_ms": p.long_funding_timestamp_ms,
-            "short_funding_timestamp_ms": p.short_funding_timestamp_ms,
-            "second_funding_timestamp_ms": p.second_funding_timestamp_ms,
-            "first_funding_leg": p.first_funding_leg,
-            "funding_edge_bps_entry": p.funding_edge_bps_entry,
-            "total_funding_edge_bps_entry": p.total_funding_edge_bps_entry,
-            "expected_edge_bps_entry": p.expected_edge_bps_entry,
-            "worst_case_edge_bps_entry": p.worst_case_edge_bps_entry,
-            "expected_shortfall_bps_entry": p.expected_shortfall_bps_entry,
-            "entry_maker_leg": p.entry_maker_leg,
-            "exit_maker_leg": p.exit_maker_leg,
-            "entry_cross_bps_entry": p.entry_cross_bps_entry,
-            "fee_bps_entry": p.fee_bps_entry,
-            "entry_slippage_bps_entry": p.entry_slippage_bps_entry,
-            "transfer_bias_bps_entry": p.transfer_bias_bps_entry,
-            "transfer_state_at_entry": p.transfer_state_at_entry,
-            "entry_liquidity_source_at_entry": p.entry_liquidity_source_at_entry,
-            "long_volume_24h_quote_at_entry": p.long_volume_24h_quote_at_entry,
-            "short_volume_24h_quote_at_entry": p.short_volume_24h_quote_at_entry,
-            "long_open_interest_quote_at_entry": p.long_open_interest_quote_at_entry,
-            "short_open_interest_quote_at_entry": p.short_open_interest_quote_at_entry,
-            "long_entry_vwap": p.long_entry_vwap,
-            "short_entry_vwap": p.short_entry_vwap,
-            "entry_capacity_constrained": p.entry_capacity_constrained,
-            "entry_target_quantity": p.entry_target_quantity,
-            "long_max_executable_quantity": p.long_max_executable_quantity,
-            "short_max_executable_quantity": p.short_max_executable_quantity,
-            "entry_max_executable_quantity": p.entry_max_executable_quantity,
-            "entry_depth_shortfall_quantity": p.entry_depth_shortfall_quantity,
-            "entry_max_executable_notional_quote": p.entry_max_executable_notional_quote,
-            "entry_depth_capped_at_entry": p.entry_depth_capped_at_entry,
-            "advisories": p.advisories,
-            "blocked_reasons": p.blocked_reasons,
-            "exit_after_first_stage": p.exit_after_first_stage,
-            "phase_state": p.phase_state.to_dict() if p.phase_state else None,
-            "passive_manager_runtime": (
-                p.passive_manager_runtime.to_dict()
-                if hasattr(p.passive_manager_runtime, "to_dict")
-                else {}
-            ),
-            "created_cycle": p.created_cycle,
-            "repost_attempt_count": p.repost_attempt_count,
-            "passive_attempt_count": p.passive_attempt_count,
-            "passive_ops_total": p.passive_ops_total,
-            "maker_remainder_slices": [
-                item.to_dict() if hasattr(item, "to_dict") else dict(item)
-                for item in p.maker_remainder_slices
-            ],
-            "lifetime_exhausted_logged_final_reason": p.lifetime_exhausted_logged_final_reason,
-            "frozen_candidate": p.frozen_candidate,
-            "repost_count": p.repost_count,
-            "zero_fill_since_ms": p.zero_fill_since_ms,
-            "passive_order": p.passive_order.to_dict() if p.passive_order else None,
-            "next_progress_poll_ms": p.next_progress_poll_ms,
-        }
-        for pid, p in state.pending_entries.items()
+        pid: pending.to_dict()
+        for pid, pending in state.pending_entries.items()
     }
 
     # Add pending close details

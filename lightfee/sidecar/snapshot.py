@@ -8,8 +8,8 @@ from math import isfinite
 from typing import Callable, Optional
 
 
-SNAPSHOT_SCHEMA_VERSION = 4
-LEGACY_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+SNAPSHOT_SCHEMA_VERSION = 5
+LEGACY_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
 _V3_SOURCE_MODES = {
     "coarse_sidecar",
     "direct_market",
@@ -25,8 +25,13 @@ _V3_ACQUISITION_MODES = {
 }
 
 
-def validate_v4_snapshot_contract(raw: object) -> list[str]:
-    """Return fail-closed proof-contract violations for a schema-v4 snapshot."""
+def _validate_snapshot_contract(
+    raw: object,
+    *,
+    expected_schema_version: int,
+    require_open_interest_proof: bool,
+) -> list[str]:
+    """Return fail-closed proof-contract violations for a typed snapshot."""
     if not isinstance(raw, dict):
         return ["root_not_object"]
     required_fields = {
@@ -51,7 +56,7 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
         f"missing:{contract_field}"
         for contract_field in sorted(required_fields - raw.keys())
     ]
-    if raw.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+    if raw.get("schema_version") != expected_schema_version:
         errors.append("schema_version_unsupported")
 
     def _nonnegative_int(value: object, *, positive: bool = False) -> bool:
@@ -339,7 +344,13 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
         if not isinstance(key, str) or not isinstance(quote, dict):
             errors.append("quote_shape_invalid")
             continue
-        errors.extend(_quote_field_contract_errors(quote, key=key))
+        errors.extend(
+            _quote_field_contract_errors(
+                quote,
+                key=key,
+                require_open_interest_proof=require_open_interest_proof,
+            )
+        )
         venue = quote.get("venue")
         symbol = quote.get("symbol")
         bid = quote.get("bid")
@@ -733,6 +744,24 @@ def validate_v4_snapshot_contract(raw: object) -> list[str]:
     return errors
 
 
+def validate_v4_snapshot_contract(raw: object) -> list[str]:
+    """Validate the legacy V4 proof contract without granting OI trust."""
+    return _validate_snapshot_contract(
+        raw,
+        expected_schema_version=4,
+        require_open_interest_proof=False,
+    )
+
+
+def validate_v5_snapshot_contract(raw: object) -> list[str]:
+    """Validate V5, including independent open-interest proof fields."""
+    return _validate_snapshot_contract(
+        raw,
+        expected_schema_version=5,
+        require_open_interest_proof=True,
+    )
+
+
 class SnapshotFreshness(Enum):
     """V1 snapshot freshness states (CONTRACT OPP-001).
 
@@ -842,9 +871,18 @@ class QuoteSnapshot:
     mark_price: float = 0.0
     index_price: float = 0.0
     volume_24h_quote: float = 0.0
-    open_interest: float = 0.0
-    open_interest_evidence_status: str = "available"
+    open_interest: float | None = None
+    open_interest_evidence_status: str = "unavailable"
     open_interest_evidence_reason: str = ""
+    open_interest_observed_at_ms: int = 0
+    open_interest_received_at_ms: int = 0
+    open_interest_source: str = ""
+    open_interest_sample_id: str = ""
+    open_interest_venue_symbol: str = ""
+    raw_open_interest: float | None = None
+    raw_open_interest_unit: str = ""
+    open_interest_contract_multiplier: float | None = None
+    open_interest_conversion_mark_price: float | None = None
     oi_candidate_count: int = 0
     oi_cache_hit_count: int = 0
     oi_cache_miss_count: int = 0
@@ -880,6 +918,7 @@ def _quote_field_contract_errors(
     quote: dict[str, object],
     *,
     key: str,
+    require_open_interest_proof: bool = False,
 ) -> list[str]:
     """Strictly type-check every raw V4 quote field consumed downstream.
 
@@ -905,7 +944,6 @@ def _quote_field_contract_errors(
         "mark_price",
         "index_price",
         "volume_24h_quote",
-        "open_interest",
         "contract_multiplier",
         "price_tick",
         "quantity_step_base",
@@ -915,6 +953,10 @@ def _quote_field_contract_errors(
     optional_finite_fields = {
         "predicted_funding_rate_bps",
         "settled_funding_rate_bps",
+        "open_interest",
+        "raw_open_interest",
+        "open_interest_contract_multiplier",
+        "open_interest_conversion_mark_price",
     }
     nonnegative_fields = {
         "bid_size",
@@ -941,6 +983,8 @@ def _quote_field_contract_errors(
         "oi_deferred_count",
         "oi_timeout_count",
         "oi_refresh_elapsed_ms",
+        "open_interest_observed_at_ms",
+        "open_interest_received_at_ms",
         "price_precision",
         "quantity_precision",
     }
@@ -957,6 +1001,10 @@ def _quote_field_contract_errors(
         "funding_forecast_stability_reason",
         "open_interest_evidence_status",
         "open_interest_evidence_reason",
+        "open_interest_source",
+        "open_interest_sample_id",
+        "open_interest_venue_symbol",
+        "raw_open_interest_unit",
         "underlying",
         "quote_currency",
         "contract_type",
@@ -995,6 +1043,102 @@ def _quote_field_contract_errors(
     for field_name in string_fields:
         if field_name in quote and type(quote[field_name]) is not str:
             errors.append(f"quote_field_type_invalid:{key}:{field_name}")
+
+    if require_open_interest_proof:
+        required_oi_fields = {
+            "open_interest",
+            "open_interest_evidence_status",
+            "open_interest_evidence_reason",
+            "open_interest_observed_at_ms",
+            "open_interest_received_at_ms",
+            "open_interest_source",
+            "open_interest_sample_id",
+            "open_interest_venue_symbol",
+            "raw_open_interest",
+            "raw_open_interest_unit",
+            "open_interest_contract_multiplier",
+            "open_interest_conversion_mark_price",
+        }
+        for field_name in sorted(required_oi_fields - quote.keys()):
+            errors.append(f"quote_oi_proof_missing:{key}:{field_name}")
+        from lightfee.marketdata.open_interest import (
+            normalize_open_interest_status,
+            open_interest_sample_id,
+        )
+
+        status = normalize_open_interest_status(
+            quote.get("open_interest_evidence_status", "unavailable")
+        )
+        if status == "observed":
+            observed_valid = bool(
+                type(quote.get("open_interest")) in (int, float)
+                and isfinite(float(quote.get("open_interest")))
+                and float(quote.get("open_interest")) >= 0.0
+                and type(quote.get("raw_open_interest")) in (int, float)
+                and isfinite(float(quote.get("raw_open_interest")))
+                and float(quote.get("raw_open_interest")) >= 0.0
+                and type(quote.get("open_interest_observed_at_ms")) is int
+                and int(quote.get("open_interest_observed_at_ms", 0)) > 0
+                and type(quote.get("open_interest_received_at_ms")) is int
+                and int(quote.get("open_interest_received_at_ms", 0))
+                >= int(quote.get("open_interest_observed_at_ms", 0))
+                and isinstance(quote.get("open_interest_source"), str)
+                and bool(str(quote.get("open_interest_source", "")).strip())
+                and isinstance(quote.get("open_interest_sample_id"), str)
+                and bool(str(quote.get("open_interest_sample_id", "")).strip())
+                and isinstance(quote.get("open_interest_venue_symbol"), str)
+                and bool(str(quote.get("open_interest_venue_symbol", "")).strip())
+                and isinstance(quote.get("raw_open_interest_unit"), str)
+                and bool(str(quote.get("raw_open_interest_unit", "")).strip())
+            )
+            if not observed_valid:
+                errors.append(f"quote_oi_observed_proof_invalid:{key}")
+            else:
+                raw_unit = str(quote.get("raw_open_interest_unit") or "")
+                raw_value = float(quote.get("raw_open_interest"))
+                value_quote = float(quote.get("open_interest"))
+                multiplier_raw = quote.get("open_interest_contract_multiplier")
+                mark_raw = quote.get("open_interest_conversion_mark_price")
+                expected_quote: float | None = None
+                if raw_unit == "quote":
+                    expected_quote = raw_value
+                elif raw_unit == "base":
+                    if (
+                        type(mark_raw) in (int, float)
+                        and isfinite(float(mark_raw))
+                        and float(mark_raw) > 0.0
+                    ):
+                        expected_quote = raw_value * float(mark_raw)
+                elif raw_unit == "contracts":
+                    if (
+                        type(multiplier_raw) in (int, float)
+                        and isfinite(float(multiplier_raw))
+                        and float(multiplier_raw) > 0.0
+                        and type(mark_raw) in (int, float)
+                        and isfinite(float(mark_raw))
+                        and float(mark_raw) > 0.0
+                    ):
+                        expected_quote = (
+                            raw_value * float(multiplier_raw) * float(mark_raw)
+                        )
+                if expected_quote is None or abs(value_quote - expected_quote) > max(
+                    1e-6,
+                    abs(expected_quote or 0.0) * 1e-9,
+                ):
+                    errors.append(f"quote_oi_economic_identity_invalid:{key}")
+                expected_sample_id = open_interest_sample_id(
+                    venue=str(quote.get("venue") or ""),
+                    canonical_symbol=str(quote.get("symbol") or ""),
+                    venue_symbol=str(quote.get("open_interest_venue_symbol") or ""),
+                    observed_at_ms=int(quote.get("open_interest_observed_at_ms") or 0),
+                    source=str(quote.get("open_interest_source") or ""),
+                    raw_value=raw_value,
+                    value_quote=value_quote,
+                )
+                if str(quote.get("open_interest_sample_id") or "") != expected_sample_id:
+                    errors.append(f"quote_oi_sample_id_invalid:{key}")
+        elif quote.get("open_interest") is not None:
+            errors.append(f"quote_oi_untrusted_value_present:{key}")
 
     for depth_field in ("bid_depth", "ask_depth"):
         if depth_field not in quote:
@@ -1116,6 +1260,14 @@ class CandidateInput:
     long_venue_index: int = 0
     short_venue_index: int = 0
     entry_notional_quote: float = 0.0
+    # V1 keeps the matched pair notional on the average executable price.
+    # A canary cap is instead a per-leg safety invariant and therefore uses
+    # the more expensive leg; never overload one field with both meanings.
+    entry_max_leg_notional_quote: float = 0.0
+    funding_canary_fee_assurance_tier: str = "unavailable"
+    funding_canary_hard_max_entry_notional_quote: float = 0.0
+    funding_canary_size_constrained: bool = False
+    candidate_revision_id: str = ""
     # V1 parity fields (CONTRACT OPP-002: candidate identity + prewarm)
     pair_id: str = ""
     funding_timestamp_ms: int = 0

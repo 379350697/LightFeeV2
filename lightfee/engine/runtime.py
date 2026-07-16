@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
 import sys
 from collections import Counter
+from contextlib import suppress
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
@@ -33,6 +36,7 @@ from lightfee.engine.bybit_duplicate_reconcile import (
 from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.execution_planner import min_hedgeable_chunk_from_notional
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.funding_risk_runtime import FundingRiskRuntime
 from lightfee.engine.reconciliation import _recon_fill_price
@@ -61,6 +65,10 @@ from lightfee.engine.loop_control import (
 from lightfee.engine.order_truth_ledger import (
     ORDER_TRUTH_LEDGER,
     OrderTruthFillStatus,
+)
+from lightfee.engine.task_cancellation import (
+    DEFAULT_TASK_CANCEL_DRAIN_S,
+    cancel_task_with_bounded_drain,
 )
 from lightfee.engine.order_truth_resolution import (
     open_order_items,
@@ -187,6 +195,20 @@ class _PendingEntryPassiveSubmitFinalized(RuntimeError):
 class LiveRuntime:
     """Live trading runtime with multi-lane ticks and control-plane exports."""
 
+    def _entry_wall_clock_now_ms(self) -> int:
+        """Clock boundary used by delegated entry-evidence runtimes."""
+
+        return wall_clock_now_ms()
+
+    async def _cancel_entry_evidence_task(self, task: asyncio.Task) -> None:
+        """Cancel an entry-evidence task with a strictly bounded foreground drain."""
+
+        await cancel_task_with_bounded_drain(
+            task,
+            cleanup_tasks=self._entry_evidence_cancel_cleanup_tasks,
+            drain_s=self._ENTRY_EVIDENCE_CANCEL_DRAIN_S,
+        )
+
     _MAX_STATIC_RECOVERY_PROBE_SYMBOLS = 1
     _MAX_BOUNDED_RECOVERY_FALLBACK_SYMBOLS = 25
     _PASSIVE_POST_ONLY_LADDER_FRACTIONS = (0.0, 0.5, 0.75, 1.0)
@@ -198,6 +220,8 @@ class LiveRuntime:
     _PASSIVE_POST_ONLY_WIDE_SPREAD_BPS = 20.0
     _PASSIVE_POST_ONLY_RETRY_BACKOFF_MS = (500, 1000, 2000, 4000, 6000, 8000, 10000)
     _MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR = 2.0
+    _ENTRY_EVIDENCE_PIPELINE_DEADLINE_S = 3.0
+    _ENTRY_EVIDENCE_CANCEL_DRAIN_S = DEFAULT_TASK_CANCEL_DRAIN_S
 
     @property
     def venue_contracts(self) -> Any:
@@ -267,6 +291,12 @@ class LiveRuntime:
         self.supervisor = Supervisor(config, self.state, self.journal)
         self._running = False
         self._export_state = ExportState()
+        self._current_state_export_pending: tuple[ExportState, int] | None = None
+        self._current_state_export_task: asyncio.Task | None = None
+        self._entry_evidence_generation: int = 0
+        self._entry_evidence_prewarm_generation: int = 0
+        self._entry_evidence_prewarm_task: asyncio.Task | None = None
+        self._entry_evidence_cancel_cleanup_tasks: set[asyncio.Task] = set()
         self._venue_adapters = venue_adapters or {}
         self.residual_repair_runtime = ResidualRepairRuntime(self)
         self.pending_entry_runtime = PendingEntryRuntime(self)
@@ -1041,6 +1071,7 @@ class LiveRuntime:
                 "hedge_client_order_id": hedge_client_order_id,
                 "hedge_attempt": hedge_attempt,
                 "reason": reason,
+                "repair_state": pending.repair_state,
                 "source": source,
                 "block_scope": block_scope,
                 "blocked_until_ms": blocked_until_ms,
@@ -1411,6 +1442,59 @@ class LiveRuntime:
             self.state, self.config, export_state, now_ms
         )
 
+    def _schedule_current_state_snapshot_export(
+        self,
+        export_state: ExportState,
+        now_ms: int,
+    ) -> None:
+        """Coalesce state exports behind one non-blocking disk writer."""
+
+        # Own interval gating on the event loop.  The writer thread must not
+        # race the heartbeat/tick lanes by mutating their shared ExportState.
+        if int(now_ms) < int(export_state.next_state_export_ms or 0):
+            return
+        export_state.next_state_export_ms = int(now_ms) + (
+            current_state_export_interval_ms(self.config)
+        )
+        self._current_state_export_pending = (ExportState(), int(now_ms))
+        task = self._current_state_export_task
+        if task is not None and not task.done():
+            return
+
+        async def _drain_latest() -> None:
+            while self._current_state_export_pending is not None:
+                pending = self._current_state_export_pending
+                self._current_state_export_pending = None
+                pending_state, pending_now_ms = pending
+                try:
+                    # Refresh and freeze all runtime-owned state on the event
+                    # loop.  The writer thread receives an immutable-by-
+                    # ownership copy and can never mutate live recovery/risk
+                    # gates while exporting diagnostics.
+                    self._refresh_runtime_market_data_config_state()
+                    self._refresh_v1_lifecycle_closure_state(pending_now_ms)
+                    frozen_state = copy.deepcopy(self.state)
+                    await asyncio.to_thread(
+                        maybe_export_current_state_snapshot,
+                        frozen_state,
+                        self.config,
+                        pending_state,
+                        pending_now_ms,
+                    )
+                except Exception as exc:
+                    try:
+                        self.journal.append(
+                            "runtime.current_state_background_export_error",
+                            {
+                                "error": f"{type(exc).__name__}: {exc}"[:240],
+                                "ts_ms": wall_clock_now_ms(),
+                            },
+                        )
+                    except RuntimeError:
+                        pass
+
+        self._current_state_export_task = asyncio.create_task(_drain_latest())
+
     def _entry_quote_lease_max_age_ms(self):
         return self.market_data_runtime._entry_quote_lease_max_age_ms()
 
@@ -1604,37 +1688,160 @@ class LiveRuntime:
         desired_quantity: float,
         price_hint: float,
     ) -> PendingEntryHedgeabilityPlan:
-        min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
-        min_hedgeable_chunk = 0.0
-        if min_notional > 0.0 and price_hint > 0.0:
-            min_hedgeable_chunk = min_notional / price_hint
-        adapter = self.get_venue_adapter(hedge_venue)
-        quantity_step = 0.0
-        passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
-        if callable(passive_metadata):
-            try:
-                metadata = passive_metadata(pending.symbol) or {}
-                quantity_step = float(
-                    metadata.get("quantity_step", metadata.get("step_size", 0.0)) or 0.0
-                )
-            except Exception:
-                quantity_step = 0.0
-        if quantity_step > 0.0:
-            min_hedgeable_chunk = max(min_hedgeable_chunk, quantity_step)
-        aligned = releasable_hedge_quantity(desired_quantity, min_hedgeable_chunk)
-        blocked_reason = "target_below_min_hedgeable_chunk" if aligned <= 1e-9 else ""
+        rule, common_step, contract_reason = (
+            self._pending_entry_frozen_symbol_rule_contract(
+                pending,
+                hedge_venue,
+            )
+        )
+        diagnostics = {
+            "maker_venue": pending.maker_venue().value,
+            "hedge_venue": hedge_venue.value,
+            "price_hint": price_hint,
+            "common_base_quantity_step_at_entry": common_step,
+            "frozen_symbol_rule": rule,
+        }
+        if contract_reason:
+            return PendingEntryHedgeabilityPlan(
+                min_hedgeable_chunk=0.0,
+                aligned_target_quantity=0.0,
+                blocked_reason=contract_reason,
+                diagnostics=diagnostics,
+            )
+        try:
+            min_hedgeable_chunk = min_hedgeable_chunk_from_notional(
+                min_base_quantity=float(rule["min_quantity_base"]),
+                min_notional_quote=float(rule["min_notional_quote"]),
+                step_base_quantity=common_step,
+                price_hint=price_hint if price_hint > 0.0 else None,
+            )
+        except (KeyError, TypeError, ValueError):
+            return PendingEntryHedgeabilityPlan(
+                min_hedgeable_chunk=0.0,
+                aligned_target_quantity=0.0,
+                blocked_reason="pending_entry_symbol_rule_evidence_invalid",
+                diagnostics=diagnostics,
+            )
+        aligned = self._align_pending_entry_quantity_down(
+            desired_quantity,
+            common_step,
+        )
+        if aligned + 1e-9 < min_hedgeable_chunk:
+            aligned = 0.0
+        blocked_reason = (
+            "target_below_min_hedgeable_chunk" if aligned <= 1e-9 else ""
+        )
+        diagnostics.update(
+            {
+                "exchange_min_notional_quote": float(
+                    rule["min_notional_quote"]
+                ),
+                "min_quantity_base": float(rule["min_quantity_base"]),
+                "quantity_step_base": float(rule["quantity_step_base"]),
+                "min_hedgeable_chunk": min_hedgeable_chunk,
+            }
+        )
         return PendingEntryHedgeabilityPlan(
             min_hedgeable_chunk=min_hedgeable_chunk,
             aligned_target_quantity=aligned,
             blocked_reason=blocked_reason,
-            diagnostics={
-                "maker_venue": pending.maker_venue().value,
-                "hedge_venue": hedge_venue.value,
-                "exchange_min_notional_quote": min_notional,
-                "price_hint": price_hint,
-                "quantity_step": quantity_step,
-            },
+            diagnostics=diagnostics,
         )
+
+    @staticmethod
+    def _align_pending_entry_quantity_down(quantity: float, step: float) -> float:
+        try:
+            quantity = float(quantity or 0.0)
+            step = float(step or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(quantity) or not math.isfinite(step):
+            return 0.0
+        if quantity <= 1e-9 or step <= 1e-12:
+            return 0.0
+        return math.floor((quantity / step) + 1e-12) * step
+
+    def _pending_entry_frozen_symbol_rule_contract(
+        self,
+        pending,
+        venue: Venue,
+    ) -> tuple[dict[str, Any], float, str]:
+        rule_getter = getattr(pending, "symbol_rule_at_entry", None)
+        rule = rule_getter(venue) if callable(rule_getter) else {}
+        if not isinstance(rule, dict) or not rule:
+            return {}, 0.0, "pending_entry_symbol_rule_evidence_missing"
+        try:
+            common_step = float(
+                getattr(pending, "common_base_quantity_step_at_entry", 0.0)
+                or 0.0
+            )
+            quantity_step = float(rule.get("quantity_step_base", 0.0) or 0.0)
+            min_quantity = float(rule.get("min_quantity_base", 0.0) or 0.0)
+            min_notional = float(rule.get("min_notional_quote", -1.0))
+        except (TypeError, ValueError):
+            return rule, 0.0, "pending_entry_symbol_rule_evidence_invalid"
+        if (
+            rule.get("evidence_complete") is not True
+            or list(rule.get("missing_fields") or [])
+            or str(rule.get("quantity_units") or "") != "base"
+            or str(rule.get("venue") or "") != venue.value
+            or str(rule.get("symbol") or "") != str(pending.symbol)
+            or not math.isfinite(common_step)
+            or not math.isfinite(quantity_step)
+            or not math.isfinite(min_quantity)
+            or not math.isfinite(min_notional)
+            or common_step <= 1e-12
+            or quantity_step <= 1e-12
+            or min_quantity <= 0.0
+            or min_notional < 0.0
+        ):
+            return rule, common_step, "pending_entry_symbol_rule_evidence_invalid"
+        grid_ratio = common_step / quantity_step
+        if abs(grid_ratio - round(grid_ratio)) > 1e-8:
+            return rule, common_step, "pending_entry_common_quantity_grid_invalid"
+        return rule, common_step, ""
+
+    def _pending_entry_order_rule_violation(
+        self,
+        pending,
+        *,
+        venue: Venue,
+        quantity: float,
+        price: float,
+    ) -> tuple[str, dict[str, Any]]:
+        rule, common_step, reason = (
+            self._pending_entry_frozen_symbol_rule_contract(pending, venue)
+        )
+        evidence: dict[str, Any] = {
+            "venue": venue.value,
+            "quantity": quantity,
+            "price": price,
+            "common_base_quantity_step_at_entry": common_step,
+            "frozen_symbol_rule": rule,
+        }
+        if reason:
+            return reason, evidence
+        aligned = self._align_pending_entry_quantity_down(quantity, common_step)
+        evidence["aligned_quantity"] = aligned
+        if abs(aligned - float(quantity or 0.0)) > 1e-9:
+            return "pending_entry_quantity_not_on_frozen_common_grid", evidence
+        min_quantity = float(rule["min_quantity_base"])
+        min_notional = float(rule["min_notional_quote"])
+        notional = float(quantity or 0.0) * float(price or 0.0)
+        evidence.update(
+            {
+                "min_quantity_base": min_quantity,
+                "min_notional_quote": min_notional,
+                "notional_quote": notional,
+            }
+        )
+        if quantity + 1e-12 < min_quantity:
+            return "pending_entry_quantity_below_frozen_minimum", evidence
+        if price <= 0.0 and min_notional > 0.0:
+            return "pending_entry_price_missing_for_frozen_min_notional", evidence
+        if notional + 1e-9 < min_notional:
+            return "pending_entry_notional_below_frozen_minimum", evidence
+        return "", evidence
 
     def _pending_entry_min_notional_violation(
         self,
@@ -1645,7 +1852,15 @@ class LiveRuntime:
     ) -> tuple[float, float] | None:
         if normalized_quantity <= 1e-9:
             return None
-        min_notional = self._venue_min_notional(hedge_venue, pending.symbol)
+        rule, _common_step, contract_reason = (
+            self._pending_entry_frozen_symbol_rule_contract(
+                pending,
+                hedge_venue,
+            )
+        )
+        if contract_reason:
+            return (0.0, math.inf)
+        min_notional = float(rule.get("min_notional_quote", 0.0) or 0.0)
         if min_notional <= 0.0 or price_hint <= 0.0:
             return None
         leg_notional = abs(float(normalized_quantity or 0.0) * price_hint)
@@ -1663,55 +1878,36 @@ class LiveRuntime:
         hedge_price: float,
         hedgeability_plan: PendingEntryHedgeabilityPlan,
     ) -> tuple[float, tuple[float, float] | None, dict]:
-        releasable = releasable_hedge_quantity(
-            missing,
-            hedgeability_plan.min_hedgeable_chunk,
-        )
-        full_normalized = missing
-        if hasattr(adapter, "normalize_quantity"):
-            full_normalized = await adapter.normalize_quantity(pending.symbol, missing)
-        full_normalized = float(full_normalized or 0.0)
-        full_min_notional_violation = self._pending_entry_min_notional_violation(
-            pending,
-            hedge_venue,
-            full_normalized,
-            hedge_price,
-        )
+        releasable = float(hedgeability_plan.aligned_target_quantity or 0.0)
         evidence = {
             "missing_hedge_quantity": missing,
             "releasable_quantity": releasable,
-            "full_missing_normalized_quantity": full_normalized,
             "min_hedgeable_chunk": hedgeability_plan.min_hedgeable_chunk,
             "hedgeability": dict(hedgeability_plan.diagnostics),
         }
-        if (
-            full_normalized > 1e-9
-            and full_min_notional_violation is None
-            and full_normalized + 1e-9 >= missing
-        ):
-            evidence["quantity_source"] = "full_missing_exchange_normalized"
-            return full_normalized, None, evidence
-
         normalized = releasable
         if hasattr(adapter, "normalize_quantity"):
             normalized = await adapter.normalize_quantity(pending.symbol, releasable)
         normalized = float(normalized or 0.0)
+        if abs(normalized - releasable) > 1e-9:
+            evidence.update(
+                {
+                    "quantity_source": "frozen_rule_adapter_mismatch",
+                    "normalized_quantity": normalized,
+                    "symbol_rule_violation_reason": (
+                        "pending_entry_frozen_rule_adapter_mismatch"
+                    ),
+                }
+            )
+            return 0.0, None, evidence
         min_notional_violation = self._pending_entry_min_notional_violation(
             pending,
             hedge_venue,
             normalized,
             hedge_price,
         )
-        evidence["quantity_source"] = "releasable_chunk_normalized"
+        evidence["quantity_source"] = "frozen_common_grid_normalized"
         evidence["normalized_quantity"] = normalized
-        evidence["full_missing_min_notional_violation"] = (
-            {
-                "leg_notional_quote": full_min_notional_violation[0],
-                "venue_min_notional_quote": full_min_notional_violation[1],
-            }
-            if full_min_notional_violation is not None
-            else None
-        )
         return normalized, min_notional_violation, evidence
 
     def _append_pending_entry_hedge_quantity_undercut(
@@ -2754,12 +2950,14 @@ class LiveRuntime:
             if not pair_id:
                 allowed.append(candidate)
                 continue
-            active_keys.add(pair_id)
+            revision_id = self._bind_entry_candidate_revision_id(candidate)
+            lease_key = revision_id
+            active_keys.add(lease_key)
             started_at_ms = int(
-                self._entry_candidate_lease_started_at_ms.get(pair_id, 0) or 0
+                self._entry_candidate_lease_started_at_ms.get(lease_key, 0) or 0
             )
             if started_at_ms <= 0:
-                self._entry_candidate_lease_started_at_ms[pair_id] = now_ms
+                self._entry_candidate_lease_started_at_ms[lease_key] = now_ms
                 allowed.append(candidate)
                 continue
             age_ms = max(now_ms - started_at_ms, 0)
@@ -2773,6 +2971,7 @@ class LiveRuntime:
             short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
             payload = {
                 "candidate_pair_id": pair_id,
+                "candidate_revision_id": revision_id,
                 "pair_id": pair_id,
                 "symbol": symbol,
                 "long_venue": long_venue,
@@ -2800,13 +2999,46 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            self._entry_candidate_lease_started_at_ms.pop(pair_id, None)
+            self._entry_candidate_lease_started_at_ms.pop(lease_key, None)
 
-        for pair_id in list(self._entry_candidate_lease_started_at_ms):
-            if pair_id not in active_keys:
-                self._entry_candidate_lease_started_at_ms.pop(pair_id, None)
+        for lease_key in list(self._entry_candidate_lease_started_at_ms):
+            if lease_key not in active_keys:
+                self._entry_candidate_lease_started_at_ms.pop(lease_key, None)
         self.state.last_scan["candidate_lease_expired_count"] = expired_count
         return allowed
+
+    def _bind_entry_candidate_revision_id(self, candidate) -> str:
+        """Return a stable economic revision and persist it on the candidate.
+
+        Fresh V5 sidecars publish this identity directly.  Older compatible
+        snapshots do not, so derive the same semantic unit before quote/OI
+        evidence starts.  A raw pair id is deliberately insufficient because
+        a new funding epoch or model observation must invalidate old leases.
+        """
+        revision_id = str(
+            getattr(candidate, "candidate_revision_id", "") or ""
+        ).strip()
+        if revision_id:
+            return revision_id
+        pair_id = self._candidate_pair_id(candidate)
+        material = "|".join(
+            (
+                pair_id,
+                str(getattr(candidate, "economics_observed_at_ms", 0) or 0),
+                str(
+                    getattr(candidate, "first_funding_timestamp_ms", 0)
+                    or getattr(candidate, "funding_timestamp_ms", 0)
+                    or 0
+                ),
+                str(getattr(candidate, "long_funding_timestamp_ms", 0) or 0),
+                str(getattr(candidate, "short_funding_timestamp_ms", 0) or 0),
+                str(getattr(candidate, "calculation_version", "") or ""),
+                str(getattr(candidate, "model_epoch", "") or ""),
+            )
+        )
+        revision_id = sha256(material.encode("utf-8")).hexdigest()[:32]
+        setattr(candidate, "candidate_revision_id", revision_id)
+        return revision_id
 
     async def _fetch_startup_live_position_snapshots(
         self, symbols: list[str]
@@ -4008,6 +4240,7 @@ class LiveRuntime:
         candidate_scope: str = "",
         skipped_untracked_count: int = 0,
         evidence_role: str = "entry_execution",
+        activation_candidates: list | None = None,
     ):
         return await self.market_data_runtime._entry_quote_revalidate_for_candidates(
             candidates,
@@ -4016,6 +4249,7 @@ class LiveRuntime:
             candidate_scope=candidate_scope,
             skipped_untracked_count=skipped_untracked_count,
             evidence_role=evidence_role,
+            activation_candidates=activation_candidates,
         )
 
     async def _refresh_entry_candidate_open_interest_evidence(
@@ -4250,6 +4484,12 @@ class LiveRuntime:
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
         self._running = False
+        prewarm_task = getattr(self, "_entry_evidence_prewarm_task", None)
+        if prewarm_task is not None and not prewarm_task.done():
+            prewarm_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await prewarm_task
+        self._entry_evidence_prewarm_task = None
         shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + shutdown_timeout_s
@@ -4367,6 +4607,19 @@ class LiveRuntime:
                 entry_open_interest_refresher.close(),
             )
 
+        ws_bbo_rest_refresher = getattr(self, "ws_bbo_rest_refresher", None)
+        if ws_bbo_rest_refresher is not None:
+            aclose = getattr(ws_bbo_rest_refresher, "aclose", None)
+            if callable(aclose):
+                await _await_shutdown_task(
+                    "close_network",
+                    "ws_bbo_rest_refresher.aclose",
+                    aclose(),
+                )
+            close = getattr(ws_bbo_rest_refresher, "close", None)
+            if callable(close):
+                close()
+
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
         await _await_shutdown_task(
             "close_network",
@@ -4420,6 +4673,9 @@ class LiveRuntime:
             self.snapshot_store.write(build_persistent_state_view(self.state))
 
         # Final current-state export
+        background_export = self._current_state_export_task
+        if background_export is not None and not background_export.done():
+            await background_export
         now_ms = wall_clock_now_ms()
         path = self.config.persistence.snapshot_path.replace(".json", "-current.json")
         self._maybe_export_current_state_snapshot(self._export_state, now_ms)
@@ -4489,26 +4745,20 @@ class LiveRuntime:
             }
         )
         self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
-        try:
-            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
-        except Exception as exc:
-            self.journal.append(
-                "runtime.current_state_scan_progress_export_error",
-                {"error": str(exc)},
-            )
+        self._schedule_current_state_snapshot_export(ExportState(), now_ms)
 
     async def tick(self) -> None:
         """Full engine tick: consume snapshot, scan, supervise, manage positions."""
         now_ms = wall_clock_now_ms()
         self.state.last_tick_ms = now_ms
         self.state.tick_count += 1
-        try:
-            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
-        except Exception as exc:
-            self.journal.append(
-                "runtime.current_state_heartbeat_export_error",
-                {"error": str(exc)},
-            )
+        self._entry_evidence_generation += 1
+        entry_evidence_generation = self._entry_evidence_generation
+        previous_prewarm = self._entry_evidence_prewarm_task
+        self._entry_evidence_prewarm_task = None
+        if previous_prewarm is not None and not previous_prewarm.done():
+            await self._cancel_entry_evidence_task(previous_prewarm)
+        self._schedule_current_state_snapshot_export(ExportState(), now_ms)
 
         # --- Load sidecar snapshot ---
         snapshot = load_snapshot(self.config.runtime.sidecar_snapshot_path)
@@ -4709,13 +4959,7 @@ class LiveRuntime:
                 "checkpoint_healthy": False,
                 "source": "fresh_snapshot_required",
             }
-        try:
-            self._maybe_export_current_state_snapshot(ExportState(), now_ms)
-        except Exception as exc:
-            self.journal.append(
-                "runtime.current_state_scan_progress_export_error",
-                {"error": str(exc)},
-            )
+        self._schedule_current_state_snapshot_export(ExportState(), now_ms)
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             self.journal.append(
                 "runtime.live_scan_revalidate_required",
@@ -4845,7 +5089,6 @@ class LiveRuntime:
             return
 
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
-            await self._refresh_hyperliquid_entry_balance_admission(now_ms)
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates,
                 self.config.strategy,
@@ -4868,19 +5111,89 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            tradeable = await self._filter_candidates_supported_by_venue_catalog(
-                tradeable,
+            entry_pipeline_loop = asyncio.get_running_loop()
+            entry_pipeline_started_monotonic = entry_pipeline_loop.time()
+            entry_pipeline_hard_deadline = (
+                entry_pipeline_started_monotonic
+                + self._ENTRY_EVIDENCE_PIPELINE_DEADLINE_S
             )
+
+            def _entry_pipeline_remaining_s() -> float:
+                return max(
+                    entry_pipeline_hard_deadline - entry_pipeline_loop.time(),
+                    0.0,
+                )
+
+            async def _entry_pipeline_await(awaitable, *, stage: str):
+                def _record_deadline_exceeded() -> None:
+                    self.state.last_scan["no_entry_reason"] = (
+                        "entry_evidence_deadline_exceeded"
+                    )
+                    self.state.last_scan["entry_evidence_deadline_stage"] = stage
+                    self.journal.append(
+                        "runtime.entry_evidence_deadline_exceeded",
+                        {
+                            "stage": stage,
+                            "elapsed_ms": max(
+                                int(
+                                    (
+                                        entry_pipeline_loop.time()
+                                        - entry_pipeline_started_monotonic
+                                    )
+                                    * 1_000
+                                ),
+                                0,
+                            ),
+                            "ts_ms": wall_clock_now_ms(),
+                        },
+                    )
+
+                task = asyncio.ensure_future(awaitable)
+                if task.done():
+                    return task.result()
+                remaining_s = _entry_pipeline_remaining_s()
+                if remaining_s <= 0.0:
+                    await self._cancel_entry_evidence_task(task)
+                    _record_deadline_exceeded()
+                    raise asyncio.TimeoutError(stage)
+                try:
+                    done, _pending = await asyncio.wait(
+                        {task},
+                        timeout=remaining_s,
+                    )
+                except asyncio.CancelledError:
+                    await self._cancel_entry_evidence_task(task)
+                    raise
+                if task in done:
+                    try:
+                        return task.result()
+                    except asyncio.TimeoutError:
+                        # Preserve the prior stage-level timeout semantics for
+                        # an awaitable that raises its own TimeoutError.
+                        _record_deadline_exceeded()
+                        raise
+                await self._cancel_entry_evidence_task(task)
+                _record_deadline_exceeded()
+                raise asyncio.TimeoutError(stage)
+
+            try:
+                tradeable = await _entry_pipeline_await(
+                    self._filter_candidates_supported_by_venue_catalog(tradeable),
+                    stage="venue_catalog",
+                )
+            except asyncio.TimeoutError:
+                return
             tradeable = self._filter_candidates_by_entry_admission(
                 tradeable,
                 now_ms=now_ms,
                 stage="shortlist",
             )
-            tradeable = await self._filter_candidates_by_entry_balance_admission(
-                tradeable,
-                now_ms=now_ms,
-                stage="shortlist",
-            )
+            # Bind legacy-compatible candidates to an economic revision before
+            # any quote/OI evidence can be leased.  This prevents a later
+            # funding/model observation on the same pair from reusing evidence
+            # created for an older candidate.
+            for candidate in tradeable:
+                self._bind_entry_candidate_revision_id(candidate)
             self.state.last_scan["catalog_admission_balance_passed_count"] = len(
                 tradeable
             )
@@ -4894,8 +5207,47 @@ class LiveRuntime:
                     if venue:
                         entry_quote_keys.add((venue, symbol))
             l2_tracking_tradeable = list(tradeable)
-            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+            tracked, initial_tracked_candidates = self._select_v1_entry_tracked_scope(
                 l2_tracking_tradeable
+            )
+            balance_filter_scope = (
+                l2_tracking_tradeable
+                if any(
+                    self._candidate_uses_venue(candidate, Venue.HYPERLIQUID)
+                    for candidate in initial_tracked_candidates
+                )
+                else initial_tracked_candidates
+            )
+            try:
+                balance_passed_candidates = await _entry_pipeline_await(
+                    self._filter_candidates_by_entry_balance_admission(
+                        balance_filter_scope,
+                        now_ms=wall_clock_now_ms(),
+                        stage="top_k_shortlist",
+                    ),
+                    stage="top_k_balance",
+                )
+            except asyncio.TimeoutError:
+                return
+            if balance_filter_scope is l2_tracking_tradeable:
+                tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+                    balance_passed_candidates
+                )
+                l2_tracking_tradeable = balance_passed_candidates
+            else:
+                tracked_candidates = balance_passed_candidates
+                tracked_pair_ids = {
+                    self._candidate_pair_id(candidate)
+                    for candidate in tracked_candidates
+                }
+                tracked = [
+                    opportunity
+                    for opportunity in tracked
+                    if opportunity.pair_id in tracked_pair_ids
+                ]
+            now_ms = wall_clock_now_ms()
+            self.state.last_scan["top_k_balance_passed_count"] = len(
+                tracked_candidates
             )
             prewarm_extra_candidates = self._select_entry_prewarm_extra_candidates(
                 l2_tracking_tradeable,
@@ -4970,58 +5322,8 @@ class LiveRuntime:
                     - prewarm_extra_quote_target_count,
                     0,
                 )
-            if tracked_candidates:
-                entry_quote_truth_overlay, _entry_quote_truth_stats = (
-                    await self._entry_quote_revalidate_for_candidates(
-                        tracked_candidates,
-                        snapshot=snapshot,
-                        now_ms=now_ms,
-                        candidate_scope=(
-                            "v1_primary_shadow" if entry_bbo_prewarm_attempted else ""
-                        ),
-                        skipped_untracked_count=skipped_untracked_quote_count,
-                        evidence_role="entry_execution",
-                    )
-                )
-            else:
-                entry_quote_truth_overlay = {}
-                _entry_quote_truth_stats = self._entry_quote_truth_empty_stats()
-                _entry_quote_truth_stats["skipped_untracked_count"] = (
-                    skipped_untracked_quote_count
-                )
-                self._entry_quote_truth_record_last_scan(_entry_quote_truth_stats)
-            if entry_bbo_prewarm_attempted and prewarm_extra_candidates:
-                await self._entry_quote_revalidate_for_candidates(
-                    prewarm_extra_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                    candidate_scope="prewarm_extra",
-                    skipped_untracked_count=skipped_untracked_quote_count,
-                    evidence_role="prewarm_only",
-                )
-            emit_stale_quote_diagnostics(
-                entry_quote_keys,
-                resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
-            )
-            for quote in entry_quote_truth_overlay.values():
-                symbol = str(getattr(quote, "symbol", "") or "").upper()
-                bid = float(getattr(quote, "bid", 0.0) or 0.0)
-                ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                if symbol and bid > 0.0 and ask > bid:
-                    price_hints[symbol] = (bid + ask) / 2.0
-            entry_freshness_filter_candidates = (
-                tracked_candidates
-                if (
-                    self._entry_readiness_provider_uses_ws_bbo()
-                    or self._local_l2_effective_enabled()
-                )
-                else tradeable
-            )
-            entry_freshness_filter_scope = (
-                "v1_primary_shadow"
-                if entry_freshness_filter_candidates is not tradeable
-                else "tradeable"
-            )
+            entry_freshness_filter_candidates = tracked_candidates
+            entry_freshness_filter_scope = "v1_primary_shadow"
             self.state.last_scan["snapshot_freshness_filter_candidate_scope"] = (
                 entry_freshness_filter_scope
             )
@@ -5037,21 +5339,120 @@ class LiveRuntime:
                 len(l2_tracking_tradeable) - len(entry_freshness_filter_candidates),
                 0,
             )
-            await self._refresh_entry_candidate_open_interest_evidence(
-                entry_freshness_filter_candidates,
-                snapshot=snapshot,
-                now_ms=now_ms,
-                evidence_role="entry_execution",
-                candidate_scope=entry_freshness_filter_scope,
-            )
-            if prewarm_extra_candidates:
-                await self._refresh_entry_candidate_open_interest_evidence(
-                    prewarm_extra_candidates,
+            oi_refresh_task = asyncio.create_task(
+                self._refresh_entry_candidate_open_interest_evidence(
+                    entry_freshness_filter_candidates,
                     snapshot=snapshot,
                     now_ms=now_ms,
-                    evidence_role="prewarm_only",
-                    candidate_scope="prewarm_extra",
+                    evidence_role="entry_execution",
+                    candidate_scope=entry_freshness_filter_scope,
                 )
+            )
+            try:
+                if tracked_candidates:
+                    entry_quote_truth_overlay, _entry_quote_truth_stats = (
+                        await _entry_pipeline_await(
+                            self._entry_quote_revalidate_for_candidates(
+                                tracked_candidates,
+                                snapshot=snapshot,
+                                now_ms=now_ms,
+                                candidate_scope=(
+                                    "v1_primary_shadow"
+                                    if entry_bbo_prewarm_attempted
+                                    else ""
+                                ),
+                                skipped_untracked_count=(
+                                    skipped_untracked_quote_count
+                                ),
+                                evidence_role="entry_execution",
+                            ),
+                            stage="quote_revalidation",
+                        )
+                    )
+                    now_ms = wall_clock_now_ms()
+                else:
+                    entry_quote_truth_overlay = {}
+                    _entry_quote_truth_stats = self._entry_quote_truth_empty_stats()
+                    _entry_quote_truth_stats["skipped_untracked_count"] = (
+                        skipped_untracked_quote_count
+                    )
+                    self._entry_quote_truth_record_last_scan(_entry_quote_truth_stats)
+            except asyncio.TimeoutError:
+                await self._cancel_entry_evidence_task(oi_refresh_task)
+                return
+            except BaseException:
+                await self._cancel_entry_evidence_task(oi_refresh_task)
+                raise
+            emit_stale_quote_diagnostics(
+                entry_quote_keys,
+                resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
+            )
+            for quote in entry_quote_truth_overlay.values():
+                symbol = str(getattr(quote, "symbol", "") or "").upper()
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                if symbol and bid > 0.0 and ask > bid:
+                    price_hints[symbol] = (bid + ask) / 2.0
+            try:
+                await _entry_pipeline_await(
+                    oi_refresh_task,
+                    stage="open_interest_revalidation",
+                )
+            except asyncio.TimeoutError:
+                return
+            now_ms = wall_clock_now_ms()
+            if prewarm_extra_candidates and self._running:
+                async def _prewarm_latest_generation() -> None:
+                    try:
+                        if entry_evidence_generation != self._entry_evidence_generation:
+                            return
+                        if entry_bbo_prewarm_attempted:
+                            await self._entry_quote_revalidate_for_candidates(
+                                prewarm_extra_candidates,
+                                snapshot=snapshot,
+                                now_ms=wall_clock_now_ms(),
+                                candidate_scope="prewarm_extra",
+                                skipped_untracked_count=skipped_untracked_quote_count,
+                                evidence_role="prewarm_only",
+                                activation_candidates=[
+                                    *tracked_candidates,
+                                    *prewarm_extra_candidates,
+                                ],
+                            )
+                        if entry_evidence_generation != self._entry_evidence_generation:
+                            return
+                        await self._refresh_entry_candidate_open_interest_evidence(
+                            prewarm_extra_candidates,
+                            snapshot=snapshot,
+                            now_ms=wall_clock_now_ms(),
+                            evidence_role="prewarm_only",
+                            candidate_scope="prewarm_extra",
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        try:
+                            self.journal.append(
+                                "runtime.entry_evidence_prewarm_failed",
+                                {
+                                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                                    "candidate_count": len(prewarm_extra_candidates),
+                                    "ts_ms": wall_clock_now_ms(),
+                                },
+                            )
+                        except RuntimeError:
+                            # A test/one-shot owner can close the journal while
+                            # a canceled prewarm is unwinding. Production stop
+                            # awaits/cancels this task before journal shutdown.
+                            pass
+
+                if entry_evidence_generation == self._entry_evidence_generation:
+                    self._entry_evidence_prewarm_generation = (
+                        entry_evidence_generation
+                    )
+                    self._entry_evidence_prewarm_task = asyncio.create_task(
+                        _prewarm_latest_generation()
+                    )
             tradeable = self._filter_candidates_by_snapshot_freshness(
                 entry_freshness_filter_candidates,
                 snapshot=snapshot,
@@ -5064,23 +5465,52 @@ class LiveRuntime:
             )
             tradeable = self._filter_expired_entry_candidate_leases(
                 tradeable,
-                now_ms=now_ms,
+                now_ms=wall_clock_now_ms(),
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
             self.state.last_scan["dispatched_candidate_count"] = 0
-            await self._refresh_recovery_ledger_for_symbols(
-                sorted(
-                    {
-                        str(getattr(candidate, "symbol", "") or "").upper()
-                        for candidate in tradeable
-                        if getattr(candidate, "symbol", "")
-                    }
-                ),
-                now_ms,
-            )
+            try:
+                await _entry_pipeline_await(
+                    self._refresh_recovery_ledger_for_symbols(
+                        sorted(
+                            {
+                                str(getattr(candidate, "symbol", "") or "").upper()
+                                for candidate in tradeable
+                                if getattr(candidate, "symbol", "")
+                            }
+                        ),
+                        now_ms,
+                    ),
+                    stage="recovery_ledger",
+                )
+            except asyncio.TimeoutError:
+                return
             if not tradeable:
-                self.state.last_scan["no_entry_reason"] = "no_tradeable_candidates"
+                evidence_deadline_count = int(
+                    self.state.last_scan.get(
+                        "entry_evidence_deadline_exceeded_count",
+                        0,
+                    )
+                    or 0
+                ) + int(
+                    self.state.last_scan.get(
+                        "oi_entry_evidence_deadline_exceeded_count",
+                        0,
+                    )
+                    or 0
+                )
+                if evidence_deadline_count > 0:
+                    self.state.last_scan["no_entry_reason"] = (
+                        "entry_evidence_deadline_exceeded"
+                    )
+                    self.state.last_scan["entry_evidence_deadline_stage"] = (
+                        "quote_or_open_interest_revalidation"
+                    )
+                else:
+                    self.state.last_scan["no_entry_reason"] = (
+                        "no_tradeable_candidates"
+                    )
             if tradeable:
                 # V1 market data warmup: funding coverage must meet threshold before entry
                 if hasattr(snapshot, 'funding_lifecycle') and snapshot.funding_lifecycle:
@@ -5115,11 +5545,17 @@ class LiveRuntime:
                 tracked_pair_ids = {t.pair_id for t in tracked}
                 # V1: activity_local_l2_symbols() follows the tracked
                 # primary+shadow scope, not the whole tradeable shortlist.
-                await self._ensure_l2_active_for_candidates(
-                    tracked_candidates,
-                    now_ms,
-                    tracked_opportunities=tracked,
-                )
+                try:
+                    await _entry_pipeline_await(
+                        self._ensure_l2_active_for_candidates(
+                            tracked_candidates,
+                            now_ms,
+                            tracked_opportunities=tracked,
+                        ),
+                        stage="l2_activation",
+                    )
+                except asyncio.TimeoutError:
+                    return
                 self._tracked_primary_pair_ids = {
                     t.pair_id for t in tracked
                     if t.class_.value == "primary_tracked"
@@ -5129,7 +5565,13 @@ class LiveRuntime:
                     self.entry_l2_sessions.track_opportunity(t, now_ms)
                 # V1 post-shortlist L2 sync after tracking: local books
                 # drive session readiness before the selection blocker.
-                await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                try:
+                    await _entry_pipeline_await(
+                        self._sync_local_l2_data(now_ms, scan_promoted=True),
+                        stage="l2_sync",
+                    )
+                except asyncio.TimeoutError:
+                    return
                 self._refresh_entry_l2_session_readiness(now_ms)
                 # V1: shadow promotion — best shadow replaces worst primary
                 # when score delta, hold window, execution guard, and readiness
@@ -5142,10 +5584,16 @@ class LiveRuntime:
                 and l2_tracking_tradeable
                 and not entry_bbo_prewarm_attempted
             ):
-                await self._ensure_entry_bbo_active_for_candidates(
-                    tracked_candidates,
-                    now_ms,
-                )
+                try:
+                    await _entry_pipeline_await(
+                        self._ensure_entry_bbo_active_for_candidates(
+                            tracked_candidates,
+                            now_ms,
+                        ),
+                        stage="quote_activation",
+                    )
+                except asyncio.TimeoutError:
+                    return
 
             if tradeable:
                 self.journal.append(
@@ -5188,6 +5636,15 @@ class LiveRuntime:
                 admission_blocker_counts: Counter[str] = Counter()
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
+                if _entry_pipeline_remaining_s() <= 0.0:
+                    self.state.last_scan["no_entry_reason"] = (
+                        "entry_evidence_deadline_exceeded"
+                    )
+                    self.state.last_scan["entry_evidence_deadline_stage"] = (
+                        "final_selection"
+                    )
+                    return
+                now_ms = wall_clock_now_ms()
                 finalists = self._select_entry_candidates(
                     tradeable,
                     now_ms=now_ms,
@@ -5205,6 +5662,15 @@ class LiveRuntime:
                 for candidate in finalists:
                     if len(self.state.open_positions) >= max_slots:
                         break
+                    if _entry_pipeline_remaining_s() <= 0.0:
+                        self.state.last_scan["no_entry_reason"] = (
+                            "entry_evidence_deadline_exceeded"
+                        )
+                        self.state.last_scan["entry_evidence_deadline_stage"] = (
+                            "dispatch"
+                        )
+                        break
+                    now_ms = wall_clock_now_ms()
                     mid_price = self._entry_quote_truth_price_hint(
                         candidate,
                         price_hints=price_hints,
@@ -5660,13 +6126,7 @@ class LiveRuntime:
         interval_s = current_state_export_interval_ms(self.config) / 1000.0
         while self._running:
             now_ms = wall_clock_now_ms()
-            try:
-                self._maybe_export_current_state_snapshot(self._export_state, now_ms)
-            except Exception as exc:
-                self.journal.append(
-                    "runtime.current_state_heartbeat_loop_export_error",
-                    {"error": str(exc)},
-                )
+            self._schedule_current_state_snapshot_export(self._export_state, now_ms)
             await asyncio.sleep(interval_s)
 
     async def run_loop(self) -> None:
@@ -5981,6 +6441,99 @@ class LiveRuntime:
             )
             return False
 
+        raw_target_quantity = target_quantity
+        frozen_contracts: list[tuple[str, Venue, dict[str, Any], float]] = []
+        for leg, venue in (
+            ("long", pending.long_venue),
+            ("short", pending.short_venue),
+        ):
+            rule, common_step, contract_reason = (
+                self._pending_entry_frozen_symbol_rule_contract(pending, venue)
+            )
+            if contract_reason:
+                self.journal.append(
+                    "execution.entry_fallback_to_taker_skipped",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": contract_reason,
+                        "terminal_reason": terminal_reason,
+                        "leg": leg,
+                        "venue": venue.value,
+                        "raw_target_quantity": raw_target_quantity,
+                        "common_base_quantity_step_at_entry": common_step,
+                        "frozen_symbol_rule": rule,
+                    },
+                )
+                return False
+            frozen_contracts.append((leg, venue, rule, common_step))
+
+        common_step = frozen_contracts[0][3]
+        target_quantity = self._align_pending_entry_quantity_down(
+            raw_target_quantity,
+            common_step,
+        )
+        if target_quantity <= 1e-9:
+            self.journal.append(
+                "execution.entry_fallback_to_taker_skipped",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": "pending_entry_terminal_quantity_below_frozen_common_grid",
+                    "terminal_reason": terminal_reason,
+                    "raw_target_quantity": raw_target_quantity,
+                    "aligned_target_quantity": target_quantity,
+                    "common_base_quantity_step_at_entry": common_step,
+                },
+            )
+            return False
+
+        for leg, venue, leg_price in (
+            ("long", pending.long_venue, long_price_hint),
+            ("short", pending.short_venue, short_price_hint),
+        ):
+            rule_reason, rule_evidence = (
+                self._pending_entry_order_rule_violation(
+                    pending,
+                    venue=venue,
+                    quantity=target_quantity,
+                    price=leg_price,
+                )
+            )
+            if rule_reason:
+                self.journal.append(
+                    "execution.entry_fallback_to_taker_skipped",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "reason": rule_reason,
+                        "terminal_reason": terminal_reason,
+                        "leg": leg,
+                        **rule_evidence,
+                    },
+                )
+                return False
+
+        canary_reason = self._funding_canary_pending_request_invariant_reason(
+            pending,
+            quantity=target_quantity,
+            price=max(long_price_hint, short_price_hint),
+            stage="terminal_dual_taker_fallback",
+            now_ms=now_ms,
+            entry_id=entry_id,
+        )
+        if canary_reason:
+            self.journal.append(
+                "execution.entry_fallback_to_taker_skipped",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": canary_reason,
+                    "terminal_reason": terminal_reason,
+                },
+            )
+            return False
+
         self.journal.append(
             "execution.entry_fallback_to_taker",
             {
@@ -5991,6 +6544,9 @@ class LiveRuntime:
                 "maker_venue": pending.maker_venue().value,
                 "maker_leg": getattr(pending, "maker_leg", "long"),
                 "repost_attempt_count": pending.repost_attempt_count,
+                "raw_target_quantity": raw_target_quantity,
+                "aligned_target_quantity": target_quantity,
+                "common_base_quantity_step_at_entry": common_step,
             },
         )
 
@@ -6044,6 +6600,27 @@ class LiveRuntime:
             entry_depth_shortfall_quantity=pending.entry_depth_shortfall_quantity,
             entry_max_executable_notional_quote=pending.entry_max_executable_notional_quote,
             entry_depth_capped_at_entry=pending.entry_depth_capped_at_entry,
+            candidate_revision_id=pending.candidate_revision_id,
+            entry_max_leg_notional_quote=(
+                target_quantity * max(long_price_hint, short_price_hint)
+            ),
+            funding_canary_enabled_at_entry=pending.funding_canary_enabled_at_entry,
+            funding_canary_fee_assurance_tier=(
+                pending.funding_canary_fee_assurance_tier
+            ),
+            funding_canary_hard_max_entry_notional_quote=(
+                pending.funding_canary_hard_max_entry_notional_quote
+            ),
+            funding_canary_size_constrained=pending.funding_canary_size_constrained,
+            long_symbol_rule_at_entry=dict(
+                pending.long_symbol_rule_at_entry or {}
+            ),
+            short_symbol_rule_at_entry=dict(
+                pending.short_symbol_rule_at_entry or {}
+            ),
+            common_base_quantity_step_at_entry=(
+                pending.common_base_quantity_step_at_entry
+            ),
             advisories=list(pending.advisories),
             blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
             exit_after_first_stage=pending.exit_after_first_stage,
@@ -6296,6 +6873,66 @@ class LiveRuntime:
                 now_ms=now_ms,
             )
 
+    def _funding_canary_pending_request_invariant_reason(
+        self,
+        pending,
+        *,
+        quantity: float,
+        price: float,
+        stage: str,
+        now_ms: int,
+        entry_id: str,
+    ) -> str:
+        """Enforce the immutable canary cap on every pending-entry order path."""
+
+        if not bool(getattr(pending, "funding_canary_enabled_at_entry", False)):
+            return ""
+        try:
+            cap = float(
+                getattr(
+                    pending,
+                    "funding_canary_hard_max_entry_notional_quote",
+                    0.0,
+                )
+                or 0.0
+            )
+            request_quantity = float(quantity or 0.0)
+            request_price = float(price or 0.0)
+        except (TypeError, ValueError):
+            cap = request_quantity = request_price = 0.0
+        request_notional = request_quantity * request_price
+        if (
+            math.isfinite(cap)
+            and math.isfinite(request_quantity)
+            and math.isfinite(request_price)
+            and math.isfinite(request_notional)
+            and cap > 0.0
+            and request_quantity > 0.0
+            and request_price > 0.0
+            and request_notional <= cap + 1e-9
+        ):
+            return ""
+
+        reason = "funding_canary_final_notional_invariant_breached"
+        self.journal.append(
+            reason,
+            {
+                "entry_id": entry_id,
+                "candidate_revision_id": str(
+                    getattr(pending, "candidate_revision_id", "") or ""
+                ),
+                "symbol": str(getattr(pending, "symbol", "") or ""),
+                "stage": stage,
+                "quantity": request_quantity,
+                "price": request_price,
+                "entry_max_leg_notional_quote": request_notional,
+                "funding_canary_hard_max_entry_notional_quote": cap,
+                "reason": reason,
+                "ts_ms": now_ms,
+            },
+        )
+        return reason
+
     async def _submit_pending_entry_passive_order_with_retries(
         self,
         *,
@@ -6327,6 +6964,34 @@ class LiveRuntime:
             )
             if price_hint is None:
                 raise _PendingEntryPassiveSubmitFinalized("missing_passive_price_hint")
+            rule_reason, rule_evidence = self._pending_entry_order_rule_violation(
+                pending,
+                venue=pending.maker_venue(),
+                quantity=float(quantity or 0.0),
+                price=float(price_hint or 0.0),
+            )
+            if rule_reason:
+                self.journal.append(
+                    "pending_entry.symbol_rule_evidence_blocked",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "stage": f"{stage_prefix}_attempt_{attempt_index}",
+                        "reason": rule_reason,
+                        **rule_evidence,
+                    },
+                )
+                raise _PendingEntryPassiveSubmitFinalized(rule_reason)
+            canary_reason = self._funding_canary_pending_request_invariant_reason(
+                pending,
+                quantity=quantity,
+                price=price_hint,
+                stage=f"{stage_prefix}_attempt_{attempt_index}",
+                now_ms=wall_clock_now_ms(),
+                entry_id=entry_id,
+            )
+            if canary_reason:
+                raise _PendingEntryPassiveSubmitFinalized(canary_reason)
             request = OrderRequest(
                 venue=pending.maker_venue(),
                 symbol=pending.symbol,
@@ -6773,11 +7438,13 @@ class LiveRuntime:
         if remaining_quantity <= 1e-9:
             return False
 
-        try:
-            normalized_quantity = float(
-                await adapter.normalize_quantity(pending.symbol, remaining_quantity)
+        _maker_rule, common_step, rule_reason = (
+            self._pending_entry_frozen_symbol_rule_contract(
+                pending,
+                pending.maker_venue(),
             )
-        except Exception as exc:
+        )
+        if rule_reason:
             pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
             self.journal.append(
                 "execution.passive_entry_repost_failed",
@@ -6786,10 +7453,14 @@ class LiveRuntime:
                     "symbol": pending.symbol,
                     "maker_venue": pending.maker_venue().value,
                     "remaining_quantity": remaining_quantity,
-                    "error": str(exc),
+                    "error": rule_reason,
                 },
             )
-            return True
+            return False
+        normalized_quantity = self._align_pending_entry_quantity_down(
+            remaining_quantity,
+            common_step,
+        )
 
         action = prepare_pending_entry_remainder_repost(
             pending,
@@ -10478,6 +11149,25 @@ class LiveRuntime:
                 missing,
                 hedge_price,
             )
+            if hedgeability_plan.blocked_reason.startswith(
+                "pending_entry_"
+            ):
+                self.journal.append(
+                    "pending_entry.symbol_rule_evidence_blocked",
+                    {
+                        "entry_id": pending.pending_id,
+                        "symbol": pending.symbol,
+                        "stage": "recovery_missing_hedge",
+                        "reason": hedgeability_plan.blocked_reason,
+                        **hedgeability_plan.diagnostics,
+                    },
+                )
+                await self._abort_pending_entry(
+                    pending,
+                    pending.pending_id,
+                    hedgeability_plan.blocked_reason,
+                )
+                return False
             if hedgeability_plan.aligned_target_quantity <= 1e-9:
                 early_decision = decide_pending_entry_hedge_delta_pre_submit(
                     pending,
@@ -10501,6 +11191,26 @@ class LiveRuntime:
                     hedgeability_plan=hedgeability_plan,
                 )
             )
+            frozen_rule_violation = str(
+                quantity_evidence.get("symbol_rule_violation_reason") or ""
+            )
+            if frozen_rule_violation:
+                self.journal.append(
+                    "pending_entry.symbol_rule_evidence_blocked",
+                    {
+                        "entry_id": pending.pending_id,
+                        "symbol": pending.symbol,
+                        "stage": "recovery_missing_hedge_normalization",
+                        "reason": frozen_rule_violation,
+                        **quantity_evidence,
+                    },
+                )
+                await self._abort_pending_entry(
+                    pending,
+                    pending.pending_id,
+                    frozen_rule_violation,
+                )
+                return False
             decision = decide_pending_entry_hedge_delta_pre_submit(
                 pending,
                 strategy=self.config.strategy,
@@ -10542,18 +11252,42 @@ class LiveRuntime:
                 )
                 return False
 
+            canary_reason = self._funding_canary_pending_request_invariant_reason(
+                pending,
+                quantity=normalized,
+                price=hedge_price,
+                stage="recovery_missing_hedge",
+                now_ms=now_ms,
+                entry_id=pending.pending_id,
+            )
+            if canary_reason:
+                # The maker leg already exists.  Shrinking only the hedge would
+                # create naked delta, so the only cap-safe outcome is the V1
+                # abort path, which flattens the first leg.
+                await self._abort_pending_entry(
+                    pending,
+                    pending.pending_id,
+                    canary_reason,
+                )
+                return False
+
             from lightfee.venues.cid import generate_exchange_cid
-            recovery_cid = generate_exchange_cid(pending.pending_id, "h", hedge_venue)
-            pending.hedge_client_order_id = recovery_cid
-            pending.hedge_attempt_count = int(
+            recovery_attempt = int(
                 getattr(pending, "hedge_attempt_count", 0) or 0
             ) + 1
+            pending.hedge_attempt_count = recovery_attempt
+            recovery_cid = generate_exchange_cid(
+                pending.pending_id,
+                f"h{recovery_attempt}",
+                hedge_venue,
+            )
+            pending.hedge_client_order_id = recovery_cid
             self._pending_entry_hedge_deadline_started(
                 pending,
                 submitted_at_ms=now_ms,
                 normalized_quantity=normalized,
                 hedge_price=hedge_price,
-                hedge_attempt=pending.hedge_attempt_count,
+                hedge_attempt=recovery_attempt,
                 hedge_venue=hedge_venue,
             )
             pending.hedge_inflight = HedgeInflight(
@@ -10561,8 +11295,25 @@ class LiveRuntime:
                 venue=hedge_venue,
                 side=pending.hedge_side(),
                 quantity=normalized,
-                attempt=pending.hedge_attempt_count,
+                attempt=recovery_attempt,
                 submitted_at_ms=now_ms,
+            )
+            self.journal.append(
+                "pending_entry.hedge_submit_attempt",
+                {
+                    "entry_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "hedge_venue": hedge_venue.value,
+                    "hedge_side": pending.hedge_side().value,
+                    "hedge_quantity": normalized,
+                    "hedge_price_hint": hedge_price,
+                    "hedge_client_order_id": recovery_cid,
+                    "hedge_attempt": recovery_attempt,
+                    "submitted_at_ms": now_ms,
+                    "maker_leg_filled": pending.maker_leg_filled,
+                    "hedge_leg_filled": pending.hedge_leg_filled,
+                    "source": "startup_recovery",
+                },
             )
 
             req = OrderRequest(
@@ -10593,12 +11344,42 @@ class LiveRuntime:
                 )
                 pending.hedge_inflight = None
                 note_pending_entry_hedge_filled(pending)
+                self.journal.append(
+                    "pending_entry.hedge_submit_result",
+                    {
+                        "entry_id": pending.pending_id,
+                        "symbol": pending.symbol,
+                        "outcome": "filled",
+                        "hedge_fill_quantity": fill.quantity,
+                        "hedge_fill_price": fill.price,
+                        "hedge_order_id": fill.order_id,
+                        "hedge_client_order_id": recovery_cid,
+                        "hedge_attempt": recovery_attempt,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "missing_hedge_remaining": (
+                            pending.missing_hedge_quantity()
+                        ),
+                        "source": "startup_recovery",
+                    },
+                )
                 if pending.missing_hedge_quantity() <= 1e-9:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
                 return True
             pending.hedge_inflight = None
             note_pending_entry_hedge_filled(pending)
+            self.journal.append(
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "outcome": "zero_fill",
+                    "hedge_client_order_id": recovery_cid,
+                    "hedge_attempt": recovery_attempt,
+                    "order_id": getattr(fill, "order_id", ""),
+                    "source": "startup_recovery",
+                },
+            )
             return False
         except OrderSubmitError as e:
             hedge_client_order_id = (
@@ -10660,6 +11441,25 @@ class LiveRuntime:
                 if pending.missing_hedge_quantity() <= 1e-9:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
+                self.journal.append(
+                    "pending_entry.hedge_submit_result",
+                    {
+                        "entry_id": pending.pending_id,
+                        "symbol": pending.symbol,
+                        "outcome": "filled",
+                        "reconciled": True,
+                        "hedge_fill_quantity": fill_qty,
+                        "hedge_fill_price": pending.hedge_fill_price,
+                        "hedge_order_id": pending.hedge_order_id,
+                        "hedge_client_order_id": hedge_client_order_id,
+                        "hedge_attempt": recovery_attempt,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "missing_hedge_remaining": (
+                            pending.missing_hedge_quantity()
+                        ),
+                        "source": "startup_recovery",
+                    },
+                )
                 return True
             if e.is_rejected:
                 self._record_pending_entry_submit_reject_truth_probe(
@@ -10710,6 +11510,7 @@ class LiveRuntime:
                     "error": str(e),
                     "reason": reason,
                     "is_rejected": e.is_rejected,
+                    "hedge_attempt": recovery_attempt,
                     "hedge_client_order_id": hedge_client_order_id,
                     "fill_reconciliation_attempted": True,
                     "fill_reconciliation_result": (
@@ -10729,8 +11530,19 @@ class LiveRuntime:
         except Exception as e:
             self.journal.append(
                 "recovery.hedge_submit_error",
-                {"entry_id": pending.pending_id, "symbol": pending.symbol,
-                 "error": str(e), "reason": reason},
+                {
+                    "entry_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "error": str(e),
+                    "reason": reason,
+                    "hedge_attempt": int(
+                        getattr(pending, "hedge_attempt_count", 0) or 0
+                    ),
+                    "hedge_client_order_id": str(
+                        getattr(pending, "hedge_client_order_id", "") or ""
+                    ),
+                    "clear_hedge_inflight": pending.hedge_inflight is None,
+                },
             )
             return False
 
@@ -10823,6 +11635,25 @@ class LiveRuntime:
                 missing,
                 hedge_price,
             )
+            if hedgeability_plan.blocked_reason.startswith(
+                "pending_entry_"
+            ):
+                self.journal.append(
+                    "pending_entry.symbol_rule_evidence_blocked",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "stage": "normal_missing_hedge",
+                        "reason": hedgeability_plan.blocked_reason,
+                        **hedgeability_plan.diagnostics,
+                    },
+                )
+                await self._abort_pending_entry(
+                    pending,
+                    entry_id,
+                    hedgeability_plan.blocked_reason,
+                )
+                return False
             if hedgeability_plan.aligned_target_quantity <= 1e-9:
                 early_decision = decide_pending_entry_hedge_delta_pre_submit(
                     pending,
@@ -10847,6 +11678,26 @@ class LiveRuntime:
                     hedgeability_plan=hedgeability_plan,
                 )
             )
+            frozen_rule_violation = str(
+                quantity_evidence.get("symbol_rule_violation_reason") or ""
+            )
+            if frozen_rule_violation:
+                self.journal.append(
+                    "pending_entry.symbol_rule_evidence_blocked",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "stage": "normal_missing_hedge_normalization",
+                        "reason": frozen_rule_violation,
+                        **quantity_evidence,
+                    },
+                )
+                await self._abort_pending_entry(
+                    pending,
+                    entry_id,
+                    frozen_rule_violation,
+                )
+                return False
             decision = decide_pending_entry_hedge_delta_pre_submit(
                 pending,
                 strategy=self.config.strategy,
@@ -10888,6 +11739,22 @@ class LiveRuntime:
                 )
                 return False
 
+            canary_reason = self._funding_canary_pending_request_invariant_reason(
+                pending,
+                quantity=normalized,
+                price=hedge_price,
+                stage="normal_missing_hedge",
+                now_ms=now_ms,
+                entry_id=entry_id,
+            )
+            if canary_reason:
+                await self._abort_pending_entry(
+                    pending,
+                    entry_id,
+                    canary_reason,
+                )
+                return False
+
             from lightfee.venues.cid import generate_exchange_cid
             attempt = int(getattr(pending, "hedge_attempt_count", 0) or 0) + 1
             pending.hedge_attempt_count = attempt
@@ -10921,6 +11788,7 @@ class LiveRuntime:
                     "hedge_price_hint": hedge_price,
                     "hedge_client_order_id": hedge_cloid,
                     "hedge_attempt": attempt,
+                    "submitted_at_ms": now_ms,
                     "maker_leg_filled": pending.maker_leg_filled,
                     "hedge_leg_filled": pending.hedge_leg_filled,
                 },
@@ -11108,6 +11976,24 @@ class LiveRuntime:
                         "reason": "non_retryable_auth_signing_failure",
                     },
                 )
+                self.journal.append(
+                    "pending_entry.hedge_submit_result",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "outcome": "error",
+                        "error": str(e),
+                        "is_rejected": True,
+                        "clear_hedge_inflight": True,
+                        "hedge_client_order_id": (
+                            submitted_inflight.client_order_id
+                            if submitted_inflight
+                            else hedge_cloid
+                        ),
+                        "hedge_attempt": attempt,
+                        "repair_state": pending.repair_state,
+                    },
+                )
                 return False
             if e.is_rejected:
                 pending.hedge_inflight = None
@@ -11188,6 +12074,9 @@ class LiveRuntime:
                     "symbol": pending.symbol,
                     "outcome": "error",
                     "error": str(e),
+                    "hedge_client_order_id": hedge_cloid,
+                    "hedge_attempt": attempt,
+                    "clear_hedge_inflight": True,
                 },
             )
             return False
@@ -12005,7 +12894,7 @@ class LiveRuntime:
         maybe_export_runtime_metrics(
             self.state, self.config, self._export_state, now_ms
         )
-        self._maybe_export_current_state_snapshot(self._export_state, now_ms)
+        self._schedule_current_state_snapshot_export(self._export_state, now_ms)
 
     # ------------------------------------------------------------------
     # Backoff

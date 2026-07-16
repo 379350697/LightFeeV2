@@ -8,6 +8,7 @@ from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, 
 from lightfee.core.domain import Venue
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -93,6 +94,8 @@ def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
     # economically admissible under the real final-entry repricing gate.
     bid = 102.0 if venue == "bybit" else 100.0
     ask = 103.0 if venue == "bybit" else 101.0
+    open_interest = 2_000_000.0
+    oi_source = "incident_fixture"
     return QuoteSnapshot(
         venue=venue,
         symbol=symbol,
@@ -105,7 +108,24 @@ def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
         funding_timestamp_ms=400_000,
         funding_interval_ms=28_800_000,
         volume_24h_quote=10_000_000.0,
-        open_interest=2_000_000.0,
+        open_interest=open_interest,
+        open_interest_evidence_status="observed",
+        open_interest_evidence_reason="fixture_observed",
+        open_interest_observed_at_ms=observed_at_ms,
+        open_interest_received_at_ms=observed_at_ms,
+        open_interest_source=oi_source,
+        open_interest_sample_id=open_interest_sample_id(
+            venue=venue,
+            canonical_symbol=symbol,
+            venue_symbol=symbol,
+            observed_at_ms=observed_at_ms,
+            source=oi_source,
+            raw_value=open_interest,
+            value_quote=open_interest,
+        ),
+        open_interest_venue_symbol=symbol,
+        raw_open_interest=open_interest,
+        raw_open_interest_unit="quote",
     )
 
 

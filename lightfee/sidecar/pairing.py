@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from math import isfinite
 
 from lightfee.config.schema import StrategyConfig
@@ -9,6 +10,7 @@ from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
 from lightfee.strategy.economics import FundingForecast, build_edge_breakdown
 from lightfee.strategy.fee_evidence import FeeEvidenceBook
+from lightfee.strategy.funding_canary_policy import canary_notional_cap_for_tier
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -482,13 +484,52 @@ def _candidate_for_pair(
         max(float(config.entry_notional_cap_quote or 0.0), 0.0),
         max(float(config.live_entry_notional_cap_quote or 0.0), 0.0),
     )
+    canary_assurance_tier = (
+        "account"
+        if account_fee_evidence_complete
+        else "conservative"
+        if (
+            config.funding_canary_require_account_fee_evidence is not True
+            and taker_fee_evidence_complete
+        )
+        else "unavailable"
+    )
+    canary_hard_cap = (
+        canary_notional_cap_for_tier(canary_assurance_tier, config)
+        if config.funding_canary_enabled is True
+        and canary_assurance_tier != "unavailable"
+        else 0.0
+    )
+    pre_canary_configured_cap = configured_cap
+    if canary_hard_cap > 0.0:
+        configured_cap = min(configured_cap, canary_hard_cap)
     conservative_depth_quantity = configured_cap / reference_mid if configured_cap > 0.0 else 0.0
+    pre_canary_conservative_depth_quantity = (
+        pre_canary_configured_cap / reference_mid
+        if pre_canary_configured_cap > 0.0
+        else 0.0
+    )
     long_depth = float(long_q.ask_size or 0.0) * max(
         float(config.max_top_book_usage_ratio or 0.0), 0.0
     )
     short_depth = float(short_q.bid_size or 0.0) * max(
         float(config.max_top_book_usage_ratio or 0.0), 0.0
     )
+    long_allocation_quantity = long_depth if long_depth > 0.0 else conservative_depth_quantity
+    short_allocation_quantity = short_depth if short_depth > 0.0 else conservative_depth_quantity
+    pre_canary_long_allocation_quantity = (
+        long_depth if long_depth > 0.0 else pre_canary_conservative_depth_quantity
+    )
+    pre_canary_short_allocation_quantity = (
+        short_depth if short_depth > 0.0 else pre_canary_conservative_depth_quantity
+    )
+    if canary_hard_cap > 0.0:
+        canary_quantity = canary_hard_cap / max(
+            float(long_q.ask),
+            float(short_q.bid),
+        )
+        long_allocation_quantity = min(long_allocation_quantity, canary_quantity)
+        short_allocation_quantity = min(short_allocation_quantity, canary_quantity)
     venue_cap = _minimum_positive(
         caps_by_venue.get(str(long_q.venue).lower(), 0.0),
         caps_by_venue.get(str(short_q.venue).lower(), 0.0),
@@ -509,11 +550,28 @@ def _candidate_for_pair(
             else 0.0
         ),
     )
+    pre_canary_allocation = allocator.allocate(
+        long_entry_price=long_q.ask,
+        short_entry_price=short_q.bid,
+        long_max_quantity=pre_canary_long_allocation_quantity,
+        short_max_quantity=pre_canary_short_allocation_quantity,
+        configured_notional_cap_quote=pre_canary_configured_cap,
+        venue_notional_cap_quote=venue_cap,
+        symbol_risk_budget_quote=float(config.max_symbol_exposure_quote or 0.0),
+        venue_pair_risk_budget_quote=float(
+            config.funding_max_venue_pair_exposure_quote or 0.0
+        ),
+        global_risk_budget_quote=global_reference_cap,
+        fallback_notional_quote=float(
+            config.funding_missing_margin_fallback_notional_quote or 0.0
+        ),
+        health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
+    )
     allocation = allocator.allocate(
         long_entry_price=long_q.ask,
         short_entry_price=short_q.bid,
-        long_max_quantity=long_depth if long_depth > 0.0 else conservative_depth_quantity,
-        short_max_quantity=short_depth if short_depth > 0.0 else conservative_depth_quantity,
+        long_max_quantity=long_allocation_quantity,
+        short_max_quantity=short_allocation_quantity,
         configured_notional_cap_quote=configured_cap,
         venue_notional_cap_quote=venue_cap,
         symbol_risk_budget_quote=float(config.max_symbol_exposure_quote or 0.0),
@@ -560,6 +618,26 @@ def _candidate_for_pair(
     # taker-impact estimate.  This cannot be reconstructed from aggregate
     # four-leg fee fields after the fact.
     quantity = float(allocation.base_quantity or 0.0)
+    canary_size_constrained = bool(
+        config.funding_canary_enabled is True
+        and canary_hard_cap > 0.0
+        and quantity + 1e-12
+        < float(pre_canary_allocation.base_quantity or 0.0)
+    )
+    if canary_size_constrained:
+        canary_below_pair_minimum = any(
+            quantity + 1e-12 < float(quote.min_quantity_base or 0.0)
+            or quantity * price + 1e-9 < float(quote.min_notional_quote or 0.0)
+            for quote, price in (
+                (long_q, float(long_q.ask)),
+                (short_q, float(short_q.bid)),
+            )
+        )
+        if canary_below_pair_minimum:
+            candidate_block_reasons.append(
+                "funding_canary_cap_below_pair_minimum"
+            )
+            candidate_blocked = True
     long_entry_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=True)
     short_entry_slippage_bps = _heuristic_slippage_bps(short_q, quantity, taking_ask=False)
     entry_maker_leg = _select_maker_leg(long_entry_slippage_bps, short_entry_slippage_bps)
@@ -619,6 +697,19 @@ def _candidate_for_pair(
     # a contract-safety fact, not a model preference: V1-compatible scoring
     # may remain visible in the sidecar, but no mode may label the candidate
     # complete or send it to live admission.
+    candidate_revision_id = sha256(
+        "|".join(
+            (
+                make_candidate_pair_id(long_q.symbol, long_q.venue, short_q.venue),
+                str(long_q.venue).lower(),
+                str(short_q.venue).lower(),
+                str(now_ms),
+                str(long_ts),
+                str(short_ts),
+                str(calculation_version),
+            )
+        ).encode("utf-8")
+    ).hexdigest()[:32]
     return CandidateInput(
         long_venue=long_q.venue,
         short_venue=short_q.venue,
@@ -683,6 +774,14 @@ def _candidate_for_pair(
         interval_aligned=interval_aligned,
         opportunity_type=opportunity_type,
         entry_notional_quote=allocation.reference_notional_quote,
+        entry_max_leg_notional_quote=max(
+            allocation.long_leg_notional_quote,
+            allocation.short_leg_notional_quote,
+        ),
+        funding_canary_fee_assurance_tier=canary_assurance_tier,
+        funding_canary_hard_max_entry_notional_quote=canary_hard_cap,
+        funding_canary_size_constrained=canary_size_constrained,
+        candidate_revision_id=candidate_revision_id,
         entry_target_quantity=allocation.base_quantity,
         long_max_executable_quantity=long_depth,
         short_max_executable_quantity=short_depth,

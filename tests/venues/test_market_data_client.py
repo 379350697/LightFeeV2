@@ -79,6 +79,492 @@ class TestMarketDataClientConstruction:
         asyncio.run(client.close())
 
 
+class TestEntryOpenInterestOnlyEndpoints:
+    """Entry evidence must stay candidate-scoped on every capable venue."""
+
+    @staticmethod
+    def _timestamp_client(spec, native_timestamp):
+        class Client(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                params = dict(params or {})
+                venue = spec.venue_id
+                if venue == Venue.OKX:
+                    row = {
+                        "instId": params["instId"],
+                        "oiUsd": "2500000",
+                    }
+                    if native_timestamp is not None:
+                        row["ts"] = native_timestamp
+                    return {"code": "0", "data": [row]}
+                if venue == Venue.BYBIT:
+                    response = {
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {
+                                    "symbol": params["symbol"],
+                                    "openInterestValue": "2500000",
+                                }
+                            ]
+                        },
+                    }
+                    if native_timestamp is not None:
+                        response["time"] = native_timestamp
+                    return response
+                if path == "/api/v3/market/open-interest":
+                    data = {
+                        "list": [
+                            {
+                                "symbol": params["symbol"],
+                                "openInterest": "2500",
+                            }
+                        ]
+                    }
+                    if native_timestamp is not None:
+                        data["ts"] = native_timestamp
+                    return {"code": "00000", "data": data}
+                return {
+                    "code": "00000",
+                    "data": [
+                        {
+                            "symbol": params["symbol"],
+                            "markPrice": "1000",
+                        }
+                    ],
+                }
+
+        return Client(spec)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [
+            (okx_spec, "okx"),
+            (bybit_spec, "bybit"),
+            (bitget_spec, "bitget"),
+        ],
+    )
+    async def test_native_oi_timestamp_defines_stable_sample_identity(
+        self,
+        monkeypatch,
+        spec_fn,
+        venue_key,
+    ):
+        received_times = iter((2_000_000, 2_000_100))
+        monkeypatch.setattr(
+            "lightfee.venues.market_data._now_ms",
+            lambda: next(received_times),
+        )
+        client = self._timestamp_client(spec_fn(), "1000000")
+
+        first = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+        second = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+
+        assert first.open_interest_observed_at_ms == 1_000_000
+        assert second.open_interest_observed_at_ms == 1_000_000
+        assert first.open_interest_received_at_ms == 2_000_000
+        assert second.open_interest_received_at_ms == 2_000_100
+        assert first.open_interest_sample_id == second.open_interest_sample_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [
+            (okx_spec, "okx"),
+            (bybit_spec, "bybit"),
+            (bitget_spec, "bitget"),
+        ],
+    )
+    async def test_missing_native_oi_timestamp_falls_back_to_received_time(
+        self,
+        monkeypatch,
+        spec_fn,
+        venue_key,
+    ):
+        monkeypatch.setattr(
+            "lightfee.venues.market_data._now_ms",
+            lambda: 2_000_000,
+        )
+        client = self._timestamp_client(spec_fn(), None)
+
+        ticker = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+
+        assert ticker.open_interest_evidence_status == "observed"
+        assert ticker.open_interest_observed_at_ms == 2_000_000
+        assert ticker.open_interest_received_at_ms == 2_000_000
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [
+            (okx_spec, "okx"),
+            (bybit_spec, "bybit"),
+            (bitget_spec, "bitget"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("native_timestamp", "expected_status"),
+        [
+            ("not-a-timestamp", "parse_error"),
+            ("2000001", "stale"),
+        ],
+    )
+    async def test_invalid_or_future_native_oi_timestamp_fails_closed(
+        self,
+        monkeypatch,
+        spec_fn,
+        venue_key,
+        native_timestamp,
+        expected_status,
+    ):
+        monkeypatch.setattr(
+            "lightfee.venues.market_data._now_ms",
+            lambda: 2_000_000,
+        )
+        client = self._timestamp_client(spec_fn(), native_timestamp)
+
+        ticker = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+
+        assert ticker.open_interest_quote is None
+        assert ticker.open_interest_evidence_status == expected_status
+        assert ticker.open_interest_observed_at_ms == 0
+        assert ticker.open_interest_received_at_ms == 2_000_000
+        assert ticker.open_interest_sample_id == ""
+
+    @pytest.mark.asyncio
+    async def test_okx_entry_oi_scopes_each_request_by_inst_id(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.calls = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                symbol = params["instId"]
+                return {"data": [{"instId": symbol, "oiUsd": "2500000"}]}
+
+        client = Client()
+        result = await client.fetch_entry_open_interest_evidence(
+            ["BTCUSDT", "ETHUSDT"]
+        )
+
+        assert {params["instId"] for _path, params in client.calls} == {
+            "BTC-USDT-SWAP",
+            "ETH-USDT-SWAP",
+        }
+        assert all(params["instType"] == "SWAP" for _path, params in client.calls)
+        assert all(t.open_interest_quote == 2_500_000.0 for t in result.values())
+
+    @pytest.mark.asyncio
+    async def test_bybit_entry_oi_scopes_each_request_by_symbol(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(bybit_spec())
+                self.calls = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                symbol = params["symbol"]
+                return {
+                    "result": {
+                        "list": [
+                            {"symbol": symbol, "openInterestValue": "2500000"}
+                        ]
+                    }
+                }
+
+        client = Client()
+        result = await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+
+        assert client.calls == [
+            (bybit_spec().funding_ticker_path, {"category": "linear", "symbol": "BTCUSDT"})
+        ]
+        assert result["bybit:BTCUSDT"].open_interest_quote == 2_500_000.0
+
+    @pytest.mark.asyncio
+    async def test_bitget_entry_oi_uses_dedicated_oi_and_targeted_mark(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(bitget_spec())
+                self.calls = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                symbol = params["symbol"]
+                if path == "/api/v3/market/open-interest":
+                    return {"data": {"list": [{"symbol": symbol, "openInterest": "2500"}]}}
+                return {"data": [{"symbol": symbol, "markPrice": "100.5"}]}
+
+        client = Client()
+        result = await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+
+        assert {path for path, _params in client.calls} == {
+            "/api/v3/market/open-interest",
+            bitget_spec().market_snapshot_path,
+        }
+        assert all(params["symbol"] == "BTCUSDT" for _path, params in client.calls)
+        assert result["bitget:BTCUSDT"].open_interest_quote == pytest.approx(
+            2500.0 * 100.5
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_entry_oi_uses_targeted_ticker_and_contract(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(gate_spec())
+                self.calls = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                if path == gate_spec().market_snapshot_path:
+                    symbol = params["contract"]
+                    return [{"contract": symbol, "total_size": "2500", "mark_price": "100.5"}]
+                return {"name": "BTC_USDT", "quanto_multiplier": "0.001"}
+
+        client = Client()
+        result = await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+
+        assert client.calls == [
+            (gate_spec().market_snapshot_path, {"contract": "BTC_USDT"}),
+            (f"{gate_spec().funding_contracts_path}/BTC_USDT", {}),
+        ]
+        assert result["gate:BTCUSDT"].open_interest_quote == pytest.approx(
+            2500.0 * 0.001 * 100.5
+        )
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_entry_oi_uses_asset_context_endpoint_only(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(hyperliquid_spec())
+                self.calls = []
+
+            async def _public_post(self, path, body):
+                self.calls.append((path, dict(body)))
+                return [
+                    {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+                    [
+                        {"openInterest": "25", "markPx": "100"},
+                        {"openInterest": "50", "markPx": "200"},
+                    ],
+                ]
+
+        client = Client()
+        result = await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+
+        assert client.calls == [
+            (hyperliquid_spec().market_snapshot_path, {"type": "metaAndAssetCtxs"})
+        ]
+        assert list(result) == ["hyperliquid:BTCUSDT"]
+        assert result["hyperliquid:BTCUSDT"].open_interest_quote == 2_500.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [
+            (okx_spec, "okx"),
+            (bybit_spec, "bybit"),
+            (bitget_spec, "bitget"),
+            (gate_spec, "gate"),
+        ],
+    )
+    async def test_one_failed_contract_does_not_poison_entry_oi_batch(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class Client(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                params = dict(params or {})
+                requested = str(
+                    params.get("instId")
+                    or params.get("symbol")
+                    or params.get("contract")
+                    or path.rsplit("/", 1)[-1]
+                )
+                if "ETH" in requested:
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "HTTP 404: contract unavailable",
+                        status_code=404,
+                    )
+                if spec.venue_id == Venue.OKX:
+                    return {
+                        "code": "0",
+                        "data": [{"instId": requested, "oiUsd": "2500000"}],
+                    }
+                if spec.venue_id == Venue.BYBIT:
+                    return {
+                        "retCode": 0,
+                        "result": {
+                            "list": [
+                                {
+                                    "symbol": requested,
+                                    "openInterestValue": "2500000",
+                                }
+                            ]
+                        },
+                    }
+                if spec.venue_id == Venue.BITGET:
+                    if path == "/api/v3/market/open-interest":
+                        return {
+                            "code": "00000",
+                            "data": {
+                                "list": [
+                                    {
+                                        "symbol": requested,
+                                        "openInterest": "2500",
+                                    }
+                                ]
+                            },
+                        }
+                    return {
+                        "code": "00000",
+                        "data": [{"symbol": requested, "markPrice": "100"}],
+                    }
+                if path == spec.market_snapshot_path:
+                    return [
+                        {
+                            "contract": requested,
+                            "total_size": "2500",
+                            "mark_price": "100",
+                        }
+                    ]
+                return {"name": requested, "quanto_multiplier": "0.001"}
+
+        result = await Client(spec).fetch_entry_open_interest_evidence(
+            ["BTCUSDT", "ETHUSDT"]
+        )
+
+        assert result[f"{venue_key}:BTCUSDT"].open_interest_evidence_status == "observed"
+        failed = result[f"{venue_key}:ETHUSDT"]
+        assert failed.open_interest_quote is None
+        assert failed.open_interest_evidence_status == "http_error"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key", "payload"),
+        [
+            (
+                okx_spec,
+                "okx",
+                {"code": "50011", "msg": "Rate limit reached", "data": []},
+            ),
+            (
+                bybit_spec,
+                "bybit",
+                {"retCode": 10006, "retMsg": "Too many visits", "result": {}},
+            ),
+            (
+                bitget_spec,
+                "bitget",
+                {"code": "429", "msg": "Too many requests", "data": None},
+            ),
+            (
+                gate_spec,
+                "gate",
+                {"code": 429, "message": "Too many requests"},
+            ),
+            (
+                hyperliquid_spec,
+                "hyperliquid",
+                {"status": "err", "response": "rate limit reached"},
+            ),
+        ],
+    )
+    async def test_http_200_application_rate_limit_is_not_symbol_not_listed(
+        self,
+        spec_fn,
+        venue_key,
+        payload,
+    ):
+        class Client(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return payload
+
+            async def _public_post(self, path, body):
+                return payload
+
+        ticker = (
+            await Client(spec_fn()).fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+
+        assert ticker.open_interest_quote is None
+        assert ticker.open_interest_evidence_status == "rate_limited"
+        assert ticker.open_interest_evidence_status != "symbol_not_listed"
+
+    @pytest.mark.asyncio
+    async def test_http_200_application_and_shape_errors_never_become_mapping_errors(self):
+        class ApplicationErrorClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return {"code": "51000", "msg": "Parameter error", "data": []}
+
+        class MalformedClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                return {"unexpected": True}
+
+        application_ticker = (
+            await ApplicationErrorClient(okx_spec()).fetch_entry_open_interest_evidence(
+                ["BTCUSDT"]
+            )
+        )["okx:BTCUSDT"]
+        malformed_ticker = (
+            await MalformedClient(okx_spec()).fetch_entry_open_interest_evidence(
+                ["BTCUSDT"]
+            )
+        )["okx:BTCUSDT"]
+
+        assert application_ticker.open_interest_evidence_status == "http_error"
+        assert malformed_ticker.open_interest_evidence_status == "parse_error"
+        assert application_ticker.open_interest_evidence_status != "symbol_not_listed"
+        assert malformed_ticker.open_interest_evidence_status != "symbol_not_listed"
+
+    @pytest.mark.asyncio
+    async def test_bybit_single_side_oi_is_unsupported_in_both_entry_and_full_paths(self):
+        class Client(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == bybit_spec().funding_contracts_path:
+                    return {"retCode": 0, "result": {"list": []}}
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "singleOpenInterestValue": "1250000",
+                            }
+                        ]
+                    },
+                }
+
+        client = Client(bybit_spec())
+        entry_ticker = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )["bybit:BTCUSDT"]
+        full_ticker = (
+            await client.fetch_funding_tickers(["BTCUSDT"])
+        )["bybit:BTCUSDT"]
+
+        for ticker in (entry_ticker, full_ticker):
+            assert ticker.open_interest_quote is None
+            assert ticker.open_interest_evidence_status == "unsupported"
+            assert ticker.open_interest_evidence_reason == (
+                "singleOpenInterestValue_is_not_total_open_interest"
+            )
+            assert ticker.raw_open_interest == 1_250_000.0
+            assert ticker.raw_open_interest_unit == "single_side_quote"
+
+
 class TestFundingTickerType:
     """FundingTicker dataclass holds all required fields."""
 
@@ -587,8 +1073,8 @@ class TestProductionSidecarParserRegressions:
         for ticker in result.values():
             assert ticker.bid > 0.0
             assert ticker.ask > 0.0
-            assert ticker.open_interest_quote == 0.0
-            assert ticker.open_interest_evidence_status == "refresh_inflight"
+            assert ticker.open_interest_quote is None
+            assert ticker.open_interest_evidence_status == "deferred"
             assert ticker.open_interest_evidence_reason == "background_refresh_inflight"
             assert ticker.oi_refresh_cap == 128
             assert ticker.oi_refresh_attempt_count == 2
@@ -644,7 +1130,7 @@ class TestProductionSidecarParserRegressions:
         )
 
         ticker = result[f"{venue_key}:BTCUSDT"]
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_evidence_reason == "fresh_refresh"
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert [call[0] for call in client.calls] == [
@@ -678,7 +1164,7 @@ class TestProductionSidecarParserRegressions:
         )
 
         ticker = result["binance:BTCUSDT"]
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.oi_timeout_count == 0
         assert ticker.oi_refresh_attempt_count == 1
@@ -707,14 +1193,14 @@ class TestProductionSidecarParserRegressions:
         client = FakeBinanceClient()
 
         first = await client._fetch_binance_style(["BTCUSDT"])
-        assert first["binance:BTCUSDT"].open_interest_evidence_status == "refresh_inflight"
+        assert first["binance:BTCUSDT"].open_interest_evidence_status == "deferred"
 
         await asyncio.sleep(0.08)
         second = await client._fetch_binance_style(["BTCUSDT"])
 
         assert client.oi_calls == 1
         ticker = second["binance:BTCUSDT"]
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
 
     @pytest.mark.asyncio
@@ -740,7 +1226,7 @@ class TestProductionSidecarParserRegressions:
         ticker = result["binance:BTCUSDT"]
         assert ticker.bid == 100.0
         assert ticker.ask == 101.0
-        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_quote is None
         assert ticker.open_interest_evidence_status == "http_error"
 
     @pytest.mark.asyncio
@@ -790,13 +1276,13 @@ class TestProductionSidecarParserRegressions:
 
         assert client.oi_calls == ["BTCUSDT"]
         ghost = result[f"{venue_key}:GHOSTUSDT"]
-        assert ghost.open_interest_quote == 0.0
-        assert ghost.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ghost.open_interest_quote is None
+        assert ghost.open_interest_evidence_status == "symbol_not_listed"
         assert ghost.open_interest_evidence_reason == "missing_bulk_book_ticker"
         assert ghost.oi_refresh_attempt_count == 1
         missing = result[f"{venue_key}:MISSINGUSDT"]
-        assert missing.open_interest_quote == 0.0
-        assert missing.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert missing.open_interest_quote is None
+        assert missing.open_interest_evidence_status == "symbol_not_listed"
         assert missing.open_interest_evidence_reason == "missing_bulk_premium_index"
         assert missing.oi_refresh_attempt_count == 1
 
@@ -830,7 +1316,7 @@ class TestProductionSidecarParserRegressions:
 
         ticker = result[f"{venue_key}:GHOSTUSDT"]
         assert [call[0] for call in client.calls] == [spec.premium_index_path]
-        assert ticker.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ticker.open_interest_evidence_status == "symbol_not_listed"
         assert ticker.open_interest_evidence_reason == "missing_symbol_mark_before_http"
         assert ticker.oi_refresh_attempt_count == 0
 
@@ -868,7 +1354,7 @@ class TestProductionSidecarParserRegressions:
 
         ticker = result[f"{venue_key}:GHOSTUSDT"]
         assert [call[0] for call in client.calls] == [spec.premium_index_path]
-        assert ticker.open_interest_evidence_status == "symbol_not_listed_before_http"
+        assert ticker.open_interest_evidence_status == "symbol_not_listed"
         assert ticker.open_interest_evidence_reason == "premium_index_symbol_rejected_before_oi_http"
         assert ticker.oi_refresh_attempt_count == 0
 
@@ -895,7 +1381,7 @@ class TestProductionSidecarParserRegressions:
         ticker = result["binance:BTCUSDT"]
         assert ticker.bid == 100.0
         assert ticker.ask == 101.0
-        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_quote is None
         assert ticker.open_interest_evidence_status == "rate_limited"
 
     @pytest.mark.asyncio
@@ -977,7 +1463,7 @@ class TestProductionSidecarParserRegressions:
         assert 1 < client.max_active_oi <= 16
         ticker = result["binance:S0USDT"]
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_cache_hit_avoids_repeated_per_symbol_request(self):
@@ -1005,9 +1491,9 @@ class TestProductionSidecarParserRegressions:
 
         assert client.oi_calls == 1
         assert first["binance:BTCUSDT"].open_interest_quote == pytest.approx(2500.0 * 100.5)
-        assert first["binance:BTCUSDT"].open_interest_evidence_status == "available"
+        assert first["binance:BTCUSDT"].open_interest_evidence_status == "observed"
         assert second["binance:BTCUSDT"].open_interest_quote == pytest.approx(2500.0 * 100.5)
-        assert second["binance:BTCUSDT"].open_interest_evidence_status == "available"
+        assert second["binance:BTCUSDT"].open_interest_evidence_status == "observed"
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_refresh_is_capped_and_deferred_symbols_are_explicit(self):
@@ -1045,8 +1531,8 @@ class TestProductionSidecarParserRegressions:
             ticker.symbol: ticker.open_interest_evidence_status
             for ticker in result.values()
         }
-        assert list(statuses.values()).count("available") == 3
-        assert list(statuses.values()).count("deferred_by_cap") == 5
+        assert list(statuses.values()).count("observed") == 3
+        assert list(statuses.values()).count("deferred") == 5
         for ticker in result.values():
             assert ticker.oi_candidate_count == 8
             assert ticker.oi_refresh_cap == 3
@@ -1056,7 +1542,7 @@ class TestProductionSidecarParserRegressions:
         deferred = [
             ticker
             for ticker in result.values()
-            if ticker.open_interest_evidence_status == "deferred_by_cap"
+            if ticker.open_interest_evidence_status == "deferred"
         ]
         assert all(
             ticker.open_interest_evidence_reason == "refresh_cap_exceeded"
@@ -1138,13 +1624,13 @@ class TestProductionSidecarParserRegressions:
 
         client = FakeBinanceClient()
         full = await client._fetch_binance_style(symbols)
-        assert full["binance:S7USDT"].open_interest_evidence_status == "deferred_by_cap"
+        assert full["binance:S7USDT"].open_interest_evidence_status == "deferred"
 
         refreshed = await client.fetch_entry_open_interest_evidence(["S7USDT"])
 
         assert client.oi_calls == ["S0USDT", "S7USDT"]
         ticker = refreshed["binance:S7USDT"]
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.oi_candidate_count == 1
         assert ticker.oi_deferred_count == 0
@@ -1185,10 +1671,10 @@ class TestProductionSidecarParserRegressions:
 
         zero_mark = result["binance:ZEROMARKUSDT"]
         missing_mark = result["binance:MISSINGMARKUSDT"]
-        assert zero_mark.open_interest_quote == 0.0
-        assert zero_mark.open_interest_evidence_status == "missing_mark_price"
-        assert missing_mark.open_interest_quote == 0.0
-        assert missing_mark.open_interest_evidence_status == "missing_mark_price"
+        assert zero_mark.open_interest_quote is None
+        assert zero_mark.open_interest_evidence_status == "parse_error"
+        assert missing_mark.open_interest_quote is None
+        assert missing_mark.open_interest_evidence_status == "parse_error"
 
     @pytest.mark.asyncio
     async def test_okx_funding_rate_requests_are_concurrent(self):
@@ -1393,7 +1879,7 @@ class TestProductionSidecarParserRegressions:
     async def test_okx_funding_observation_uses_response_receipt_time(self, monkeypatch):
         import lightfee.venues.market_data as market_data
 
-        times = iter((1_000, 2_000))
+        times = iter((1_000, 2_000, 3_000))
         monkeypatch.setattr(market_data, "_now_ms", lambda: next(times))
 
         class FakeOkxClient(MarketDataClient):
@@ -1633,8 +2119,8 @@ class TestProductionSidecarParserRegressions:
         btc = result["okx:BTCUSDT"]
         eth = result["okx:ETHUSDT"]
         assert btc.open_interest_quote == pytest.approx(1_500_000.0)
-        assert btc.open_interest_evidence_status == "available"
-        assert eth.open_interest_quote == 0.0
+        assert btc.open_interest_evidence_status == "observed"
+        assert eth.open_interest_quote is None
         assert eth.open_interest_evidence_status == "unavailable"
         assert eth.open_interest_evidence_reason == "missing_open_interest"
 
@@ -1666,7 +2152,7 @@ class TestProductionSidecarParserRegressions:
         result = await FakeOkxClient(okx_spec())._fetch_okx_style(["BTCUSDT"])
 
         ticker = result["okx:BTCUSDT"]
-        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_quote is None
         assert ticker.open_interest_evidence_status == "http_error"
         assert ticker.open_interest_evidence_reason == "timeout"
 
@@ -1691,8 +2177,8 @@ class TestProductionSidecarParserRegressions:
         result = await FakeBybitClient(bybit_spec())._fetch_bybit_style(["BTCUSDT"])
 
         ticker = result["bybit:BTCUSDT"]
-        assert ticker.open_interest_quote == 0.0
-        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_quote is None
+        assert ticker.open_interest_evidence_status == "parse_error"
         assert ticker.open_interest_evidence_reason == "missing_open_interest_value"
 
     @pytest.mark.asyncio
@@ -1722,7 +2208,7 @@ class TestProductionSidecarParserRegressions:
         assert ticker.bid == 100.0
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
 
     @pytest.mark.asyncio
     async def test_bitget_current_fund_rate_supplies_future_funding_timestamp(self):
@@ -2006,7 +2492,7 @@ class TestProductionSidecarParserRegressions:
         assert ticker.ask == 65000.0
         assert ticker.funding_rate_bps == 1.0
         assert ticker.open_interest_quote == pytest.approx(20.0 * 65000.0)
-        assert ticker.open_interest_evidence_status == "available"
+        assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_evidence_reason == "openInterest_times_mark"
 
     @pytest.mark.asyncio
@@ -2758,8 +3244,8 @@ class TestProductionSidecarParserRegressions:
 
         assert ticker.bid_size == 0.0
         assert ticker.ask_size == 0.0
-        assert ticker.open_interest_quote == 0.0
-        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_quote is None
+        assert ticker.open_interest_evidence_status == "parse_error"
         assert ticker.open_interest_evidence_reason == "missing_contract_multiplier"
         assert ticker.contract_normalization_complete is False
 

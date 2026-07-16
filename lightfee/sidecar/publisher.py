@@ -15,6 +15,7 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
     validate_v4_snapshot_contract,
+    validate_v5_snapshot_contract,
 )
 from lightfee.strategy.economics import build_edge_breakdown
 from lightfee.strategy.fee_contract import derive_candidate_stage_fee_bps
@@ -426,10 +427,10 @@ def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
     """Validate and atomically replace the last readable snapshot."""
     data = _snapshot_to_dict(snapshot)
     if data.get("schema_version") == SNAPSHOT_SCHEMA_VERSION:
-        contract_errors = validate_v4_snapshot_contract(data)
+        contract_errors = validate_v5_snapshot_contract(data)
         if contract_errors:
             raise ValueError(
-                "refusing to publish invalid V4 snapshot: "
+                "refusing to publish invalid V5 snapshot: "
                 + "; ".join(contract_errors)
             )
     target = Path(path)
@@ -475,7 +476,9 @@ def load_snapshot(path: str | Path) -> SidecarSnapshot | None:
         SNAPSHOT_SCHEMA_VERSION,
     }:
         return None
-    if schema_version == SNAPSHOT_SCHEMA_VERSION and not _v4_proof_contract_valid(data):
+    if schema_version == 4 and not _v4_proof_contract_valid(data):
+        return None
+    if schema_version == SNAPSHOT_SCHEMA_VERSION and not _v5_proof_contract_valid(data):
         return None
     try:
         return _dict_to_snapshot(data)
@@ -486,6 +489,11 @@ def load_snapshot(path: str | Path) -> SidecarSnapshot | None:
 def _v4_proof_contract_valid(data: dict[str, object]) -> bool:
     """Require producer proof before a v4 snapshot enters live consumers."""
     return not validate_v4_snapshot_contract(data)
+
+
+def _v5_proof_contract_valid(data: dict[str, object]) -> bool:
+    """Require independent OI proof before a V5 snapshot is trusted."""
+    return not validate_v5_snapshot_contract(data)
 
 
 def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
@@ -575,6 +583,15 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "open_interest": q.open_interest,
                 "open_interest_evidence_status": q.open_interest_evidence_status,
                 "open_interest_evidence_reason": q.open_interest_evidence_reason,
+                "open_interest_observed_at_ms": q.open_interest_observed_at_ms,
+                "open_interest_received_at_ms": q.open_interest_received_at_ms,
+                "open_interest_source": q.open_interest_source,
+                "open_interest_sample_id": q.open_interest_sample_id,
+                "open_interest_venue_symbol": q.open_interest_venue_symbol,
+                "raw_open_interest": q.raw_open_interest,
+                "raw_open_interest_unit": q.raw_open_interest_unit,
+                "open_interest_contract_multiplier": q.open_interest_contract_multiplier,
+                "open_interest_conversion_mark_price": q.open_interest_conversion_mark_price,
                 "oi_candidate_count": q.oi_candidate_count,
                 "oi_cache_hit_count": q.oi_cache_hit_count,
                 "oi_cache_miss_count": q.oi_cache_miss_count,
@@ -655,6 +672,15 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "short_funding_timestamp_ms": c.short_funding_timestamp_ms,
                 "second_funding_timestamp_ms": c.second_funding_timestamp_ms,
                 "entry_notional_quote": c.entry_notional_quote,
+                "entry_max_leg_notional_quote": c.entry_max_leg_notional_quote,
+                "funding_canary_fee_assurance_tier": (
+                    c.funding_canary_fee_assurance_tier
+                ),
+                "funding_canary_hard_max_entry_notional_quote": (
+                    c.funding_canary_hard_max_entry_notional_quote
+                ),
+                "funding_canary_size_constrained": c.funding_canary_size_constrained,
+                "candidate_revision_id": c.candidate_revision_id,
                 "first_funding_leg": c.first_funding_leg,
                 "entry_maker_leg": c.entry_maker_leg,
                 "exit_maker_leg": c.exit_maker_leg,
@@ -939,12 +965,15 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
             if isinstance(d.get("candidate_build_diagnostics", {}), dict)
             else {}
         ),
-        quotes={k: _quote_from_dict(v) for k, v in quotes_raw.items()},
+        quotes={
+            k: _quote_from_dict(v, schema_version=int(d.get("schema_version", 0) or 0))
+            for k, v in quotes_raw.items()
+        },
         candidates=[_enrich_candidate(c) for c in d.get("candidates", [])],
     )
 
 
-def _quote_from_dict(raw: object) -> QuoteSnapshot:
+def _quote_from_dict(raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSION) -> QuoteSnapshot:
     """Parse optional executable depth at the snapshot compatibility boundary.
 
     A malformed ladder must never make a historical BBO snapshot unreadable or
@@ -969,7 +998,6 @@ def _quote_from_dict(raw: object) -> QuoteSnapshot:
         "mark_price",
         "index_price",
         "volume_24h_quote",
-        "open_interest",
         "contract_multiplier",
         "price_tick",
         "quantity_step_base",
@@ -979,6 +1007,14 @@ def _quote_from_dict(raw: object) -> QuoteSnapshot:
         if field in value:
             value[field] = _safe_float(value[field], default=0.0)
     for field in ("predicted_funding_rate_bps", "settled_funding_rate_bps"):
+        if field in value:
+            value[field] = _safe_optional_float(value[field])
+    for field in (
+        "open_interest",
+        "raw_open_interest",
+        "open_interest_contract_multiplier",
+        "open_interest_conversion_mark_price",
+    ):
         if field in value:
             value[field] = _safe_optional_float(value[field])
     for field in (
@@ -995,11 +1031,26 @@ def _quote_from_dict(raw: object) -> QuoteSnapshot:
         "oi_deferred_count",
         "oi_timeout_count",
         "oi_refresh_elapsed_ms",
+        "open_interest_observed_at_ms",
+        "open_interest_received_at_ms",
         "price_precision",
         "quantity_precision",
     ):
         if field in value:
             value[field] = _safe_int(value[field], default=0)
+    if schema_version < 5:
+        value["open_interest"] = None
+        value["open_interest_evidence_status"] = "stale"
+        value["open_interest_evidence_reason"] = "legacy_snapshot_missing_oi_proof"
+        value["open_interest_observed_at_ms"] = 0
+        value["open_interest_received_at_ms"] = 0
+        value["open_interest_source"] = ""
+        value["open_interest_sample_id"] = ""
+        value["open_interest_venue_symbol"] = ""
+        value["raw_open_interest"] = None
+        value["raw_open_interest_unit"] = ""
+        value["open_interest_contract_multiplier"] = None
+        value["open_interest_conversion_mark_price"] = None
     # Snapshot JSON is an untrusted compatibility boundary.  Python treats a
     # non-empty string such as ``"false"`` as truthy, which would otherwise
     # let malformed v3 evidence assert forecast stability or contract

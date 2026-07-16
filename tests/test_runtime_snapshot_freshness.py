@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter
 
@@ -7,11 +8,15 @@ import pytest
 
 from lightfee.core.domain import Venue
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
-from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
+from lightfee.engine.market_data_runtime import (
+    EntryOpenInterestRefresher,
+    _targeted_open_interest_observed_proof_valid,
+)
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
 from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -54,6 +59,170 @@ class CapturingEntryExecutor:
             route=ExecutionRoute.PASSIVE_INCREMENTAL,
             state=EntryState.COMPLETED,
         )
+
+
+@pytest.mark.asyncio
+async def test_tick_cancels_previous_entry_prewarm_generation_before_early_return(
+    tmp_path,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="paper",
+            sidecar_snapshot_path=str(tmp_path / "missing-sidecar.json"),
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    cancel_cleanup_finished = asyncio.Event()
+
+    async def stale_prewarm() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await asyncio.sleep(0.15)
+            cancel_cleanup_finished.set()
+            raise
+
+    runtime._entry_evidence_prewarm_task = asyncio.create_task(stale_prewarm())
+    await started.wait()
+    previous_generation = runtime._entry_evidence_generation
+
+    runtime.journal.open()
+    try:
+        started_monotonic = asyncio.get_running_loop().time()
+        await runtime.tick()
+        elapsed_s = asyncio.get_running_loop().time() - started_monotonic
+    finally:
+        runtime.journal.close()
+
+    assert cancelled.is_set()
+    assert elapsed_s < 0.08
+    assert not cancel_cleanup_finished.is_set()
+    assert runtime._entry_evidence_prewarm_task is None
+    assert runtime._entry_evidence_generation == previous_generation + 1
+    await asyncio.wait_for(cancel_cleanup_finished.wait(), timeout=0.5)
+    await asyncio.sleep(0)
+    assert not runtime._entry_evidence_cancel_cleanup_tasks
+
+
+@pytest.mark.asyncio
+async def test_entry_pipeline_shared_deadline_cancels_quote_and_oi_waiters(
+    tmp_path,
+    monkeypatch,
+):
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600_000,
+            max_market_age_ms=600_000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=_entry_flow_strategy_config(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.entry_executor = CapturingEntryExecutor()
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime._ENTRY_EVIDENCE_PIPELINE_DEADLINE_S = 0.02
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"{venue}:BTCUSDT": _quote_with_liquidity(
+                venue,
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms,
+            )
+            for venue in ("okx", "bybit")
+        },
+        candidates=[candidate],
+    )
+    quote_cancelled = asyncio.Event()
+    quote_cancel_cleanup_finished = asyncio.Event()
+    oi_cancelled = asyncio.Event()
+
+    async def passthrough(candidates, *args, **kwargs):
+        return list(candidates)
+
+    async def slow_quote(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            quote_cancelled.set()
+            await asyncio.sleep(0.15)
+            quote_cancel_cleanup_finished.set()
+            raise
+
+    async def slow_oi(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            oi_cancelled.set()
+            raise
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(
+        runtime,
+        "_filter_candidates_supported_by_venue_catalog",
+        passthrough,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_filter_candidates_by_entry_balance_admission",
+        passthrough,
+    )
+    monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", slow_quote)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_entry_candidate_open_interest_evidence",
+        slow_oi,
+    )
+
+    runtime.journal.open()
+    try:
+        started_monotonic = asyncio.get_running_loop().time()
+        await runtime.tick()
+        elapsed_s = asyncio.get_running_loop().time() - started_monotonic
+    finally:
+        runtime.journal.close()
+
+    assert quote_cancelled.is_set()
+    assert oi_cancelled.is_set()
+    assert elapsed_s < 0.08
+    assert not quote_cancel_cleanup_finished.is_set()
+    await asyncio.wait_for(quote_cancel_cleanup_finished.wait(), timeout=0.5)
+    await asyncio.sleep(0)
+    assert not runtime._entry_evidence_cancel_cleanup_tasks
+    assert runtime.state.last_scan["no_entry_reason"] == (
+        "entry_evidence_deadline_exceeded"
+    )
+    assert runtime.state.last_scan["entry_evidence_deadline_stage"] == (
+        "quote_revalidation"
+    )
 
 
 @pytest.mark.asyncio
@@ -268,6 +437,12 @@ def _quote(venue: str, symbol: str, bid: float, ask: float) -> QuoteSnapshot:
         funding_interval_ms=28_800_000,
         volume_24h_quote=10_000_000.0,
         open_interest=2_000_000.0,
+        open_interest_evidence_status="observed",
+        open_interest_observed_at_ms=69_000,
+        open_interest_received_at_ms=69_000,
+        open_interest_source="test_fixture",
+        open_interest_sample_id=f"{venue}:{symbol}:69000",
+        open_interest_venue_symbol=symbol,
     )
 
 
@@ -278,7 +453,13 @@ def _quote_with_liquidity(
     volume_24h_quote: float,
     open_interest: float,
     observed_at_ms: int = 69000,
+    open_interest_observed_at_ms: int | None = None,
 ) -> QuoteSnapshot:
+    oi_observed_at_ms = (
+        observed_at_ms
+        if open_interest_observed_at_ms is None
+        else open_interest_observed_at_ms
+    )
     return QuoteSnapshot(
         venue=venue,
         symbol=symbol,
@@ -292,6 +473,71 @@ def _quote_with_liquidity(
         funding_interval_ms=28_800_000,
         volume_24h_quote=volume_24h_quote,
         open_interest=open_interest,
+        open_interest_evidence_status="observed",
+        open_interest_observed_at_ms=oi_observed_at_ms,
+        open_interest_received_at_ms=oi_observed_at_ms,
+        open_interest_source="test_fixture",
+        open_interest_sample_id=f"{venue}:{symbol}:{oi_observed_at_ms}",
+        open_interest_venue_symbol=symbol,
+    )
+
+
+def _targeted_observed_oi_result(
+    venue: str,
+    symbol: str,
+    now_ms: int,
+    *,
+    source: str,
+    value_quote: float = 2_500_000.0,
+) -> dict:
+    return {
+        "open_interest_quote": value_quote,
+        "open_interest_evidence_status": "observed",
+        "open_interest_evidence_reason": "targeted_refresh",
+        "open_interest_observed_at_ms": now_ms,
+        "open_interest_received_at_ms": now_ms,
+        "open_interest_source": source,
+        "open_interest_sample_id": open_interest_sample_id(
+            venue=venue,
+            canonical_symbol=symbol,
+            venue_symbol=symbol,
+            observed_at_ms=now_ms,
+            source=source,
+            raw_value=value_quote,
+            value_quote=value_quote,
+        ),
+        "open_interest_venue_symbol": symbol,
+        "raw_open_interest": value_quote,
+        "raw_open_interest_unit": "quote",
+        "open_interest_contract_multiplier": 1.0,
+        "open_interest_conversion_mark_price": None,
+    }
+
+
+def test_targeted_oi_ingress_rejects_non_finite_and_forged_sample_proof():
+    payload = _targeted_observed_oi_result(
+        "okx",
+        "BTCUSDT",
+        70_000,
+        source="test_targeted_refresh",
+    )
+    assert _targeted_open_interest_observed_proof_valid(
+        venue="okx",
+        symbol="BTCUSDT",
+        result=payload,
+    )
+
+    non_finite = dict(payload, open_interest_quote=float("nan"))
+    forged_sample = dict(payload, open_interest_sample_id="forged")
+    assert not _targeted_open_interest_observed_proof_valid(
+        venue="okx",
+        symbol="BTCUSDT",
+        result=non_finite,
+    )
+    assert not _targeted_open_interest_observed_proof_valid(
+        venue="okx",
+        symbol="BTCUSDT",
+        result=forged_sample,
     )
 
 
@@ -359,6 +605,7 @@ def test_ws_bbo_provider_resolves_stale_sidecar_quote_for_entry_freshness(tmp_pa
                 volume_24h_quote=10_000_000.0,
                 open_interest=2_000_000.0,
                 observed_at_ms=now_ms - 31_000,
+                open_interest_observed_at_ms=now_ms - 100,
             ),
             "bybit:BTCUSDT": _quote_with_liquidity(
                 "bybit",
@@ -366,6 +613,7 @@ def test_ws_bbo_provider_resolves_stale_sidecar_quote_for_entry_freshness(tmp_pa
                 volume_24h_quote=10_000_000.0,
                 open_interest=2_000_000.0,
                 observed_at_ms=now_ms - 31_000,
+                open_interest_observed_at_ms=now_ms - 100,
             ),
         },
         candidates=[candidate],
@@ -987,6 +1235,111 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
 
 
 @pytest.mark.asyncio
+async def test_quote_revalidation_overlay_keeps_ws_that_superseded_delayed_rest(
+    tmp_path,
+    monkeypatch,
+):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live", max_market_age_ms=600_000),
+        strategy=_entry_flow_strategy_config(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_quote_lease_ttl_ms=1_500,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.last_scan = {}
+    runtime._entry_wall_clock_now_ms = lambda: now_ms
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"{venue}:BTCUSDT": _quote_with_liquidity(
+                venue,
+                "BTCUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms - 10_000,
+            )
+            for venue in ("okx", "bybit")
+        },
+        candidates=[candidate],
+    )
+
+    async def activate(candidates, activation_now_ms):
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("okx", "BTCUSDT"),
+            ("bybit", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = set()
+
+    class RacingRefresher:
+        async def arefresh_quote_result(self, venue, symbol, *, now_ms):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=101.0,
+                    ask=101.1,
+                    observed_at_ms=now_ms - 5,
+                    received_at_ms=now_ms - 5,
+                    exchange_event_at_ms=2_000,
+                    source=f"{venue}_book_ticker",
+                )
+            )
+            quote = TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=99.0,
+                ask=99.1,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                exchange_event_at_ms=1_000,
+                source=f"{venue}_rest_top_book",
+            )
+            return type(
+                "RefreshResult",
+                (),
+                {"outcome": "resolved", "quote": quote},
+            )()
+
+    runtime.ws_bbo_rest_refresher = RacingRefresher()
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        activate,
+    )
+
+    runtime.journal.open()
+    try:
+        overlay, stats = await runtime._entry_quote_revalidate_for_candidates(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=now_ms,
+        )
+    finally:
+        runtime.journal.close()
+
+    assert set(overlay) == {("okx", "BTCUSDT"), ("bybit", "BTCUSDT")}
+    assert {quote.source for quote in overlay.values()} == {
+        "okx_book_ticker",
+        "bybit_book_ticker",
+    }
+    assert {quote.bid for quote in overlay.values()} == {101.0}
+    assert stats["rest_resolved_count"] == 0
+    assert stats["ws_resolved_count"] == 2
+
+
+@pytest.mark.asyncio
 async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without_expanding_execution_scope(
     tmp_path,
     monkeypatch,
@@ -1093,7 +1446,16 @@ async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without
 
     original_revalidate = runtime._entry_quote_revalidate_for_candidates
 
-    async def record_revalidate(candidates, *, snapshot, now_ms, candidate_scope="", skipped_untracked_count=0, evidence_role="entry_execution"):
+    async def record_revalidate(
+        candidates,
+        *,
+        snapshot,
+        now_ms,
+        candidate_scope="",
+        skipped_untracked_count=0,
+        evidence_role="entry_execution",
+        activation_candidates=None,
+    ):
         quote_revalidate_calls.append({
             "candidate_count": len(candidates),
             "candidate_scope": candidate_scope,
@@ -1107,6 +1469,7 @@ async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without
             candidate_scope=candidate_scope,
             skipped_untracked_count=skipped_untracked_count,
             evidence_role=evidence_role,
+            activation_candidates=activation_candidates,
         )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
@@ -1116,8 +1479,11 @@ async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without
 
     runtime.journal.open()
     try:
+        runtime._running = True
         await runtime.tick()
+        await runtime._entry_evidence_prewarm_task
     finally:
+        runtime._running = False
         runtime.journal.close()
 
     records = _read_journal_records(tmp_path / "events.jsonl")
@@ -1127,7 +1493,7 @@ async def test_runtime_ws_bbo_quote_revalidate_prewarms_extra_candidates_without
         if record["kind"] == "runtime.entry_quote_revalidate_probe"
     ][-1]
 
-    assert prewarm_candidate_counts == [3, 24]
+    assert prewarm_candidate_counts == [3, 27]
     assert quote_revalidate_calls == [
         {
             "candidate_count": 3,
@@ -1647,8 +2013,15 @@ async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucke
     assert {payload["quote_validation_reject_reason"] for payload in failures} == {
         "stale"
     }
-    assert all(payload["rest_quote_observed_at_ms"] == now_ms - 250 for payload in failures)
-    assert all(payload["rest_quote_age_ms"] == 250 for payload in failures)
+    assert all(
+        payload["rest_quote_observed_at_ms"]
+        == payload["rest_quote_received_at_ms"] - 250
+        for payload in failures
+    )
+    assert all(
+        250 <= payload["rest_quote_age_ms"] < 1_000
+        for payload in failures
+    )
     assert all(payload["rest_revalidate_hit"] is True for payload in failures)
     assert all(payload["rest_revalidate_terminal_stale"] is True for payload in failures)
     assert all(payload["ws_bbo_lease_hit"] is False for payload in failures)
@@ -1827,6 +2200,7 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     )
     candidate = _freshness_candidate("LEASEUSDT")
     candidate.pair_id = "leaseusdt:okx->bybit"
+    candidate.candidate_revision_id = "lease-revision-1"
     runtime = LiveRuntime(
         config,
         venue_adapters={
@@ -1838,7 +2212,7 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime._live_scan_success_streak = 3
     runtime.entry_executor = CapturingEntryExecutor()
-    runtime._entry_candidate_lease_started_at_ms[candidate.pair_id] = 1_000
+    runtime._entry_candidate_lease_started_at_ms[candidate.candidate_revision_id] = 1_000
 
     now_ms = 2_500
     snapshot = _candidate_lease_snapshot(candidate, now_ms)
@@ -1866,6 +2240,31 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     )
     assert expired["action_taken"] == "expire_candidate_and_rescan"
     assert expired["reason"] == "candidate_lease_hard_expired"
+
+
+def test_legacy_candidate_revision_changes_with_economic_observation(tmp_path):
+    config = AppConfig(
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        )
+    )
+    runtime = LiveRuntime(config)
+    older = _freshness_candidate("REVUSDT")
+    newer = _freshness_candidate("REVUSDT")
+    older.candidate_revision_id = ""
+    newer.candidate_revision_id = ""
+    older.economics_observed_at_ms = 1_000
+    newer.economics_observed_at_ms = 2_000
+
+    older_revision = runtime._bind_entry_candidate_revision_id(older)
+    newer_revision = runtime._bind_entry_candidate_revision_id(newer)
+
+    assert older_revision
+    assert newer_revision
+    assert older_revision != newer_revision
+    assert older.candidate_revision_id == older_revision
+    assert newer.candidate_revision_id == newer_revision
 
 
 @pytest.mark.asyncio
@@ -3417,6 +3816,9 @@ def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_pa
         "last_class": "temporary_below_floor",
         "last_observed_open_interest_quote": 900000,
         "last_observed_open_interest_at_ms": 69000,
+        "last_observed_sample_id": "okx:BTCUSDT:69000",
+        "counted_low_sample_ids": ["okx:BTCUSDT:69000"],
+        "last_counted_low_sample_id": "okx:BTCUSDT:69000",
         "last_structural_probe_at_ms": None,
     }
     assert records_by_venue["bybit"] == {
@@ -3428,6 +3830,9 @@ def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_pa
         "last_class": "eligible",
         "last_observed_open_interest_quote": 2000000,
         "last_observed_open_interest_at_ms": 69000,
+        "last_observed_sample_id": "bybit:BTCUSDT:69000",
+        "counted_low_sample_ids": [],
+        "last_counted_low_sample_id": None,
         "last_structural_probe_at_ms": None,
     }
     records = _read_journal_records(tmp_path / "events.jsonl")
@@ -3521,8 +3926,25 @@ def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(t
             "last_class": "eligible",
             "last_observed_open_interest_quote": 2000000,
             "last_observed_open_interest_at_ms": 69000,
+            "last_observed_sample_id": "bybit:BTCUSDT:69000",
+            "counted_low_sample_ids": [],
+            "last_counted_low_sample_id": None,
             "last_structural_probe_at_ms": None,
-        }
+        },
+        {
+            "venue": "okx",
+            "symbol": "BTCUSDT",
+            "consecutive_failures": 0,
+            "last_failure_at_ms": None,
+            "suppress_until_ms": None,
+            "last_class": None,
+            "last_observed_open_interest_quote": None,
+            "last_observed_open_interest_at_ms": None,
+            "last_observed_sample_id": None,
+            "counted_low_sample_ids": [],
+            "last_counted_low_sample_id": None,
+            "last_structural_probe_at_ms": None,
+        },
     ]
     records = _read_journal_records(tmp_path / "events.jsonl")
     decision = next(
@@ -3541,8 +3963,97 @@ def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(t
     )
 
 
+@pytest.mark.parametrize(
+    ("open_interest", "oi_observed_at_ms"),
+    [
+        (float("nan"), 69_000),
+        ("N/A", 69_000),
+        (2_000_000.0, "N/A"),
+        (2_000_000.0, 70_001),
+    ],
+)
+def test_runtime_never_admits_invalid_or_future_observed_oi(
+    tmp_path,
+    open_interest,
+    oi_observed_at_ms,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69_000,
+        market_observed_at_ms=69_000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "okx:BTCUSDT": _quote_with_liquidity(
+                "okx",
+                "BTCUSDT",
+                volume_24h_quote=6_000_000.0,
+                open_interest=open_interest,
+                open_interest_observed_at_ms=oi_observed_at_ms,
+            ),
+            "bybit:BTCUSDT": _quote_with_liquidity(
+                "bybit",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        filtered = runtime._filter_candidates_by_snapshot_freshness(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70_000,
+            metrics={},
+            ages={},
+        )
+    finally:
+        runtime.journal.close()
+
+    assert filtered == []
+    okx_record = next(
+        record
+        for record in runtime.state.entry_liquidity_qualification_records
+        if record["venue"] == "okx"
+    )
+    assert okx_record["consecutive_failures"] == 0
+    assert okx_record["last_class"] is None
+    decisions = [
+        record["payload"]
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "runtime.snapshot_freshness_decision"
+    ]
+    assert any(
+        decision.get("reason") == "oi_evidence_unavailable"
+        and decision.get("open_interest_evidence_status") in {"parse_error", "stale"}
+        for decision in decisions
+    )
+
+
 @pytest.mark.asyncio
-async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_gate(tmp_path):
+async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_gate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms",
+        lambda: 70_000,
+    )
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -3568,9 +4079,12 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
             self.calls.append((venue, symbol))
             if venue == "binance" and symbol == "BTCUSDT":
                 return {
-                    "open_interest_quote": 2_500_000.0,
-                    "open_interest_evidence_status": "available",
-                    "open_interest_evidence_reason": "targeted_refresh",
+                    **_targeted_observed_oi_result(
+                        venue,
+                        symbol,
+                        now_ms,
+                        source="test_targeted_refresh",
+                    ),
                     "oi_targeted_refresh_elapsed_ms": 7,
                 }
             return None
@@ -3640,7 +4154,7 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
     assert filtered == [candidate]
     refreshed_quote = snapshot.quotes["binance:BTCUSDT"]
     assert refreshed_quote.open_interest == 2_500_000.0
-    assert refreshed_quote.open_interest_evidence_status == "available"
+    assert refreshed_quote.open_interest_evidence_status == "observed"
     records = _read_journal_records(tmp_path / "events.jsonl")
     assert "runtime.entry_oi_targeted_refresh_resolved" in [
         record["kind"] for record in records
@@ -3653,7 +4167,14 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
 
 
 @pytest.mark.asyncio
-async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(tmp_path):
+async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms",
+        lambda: 70_000,
+    )
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -3677,11 +4198,12 @@ async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(tmp_
 
         async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
             self.calls.append((venue, symbol))
-            return {
-                "open_interest_quote": 2_500_000.0,
-                "open_interest_evidence_status": "available",
-                "open_interest_evidence_reason": "targeted_refresh",
-            }
+            return _targeted_observed_oi_result(
+                venue,
+                symbol,
+                now_ms,
+                source="test_targeted_refresh",
+            )
 
     refresher = FakeOiRefresher()
     runtime.entry_open_interest_refresher = refresher
@@ -3751,8 +4273,8 @@ async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(tmp_
     assert stats["attempt_count"] == 2
     assert stats["resolved_count"] == 2
     assert filtered == [candidate]
-    assert snapshot.quotes["okx:BTCUSDT"].open_interest_evidence_status == "available"
-    assert snapshot.quotes["bybit:BTCUSDT"].open_interest_evidence_status == "available"
+    assert snapshot.quotes["okx:BTCUSDT"].open_interest_evidence_status == "observed"
+    assert snapshot.quotes["bybit:BTCUSDT"].open_interest_evidence_status == "observed"
     records = _read_journal_records(tmp_path / "events.jsonl")
     assert not any(
         record["payload"].get("reason") == "oi_evidence_unavailable"
@@ -3796,8 +4318,12 @@ async def test_runtime_targeted_oi_refresh_batches_same_venue_targets(tmp_path):
             self.calls.append((venue, tuple(symbols)))
             return {
                 symbol: {
-                    "open_interest_quote": 2_500_000.0,
-                    "open_interest_evidence_status": "available",
+                    **_targeted_observed_oi_result(
+                        venue,
+                        symbol,
+                        now_ms,
+                        source="test_targeted_batch_refresh",
+                    ),
                     "open_interest_evidence_reason": "targeted_batch_refresh",
                     "oi_targeted_refresh_elapsed_ms": 9,
                 }
@@ -3879,14 +4405,96 @@ async def test_runtime_targeted_oi_refresh_batches_same_venue_targets(tmp_path):
     assert refresher.calls == [("binance", ("BTCUSDT", "ETHUSDT"))]
     assert stats["attempt_count"] == 2
     assert stats["resolved_count"] == 2
-    assert snapshot.quotes["binance:BTCUSDT"].open_interest_evidence_status == "available"
-    assert snapshot.quotes["binance:ETHUSDT"].open_interest_evidence_status == "available"
+    assert snapshot.quotes["binance:BTCUSDT"].open_interest_evidence_status == "observed"
+    assert snapshot.quotes["binance:ETHUSDT"].open_interest_evidence_status == "observed"
     records = _read_journal_records(tmp_path / "events.jsonl")
     assert [
         record["payload"]["symbol"]
         for record in records
         if record["kind"] == "runtime.entry_oi_targeted_refresh_resolved"
     ] == ["BTCUSDT", "ETHUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_targeted_oi_fallback_is_concurrent_and_hard_deadlined(
+    tmp_path,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.long_venue = "binance"
+    candidate.short_venue = "aster"
+
+    class SingleOnlyOiRefresher:
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+        ):
+            if venue == "binance":
+                await asyncio.sleep(0.05)
+                return _targeted_observed_oi_result(
+                    venue,
+                    symbol,
+                    now_ms,
+                    source="single_target_fixture",
+                )
+            await asyncio.sleep(2.0)
+            raise AssertionError("the hard deadline must cancel this target")
+
+    runtime.entry_open_interest_refresher = SingleOnlyOiRefresher()
+    snapshot = SidecarSnapshot(
+        published_at_ms=70_000,
+        market_observed_at_ms=70_000,
+        quotes={
+            f"{venue}:BTCUSDT": QuoteSnapshot(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=70_000,
+                volume_24h_quote=10_000_000.0,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+                open_interest_evidence_reason="prior_timeout",
+            )
+            for venue in ("binance", "aster")
+        },
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70_000,
+        )
+    finally:
+        runtime.journal.close()
+    elapsed = loop.time() - started
+
+    assert elapsed < 1.0
+    assert stats["resolved_count"] == 1
+    assert stats["timeout_count"] == 1
+    assert stats["entry_evidence_deadline_exceeded_count"] == 1
+    assert snapshot.quotes["binance:BTCUSDT"].open_interest == 2_500_000.0
+    assert snapshot.quotes["aster:BTCUSDT"].open_interest is None
+    assert (
+        snapshot.quotes["aster:BTCUSDT"].open_interest_evidence_reason
+        == "entry_evidence_deadline_exceeded"
+    )
 
 
 def test_entry_open_interest_refresher_uses_targeted_public_budget():
@@ -3997,7 +4605,7 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
         record["payload"]
         for record in records
         if record["kind"] == "runtime.snapshot_freshness_decision"
-        and record["payload"]["reason"] == "oi_evidence_unavailable"
+        and record["payload"]["reason"] == "oi_refresh_failed"
     )
     assert decision["open_interest_evidence_status"] == "timeout"
 
@@ -4026,6 +4634,8 @@ def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tm
             "last_class": "structural_ineligibility",
             "last_observed_open_interest_quote": 900000,
             "last_observed_open_interest_at_ms": 10000,
+            "last_observed_sample_id": "sample-3",
+            "counted_low_sample_ids": ["sample-1", "sample-2", "sample-3"],
             "last_structural_probe_at_ms": 69500,
         }
     ]
@@ -4075,6 +4685,15 @@ def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tm
             ages={},
         )
         assert filtered == []
+
+        okx_quote = snapshot.quotes["okx:BTCUSDT"]
+        okx_quote.open_interest_observed_at_ms = 130000
+        okx_quote.open_interest_received_at_ms = 130000
+        okx_quote.open_interest_sample_id = "okx:BTCUSDT:130000"
+        bybit_quote = snapshot.quotes["bybit:BTCUSDT"]
+        bybit_quote.open_interest_observed_at_ms = 130000
+        bybit_quote.open_interest_received_at_ms = 130000
+        bybit_quote.open_interest_sample_id = "bybit:BTCUSDT:130000"
 
         filtered = runtime._filter_candidates_by_snapshot_freshness(
             [candidate],

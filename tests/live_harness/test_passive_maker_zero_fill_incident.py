@@ -168,6 +168,24 @@ def _payload(kind: str) -> dict:
     return next(event["payload"] for event in _events() if event["kind"] == kind)
 
 
+def _frozen_base_symbol_rule(venue: Venue, symbol: str) -> dict[str, object]:
+    """Executable entry-time rule evidence for the synthetic RIVER incident."""
+
+    return {
+        "venue": venue.value,
+        "symbol": symbol,
+        "venue_symbol": symbol,
+        "quantity_units": "base",
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 0.0,
+        "source": "live_harness_fixture",
+        "rule_source": "synthetic_identity_adapter",
+        "missing_fields": [],
+        "evidence_complete": True,
+    }
+
+
 def _pending_from_fixture() -> PendingEntry:
     selected = _payload("entry.selected")
     submitted = _payload("order.passive_submitted")
@@ -194,6 +212,15 @@ def _pending_from_fixture() -> PendingEntry:
         funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
         long_funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
         short_funding_timestamp_ms=_VIABLE_FIRST_FUNDING_MS,
+        long_symbol_rule_at_entry=_frozen_base_symbol_rule(
+            Venue.OKX,
+            selected["symbol"],
+        ),
+        short_symbol_rule_at_entry=_frozen_base_symbol_rule(
+            Venue.BYBIT,
+            selected["symbol"],
+        ),
+        common_base_quantity_step_at_entry=0.001,
         repost_count=1,
         zero_fill_since_ms=int(submitted["accepted_at_ms"]),
         phase_state=PendingEntryPassivePhaseState(
@@ -587,8 +614,8 @@ async def test_force_standard_terminal_fallback_uses_rechecked_candidate_sizing(
     assert executed is True
     assert len(recorder.contexts) == 1
     ctx = recorder.contexts[0]
-    assert ctx.long_quantity == pytest.approx(25.0 / 7.0)
-    assert ctx.short_quantity == pytest.approx(25.0 / 7.0)
+    assert ctx.long_quantity == pytest.approx(3.571)
+    assert ctx.short_quantity == pytest.approx(3.571)
     assert ctx.long_price_hint == pytest.approx(7.0)
     assert ctx.short_price_hint == pytest.approx(8.0)
     assert ctx.blocked_reasons == []

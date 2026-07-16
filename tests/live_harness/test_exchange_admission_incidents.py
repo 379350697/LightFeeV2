@@ -960,6 +960,24 @@ class FailingSingleLegCleanupAdapter(LiveSingleLegCleanupAdapter):
         )
 
 
+def _frozen_base_symbol_rule(venue: Venue, symbol: str) -> dict[str, object]:
+    """Executable entry-time rule evidence for synthetic admission incidents."""
+
+    return {
+        "venue": venue.value,
+        "symbol": symbol,
+        "venue_symbol": symbol,
+        "quantity_units": "base",
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 0.0,
+        "source": "live_harness_fixture",
+        "rule_source": "synthetic_identity_adapter",
+        "missing_fields": [],
+        "evidence_complete": True,
+    }
+
+
 def _pending_for_hedge_reject(
     *,
     entry_id: str,
@@ -986,6 +1004,9 @@ def _pending_for_hedge_reject(
         hedge_leg_filled=0.0,
         maker_price=1.0,
         maker_fill_price=1.0,
+        long_symbol_rule_at_entry=_frozen_base_symbol_rule(long_venue, symbol),
+        short_symbol_rule_at_entry=_frozen_base_symbol_rule(short_venue, symbol),
+        common_base_quantity_step_at_entry=0.001,
     )
 
 
