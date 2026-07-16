@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import zlib
 
 import pytest
 
@@ -96,6 +97,11 @@ def _config(**overrides: object) -> SpreadReversionConfig:
         "taker_fee_bps_by_venue": {"cheap": 0.0, "rich": 0.0},
         "signal_ttl_ms": 5_000,
         "quote_skew_ms": 1_000,
+        # Focused signal tests advance independent market evidence once per
+        # second. Preserve that intended cadence while production's six-hour /
+        # 7,200-sample contract derives a three-second interval.
+        "stats_window_ms": 7_200_000,
+        "stats_max_samples": 7_200,
     }
     values.update(overrides)
     return SpreadReversionConfig(**values)
@@ -165,6 +171,192 @@ def test_stats_snapshot_is_computed_once_per_accepted_observation(monkeypatch) -
     assert expired.sample_count == 0
 
 
+def test_configured_stats_sampling_represents_full_window_and_staggers_pairs() -> None:
+    tracker = SpreadStatsTracker()
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    assert tracker.sample_interval_ms == 3_000
+
+    pair_count = 254
+    started_at_ms = 100_000
+    for index in range(pair_count):
+        update = tracker.observe(
+            f"S{index:03d}",
+            "alpha",
+            "beta",
+            float(index),
+            observed_at_ms=started_at_ms,
+        )
+        assert update.accepted is True
+
+    accepted_per_refresh: list[int] = []
+    for offset_ms in range(250, 3_001, 250):
+        accepted = 0
+        for index in range(pair_count):
+            update = tracker.observe(
+                f"S{index:03d}",
+                "alpha",
+                "beta",
+                float(index),
+                observed_at_ms=started_at_ms + offset_ms,
+            )
+            accepted += int(update.accepted)
+        accepted_per_refresh.append(accepted)
+
+    assert sum(accepted_per_refresh) == pair_count
+    assert max(accepted_per_refresh) <= 32
+
+
+def test_configure_resamples_oversampled_history_without_lookahead() -> None:
+    tracker = SpreadStatsTracker()
+    for observed_at_ms in range(100_000, 103_000, 250):
+        tracker.update(
+            "BTCUSDT",
+            "alpha",
+            "beta",
+            float(observed_at_ms),
+            observed_at_ms=observed_at_ms,
+        )
+    assert tracker.snapshot("BTCUSDT", "alpha", "beta", now_ms=103_000).sample_count == 12
+
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    state = tracker.snapshot("BTCUSDT", "alpha", "beta", now_ms=103_000)
+    assert state is not None
+    assert 1 <= state.sample_count <= 2
+    assert state.last_observed_ms <= 102_750
+
+
+def test_same_bucket_shocks_still_trigger_causal_structural_break() -> None:
+    tracker = SpreadStatsTracker()
+    tracker.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+            structural_break_sigma=3.0,
+            structural_break_consecutive=5,
+            structural_break_cooldown_ms=30_000,
+        )
+    )
+    for index, value in enumerate((-1.0, 0.0, 1.0, -1.0, 0.0, 1.0)):
+        tracker.update(
+            "BTCUSDT",
+            "alpha",
+            "beta",
+            value,
+            observed_at_ms=100_000 + index * 3_000,
+        )
+
+    key = ("BTCUSDT", "alpha", "beta")
+    last_observed_ms = 115_000
+    next_bucket = tracker._sample_bucket(key, last_observed_ms) + 1
+    phase_ms = zlib.crc32("|".join(key).encode("utf-8")) % tracker.sample_interval_ms
+    bucket_started_at_ms = phase_ms + next_bucket * tracker.sample_interval_ms
+    normal = tracker.observe(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        0.0,
+        observed_at_ms=bucket_started_at_ms,
+    )
+    assert normal.accepted is True
+
+    first_shock = tracker.observe(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        100.0,
+        observed_at_ms=bucket_started_at_ms + 100,
+    )
+    assert first_shock.accepted is False
+    assert first_shock.structural_break is False
+    for _ in range(5):
+        repeated = tracker.observe(
+            "BTCUSDT",
+            "alpha",
+            "beta",
+            100.0,
+            observed_at_ms=bucket_started_at_ms + 100,
+        )
+        assert repeated.structural_break is False
+        assert repeated.duplicate_evidence is True
+    late = tracker.observe(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        100.0,
+        observed_at_ms=bucket_started_at_ms + 99,
+    )
+    assert late.structural_break is False
+    assert late.out_of_order_evidence is True
+
+    for offset_ms in (200, 300, 400):
+        control = tracker.observe(
+            "BTCUSDT",
+            "alpha",
+            "beta",
+            100.0,
+            observed_at_ms=bucket_started_at_ms + offset_ms,
+        )
+        assert control.accepted is False
+        assert control.structural_break is False
+
+    broken = tracker.observe(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        100.0,
+        observed_at_ms=bucket_started_at_ms + 500,
+    )
+    assert broken.accepted is False
+    assert broken.structural_break is True
+    state = tracker.snapshot(
+        "BTCUSDT",
+        "alpha",
+        "beta",
+        now_ms=bucket_started_at_ms + 500,
+    )
+    assert state is not None
+    assert state.sample_count == 0
+    assert state.cooldown_until_ms == bucket_started_at_ms + 30_500
+
+
+def test_resampling_resets_incomparable_structural_break_counters() -> None:
+    legacy = SpreadStatsTracker()
+    for index in range(12):
+        legacy.update(
+            "BTCUSDT",
+            "alpha",
+            "beta",
+            float(index % 3 - 1),
+            observed_at_ms=100_000 + index * 250,
+        )
+    checkpoint = legacy.checkpoint(now_ms=103_000)
+    row = checkpoint["BTCUSDT|alpha|beta"]
+    row["break_consecutive"] = 4
+    row["shock_consecutive"] = 4
+
+    restored = SpreadStatsTracker()
+    restored.configure(
+        SpreadReversionConfig(
+            stats_window_ms=36_000,
+            stats_max_samples=12,
+        )
+    )
+    assert restored.restore(checkpoint, now_ms=103_000)
+    migrated = restored.checkpoint(now_ms=103_000)["BTCUSDT|alpha|beta"]
+    assert migrated["break_consecutive"] == 0
+    assert migrated["shock_consecutive"] == 0
+
+
 def test_out_of_order_observation_cannot_contaminate_rolling_state_or_signal() -> None:
     tracker = SpreadStatsTracker()
     tracker.update("BTCUSDT", "cheap", "rich", -1.0, observed_at_ms=1_000)
@@ -218,7 +410,7 @@ def test_control_only_stats_observation_preserves_full_update_state() -> None:
             exit_half_spread_bps=2.0,
         )
 
-        assert control.accepted is True
+        assert control.accepted is not control.structural_break
         assert control.structural_break is full_snapshot.structural_break
         assert control.cooldown_until_ms == full_snapshot.cooldown_until_ms
         assert control_only.checkpoint(now_ms=observed_at_ms) == full.checkpoint(
@@ -250,6 +442,17 @@ def test_current_observation_is_not_in_its_own_zscore_and_direction_is_correct()
     assert candidate.short_venue == "cheap"
     after = tracker.snapshot("BTCUSDT", "cheap", "rich", now_ms=31_000)
     assert after is not None and after.sample_count == before.sample_count + 1
+
+    duplicate_rejections: dict[str, int] = {}
+    assert build_spread_reversion_candidates(
+        _quotes_for_signed_basis(20.0, now_ms=31_000),
+        ["BTCUSDT"],
+        tracker=tracker,
+        config=_config(),
+        now_ms=31_000,
+        rejection_counts=duplicate_rejections,
+    ) == []
+    assert duplicate_rejections == {"duplicate_stats_evidence": 1}
 
 
 def test_repeated_scheduler_reads_do_not_manufacture_history_samples() -> None:
