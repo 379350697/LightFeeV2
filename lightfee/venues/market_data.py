@@ -305,6 +305,12 @@ _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
 _OKX_FUNDING_RATE_BATCH_TIMEOUT_S = 1.0
 _OKX_FUNDING_RATE_FALLBACK_TOTAL_TIMEOUT_S = 0.5
 _OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS = 64
+# OKX market/tickers is one venue-wide response (roughly 125 KiB in
+# production), not a per-symbol fan-out.  Bound each attempt separately so a
+# poisoned/stale keep-alive connection cannot consume the whole sidecar domain
+# budget.  One transport recycle is safe here because the funding sidecar owns
+# this MarketDataClient and this request precedes its enrichment requests.
+_OKX_MARKET_TICKERS_ATTEMPT_TIMEOUT_S = 3.0
 _FUNDING_INTERVAL_HISTORY_SEMAPHORE = 8
 _FUNDING_INTERVAL_HISTORY_BUDGET_S = 3.0
 
@@ -479,6 +485,53 @@ class MarketDataClient:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def _recycle_public_http_client(self) -> None:
+        """Discard one client's connection pool after a transport failure."""
+        client, self._client = self._client, None
+        if client is None:
+            return
+        try:
+            await client.aclose()
+        except Exception:
+            # The failed pool is already detached.  Cleanup failure must not
+            # prevent the bounded retry from constructing a fresh transport.
+            return
+
+    async def _public_get_with_recycled_transport_retry(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        attempt_timeout_s: float,
+    ) -> Any:
+        """Retry one idempotent GET once on a connection-level failure.
+
+        HTTP responses (including 4xx/5xx) are authoritative and are not
+        retried here.  Only a timeout/network failure without an HTTP status
+        recycles the client, keeping rate-limit and fail-closed semantics
+        unchanged.
+        """
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return await asyncio.wait_for(
+                    self._public_get(path, params=params),
+                    timeout=max(float(attempt_timeout_s), 0.001),
+                )
+            except asyncio.TimeoutError:
+                last_error = PublicTransportError(
+                    PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                    f"timeout: GET {path}",
+                )
+            except PublicTransportError as exc:
+                if int(getattr(exc, "status_code", 0) or 0) > 0:
+                    raise
+                last_error = exc
+            if attempt == 0:
+                await self._recycle_public_http_client()
+        assert last_error is not None
+        raise last_error
 
     # ------------------------------------------------------------------
     # Symbol conversion
@@ -1786,7 +1839,11 @@ class MarketDataClient:
 
         # 1. market/tickers?instType=SWAP (bid/ask, volume, OI from volCcy24h)
         ticker_path = spec.funding_ticker_path
-        raw = await self._public_get(ticker_path, params={"instType": "SWAP"})
+        raw = await self._public_get_with_recycled_transport_retry(
+            ticker_path,
+            params={"instType": "SWAP"},
+            attempt_timeout_s=_OKX_MARKET_TICKERS_ATTEMPT_TIMEOUT_S,
+        )
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
 

@@ -1229,6 +1229,71 @@ class TestProductionSidecarParserRegressions:
         assert client.max_active_funding > 1
 
     @pytest.mark.asyncio
+    async def test_okx_market_tickers_recycles_failed_transport_once(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.ticker_attempts = 0
+                self.recycle_count = 0
+
+            async def _recycle_public_http_client(self):
+                self.recycle_count += 1
+
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    self.ticker_attempts += 1
+                    if self.ticker_attempts == 1:
+                        raise PublicTransportError(
+                            PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                            "timeout: GET /api/v5/market/tickers",
+                        )
+                    return {
+                        "data": [
+                            {
+                                "instId": "BTC-USDT-SWAP",
+                                "bidPx": "10",
+                                "askPx": "11",
+                            }
+                        ]
+                    }
+                if path == "/api/v5/public/funding-rate":
+                    return {"data": []}
+                return {"data": []}
+
+        client = FakeOkxClient()
+        result = await client._fetch_okx_style(["BTCUSDT"])
+
+        assert client.ticker_attempts == 2
+        assert client.recycle_count == 1
+        assert result["okx:BTCUSDT"].bid == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_market_tickers_does_not_retry_http_response_errors(self):
+        class FakeOkxClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.ticker_attempts = 0
+                self.recycle_count = 0
+
+            async def _recycle_public_http_client(self):
+                self.recycle_count += 1
+
+            async def _public_get(self, path, params=None):
+                self.ticker_attempts += 1
+                raise PublicTransportError(
+                    PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                    "HTTP 429",
+                    status_code=429,
+                )
+
+        client = FakeOkxClient()
+        with pytest.raises(PublicTransportError, match="HTTP 429"):
+            await client._fetch_okx_style(["BTCUSDT"])
+
+        assert client.ticker_attempts == 1
+        assert client.recycle_count == 0
+
+    @pytest.mark.asyncio
     async def test_okx_funding_rate_uses_batch_any_before_symbol_fallback(self):
         class FakeOkxClient(MarketDataClient):
             def __init__(self):

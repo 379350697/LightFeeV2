@@ -31,6 +31,12 @@ def test_trade_optimization_timer_assets_are_deploy_critical():
     assert "deploy/systemd/lightfee-trade-optimization-report.timer" in manifest.CRITICAL_FILES
 
 
+def test_fee_evidence_refresh_assets_are_deploy_critical():
+    assert "scripts/refresh_account_fee_evidence.py" in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-fee-evidence-refresh.service" in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-fee-evidence-refresh.timer" in manifest.CRITICAL_FILES
+
+
 def _stub_manifest_generation(monkeypatch):
     monkeypatch.setattr(
         manifest, "build_manifest", lambda root: {"lightfee/engine/runtime.py": "abc"}
@@ -114,6 +120,7 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert 'echo "=== Remote-local deploy mode: skipping rsync/scp ==="' in script
     assert (
         "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer "
+        "&& systemctl enable --now lightfee-fee-evidence-refresh.timer "
         "&& systemctl restart lightfee-sidecar.service "
         "&& systemctl enable lightfee-spread-bbo.service "
         "&& systemctl restart lightfee-spread-bbo.service "
@@ -183,6 +190,30 @@ def test_generate_deploy_script_installs_trade_optimization_timer(tmp_path, monk
     )
     assert "systemctl enable --now lightfee-trade-optimization-report.timer" in script
     assert "systemctl restart lightfee-trade-optimization-report.service" not in script
+
+
+def test_generate_deploy_script_installs_fee_evidence_refresh_timer(
+    tmp_path, monkeypatch
+):
+    _stub_manifest_generation(monkeypatch)
+
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+
+    assert (
+        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.service" /etc/systemd/system/lightfee-fee-evidence-refresh.service'
+        in script
+    )
+    assert (
+        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.timer" /etc/systemd/system/lightfee-fee-evidence-refresh.timer'
+        in script
+    )
+    assert "systemctl enable --now lightfee-fee-evidence-refresh.timer" in script
+    assert "systemctl restart lightfee-fee-evidence-refresh.service" not in script
 
 
 def test_generate_deploy_script_preserves_remote_version_and_skips_local_caches(

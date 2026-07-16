@@ -1,0 +1,22 @@
+[Unit]
+Description=Refresh LightFee V2 signed account fee evidence
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/lightfee-v2
+EnvironmentFile=/etc/lightfee/lightfee.env
+Environment=LIGHTFEE_PRODUCTION_GUARD=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+ExecStart=/opt/lightfee-v2/.venv/bin/python3 scripts/refresh_account_fee_evidence.py --config config/live.toml
+RuntimeMaxSec=2min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/lightfee-v2/runtime
+StandardOutput=journal
+StandardError=journal

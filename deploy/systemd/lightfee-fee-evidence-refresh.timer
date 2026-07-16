@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh LightFee V2 account fee evidence every 6 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+AccuracySec=2min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=lightfee-fee-evidence-refresh.service
+
+[Install]
+WantedBy=timers.target
