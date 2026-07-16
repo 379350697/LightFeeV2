@@ -996,6 +996,33 @@ class SidecarService:
             evidence,
             allow_verified_maker_rebates=True,
         )
+        strategy = config.strategy
+        if (
+            strategy.funding_canary_enabled is True
+            and strategy.funding_canary_require_account_fee_evidence is not True
+        ):
+            # A venue without identity-bound account evidence remains tradable
+            # only through the conservative small-sample tier.  Price that tier
+            # before ranking so its apparent alpha cannot rely on a maker
+            # discount or an optimistic public fee schedule.
+            buffer_bps = float(
+                strategy.funding_canary_conservative_fee_buffer_bps or 0.0
+            )
+            expected_identities = config.runtime.fee_evidence_account_identity_hashes
+            for venue_name, configured_fee in configured_taker.items():
+                account_authoritative = bool(
+                    evidence.integrity_verified is True
+                    and evidence.complete_for(venue_name)
+                    and evidence.identity_matches(expected_identities, venue_name)
+                )
+                if account_authoritative:
+                    continue
+                conservative_taker = float(configured_fee) + buffer_bps
+                taker_fees[venue_name] = max(
+                    float(taker_fees.get(venue_name, 0.0)),
+                    conservative_taker,
+                )
+                maker_fees[venue_name] = taker_fees[venue_name]
         return FundingCandidateService(
             strategy=config.strategy,
             venue_fee_bps=taker_fees,

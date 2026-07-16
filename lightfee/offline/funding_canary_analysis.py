@@ -9,7 +9,11 @@ later configuration or an inferred PnL value.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import hashlib
+import hmac
+import json
 from math import ceil, isfinite
+import os
 from typing import Iterable, Mapping
 
 from lightfee.engine.exit import (
@@ -18,6 +22,7 @@ from lightfee.engine.exit import (
     execution_benchmark_receipt_max_fill_at_ms,
     execution_benchmark_receipt_semantically_verified,
 )
+from lightfee.strategy.funding_canary_policy import canonical_venue_pair
 
 
 _TERMINAL_KINDS = frozenset(
@@ -40,7 +45,10 @@ _RELEVANT_KINDS = frozenset(
         *_TERMINAL_KINDS,
     }
 )
-_POLICY_VERSION = "funding-canary-v1"
+_LEGACY_POLICY_VERSION = "funding-canary-v1"
+_POLICY_VERSION = "funding-canary-v2"
+_APPROVED_POLICY_SCHEMA_VERSION = 1
+_APPROVED_POLICY_HMAC_ENV = "LIGHTFEE_CANARY_POLICY_HMAC_KEY"
 _HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
 _HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
 _HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
@@ -137,6 +145,7 @@ def analyze_funding_canary_events(
     *,
     required_closed_loops: int = _MIN_REQUIRED_CLOSED_LOOPS,
     source_evidence_verified: bool = False,
+    approved_policy: Mapping[str, object] | None = None,
 ) -> FundingCanaryReport:
     """Evaluate a canary cohort without filling gaps from assumptions.
 
@@ -280,7 +289,10 @@ def analyze_funding_canary_events(
     for (run_id, entry_id), selected_payload in selected.items():
         position_id = entry_to_position.get((run_id, entry_id), entry_id)
         position_key = (run_id, position_id)
-        contract_reason = _selection_contract_reason(selected_payload)
+        contract_reason = _selection_contract_reason(
+            selected_payload,
+            approved_policy=approved_policy,
+        )
         contract_valid = not contract_reason
         if not contract_valid:
             report.invalid_canary_contract_count += 1
@@ -313,7 +325,14 @@ def analyze_funding_canary_events(
             continue
         report.opened_count += 1
         actual_notional = _entry_notional(opened_payload)
-        if actual_notional <= 0.0 or actual_notional > _HARD_MAX_ENTRY_NOTIONAL_QUOTE + 1e-12:
+        selected_notional_cap = _finite_required(
+            selected_payload.get("funding_canary_hard_max_entry_notional_quote")
+        )
+        if (
+            actual_notional <= 0.0
+            or selected_notional_cap is None
+            or actual_notional > selected_notional_cap + 1e-12
+        ):
             report.over_notional_count += 1
         if not position_terminal_events:
             report.opened_unclosed_count += 1
@@ -367,7 +386,8 @@ def analyze_funding_canary_events(
         complete = bool(
             contract_valid
             and actual_notional > 0.0
-            and actual_notional <= _HARD_MAX_ENTRY_NOTIONAL_QUOTE + 1e-12
+            and selected_notional_cap is not None
+            and actual_notional <= selected_notional_cap + 1e-12
             and official
             and truth_flat
             and cost is not None
@@ -473,15 +493,153 @@ def _promotion_blockers(report: FundingCanaryReport) -> list[str]:
     return blockers
 
 
-def _selection_contract_reason(selected: Mapping[str, object]) -> str:
+def sign_funding_canary_approved_policy(
+    policy: Mapping[str, object],
+) -> dict[str, object]:
+    """Seal an operator-approved v2 promotion policy with a separate HMAC key."""
+
+    material = _normalized_approved_v2_policy(policy)
+    if material is None:
+        raise ValueError("invalid funding canary approved policy")
+    key = os.environ.get(_APPROVED_POLICY_HMAC_ENV, "").encode("utf-8")
+    if not key:
+        raise ValueError(f"{_APPROVED_POLICY_HMAC_ENV} must be non-empty")
+    signature = hmac.new(
+        key,
+        _approved_policy_bytes(material),
+        hashlib.sha256,
+    ).hexdigest()
+    return {**material, "signature": signature}
+
+
+def _approved_v2_policy_reason(
+    selected: Mapping[str, object],
+    approved_policy: Mapping[str, object] | None,
+) -> str:
+    if not isinstance(approved_policy, Mapping):
+        return "approved_v2_policy_missing"
+    material = _normalized_approved_v2_policy(approved_policy)
+    signature = str(approved_policy.get("signature") or "").strip().lower()
+    key = os.environ.get(_APPROVED_POLICY_HMAC_ENV, "").encode("utf-8")
+    if material is None or not key or len(signature) != 64:
+        return "approved_v2_policy_unverified"
+    expected_signature = hmac.new(
+        key,
+        _approved_policy_bytes(material),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        return "approved_v2_policy_unverified"
+    if material["cohort_id"] != _text(selected.get("funding_canary_cohort_id")):
+        return "approved_v2_policy_cohort_mismatch"
+    selected_values = (
+        _finite_required(
+            selected.get("funding_canary_hard_max_entry_notional_quote")
+        ),
+        _finite_required(
+            selected.get("funding_canary_hard_min_expected_net_edge_bps")
+        ),
+        _finite_required(
+            selected.get("funding_canary_hard_min_worst_case_edge_bps")
+        ),
+    )
+    approved_values = (
+        float(material["max_entry_notional_quote"]),
+        float(material["min_expected_net_edge_bps"]),
+        float(material["min_worst_case_edge_bps"]),
+    )
+    if any(value is None for value in selected_values) or any(
+        abs(float(selected_value) - approved_value) > 1e-12
+        for selected_value, approved_value in zip(
+            selected_values, approved_values, strict=True
+        )
+    ):
+        return "approved_v2_policy_limits_mismatch"
+    pair = canonical_venue_pair(
+        selected.get("long_venue"), selected.get("short_venue")
+    )
+    if pair not in material["allowed_venue_pairs"]:
+        return "approved_v2_policy_venue_pair_not_allowed"
+    return ""
+
+
+def _normalized_approved_v2_policy(
+    policy: Mapping[str, object],
+) -> dict[str, object] | None:
+    if (
+        _integer(policy.get("schema_version")) != _APPROVED_POLICY_SCHEMA_VERSION
+        or _text(policy.get("policy_version")) != _POLICY_VERSION
+        or not _text(policy.get("cohort_id"))
+    ):
+        return None
+    max_notional = _finite_required(policy.get("max_entry_notional_quote"))
+    min_expected = _finite_required(policy.get("min_expected_net_edge_bps"))
+    min_worst = _finite_required(policy.get("min_worst_case_edge_bps"))
+    raw_pairs = policy.get("allowed_venue_pairs")
+    if (
+        max_notional is None
+        or max_notional <= 0.0
+        or min_expected is None
+        or min_expected < 0.0
+        or min_worst is None
+        or min_worst < 0.0
+        or not isinstance(raw_pairs, list)
+    ):
+        return None
+    pairs: set[str] = set()
+    for raw_pair in raw_pairs:
+        parts = str(raw_pair or "").strip().lower().replace("|", ":").split(":")
+        pair = canonical_venue_pair(*parts) if len(parts) == 2 else ""
+        if not pair:
+            return None
+        pairs.add(pair)
+    if not pairs:
+        return None
+    return {
+        "schema_version": _APPROVED_POLICY_SCHEMA_VERSION,
+        "policy_version": _POLICY_VERSION,
+        "cohort_id": _text(policy.get("cohort_id")),
+        "max_entry_notional_quote": max_notional,
+        "min_expected_net_edge_bps": min_expected,
+        "min_worst_case_edge_bps": min_worst,
+        "allowed_venue_pairs": sorted(pairs),
+    }
+
+
+def _approved_policy_bytes(material: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        dict(material),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _selection_contract_reason(
+    selected: Mapping[str, object],
+    *,
+    approved_policy: Mapping[str, object] | None = None,
+) -> str:
     """Validate the immutable selected-marker contract, never current config."""
 
-    if _text(selected.get("funding_canary_policy_version")) != _POLICY_VERSION:
+    policy_version = _text(selected.get("funding_canary_policy_version"))
+    if policy_version not in {_LEGACY_POLICY_VERSION, _POLICY_VERSION}:
         return "policy_version_missing_or_mismatched"
     if not _text(selected.get("funding_canary_cohort_id")):
         return "cohort_id_missing"
     if selected.get("economics_complete") is not True:
         return "economics_incomplete"
+    assurance_tier = _text(
+        selected.get("funding_canary_fee_assurance_tier")
+    ) or ("account" if policy_version == _LEGACY_POLICY_VERSION else "")
+    # Conservative-tier entries are legitimate bounded discovery samples, but
+    # cannot graduate a release cohort without account-bound fee evidence.
+    if assurance_tier != "account":
+        return "account_fee_assurance_required_for_promotion"
+    if policy_version == _POLICY_VERSION:
+        approval_reason = _approved_v2_policy_reason(selected, approved_policy)
+        if approval_reason:
+            return approval_reason
     if selected.get("account_fee_evidence_complete") is not True:
         return "account_fee_evidence_incomplete"
     if selected.get("account_fee_evidence_integrity_verified") is not True:
@@ -509,17 +667,23 @@ def _selection_contract_reason(selected: Mapping[str, object]) -> str:
         or reserve is None
     ):
         return "required_numeric_evidence_missing"
-    if hard_cap > _HARD_MAX_ENTRY_NOTIONAL_QUOTE + 1e-12 or hard_cap <= 0.0:
+    if hard_cap <= 0.0:
         return "hard_notional_cap_invalid"
-    if hard_expected < _HARD_MIN_EXPECTED_NET_EDGE_BPS - 1e-12:
+    if hard_expected < 0.0:
         return "hard_expected_floor_weakened"
-    if hard_worst < _HARD_MIN_WORST_CASE_EDGE_BPS - 1e-12:
+    if hard_worst < 0.0:
         return "hard_worst_floor_weakened"
-    if expected < _HARD_MIN_EXPECTED_NET_EDGE_BPS - 1e-12:
+    if policy_version == _LEGACY_POLICY_VERSION and (
+        hard_cap > _HARD_MAX_ENTRY_NOTIONAL_QUOTE + 1e-12
+        or hard_expected < _HARD_MIN_EXPECTED_NET_EDGE_BPS - 1e-12
+        or hard_worst < _HARD_MIN_WORST_CASE_EDGE_BPS - 1e-12
+    ):
+        return "legacy_hard_release_contract_weakened"
+    if expected < hard_expected - 1e-12:
         return "expected_edge_below_hard_floor"
-    if worst < _HARD_MIN_WORST_CASE_EDGE_BPS - 1e-12:
+    if worst < hard_worst - 1e-12:
         return "worst_edge_below_hard_floor"
-    if planned <= 0.0 or planned > min(hard_cap, _HARD_MAX_ENTRY_NOTIONAL_QUOTE) + 1e-12:
+    if planned <= 0.0 or planned > hard_cap + 1e-12:
         return "planned_entry_notional_exceeds_hard_cap"
     return ""
 
@@ -699,8 +863,8 @@ def _opened_matched_base_quantity(opened: Mapping[str, object]) -> float | None:
     positive base quantity; it never substitutes a planned size because the
     execution receipts must cover what actually reached the exchange.
     """
-    for field in ("matched_quantity", "quantity"):
-        quantity = _finite_required(opened.get(field))
+    for quantity_field in ("matched_quantity", "quantity"):
+        quantity = _finite_required(opened.get(quantity_field))
         if quantity is not None and quantity > 0.0:
             return quantity
     return None

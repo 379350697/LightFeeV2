@@ -2306,6 +2306,7 @@ class TestPlannerDispatchIntegration:
             )
         )
         config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
+        config.strategy.max_concurrent_positions_per_symbol = 0
         runtime.journal = tmp_journal
         runtime.entry_executor = self._capturing_executor()
         self._install_hot_book(

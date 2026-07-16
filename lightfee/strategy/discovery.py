@@ -6,6 +6,11 @@ from enum import Enum
 
 from lightfee.config.schema import StrategyConfig
 from lightfee.sidecar.snapshot import CandidateInput
+from lightfee.strategy.funding_canary_policy import (
+    canary_edge_floors,
+    canary_fee_assurance_tier,
+    canary_notional_cap,
+)
 
 
 class BlockReason(Enum):
@@ -21,8 +26,9 @@ class BlockReason(Enum):
     TRANSFER_UNAVAILABLE = "transfer_unavailable"
     MISSING_CANDIDATE_IDENTITY = "missing_candidate_identity_or_funding_timestamp"
     FUNDING_NEW_ENTRIES_DISABLED = "funding_new_entries_disabled"
-    FUNDING_CANARY_VENUE_NOT_ALLOWED = (
-        "funding_canary_venue_not_statement_reconcilable"
+    FUNDING_CANARY_VENUE_NOT_ALLOWED = "funding_canary_venue_not_allowed"
+    FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE = (
+        "funding_canary_fee_assurance_unavailable"
     )
     FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED = (
         "funding_canary_notional_cap_exceeded"
@@ -52,22 +58,6 @@ def discover_tradeable_candidates(
         config.funding_new_entries_enabled is True
         and config.funding_canary_enabled is True
     )
-    min_expected_edge_bps = config.min_expected_edge_bps
-    min_worst_case_edge_bps = config.min_worst_case_edge_bps
-    if canary_venue_filter_enabled:
-        # CandidateInput.expected_edge_bps is the legacy dual-write of the v3
-        # expected_net_edge_bps field.  Raise the discovery floors to the
-        # configured canary contract so an ultimately ineligible candidate
-        # cannot monopolise the bounded V1 primary/shadow tracking scope.
-        min_expected_edge_bps = max(
-            min_expected_edge_bps,
-            config.funding_canary_min_expected_net_edge_bps,
-        )
-        min_worst_case_edge_bps = max(
-            min_worst_case_edge_bps,
-            config.funding_canary_min_worst_case_edge_bps,
-        )
-
     for c in candidates:
         if c.blocked:
             if "missing_candidate_identity_or_funding_timestamp" in c.blocked_reasons:
@@ -91,10 +81,13 @@ def discover_tradeable_candidates(
             not in canary_allowed_venues
         ):
             reasons.append(BlockReason.FUNDING_CANARY_VENUE_NOT_ALLOWED)
+        assurance_tier = canary_fee_assurance_tier(c, config)
+        if canary_venue_filter_enabled and assurance_tier == "unavailable":
+            reasons.append(BlockReason.FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE)
         if (
             canary_venue_filter_enabled
             and c.entry_notional_quote
-            > config.funding_canary_max_entry_notional_quote
+            > canary_notional_cap(c, config)
         ):
             reasons.append(BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED)
         if require_complete_economics and (
@@ -122,6 +115,14 @@ def discover_tradeable_candidates(
                 reasons.append(BlockReason.STAGGER_GAP_TOO_WIDE)
 
         # Edge gates
+        min_expected_edge_bps = config.min_expected_edge_bps
+        min_worst_case_edge_bps = config.min_worst_case_edge_bps
+        if canary_venue_filter_enabled:
+            canary_expected, canary_worst = canary_edge_floors(
+                config, c.long_venue, c.short_venue
+            )
+            min_expected_edge_bps = max(min_expected_edge_bps, canary_expected)
+            min_worst_case_edge_bps = max(min_worst_case_edge_bps, canary_worst)
         if c.funding_edge_bps < config.min_funding_edge_bps:
             reasons.append(BlockReason.FUNDING_EDGE_BELOW_FLOOR)
         if c.expected_edge_bps < min_expected_edge_bps:

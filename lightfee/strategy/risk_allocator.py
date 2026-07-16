@@ -303,6 +303,9 @@ class StrategyRiskAllocator:
         correlation_group_by_symbol: dict[str, str],
         expected_shortfall_bps: float,
         expected_shortfall_budget_quote: float,
+        max_concurrent_positions_per_venue: int = 0,
+        max_concurrent_positions_per_symbol: int = 0,
+        max_concurrent_positions_per_venue_pair: int = 0,
     ) -> StrategyRiskAdmission:
         """Check a pair against live portfolio concentration limits.
 
@@ -360,6 +363,9 @@ class StrategyRiskAllocator:
         venue_exposure: dict[str, float] = {}
         symbol_exposure: dict[str, float] = {}
         pair_exposure: dict[tuple[str, str], float] = {}
+        venue_position_count: dict[str, int] = {}
+        symbol_position_count: dict[str, int] = {}
+        pair_position_count: dict[tuple[str, str], int] = {}
         settlement_exposure: dict[int, float] = {}
         correlation_exposure: dict[str, float] = {}
         global_gross = 0.0
@@ -394,12 +400,24 @@ class StrategyRiskAllocator:
             venue_exposure[position_short_venue] = (
                 venue_exposure.get(position_short_venue, 0.0) + short_notional
             )
+            venue_position_count[position_long_venue] = (
+                venue_position_count.get(position_long_venue, 0) + 1
+            )
+            venue_position_count[position_short_venue] = (
+                venue_position_count.get(position_short_venue, 0) + 1
+            )
             symbol_exposure[position_symbol] = (
                 symbol_exposure.get(position_symbol, 0.0) + position_reference
+            )
+            symbol_position_count[position_symbol] = (
+                symbol_position_count.get(position_symbol, 0) + 1
             )
             position_pair = tuple(sorted((position_long_venue, position_short_venue)))
             pair_exposure[position_pair] = (
                 pair_exposure.get(position_pair, 0.0) + position_reference
+            )
+            pair_position_count[position_pair] = (
+                pair_position_count.get(position_pair, 0) + 1
             )
             global_gross += position_gross
             position_group = correlation_groups.get(position_symbol, position_symbol)
@@ -458,6 +476,30 @@ class StrategyRiskAllocator:
         )
         if max_concurrent_positions > 0 and len(positions) >= max_concurrent_positions:
             return _risk_admission_with_reason(admission, "max_concurrent_positions")
+        if max_concurrent_positions_per_venue > 0 and any(
+            venue_position_count.get(venue, 0) + 1
+            > max_concurrent_positions_per_venue
+            for venue in (long_venue_key, short_venue_key)
+        ):
+            return _risk_admission_with_reason(
+                admission, "max_concurrent_positions_per_venue"
+            )
+        if (
+            max_concurrent_positions_per_symbol > 0
+            and symbol_position_count.get(symbol_key, 0) + 1
+            > max_concurrent_positions_per_symbol
+        ):
+            return _risk_admission_with_reason(
+                admission, "max_concurrent_positions_per_symbol"
+            )
+        if (
+            max_concurrent_positions_per_venue_pair > 0
+            and pair_position_count.get(pair_key, 0) + 1
+            > max_concurrent_positions_per_venue_pair
+        ):
+            return _risk_admission_with_reason(
+                admission, "max_concurrent_positions_per_venue_pair"
+            )
         if max_concurrent_venue_pairs > 0 and projected_pair_count > max_concurrent_venue_pairs:
             return _risk_admission_with_reason(admission, "max_concurrent_venue_pairs")
         if max_single_venue_exposure_quote > 0.0 and any(

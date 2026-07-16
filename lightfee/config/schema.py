@@ -153,9 +153,12 @@ class StrategyConfig:
     entry_min_first_funding_remaining_secs: int = 60
     post_funding_hold_secs: int = 0
     entry_notional_cap_quote: float = 1000.0
-    live_entry_notional_cap_quote: float = 30.0
+    live_entry_notional_cap_quote: float = 50.0
     min_entry_leg_notional_quote: float = 8.0
-    max_concurrent_positions: int = 2
+    max_concurrent_positions: int = 8
+    max_concurrent_positions_per_venue: int = 2
+    max_concurrent_positions_per_symbol: int = 1
+    max_concurrent_positions_per_venue_pair: int = 2
     max_single_venue_exposure_quote: float = 200.0
     max_symbol_exposure_quote: float = 100.0
     max_global_net_exposure_quote: float = 0.0
@@ -186,13 +189,32 @@ class StrategyConfig:
     # existing live position.
     funding_canary_enabled: bool = False
     funding_canary_allowed_venues: list[str] = field(
-        default_factory=lambda: ["binance", "bybit", "okx", "gate"]
+        default_factory=lambda: [
+            "aster",
+            "binance",
+            "bitget",
+            "bybit",
+            "gate",
+            "hyperliquid",
+            "okx",
+        ]
     )
-    funding_canary_max_concurrent_positions: int = 1
-    funding_canary_max_entry_notional_quote: float = 30.0
-    funding_canary_min_expected_net_edge_bps: float = 8.0
-    funding_canary_min_worst_case_edge_bps: float = 3.0
-    funding_canary_require_account_fee_evidence: bool = True
+    funding_canary_max_concurrent_positions: int = 8
+    funding_canary_max_entry_notional_quote: float = 50.0
+    funding_canary_min_expected_net_edge_bps: float = 3.0
+    funding_canary_min_worst_case_edge_bps: float = 0.0
+    funding_canary_min_expected_net_edge_bps_by_venue_pair: dict[str, float] = field(
+        default_factory=dict
+    )
+    funding_canary_min_worst_case_edge_bps_by_venue_pair: dict[str, float] = field(
+        default_factory=dict
+    )
+    # Strict mode requires signed account-specific evidence for both legs.
+    # When false, a pair without that evidence may only use the smaller
+    # conservative tier below, priced from configured fee upper bounds.
+    funding_canary_require_account_fee_evidence: bool = False
+    funding_canary_conservative_fee_max_entry_notional_quote: float = 15.0
+    funding_canary_conservative_fee_buffer_bps: float = 2.0
     funding_economics_mode: str = "v1_exact"
     funding_forecast_mode: str = "shadow"
     funding_forecast_uncertainty_haircut_bps: float = 2.0
@@ -224,6 +246,8 @@ class StrategyConfig:
     )
     funding_expected_shortfall_bps: float = 0.0
     funding_expected_shortfall_budget_quote: float = 0.0
+    funding_es_cold_start_max_entry_notional_quote: float = 15.0
+    funding_es_cold_start_bps: float = 100.0
     # Historical Expected Shortfall of the *paired basis*, not outright asset
     # volatility.  These defaults collect bounded shadow evidence while the
     # entry freeze is in force.  A live funding entry may only be enabled once

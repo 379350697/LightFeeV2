@@ -154,6 +154,7 @@ class TestDiscovery:
             ranking_edge_bps=10.0,
             entry_notional_quote=30.0,
             first_funding_timestamp_ms=FUNDING_TS_MS,
+            account_fee_evidence_complete=True,
         )
 
         result = discover_tradeable_candidates(
@@ -193,6 +194,7 @@ class TestDiscovery:
                 ranking_edge_bps=20.0,
                 entry_notional_quote=notional,
                 first_funding_timestamp_ms=FUNDING_TS_MS,
+                account_fee_evidence_complete=True,
             )
 
         low_expected = candidate("LOW_EXPECTED", expected=7.99, worst=4.0, notional=30.0)

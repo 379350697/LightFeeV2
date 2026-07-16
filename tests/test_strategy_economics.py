@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lightfee.config.schema import StrategyConfig
+from lightfee.config.schema import StrategyConfig, VenueConfig
 from lightfee.core.domain import EntryLeverageEvidence, Venue
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
@@ -1975,6 +1975,65 @@ def test_risk_allocator_enforces_portfolio_venue_symbol_and_settlement_limits() 
     assert admission.projected_venue_exposure_quote["cheap"] == pytest.approx(110.0)
 
 
+def test_risk_allocator_enforces_granular_position_count_limits() -> None:
+    existing = SimpleNamespace(
+        symbol="BTCUSDT",
+        long_venue="cheap",
+        short_venue="rich",
+        long_quantity=0.1,
+        short_quantity=0.1,
+        long_entry_price=100.0,
+        short_entry_price=100.0,
+        funding_timestamp_ms=1_200_000,
+    )
+    base = {
+        "open_positions": [existing],
+        "long_entry_price": 100.0,
+        "short_entry_price": 100.0,
+        "base_quantity": 0.1,
+        "first_funding_timestamp_ms": 1_250_000,
+        "max_concurrent_positions": 8,
+        "max_single_venue_exposure_quote": 0.0,
+        "max_symbol_exposure_quote": 0.0,
+        "max_concurrent_venue_pairs": 0,
+        "max_venue_pair_exposure_quote": 0.0,
+        "max_global_gross_exposure_quote": 0.0,
+        "max_settlement_bucket_exposure_quote": 0.0,
+        "settlement_crowding_bucket_ms": 300_000,
+        "max_correlation_group_exposure_quote": 0.0,
+        "correlation_group_by_symbol": {},
+        "expected_shortfall_bps": 0.0,
+        "expected_shortfall_budget_quote": 0.0,
+    }
+    allocator = StrategyRiskAllocator()
+
+    per_venue = allocator.assess_portfolio_admission(
+        **base,
+        symbol="ETHUSDT",
+        long_venue="cheap",
+        short_venue="other",
+        max_concurrent_positions_per_venue=1,
+    )
+    per_symbol = allocator.assess_portfolio_admission(
+        **base,
+        symbol="BTCUSDT",
+        long_venue="other-a",
+        short_venue="other-b",
+        max_concurrent_positions_per_symbol=1,
+    )
+    per_pair = allocator.assess_portfolio_admission(
+        **base,
+        symbol="ETHUSDT",
+        long_venue="cheap",
+        short_venue="rich",
+        max_concurrent_positions_per_venue_pair=1,
+    )
+
+    assert per_venue.reason == "max_concurrent_positions_per_venue"
+    assert per_symbol.reason == "max_concurrent_positions_per_symbol"
+    assert per_pair.reason == "max_concurrent_positions_per_venue_pair"
+
+
 def test_risk_allocator_fails_closed_when_enabled_settlement_or_es_budget_lacks_evidence() -> None:
     missing_settlement = StrategyRiskAllocator().assess_portfolio_admission(
         open_positions=[],
@@ -2532,7 +2591,7 @@ def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monke
     )
 
 
-def test_funding_canary_runtime_defense_rejects_programmatic_scale_bypass() -> None:
+def test_funding_canary_runtime_accepts_configurable_bounded_scale() -> None:
     dispatch = object.__new__(EntryDispatchRuntime)
     dispatch.ctx = SimpleNamespace(
         config=SimpleNamespace(
@@ -2541,24 +2600,34 @@ def test_funding_canary_runtime_defense_rejects_programmatic_scale_bypass() -> N
                 funding_canary_allowed_venues=["cheap", "rich"],
                 funding_canary_max_concurrent_positions=2,
                 funding_canary_max_entry_notional_quote=1_000.0,
+                funding_canary_conservative_fee_max_entry_notional_quote=30.0,
             ),
             runtime=SimpleNamespace(mode="paper"),
+            venues=[
+                VenueConfig(venue="cheap", taker_fee_bps=1.0),
+                VenueConfig(venue="rich", taker_fee_bps=1.0),
+            ],
         ),
         state=SimpleNamespace(open_positions=[], pending_entries=[]),
     )
 
     assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
-        == "funding_canary_hard_concurrency_cap_invalid"
-    )
-    dispatch.ctx.config.strategy.funding_canary_max_concurrent_positions = 1
-    assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
-        == "funding_canary_hard_notional_cap_invalid"
+        dispatch._funding_canary_admission_reason(
+            _candidate(
+                taker_fee_evidence_complete=True,
+                expected_net_edge_bps=5.0,
+                long_taker_fee_bps=3.0,
+                short_taker_fee_bps=3.0,
+                entry_fee_bps=6.0,
+                exit_fee_bps=6.0,
+            ),
+            1_000,
+        )
+        == ""
     )
 
 
-def test_funding_canary_runtime_defense_cannot_relax_economics_floors() -> None:
+def test_funding_canary_runtime_applies_pair_specific_economics_floors() -> None:
     dispatch = object.__new__(EntryDispatchRuntime)
     dispatch.ctx = SimpleNamespace(
         config=SimpleNamespace(
@@ -2567,6 +2636,9 @@ def test_funding_canary_runtime_defense_cannot_relax_economics_floors() -> None:
                 funding_canary_allowed_venues=["cheap", "rich"],
                 funding_canary_min_expected_net_edge_bps=0.0,
                 funding_canary_min_worst_case_edge_bps=0.0,
+                funding_canary_min_expected_net_edge_bps_by_venue_pair={
+                    "rich:cheap": 6.0
+                },
             ),
             runtime=SimpleNamespace(mode="paper"),
         ),
@@ -2574,32 +2646,56 @@ def test_funding_canary_runtime_defense_cannot_relax_economics_floors() -> None:
     )
 
     assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
+        dispatch._funding_canary_admission_reason(
+            _candidate(taker_fee_evidence_complete=True, entry_notional_quote=15.0),
+            1_000,
+        )
         == "funding_canary_expected_edge_below_floor"
     )
 
 
-def test_funding_canary_runtime_defense_requires_private_statement_venue() -> None:
+def test_funding_canary_runtime_supports_non_statement_venues_with_conservative_fees() -> None:
     dispatch = object.__new__(EntryDispatchRuntime)
     dispatch.ctx = SimpleNamespace(
         config=SimpleNamespace(
             strategy=StrategyConfig(
                 funding_new_entries_enabled=True,
                 funding_canary_enabled=True,
-                funding_canary_allowed_venues=["cheap", "rich"],
+                funding_canary_allowed_venues=["gate", "hyperliquid"],
             ),
-            runtime=SimpleNamespace(mode="live"),
+            runtime=SimpleNamespace(
+                mode="live",
+                fee_evidence_max_age_ms=24 * 60 * 60 * 1000,
+                fee_evidence_integrity_key_env="",
+            ),
+            venues=[
+                VenueConfig(venue="gate", taker_fee_bps=1.0),
+                VenueConfig(venue="hyperliquid", taker_fee_bps=1.0),
+            ],
         ),
         state=SimpleNamespace(open_positions=[], pending_entries=[]),
     )
 
     assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000)
-        == "funding_canary_venue_not_statement_reconcilable"
+        dispatch._funding_canary_admission_reason(
+            _candidate(
+                long_venue="gate",
+                short_venue="hyperliquid",
+                entry_notional_quote=15.0,
+                taker_fee_evidence_complete=True,
+                expected_net_edge_bps=5.0,
+                long_taker_fee_bps=3.0,
+                short_taker_fee_bps=3.0,
+                entry_fee_bps=6.0,
+                exit_fee_bps=6.0,
+            ),
+            1_000,
+        )
+        == ""
     )
 
 
-def test_funding_canary_runtime_defense_blocks_live_bypass_before_economics() -> None:
+def test_funding_canary_profile_can_be_disabled_without_blocking_live_entry() -> None:
     dispatch = object.__new__(EntryDispatchRuntime)
     dispatch.ctx = SimpleNamespace(
         config=SimpleNamespace(
@@ -2612,6 +2708,14 @@ def test_funding_canary_runtime_defense_blocks_live_bypass_before_economics() ->
         state=SimpleNamespace(open_positions=[], pending_entries=[]),
     )
 
+    assert dispatch._funding_canary_admission_reason(_candidate(), 1_000) == ""
     assert (
-        dispatch._funding_canary_admission_reason(_candidate(), 1_000) == "funding_canary_required"
+        dispatch._funding_canary_submission_reason(
+            _candidate(),
+            1_000,
+            quantity=0.1,
+            long_price=100.0,
+            short_price=101.0,
+        )
+        == ""
     )

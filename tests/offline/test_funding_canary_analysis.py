@@ -3,12 +3,16 @@ from __future__ import annotations
 import pytest
 
 from lightfee.engine.exit import seal_execution_benchmark_receipt
-from lightfee.offline.funding_canary_analysis import analyze_funding_canary_events
+from lightfee.offline.funding_canary_analysis import (
+    analyze_funding_canary_events,
+    sign_funding_canary_approved_policy,
+)
 
 
 @pytest.fixture(autouse=True)
 def _execution_benchmark_integrity_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", "canary-test-secret")
+    monkeypatch.setenv("LIGHTFEE_CANARY_POLICY_HMAC_KEY", "policy-test-secret")
 
 
 def _event(entry_id: str, seq: int, kind: str, payload: dict) -> dict:
@@ -507,6 +511,114 @@ def test_canary_requires_account_identity_binding_in_selected_evidence() -> None
     assert report.promotion_ready is False
     assert report.invalid_canary_contract_count == 1
     assert "acceptance_canary_contract_invalid" in report.promotion_blockers
+
+
+def test_v2_conservative_fee_tier_can_collect_samples_but_cannot_promote() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    for event in records:
+        if event["kind"] != "execution.entry_selected":
+            continue
+        event["payload"].update(
+            {
+                "funding_canary_policy_version": "funding-canary-v2",
+                "funding_canary_cohort_id": "conservative-cohort-v2",
+                "funding_canary_fee_assurance_tier": "conservative",
+                "account_fee_evidence_complete": False,
+                "account_fee_evidence_integrity_verified": False,
+                "account_fee_evidence_identity_bound": False,
+                "funding_canary_hard_max_entry_notional_quote": 15.0,
+                "funding_canary_hard_min_expected_net_edge_bps": 3.0,
+                "funding_canary_hard_min_worst_case_edge_bps": 0.0,
+            }
+        )
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.promotion_ready is False
+    assert report.invalid_canary_contract_count == 30
+    assert "acceptance_canary_contract_invalid" in report.promotion_blockers
+
+
+def test_v2_account_tier_requires_matching_signed_operator_policy() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    for event in records:
+        if event["kind"] != "execution.entry_selected":
+            continue
+        event["payload"].update(
+            {
+                "funding_canary_policy_version": "funding-canary-v2",
+                "funding_canary_cohort_id": "approved-cohort-v2",
+                "funding_canary_fee_assurance_tier": "account",
+                "funding_canary_hard_max_entry_notional_quote": 50.0,
+                "funding_canary_hard_min_expected_net_edge_bps": 3.0,
+                "funding_canary_hard_min_worst_case_edge_bps": 0.0,
+                "long_venue": "cheap",
+                "short_venue": "rich",
+            }
+        )
+    missing = analyze_funding_canary_events(
+        records,
+        source_evidence_verified=True,
+    )
+    approved_policy = sign_funding_canary_approved_policy(
+        {
+            "schema_version": 1,
+            "policy_version": "funding-canary-v2",
+            "cohort_id": "approved-cohort-v2",
+            "max_entry_notional_quote": 50.0,
+            "min_expected_net_edge_bps": 3.0,
+            "min_worst_case_edge_bps": 0.0,
+            "allowed_venue_pairs": ["rich|cheap"],
+        }
+    )
+    approved = analyze_funding_canary_events(
+        records,
+        source_evidence_verified=True,
+        approved_policy=approved_policy,
+    )
+
+    assert missing.promotion_ready is False
+    assert missing.invalid_canary_contract_count == 30
+    assert approved.promotion_ready is True
+    assert approved.complete_loop_count == 30
+
+
+def test_v2_operator_policy_rejects_signature_or_limit_tampering() -> None:
+    records = _complete_loop("entry-v2")
+    selected = records[0]["payload"]
+    selected.update(
+        {
+            "funding_canary_policy_version": "funding-canary-v2",
+            "funding_canary_cohort_id": "approved-cohort-v2",
+            "funding_canary_fee_assurance_tier": "account",
+            "funding_canary_hard_max_entry_notional_quote": 50.0,
+            "funding_canary_hard_min_expected_net_edge_bps": 3.0,
+            "funding_canary_hard_min_worst_case_edge_bps": 0.0,
+            "long_venue": "cheap",
+            "short_venue": "rich",
+        }
+    )
+    approved_policy = sign_funding_canary_approved_policy(
+        {
+            "schema_version": 1,
+            "policy_version": "funding-canary-v2",
+            "cohort_id": "approved-cohort-v2",
+            "max_entry_notional_quote": 50.0,
+            "min_expected_net_edge_bps": 3.0,
+            "min_worst_case_edge_bps": 0.0,
+            "allowed_venue_pairs": ["cheap:rich"],
+        }
+    )
+    approved_policy["max_entry_notional_quote"] = 500.0
+
+    report = analyze_funding_canary_events(
+        records,
+        source_evidence_verified=True,
+        approved_policy=approved_policy,
+    )
+
+    assert report.invalid_canary_contract_count == 1
+    assert report.loops[0].contract_reason == "approved_v2_policy_unverified"
 
 
 def test_canary_rejects_final_edge_and_per_leg_cap_breaches() -> None:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -19,7 +20,6 @@ from lightfee.offline.acceptance_evidence import (  # noqa: E402
     AcceptanceEvidenceError,
     read_verified_jsonl,
 )
-import json
 
 
 def main() -> int:
@@ -29,6 +29,13 @@ def main() -> int:
         "--evidence-manifest",
         type=Path,
         help="signed manifest binding the exact JSONL byte streams to this report",
+    )
+    parser.add_argument(
+        "--approved-policy-manifest",
+        type=Path,
+        help=(
+            "HMAC-signed v2 policy approval binding cohort, caps, floors, and venue pairs"
+        ),
     )
     parser.add_argument("--required-closed-loops", type=int, default=30)
     parser.add_argument("--output", type=Path)
@@ -43,6 +50,17 @@ def main() -> int:
         )
     except AcceptanceEvidenceError as exc:
         parser.error(str(exc))
+    approved_policy = None
+    if args.approved_policy_manifest is not None:
+        try:
+            loaded_policy = json.loads(
+                args.approved_policy_manifest.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"invalid approved policy manifest: {exc}")
+        if not isinstance(loaded_policy, dict):
+            parser.error("approved policy manifest must contain one JSON object")
+        approved_policy = loaded_policy
     report = analyze_funding_canary_events(
         records,
         # The analyzer applies the immutable 30-loop floor as well.  Keep the
@@ -50,6 +68,7 @@ def main() -> int:
         # allow an operator to downgrade this canary by passing ``1``.
         required_closed_loops=max(int(args.required_closed_loops), 30),
         source_evidence_verified=True,
+        approved_policy=approved_policy,
     )
     payload = funding_canary_report_dict(report)
     payload["acceptance_evidence"] = evidence.as_dict()

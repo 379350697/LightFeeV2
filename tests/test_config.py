@@ -23,21 +23,13 @@ def test_strategy_config_forecast_default_is_reachable_in_a_seven_day_8h_window(
     assert StrategyConfig().funding_forecast_min_samples <= 21
 
 
-def test_funding_canary_rejects_relaxed_edge_floors_and_requires_positive_notional():
+def test_funding_canary_accepts_configurable_nonnegative_floors_and_requires_positive_notional():
     cfg = AppConfig()
     cfg.strategy.funding_canary_enabled = True
     cfg.strategy.funding_canary_min_expected_net_edge_bps = 0.0
     cfg.strategy.funding_canary_min_worst_case_edge_bps = 0.0
 
-    issues = validate_config(cfg)
-    assert (
-        "strategy.funding_canary_min_expected_net_edge_bps must be >= 8.0 during the canary release"
-        in issues
-    )
-    assert (
-        "strategy.funding_canary_min_worst_case_edge_bps must be >= 3.0 during the canary release"
-        in issues
-    )
+    assert not any("funding_canary_min_" in issue for issue in validate_config(cfg))
 
     cfg.strategy.funding_canary_max_entry_notional_quote = 0.0
     assert (
@@ -46,45 +38,65 @@ def test_funding_canary_rejects_relaxed_edge_floors_and_requires_positive_notion
     )
 
 
-def test_funding_canary_release_caps_cannot_be_scaled_by_configuration():
+def test_funding_canary_caps_are_configurable_but_conservative_tier_stays_smaller():
     cfg = AppConfig()
     cfg.strategy.funding_canary_enabled = True
     cfg.strategy.funding_canary_max_concurrent_positions = 2
     cfg.strategy.funding_canary_max_entry_notional_quote = 31.0
 
-    issues = validate_config(cfg)
+    assert not any("funding_canary_max_concurrent_positions" in issue for issue in validate_config(cfg))
+    assert not any("funding_canary_max_entry_notional_quote" in issue for issue in validate_config(cfg))
 
+    cfg.strategy.funding_canary_conservative_fee_max_entry_notional_quote = 31.01
     assert (
-        "strategy.funding_canary_max_concurrent_positions must equal 1 during the canary release"
-        in issues
-    )
-    assert (
-        "strategy.funding_canary_max_entry_notional_quote must be <= 30.0 during the canary release"
-        in issues
+        "strategy.funding_canary_conservative_fee_max_entry_notional_quote "
+        "must not exceed funding_canary_max_entry_notional_quote"
+        in validate_config(cfg)
     )
 
 
-def test_funding_canary_cannot_bypass_account_fee_evidence():
+def test_funding_canary_allows_bounded_conservative_fee_assurance():
     cfg = AppConfig()
     cfg.strategy.funding_canary_enabled = True
     cfg.strategy.funding_canary_require_account_fee_evidence = False
 
-    issues = validate_config(cfg)
-
-    assert (
-        "strategy.funding_canary_require_account_fee_evidence must be true during the canary release"
-        in issues
-    )
+    assert not any("require_account_fee_evidence" in issue for issue in validate_config(cfg))
 
 
-def test_funding_canary_requires_statement_reconcilable_venues():
+@pytest.mark.parametrize(
+    ("field_name", "value", "expected"),
+    [
+        ("taker_fee_bps", -1.0, "taker_fee_bps must be finite and >= 0"),
+        ("taker_fee_bps", float("nan"), "taker_fee_bps must be finite and >= 0"),
+        (
+            "maker_fee_bps",
+            -0.1,
+            "maker_fee_bps must be finite and >= 0; maker rebates require signed account fee evidence",
+        ),
+        ("max_notional", 0.0, "max_notional must be finite and > 0"),
+    ],
+)
+def test_venue_cost_and_cap_configuration_fails_closed(
+    field_name: str, value: float, expected: str
+) -> None:
+    venue = VenueConfig(venue="bybit")
+    setattr(venue, field_name, value)
+    cfg = AppConfig(symbols=["BTCUSDT"], venues=[venue])
+
+    assert any(expected in issue for issue in validate_config(cfg))
+
+
+def test_funding_canary_supports_all_seven_live_venues_and_rejects_unknown_names():
     cfg = AppConfig()
     cfg.strategy.funding_canary_enabled = True
-    cfg.strategy.funding_canary_allowed_venues = ["binance", "hyperliquid"]
+    cfg.strategy.funding_canary_allowed_venues = [
+        "aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"
+    ]
+    assert not any("funding_canary_allowed_venues" in issue for issue in validate_config(cfg))
 
+    cfg.strategy.funding_canary_allowed_venues.append("unknown")
     assert (
-        "strategy.funding_canary_allowed_venues must support private "
-        "funding-statement reconciliation: hyperliquid"
+        "strategy.funding_canary_allowed_venues contains unsupported live perp venues: unknown"
         in validate_config(cfg)
     )
 
@@ -112,25 +124,40 @@ def test_v3_spread_paper_requires_fee_account_identity_for_each_venue():
     )
 
 
-def test_live_funding_entries_require_the_canary_gate():
+def test_live_funding_entries_do_not_require_the_canary_profile():
     cfg = AppConfig()
     cfg.runtime.mode = "live"
     cfg.strategy.risk_monitor_enabled = True
     cfg.strategy.funding_new_entries_enabled = True
 
-    assert (
-        "strategy.funding_canary_enabled must be true when live funding new entries are enabled"
-        in validate_config(cfg)
-    )
-
-    cfg.strategy.funding_canary_enabled = True
     assert not any(
         "funding_canary_enabled must be true" in issue
         for issue in validate_config(cfg)
     )
 
 
-def test_live_funding_canary_requires_execution_benchmark_signing_key(
+def test_live_funding_entries_require_positive_bounded_es_cold_start_controls():
+    cfg = AppConfig()
+    cfg.runtime.mode = "live"
+    cfg.strategy.risk_monitor_enabled = True
+    cfg.strategy.funding_new_entries_enabled = True
+    cfg.strategy.funding_es_cold_start_max_entry_notional_quote = 0.0
+    cfg.strategy.funding_es_cold_start_bps = 0.0
+
+    issues = validate_config(cfg)
+
+    assert (
+        "strategy.funding_es_cold_start_max_entry_notional_quote must be > 0 "
+        "when live funding entries are enabled"
+        in issues
+    )
+    assert (
+        "strategy.funding_es_cold_start_bps must be > 0 when live funding entries are enabled"
+        in issues
+    )
+
+
+def test_live_funding_canary_does_not_require_promotion_receipt_key_at_startup(
     monkeypatch: pytest.MonkeyPatch,
 ):
     cfg = AppConfig()
@@ -140,9 +167,9 @@ def test_live_funding_canary_requires_execution_benchmark_signing_key(
     cfg.strategy.funding_canary_enabled = True
     monkeypatch.delenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", raising=False)
 
-    assert (
-        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY must be non-empty for a live funding canary"
-        in validate_config(cfg)
+    assert not any(
+        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY" in issue
+        for issue in validate_config(cfg)
     )
 
     monkeypatch.setenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", "canary-test-key")

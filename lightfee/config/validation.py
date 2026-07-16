@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -19,14 +18,10 @@ from lightfee.strategy.fee_evidence import (
     LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
     TRUSTED_FEE_EVIDENCE_HMAC_ENV,
 )
-from lightfee.engine.exit import TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV
-
-
-_CANARY_HARD_MAX_CONCURRENT_POSITIONS = 1
-_CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE = 30.0
-_CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS = 8.0
-_CANARY_HARD_MIN_WORST_CASE_EDGE_BPS = 3.0
-_CANARY_STATEMENT_RECONCILABLE_VENUES = frozenset({"binance", "bybit", "okx", "gate"})
+from lightfee.strategy.funding_canary_policy import (
+    ALL_LIVE_FUNDING_VENUES,
+    canonical_venue_pair,
+)
 
 
 def validate_config(config: AppConfig) -> list[str]:
@@ -99,6 +94,13 @@ def validate_config(config: AppConfig) -> list[str]:
 
     if config.strategy.max_concurrent_positions < 0:
         issues.append("strategy.max_concurrent_positions must be >= 0")
+    for field_name in (
+        "max_concurrent_positions_per_venue",
+        "max_concurrent_positions_per_symbol",
+        "max_concurrent_positions_per_venue_pair",
+    ):
+        if not _is_positive_int(getattr(config.strategy, field_name)):
+            issues.append(f"strategy.{field_name} must be a positive integer")
 
     if config.strategy.entry_min_first_funding_remaining_secs < 0:
         issues.append("strategy.entry_min_first_funding_remaining_secs must be >= 0")
@@ -176,6 +178,10 @@ def validate_config(config: AppConfig) -> list[str]:
         "funding_max_correlation_group_exposure_quote": config.strategy.funding_max_correlation_group_exposure_quote,
         "funding_expected_shortfall_bps": config.strategy.funding_expected_shortfall_bps,
         "funding_expected_shortfall_budget_quote": config.strategy.funding_expected_shortfall_budget_quote,
+        "funding_es_cold_start_max_entry_notional_quote": (
+            config.strategy.funding_es_cold_start_max_entry_notional_quote
+        ),
+        "funding_es_cold_start_bps": config.strategy.funding_es_cold_start_bps,
     }.items():
         if not _is_finite_nonnegative(value):
             issues.append(f"strategy.{field_name} must be finite and >= 0")
@@ -253,11 +259,17 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append(
                 "strategy.funding_expected_shortfall_budget_quote must be > 0 when live funding entries are enabled"
             )
+        for field_name, value in {
+            "funding_es_cold_start_max_entry_notional_quote": (
+                config.strategy.funding_es_cold_start_max_entry_notional_quote
+            ),
+            "funding_es_cold_start_bps": config.strategy.funding_es_cold_start_bps,
+        }.items():
+            if not _is_positive_finite(value):
+                issues.append(
+                    f"strategy.{field_name} must be > 0 when live funding entries are enabled"
+                )
     if config.strategy.funding_canary_enabled is True:
-        if config.strategy.funding_canary_require_account_fee_evidence is not True:
-            issues.append(
-                "strategy.funding_canary_require_account_fee_evidence must be true during the canary release"
-            )
         allowed_venues = config.strategy.funding_canary_allowed_venues
         if (
             not isinstance(allowed_venues, list)
@@ -273,24 +285,15 @@ def validate_config(config: AppConfig) -> list[str]:
                 for venue in allowed_venues
                 if str(venue or "").strip()
             }
-            unsupported = sorted(
-                normalized_venues - _CANARY_STATEMENT_RECONCILABLE_VENUES
-            )
+            unsupported = sorted(normalized_venues - ALL_LIVE_FUNDING_VENUES)
             if unsupported:
                 issues.append(
-                    "strategy.funding_canary_allowed_venues must support private "
-                    "funding-statement reconciliation: " + ", ".join(unsupported)
+                    "strategy.funding_canary_allowed_venues contains unsupported "
+                    "live perp venues: " + ", ".join(unsupported)
                 )
         if not _is_positive_int(config.strategy.funding_canary_max_concurrent_positions):
             issues.append(
                 "strategy.funding_canary_max_concurrent_positions must be a positive integer"
-            )
-        elif (
-            int(config.strategy.funding_canary_max_concurrent_positions)
-            != _CANARY_HARD_MAX_CONCURRENT_POSITIONS
-        ):
-            issues.append(
-                "strategy.funding_canary_max_concurrent_positions must equal 1 during the canary release"
             )
         for field_name, value in {
             "funding_canary_max_entry_notional_quote": (
@@ -302,71 +305,80 @@ def validate_config(config: AppConfig) -> list[str]:
             "funding_canary_min_worst_case_edge_bps": (
                 config.strategy.funding_canary_min_worst_case_edge_bps
             ),
+            "funding_canary_conservative_fee_max_entry_notional_quote": (
+                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
+            ),
+            "funding_canary_conservative_fee_buffer_bps": (
+                config.strategy.funding_canary_conservative_fee_buffer_bps
+            ),
         }.items():
             if not _is_finite_nonnegative(value) or (
-                field_name == "funding_canary_max_entry_notional_quote" and float(value) <= 0.0
+                field_name
+                in {
+                    "funding_canary_max_entry_notional_quote",
+                    "funding_canary_conservative_fee_max_entry_notional_quote",
+                }
+                and float(value) <= 0.0
             ):
-                comparator = "> 0" if field_name == "funding_canary_max_entry_notional_quote" else ">= 0"
+                comparator = (
+                    "> 0"
+                    if field_name
+                    in {
+                        "funding_canary_max_entry_notional_quote",
+                        "funding_canary_conservative_fee_max_entry_notional_quote",
+                    }
+                    else ">= 0"
+                )
                 issues.append(f"strategy.{field_name} must be finite and {comparator}")
         if (
-            _is_finite_nonnegative(
+            _is_positive_finite(
+                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
+            )
+            and _is_positive_finite(
                 config.strategy.funding_canary_max_entry_notional_quote
             )
-            and float(config.strategy.funding_canary_max_entry_notional_quote)
-            > _CANARY_HARD_MAX_ENTRY_NOTIONAL_QUOTE
+            and float(
+                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
+            )
+            > float(config.strategy.funding_canary_max_entry_notional_quote)
         ):
             issues.append(
-                "strategy.funding_canary_max_entry_notional_quote must be <= 30.0 during the canary release"
+                "strategy.funding_canary_conservative_fee_max_entry_notional_quote "
+                "must not exceed funding_canary_max_entry_notional_quote"
             )
-        if (
-            _is_finite_nonnegative(
-                config.strategy.funding_canary_min_expected_net_edge_bps
-            )
-            and float(config.strategy.funding_canary_min_expected_net_edge_bps)
-            < _CANARY_HARD_MIN_EXPECTED_NET_EDGE_BPS
-        ):
-            issues.append(
-                "strategy.funding_canary_min_expected_net_edge_bps must be >= 8.0 during the canary release"
-            )
-        if (
-            _is_finite_nonnegative(
-                config.strategy.funding_canary_min_worst_case_edge_bps
-            )
-            and float(config.strategy.funding_canary_min_worst_case_edge_bps)
-            < _CANARY_HARD_MIN_WORST_CASE_EDGE_BPS
-        ):
-            issues.append(
-                "strategy.funding_canary_min_worst_case_edge_bps must be >= 3.0 during the canary release"
-            )
-    # Any live new funding entry is necessarily a canary at this release
-    # stage.  Leaving the old master switch independently enable-able would
-    # make it possible to bypass the notional, concurrency and account-fee
-    # proof gates merely by omitting the canary flag.  Existing positions,
-    # recovery and close paths are not affected by this startup contract.
-    if (
-        config.runtime.mode == "live"
-        and config.strategy.funding_new_entries_enabled is True
-        and config.strategy.funding_canary_enabled is not True
-    ):
-        issues.append(
-            "strategy.funding_canary_enabled must be true when live funding new entries are enabled"
-        )
+        for field_name, raw_map in {
+            "funding_canary_min_expected_net_edge_bps_by_venue_pair": (
+                config.strategy.funding_canary_min_expected_net_edge_bps_by_venue_pair
+            ),
+            "funding_canary_min_worst_case_edge_bps_by_venue_pair": (
+                config.strategy.funding_canary_min_worst_case_edge_bps_by_venue_pair
+            ),
+        }.items():
+            if not isinstance(raw_map, dict):
+                issues.append(f"strategy.{field_name} must be a mapping")
+                continue
+            for raw_pair, value in raw_map.items():
+                parts = (
+                    str(raw_pair or "")
+                    .strip()
+                    .lower()
+                    .replace("|", ":")
+                    .split(":")
+                )
+                pair = canonical_venue_pair(*parts) if len(parts) == 2 else ""
+                if (
+                    not pair
+                    or any(venue not in ALL_LIVE_FUNDING_VENUES for venue in parts)
+                    or not _is_finite_nonnegative(value)
+                ):
+                    issues.append(
+                        f"strategy.{field_name} contains invalid venue pair floor: "
+                        f"{raw_pair}"
+                    )
     if (
         config.runtime.mode == "live"
         and config.strategy.funding_new_entries_enabled is True
         and config.strategy.funding_canary_enabled is True
-        and not os.environ.get(TRUSTED_EXECUTION_BENCHMARK_HMAC_ENV, "").strip()
-    ):
-        # The runtime deliberately keeps V1 close/recovery working without a
-        # receipt key, but a live canary must discover this omission before it
-        # can submit a position that is structurally unable to graduate.
-        issues.append(
-            "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY must be non-empty for a live funding canary"
-        )
-    if (
-        config.runtime.mode == "live"
-        and config.strategy.funding_new_entries_enabled is True
-        and config.strategy.funding_canary_require_account_fee_evidence is True
     ):
         if (
             _is_positive_int(config.runtime.fee_evidence_max_age_ms)
@@ -390,16 +402,11 @@ def validate_config(config: AppConfig) -> list[str]:
                 "runtime.fee_evidence_account_identity_hashes must be a mapping"
             )
         else:
-            required_venues = {
-                str(venue or "").strip().lower()
-                for venue in config.strategy.funding_canary_allowed_venues
-                if str(venue or "").strip()
-            }
-            for venue in sorted(required_venues):
-                if not _is_sha256_hex(identities.get(venue)):
+            for venue, identity_hash in sorted(identities.items()):
+                if not _is_sha256_hex(identity_hash):
                     issues.append(
-                        "runtime.fee_evidence_account_identity_hashes must contain "
-                        f"a SHA256 identity hash for canary venue {venue}"
+                        "runtime.fee_evidence_account_identity_hashes contains an "
+                        f"invalid SHA256 identity hash for canary venue {venue}"
                     )
     if (
         config.strategy.spread_paper_enabled is True
@@ -713,6 +720,19 @@ def validate_config(config: AppConfig) -> list[str]:
             Venue.from_str(vc.venue)
         except ValueError:
             issues.append(f"unknown venue: {vc.venue}")
+        if not _is_finite_nonnegative(vc.taker_fee_bps):
+            issues.append(
+                f"venue {vc.venue} taker_fee_bps must be finite and >= 0"
+            )
+        if vc.maker_fee_bps is not None and not _is_finite_nonnegative(
+            vc.maker_fee_bps
+        ):
+            issues.append(
+                f"venue {vc.venue} maker_fee_bps must be finite and >= 0; "
+                "maker rebates require signed account fee evidence"
+            )
+        if not _is_positive_finite(vc.max_notional):
+            issues.append(f"venue {vc.venue} max_notional must be finite and > 0")
 
     # V1 directed_pairs validation (CONFIG-001, CONFIG-004)
     issues.extend(validate_directed_pairs(config.runtime.directed_pairs, config.symbols))

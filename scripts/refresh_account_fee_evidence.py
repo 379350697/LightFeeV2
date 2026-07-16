@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Refresh signed live-canary fee evidence from read-only private APIs.
+"""Refresh signed account-fee evidence from available read-only private APIs.
 
-The command supports only venues whose account identity and fee schedule are
-both available from an authenticated read endpoint.  It never creates,
+Venues without an implemented account-fee endpoint remain eligible only for
+the separately capped conservative canary tier.  This command never creates,
 cancels, or amends an order.
 """
 
@@ -30,7 +30,7 @@ from lightfee.strategy.fee_evidence import (
 from lightfee.venues.registry import build_adapter_map
 
 
-SUPPORTED_VENUES = (Venue.BYBIT, Venue.OKX)
+ACCOUNT_FEE_API_VENUES = frozenset({Venue.BYBIT, Venue.OKX})
 
 
 def _rate(value: object, *, field: str) -> float:
@@ -131,34 +131,61 @@ def parse_okx_evidence(
 
 
 async def collect_evidence(config_path: str, *, now_ms: int) -> dict[str, object]:
-    adapters = build_adapter_map(load_config(config_path))
-    missing = [venue.value for venue in SUPPORTED_VENUES if venue not in adapters]
+    config = load_config(config_path)
+    requested = {
+        Venue.from_str(str(venue))
+        for venue in config.strategy.funding_canary_allowed_venues
+        if str(venue).strip()
+    }
+    exact_venues = requested & ACCOUNT_FEE_API_VENUES
+    if not exact_venues:
+        raise ValueError(
+            "no configured canary venue has an account-fee API collector; "
+            "conservative fee tiers do not produce signed account evidence"
+        )
+    adapters = build_adapter_map(config)
+    missing = [venue.value for venue in exact_venues if venue not in adapters]
     if missing:
-        raise ValueError("missing configured canary venues: " + ", ".join(missing))
+        raise ValueError("missing configured account-fee venues: " + ", ".join(missing))
     try:
-        bybit_transport = adapters[Venue.BYBIT]._transport
-        okx_transport = adapters[Venue.OKX]._transport
-        bybit_fee, bybit_identity, okx_fee, okx_identity = await asyncio.gather(
-            bybit_transport._request(
-                "GET",
-                "/v5/account/fee-rate",
-                params={"category": "linear", "symbol": "BTCUSDT"},
-                private=True,
-            ),
-            bybit_transport._request("GET", "/v5/user/query-api", private=True),
-            okx_transport._request(
-                "GET",
-                "/api/v5/account/trade-fee",
-                params={"instType": "SWAP"},
-                private=True,
-            ),
-            okx_transport._request("GET", "/api/v5/account/config", private=True),
+        async def collect_bybit() -> dict[str, object]:
+            transport = adapters[Venue.BYBIT]._transport
+            fee, identity = await asyncio.gather(
+                transport._request(
+                    "GET",
+                    "/v5/account/fee-rate",
+                    params={"category": "linear", "symbol": "BTCUSDT"},
+                    private=True,
+                ),
+                transport._request("GET", "/v5/user/query-api", private=True),
+            )
+            return parse_bybit_evidence(fee, identity, now_ms=now_ms)
+
+        async def collect_okx() -> dict[str, object]:
+            transport = adapters[Venue.OKX]._transport
+            fee, identity = await asyncio.gather(
+                transport._request(
+                    "GET",
+                    "/api/v5/account/trade-fee",
+                    params={"instType": "SWAP"},
+                    private=True,
+                ),
+                transport._request("GET", "/api/v5/account/config", private=True),
+            )
+            return parse_okx_evidence(fee, identity, now_ms=now_ms)
+
+        collectors = {
+            Venue.BYBIT: collect_bybit,
+            Venue.OKX: collect_okx,
+        }
+        rows = await asyncio.gather(
+            *(collectors[venue]() for venue in sorted(exact_venues, key=lambda v: v.value))
         )
         return {
-            "bybit": parse_bybit_evidence(
-                bybit_fee, bybit_identity, now_ms=now_ms
-            ),
-            "okx": parse_okx_evidence(okx_fee, okx_identity, now_ms=now_ms),
+            venue.value: row
+            for venue, row in zip(
+                sorted(exact_venues, key=lambda value: value.value), rows, strict=True
+            )
         }
     finally:
         transports = {
