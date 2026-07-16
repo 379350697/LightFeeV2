@@ -642,9 +642,16 @@ def _selection_contract_reason(
             return approval_reason
     if selected.get("account_fee_evidence_complete") is not True:
         return "account_fee_evidence_incomplete"
-    if selected.get("account_fee_evidence_integrity_verified") is not True:
+    local_authoritative = selected.get("account_fee_evidence_authoritative") is True
+    if (
+        not local_authoritative
+        and selected.get("account_fee_evidence_integrity_verified") is not True
+    ):
         return "account_fee_evidence_unverified"
-    if selected.get("account_fee_evidence_identity_bound") is not True:
+    if (
+        not local_authoritative
+        and selected.get("account_fee_evidence_identity_bound") is not True
+    ):
         return "account_fee_identity_not_bound"
     hard_cap = _finite_required(selected.get("funding_canary_hard_max_entry_notional_quote"))
     hard_expected = _finite_required(

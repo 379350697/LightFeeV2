@@ -15,19 +15,20 @@ runtime、journal 与诊断工具读取。
   一笔 open/pending pair、每腿名义上限 30 quote，并要求 expected/worst edge 分别
   不低于 8/3 bps。它在 shortlist 与 first-leg submit 前各校验一次；后一次不重计
   并发，以免影响已进入 V1 hedge/recovery 的仓位。
-- `runtime/account-fee-evidence.json` 只接受私有账户费率 API 或已核对的 private-fill
-  导出，必须包含 source、evidence_ref、observed_at_ms、maker/taker bps 与每个 venue 的
-  `account_identity_hash`。只有 schema-v3、固定 HMAC 环境变量
-  `LIGHTFEE_FEE_EVIDENCE_HMAC_KEY`、固定 key id `lightfee-fee-evidence-v3` 的完整性
-  验证才可授权；每个 hash 还必须与
-  `runtime.fee_evidence_account_identity_hashes` 的实际交易账户绑定一致。journal 会冻结
-  每个 venue 的 provenance 与 fingerprint；缺失、超过 24 小时、签名/账户绑定无效或候选
-  fingerprint 不一致时 canary fail-closed，`funding_canary_require_account_fee_evidence`
-  在 canary 期间必须为 true。
-  静态费率仍是默认保守地板；仅经签名验证的 maker rebate 可在显式 paper
-  配置中计入。可用 `scripts/validate_fee_evidence.py ... --require-integrity
-  --require-venue binance --require-account-identity binance=<sha256>` 离线验证，
-  不会访问交易所。
+- 资金费与价差 paper 的费率证据已分离。资金费使用
+  `runtime/funding-account-fee-evidence.json`（schema v4）：定时任务通过七所私有只读
+  费率接口采集，原子写入当前服务用户拥有的 0600 普通文件，不再要求同机自签 HMAC
+  或手工维护账户 UID hash。symbol-scoped 交易所会逐配置合约采集，响应 symbol 必须与请求
+  一致；每所保存逐 symbol 子记录，再以参与池内最高手续费聚合，避免 BTC 档位被错误外推给
+  其他合约。OKX 先用私有 instruments 的 `instId -> groupId` 映射，再从 `feeGroup[]` 精确选择
+  目标费组，不再读取已废弃的顶层 maker/taker。单所/单 symbol 刷新失败只复用未超过 5 天
+  的对应 last-good；仍缺失的 symbol 不具备 account-authoritative 采样资格，但不会污染其他
+  symbol/交易所。费率通常低频变化，因此按 24 小时刷新并设置 5 天硬过期；刷新期间仍以最后
+  一份有效逐标的证据计费。journal 继续冻结每所 provenance 与 fingerprint；缺失、过期、文件权限不安全或
+  候选 fingerprint 不一致时 account tier fail-closed。最终准入按
+  `max(TOML 保守地板, account evidence)` 重建 maker/taker 成本；schema-v4 不启用 maker rebate。
+- strict spread paper 继续使用独立的 `runtime/account-fee-evidence.json` schema-v3
+  HMAC/账户绑定契约；资金费刷新任务不会覆盖它。
 - sidecar schema v4 承载完整经济学、funding forecast 和精确执行合约证据。解析时同时将 candidate
   的 venue/symbol 回查到两条原始 quote，要求二者均为已标准化的 linear 合约、
   underlying/quote/multiplier 一致且精度、interval、index 与 venue 状态完整；

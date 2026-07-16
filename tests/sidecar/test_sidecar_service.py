@@ -93,7 +93,7 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
     assert id(service._allocator) == allocator_id
 
 
-def test_canary_conservative_tier_prices_missing_account_evidence_before_ranking(
+def test_canary_conservative_tier_defers_symbol_specific_buffer_to_pairing(
     tmp_path,
 ) -> None:
     service = object.__new__(SidecarService)
@@ -109,12 +109,12 @@ def test_canary_conservative_tier_prices_missing_account_evidence_before_ranking
             VenueConfig(venue="rich", taker_fee_bps=2.0, maker_fee_bps=0.2),
         ],
     )
-    service.config.runtime.fee_evidence_path = str(tmp_path / "missing.json")
+    service.config.runtime.funding_fee_evidence_path = str(tmp_path / "missing.json")
 
     candidate_service = service._new_candidate_service(now_ms=1_000)
 
-    assert candidate_service._fee_by_venue == {"cheap": 3.0, "rich": 4.0}
-    assert candidate_service._maker_fee_by_venue == {"cheap": 3.0, "rich": 4.0}
+    assert candidate_service._fee_by_venue == {"cheap": 1.0, "rich": 2.0}
+    assert candidate_service._maker_fee_by_venue == {"cheap": 0.1, "rich": 0.2}
 
 
 def test_source_identity_corruption_is_quarantined_per_symbol() -> None:

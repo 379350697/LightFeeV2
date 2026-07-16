@@ -2656,6 +2656,14 @@ def test_trade_optimization_report_timer_is_six_hour_readonly_job():
     assert "Unit=lightfee-trade-optimization-report.service" in timer
 
 
+def test_account_fee_evidence_timer_refreshes_daily():
+    timer = Path("deploy/systemd/lightfee-fee-evidence-refresh.timer").read_text()
+
+    assert "OnUnitActiveSec=24h" in timer
+    assert "Persistent=true" in timer
+    assert "Unit=lightfee-fee-evidence-refresh.service" in timer
+
+
 def test_spread_sidecar_systemd_template_uses_module_entrypoint():
     text = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     assert ".venv/bin/python3 -m lightfee.apps.spread_sidecar" in text

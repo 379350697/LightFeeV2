@@ -26,8 +26,11 @@ def main() -> int:
     parser.add_argument(
         "--max-age-ms",
         type=int,
-        default=24 * 60 * 60 * 1000,
-        help="maximum evidence age (default: 24 hours)",
+        default=None,
+        help=(
+            "maximum evidence age; defaults to 5 days for funding schema-v4 "
+            "and 24 hours for strict spread schema-v3"
+        ),
     )
     parser.add_argument(
         "--require-integrity",
@@ -39,6 +42,11 @@ def main() -> int:
         action="append",
         default=[],
         help="venue that must be covered; repeat for every canary/paper venue",
+    )
+    parser.add_argument(
+        "--require-symbol",
+        default="",
+        help="canonical funding symbol that schema-v4 evidence must cover",
     )
     parser.add_argument(
         "--require-account-identity",
@@ -55,12 +63,25 @@ def main() -> int:
     )
     args = parser.parse_args()
     now_ms = int(args.now_ms or time.time() * 1000)
+    max_age_ms = (
+        int(args.max_age_ms)
+        if args.max_age_ms is not None
+        else 5 * 24 * 60 * 60 * 1000
+    )
     evidence = load_fee_evidence(
         args.path,
         now_ms=now_ms,
-        max_age_ms=int(args.max_age_ms),
+        max_age_ms=max_age_ms,
     )
+    if args.max_age_ms is None and evidence.schema_version == FEE_EVIDENCE_SCHEMA_VERSION:
+        max_age_ms = 24 * 60 * 60 * 1000
+        evidence = load_fee_evidence(
+            args.path,
+            now_ms=now_ms,
+            max_age_ms=max_age_ms,
+        )
     venues = [str(venue).strip().lower() for venue in args.require_venue if str(venue).strip()]
+    required_symbol = str(args.require_symbol or "").strip().upper()
     expected_identities: dict[str, str] = {}
     for raw in args.require_account_identity:
         venue, separator, identity_hash = str(raw or "").partition("=")
@@ -77,11 +98,23 @@ def main() -> int:
             and evidence.identity_matches(expected_identities, *expected_identities)
         )
     )
+    symbol_authority_valid = (
+        not required_symbol
+        or (
+            bool(venues)
+            and evidence.account_authoritative_for(
+                expected_identities,
+                *venues,
+                symbol=required_symbol,
+            )
+        )
+    )
     valid = (
         evidence.loaded
         and evidence.complete_for(*venues)
         and (not args.require_integrity or evidence.integrity_verified is True)
         and identity_binding_valid
+        and symbol_authority_valid
     )
     print(
         json.dumps(
@@ -89,6 +122,7 @@ def main() -> int:
                 "valid": valid,
                 "reason": evidence.reason,
                 "source_path": evidence.source_path,
+                "max_age_ms": max_age_ms,
                 "required_venues": venues,
                 "covered_venues": sorted(evidence.schedules),
                 "observed_at_ms": evidence.observed_at_ms_for(*venues)
@@ -98,6 +132,18 @@ def main() -> int:
                 "document_sha256": evidence.document_sha256,
                 "integrity_verified": evidence.integrity_verified,
                 "integrity_key_id": evidence.integrity_key_id,
+                "local_file_verified": evidence.local_file_verified,
+                "account_fee_evidence_authoritative": (
+                    evidence.account_authoritative_for(
+                        expected_identities,
+                        *venues,
+                        symbol=required_symbol,
+                    )
+                    if venues
+                    else False
+                ),
+                "required_symbol": required_symbol,
+                "symbol_authority_valid": symbol_authority_valid,
                 "required_account_identity_hashes": expected_identities,
                 "account_identity_binding_valid": identity_binding_valid,
             },

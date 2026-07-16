@@ -403,24 +403,48 @@ def _candidate_for_pair(
     account_fee_evidence_base_complete = bool(
         fee_evidence is not None
         and fee_evidence.complete_for(long_q.venue, short_q.venue)
-        and fee_evidence.integrity_verified is True
     )
-    account_fee_identity_matches = bool(
-        account_fee_evidence_base_complete
-        and (
-            expected_fee_identity_hashes is None
-            or fee_evidence.identity_matches(
-                expected_fee_identity_hashes,
-                long_q.venue,
-                short_q.venue,
-            )
+    long_account_fee_authoritative = bool(
+        fee_evidence is not None
+        and fee_evidence.account_authoritative_for(
+            expected_fee_identity_hashes or {},
+            long_q.venue,
+            symbol=long_q.symbol,
         )
     )
-    account_fee_evidence_complete = (
-        account_fee_evidence_base_complete and account_fee_identity_matches
+    short_account_fee_authoritative = bool(
+        fee_evidence is not None
+        and fee_evidence.account_authoritative_for(
+            expected_fee_identity_hashes or {},
+            short_q.venue,
+            symbol=short_q.symbol,
+        )
     )
+    account_fee_identity_matches = (
+        long_account_fee_authoritative and short_account_fee_authoritative
+    )
+    account_fee_evidence_complete = account_fee_identity_matches
     long_maker_fee = maker_fee_by_venue.get(str(long_q.venue).lower(), long_fee)
     short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
+    if (
+        config.funding_canary_enabled is True
+        and config.funding_canary_require_account_fee_evidence is not True
+    ):
+        # The fallback tier is a property of this symbol/venue leg, not of the
+        # venue as a whole.  A daily-universe symbol that was not covered by
+        # the latest private fee response must not inherit another symbol's
+        # authority or maker discount.  Keep an authoritative sibling leg at
+        # its measured fee and price only the unverified leg conservatively.
+        conservative_buffer_bps = max(
+            float(config.funding_canary_conservative_fee_buffer_bps or 0.0),
+            0.0,
+        )
+        if not long_account_fee_authoritative:
+            long_fee += conservative_buffer_bps
+            long_maker_fee = long_fee
+        if not short_account_fee_authoritative:
+            short_fee += conservative_buffer_bps
+            short_maker_fee = short_fee
     venue_haircut = float(
         config.funding_venue_risk_haircut_bps_by_venue.get(str(long_q.venue).lower(), 0.0) or 0.0
     ) + float(
@@ -504,7 +528,19 @@ def _candidate_for_pair(
         and expected_fee_identity_hashes is not None
         and not account_fee_identity_matches
     ):
-        candidate_block_reasons.append("account_fee_account_identity_mismatch")
+        schedules = (
+            fee_evidence.schedule_for(long_q.venue),
+            fee_evidence.schedule_for(short_q.venue),
+        ) if fee_evidence is not None else ()
+        if any(
+            schedule is not None
+            and schedule.covered_symbols
+            and str(long_q.symbol).strip().upper() not in schedule.covered_symbols
+            for schedule in schedules
+        ):
+            candidate_block_reasons.append("account_fee_symbol_coverage_missing")
+        else:
+            candidate_block_reasons.append("account_fee_account_identity_mismatch")
     if not taker_fee_evidence_complete:
         # A zero fee can be a valid explicitly configured VIP tier, but an
         # omitted, non-finite, or negative taker fee is not evidence.  The
@@ -621,12 +657,16 @@ def _candidate_for_pair(
             else ""
         ),
         account_fee_evidence_fingerprint=(
-            fee_evidence.fingerprint_for(long_q.venue, short_q.venue)
+            fee_evidence.fingerprint_for(
+                long_q.venue, short_q.venue, symbol=long_q.symbol
+            )
             if account_fee_evidence_complete and fee_evidence is not None
             else ""
         ),
         account_fee_evidence_provenance=(
-            fee_evidence.provenance_for(long_q.venue, short_q.venue)
+            fee_evidence.provenance_for(
+                long_q.venue, short_q.venue, symbol=long_q.symbol
+            )
             if account_fee_evidence_complete and fee_evidence is not None
             else []
         ),

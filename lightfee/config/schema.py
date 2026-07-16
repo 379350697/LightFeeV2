@@ -91,22 +91,23 @@ class RuntimeConfig:
     funding_basis_risk_checkpoint_path: str = (
         "runtime/funding-basis-risk-v1-checkpoint.json"
     )
-    # Account-scoped maker/taker schedules are short-lived evidence, distinct
-    # from static configuration defaults.  Live canaries and official paper
-    # cohorts consume this file fail-closed; shadow diagnostics may still use
-    # the static conservative fee floor when it is absent.
+    # Strict spread-paper schema-v3 evidence.  It remains isolated from the
+    # funding collector so one strategy cannot overwrite the other's cohort.
     fee_evidence_path: str = "runtime/account-fee-evidence.json"
-    # A seven-day fee snapshot cannot safely authorize a small live canary.
-    # Schema-v3 evidence uses a code-owned fixed HMAC environment name.  This
-    # legacy field is retained only to parse old TOML and must be blank (or
-    # the exact fixed name) for live canary validation.
+    # Strict spread-paper evidence keeps its independent 24-hour ceiling.
     fee_evidence_max_age_ms: int = 24 * 60 * 60 * 1000
+    # Legacy schema-v3 settings remain available only for strict spread-paper
+    # compatibility.  Funding schema v4 relies on the local 0600 file boundary.
     fee_evidence_integrity_key_env: str = ""
-    # Non-sensitive SHA256(account/subaccount UID) binding per venue.  The
-    # signed fee schedule must match this configured trading-account identity.
     fee_evidence_account_identity_hashes: dict[str, str] = field(
         default_factory=dict
     )
+    # Funding-only schema-v4 account rates.  This local 0600 snapshot is
+    # deliberately separate from strict spread-paper evidence/configuration.
+    # Account fee tiers change infrequently: refresh once per day and retain
+    # a per-symbol last-good observation for at most five days.
+    funding_fee_evidence_path: str = "runtime/funding-account-fee-evidence.json"
+    funding_fee_evidence_max_age_ms: int = 5 * 24 * 60 * 60 * 1000
     spread_sidecar_refresh_ms: int = 1000
     spread_sidecar_fetch_timeout_s: float = 10.0
     spread_sidecar_source_mode: str = "sidecar_snapshot"

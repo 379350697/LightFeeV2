@@ -1,0 +1,90 @@
+{
+  "schema_version": 4,
+  "generated_at_ms": 0,
+  "venues": {
+    "aster": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "binance": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "bitget": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "bybit": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "gate": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "hyperliquid": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    },
+    "okx": {
+      "taker_fee_bps": 0.0,
+      "maker_fee_bps": 0.0,
+      "observed_at_ms": 0,
+      "source": "account_fee_api",
+      "evidence_ref": "REPLACE_WITH_PRIVATE_API_SNAPSHOT_ID",
+      "covered_symbols": ["BTCUSDT", "ETHUSDT"],
+      "symbol_schedules": {
+        "BTCUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_BTC_SNAPSHOT_ID"},
+        "ETHUSDT": {"taker_fee_bps": 0.0, "maker_fee_bps": 0.0, "observed_at_ms": 0, "evidence_ref": "REPLACE_WITH_ETH_SNAPSHOT_ID"}
+      }
+    }
+  }
+}

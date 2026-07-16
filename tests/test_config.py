@@ -63,6 +63,54 @@ def test_funding_canary_allows_bounded_conservative_fee_assurance():
     assert not any("require_account_fee_evidence" in issue for issue in validate_config(cfg))
 
 
+def test_funding_and_spread_fee_evidence_are_separate_runtime_inputs():
+    cfg = AppConfig()
+
+    assert cfg.runtime.funding_fee_evidence_path != cfg.runtime.fee_evidence_path
+    assert cfg.runtime.funding_fee_evidence_max_age_ms == 5 * 24 * 60 * 60 * 1000
+    assert cfg.runtime.fee_evidence_max_age_ms == 24 * 60 * 60 * 1000
+    cfg.runtime.funding_fee_evidence_path = ""
+    assert "runtime.funding_fee_evidence_path must be non-empty" in validate_config(cfg)
+    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+    cfg.runtime.funding_fee_evidence_path = cfg.runtime.fee_evidence_path
+    assert (
+        "runtime.funding_fee_evidence_path must differ from runtime.fee_evidence_path"
+        in validate_config(cfg)
+    )
+    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+    cfg.runtime.fee_evidence_path = "runtime/account-fee-evidence.json"
+    cfg.runtime.funding_fee_evidence_path = "runtime/../runtime/account-fee-evidence.json"
+    assert (
+        "runtime.funding_fee_evidence_path must differ from runtime.fee_evidence_path"
+        in validate_config(cfg)
+    )
+    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+    cfg.runtime.funding_fee_evidence_max_age_ms = 0
+    assert (
+        "runtime.funding_fee_evidence_max_age_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+
+
+def test_live_funding_fee_evidence_accepts_five_days_but_not_longer():
+    cfg = AppConfig()
+    cfg.runtime.mode = "live"
+    cfg.strategy.funding_new_entries_enabled = True
+    cfg.strategy.funding_canary_enabled = True
+    cfg.runtime.funding_fee_evidence_max_age_ms = 5 * 24 * 60 * 60 * 1000
+
+    assert not any(
+        "funding_fee_evidence_max_age_ms" in issue for issue in validate_config(cfg)
+    )
+
+    cfg.runtime.funding_fee_evidence_max_age_ms += 1
+    assert (
+        "runtime.funding_fee_evidence_max_age_ms must be <= 432000000 "
+        "for a live funding canary"
+        in validate_config(cfg)
+    )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value", "expected"),
     [

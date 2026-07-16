@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh LightFee V2 signed account fee evidence
+Description=Refresh LightFee V2 local account fee evidence
 After=network-online.target
 Wants=network-online.target
 

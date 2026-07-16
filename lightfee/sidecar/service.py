@@ -974,9 +974,19 @@ class SidecarService:
             venue_configs = _canonical_venue_configs(config.venues)
             self._venue_configs_by_name = venue_configs
         evidence = load_fee_evidence(
-            config.runtime.fee_evidence_path,
+            getattr(
+                config.runtime,
+                "funding_fee_evidence_path",
+                config.runtime.fee_evidence_path,
+            ),
             now_ms=int(now_ms if now_ms is not None else time.time() * 1000),
-            max_age_ms=int(config.runtime.fee_evidence_max_age_ms),
+            max_age_ms=int(
+                getattr(
+                    config.runtime,
+                    "funding_fee_evidence_max_age_ms",
+                    config.runtime.fee_evidence_max_age_ms,
+                )
+            ),
         )
         configured_taker = {
             venue_name: float(venue.taker_fee_bps or 0.0)
@@ -996,33 +1006,6 @@ class SidecarService:
             evidence,
             allow_verified_maker_rebates=True,
         )
-        strategy = config.strategy
-        if (
-            strategy.funding_canary_enabled is True
-            and strategy.funding_canary_require_account_fee_evidence is not True
-        ):
-            # A venue without identity-bound account evidence remains tradable
-            # only through the conservative small-sample tier.  Price that tier
-            # before ranking so its apparent alpha cannot rely on a maker
-            # discount or an optimistic public fee schedule.
-            buffer_bps = float(
-                strategy.funding_canary_conservative_fee_buffer_bps or 0.0
-            )
-            expected_identities = config.runtime.fee_evidence_account_identity_hashes
-            for venue_name, configured_fee in configured_taker.items():
-                account_authoritative = bool(
-                    evidence.integrity_verified is True
-                    and evidence.complete_for(venue_name)
-                    and evidence.identity_matches(expected_identities, venue_name)
-                )
-                if account_authoritative:
-                    continue
-                conservative_taker = float(configured_fee) + buffer_bps
-                taker_fees[venue_name] = max(
-                    float(taker_fees.get(venue_name, 0.0)),
-                    conservative_taker,
-                )
-                maker_fees[venue_name] = taker_fees[venue_name]
         return FundingCandidateService(
             strategy=config.strategy,
             venue_fee_bps=taker_fees,

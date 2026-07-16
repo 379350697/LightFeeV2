@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 
 from lightfee.strategy.fee_evidence import (
     FEE_EVIDENCE_SCHEMA_VERSION,
+    LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
     TRUSTED_FEE_EVIDENCE_HMAC_ENV,
     TRUSTED_FEE_EVIDENCE_KEY_ID,
     effective_fee_maps,
@@ -34,6 +36,24 @@ def _payload(*, observed_at_ms: int, source: str = "account_fee_api") -> dict:
             },
         },
     }
+
+
+def _local_payload(*, observed_at_ms: int) -> dict:
+    payload = _payload(observed_at_ms=observed_at_ms)
+    payload["schema_version"] = LOCAL_FEE_EVIDENCE_SCHEMA_VERSION
+    for row in payload["venues"].values():
+        row.pop("account_identity_hash", None)
+        row["covered_symbols"] = ["BTCUSDT", "ETHUSDT"]
+        row["symbol_schedules"] = {
+            symbol: {
+                "taker_fee_bps": row["taker_fee_bps"],
+                "maker_fee_bps": row["maker_fee_bps"],
+                "observed_at_ms": row["observed_at_ms"],
+                "evidence_ref": f"{row['evidence_ref']}:{symbol}",
+            }
+            for symbol in row["covered_symbols"]
+        }
+    return payload
 
 
 def test_fee_evidence_requires_fresh_private_schedule_and_preserves_static_floor(
@@ -223,3 +243,161 @@ def test_negative_static_maker_fee_never_becomes_a_rebate() -> None:
     _, maker = effective_fee_maps({"cheap": 1.0}, {"cheap": -0.2}, None)
 
     assert maker["cheap"] == 1.0
+
+
+def test_local_v4_fee_evidence_is_authoritative_without_hmac_or_identity(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "account-fees.json"
+    payload = _local_payload(observed_at_ms=1_000)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.delenv(TRUSTED_FEE_EVIDENCE_HMAC_ENV, raising=False)
+
+    evidence = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+
+    assert evidence.loaded is True
+    assert evidence.integrity_verified is False
+    assert evidence.local_file_verified is True
+    assert evidence.account_authoritative_for({}, "cheap", "rich") is False
+    assert evidence.account_authoritative_for(
+        {}, "cheap", "rich", symbol="BTCUSDT"
+    ) is True
+    assert evidence.account_authoritative_for(
+        {}, "cheap", "rich", symbol="SOLUSDT"
+    ) is False
+    assert all(
+        row["account_fee_evidence_authoritative"] is True
+        for row in evidence.provenance_for("cheap", "rich", symbol="BTCUSDT")
+    )
+
+
+def test_local_v4_fee_evidence_rejects_group_or_world_readable_file(tmp_path) -> None:
+    path = tmp_path / "account-fees.json"
+    payload = _local_payload(observed_at_ms=1_000)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o640)
+
+    evidence = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+
+    assert evidence.loaded is False
+    assert evidence.reason == "fee_evidence_local_file_permissions_unsafe"
+
+
+def test_local_v4_fee_evidence_rejects_wrong_owner(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "account-fees.json"
+    path.write_text(json.dumps(_local_payload(observed_at_ms=1_000)), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(os, "geteuid", lambda: path.stat().st_uid + 1)
+
+    evidence = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+
+    assert evidence.loaded is False
+    assert evidence.reason == "fee_evidence_local_file_owner_mismatch"
+
+
+def test_fee_schedule_digest_is_stable_across_refresh_epochs(tmp_path) -> None:
+    path = tmp_path / "account-fees.json"
+    first = _local_payload(observed_at_ms=1_000)
+    path.write_text(json.dumps(first), encoding="utf-8")
+    path.chmod(0o600)
+    first_book = load_fee_evidence(path, now_ms=1_100, max_age_ms=10_000)
+
+    second = _local_payload(observed_at_ms=2_000)
+    for row in second["venues"].values():
+        row["evidence_ref"] = "new-private-api-observation"
+    path.write_text(json.dumps(second), encoding="utf-8")
+    path.chmod(0o600)
+    second_book = load_fee_evidence(path, now_ms=2_100, max_age_ms=10_000)
+
+    assert first_book.document_sha256 != second_book.document_sha256
+    assert first_book.schedule_sha256 == second_book.schedule_sha256
+
+
+def test_local_v4_rejects_stale_venue_without_poisoning_fresh_venues(tmp_path) -> None:
+    path = tmp_path / "account-fees.json"
+    payload = _local_payload(observed_at_ms=1_000)
+    payload["venues"]["rich"]["observed_at_ms"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    evidence = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+
+    assert evidence.loaded is True
+    assert evidence.complete_for("cheap") is True
+    assert evidence.complete_for("rich") is False
+    assert evidence.account_authoritative_for({}, "cheap", symbol="BTCUSDT") is True
+
+
+def test_local_v4_rejects_missing_or_ambiguous_symbol_coverage(tmp_path) -> None:
+    path = tmp_path / "account-fees.json"
+    payload = _payload(observed_at_ms=1_000)
+    payload["schema_version"] = LOCAL_FEE_EVIDENCE_SCHEMA_VERSION
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    missing = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+    assert missing.loaded is False
+    assert missing.reason == "fee_evidence_symbol_coverage_invalid:cheap"
+
+    for row in payload["venues"].values():
+        row["covered_symbols"] = ["ETHUSDT", "BTCUSDT"]
+        row["symbol_schedules"] = {
+            symbol: {
+                "taker_fee_bps": row["taker_fee_bps"],
+                "maker_fee_bps": row["maker_fee_bps"],
+                "observed_at_ms": row["observed_at_ms"],
+                "evidence_ref": f"coverage:{symbol}",
+            }
+            for symbol in row["covered_symbols"]
+        }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    unsorted = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+    assert unsorted.loaded is False
+    assert unsorted.reason == "fee_evidence_symbol_coverage_invalid:cheap"
+
+
+def test_local_v4_rejects_future_child_even_when_aggregate_epoch_is_current(
+    tmp_path,
+) -> None:
+    path = tmp_path / "account-fees.json"
+    payload = _local_payload(observed_at_ms=1_000)
+    payload["venues"]["cheap"]["symbol_schedules"]["ETHUSDT"][
+        "observed_at_ms"
+    ] = 2_000
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    evidence = load_fee_evidence(path, now_ms=1_100, max_age_ms=500)
+
+    assert evidence.loaded is True
+    assert evidence.complete_for("cheap") is True
+    assert evidence.complete_for("rich") is True
+    assert evidence.account_authoritative_for(
+        {}, "cheap", symbol="BTCUSDT"
+    ) is True
+    assert evidence.account_authoritative_for(
+        {}, "cheap", symbol="ETHUSDT"
+    ) is False
+
+
+def test_fee_evidence_rejects_non_regular_symlink_and_oversized_inputs(tmp_path) -> None:
+    fifo = tmp_path / "account-fees.fifo"
+    os.mkfifo(fifo, 0o600)
+    fifo_result = load_fee_evidence(fifo, now_ms=1_100, max_age_ms=500)
+    assert fifo_result.reason == "fee_evidence_local_file_not_regular"
+
+    target = tmp_path / "target.json"
+    target.write_text(json.dumps(_local_payload(observed_at_ms=1_000)), encoding="utf-8")
+    target.chmod(0o600)
+    symlink = tmp_path / "account-fees-link.json"
+    symlink.symlink_to(target)
+    symlink_result = load_fee_evidence(symlink, now_ms=1_100, max_age_ms=500)
+    assert symlink_result.reason == "fee_evidence_unreadable"
+
+    oversized = tmp_path / "oversized.json"
+    with oversized.open("wb") as handle:
+        handle.truncate(1024 * 1024 + 1)
+    oversized.chmod(0o600)
+    oversized_result = load_fee_evidence(oversized, now_ms=1_100, max_age_ms=500)
+    assert oversized_result.reason == "fee_evidence_file_too_large"

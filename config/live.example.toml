@@ -9,15 +9,15 @@ sidecar_refresh_ms = 3000
 sidecar_perp_liquidity_budget_ms = 30000
 spread_sidecar_snapshot_path = "runtime/spread-opportunities-current.json"
 spread_stats_checkpoint_path = "runtime/spread-stats-v2-checkpoint.json"
-# Private account fee evidence is read-only and short-lived.  Do not enable a
-# funding canary or official paper run until this is produced from an account
-# fee API/private-fill reconciliation for every participating venue.
+# Funding account fees are refreshed from seven private read-only APIs into an
+# atomic 0600 local file. Failed symbols reuse their own still-fresh last-good
+# rows; uncovered symbols cannot claim account-authoritative economics.
+funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+funding_fee_evidence_max_age_ms = 432000000
+# Strict spread-paper fee evidence remains a separate schema-v3 input.
 fee_evidence_path = "runtime/account-fee-evidence.json"
 fee_evidence_max_age_ms = 86400000
-# Environment variable name only; the secret must not be committed to TOML.
-fee_evidence_integrity_key_env = "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY"
-# Bind each canary/v3-paper venue to SHA256(account-or-subaccount UID).  Keep
-# this empty until real values are supplied; strict admission then fails closed.
+fee_evidence_integrity_key_env = ""
 fee_evidence_account_identity_hashes = {}
 spread_sidecar_refresh_ms = 1000
 spread_sidecar_fetch_timeout_s = 10.0
@@ -188,8 +188,8 @@ tuning_diagnostics_max_records = 10000
 
 [[venues]]
 venue = "binance"
-# Conservative non-VIP fallback floors. Official paper/live admission still
-# requires fresh signed account-fee evidence for the actual account tier.
+# Conservative non-VIP fallback floors. Funding live uses its local schema-v4
+# snapshot; strict spread paper uses its separate signed schema-v3 evidence.
 taker_fee_bps = 5.0
 maker_fee_bps = 2.0
 max_notional = 1000.0

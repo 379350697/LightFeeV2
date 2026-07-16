@@ -53,10 +53,9 @@ from lightfee.marketdata.liquidity import (
 )
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.fee_evidence import (
-    FEE_EVIDENCE_SCHEMA_VERSION,
     LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
-    TRUSTED_FEE_EVIDENCE_HMAC_ENV,
     TRUSTED_FEE_EVIDENCE_KEY_ID,
+    effective_fee_maps,
     load_fee_evidence,
 )
 from lightfee.strategy.funding_canary_policy import (
@@ -95,11 +94,11 @@ def _funding_canary_cohort_id(candidate: object, strategy: object) -> str:
     """
 
     raw_provenance = getattr(candidate, "account_fee_evidence_provenance", []) or []
-    document_digests = sorted(
+    schedule_digests = sorted(
         {
-            str(item.get("document_sha256") or "")
+            str(item.get("schedule_sha256") or "")
             for item in raw_provenance
-            if isinstance(item, dict) and str(item.get("document_sha256") or "")
+            if isinstance(item, dict) and str(item.get("schedule_sha256") or "")
         }
     )
     account_identity_hashes = sorted(
@@ -131,7 +130,7 @@ def _funding_canary_cohort_id(candidate: object, strategy: object) -> str:
         ).lower(),
         "entry_maker_leg": str(getattr(candidate, "entry_maker_leg", "") or "").lower(),
         "exit_maker_leg": str(getattr(candidate, "exit_maker_leg", "") or "").lower(),
-        "fee_document_sha256": document_digests,
+        "fee_schedule_sha256": schedule_digests,
         "fee_account_identity_hashes": account_identity_hashes,
         "budgeted_execution_cost_bps": (
             execution_budget[0] if execution_budget is not None else None
@@ -2560,14 +2559,17 @@ class EntryDispatchRuntime:
             and strategy.funding_canary_enabled is True
         ):
             try:
-                evidence_max_age_ms = int(runtime.fee_evidence_max_age_ms)
+                evidence_max_age_ms = int(
+                    getattr(
+                        runtime,
+                        "funding_fee_evidence_max_age_ms",
+                        runtime.fee_evidence_max_age_ms,
+                    )
+                )
             except (TypeError, ValueError, OverflowError):
                 return "funding_canary_fee_evidence_age_invalid"
             if not (0 < evidence_max_age_ms <= LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS):
                 return "funding_canary_fee_evidence_age_invalid"
-            configured_key_env = str(runtime.fee_evidence_integrity_key_env or "").strip()
-            if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
-                return "funding_canary_fee_evidence_integrity_key_policy_mismatch"
 
         if assurance_tier == "conservative":
             venue_configs = {
@@ -2580,21 +2582,16 @@ class EntryDispatchRuntime:
                 )
                 long_config = venue_configs[long_venue]
                 short_config = venue_configs[short_venue]
-                long_required = float(long_config.taker_fee_bps) + buffer_bps
-                short_required = float(short_config.taker_fee_bps) + buffer_bps
                 long_fee = float(getattr(candidate, "long_taker_fee_bps", 0.0) or 0.0)
                 short_fee = float(getattr(candidate, "short_taker_fee_bps", 0.0) or 0.0)
                 entry_fee = float(getattr(candidate, "entry_fee_bps", 0.0) or 0.0)
                 exit_fee = float(getattr(candidate, "exit_fee_bps", 0.0) or 0.0)
             except (KeyError, TypeError, ValueError, OverflowError):
                 return "funding_canary_conservative_fee_config_invalid"
-            required_pair_fee = long_required + short_required
             if not all(
                 math.isfinite(value) and value >= 0.0
                 for value in (
                     buffer_bps,
-                    long_required,
-                    short_required,
                     long_fee,
                     short_fee,
                     entry_fee,
@@ -2602,35 +2599,148 @@ class EntryDispatchRuntime:
                 )
             ):
                 return "funding_canary_conservative_fee_config_invalid"
+
+            evidence = load_fee_evidence(
+                getattr(
+                    runtime,
+                    "funding_fee_evidence_path",
+                    getattr(runtime, "fee_evidence_path", ""),
+                ),
+                now_ms=now_ms,
+                max_age_ms=int(
+                    getattr(
+                        runtime,
+                        "funding_fee_evidence_max_age_ms",
+                        getattr(runtime, "fee_evidence_max_age_ms", 0),
+                    )
+                    or 0
+                ),
+            )
+            expected_identity_hashes = getattr(
+                runtime, "fee_evidence_account_identity_hashes", {}
+            )
+            if not isinstance(expected_identity_hashes, dict):
+                expected_identity_hashes = {}
+            candidate_symbol = str(
+                getattr(candidate, "symbol", "") or ""
+            ).strip().upper()
+
+            def required_leg_fees(
+                venue: str, venue_config: object
+            ) -> tuple[float, float]:
+                static_taker = float(getattr(venue_config, "taker_fee_bps"))
+                configured_maker = getattr(venue_config, "maker_fee_bps", None)
+                static_maker = float(
+                    static_taker if configured_maker is None else configured_maker
+                )
+                authoritative = evidence.account_authoritative_for(
+                    expected_identity_hashes,
+                    venue,
+                    symbol=candidate_symbol,
+                )
+                if not authoritative:
+                    conservative_taker = static_taker + buffer_bps
+                    # No private proof means no maker discount on this leg.
+                    return conservative_taker, conservative_taker
+                schedule = evidence.schedule_for(venue)
+                if schedule is None:
+                    raise ValueError("missing authoritative fee schedule")
+                symbol_schedule = next(
+                    (
+                        row
+                        for row in schedule.symbol_schedules
+                        if row.symbol == candidate_symbol
+                    ),
+                    None,
+                )
+                evidence_taker = (
+                    symbol_schedule.taker_fee_bps
+                    if symbol_schedule is not None
+                    else schedule.taker_fee_bps
+                )
+                evidence_maker = (
+                    symbol_schedule.maker_fee_bps
+                    if symbol_schedule is not None
+                    else schedule.maker_fee_bps
+                )
+                return (
+                    max(static_taker, evidence_taker),
+                    max(static_maker, evidence_maker),
+                )
+
+            try:
+                long_required, long_required_maker = required_leg_fees(
+                    long_venue, long_config
+                )
+                short_required, short_required_maker = required_leg_fees(
+                    short_venue, short_config
+                )
+            except (TypeError, ValueError, OverflowError):
+                return "funding_canary_conservative_fee_config_invalid"
+            if not all(
+                math.isfinite(value) and value >= 0.0
+                for value in (
+                    long_required,
+                    long_required_maker,
+                    short_required,
+                    short_required_maker,
+                )
+            ):
+                return "funding_canary_conservative_fee_config_invalid"
+
+            def required_pair_fee(maker_leg: object) -> float | None:
+                selected = str(maker_leg or "").strip().lower()
+                if selected not in {"", "long", "short"}:
+                    return None
+                return (
+                    long_required_maker if selected == "long" else long_required
+                ) + (
+                    short_required_maker if selected == "short" else short_required
+                )
+
+            required_entry_fee = required_pair_fee(
+                getattr(candidate, "entry_maker_leg", "")
+            )
+            required_exit_fee = required_pair_fee(
+                getattr(candidate, "exit_maker_leg", "")
+            )
             if (
                 long_fee + 1e-12 < long_required
                 or short_fee + 1e-12 < short_required
-                or entry_fee + 1e-12 < required_pair_fee
-                or exit_fee + 1e-12 < required_pair_fee
+                or required_entry_fee is None
+                or required_exit_fee is None
+                or entry_fee + 1e-12 < required_entry_fee
+                or exit_fee + 1e-12 < required_exit_fee
             ):
                 return "funding_canary_fee_cost_understated"
             return ""
 
         evidence = load_fee_evidence(
-            runtime.fee_evidence_path,
+            getattr(runtime, "funding_fee_evidence_path", runtime.fee_evidence_path),
             now_ms=now_ms,
-            max_age_ms=int(runtime.fee_evidence_max_age_ms),
+            max_age_ms=int(
+                getattr(
+                    runtime,
+                    "funding_fee_evidence_max_age_ms",
+                    runtime.fee_evidence_max_age_ms,
+                )
+            ),
         )
         if not evidence.complete_for(long_venue, short_venue):
             return "funding_canary_account_fee_evidence_unavailable"
-        if evidence.integrity_verified is not True:
-            return "funding_canary_account_fee_evidence_unverified"
-        if evidence.schema_version != FEE_EVIDENCE_SCHEMA_VERSION:
-            return "funding_canary_account_fee_evidence_schema_not_authoritative"
         expected_identity_hashes = getattr(
             runtime, "fee_evidence_account_identity_hashes", {}
         )
-        if not isinstance(expected_identity_hashes, dict) or not evidence.identity_matches(
+        if not isinstance(expected_identity_hashes, dict):
+            expected_identity_hashes = {}
+        candidate_symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+        if not evidence.account_authoritative_for(
             expected_identity_hashes,
             long_venue,
             short_venue,
+            symbol=candidate_symbol,
         ):
-            return "funding_canary_account_identity_mismatch"
+            return "funding_canary_account_fee_evidence_unverified"
         if getattr(candidate, "account_fee_evidence_complete", False) is not True:
             return "funding_canary_candidate_fee_provenance_missing"
         if (
@@ -2640,8 +2750,12 @@ class EntryDispatchRuntime:
             != evidence.source_for(long_venue, short_venue)
         ):
             return "funding_canary_fee_evidence_epoch_mismatch"
-        expected_fingerprint = evidence.fingerprint_for(long_venue, short_venue)
-        expected_provenance = evidence.provenance_for(long_venue, short_venue)
+        expected_fingerprint = evidence.fingerprint_for(
+            long_venue, short_venue, symbol=candidate_symbol
+        )
+        expected_provenance = evidence.provenance_for(
+            long_venue, short_venue, symbol=candidate_symbol
+        )
         if (
             not expected_fingerprint
             or str(
@@ -2659,11 +2773,43 @@ class EntryDispatchRuntime:
             return "funding_canary_invalid_fee_economics"
         long_schedule = evidence.schedule_for(long_venue)
         short_schedule = evidence.schedule_for(short_venue)
+        venue_configs = {
+            str(getattr(venue, "venue", "") or "").strip().lower(): venue
+            for venue in getattr(self.ctx.config, "venues", [])
+        }
+        try:
+            long_config = venue_configs[long_venue]
+            short_config = venue_configs[short_venue]
+            configured_taker = {
+                long_venue: float(long_config.taker_fee_bps),
+                short_venue: float(short_config.taker_fee_bps),
+            }
+            configured_maker = {
+                long_venue: float(
+                    long_config.maker_fee_bps
+                    if long_config.maker_fee_bps is not None
+                    else long_config.taker_fee_bps
+                ),
+                short_venue: float(
+                    short_config.maker_fee_bps
+                    if short_config.maker_fee_bps is not None
+                    else short_config.taker_fee_bps
+                ),
+            }
+            required_taker, required_maker = effective_fee_maps(
+                configured_taker,
+                configured_maker,
+                evidence,
+            )
+            long_required_taker = required_taker[long_venue]
+            short_required_taker = required_taker[short_venue]
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "funding_canary_account_fee_config_invalid"
         if (
             long_schedule is None
             or short_schedule is None
-            or long_fee + 1e-12 < long_schedule.taker_fee_bps
-            or short_fee + 1e-12 < short_schedule.taker_fee_bps
+            or long_fee + 1e-12 < long_required_taker
+            or short_fee + 1e-12 < short_required_taker
         ):
             return "funding_canary_fee_cost_understated"
         # The candidate may price a V1 passive maker leg.  Checking only the
@@ -2684,14 +2830,14 @@ class EntryDispatchRuntime:
             if selected not in {"", "long", "short"}:
                 return None
             long_cost = (
-                long_schedule.maker_fee_bps
+                required_maker[long_venue]
                 if selected == "long"
-                else long_schedule.taker_fee_bps
+                else long_required_taker
             )
             short_cost = (
-                short_schedule.maker_fee_bps
+                required_maker[short_venue]
                 if selected == "short"
-                else short_schedule.taker_fee_bps
+                else short_required_taker
             )
             return long_cost + short_cost
 
@@ -3967,6 +4113,11 @@ class EntryDispatchRuntime:
                 and item.get("integrity_key_id") == TRUSTED_FEE_EVIDENCE_KEY_ID
                 for item in fee_provenance
             )
+            fee_evidence_authoritative = bool(fee_provenance) and all(
+                isinstance(item, dict)
+                and item.get("account_fee_evidence_authoritative") is True
+                for item in fee_provenance
+            )
             strategy = self.ctx.config.strategy
             canary_assurance_tier = canary_fee_assurance_tier(candidate, strategy)
             canary_min_expected, canary_min_worst = canary_edge_floors(
@@ -4051,6 +4202,7 @@ class EntryDispatchRuntime:
                     is True,
                     "account_fee_evidence_integrity_verified": fee_evidence_integrity_verified,
                     "account_fee_evidence_identity_bound": fee_evidence_identity_bound,
+                    "account_fee_evidence_authoritative": fee_evidence_authoritative,
                     "funding_canary_fee_assurance_tier": canary_assurance_tier,
                     "funding_canary_policy_version": _FUNDING_CANARY_POLICY_VERSION,
                     "funding_canary_cohort_id": _funding_canary_cohort_id(

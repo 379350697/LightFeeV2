@@ -1,9 +1,9 @@
 [Unit]
-Description=Refresh LightFee V2 account fee evidence every 6 hours
+Description=Refresh LightFee V2 account fee evidence every 24 hours
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=6h
+OnUnitActiveSec=24h
 AccuracySec=2min
 RandomizedDelaySec=2min
 Persistent=true

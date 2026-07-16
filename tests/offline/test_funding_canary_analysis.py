@@ -513,6 +513,25 @@ def test_canary_requires_account_identity_binding_in_selected_evidence() -> None
     assert "acceptance_canary_contract_invalid" in report.promotion_blockers
 
 
+def test_local_account_fee_authority_replaces_same_host_hmac_identity_ceremony() -> None:
+    records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
+    for event in records:
+        if event["kind"] != "execution.entry_selected":
+            continue
+        event["payload"].update(
+            {
+                "account_fee_evidence_authoritative": True,
+                "account_fee_evidence_integrity_verified": False,
+                "account_fee_evidence_identity_bound": False,
+            }
+        )
+
+    report = analyze_funding_canary_events(records, source_evidence_verified=True)
+
+    assert report.invalid_canary_contract_count == 0
+    assert report.promotion_ready is True
+
+
 def test_v2_conservative_fee_tier_can_collect_samples_but_cannot_promote() -> None:
     records = [event for index in range(30) for event in _complete_loop(f"entry-{index}")]
     for event in records:

@@ -80,8 +80,21 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append("runtime.funding_basis_risk_checkpoint_path must be non-empty")
     if not str(config.runtime.fee_evidence_path or "").strip():
         issues.append("runtime.fee_evidence_path must be non-empty")
+    if not str(config.runtime.funding_fee_evidence_path or "").strip():
+        issues.append("runtime.funding_fee_evidence_path must be non-empty")
+    elif _canonical_path(config.runtime.funding_fee_evidence_path) == _canonical_path(
+        config.runtime.fee_evidence_path
+    ):
+        issues.append(
+            "runtime.funding_fee_evidence_path must differ from "
+            "runtime.fee_evidence_path"
+        )
     if not _is_positive_int(config.runtime.fee_evidence_max_age_ms):
         issues.append("runtime.fee_evidence_max_age_ms must be a positive integer")
+    if not _is_positive_int(config.runtime.funding_fee_evidence_max_age_ms):
+        issues.append(
+            "runtime.funding_fee_evidence_max_age_ms must be a positive integer"
+        )
     if config.runtime.local_l2_depth_bridge_enabled:
         if not str(config.runtime.local_l2_depth_bridge_path or "").strip():
             issues.append("runtime.local_l2_depth_bridge_path must be set when enabled")
@@ -381,33 +394,14 @@ def validate_config(config: AppConfig) -> list[str]:
         and config.strategy.funding_canary_enabled is True
     ):
         if (
-            _is_positive_int(config.runtime.fee_evidence_max_age_ms)
-            and int(config.runtime.fee_evidence_max_age_ms)
+            _is_positive_int(config.runtime.funding_fee_evidence_max_age_ms)
+            and int(config.runtime.funding_fee_evidence_max_age_ms)
             > LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS
         ):
             issues.append(
-                "runtime.fee_evidence_max_age_ms must be <= 86400000 for a live funding canary"
+                "runtime.funding_fee_evidence_max_age_ms must be <= 432000000 "
+                "for a live funding canary"
             )
-        configured_key_env = str(
-            config.runtime.fee_evidence_integrity_key_env or ""
-        ).strip()
-        if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
-            issues.append(
-                "runtime.fee_evidence_integrity_key_env must be blank or the fixed "
-                "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY for a live funding canary"
-            )
-        identities = config.runtime.fee_evidence_account_identity_hashes
-        if not isinstance(identities, dict):
-            issues.append(
-                "runtime.fee_evidence_account_identity_hashes must be a mapping"
-            )
-        else:
-            for venue, identity_hash in sorted(identities.items()):
-                if not _is_sha256_hex(identity_hash):
-                    issues.append(
-                        "runtime.fee_evidence_account_identity_hashes contains an "
-                        f"invalid SHA256 identity hash for canary venue {venue}"
-                    )
     if (
         config.strategy.spread_paper_enabled is True
         and str(config.strategy.spread_paper_model_epoch or "").startswith("v3_")
@@ -762,6 +756,11 @@ def _is_finite_nonnegative(value: object) -> bool:
     except (TypeError, ValueError):
         return False
     return math.isfinite(numeric) and numeric >= 0.0
+
+
+def _canonical_path(value: object) -> Path:
+    """Normalize aliases so two strategy inputs cannot resolve to one file."""
+    return Path(str(value or "").strip()).expanduser().resolve(strict=False)
 
 
 def _is_finite_ratio(value: object) -> bool:

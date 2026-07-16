@@ -10,7 +10,10 @@ import pytest
 
 from lightfee.config.schema import StrategyConfig, VenueConfig
 from lightfee.core.domain import EntryLeverageEvidence, Venue
-from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.entry_dispatch_runtime import (
+    EntryDispatchRuntime,
+    _funding_canary_cohort_id,
+)
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
@@ -30,6 +33,7 @@ from lightfee.strategy.economics import (
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.strategy.fee_evidence import (
+    LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
     load_fee_evidence,
     sign_fee_evidence_payload,
 )
@@ -1514,6 +1518,73 @@ def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
     assert mismatching.account_fee_evidence_complete is False
     assert "account_fee_account_identity_mismatch" in mismatching.blocked_reasons
 
+    local_path = tmp_path / "pairing-account-fees-v4.json"
+    local_payload = {
+        "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
+        "venues": {
+            venue: {
+                "taker_fee_bps": 1.0,
+                "maker_fee_bps": 0.5,
+                "observed_at_ms": 1_000,
+                "source": "account_fee_api",
+                "evidence_ref": f"local:{venue}",
+                "covered_symbols": ["BTCUSDT"],
+                "symbol_schedules": {
+                    "BTCUSDT": {
+                        "taker_fee_bps": 1.0,
+                        "maker_fee_bps": 0.5,
+                        "observed_at_ms": 1_000,
+                        "evidence_ref": f"local:{venue}:BTCUSDT",
+                    }
+                },
+            }
+            for venue in ("cheap", "rich")
+        },
+    }
+    local_path.write_text(json.dumps(local_payload), encoding="utf-8")
+    local_path.chmod(0o600)
+    local_evidence = load_fee_evidence(
+        local_path, now_ms=1_100, max_age_ms=10_000
+    )
+    local_candidate = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        expected_fee_identity_hashes={},
+        **(common | {"fee_evidence": local_evidence}),
+    )[0]
+
+    assert local_candidate.account_fee_evidence_complete is True
+    assert all(
+        row["account_fee_evidence_authoritative"] is True
+        for row in local_candidate.account_fee_evidence_provenance
+    )
+
+    uncovered_quotes = {
+        key.replace("BTCUSDT", "SOLUSDT"): replace(quote, symbol="SOLUSDT")
+        for key, quote in quotes.items()
+    }
+    uncovered_candidate = build_same_symbol_pairs(
+        uncovered_quotes,
+        ["SOLUSDT"],
+        strategy=StrategyConfig(
+            funding_canary_enabled=True,
+            funding_canary_require_account_fee_evidence=False,
+            funding_canary_conservative_fee_buffer_bps=2.0,
+        ),
+        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
+        venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},
+        fee_evidence=local_evidence,
+        expected_fee_identity_hashes={},
+        passive_execution_enabled=True,
+        observed_at_ms=1_100,
+    )[0]
+
+    assert uncovered_candidate.account_fee_evidence_complete is False
+    assert uncovered_candidate.long_taker_fee_bps == pytest.approx(3.0)
+    assert uncovered_candidate.short_taker_fee_bps == pytest.approx(3.0)
+    assert uncovered_candidate.entry_fee_bps == pytest.approx(6.0)
+    assert uncovered_candidate.exit_fee_bps == pytest.approx(6.0)
+
 
 def test_risk_allocator_returns_one_common_base_quantity_and_falls_back_on_missing_margin() -> None:
     allocation = StrategyRiskAllocator().allocate(
@@ -2452,6 +2523,14 @@ def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monke
                     "rich": "b" * 64,
                 },
             ),
+            venues=[
+                VenueConfig(
+                    venue="cheap", taker_fee_bps=0.8, maker_fee_bps=0.2
+                ),
+                VenueConfig(
+                    venue="rich", taker_fee_bps=0.7, maker_fee_bps=0.2
+                ),
+            ],
         ),
         state=SimpleNamespace(open_positions=[], pending_entries=[]),
     )
@@ -2590,6 +2669,109 @@ def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monke
         == "funding_canary_fee_cost_understated"
     )
 
+    local_payload = {
+        "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
+        "venues": {
+            "cheap": {
+                "taker_fee_bps": 0.8,
+                "maker_fee_bps": 0.2,
+                "observed_at_ms": 1_000,
+                "source": "account_fee_api",
+                "evidence_ref": "local-fee-snapshot-1",
+                "covered_symbols": ["BTCUSDT"],
+                "symbol_schedules": {
+                    "BTCUSDT": {
+                        "taker_fee_bps": 0.8,
+                        "maker_fee_bps": 0.2,
+                        "observed_at_ms": 1_000,
+                        "evidence_ref": "local-fee-snapshot-1:BTCUSDT",
+                    }
+                },
+            },
+            "rich": {
+                "taker_fee_bps": 0.7,
+                "maker_fee_bps": 0.2,
+                "observed_at_ms": 1_000,
+                "source": "account_fee_api",
+                "evidence_ref": "local-fee-snapshot-1",
+                "covered_symbols": ["BTCUSDT"],
+                "symbol_schedules": {
+                    "BTCUSDT": {
+                        "taker_fee_bps": 0.7,
+                        "maker_fee_bps": 0.2,
+                        "observed_at_ms": 1_000,
+                        "evidence_ref": "local-fee-snapshot-1:BTCUSDT",
+                    }
+                },
+            },
+        },
+    }
+    evidence_path.write_text(json.dumps(local_payload), encoding="utf-8")
+    evidence_path.chmod(0o600)
+    local_evidence = load_fee_evidence(
+        evidence_path, now_ms=1_100, max_age_ms=10_000
+    )
+    local_candidate = replace(
+        candidate,
+        account_fee_evidence_fingerprint=local_evidence.fingerprint_for(
+            "cheap", "rich", symbol="BTCUSDT"
+        ),
+        account_fee_evidence_provenance=local_evidence.provenance_for(
+            "cheap", "rich", symbol="BTCUSDT"
+        ),
+    )
+
+    assert dispatch._funding_canary_admission_reason(local_candidate, 1_100) == ""
+
+    uncovered = replace(local_candidate, symbol="SOLUSDT")
+    assert (
+        dispatch._funding_canary_admission_reason(uncovered, 1_100)
+        == "funding_canary_account_fee_evidence_unverified"
+    )
+
+    dispatch.ctx.config.venues[0].taker_fee_bps = 1.2
+    assert (
+        dispatch._funding_canary_admission_reason(local_candidate, 1_100)
+        == "funding_canary_fee_cost_understated"
+    )
+
+
+def test_funding_canary_cohort_survives_fee_refresh_but_resets_on_rate_change() -> None:
+    strategy = StrategyConfig()
+    base = _candidate(
+        account_fee_evidence_provenance=[
+            {
+                "document_sha256": "epoch-one",
+                "schedule_sha256": "stable-fee-contract",
+            }
+        ]
+    )
+    refreshed = replace(
+        base,
+        account_fee_evidence_provenance=[
+            {
+                "document_sha256": "epoch-two",
+                "schedule_sha256": "stable-fee-contract",
+            }
+        ],
+    )
+    changed = replace(
+        refreshed,
+        account_fee_evidence_provenance=[
+            {
+                "document_sha256": "epoch-three",
+                "schedule_sha256": "changed-fee-contract",
+            }
+        ],
+    )
+
+    assert _funding_canary_cohort_id(base, strategy) == _funding_canary_cohort_id(
+        refreshed, strategy
+    )
+    assert _funding_canary_cohort_id(base, strategy) != _funding_canary_cohort_id(
+        changed, strategy
+    )
+
 
 def test_funding_canary_runtime_accepts_configurable_bounded_scale() -> None:
     dispatch = object.__new__(EntryDispatchRuntime)
@@ -2692,6 +2874,108 @@ def test_funding_canary_runtime_supports_non_statement_venues_with_conservative_
             1_000,
         )
         == ""
+    )
+
+
+def test_funding_canary_conservative_gate_prices_mixed_symbol_authority_per_leg(
+    tmp_path,
+) -> None:
+    evidence_path = tmp_path / "mixed-account-fees.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
+                "venues": {
+                    "cheap": {
+                        "taker_fee_bps": 1.5,
+                        "maker_fee_bps": 0.4,
+                        "observed_at_ms": 1_000,
+                        "source": "account_fee_api",
+                        "evidence_ref": "cheap-mixed",
+                        "covered_symbols": ["BTCUSDT"],
+                        "symbol_schedules": {
+                            "BTCUSDT": {
+                                "taker_fee_bps": 1.5,
+                                "maker_fee_bps": 0.4,
+                                "observed_at_ms": 1_000,
+                                "evidence_ref": "cheap:BTCUSDT",
+                            }
+                        },
+                    },
+                    "rich": {
+                        "taker_fee_bps": 1.2,
+                        "maker_fee_bps": 0.3,
+                        "observed_at_ms": 1_000,
+                        "source": "account_fee_api",
+                        "evidence_ref": "rich-mixed",
+                        "covered_symbols": ["SOLUSDT"],
+                        "symbol_schedules": {
+                            "SOLUSDT": {
+                                "taker_fee_bps": 1.2,
+                                "maker_fee_bps": 0.3,
+                                "observed_at_ms": 1_000,
+                                "evidence_ref": "rich:SOLUSDT",
+                            }
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_path.chmod(0o600)
+    dispatch = object.__new__(EntryDispatchRuntime)
+    dispatch.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=StrategyConfig(
+                funding_canary_enabled=True,
+                funding_canary_allowed_venues=["cheap", "rich"],
+                funding_canary_require_account_fee_evidence=False,
+                funding_canary_conservative_fee_buffer_bps=2.0,
+                funding_canary_min_expected_net_edge_bps=0.0,
+                funding_canary_min_worst_case_edge_bps=0.0,
+            ),
+            runtime=SimpleNamespace(
+                mode="paper",
+                funding_fee_evidence_path=str(evidence_path),
+                funding_fee_evidence_max_age_ms=10_000,
+                fee_evidence_account_identity_hashes={},
+            ),
+            venues=[
+                VenueConfig(
+                    venue="cheap", taker_fee_bps=1.0, maker_fee_bps=0.2
+                ),
+                VenueConfig(
+                    venue="rich", taker_fee_bps=1.0, maker_fee_bps=0.2
+                ),
+            ],
+        ),
+        state=SimpleNamespace(open_positions=[], pending_entries=[]),
+    )
+    candidate = _candidate(
+        entry_notional_quote=15.0,
+        taker_fee_evidence_complete=True,
+        account_fee_evidence_complete=False,
+        long_taker_fee_bps=1.5,
+        short_taker_fee_bps=3.0,
+        entry_maker_leg="long",
+        exit_maker_leg="short",
+        entry_fee_bps=3.4,
+        exit_fee_bps=4.5,
+    )
+
+    assert dispatch._funding_canary_admission_reason(candidate, 1_100) == ""
+    assert (
+        dispatch._funding_canary_admission_reason(
+            replace(candidate, entry_fee_bps=3.3), 1_100
+        )
+        == "funding_canary_fee_cost_understated"
+    )
+    assert (
+        dispatch._funding_canary_admission_reason(
+            replace(candidate, exit_fee_bps=4.4), 1_100
+        )
+        == "funding_canary_fee_cost_understated"
     )
 
 
