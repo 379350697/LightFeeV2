@@ -21,6 +21,12 @@ class BlockReason(Enum):
     TRANSFER_UNAVAILABLE = "transfer_unavailable"
     MISSING_CANDIDATE_IDENTITY = "missing_candidate_identity_or_funding_timestamp"
     FUNDING_NEW_ENTRIES_DISABLED = "funding_new_entries_disabled"
+    FUNDING_CANARY_VENUE_NOT_ALLOWED = (
+        "funding_canary_venue_not_statement_reconcilable"
+    )
+    FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED = (
+        "funding_canary_notional_cap_exceeded"
+    )
     INCOMPLETE_ECONOMICS = "incomplete_economics"
 
 
@@ -37,6 +43,30 @@ def discover_tradeable_candidates(
     Gates applied in V1 order with stable V1 block-reason labels.
     """
     passed: list[tuple[CandidateInput, list[BlockReason]]] = []
+    canary_allowed_venues = {
+        str(venue or "").strip().lower()
+        for venue in config.funding_canary_allowed_venues
+        if str(venue or "").strip()
+    }
+    canary_venue_filter_enabled = (
+        config.funding_new_entries_enabled is True
+        and config.funding_canary_enabled is True
+    )
+    min_expected_edge_bps = config.min_expected_edge_bps
+    min_worst_case_edge_bps = config.min_worst_case_edge_bps
+    if canary_venue_filter_enabled:
+        # CandidateInput.expected_edge_bps is the legacy dual-write of the v3
+        # expected_net_edge_bps field.  Raise the discovery floors to the
+        # configured canary contract so an ultimately ineligible candidate
+        # cannot monopolise the bounded V1 primary/shadow tracking scope.
+        min_expected_edge_bps = max(
+            min_expected_edge_bps,
+            config.funding_canary_min_expected_net_edge_bps,
+        )
+        min_worst_case_edge_bps = max(
+            min_worst_case_edge_bps,
+            config.funding_canary_min_worst_case_edge_bps,
+        )
 
     for c in candidates:
         if c.blocked:
@@ -50,6 +80,23 @@ def discover_tradeable_candidates(
         # hedge, residual repair, recovery or any close lifecycle.
         if config.funding_new_entries_enabled is not True:
             reasons.append(BlockReason.FUNDING_NEW_ENTRIES_DISABLED)
+        # The final dispatch boundary repeats this safety check.  Applying the
+        # static venue subset here is also required for correctness: V1 tracks
+        # only a bounded primary/shadow shortlist, so a higher-ranked venue
+        # that the canary can never trade must not consume those tracking
+        # slots and starve an allowed pair before final admission.
+        if canary_venue_filter_enabled and (
+            str(c.long_venue or "").strip().lower() not in canary_allowed_venues
+            or str(c.short_venue or "").strip().lower()
+            not in canary_allowed_venues
+        ):
+            reasons.append(BlockReason.FUNDING_CANARY_VENUE_NOT_ALLOWED)
+        if (
+            canary_venue_filter_enabled
+            and c.entry_notional_quote
+            > config.funding_canary_max_entry_notional_quote
+        ):
+            reasons.append(BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED)
         if require_complete_economics and (
             c.economics_complete is not True
             or c.economics_observed_at_ms <= 0
@@ -77,9 +124,9 @@ def discover_tradeable_candidates(
         # Edge gates
         if c.funding_edge_bps < config.min_funding_edge_bps:
             reasons.append(BlockReason.FUNDING_EDGE_BELOW_FLOOR)
-        if c.expected_edge_bps < config.min_expected_edge_bps:
+        if c.expected_edge_bps < min_expected_edge_bps:
             reasons.append(BlockReason.EXPECTED_EDGE_BELOW_FLOOR)
-        if c.worst_case_edge_bps < config.min_worst_case_edge_bps:
+        if c.worst_case_edge_bps < min_worst_case_edge_bps:
             reasons.append(BlockReason.WORST_CASE_EDGE_BELOW_FLOOR)
 
         # Zero order size
