@@ -231,7 +231,7 @@ def test_bbo_process_uses_slow_lane_last_good_ttl_for_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bbo_process_routes_hyperliquid_to_l2_websocket_not_rest(tmp_path):
+async def test_bbo_process_routes_hyperliquid_to_bbo_websocket_not_rest(tmp_path):
     config = AppConfig(
         symbols=["BTCUSDT"],
         venues=[
@@ -252,7 +252,7 @@ async def test_bbo_process_routes_hyperliquid_to_l2_websocket_not_rest(tmp_path)
         client = source._new_client("BTCUSDT")
         assert client.build_subscribe_message() == {
             "method": "subscribe",
-            "subscription": {"type": "l2Book", "coin": "BTC"},
+            "subscription": {"type": "bbo", "coin": "BTC"},
         }
     finally:
         await service.close()
@@ -272,7 +272,7 @@ async def test_hyperliquid_ws_source_preserves_receipt_clock_contract() -> None:
             ask_size=3.0,
             observed_at_ms=now_ms - 500,
             received_at_ms=now_ms - 5,
-            source="hyperliquid_l2_book_top",
+            source="hyperliquid_bbo",
         )
     )
 
@@ -282,7 +282,7 @@ async def test_hyperliquid_ws_source_preserves_receipt_clock_contract() -> None:
     assert quote.observed_at_ms == now_ms - 5
     assert quote.received_at_ms == now_ms - 5
     assert quote.exchange_event_at_ms == now_ms - 500
-    assert quote.source == "hyperliquid_l2_book_top"
+    assert quote.source == "hyperliquid_bbo"
 
 
 @pytest.mark.asyncio
@@ -297,7 +297,7 @@ async def test_hyperliquid_ws_source_starts_the_complete_bounded_universe(
         started.append(client.symbol)
 
     monkeypatch.setattr(
-        spread_bbo_service._HyperliquidL2BookBboWsClient,
+        spread_bbo_service.HyperliquidBboWsClient,
         "start",
         start,
     )
@@ -321,7 +321,7 @@ async def test_hyperliquid_ws_source_rejects_stale_cached_quote() -> None:
             ask=101.0,
             observed_at_ms=now_ms - 5,
             received_at_ms=now_ms - 500,
-            source="hyperliquid_l2_book_top",
+            source="hyperliquid_bbo",
         )
     )
 

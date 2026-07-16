@@ -30,33 +30,23 @@ from lightfee.venues.transport import EndpointRateLimiter
 logger = logging.getLogger("lightfee.sidecar.spread_bbo_service")
 
 
-class _HyperliquidL2BookBboWsClient(HyperliquidBboWsClient):
-    """Use the periodic L2 snapshot stream, not the 20-weight REST payload."""
-
-    def build_subscribe_message(self) -> dict:
-        return {
-            "method": "subscribe",
-            "subscription": {"type": "l2Book", "coin": self.wire_symbol},
-        }
-
-
 class HyperliquidSpreadBboSource:
-    """Fresh Hyperliquid BBOs backed only by official L2 WebSocket streams."""
+    """Fresh Hyperliquid BBOs backed only by the official BBO WebSocket."""
 
     venue = "hyperliquid"
 
     def __init__(self, *, max_age_ms: int) -> None:
         self.max_age_ms = max(int(max_age_ms or 0), 1)
         self._cache = VenueBboCache()
-        self._clients: dict[str, _HyperliquidL2BookBboWsClient] = {}
+        self._clients: dict[str, HyperliquidBboWsClient] = {}
         self._spec = get_spec(Venue.HYPERLIQUID)
 
-    def _new_client(self, symbol: str) -> _HyperliquidL2BookBboWsClient:
+    def _new_client(self, symbol: str) -> HyperliquidBboWsClient:
         canonical = str(symbol or "").strip().upper()
         venue_symbol = canonical
         if self._spec.symbol_to_venue is not None:
             venue_symbol = self._spec.symbol_to_venue(canonical)
-        return _HyperliquidL2BookBboWsClient(
+        return HyperliquidBboWsClient(
             venue=self.venue,
             symbol=canonical,
             venue_symbol=str(venue_symbol or canonical),
