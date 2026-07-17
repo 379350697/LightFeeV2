@@ -1,8 +1,6 @@
 """Exchange-native funding and market data source backed by MarketDataClient."""
 
 from __future__ import annotations
-
-import time
 from typing import Optional
 
 from lightfee.core.domain import Venue
@@ -75,11 +73,21 @@ class ExchangeSource:
             symbol=ft.symbol,
             bid=ft.bid,
             ask=ft.ask,
-            observed_at_ms=int(time.time() * 1000),
+            observed_at_ms=int(ft.market_received_at_ms or 0),
+            market_event_at_ms=int(ft.market_event_at_ms or 0),
             source="sidecar_quote",
             bid_size=ft.bid_size,
             ask_size=ft.ask_size,
             funding_rate_bps=ft.funding_rate_bps,
+            funding_rate_observed_at_ms=int(
+                ft.funding_rate_observed_at_ms or 0
+            ),
+            funding_rate_event_at_ms=int(ft.funding_rate_event_at_ms or 0),
+            funding_rate_received_at_ms=int(
+                ft.funding_rate_received_at_ms or 0
+            ),
+            funding_rate_source=ft.funding_rate_source,
+            funding_rate_sample_id=ft.funding_rate_sample_id,
             funding_timestamp_ms=ft.funding_timestamp_ms,
             funding_interval_ms=ft.funding_interval_ms,
             predicted_funding_rate_bps=ft.predicted_funding_rate_bps,
@@ -93,6 +101,7 @@ class ExchangeSource:
             open_interest_evidence_status=ft.open_interest_evidence_status,
             open_interest_evidence_reason=ft.open_interest_evidence_reason,
             open_interest_observed_at_ms=int(ft.open_interest_observed_at_ms or 0),
+            open_interest_event_at_ms=int(ft.open_interest_event_at_ms or 0),
             open_interest_received_at_ms=int(ft.open_interest_received_at_ms or 0),
             open_interest_source=ft.open_interest_source,
             open_interest_sample_id=ft.open_interest_sample_id,
@@ -135,10 +144,53 @@ class ExchangeSource:
 
     async def fetch_market_quotes(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
         """Fetch bid/ask/mark for symbols as QuoteSnapshot."""
-        tickers = await self._client.fetch_funding_tickers(symbols)
+        tickers = await self._client.fetch_funding_tickers(
+            symbols,
+            include_open_interest=False,
+        )
         result: dict[str, QuoteSnapshot] = {}
         for key, ft in tickers.items():
             result[key] = self._from_funding_ticker(ft)
+        # Funding, contract, and fee metadata are slow variables. Reacquire a
+        # lightweight BBO after that work so candidate prices keep the actual
+        # response-arrival clock instead of inheriting an aged first request.
+        try:
+            top_books = await self._client.fetch_top_book_quotes(symbols)
+        except Exception:
+            top_books = {}
+        for key, quote in result.items():
+            top = top_books.get(key)
+            if top is None:
+                # The funding ticker remains useful for slow funding/contract
+                # metadata, but its embedded price was observed before that
+                # work completed.  It must never masquerade as a fresh Top-K
+                # ranking seed when the final BBO request failed or omitted the
+                # symbol.
+                quote.bid = 0.0
+                quote.ask = 0.0
+                quote.bid_size = 0.0
+                quote.ask_size = 0.0
+                quote.observed_at_ms = 0
+                quote.market_event_at_ms = 0
+                quote.source = "sidecar_bbo_unavailable"
+                continue
+            received_at_ms = int(top.received_at_ms or top.observed_at_ms or 0)
+            if received_at_ms <= 0:
+                quote.bid = 0.0
+                quote.ask = 0.0
+                quote.bid_size = 0.0
+                quote.ask_size = 0.0
+                quote.observed_at_ms = 0
+                quote.market_event_at_ms = 0
+                quote.source = "sidecar_bbo_unavailable"
+                continue
+            quote.bid = float(top.bid)
+            quote.ask = float(top.ask)
+            quote.bid_size = float(top.bid_size or 0.0)
+            quote.ask_size = float(top.ask_size or 0.0)
+            quote.observed_at_ms = received_at_ms
+            quote.market_event_at_ms = int(top.exchange_event_at_ms or 0)
+            quote.source = str(top.source or "sidecar_rest_bbo")
         return result
 
     async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:

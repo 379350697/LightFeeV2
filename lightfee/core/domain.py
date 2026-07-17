@@ -314,6 +314,20 @@ class PerpLiquiditySnapshot:
     bid_depth: list[tuple[float, float]] = field(default_factory=list)
     ask_depth: list[tuple[float, float]] = field(default_factory=list)
     observed_at_ms: int = 0
+    volume_24h_quote: float | None = None
+    open_interest_quote: float | None = None
+    open_interest_evidence_status: str = "unavailable"
+    open_interest_evidence_reason: str = ""
+    open_interest_observed_at_ms: int = 0
+    open_interest_event_at_ms: int = 0
+    open_interest_received_at_ms: int = 0
+    open_interest_source: str = ""
+    open_interest_sample_id: str = ""
+    open_interest_venue_symbol: str = ""
+    raw_open_interest: float | None = None
+    raw_open_interest_unit: str = ""
+    open_interest_contract_multiplier: float | None = None
+    open_interest_conversion_mark_price: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
-from dataclasses import fields as dataclass_fields
+from dataclasses import fields as dataclass_fields, replace
+from hashlib import sha256
 from math import isclose, isfinite
 import os
 import tempfile
+import time
 from pathlib import Path
 
 from lightfee.sidecar.snapshot import (
@@ -58,9 +60,7 @@ def _v3_economics_contract_reason(
     candidate: dict,
     *,
     quotes_raw: object,
-    quote_evidence_index: dict[
-        tuple[str, str], tuple[dict | None, str]
-    ] | None = None,
+    quote_evidence_index: dict[tuple[str, str], tuple[dict | None, str]] | None = None,
 ) -> str:
     """Return a fail-closed reason for a claimed-complete V3 candidate.
 
@@ -235,9 +235,7 @@ def _v3_candidate_contract_reason(
     candidate: dict,
     quotes_raw: object,
     *,
-    quote_evidence_index: dict[
-        tuple[str, str], tuple[dict | None, str]
-    ] | None = None,
+    quote_evidence_index: dict[tuple[str, str], tuple[dict | None, str]] | None = None,
 ) -> str:
     """Verify that a V3 candidate is backed by compatible quote contracts.
 
@@ -364,9 +362,7 @@ def _v3_normalised_contract_fields(raw: dict) -> tuple[str, str, float] | None:
     ):
         return None
     raw_multiplier = raw.get("contract_multiplier")
-    if isinstance(raw_multiplier, bool) or not isinstance(
-        raw_multiplier, (int, float)
-    ):
+    if isinstance(raw_multiplier, bool) or not isinstance(raw_multiplier, (int, float)):
         return None
     multiplier = float(raw_multiplier)
     price_precision = _v3_nonnegative_int(raw.get("price_precision"))
@@ -423,6 +419,114 @@ def _v3_nonnegative_int(value: object) -> int | None:
     return value
 
 
+FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION = 6
+FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES = 32
+FUNDING_ENTRY_SNAPSHOT_MAX_BYTES = 1_000_000
+
+
+def _funding_entry_snapshot_base_path(path: str | Path) -> Path:
+    target = Path(path)
+    return target.with_name(f"{target.name}.funding-entry-v6.json")
+
+
+def funding_entry_snapshot_manifest_path(path: str | Path) -> Path:
+    target = _funding_entry_snapshot_base_path(path)
+    return target.with_name(f"{target.name}.manifest.json")
+
+
+def _read_funding_entry_manifest(
+    path: str | Path,
+) -> tuple[dict[str, object], os.stat_result] | None:
+    manifest_path = funding_entry_snapshot_manifest_path(path)
+    try:
+        with open(manifest_path, "rb") as manifest_file:
+            raw = manifest_file.read()
+            stat = os.fstat(manifest_file.fileno())
+        manifest = json.loads(raw)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    return manifest, stat
+
+
+def _funding_entry_payload_path_from_manifest(
+    path: str | Path,
+    manifest: dict[str, object],
+) -> Path | None:
+    base = _funding_entry_snapshot_base_path(path)
+    generation_id = str(manifest.get("generation_id", "") or "")
+    payload_name = str(manifest.get("payload_path", "") or "")
+    if not generation_id or len(generation_id) != 64:
+        return None
+    if any(ch not in "0123456789abcdef" for ch in generation_id):
+        return None
+    expected_name = f"{base.name}.{generation_id}.json"
+    if payload_name != expected_name or Path(payload_name).name != payload_name:
+        return None
+    return base.with_name(payload_name)
+
+
+def funding_entry_snapshot_path(path: str | Path) -> Path:
+    """Resolve the immutable payload selected by the installed manifest.
+
+    Before the first manifest exists, return the historical base name.  That
+    fallback is intentionally non-authoritative and is only useful for
+    install-state diagnostics and backwards-compatible path probes.
+    """
+    installed = _read_funding_entry_manifest(path)
+    if installed is not None:
+        payload_path = _funding_entry_payload_path_from_manifest(path, installed[0])
+        if payload_path is not None:
+            return payload_path
+    return _funding_entry_snapshot_base_path(path)
+
+
+def _json_text(data: object, *, indent: int | None) -> str:
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        indent=indent,
+        separators=(",", ":") if indent is None else None,
+    )
+
+
+def _atomic_write_json(
+    data: object,
+    target: Path,
+    *,
+    indent: int | None,
+    max_bytes: int | None = None,
+) -> int:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".snapshot-")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        content = _json_text(data, indent=indent)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        size = len(content.encode("utf-8"))
+        if max_bytes is not None and size > max(int(max_bytes), 0):
+            raise ValueError(f"snapshot payload exceeds hard limit: {size}>{int(max_bytes)}")
+        tmp.replace(target)
+        # Make the rename durable as well as atomic. The payload/manifest
+        # protocol can recover from a crash between files, but it must not
+        # claim durability while the directory entry is still only cached.
+        directory_fd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return size
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
 def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
     """Validate and atomically replace the last readable snapshot."""
     data = _snapshot_to_dict(snapshot)
@@ -430,25 +534,389 @@ def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
         contract_errors = validate_v5_snapshot_contract(data)
         if contract_errors:
             raise ValueError(
-                "refusing to publish invalid V5 snapshot: "
-                + "; ".join(contract_errors)
+                "refusing to publish invalid V5 snapshot: " + "; ".join(contract_errors)
             )
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=".snapshot-")
-    os.close(fd)
-    tmp = Path(tmp_name)
+    _atomic_write_json(data, Path(path), indent=2)
+
+
+def _funding_entry_candidates(snapshot: SidecarSnapshot, limit: int) -> list:
+    """Keep only executable rows in the bounded live-entry payload."""
+    viable = [c for c in snapshot.candidates if not c.blocked and c.economics_complete]
+    return viable[: max(int(limit), 1)]
+
+
+def publish_funding_entry_snapshot(
+    snapshot: SidecarSnapshot,
+    path: str | Path,
+    *,
+    max_candidates: int = FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
+) -> dict[str, object]:
+    """Publish the bounded live-entry data plane before the full audit snapshot.
+
+    The payload deliberately remains a strict V5 contract so all existing
+    parsing and evidence validation stays authoritative.  The V6 manifest is
+    the generation/install contract: consumers only adopt a payload whose
+    size, mtime and digest match a manifest written after atomic installation.
+    """
+    candidates = _funding_entry_candidates(snapshot, max_candidates)
+    original_diagnostics = dict(snapshot.candidate_build_diagnostics)
+    targets = {(c.long_venue.lower(), c.symbol.lower()) for c in candidates} | {
+        (c.short_venue.lower(), c.symbol.lower()) for c in candidates
+    }
+    # With no executable candidate, the live data plane is deliberately
+    # empty/unavailable.  Rejection counts and source cardinalities remain in
+    # the bounded diagnostics, while quote/lifecycle evidence stays in the
+    # background audit artifact and cannot masquerade as an entry payload.
+    quotes = {
+        key: quote
+        for key, quote in snapshot.quotes.items()
+        if (quote.venue.lower(), quote.symbol.lower()) in targets
+    }
+    degraded_symbols = {
+        venue: [symbol for symbol in symbols if (venue.lower(), symbol.lower()) in targets]
+        for venue, symbols in snapshot.degraded_symbols.items()
+    }
+    degraded_symbols = {k: v for k, v in degraded_symbols.items() if v}
+    quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
+    for quote in quotes.values():
+        quotes_by_venue.setdefault(quote.venue, []).append(quote)
+
+    def _lifecycle(rows: list, domain: str) -> list:
+        compact = []
+        for row in rows:
+            venue_quotes = quotes_by_venue.get(row.venue, [])
+            if not venue_quotes and targets:
+                continue
+            if domain == "funding":
+                usable = sum(
+                    q.funding_timestamp_ms > 0 and q.funding_interval_ms > 0 for q in venue_quotes
+                )
+            elif domain == "market":
+                usable = sum(q.bid > 0 and q.ask > 0 and q.bid <= q.ask for q in venue_quotes)
+            else:
+                usable = sum(
+                    bool(
+                        isfinite(float(q.volume_24h_quote or 0.0))
+                        and float(q.volume_24h_quote or 0.0) > 0.0
+                        and q.open_interest_evidence_status == "observed"
+                        and q.open_interest is not None
+                        and isfinite(float(q.open_interest))
+                        and float(q.open_interest) >= 0.0
+                        and int(q.open_interest_observed_at_ms or 0) > 0
+                        and int(q.open_interest_received_at_ms or 0)
+                        >= int(q.open_interest_observed_at_ms or 0)
+                        and int(q.open_interest_event_at_ms or 0)
+                        <= int(q.open_interest_received_at_ms or 0) + 5_000
+                        and bool(str(q.open_interest_sample_id or "").strip())
+                        and bool(str(q.open_interest_venue_symbol or "").strip())
+                    )
+                    for q in venue_quotes
+                )
+            selected_symbol_degraded = any(
+                (row.venue.lower(), str(symbol).lower()) in targets
+                for symbol in snapshot.degraded_symbols.get(row.venue, [])
+            )
+            selected_reason = (
+                row.degraded_reason
+                if (not targets or selected_symbol_degraded or usable < len(venue_quotes))
+                else ""
+            )
+            if (
+                venue_quotes
+                and usable < len(venue_quotes)
+                and not str(selected_reason or "").strip()
+            ):
+                selected_reason = f"entry_snapshot_{domain}_evidence_unavailable"
+            compact.append(
+                replace(
+                    row,
+                    symbol_count=len(venue_quotes),
+                    coverage_usable=usable,
+                    degraded_reason=(
+                        selected_reason
+                        if venue_quotes or selected_reason
+                        else "entry_snapshot_no_candidate"
+                    ),
+                )
+            )
+        return compact
+
+    requested_symbols = sorted({symbol.upper() for _, symbol in targets}) or list(
+        original_diagnostics.get("requested_symbols", [])
+    )
+    requested_venues = sorted({venue for venue, _ in targets}) or list(
+        original_diagnostics.get("requested_venues", [])
+    )
+    entry_diagnostics = {
+        "input_quote_count": len(quotes),
+        "requested_symbol_count": len(requested_symbols),
+        "requested_symbols": requested_symbols,
+        "requested_venues": requested_venues,
+        "directional_pair_count": len(candidates),
+        "output_candidate_count": len(candidates),
+        "future_input_quote_count": sum(
+            quote.observed_at_ms > snapshot.candidate_build_observed_at_ms
+            for quote in quotes.values()
+        ),
+        "rejection_counts": {
+            str(reason): int(count)
+            for reason, count in sorted(
+                dict(original_diagnostics.get("rejection_counts", {}) or {}).items()
+            )[:64]
+            if int(count or 0) >= 0
+        },
+        "diagnostics_only": not bool(candidates),
+        "source_candidate_count": len(snapshot.candidates),
+        "source_quote_count": len(snapshot.quotes),
+        "seed_frontier_complete": bool(original_diagnostics.get("seed_frontier_complete", True)),
+        "seed_frontier_stop_reason": str(
+            original_diagnostics.get("seed_frontier_stop_reason", "") or ""
+        ),
+        "seed_frontier_count": int(original_diagnostics.get("seed_frontier_count", 0) or 0),
+        "seed_pair_count": int(original_diagnostics.get("seed_pair_count", 0) or 0),
+    }
+    funding_lifecycle = _lifecycle(snapshot.funding_lifecycle, "funding")
+    market_lifecycle = _lifecycle(snapshot.market_lifecycle, "market")
+    liquidity_lifecycle = _lifecycle(snapshot.liquidity_lifecycle, "liquidity")
+    reasoned_domains = {
+        domain
+        for domain, rows in (
+            ("funding", funding_lifecycle),
+            ("market", market_lifecycle),
+            ("liquidity", liquidity_lifecycle),
+        )
+        if any(str(row.degraded_reason or "").strip() for row in rows)
+    }
+    reasoned_venues = {
+        row.venue
+        for rows in (funding_lifecycle, market_lifecycle, liquidity_lifecycle)
+        for row in rows
+        if str(row.degraded_reason or "").strip()
+    }
+    selected_degraded_venues = sorted(
+        {
+            venue
+            for venue in requested_venues
+            if venue in reasoned_venues or bool(degraded_symbols.get(venue))
+        }
+    )
+    selected_degraded_domains = sorted(reasoned_domains)
+    has_selected_degradation = bool(
+        selected_degraded_venues or selected_degraded_domains or degraded_symbols
+    )
+    acquisition_mode = (
+        "unavailable"
+        if not candidates
+        else (
+            snapshot.acquisition_mode
+            if has_selected_degradation
+            and snapshot.acquisition_mode in {"degraded_sidecar", "last_good_sidecar"}
+            else "degraded_sidecar"
+            if has_selected_degradation
+            else "fresh_sidecar"
+        )
+    )
+    entry_snapshot = replace(
+        snapshot,
+        funding_lifecycle=funding_lifecycle,
+        market_lifecycle=market_lifecycle,
+        liquidity_lifecycle=liquidity_lifecycle,
+        transfer_lifecycle=[
+            row
+            for row in snapshot.transfer_lifecycle
+            if row.from_venue in quotes_by_venue and row.to_venue in quotes_by_venue
+        ],
+        degraded_venues=selected_degraded_venues,
+        degraded_domains=selected_degraded_domains,
+        degraded_symbols=degraded_symbols,
+        acquisition_mode=acquisition_mode,
+        candidate_build_diagnostics=entry_diagnostics,
+        quotes=quotes,
+        candidates=candidates,
+    )
+    data = _snapshot_to_dict(entry_snapshot)
+    contract_errors = validate_v5_snapshot_contract(data)
+    if contract_errors:
+        raise ValueError(
+            "refusing to publish invalid funding entry snapshot: " + "; ".join(contract_errors)
+        )
+    previous_generation = _verified_funding_entry_generation(
+        path,
+        verify_digest=False,
+    )
+    payload_content = _json_text(data, indent=None).encode("utf-8")
+    payload_size = len(payload_content)
+    if payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
+        raise ValueError(
+            "snapshot payload exceeds hard limit: "
+            f"{payload_size}>{FUNDING_ENTRY_SNAPSHOT_MAX_BYTES}"
+        )
+    payload_digest = sha256(payload_content).hexdigest()
+    generation_id = sha256(f"{payload_digest}:{time.time_ns()}:{os.getpid()}".encode()).hexdigest()
+    payload_base = _funding_entry_snapshot_base_path(path)
+    payload_path = payload_base.with_name(f"{payload_base.name}.{generation_id}.json")
+    payload_size = _atomic_write_json(
+        data,
+        payload_path,
+        indent=None,
+        max_bytes=FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+    )
+    stat = payload_path.stat()
+    if sha256(payload_path.read_bytes()).hexdigest() != payload_digest:
+        raise OSError("funding entry payload digest changed during installation")
+    manifest_prepared_at_ms = time.time_ns() // 1_000_000
+    manifest = {
+        "schema_version": FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION,
+        "generation_id": generation_id,
+        # A file cannot encode the exact completion time of its own atomic
+        # rename.  Consumers therefore use the installed manifest inode clock
+        # below; this field is diagnostic preparation time only.
+        "manifest_prepared_at_ms": manifest_prepared_at_ms,
+        "ready_clock_source": "manifest_install_ctime",
+        "payload_path": payload_path.name,
+        "payload_size_bytes": payload_size,
+        "payload_mtime_ns": stat.st_mtime_ns,
+        "payload_sha256": payload_digest,
+        "candidate_count": len(candidates),
+        "quote_count": len(quotes),
+    }
+    manifest_path = funding_entry_snapshot_manifest_path(path)
     try:
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        with open(tmp, "w") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.replace(target)
+        _atomic_write_json(manifest, manifest_path, indent=None)
     except Exception:
-        if tmp.exists():
-            tmp.unlink()
+        # A pre-install failure leaves the old manifest authoritative.  Only
+        # remove this generation when the manifest demonstrably does not point
+        # at it; a directory-fsync failure can happen after rename visibility.
+        current = _verified_funding_entry_generation(path, verify_digest=False)
+        if current is None or current[4][0] != generation_id:
+            try:
+                payload_path.unlink()
+            except OSError:
+                pass
         raise
+    installed = _verified_funding_entry_generation(path, verify_digest=True)
+    if installed is None or installed[4][0] != generation_id:
+        raise OSError("funding entry manifest did not install the prepared generation")
+    manifest_stat = installed[3]
+    installed_at_ms = (
+        max(
+            int(manifest_stat.st_ctime_ns),
+            int(manifest_stat.st_mtime_ns),
+        )
+        // 1_000_000
+    )
+    # The manifest is now the sole authoritative pointer.  Removing the
+    # previously selected immutable file cannot make a cold start miss the new
+    # generation, and the loader retries if it raced the pointer swap.
+    if previous_generation is not None:
+        previous_payload = previous_generation[1]
+        if previous_payload != payload_path:
+            try:
+                previous_payload.unlink()
+            except OSError:
+                pass
+    return {**manifest, "ready_at_ms": installed_at_ms}
+
+
+def _verified_funding_entry_generation(
+    path: str | Path,
+    *,
+    verify_digest: bool,
+) -> (
+    tuple[
+        dict[str, object],
+        Path,
+        os.stat_result,
+        os.stat_result,
+        tuple[str, int, int],
+    ]
+    | None
+):
+    installed = _read_funding_entry_manifest(path)
+    if installed is None:
+        return None
+    manifest, manifest_stat = installed
+    schema_version = manifest.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION:
+        return None
+    payload_path = _funding_entry_payload_path_from_manifest(path, manifest)
+    if payload_path is None:
+        return None
+    try:
+        payload_stat = payload_path.stat()
+        if int(manifest.get("payload_size_bytes", -1)) != payload_stat.st_size:
+            return None
+        if int(manifest.get("payload_mtime_ns", -1)) != payload_stat.st_mtime_ns:
+            return None
+        generation_id = str(manifest.get("generation_id", "") or "")
+        if verify_digest:
+            expected_digest = str(manifest.get("payload_sha256", "") or "")
+            if not expected_digest or sha256(payload_path.read_bytes()).hexdigest() != (
+                expected_digest
+            ):
+                return None
+    except (OSError, TypeError, ValueError):
+        return None
+    identity = (generation_id, payload_stat.st_mtime_ns, payload_stat.st_size)
+    return manifest, payload_path, payload_stat, manifest_stat, identity
+
+
+def funding_entry_snapshot_identity(
+    path: str | Path,
+    *,
+    verify_digest: bool = False,
+) -> tuple[str, int, int] | None:
+    """Return a verified generation identity; never expose a half-installed payload."""
+    installed = _verified_funding_entry_generation(
+        path,
+        verify_digest=verify_digest,
+    )
+    return None if installed is None else installed[4]
+
+
+def load_funding_entry_snapshot(path: str | Path) -> SidecarSnapshot | None:
+    # A reader can capture G1 immediately before G2 installs and prunes G1.
+    # Re-reading the manifest once turns that benign race into a G2 cold start
+    # instead of a false missing snapshot.
+    for _attempt in range(2):
+        first = _verified_funding_entry_generation(path, verify_digest=True)
+        if first is None:
+            continue
+        loaded = load_snapshot(first[1])
+        if loaded is None:
+            continue
+        second = _verified_funding_entry_generation(path, verify_digest=True)
+        if second is None:
+            continue
+        first_token = (
+            first[4],
+            first[3].st_ino,
+            first[3].st_ctime_ns,
+            first[3].st_mtime_ns,
+            first[3].st_size,
+        )
+        second_token = (
+            second[4],
+            second[3].st_ino,
+            second[3].st_ctime_ns,
+            second[3].st_mtime_ns,
+            second[3].st_size,
+        )
+        if first_token != second_token:
+            continue
+        # Atomic rename/install is the publication boundary.  The inode
+        # change clock cannot predate that boundary, unlike a timestamp
+        # serialized before fsync/rename.
+        ready_at_ms = (
+            max(
+                int(second[3].st_ctime_ns),
+                int(second[3].st_mtime_ns),
+            )
+            // 1_000_000
+        )
+        if ready_at_ms > 0:
+            return replace(loaded, ready_at_ms=ready_at_ms)
+    return None
 
 
 def load_snapshot(path: str | Path) -> SidecarSnapshot | None:
@@ -559,12 +1027,18 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "bid": q.bid,
                 "ask": q.ask,
                 "observed_at_ms": q.observed_at_ms,
+                "market_event_at_ms": q.market_event_at_ms,
                 "source": q.source,
                 "bid_size": q.bid_size,
                 "ask_size": q.ask_size,
                 "bid_depth": [list(level) for level in q.bid_depth],
                 "ask_depth": [list(level) for level in q.ask_depth],
                 "funding_rate_bps": q.funding_rate_bps,
+                "funding_rate_observed_at_ms": q.funding_rate_observed_at_ms,
+                "funding_rate_event_at_ms": q.funding_rate_event_at_ms,
+                "funding_rate_received_at_ms": q.funding_rate_received_at_ms,
+                "funding_rate_source": q.funding_rate_source,
+                "funding_rate_sample_id": q.funding_rate_sample_id,
                 "funding_timestamp_ms": q.funding_timestamp_ms,
                 "funding_interval_ms": q.funding_interval_ms,
                 "predicted_funding_rate_bps": q.predicted_funding_rate_bps,
@@ -584,6 +1058,7 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "open_interest_evidence_status": q.open_interest_evidence_status,
                 "open_interest_evidence_reason": q.open_interest_evidence_reason,
                 "open_interest_observed_at_ms": q.open_interest_observed_at_ms,
+                "open_interest_event_at_ms": q.open_interest_event_at_ms,
                 "open_interest_received_at_ms": q.open_interest_received_at_ms,
                 "open_interest_source": q.open_interest_source,
                 "open_interest_sample_id": q.open_interest_sample_id,
@@ -652,16 +1127,10 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 # candidate indistinguishable from a provenance-free one
                 # after the required JSON round trip.
                 "account_fee_evidence_complete": c.account_fee_evidence_complete,
-                "account_fee_evidence_observed_at_ms": (
-                    c.account_fee_evidence_observed_at_ms
-                ),
+                "account_fee_evidence_observed_at_ms": (c.account_fee_evidence_observed_at_ms),
                 "account_fee_evidence_source": c.account_fee_evidence_source,
-                "account_fee_evidence_fingerprint": (
-                    c.account_fee_evidence_fingerprint
-                ),
-                "account_fee_evidence_provenance": list(
-                    c.account_fee_evidence_provenance
-                ),
+                "account_fee_evidence_fingerprint": (c.account_fee_evidence_fingerprint),
+                "account_fee_evidence_provenance": list(c.account_fee_evidence_provenance),
                 "opportunity_type": c.opportunity_type,
                 "blocked": c.blocked,
                 "blocked_reasons": c.blocked_reasons,
@@ -673,14 +1142,23 @@ def _snapshot_to_dict(s: SidecarSnapshot) -> dict:
                 "second_funding_timestamp_ms": c.second_funding_timestamp_ms,
                 "entry_notional_quote": c.entry_notional_quote,
                 "entry_max_leg_notional_quote": c.entry_max_leg_notional_quote,
-                "funding_canary_fee_assurance_tier": (
-                    c.funding_canary_fee_assurance_tier
-                ),
+                "funding_canary_fee_assurance_tier": (c.funding_canary_fee_assurance_tier),
                 "funding_canary_hard_max_entry_notional_quote": (
                     c.funding_canary_hard_max_entry_notional_quote
                 ),
                 "funding_canary_size_constrained": c.funding_canary_size_constrained,
+                "funding_canary_requested_quantity": (c.funding_canary_requested_quantity),
+                "funding_canary_requested_max_leg_notional_quote": (
+                    c.funding_canary_requested_max_leg_notional_quote
+                ),
+                "contract_price_consistency_ratio": (c.contract_price_consistency_ratio),
+                "contract_price_consistency_long_price": (c.contract_price_consistency_long_price),
+                "contract_price_consistency_short_price": (
+                    c.contract_price_consistency_short_price
+                ),
                 "candidate_revision_id": c.candidate_revision_id,
+                "opportunity_lease_id": c.opportunity_lease_id,
+                "candidate_built_at_ms": c.candidate_built_at_ms,
                 "first_funding_leg": c.first_funding_leg,
                 "entry_maker_leg": c.entry_maker_leg,
                 "exit_maker_leg": c.exit_maker_leg,
@@ -838,10 +1316,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
             schema_version >= 3
             and "first_funding_timestamp_ms" in c
             and raw_ff_ts not in (None, 0)
-            and (
-                isinstance(raw_ff_ts, bool)
-                or not isinstance(raw_ff_ts, int)
-            )
+            and (isinstance(raw_ff_ts, bool) or not isinstance(raw_ff_ts, int))
         )
         ff_ts = _safe_int(raw_ff_ts, default=0)
         f_ts = _safe_int(c.get("funding_timestamp_ms"), default=0)
@@ -862,12 +1337,7 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
                             short_fts = qts
 
         # Derive first_funding_timestamp_ms from per-leg timestamps (V1: min(long, short))
-        if (
-            not explicit_ff_ts_malformed
-            and ff_ts <= 0
-            and long_fts > 0
-            and short_fts > 0
-        ):
+        if not explicit_ff_ts_malformed and ff_ts <= 0 and long_fts > 0 and short_fts > 0:
             ff_ts = min(long_fts, short_fts)
         elif not explicit_ff_ts_malformed and ff_ts <= 0:
             # Fallback: derive from quotes
@@ -973,7 +1443,9 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
     )
 
 
-def _quote_from_dict(raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSION) -> QuoteSnapshot:
+def _quote_from_dict(
+    raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSION
+) -> QuoteSnapshot:
     """Parse optional executable depth at the snapshot compatibility boundary.
 
     A malformed ladder must never make a historical BBO snapshot unreadable or
@@ -1019,7 +1491,11 @@ def _quote_from_dict(raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSI
             value[field] = _safe_optional_float(value[field])
     for field in (
         "observed_at_ms",
+        "market_event_at_ms",
         "funding_timestamp_ms",
+        "funding_rate_observed_at_ms",
+        "funding_rate_event_at_ms",
+        "funding_rate_received_at_ms",
         "funding_interval_ms",
         "funding_forecast_sample_count",
         "funding_forecast_started_at_ms",
@@ -1032,6 +1508,7 @@ def _quote_from_dict(raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSI
         "oi_timeout_count",
         "oi_refresh_elapsed_ms",
         "open_interest_observed_at_ms",
+        "open_interest_event_at_ms",
         "open_interest_received_at_ms",
         "price_precision",
         "quantity_precision",
@@ -1043,6 +1520,7 @@ def _quote_from_dict(raw: object, *, schema_version: int = SNAPSHOT_SCHEMA_VERSI
         value["open_interest_evidence_status"] = "stale"
         value["open_interest_evidence_reason"] = "legacy_snapshot_missing_oi_proof"
         value["open_interest_observed_at_ms"] = 0
+        value["open_interest_event_at_ms"] = 0
         value["open_interest_received_at_ms"] = 0
         value["open_interest_source"] = ""
         value["open_interest_sample_id"] = ""
@@ -1112,10 +1590,7 @@ def _normalise_candidate_fields(
         normalized = value
         valid = True
         if annotation == "float":
-            valid = (
-                type(value) in (int, float)
-                and isfinite(float(value))
-            )
+            valid = type(value) in (int, float) and isfinite(float(value))
             normalized = float(value) if valid else 0.0
         elif annotation == "int":
             valid = type(value) is int
@@ -1127,22 +1602,16 @@ def _normalise_candidate_fields(
             valid = isinstance(value, str)
             normalized = value if valid else ""
         elif annotation == "Optional[float]":
-            valid = value is None or (
-                type(value) in (int, float) and isfinite(float(value))
-            )
+            valid = value is None or (type(value) in (int, float) and isfinite(float(value)))
             normalized = None if value is None or not valid else float(value)
         elif annotation == "Optional[str]":
             valid = value is None or isinstance(value, str)
             normalized = value if valid else None
         elif annotation == "list[str]":
-            valid = isinstance(value, list) and all(
-                isinstance(item, str) for item in value
-            )
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             normalized = list(value) if valid else []
         elif annotation == "list[dict[str, object]]":
-            valid = isinstance(value, list) and all(
-                isinstance(item, dict) for item in value
-            )
+            valid = isinstance(value, list) and all(isinstance(item, dict) for item in value)
             normalized = list(value) if valid else []
         raw[name] = normalized
         if not valid:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -22,6 +24,24 @@ from lightfee.sidecar.service import (
     _restorable_prior_last_good_quotes,
 )
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
+
+
+def _schedule_audit_build(
+    service: SidecarService,
+    snapshot: SidecarSnapshot,
+    candidate_service,
+) -> None:
+    service._schedule_audit_snapshot_publish(
+        snapshot,
+        candidate_service=candidate_service,
+        quotes={},
+        symbols=[],
+        observed_at_ms=snapshot.published_at_ms,
+        quote_liquidity_by_venue={},
+        skip_venues=set(),
+        listed_symbols_by_venue={},
+        market_quality_failed_symbols={},
+    )
 
 
 def _complete_contract_fields(*, quantity_precision: int = 3) -> dict[str, object]:
@@ -274,6 +294,10 @@ def test_incomplete_contract_cannot_advance_last_good_cache() -> None:
         ask=101.0,
         observed_at_ms=2_000,
         funding_rate_bps=1.0,
+        funding_rate_observed_at_ms=1_000,
+        funding_rate_received_at_ms=1_000,
+        funding_rate_source="test_fixture",
+        funding_rate_sample_id="funding:binance:BTCUSDT:1000:1:30000000",
         funding_timestamp_ms=30_000_000,
         funding_interval_ms=28_800_000,
         underlying="BTC",
@@ -307,6 +331,11 @@ def test_restart_restore_accepts_only_fresh_direct_contract_truth() -> None:
         ask=101.0,
         observed_at_ms=1_000,
         funding_rate_bps=1.0,
+        funding_rate_observed_at_ms=1_000,
+        funding_rate_event_at_ms=1_000,
+        funding_rate_received_at_ms=1_000,
+        funding_rate_source="binance_funding_info",
+        funding_rate_sample_id="funding:binance:BTCUSDT:1000:1:30000000",
         funding_timestamp_ms=30_000_000,
         funding_interval_ms=28_800_000,
         **_complete_contract_fields(quantity_precision=0),
@@ -395,6 +424,10 @@ def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> 
                 ask=101.0,
                 observed_at_ms=1_000,
                 funding_rate_bps=1.0,
+                funding_rate_observed_at_ms=1_000,
+                funding_rate_received_at_ms=1_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id="funding:binance:BTCUSDT:1000:1:30000000",
                 funding_timestamp_ms=30_000_000,
                 funding_interval_ms=28_800_000,
                 **_complete_contract_fields(),
@@ -415,6 +448,174 @@ def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> 
     assert list(service._inject_last_good(
         "binance", ["BTCUSDT"], now_ms=1_500
     )) == ["binance:BTCUSDT"]
+
+
+@pytest.mark.asyncio
+async def test_audit_writer_is_nonblocking_and_coalesces_to_latest_generation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(venues=[])
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service._liquidity_timeout_s = 0.01
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._audit_executor = ThreadPoolExecutor(max_workers=1)
+
+    async def no_liquidity(*_args, **_kwargs):
+        return []
+
+    service._fetch_liquidity_all_venues = no_liquidity
+    service._configured_venue_names = lambda: []
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingBuilder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def build(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                started.set()
+                assert release.wait(timeout=2.0)
+            return []
+
+    builder = BlockingBuilder()
+    published_generations: list[int] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_snapshot",
+        lambda snapshot, _path: published_generations.append(
+            snapshot.published_at_ms
+        ),
+    )
+
+    try:
+        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=1), builder)
+        task = service._audit_publish_task
+        assert task is not None
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+
+        # Scheduling later generations returns while G1 is still blocked, and
+        # only the newest pending generation survives the coalescing slot.
+        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=2), builder)
+        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=3), builder)
+        assert service._audit_pending_build["snapshot"].published_at_ms == 3
+        assert not task.done()
+
+        release.set()
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        release.set()
+        service._audit_executor.shutdown(wait=True, cancel_futures=True)
+
+    assert published_generations == [1, 3]
+    assert builder.calls == 2
+    assert service._audit_publish_task is None
+
+
+@pytest.mark.asyncio
+async def test_audit_failure_does_not_poison_next_generation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(venues=[])
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service._liquidity_timeout_s = 0.01
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._audit_executor = ThreadPoolExecutor(max_workers=1)
+
+    async def no_liquidity(*_args, **_kwargs):
+        return []
+
+    service._fetch_liquidity_all_venues = no_liquidity
+    service._configured_venue_names = lambda: []
+
+    class FailingBuilder:
+        def build(self, *_args, **_kwargs):
+            raise RuntimeError("audit-build-failed")
+
+    class HealthyBuilder:
+        def build(self, *_args, **_kwargs):
+            return []
+
+    published_generations: list[int] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_snapshot",
+        lambda snapshot, _path: published_generations.append(
+            snapshot.published_at_ms
+        ),
+    )
+
+    try:
+        _schedule_audit_build(
+            service,
+            SidecarSnapshot(published_at_ms=1),
+            FailingBuilder(),
+        )
+        failed_task = service._audit_publish_task
+        assert failed_task is not None
+        await asyncio.wait_for(failed_task, timeout=2.0)
+        assert published_generations == []
+
+        _schedule_audit_build(
+            service,
+            SidecarSnapshot(published_at_ms=2),
+            HealthyBuilder(),
+        )
+        healthy_task = service._audit_publish_task
+        assert healthy_task is not None
+        await asyncio.wait_for(healthy_task, timeout=2.0)
+    finally:
+        service._audit_executor.shutdown(wait=True, cancel_futures=True)
+
+    assert published_generations == [2]
+    assert service._audit_publish_task is None
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_blocked_audit_without_hanging() -> None:
+    service = object.__new__(SidecarService)
+    service._entry_venue_fetch_tasks = {}
+    service._entry_venue_late_tasks = set()
+    service.entry_venue_republish_event = asyncio.Event()
+    service._audit_pending_build = {"snapshot": object()}
+    service._exchange_sources = {}
+    service._spread_bbo_sources = {}
+    service._liquidity_sources = {}
+    cancelled = asyncio.Event()
+
+    async def blocked_audit() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[bool, bool]] = []
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            self.calls.append((wait, cancel_futures))
+
+    executor = RecordingExecutor()
+    service._audit_executor = executor
+    service._audit_publish_task = asyncio.create_task(blocked_audit())
+    await asyncio.sleep(0)
+
+    await asyncio.wait_for(service.close(), timeout=0.1)
+
+    assert cancelled.is_set()
+    assert service._audit_publish_task is None
+    assert service._audit_pending_build is None
+    assert executor.calls == [(False, True)]
 
 
 @pytest.mark.asyncio
@@ -443,6 +644,13 @@ async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
                     "binance:BTCUSDT": QuoteSnapshot(
                         venue="binance", symbol="BTCUSDT", bid=100.0, ask=101.0,
                         observed_at_ms=1_500, funding_rate_bps=1.0,
+                        funding_rate_observed_at_ms=1_500,
+                        funding_rate_event_at_ms=1_500,
+                        funding_rate_received_at_ms=1_500,
+                        funding_rate_source="binance_funding_info",
+                        funding_rate_sample_id=(
+                            "funding:binance:BTCUSDT:1500:1:30000000"
+                        ),
                         funding_timestamp_ms=30_000_000,
                         funding_interval_ms=28_800_000,
                         **_complete_contract_fields(),
@@ -457,6 +665,13 @@ async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
                     "okx:BTCUSDT": QuoteSnapshot(
                         venue="okx", symbol="BTCUSDT", bid=100.0, ask=101.0,
                         observed_at_ms=2_500, funding_rate_bps=-1.0,
+                        funding_rate_observed_at_ms=2_500,
+                        funding_rate_event_at_ms=2_500,
+                        funding_rate_received_at_ms=2_500,
+                        funding_rate_source="okx_funding_rate",
+                        funding_rate_sample_id=(
+                            "funding:okx:BTCUSDT:2500:-1:30000000"
+                        ),
                         funding_timestamp_ms=30_000_000,
                         funding_interval_ms=28_800_000,
                         **_complete_contract_fields(quantity_precision=0),

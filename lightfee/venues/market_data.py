@@ -11,6 +11,7 @@ while adding private trading methods (order, position, account risk).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import random
 import time
@@ -28,6 +29,7 @@ from lightfee.marketdata.open_interest import (
     open_interest_sample_id,
     validated_open_interest_evidence,
 )
+from lightfee.sidecar.snapshot import funding_rate_sample_id
 from lightfee.venues.specs import VenueSpec
 
 if TYPE_CHECKING:
@@ -45,11 +47,22 @@ class FundingTicker:
     symbol: str
     bid: float
     ask: float
+    # Local arrival of the BBO payload. Later funding/metadata/OI requests
+    # must never refresh this market-data clock.
+    market_received_at_ms: int = 0
+    market_event_at_ms: int = 0
     bid_size: float = 0.0
     ask_size: float = 0.0
     mark_price: float = 0.0
     index_price: float = 0.0
     funding_rate_bps: float = 0.0
+    # Independent funding-alpha clock.  A later BBO response must never make
+    # an older funding observation look fresh.
+    funding_rate_observed_at_ms: int = 0
+    funding_rate_event_at_ms: int = 0
+    funding_rate_received_at_ms: int = 0
+    funding_rate_source: str = ""
+    funding_rate_sample_id: str = ""
     funding_timestamp_ms: int = 0
     # The public source may expose a next/predicted rate separately from the
     # last settled/current rate.  ``None`` deliberately means unavailable;
@@ -70,6 +83,7 @@ class FundingTicker:
     open_interest_evidence_status: str = "unavailable"
     open_interest_evidence_reason: str = ""
     open_interest_observed_at_ms: int = 0
+    open_interest_event_at_ms: int = 0
     open_interest_received_at_ms: int = 0
     open_interest_source: str = ""
     open_interest_sample_id: str = ""
@@ -86,6 +100,14 @@ class FundingTicker:
     oi_deferred_count: int = 0
     oi_timeout_count: int = 0
     oi_refresh_elapsed_ms: int = 0
+    oi_dns_ms: int | None = None
+    oi_connect_ms: int = 0
+    oi_pool_wait_ms: int = 0
+    oi_rate_limit_wait_ms: int = 0
+    oi_transport_total_ms: int = 0
+    oi_http_ms: int = 0
+    oi_parse_ms: int = 0
+    oi_dns_timing_status: str = "unavailable"
     # Contract-normalisation evidence consumed by the spread strategy.  The
     # quantities emitted by this public client are already base quantities;
     # multiplier therefore describes the normalised economic unit.
@@ -113,9 +135,26 @@ class FundingTicker:
 class PerpLiquidity:
     venue: str
     symbol: str
-    volume_24h_quote: float
-    open_interest_quote: float
+    volume_24h_quote: float | None
+    open_interest_quote: float | None
     observed_at_ms: int
+    open_interest_evidence_status: str = "unavailable"
+    open_interest_evidence_reason: str = ""
+    open_interest_observed_at_ms: int = 0
+    open_interest_event_at_ms: int = 0
+    open_interest_received_at_ms: int = 0
+    open_interest_source: str = ""
+    open_interest_sample_id: str = ""
+    open_interest_venue_symbol: str = ""
+    raw_open_interest: float | None = None
+    raw_open_interest_unit: str = ""
+    open_interest_contract_multiplier: float | None = None
+    open_interest_conversion_mark_price: float | None = None
+
+
+_PUBLIC_REQUEST_PHASE_COLLECTOR: contextvars.ContextVar[
+    list[dict[str, Any]] | None
+] = contextvars.ContextVar("lightfee_public_request_phase_collector", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +185,45 @@ def _has_nonempty_field(item: dict[str, Any], *keys: str) -> bool:
             continue
         return True
     return False
+
+
+def _funding_rate_fields(
+    *,
+    venue: str,
+    symbol: str,
+    rate_bps: float,
+    funding_timestamp_ms: int,
+    observed_at_ms: int,
+    source: str,
+    event_at_ms: int = 0,
+) -> dict[str, Any]:
+    """Build one immutable funding-alpha receipt without inventing time."""
+    observed = int(observed_at_ms or 0)
+    event = int(event_at_ms or 0)
+    if observed <= 0:
+        return {
+            "funding_rate_observed_at_ms": 0,
+            "funding_rate_event_at_ms": 0,
+            "funding_rate_received_at_ms": 0,
+            "funding_rate_source": "",
+            "funding_rate_sample_id": "",
+        }
+    if event < 0 or event > observed + 5_000:
+        event = 0
+    sample_id = funding_rate_sample_id(
+        venue=venue,
+        symbol=symbol,
+        observed_at_ms=observed,
+        rate_bps=rate_bps,
+        funding_timestamp_ms=funding_timestamp_ms,
+    )
+    return {
+        "funding_rate_observed_at_ms": observed,
+        "funding_rate_event_at_ms": event,
+        "funding_rate_received_at_ms": observed,
+        "funding_rate_source": str(source or ""),
+        "funding_rate_sample_id": sample_id,
+    }
 
 
 def _positive_exchange_number(value: Any) -> float:
@@ -397,13 +475,22 @@ def _open_interest_fields(
     reason: str,
 ) -> dict[str, object]:
     normalized_status = normalize_open_interest_status(status)
+    # Adapter callers pass the native exchange timestamp as ``observed_at_ms``
+    # for backward compatibility.  The evidence contract stores that on the
+    # exchange clock and records local arrival separately.
+    event_at_ms = max(int(observed_at_ms or 0), 0)
+    local_observed_at_ms = (
+        int(received_at_ms)
+        if normalized_status == OpenInterestEvidenceStatus.OBSERVED.value
+        else 0
+    )
     sample_id = ""
     if normalized_status == OpenInterestEvidenceStatus.OBSERVED.value:
         sample_id = open_interest_sample_id(
             venue=venue,
             canonical_symbol=canonical_symbol,
             venue_symbol=venue_symbol,
-            observed_at_ms=observed_at_ms,
+            observed_at_ms=event_at_ms or local_observed_at_ms,
             source=source,
             raw_value=raw_value,
             value_quote=value_quote,
@@ -417,7 +504,8 @@ def _open_interest_fields(
             raw_unit=raw_unit,
             contract_multiplier=contract_multiplier,
             conversion_mark_price=conversion_mark_price,
-            observed_at_ms=observed_at_ms or None,
+            observed_at_ms=local_observed_at_ms or None,
+            event_at_ms=event_at_ms or None,
             received_at_ms=received_at_ms,
             source=source,
             status=normalized_status,
@@ -430,6 +518,7 @@ def _open_interest_fields(
         "open_interest_evidence_status": evidence.status,
         "open_interest_evidence_reason": evidence.reason,
         "open_interest_observed_at_ms": int(evidence.observed_at_ms or 0),
+        "open_interest_event_at_ms": int(evidence.event_at_ms or 0),
         "open_interest_received_at_ms": int(evidence.received_at_ms or 0),
         "open_interest_source": evidence.source,
         "open_interest_sample_id": evidence.sample_id,
@@ -447,16 +536,16 @@ def _entry_oi_observed_at_ms(
     received_at_ms: int,
     field_name: str,
 ) -> tuple[int, str | None, str | None]:
-    """Resolve exchange observation time without refreshing stale evidence.
+    """Parse the independent exchange event timestamp.
 
-    A genuinely absent vendor timestamp falls back to the local receipt time.
-    A present-but-invalid or future timestamp fails closed instead of minting a
-    fresh sample identity from the receipt clock.
+    An absent vendor timestamp is valid and returns zero: local receipt time is
+    still the freshness boundary.  Small positive vendor-clock skew is kept as
+    evidence rather than compared as if both clocks were identical.
     """
     if native_timestamp is None or (
         isinstance(native_timestamp, str) and not native_timestamp.strip()
     ):
-        return int(received_at_ms), None, None
+        return 0, None, None
     if isinstance(native_timestamp, bool):
         return 0, "parse_error", f"invalid_{field_name}"
     try:
@@ -470,7 +559,7 @@ def _entry_oi_observed_at_ms(
     ):
         return 0, "parse_error", f"invalid_{field_name}"
     observed_at_ms = int(parsed)
-    if observed_at_ms > int(received_at_ms):
+    if observed_at_ms > int(received_at_ms) + 5_000:
         return 0, "stale", f"future_{field_name}"
     return observed_at_ms, None, None
 
@@ -811,6 +900,12 @@ class MarketDataClient:
         path: str,
         params: Optional[dict[str, Any]] = None,
     ) -> tuple[Any, int]:
+        # Test/replay clients commonly override ``_public_get`` to provide a
+        # deterministic transport. Preserve that boundary while still stamping
+        # the local arrival immediately after the await returns.
+        if type(self)._public_get is not MarketDataClient._public_get:
+            payload = await self._public_get(path, params=params)
+            return payload, _now_ms()
         return await self._public_request_with_received_at(
             "GET", path, params=params
         )
@@ -820,6 +915,9 @@ class MarketDataClient:
         path: str,
         body: Optional[dict[str, Any]] = None,
     ) -> tuple[Any, int]:
+        if type(self)._public_post is not MarketDataClient._public_post:
+            payload = await self._public_post(path, body=body)
+            return payload, _now_ms()
         return await self._public_request_with_received_at(
             "POST", path, body=body
         )
@@ -848,6 +946,8 @@ class MarketDataClient:
         client = await self._get_client()
         base_url = self._spec.public_base_url
         scopes = self._public_rate_limit_scopes(method, path)
+        phase_collector = _PUBLIC_REQUEST_PHASE_COLLECTOR.get()
+        rate_limit_started = time.perf_counter()
 
         if self._rate_limiter is not None:
             await self._rate_limiter.wait_until_ready_for_scopes(scopes)
@@ -857,13 +957,74 @@ class MarketDataClient:
         global_rt = _get_global_rt()
         if self._consume_global_rate_limit_budget and global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
+        rate_limit_elapsed_ms = max(
+            int((time.perf_counter() - rate_limit_started) * 1_000),
+            0,
+        )
 
         url = base_url + path
+        transport_started = time.perf_counter()
+        trace_events: dict[str, float] = {}
+
+        async def _trace(event_name: str, _info: dict[str, Any]) -> None:
+            trace_events[event_name] = time.perf_counter()
+
+        request_kwargs: dict[str, Any] = {}
+        if phase_collector is not None and isinstance(client, httpx.AsyncClient):
+            request_kwargs["extensions"] = {"trace": _trace}
+
+        phase_recorded = False
+        phase_payload: dict[str, Any] = {}
+
+        def _record_phase(*, parse_ms: int = 0) -> dict[str, Any]:
+            nonlocal phase_recorded, phase_payload
+            if phase_recorded:
+                return dict(phase_payload)
+            phase_recorded = True
+            if phase_collector is None:
+                return {}
+            transport_finished = time.perf_counter()
+            connect_started = trace_events.get("connection.connect_tcp.started")
+            connect_finished = trace_events.get("connection.connect_tcp.complete")
+            first_transport_event = min(trace_events.values(), default=transport_started)
+            connect_ms = (
+                max(int((connect_finished - connect_started) * 1_000), 0)
+                if connect_started is not None and connect_finished is not None
+                else 0
+            )
+            transport_total_ms = max(
+                int((transport_finished - transport_started) * 1_000),
+                0,
+            )
+            pool_wait_ms = max(
+                int((first_transport_event - transport_started) * 1_000),
+                0,
+            )
+            # ``http_ms`` is the residual response/request phase.  Keep the
+            # total separately so operators cannot accidentally add a total
+            # to its component timings and double count latency.
+            http_ms = max(transport_total_ms - pool_wait_ms - connect_ms, 0)
+            phase_payload = {
+                    # httpcore exposes DNS+TCP as one connect_tcp phase. Keep
+                    # DNS explicitly unavailable instead of fabricating a
+                    # split, and retain the combined actionable duration.
+                    "dns_ms": None,
+                    "dns_timing_status": "included_in_connect",
+                    "connect_ms": connect_ms,
+                    "pool_wait_ms": pool_wait_ms,
+                    "rate_limit_wait_ms": rate_limit_elapsed_ms,
+                    "transport_total_ms": transport_total_ms,
+                    "http_ms": http_ms,
+                    "parse_ms": max(int(parse_ms), 0),
+                }
+            phase_collector.append(phase_payload)
+            return dict(phase_payload)
+
         try:
             if method.upper() == "GET":
-                resp = await client.get(url, params=params)
+                resp = await client.get(url, params=params, **request_kwargs)
             elif method.upper() == "POST":
-                resp = await client.post(url, json=body)
+                resp = await client.post(url, json=body, **request_kwargs)
             else:
                 raise ValueError(f"unsupported method: {method}")
             received_at_ms = _now_ms()
@@ -881,22 +1042,55 @@ class MarketDataClient:
                             scopes,
                             retry_after_ms=retry_after,
                         )
+                phase = _record_phase()
                 raise PublicTransportError(
                     PublicTransportErrorCategory.TRANSPORT_FAILURE,
                     f"HTTP {resp.status_code}: {resp.text[:200]}",
                     status_code=resp.status_code,
+                    phase_timings=phase,
                 )
 
             if self._rate_limiter is not None:
                 self._rate_limiter.record_success_for_scopes(scopes)
 
             if not resp.text:
+                _record_phase()
                 return {}, received_at_ms
-            return resp.json(), received_at_ms
+            parse_started = time.perf_counter()
+            try:
+                payload = resp.json()
+            except Exception as exc:
+                parse_ms = max(
+                    int((time.perf_counter() - parse_started) * 1_000),
+                    0,
+                )
+                phase = _record_phase(parse_ms=parse_ms)
+                raise PublicTransportError(
+                    PublicTransportErrorCategory.PARSE_FAILURE,
+                    f"invalid JSON: {method} {path}: {type(exc).__name__}",
+                    phase_timings=phase,
+                ) from exc
+            finally:
+                parse_ms = max(
+                    int((time.perf_counter() - parse_started) * 1_000),
+                    0,
+                )
+                _record_phase(parse_ms=parse_ms)
+            return payload, received_at_ms
         except httpx.TimeoutException:
-            raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"timeout: {method} {path}")
+            phase = _record_phase()
+            raise PublicTransportError(
+                PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                f"timeout: {method} {path}",
+                phase_timings=phase,
+            )
         except httpx.NetworkError as e:
-            raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"network: {method} {path}: {e}")
+            phase = _record_phase()
+            raise PublicTransportError(
+                PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                f"network: {method} {path}: {e}",
+                phase_timings=phase,
+            )
 
     async def fetch_top_book_quotes(
         self,
@@ -911,7 +1105,12 @@ class MarketDataClient:
     # Funding ticker fetch — main sidecar entry point
     # ------------------------------------------------------------------
 
-    async def fetch_funding_tickers(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def fetch_funding_tickers(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         """Fetch funding + bid/ask + mark + volume + OI for requested symbols.
 
         Returns {venue_key:symbol -> FundingTicker}.
@@ -919,7 +1118,10 @@ class MarketDataClient:
         venue_id = self._spec.venue_id
 
         if venue_id in (Venue.BINANCE, Venue.ASTER):
-            tickers = await self._fetch_binance_style(symbols)
+            tickers = await self._fetch_binance_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         elif venue_id == Venue.OKX:
             tickers = await self._fetch_okx_style(symbols)
         elif venue_id == Venue.BYBIT:
@@ -1175,22 +1377,48 @@ class MarketDataClient:
         if not scoped_symbols:
             return {}
         deduped = list(dict.fromkeys(scoped_symbols))
-        if self._spec.venue_id in (Venue.BINANCE, Venue.ASTER):
-            return await self._fetch_binance_style_entry_open_interest(
-                deduped,
-                force_refresh=force_refresh,
-            )
-        if self._spec.venue_id == Venue.OKX:
-            return await self._fetch_okx_entry_open_interest(deduped)
-        if self._spec.venue_id == Venue.BYBIT:
-            return await self._fetch_bybit_entry_open_interest(deduped)
-        if self._spec.venue_id == Venue.BITGET:
-            return await self._fetch_bitget_entry_open_interest(deduped)
-        if self._spec.venue_id == Venue.GATE:
-            return await self._fetch_gate_entry_open_interest(deduped)
-        if self._spec.venue_id == Venue.HYPERLIQUID:
-            return await self._fetch_hyperliquid_entry_open_interest(deduped)
-        return {}
+        phase_rows: list[dict[str, Any]] = []
+        phase_token = _PUBLIC_REQUEST_PHASE_COLLECTOR.set(phase_rows)
+        try:
+            if self._spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                result = await self._fetch_binance_style_entry_open_interest(
+                    deduped,
+                    force_refresh=force_refresh,
+                )
+            elif self._spec.venue_id == Venue.OKX:
+                result = await self._fetch_okx_entry_open_interest(deduped)
+            elif self._spec.venue_id == Venue.BYBIT:
+                result = await self._fetch_bybit_entry_open_interest(deduped)
+            elif self._spec.venue_id == Venue.BITGET:
+                result = await self._fetch_bitget_entry_open_interest(deduped)
+            elif self._spec.venue_id == Venue.GATE:
+                result = await self._fetch_gate_entry_open_interest(deduped)
+            elif self._spec.venue_id == Venue.HYPERLIQUID:
+                result = await self._fetch_hyperliquid_entry_open_interest(deduped)
+            else:
+                result = {}
+        finally:
+            _PUBLIC_REQUEST_PHASE_COLLECTOR.reset(phase_token)
+        phase_totals = {
+            "oi_dns_ms": None,
+            "oi_connect_ms": sum(int(row.get("connect_ms", 0) or 0) for row in phase_rows),
+            "oi_pool_wait_ms": sum(int(row.get("pool_wait_ms", 0) or 0) for row in phase_rows),
+            "oi_rate_limit_wait_ms": sum(
+                int(row.get("rate_limit_wait_ms", 0) or 0) for row in phase_rows
+            ),
+            "oi_transport_total_ms": sum(
+                int(row.get("transport_total_ms", 0) or 0) for row in phase_rows
+            ),
+            "oi_http_ms": sum(int(row.get("http_ms", 0) or 0) for row in phase_rows),
+            "oi_parse_ms": sum(int(row.get("parse_ms", 0) or 0) for row in phase_rows),
+            "oi_dns_timing_status": (
+                "included_in_connect" if phase_rows else "unavailable"
+            ),
+        }
+        return {
+            key: replace(ticker, **phase_totals)
+            for key, ticker in result.items()
+        }
 
     def _entry_oi_ticker(
         self,
@@ -1282,48 +1510,141 @@ class MarketDataClient:
         self,
         symbols: list[str],
     ) -> dict[str, FundingTicker]:
-        async def _one(canonical: str) -> tuple[str, FundingTicker]:
-            venue_symbol = self._to_venue_symbol(canonical)
-            raw = await self._public_get(
-                self._spec.open_interest_path,
-                params={"instType": "SWAP", "instId": venue_symbol},
+        canonical_candidates: dict[str, tuple[str, ...]] = {}
+        canonical_by_venue_symbol: dict[str, set[str]] = {}
+        for raw_symbol in symbols:
+            canonical = str(raw_symbol or "").upper()
+            venue_candidates = [self._to_venue_symbol(canonical)]
+            for prefix in ("1000000", "1000"):
+                if canonical.startswith(prefix):
+                    stripped = self._to_venue_symbol(canonical[len(prefix):])
+                    if stripped not in venue_candidates:
+                        venue_candidates.append(stripped)
+                    break
+            canonical_candidates[canonical] = tuple(venue_candidates)
+            for venue_symbol in venue_candidates:
+                canonical_by_venue_symbol.setdefault(venue_symbol, set()).add(canonical)
+
+        ambiguous_canonicals = {
+            canonical
+            for canonical, venue_candidates in canonical_candidates.items()
+            if any(
+                len(canonical_by_venue_symbol.get(venue_symbol, set())) > 1
+                for venue_symbol in venue_candidates
             )
-            received_at_ms = _now_ms()
-            application_error = _entry_oi_application_error(Venue.OKX, raw)
-            if application_error is not None:
-                status, reason = application_error
-                return self._entry_oi_unavailable_result(
-                    canonical,
-                    source="okx_public_open_interest",
-                    status=status,
-                    reason=reason,
-                    received_at_ms=received_at_ms,
+        }
+
+        async def _one(canonical: str) -> tuple[str, FundingTicker]:
+            venue_candidates = canonical_candidates.get(
+                canonical,
+                (self._to_venue_symbol(canonical),),
+            )
+            primary_venue_symbol = venue_candidates[0]
+            if canonical in ambiguous_canonicals:
+                return f"okx:{canonical}", self._entry_oi_ticker(
+                    canonical_symbol=canonical,
+                    venue_symbol=primary_venue_symbol,
+                    value_quote=None,
+                    raw_value=None,
+                    raw_unit="",
+                    contract_multiplier=None,
+                    conversion_mark_price=None,
+                    observed_at_ms=0,
+                    received_at_ms=_now_ms(),
+                    source="okx_contract_mapping",
+                    status="ambiguous_mapping",
+                    reason="multiple_canonical_symbols_for_venue_symbol",
                 )
-            if not isinstance(raw, dict) or not isinstance(raw.get("data"), list):
-                return self._entry_oi_unavailable_result(
-                    canonical,
-                    source="okx_public_open_interest",
-                    status="parse_error",
-                    reason="invalid_open_interest_response_shape",
-                    received_at_ms=received_at_ms,
+
+            async def _request(venue_symbol: str):
+                raw = await self._public_get(
+                    self._spec.open_interest_path,
+                    params={"instType": "SWAP", "instId": venue_symbol},
                 )
-            rows = raw.get("data", []) if isinstance(raw, dict) else []
-            rows = rows if isinstance(rows, list) else []
+                return venue_symbol, raw, _now_ms()
+
+            responses = await asyncio.gather(
+                *(_request(venue_symbol) for venue_symbol in venue_candidates),
+                return_exceptions=True,
+            )
+            valid_rows: list[tuple[str, dict[str, Any], int]] = []
+            parse_failures: list[str] = []
+            application_failures: list[tuple[str, str]] = []
+            for response in responses:
+                if isinstance(response, BaseException):
+                    application_failures.append(
+                        (
+                            self._binance_style_oi_status_from_error(response),
+                            _http_error_reason(response),
+                        )
+                    )
+                    continue
+                venue_symbol, raw, received_at_ms = response
+                application_error = _entry_oi_application_error(Venue.OKX, raw)
+                if application_error is not None:
+                    application_failures.append(application_error)
+                    continue
+                if not isinstance(raw, dict) or not isinstance(raw.get("data"), list):
+                    parse_failures.append("invalid_open_interest_response_shape")
+                    continue
+                matches = [
+                    row
+                    for row in raw.get("data", [])
+                    if isinstance(row, dict)
+                    and str(row.get("instId") or "") == venue_symbol
+                ]
+                if len(matches) > 1:
+                    parse_failures.append("duplicate_instId")
+                    valid_rows.extend(
+                        (venue_symbol, row, received_at_ms) for row in matches
+                    )
+                elif len(matches) == 1:
+                    valid_rows.append((venue_symbol, matches[0], received_at_ms))
+
             observed_at_ms = 0
-            matches = [
-                row for row in rows
-                if isinstance(row, dict) and str(row.get("instId") or "") == venue_symbol
-            ]
-            if len(matches) > 1:
-                status, reason = "ambiguous_mapping", "duplicate_instId"
+            valid_received_at_ms = [item[2] for item in valid_rows]
+            received_at_ms = (
+                max(valid_received_at_ms)
+                if valid_received_at_ms
+                else _now_ms()
+            )
+            if application_failures and len(venue_candidates) > 1:
+                # A prefixed canonical is only exact after every possible
+                # venue symbol has been excluded or matched.  One successful
+                # row plus one unknown request could still hide a second
+                # listed contract, so it is not safe to bind either result.
+                venue_symbol = primary_venue_symbol
+                failure_priority = {
+                    "rate_limited": 0,
+                    "timeout": 1,
+                    "http_error": 2,
+                    "parse_error": 3,
+                }
+                status, reason = min(
+                    application_failures,
+                    key=lambda item: failure_priority.get(item[0], 9),
+                )
                 value = raw_value = None
                 raw_unit = ""
-            elif not matches:
-                status, reason = "symbol_not_listed", "instId_not_found"
+            elif len(valid_rows) > 1:
+                venue_symbol = primary_venue_symbol
+                status, reason = "ambiguous_mapping", "multiple_matching_instId"
                 value = raw_value = None
                 raw_unit = ""
+            elif not valid_rows:
+                venue_symbol = primary_venue_symbol
+                value = raw_value = None
+                raw_unit = ""
+                if "duplicate_instId" in parse_failures:
+                    status, reason = "ambiguous_mapping", "duplicate_instId"
+                elif parse_failures:
+                    status, reason = "parse_error", parse_failures[0]
+                elif application_failures and len(application_failures) == len(responses):
+                    status, reason = application_failures[0]
+                else:
+                    status, reason = "symbol_not_listed", "instId_not_found"
             else:
-                row = matches[0]
+                venue_symbol, row, received_at_ms = valid_rows[0]
                 value, valid, key = _first_present_float(row, "oiUsd")
                 if valid:
                     status, reason = "observed", key
@@ -1664,7 +1985,10 @@ class MarketDataClient:
                 raw_unit="contracts" if status == "observed" else "",
                 contract_multiplier=multiplier,
                 conversion_mark_price=mark,
-                observed_at_ms=received_at_ms if status == "observed" else 0,
+                # Gate does not return a native OI event timestamp.  Zero is
+                # explicit unknown; local observation/receipt remains the
+                # response-arrival clock below.
+                observed_at_ms=0,
                 received_at_ms=received_at_ms,
                 source="gate_tickers",
                 status=status,
@@ -1761,7 +2085,8 @@ class MarketDataClient:
                 raw_unit="base" if status == "observed" else "",
                 contract_multiplier=1.0 if status == "observed" else None,
                 conversion_mark_price=mark,
-                observed_at_ms=received_at_ms if status == "observed" else 0,
+                # Hyperliquid's combined context has no native OI event time.
+                observed_at_ms=0,
                 received_at_ms=received_at_ms,
                 source="hyperliquid_meta_and_asset_ctxs",
                 status=status,
@@ -2311,7 +2636,12 @@ class MarketDataClient:
             )
         return result
 
-    async def _fetch_binance_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_binance_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         now_ms = _now_ms()
@@ -2320,7 +2650,9 @@ class MarketDataClient:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
         # 1. bookTicker (bid/ask)
-        raw_tickers = await self._public_get(spec.funding_ticker_path)
+        raw_tickers, market_received_at_ms = await self._public_get_with_received_at(
+            spec.funding_ticker_path
+        )
         items = raw_tickers if isinstance(raw_tickers, list) else [raw_tickers]
 
         ticker_map: dict[str, dict] = {}
@@ -2393,8 +2725,10 @@ class MarketDataClient:
 
         # 2. premiumIndex (mark, index, funding rate, funding time)
         raw_pi: list[dict] = []
+        funding_received_at_ms = 0
         if spec.premium_index_path:
             pi_resp = await self._public_get(spec.premium_index_path)
+            funding_received_at_ms = _now_ms()
             raw_pi = pi_resp if isinstance(pi_resp, list) else [pi_resp]
 
         pi_map: dict[str, dict] = {}
@@ -2454,7 +2788,7 @@ class MarketDataClient:
             venue_sym: "not_refreshed" if spec.open_interest_path else "unsupported"
             for venue_sym in venue_sym_to_canon
         }
-        if spec.open_interest_path:
+        if spec.open_interest_path and include_open_interest:
             oi_candidate_count = 0
             oi_cache_hit_count = 0
             oi_cache_miss_count = 0
@@ -2592,6 +2926,14 @@ class MarketDataClient:
             oi_deferred_count = 0
             oi_timeout_count = 0
             oi_refresh_elapsed_ms = 0
+            if spec.open_interest_path and not include_open_interest:
+                oi_evidence_status = {
+                    venue_sym: "unavailable" for venue_sym in venue_sym_to_canon
+                }
+                oi_evidence_reason = {
+                    venue_sym: "entry_targeted_revalidation_required"
+                    for venue_sym in venue_sym_to_canon
+                }
 
         result: dict[str, FundingTicker] = {}
         for venue_sym, canon in venue_sym_to_canon.items():
@@ -2624,6 +2966,7 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(t.get("bidPrice", 0)),
                 ask=_safe_float(t.get("askPrice", 0)),
+                market_received_at_ms=market_received_at_ms,
                 bid_size=(
                     _safe_float(t.get("bidQty", 0)) if metadata_complete else 0.0
                 ),
@@ -2633,6 +2976,15 @@ class MarketDataClient:
                 mark_price=_safe_float(pi.get("markPrice", 0)),
                 index_price=_safe_float(pi.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(pi.get("lastFundingRate", 0)) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon,
+                    rate_bps=_safe_float(pi.get("lastFundingRate", 0)) * 10000.0,
+                    funding_timestamp_ms=_funding_timestamp_ms(pi),
+                    observed_at_ms=(funding_received_at_ms if pi else 0),
+                    event_at_ms=int(_safe_float(pi.get("time", 0))),
+                    source="binance_style_premium_index",
+                ),
                 settled_funding_rate_bps=(
                     _safe_float(pi.get("lastFundingRate", 0)) * 10000.0
                     if _has_nonempty_field(pi, "lastFundingRate")
@@ -2748,6 +3100,7 @@ class MarketDataClient:
             params={"instType": "SWAP"},
             attempt_timeout_s=_OKX_MARKET_TICKERS_ATTEMPT_TIMEOUT_S,
         )
+        market_received_at_ms = _now_ms()
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
 
@@ -3102,11 +3455,22 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(t.get("bidPx", 0)),
                 ask=_safe_float(t.get("askPx", 0)),
+                market_received_at_ms=market_received_at_ms,
+                market_event_at_ms=int(_safe_float(t.get("ts", 0))),
                 bid_size=_safe_float(t.get("bidSz", 0)) * base_size_multiplier,
                 ask_size=_safe_float(t.get("askSz", 0)) * base_size_multiplier,
                 mark_price=mark_price_map.get(venue_sym, 0.0),
                 index_price=index_price_map.get(venue_sym, 0.0),
                 funding_rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon,
+                    rate_bps=_safe_float(fr.get("fundingRate", 0)) * 10000.0,
+                    funding_timestamp_ms=next_funding_time_ms,
+                    observed_at_ms=funding_observed_at_ms.get(venue_sym, 0),
+                    event_at_ms=int(_safe_float(fr.get("ts", 0))),
+                    source="okx_funding_rate",
+                ),
                 predicted_funding_rate_bps=_optional_rate_bps(
                     fr, "nextFundingRate", "predictedFundingRate"
                 ),
@@ -3172,6 +3536,7 @@ class MarketDataClient:
                     symbol=canon,
                     bid=0.0,
                     ask=0.0,
+                    market_received_at_ms=market_received_at_ms,
                     mark_price=0.0,
                     index_price=0.0,
                     funding_rate_bps=0.0,
@@ -3203,7 +3568,10 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw = await self._public_get(spec.funding_ticker_path, params={"category": "linear"})
+        raw, market_received_at_ms = await self._public_get_with_received_at(
+            spec.funding_ticker_path,
+            params={"category": "linear"},
+        )
         result_wrap = raw.get("result", raw)
         items = result_wrap.get("list", []) if isinstance(result_wrap, dict) else (result_wrap if isinstance(result_wrap, list) else [])
 
@@ -3309,6 +3677,10 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(item.get("bid1Price", 0)),
                 ask=_safe_float(item.get("ask1Price", 0)),
+                market_received_at_ms=market_received_at_ms,
+                market_event_at_ms=int(
+                    _safe_float(raw.get("time", 0)) if isinstance(raw, dict) else 0
+                ),
                 bid_size=(
                     _safe_float(item.get("bid1Size", 0))
                     if metadata_complete
@@ -3322,6 +3694,19 @@ class MarketDataClient:
                 mark_price=_safe_float(item.get("markPrice", 0)),
                 index_price=_safe_float(item.get("indexPrice", 0)),
                 funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon,
+                    rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
+                    funding_timestamp_ms=funding_timestamp_ms,
+                    observed_at_ms=market_received_at_ms,
+                    event_at_ms=int(
+                        _safe_float(raw.get("time", 0))
+                        if isinstance(raw, dict)
+                        else 0
+                    ),
+                    source="bybit_linear_tickers",
+                ),
                 predicted_funding_rate_bps=_optional_rate_bps(
                     item, "predictedFundingRate", "nextFundingRate"
                 ),
@@ -3350,8 +3735,12 @@ class MarketDataClient:
                     raw_unit=raw_open_interest_unit,
                     contract_multiplier=1.0 if has_open_interest_quote else None,
                     conversion_mark_price=None,
-                    observed_at_ms=(now_ms if has_open_interest_quote else 0),
-                    received_at_ms=now_ms,
+                    observed_at_ms=(
+                        int(_safe_float(raw.get("time", 0)))
+                        if has_open_interest_quote and isinstance(raw, dict)
+                        else 0
+                    ),
+                    received_at_ms=market_received_at_ms,
                     source="bybit_tickers",
                     status=oi_status,
                     reason=oi_reason,
@@ -3392,7 +3781,10 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw = await self._public_get(spec.funding_ticker_path, params={"productType": "USDT-FUTURES"})
+        raw, market_received_at_ms = await self._public_get_with_received_at(
+            spec.funding_ticker_path,
+            params={"productType": "USDT-FUTURES"},
+        )
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
 
@@ -3422,6 +3814,7 @@ class MarketDataClient:
 
         now_ms = _now_ms()
         funding_map: dict[str, dict[str, Any]] = {}
+        funding_received_at_ms = 0
         if spec.funding_rate_path:
             try:
                 funding_raw = await self._public_get(
@@ -3430,6 +3823,7 @@ class MarketDataClient:
                 )
             except PublicTransportError:
                 funding_raw = {}
+            funding_received_at_ms = _now_ms() if funding_raw else 0
             funding_data = (
                 funding_raw.get("data", []) if isinstance(funding_raw, dict) else []
             )
@@ -3520,6 +3914,12 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(item.get("bidPr", item.get("bestBid", 0))),
                 ask=_safe_float(item.get("askPr", item.get("bestAsk", 0))),
+                market_received_at_ms=market_received_at_ms,
+                market_event_at_ms=int(
+                    _safe_float(raw.get("requestTime", 0))
+                    if isinstance(raw, dict)
+                    else 0
+                ),
                 bid_size=(
                     _safe_float(item.get("bidSz", 0)) if metadata_complete else 0.0
                 ),
@@ -3531,6 +3931,37 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(
                     funding_item.get("fundingRate", item.get("fundingRate", 0))
                 ) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon,
+                    rate_bps=_safe_float(
+                        funding_item.get(
+                            "fundingRate", item.get("fundingRate", 0)
+                        )
+                    )
+                    * 10000.0,
+                    funding_timestamp_ms=funding_timestamp_ms,
+                    observed_at_ms=(
+                        funding_received_at_ms
+                        if funding_item
+                        else market_received_at_ms
+                    ),
+                    event_at_ms=int(
+                        _safe_float(
+                            funding_item.get(
+                                "requestTime",
+                                raw.get("requestTime", 0)
+                                if isinstance(raw, dict)
+                                else 0,
+                            )
+                        )
+                    ),
+                    source=(
+                        "bitget_funding_rate"
+                        if funding_item
+                        else "bitget_market_ticker_funding"
+                    ),
+                ),
                 predicted_funding_rate_bps=_optional_rate_bps(
                     funding_item, "nextFundingRate", "predictedFundingRate"
                 ),
@@ -3561,8 +3992,12 @@ class MarketDataClient:
                     raw_unit="base" if has_holding_amount else "",
                     contract_multiplier=1.0 if has_holding_amount else None,
                     conversion_mark_price=(mark if mark > 0.0 else None),
-                    observed_at_ms=(now_ms if oi_status == "observed" else 0),
-                    received_at_ms=now_ms,
+                    observed_at_ms=(
+                        int(_safe_float(raw.get("requestTime", 0)))
+                        if oi_status == "observed" and isinstance(raw, dict)
+                        else 0
+                    ),
+                    received_at_ms=market_received_at_ms,
                     source="bitget_tickers",
                     status=oi_status,
                     reason=oi_reason,
@@ -3593,11 +4028,14 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw = await self._public_get(spec.funding_ticker_path)
+        raw, market_received_at_ms = await self._public_get_with_received_at(
+            spec.funding_ticker_path
+        )
         items = raw if isinstance(raw, list) else [raw]
 
         now_ms = _now_ms()
         contract_map: dict[str, dict[str, Any]] = {}
+        funding_observed_at_ms: dict[str, int] = {}
         missing_contract_symbols: set[str] = set()
         for venue_sym, canon in venue_sym_to_canon.items():
             cache_key = f"{venue_str}:{canon}"
@@ -3610,7 +4048,8 @@ class MarketDataClient:
                 else:
                     self._gate_contract_metadata_by_key.pop(cache_key, None)
             if self._funding_rate_is_fresh(cache_key, now_ms):
-                rate_bps, ts_ms, _ = self._funding_cache[cache_key]
+                rate_bps, ts_ms, cached_observed_at_ms = self._funding_cache[cache_key]
+                funding_observed_at_ms[venue_sym] = int(cached_observed_at_ms)
                 contract_map.setdefault(venue_sym, {}).update(
                     {
                         "funding_rate": str(rate_bps / 10000.0),
@@ -3662,6 +4101,8 @@ class MarketDataClient:
                         funding_timestamp_ms,
                         now_ms,
                     )
+                    if sym in venue_sym_to_canon:
+                        funding_observed_at_ms[sym] = now_ms
                 if sym in venue_sym_to_canon and (funding_is_fresh or sym not in contract_map):
                     contract_map[sym] = contract_item
 
@@ -3734,6 +4175,7 @@ class MarketDataClient:
                 symbol=canon,
                 bid=_safe_float(item.get("highest_bid", 0)),
                 ask=_safe_float(item.get("lowest_ask", 0)),
+                market_received_at_ms=market_received_at_ms,
                 bid_size=bid_size_contracts * size_multiplier,
                 ask_size=ask_size_contracts * size_multiplier,
                 mark_price=mark,
@@ -3741,6 +4183,28 @@ class MarketDataClient:
                 funding_rate_bps=_safe_float(
                     contract_item.get("funding_rate", item.get("funding_rate", 0))
                 ) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon,
+                    rate_bps=_safe_float(
+                        contract_item.get(
+                            "funding_rate", item.get("funding_rate", 0)
+                        )
+                    )
+                    * 10000.0,
+                    funding_timestamp_ms=funding_timestamp_ms,
+                    observed_at_ms=funding_observed_at_ms.get(
+                        sym,
+                        market_received_at_ms
+                        if _has_nonempty_field(item, "funding_rate")
+                        else 0,
+                    ),
+                    source=(
+                        "gate_contract_funding"
+                        if sym in funding_observed_at_ms
+                        else "gate_market_ticker_funding"
+                    ),
+                ),
                 predicted_funding_rate_bps=_optional_rate_bps(
                     contract_item, "funding_rate_indicative", "next_funding_rate"
                 ),
@@ -3771,8 +4235,11 @@ class MarketDataClient:
                     raw_unit="contracts" if has_oi_contracts else "",
                     contract_multiplier=(quanto if quanto > 0.0 else None),
                     conversion_mark_price=(mark if mark > 0.0 else None),
-                    observed_at_ms=(now_ms if oi_status == "observed" else 0),
-                    received_at_ms=now_ms,
+                    # Gate's bulk ticker does not carry a response-wide event
+                    # timestamp.  Unknown vendor time is 0; local freshness is
+                    # anchored to the actual HTTP receipt below.
+                    observed_at_ms=0,
+                    received_at_ms=market_received_at_ms,
                     source="gate_tickers",
                     status=oi_status,
                     reason=oi_reason,
@@ -3802,11 +4269,12 @@ class MarketDataClient:
         spec = self._spec
         venue_str = spec.venue_id.value
         canonical_set = {s.upper() for s in symbols}
-        observed_at_ms = _now_ms()
-
         # Use metaAndAssetCtxs as a bulk call (plan requirement)
         body = {"type": "metaAndAssetCtxs"}
-        raw = await self._public_post(spec.funding_ticker_path, body=body)
+        raw, market_received_at_ms = await self._public_post_with_received_at(
+            spec.funding_ticker_path,
+            body=body,
+        )
 
         # Response: [universe, assetCtxs]
         universe: list[dict] = []
@@ -3832,7 +4300,7 @@ class MarketDataClient:
                 ctx_by_name[name] = ctx
 
         # V1 parity: funding timestamp is next hour boundary
-        funding_ts = _next_hour_boundary(observed_at_ms)
+        funding_ts = _next_hour_boundary(market_received_at_ms)
 
         result: dict[str, FundingTicker] = {}
         for idx, item in enumerate(universe):
@@ -3901,6 +4369,7 @@ class MarketDataClient:
                 symbol=canon.upper(),
                 bid=best_bid,
                 ask=best_ask,
+                market_received_at_ms=market_received_at_ms,
                 bid_size=bid_size if metadata_complete else 0.0,
                 ask_size=ask_size if metadata_complete else 0.0,
                 mark_price=mark,
@@ -3908,10 +4377,18 @@ class MarketDataClient:
                     ctx.get("oraclePx", ctx.get("indexPx", item.get("indexPx", 0)))
                 ),
                 funding_rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
+                **_funding_rate_fields(
+                    venue=venue_str,
+                    symbol=canon.upper(),
+                    rate_bps=_safe_float(ctx.get("funding", 0)) * 10000.0,
+                    funding_timestamp_ms=funding_ts,
+                    observed_at_ms=market_received_at_ms,
+                    source="hyperliquid_meta_and_asset_contexts",
+                ),
                 funding_timestamp_ms=funding_ts,
                 funding_interval_ms=3_600_000,
                 funding_interval_source="hyperliquid_protocol_hourly",
-                funding_interval_observed_at_ms=observed_at_ms,
+                funding_interval_observed_at_ms=market_received_at_ms,
                 funding_forecast_source="quoted_rate_hourly_protocol",
                 volume_24h_quote=_safe_float(ctx.get("dayNtlVlm", 0)),
                 **_open_interest_fields(
@@ -3923,10 +4400,10 @@ class MarketDataClient:
                     raw_unit="base" if has_open_interest else "",
                     contract_multiplier=1.0 if has_open_interest else None,
                     conversion_mark_price=(mark if mark > 0.0 else None),
-                    observed_at_ms=(
-                        observed_at_ms if oi_status == "observed" else 0
-                    ),
-                    received_at_ms=observed_at_ms,
+                    # metaAndAssetCtxs has no payload event timestamp.  Do not
+                    # forge one from the request-start wall clock.
+                    observed_at_ms=0,
+                    received_at_ms=market_received_at_ms,
                     source="hyperliquid_meta_and_asset_ctxs",
                     status=oi_status,
                     reason=oi_reason,
@@ -3951,15 +4428,67 @@ class MarketDataClient:
     async def fetch_perp_liquidity(self, symbols: list[str]) -> dict[str, PerpLiquidity]:
         """Fetch perp liquidity snapshot for symbols."""
         tickers = await self.fetch_funding_tickers(symbols)
-        now_ms = _now_ms()
         result: dict[str, PerpLiquidity] = {}
         for key, ft in tickers.items():
             result[key] = PerpLiquidity(
                 venue=ft.venue,
                 symbol=ft.symbol,
-                volume_24h_quote=ft.volume_24h_quote,
-                open_interest_quote=float(ft.open_interest_quote or 0.0),
-                observed_at_ms=now_ms,
+                volume_24h_quote=(
+                    float(ft.volume_24h_quote)
+                    if isinstance(ft.volume_24h_quote, (int, float))
+                    and not isinstance(ft.volume_24h_quote, bool)
+                    and math.isfinite(float(ft.volume_24h_quote))
+                    and float(ft.volume_24h_quote) >= 0.0
+                    else None
+                ),
+                # Unknown OI is not zero liquidity.  Only an exchange-observed
+                # finite value is carried to the audit evidence plane.
+                open_interest_quote=(
+                    float(ft.open_interest_quote)
+                    if isinstance(ft.open_interest_quote, (int, float))
+                    and not isinstance(ft.open_interest_quote, bool)
+                    and math.isfinite(float(ft.open_interest_quote))
+                    and float(ft.open_interest_quote) >= 0.0
+                    else None
+                ),
+                observed_at_ms=int(
+                    getattr(ft, "market_received_at_ms", 0) or 0
+                ),
+                open_interest_evidence_status=str(
+                    getattr(ft, "open_interest_evidence_status", "unavailable")
+                    or "unavailable"
+                ),
+                open_interest_evidence_reason=str(
+                    getattr(ft, "open_interest_evidence_reason", "") or ""
+                ),
+                open_interest_observed_at_ms=int(
+                    getattr(ft, "open_interest_observed_at_ms", 0) or 0
+                ),
+                open_interest_event_at_ms=int(
+                    getattr(ft, "open_interest_event_at_ms", 0) or 0
+                ),
+                open_interest_received_at_ms=int(
+                    getattr(ft, "open_interest_received_at_ms", 0) or 0
+                ),
+                open_interest_source=str(
+                    getattr(ft, "open_interest_source", "") or ""
+                ),
+                open_interest_sample_id=str(
+                    getattr(ft, "open_interest_sample_id", "") or ""
+                ),
+                open_interest_venue_symbol=str(
+                    getattr(ft, "open_interest_venue_symbol", "") or ""
+                ),
+                raw_open_interest=getattr(ft, "raw_open_interest", None),
+                raw_open_interest_unit=str(
+                    getattr(ft, "raw_open_interest_unit", "") or ""
+                ),
+                open_interest_contract_multiplier=getattr(
+                    ft, "open_interest_contract_multiplier", None
+                ),
+                open_interest_conversion_mark_price=getattr(
+                    ft, "open_interest_conversion_mark_price", None
+                ),
             )
         return result
 
@@ -3972,13 +4501,21 @@ class MarketDataClient:
 class PublicTransportErrorCategory:
     TRANSPORT_FAILURE = "transport_failure"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    PARSE_FAILURE = "parse_failure"
 
 
 class PublicTransportError(Exception):
-    def __init__(self, category: str, message: str, status_code: int = 0) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        status_code: int = 0,
+        phase_timings: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        self.phase_timings = dict(phase_timings or {})
 
 
 def _parse_retry_after_ms(headers: dict[str, str]) -> Optional[int]:

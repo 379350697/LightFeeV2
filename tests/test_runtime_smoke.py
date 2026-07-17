@@ -769,6 +769,16 @@ class TestRuntimeLaneScheduling:
             "candidates": [],
             "degraded_venues": [],
         }))
+        from lightfee.sidecar.publisher import load_snapshot
+
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.funding_entry_snapshot_identity",
+            lambda _path: ("test-v6-file", 1, 1),
+        )
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.load_funding_entry_snapshot",
+            lambda _path: load_snapshot(sidecar_path),
+        )
         config = AppConfig(
             runtime=RuntimeConfig(
                 mode="live",
@@ -791,17 +801,31 @@ class TestRuntimeLaneScheduling:
         runtime = LiveRuntime(config)
         exported_during_scan: dict[str, object] = {}
 
-        async def observe_exported_progress(now_ms_arg: int, *, scan_promoted: bool = False):
-            background_export = runtime._current_state_export_task
-            if background_export is not None:
-                await background_export
-            with open(current_state_export_path(config)) as f:
-                exported_during_scan.update(json.load(f))
+        original_schedule_export = runtime._schedule_current_state_snapshot_export
 
-        monkeypatch.setattr(runtime, "_sync_local_l2_data", observe_exported_progress)
+        def observe_exported_progress(*args, **kwargs):
+            last_scan = runtime.state.last_scan
+            if isinstance(last_scan, dict) and last_scan.get("snapshot_freshness") == "fresh":
+                exported_during_scan.update(
+                    {
+                        "tick_count": runtime.state.tick_count,
+                        "last_tick_ms": runtime.state.last_tick_ms,
+                        "last_scan": dict(runtime.state.last_scan),
+                    }
+                )
+            return original_schedule_export(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime,
+            "_schedule_current_state_snapshot_export",
+            observe_exported_progress,
+        )
         runtime.journal.open()
         try:
             await runtime.tick()
+            background_export = runtime._current_state_export_task
+            if background_export is not None:
+                await background_export
         finally:
             runtime.journal.close()
 

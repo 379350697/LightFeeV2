@@ -7,7 +7,7 @@ Do not change market-data business conditions while extracting it.
 from __future__ import annotations
 
 import asyncio
-import math
+import copy
 from collections import Counter
 from typing import Any
 
@@ -20,8 +20,65 @@ from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 from lightfee.marketdata.open_interest import (
     normalize_open_interest_status,
-    open_interest_sample_id,
+    observed_open_interest_proof_reason,
+    open_interest_timestamps_are_fresh,
 )
+from lightfee.sidecar.snapshot import funding_rate_evidence_reason
+
+
+def _mark_entry_evidence_domain_state(
+    coordinator: dict[str, Any] | None,
+    *,
+    domain: str,
+    candidate_index: int,
+    state: str,
+) -> bool:
+    """Publish one domain result and report cross-domain selection readiness."""
+    if coordinator is None:
+        return state == "ready"
+    domain_states = coordinator.setdefault(domain, {})
+    domain_states[int(candidate_index)] = state
+    quote_states = coordinator.setdefault("quote", {})
+    oi_states = coordinator.setdefault("open_interest", {})
+    economics_states = coordinator.setdefault("economics", {})
+    candidate_count = int(coordinator.get("candidate_count", 0) or 0)
+    validator = coordinator.get("candidate_ready_validator")
+    # Validate every row whose two public evidence domains are complete.
+    # Selection later reprices and reranks this entire ready set; economics is
+    # not a one-winner latch tied to stale snapshot rank.
+    for index in range(candidate_count):
+        if economics_states.get(index) in {"ready", "failed"}:
+            continue
+        if quote_states.get(index) != "ready" or oi_states.get(index) != "ready":
+            continue
+        if callable(validator) and not bool(validator(index)):
+            economics_states[index] = "failed"
+            continue
+        economics_states[index] = "ready"
+
+    ready_indices = [
+        index
+        for index in range(candidate_count)
+        if economics_states.get(index) == "ready"
+    ]
+    if not ready_indices:
+        return False
+    # Fast path only when the highest unresolved prior snapshot rank is now
+    # terminal.  If a lower row finishes first, the common deadline remains
+    # open so a higher row can join the same fresh-economics rerank batch.
+    selected_index = min(ready_indices)
+    if not all(
+        quote_states.get(prior) == "failed"
+        or oi_states.get(prior) == "failed"
+        or economics_states.get(prior) == "failed"
+        for prior in range(selected_index)
+    ):
+        return False
+    coordinator["selected_index"] = selected_index
+    ready_event = coordinator.get("selection_ready_event")
+    if isinstance(ready_event, asyncio.Event):
+        ready_event.set()
+    return True
 
 
 def _targeted_open_interest_observed_proof_valid(
@@ -31,71 +88,77 @@ def _targeted_open_interest_observed_proof_valid(
     result: dict[str, Any],
 ) -> bool:
     """Validate the full economic/sample identity before mutating a quote."""
-
-    def _finite_number(value: object, *, positive: bool = False) -> float | None:
-        if isinstance(value, bool):
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(parsed) or parsed < (0.0 if not positive else 1e-300):
-            return None
-        return parsed
-
-    value_quote = _finite_number(result.get("open_interest_quote"))
-    raw_value = _finite_number(result.get("raw_open_interest"))
-    if value_quote is None or raw_value is None:
-        return False
-    raw_unit = str(result.get("raw_open_interest_unit") or "")
-    mark = _finite_number(
-        result.get("open_interest_conversion_mark_price"),
-        positive=True,
-    )
-    multiplier = _finite_number(
-        result.get("open_interest_contract_multiplier"),
-        positive=True,
-    )
-    if raw_unit == "quote":
-        expected_quote = raw_value
-    elif raw_unit == "base" and mark is not None:
-        expected_quote = raw_value * mark
-    elif raw_unit == "contracts" and mark is not None and multiplier is not None:
-        expected_quote = raw_value * multiplier * mark
-    else:
-        return False
-    if not math.isfinite(expected_quote) or abs(value_quote - expected_quote) > max(
-        1e-6,
-        abs(expected_quote) * 1e-9,
-    ):
-        return False
-    try:
-        observed_at_ms = int(result.get("open_interest_observed_at_ms") or 0)
-        received_at_ms = int(result.get("open_interest_received_at_ms") or 0)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    if (
-        isinstance(result.get("open_interest_observed_at_ms"), bool)
-        or isinstance(result.get("open_interest_received_at_ms"), bool)
-        or observed_at_ms <= 0
-        or received_at_ms < observed_at_ms
-    ):
-        return False
-    source = str(result.get("open_interest_source") or "").strip()
-    venue_symbol = str(result.get("open_interest_venue_symbol") or "").strip()
-    sample_id = str(result.get("open_interest_sample_id") or "").strip()
-    if not source or not venue_symbol or not sample_id:
-        return False
-    expected_sample_id = open_interest_sample_id(
+    return not observed_open_interest_proof_reason(
         venue=venue,
         canonical_symbol=symbol,
-        venue_symbol=venue_symbol,
-        observed_at_ms=observed_at_ms,
-        source=source,
-        raw_value=raw_value,
-        value_quote=value_quote,
+        venue_symbol=str(result.get("open_interest_venue_symbol") or ""),
+        value_quote=result.get("open_interest_quote"),
+        raw_value=result.get("raw_open_interest"),
+        raw_unit=str(result.get("raw_open_interest_unit") or ""),
+        contract_multiplier=result.get("open_interest_contract_multiplier"),
+        conversion_mark_price=result.get("open_interest_conversion_mark_price"),
+        observed_at_ms=result.get("open_interest_observed_at_ms"),
+        event_at_ms=result.get("open_interest_event_at_ms"),
+        received_at_ms=result.get("open_interest_received_at_ms"),
+        source=str(result.get("open_interest_source") or ""),
+        sample_id=str(result.get("open_interest_sample_id") or ""),
     )
-    return sample_id == expected_sample_id
+
+
+def _open_interest_exception_status(exc: Exception) -> str:
+    """Preserve transport/parse semantics at the entry evidence boundary."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    response = getattr(exc, "response", None)
+    status_code = int(
+        getattr(exc, "status_code", 0)
+        or getattr(response, "status_code", 0)
+        or 0
+    )
+    message = str(exc).lower()
+    if status_code in {418, 429} or any(
+        marker in message
+        for marker in ("rate limit", "rate-limit", "too many requests")
+    ):
+        return "rate_limited"
+    if (
+        str(getattr(exc, "category", "") or "") == "parse_failure"
+        or isinstance(exc, (ValueError, TypeError, KeyError, OverflowError))
+    ):
+        return "parse_error"
+    return "http_error"
+
+
+def _open_interest_exception_phase_timings(exc: Exception) -> dict[str, Any]:
+    phase = getattr(exc, "phase_timings", None)
+    if not isinstance(phase, dict):
+        return {}
+    return {
+        "oi_dns_ms": phase.get("dns_ms"),
+        "oi_connect_ms": int(phase.get("connect_ms", 0) or 0),
+        "oi_pool_wait_ms": int(phase.get("pool_wait_ms", 0) or 0),
+        "oi_rate_limit_wait_ms": int(
+            phase.get("rate_limit_wait_ms", 0) or 0
+        ),
+        "oi_transport_total_ms": int(
+            phase.get("transport_total_ms", 0) or 0
+        ),
+        "oi_http_ms": int(phase.get("http_ms", 0) or 0),
+        "oi_parse_ms": int(phase.get("parse_ms", 0) or 0),
+        "oi_dns_timing_status": str(
+            phase.get("dns_timing_status", "unavailable") or "unavailable"
+        ),
+    }
+
+
+def _evidence_clock_or_zero(value: object) -> int:
+    """Parse an evidence clock without letting malformed payloads crash a tick."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 class EntryOpenInterestRefresher:
@@ -113,6 +176,19 @@ class EntryOpenInterestRefresher:
 
     def __init__(self, *, targeted_budget_s: float | None = None) -> None:
         self._clients: dict[str, Any] = {}
+        self._cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._inflight: dict[tuple[str, str], asyncio.Task] = {}
+        self._inflight_started_at_ms: dict[tuple[str, str], int] = {}
+        self._venue_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._cache_max_entries = 2_048
+        # Top-32 entry candidates can expose two distinct OI targets each.
+        # The per-venue semaphore below remains the transport concurrency
+        # bound; this registry cap must not discard the second half of that
+        # already-bounded candidate frontier before a different venue starts.
+        self._max_inflight = 64
+        self._reused_count = 0
+        self._deferred_count = 0
+        self._cancelled_count = 0
         if targeted_budget_s is None:
             from lightfee.venues.market_data import (
                 BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
@@ -122,11 +198,46 @@ class EntryOpenInterestRefresher:
         self._targeted_budget_s = max(float(targeted_budget_s or 0.0), 0.0)
 
     async def close(self) -> None:
+        inflight = list(self._inflight.values())
+        for task in inflight:
+            if not task.done():
+                self._cancelled_count += 1
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        self._inflight.clear()
+        self._inflight_started_at_ms.clear()
+        self._cache.clear()
+        self._venue_semaphores.clear()
         for client in list(self._clients.values()):
             close = getattr(client, "close", None)
             if callable(close):
                 await close()
         self._clients.clear()
+
+    def scheduler_metrics(self, *, now_ms: int) -> dict[str, int]:
+        started_values = [
+            int(self._inflight_started_at_ms.get(key, 0) or 0)
+            for key, task in self._inflight.items()
+            if not task.done()
+        ]
+        oldest_started = min(
+            (value for value in started_values if value > 0),
+            default=0,
+        )
+        return {
+            "inflight_count": sum(
+                1 for task in self._inflight.values() if not task.done()
+            ),
+            "queued_count": 0,
+            "max_inflight": self._max_inflight,
+            "oldest_age_ms": (
+                max(int(now_ms) - oldest_started, 0) if oldest_started else 0
+            ),
+            "reused_count": self._reused_count,
+            "deferred_count": self._deferred_count,
+            "cancelled_count": self._cancelled_count,
+        }
 
     def _client_for_venue(self, venue: str):
         venue_key = str(venue or "").strip().lower()
@@ -148,7 +259,10 @@ class EntryOpenInterestRefresher:
         symbol: str,
         *,
         now_ms: int,
+        force_refresh: bool = False,
+        max_age_ms: int = 30_000,
     ) -> dict[str, Any] | None:
+        venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
         if not symbol_key:
             return {
@@ -156,12 +270,113 @@ class EntryOpenInterestRefresher:
                 "open_interest_evidence_status": "unsupported",
                 "open_interest_evidence_reason": "unsupported_targeted_refresh",
             }
-        batch = await self.refresh_open_interest_batch(
-            venue,
-            [symbol_key],
-            now_ms=now_ms,
-        )
-        return batch.get(symbol_key)
+        cache_key = (venue_key, symbol_key)
+        inflight_key = (venue_key, symbol_key)
+        cached = self._cache.get(cache_key)
+        observed_at_ms = int((cached or {}).get("open_interest_observed_at_ms", 0) or 0)
+        received_at_ms = int((cached or {}).get("open_interest_received_at_ms", 0) or 0)
+        event_at_ms = int((cached or {}).get("open_interest_event_at_ms", 0) or 0)
+        if (
+            not force_refresh
+            and cached is not None
+            and normalize_open_interest_status(
+                cached.get("open_interest_evidence_status", "unavailable")
+            ) == "observed"
+            and open_interest_timestamps_are_fresh(
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                event_at_ms=event_at_ms,
+                now_ms=now_ms,
+                max_age_ms=max_age_ms,
+            )
+        ):
+            return dict(cached)
+
+        task = self._inflight.get(inflight_key)
+        if task is None or task.done():
+            live_inflight = sum(
+                1 for current in self._inflight.values() if not current.done()
+            )
+            if live_inflight >= self._max_inflight:
+                self._deferred_count += 1
+                return {
+                    "open_interest_quote": None,
+                    "open_interest_evidence_status": "deferred",
+                    "open_interest_evidence_reason": (
+                        "entry_evidence_scheduler_capacity_exceeded"
+                    ),
+                    "oi_scheduler_deferred_count": 1,
+                    **self.scheduler_metrics(now_ms=now_ms),
+                }
+            async def _load() -> dict[str, Any] | None:
+                batch = await self.refresh_open_interest_batch(
+                    venue_key,
+                    [symbol_key],
+                    now_ms=now_ms,
+                    force_refresh=force_refresh,
+                )
+                return batch.get(symbol_key)
+
+            task = asyncio.create_task(
+                _load(),
+                name=f"entry-oi:{venue_key}:{symbol_key}",
+            )
+            self._inflight[inflight_key] = task
+            self._inflight_started_at_ms[inflight_key] = int(now_ms)
+
+            def _completed(done: asyncio.Task) -> None:
+                if self._inflight.get(inflight_key) is done:
+                    self._inflight.pop(inflight_key, None)
+                    self._inflight_started_at_ms.pop(inflight_key, None)
+                if done.cancelled():
+                    return
+                try:
+                    payload = done.result()
+                except Exception:
+                    return
+                if (
+                    payload is None
+                    or normalize_open_interest_status(
+                        payload.get("open_interest_evidence_status", "unavailable")
+                    )
+                    != "observed"
+                    or not _targeted_open_interest_observed_proof_valid(
+                        venue=venue_key,
+                        symbol=symbol_key,
+                        result=payload,
+                    )
+                ):
+                    # A failed refresh is actionable evidence for this caller,
+                    # but must never overwrite a newer last-good observation.
+                    return
+                previous = self._cache.get(cache_key)
+                new_order = (
+                    int(payload.get("open_interest_observed_at_ms", 0) or 0),
+                    int(payload.get("open_interest_received_at_ms", 0) or 0),
+                    str(payload.get("open_interest_sample_id", "") or ""),
+                )
+                previous_order = (
+                    int((previous or {}).get("open_interest_observed_at_ms", 0) or 0),
+                    int((previous or {}).get("open_interest_received_at_ms", 0) or 0),
+                    str((previous or {}).get("open_interest_sample_id", "") or ""),
+                )
+                if previous is None or new_order >= previous_order:
+                    self._cache[cache_key] = dict(payload)
+                    while len(self._cache) > self._cache_max_entries:
+                        self._cache.pop(next(iter(self._cache)))
+
+            task.add_done_callback(_completed)
+        else:
+            self._reused_count += 1
+        # The target deadline belongs to the caller.  It must not cancel the
+        # singleflight request and leave a connection/rate-limit task orphaned.
+        result = await asyncio.shield(task)
+        if result is None:
+            return None
+        return {
+            **result,
+            **self.scheduler_metrics(now_ms=now_ms),
+        }
 
     async def refresh_open_interest_batch(
         self,
@@ -169,6 +384,7 @@ class EntryOpenInterestRefresher:
         symbols: list[str],
         *,
         now_ms: int,
+        force_refresh: bool = False,
     ) -> dict[str, dict[str, Any]]:
         venue_key = str(venue or "").strip().lower()
         symbol_keys = [
@@ -189,18 +405,25 @@ class EntryOpenInterestRefresher:
         if not symbol_keys:
             return {}
         try:
-            result = await self._client_for_venue(
-                venue_key
-            ).fetch_entry_open_interest_evidence(
-                symbol_keys,
-                force_refresh=True,
+            semaphore = self._venue_semaphores.setdefault(
+                venue_key,
+                asyncio.Semaphore(2),
             )
+            async with semaphore:
+                result = await self._client_for_venue(
+                    venue_key
+                ).fetch_entry_open_interest_evidence(
+                    symbol_keys,
+                    force_refresh=force_refresh,
+                )
         except Exception as exc:
+            status = _open_interest_exception_status(exc)
             return {
                 symbol: {
                     "open_interest_quote": None,
-                    "open_interest_evidence_status": "timeout",
+                    "open_interest_evidence_status": status,
                     "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                    **_open_interest_exception_phase_timings(exc),
                 }
                 for symbol in symbol_keys
             }
@@ -225,6 +448,9 @@ class EntryOpenInterestRefresher:
                 ),
                 "open_interest_observed_at_ms": int(
                     getattr(ticker, "open_interest_observed_at_ms", 0) or 0
+                ),
+                "open_interest_event_at_ms": int(
+                    getattr(ticker, "open_interest_event_at_ms", 0) or 0
                 ),
                 "open_interest_received_at_ms": int(
                     getattr(ticker, "open_interest_received_at_ms", 0) or 0
@@ -259,6 +485,23 @@ class EntryOpenInterestRefresher:
                 "oi_timeout_count": int(getattr(ticker, "oi_timeout_count", 0) or 0),
                 "oi_refresh_elapsed_ms": int(
                     getattr(ticker, "oi_refresh_elapsed_ms", 0) or 0
+                ),
+                "oi_dns_ms": getattr(ticker, "oi_dns_ms", None),
+                "oi_connect_ms": int(getattr(ticker, "oi_connect_ms", 0) or 0),
+                "oi_pool_wait_ms": int(
+                    getattr(ticker, "oi_pool_wait_ms", 0) or 0
+                ),
+                "oi_rate_limit_wait_ms": int(
+                    getattr(ticker, "oi_rate_limit_wait_ms", 0) or 0
+                ),
+                "oi_transport_total_ms": int(
+                    getattr(ticker, "oi_transport_total_ms", 0) or 0
+                ),
+                "oi_http_ms": int(getattr(ticker, "oi_http_ms", 0) or 0),
+                "oi_parse_ms": int(getattr(ticker, "oi_parse_ms", 0) or 0),
+                "oi_dns_timing_status": str(
+                    getattr(ticker, "oi_dns_timing_status", "unavailable")
+                    or "unavailable"
                 ),
             }
         return payloads
@@ -1198,6 +1441,8 @@ class MarketDataRuntime:
             "rest_failed_count": 0,
             "rest_throttled_count": 0,
             "entry_evidence_deadline_exceeded_count": 0,
+            "superseded_by_ready_candidate_count": 0,
+            "deferred_count": 0,
             "wait_budget_ms": 0,
             "wait_elapsed_ms": 0,
             "resolved_count": 0,
@@ -1271,6 +1516,9 @@ class MarketDataRuntime:
         self.ctx.state.last_scan["entry_evidence_deadline_exceeded_count"] = int(
             stats.get("entry_evidence_deadline_exceeded_count", 0) or 0
         )
+        self.ctx.state.last_scan[
+            "quote_revalidate_superseded_count"
+        ] = int(stats.get("superseded_by_ready_candidate_count", 0) or 0)
         self.ctx.state.last_scan["budget_excluded_without_rest_count"] = int(
             stats.get("budget_excluded_without_rest_count", 0) or 0
         )
@@ -1359,7 +1607,30 @@ class MarketDataRuntime:
     ) -> dict:
         merged = dict(market_quotes or {})
         for (venue, symbol), quote in (overlay or {}).items():
-            merged[f"{venue}:{symbol}"] = quote
+            key = f"{venue}:{symbol}"
+            base_quote = merged.get(key) or merged.get((venue, symbol))
+            if base_quote is None:
+                merged[key] = quote
+                continue
+            # REST/WS BBO truth intentionally contains only executable price
+            # fields. Preserve the authenticated contract/OI metadata from
+            # the installed snapshot while replacing its market observation.
+            enriched = copy.copy(base_quote)
+            for field in (
+                "venue",
+                "symbol",
+                "bid",
+                "ask",
+                "bid_size",
+                "ask_size",
+                "observed_at_ms",
+                "received_at_ms",
+                "exchange_event_at_ms",
+                "source",
+            ):
+                if hasattr(quote, field):
+                    setattr(enriched, field, getattr(quote, field))
+            merged[key] = enriched
         return merged
 
     def _entry_quote_truth_price_hint(
@@ -1413,7 +1684,10 @@ class MarketDataRuntime:
             return True, "quote_stale", evidence
         if fallback_source == "last_good_sidecar":
             return True, "last_good_sidecar", evidence
-        return False, "", {}
+        # A sidecar BBO is a ranking seed, never final execution evidence.
+        # Every Top-K leg must obtain a current WS/REST overlay so repricing
+        # and final ranking use the same quotes that authorize submit.
+        return True, "entry_final_revalidation", evidence
 
     def _entry_quote_revalidate_targets(
         self,
@@ -1652,8 +1926,14 @@ class MarketDataRuntime:
         skipped_untracked_count: int = 0,
         evidence_role: str = "entry_execution",
         activation_candidates: list | None = None,
+        evidence_coordinator: dict[str, Any] | None = None,
     ) -> tuple[dict[tuple[str, str], Any], dict[str, Any]]:
         overlay: dict[tuple[str, str], Any] = {}
+        if evidence_coordinator is not None:
+            # Share the incrementally accepted quote view with the runtime's
+            # pure candidate validator.  The dict identity stays stable while
+            # target completions arrive on this event loop.
+            evidence_coordinator["quote_overlay"] = overlay
         stats = self._entry_quote_truth_empty_stats()
         loop = asyncio.get_running_loop()
         evidence_started_monotonic = loop.time()
@@ -1661,11 +1941,7 @@ class MarketDataRuntime:
         stats["evidence_role"] = evidence_role
         stats["candidate_count"] = len(candidates or [])
         stats["skipped_untracked_count"] = max(int(skipped_untracked_count or 0), 0)
-        if (
-            not candidates
-            or not self._entry_readiness_provider_uses_ws_bbo()
-            or self.ctx.config.runtime.mode == "paper"
-        ):
+        if not candidates:
             self._entry_quote_truth_record_last_scan(stats)
             if evidence_role != "prewarm_only":
                 self._emit_entry_quote_revalidate_probe(
@@ -1679,7 +1955,7 @@ class MarketDataRuntime:
             min(0.100, 0.750 - (loop.time() - evidence_started_monotonic)),
             0.0,
         )
-        if activation_budget_s > 0.0:
+        if activation_budget_s > 0.0 and activation_candidates != []:
             try:
                 await asyncio.wait_for(
                     self._call_ensure_entry_bbo_active_for_candidates(
@@ -1700,6 +1976,17 @@ class MarketDataRuntime:
         )
         stats["all_target_count"] = len(all_targets)
         if not all_targets:
+            # Existing sidecar/WS evidence can already satisfy both legs.  It
+            # is still a completed quote-domain result and must participate in
+            # cross-domain early selection; otherwise a fresh cache waits for
+            # an unrelated OI timeout merely because no REST work was needed.
+            for candidate_index in range(len(candidates or [])):
+                _mark_entry_evidence_domain_state(
+                    evidence_coordinator,
+                    domain="quote",
+                    candidate_index=candidate_index,
+                    state="ready",
+                )
             self._entry_quote_truth_record_last_scan(stats)
             if evidence_role != "prewarm_only":
                 self._emit_entry_quote_revalidate_probe(
@@ -1853,47 +2140,80 @@ class MarketDataRuntime:
                     error = f"{type(exc).__name__}: {exc}"[:240]
                 return key, target, result, refreshed, error
 
-            task_by_key = {
-                key: asyncio.create_task(_refresh_target(key, target))
-                for key, target in list(unresolved.items())
+            # Top-K is itself the hard bound (at most 64 legs).  Every target
+            # must start inside the same evidence generation; an additional
+            # global FIFO of eight lets four slow pairs starve every lower,
+            # otherwise profitable venue.  Venue clients still enforce their
+            # own connection-pool and rate-limit concurrency.
+            max_in_flight = max(len(unresolved), 1)
+            queued_keys = list(unresolved)
+            task_by_key: dict[tuple[str, str], asyncio.Task] = {}
+            task_key: dict[asyncio.Task, tuple[str, str]] = {}
+
+            def _launch_more() -> None:
+                while queued_keys and len(task_key) < max_in_flight:
+                    key = queued_keys.pop(0)
+                    target = unresolved.get(key)
+                    if target is None:
+                        continue
+                    target["rest_revalidate_attempted"] = True
+                    task = asyncio.create_task(_refresh_target(key, target))
+                    task_by_key[key] = task
+                    task_key[task] = key
+                    stats["rest_attempt_count"] += 1
+
+            _launch_more()
+            completed_keys: set[tuple[str, str]] = set(overlay)
+            required_target_keys = {
+                (target["venue"], target["symbol"])
+                for target in all_targets
             }
-            stats["rest_attempt_count"] += len(task_by_key)
-            for target in unresolved.values():
-                target["rest_revalidate_attempted"] = True
-            if task_by_key:
-                try:
-                    done, pending = await asyncio.wait(
-                        set(task_by_key.values()),
-                        timeout=max(
-                            0.750 - (loop.time() - evidence_started_monotonic),
-                            0.0,
-                        ),
-                    )
-                except asyncio.CancelledError:
-                    for task in task_by_key.values():
-                        task.cancel()
-                    await asyncio.gather(
-                        *task_by_key.values(),
-                        return_exceptions=True,
-                    )
-                    raise
-            else:
-                done, pending = set(), set()
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-                stats["entry_evidence_deadline_exceeded_count"] = len(pending)
-                pending_tasks = set(pending)
-                for key, task in task_by_key.items():
-                    if task in pending_tasks:
-                        unresolved[key]["rest_outcome"] = (
-                            "entry_evidence_deadline_exceeded"
+            # A target excluded before REST is already a resolved failure for
+            # ranking purposes; it must not keep every lower candidate behind
+            # an impossible higher row until the batch deadline.
+            completed_keys.update(
+                required_target_keys - set(unresolved) - set(overlay)
+            )
+
+            def _highest_resolved_candidate_is_ready() -> bool:
+                selection_ready = False
+                for candidate_index, candidate in enumerate(candidates):
+                    symbol = str(
+                        getattr(candidate, "symbol", "") or ""
+                    ).strip().upper()
+                    candidate_required_keys = {
+                        (
+                            str(getattr(candidate, venue_attr, "") or "")
+                            .strip()
+                            .lower(),
+                            symbol,
                         )
-            completed = await asyncio.gather(*done, return_exceptions=True)
-            for completed_item in completed:
+                        for venue_attr in ("long_venue", "short_venue")
+                    } & required_target_keys
+                    if not candidate_required_keys.issubset(completed_keys):
+                        return selection_ready
+                    candidate_ready = candidate_required_keys.issubset(
+                        set(overlay)
+                    )
+                    if evidence_coordinator is not None:
+                        selection_ready = (
+                            _mark_entry_evidence_domain_state(
+                                evidence_coordinator,
+                                domain="quote",
+                                candidate_index=candidate_index,
+                                state="ready" if candidate_ready else "failed",
+                            )
+                            or selection_ready
+                        )
+                    # Standalone domain refresh has no cross-domain economic
+                    # validator, so evidence-ready cannot authorize pruning.
+                    # This row is fully resolved but unusable. Continue down
+                    # the ranked frontier rather than waiting for it again.
+                return selection_ready
+
+            def _apply_completed_quote_refresh(completed_item) -> None:
                 if isinstance(completed_item, BaseException):
-                    continue
+                    return
                 key, target, result, refreshed, refresh_error = completed_item
                 if result is not None:
                     rest_outcome = str(getattr(result, "outcome", "") or "")
@@ -1956,7 +2276,7 @@ class MarketDataRuntime:
                 target["quote_validation_reject_reason"] = reject_reason
                 if reject_reason:
                     stats["rest_failed_count"] += 1
-                    continue
+                    return
                 cache = self.ctx.ws_bbo_cache
                 if cache is not None and hasattr(cache, "update_quote"):
                     accepted = bool(
@@ -1987,10 +2307,68 @@ class MarketDataRuntime:
                             stats["ws_resolved_count"] += 1
                         else:
                             stats["rest_failed_count"] += 1
-                        continue
+                        return
                 overlay[key] = refreshed
                 unresolved.pop(key, None)
                 stats["rest_resolved_count"] += 1
+
+            pending = set(task_by_key.values())
+            _highest_resolved_candidate_is_ready()
+            try:
+                while pending:
+                    remaining_s = max(
+                        0.750 - (loop.time() - evidence_started_monotonic),
+                        0.0,
+                    )
+                    if remaining_s <= 0.0:
+                        break
+                    done, _still_pending = await asyncio.wait(
+                        pending,
+                        timeout=remaining_s,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        break
+                    pending.difference_update(done)
+                    done_list = list(done)
+                    completed = await asyncio.gather(
+                        *done_list,
+                        return_exceptions=True,
+                    )
+                    for task, completed_item in zip(done_list, completed):
+                        completed_keys.add(task_key[task])
+                        _apply_completed_quote_refresh(completed_item)
+                        task_key.pop(task, None)
+                    _highest_resolved_candidate_is_ready()
+                    _launch_more()
+                    pending.update(task_key)
+            except asyncio.CancelledError:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise
+
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            remaining_keys = [
+                *[task_key[task] for task in pending if task in task_key],
+                *queued_keys,
+            ]
+            if remaining_keys:
+                stats["entry_evidence_deadline_exceeded_count"] = len(
+                    remaining_keys
+                )
+                for key in remaining_keys:
+                    unresolved[key]["rest_outcome"] = (
+                        "entry_evidence_deadline_exceeded"
+                    )
+                    completed_keys.add(key)
+                # A deadline is a terminal result for each affected target,
+                # not an unresolved batch. Publish those failed leaves so a
+                # lower-ranked candidate whose own legs completed can advance.
+                _highest_resolved_candidate_is_ready()
         else:
             for target in unresolved.values():
                 if bool(target.get("ws_budget_excluded")):
@@ -2190,6 +2568,41 @@ class MarketDataRuntime:
                 self._schedule_entry_quote_rewarm_after_rest_stale(
                     payload,
                     now_ms=now_ms,
+                )
+
+        # Publish a terminal quote-domain state for every candidate even when
+        # no REST adapter exists, every target came from cache, or the batch
+        # ended at its deadline. Incremental publication above is the latency
+        # fast path; this is the completeness invariant used by the final
+        # ready-only frontier.
+        if evidence_coordinator is not None:
+            required_target_keys = {
+                (target["venue"], target["symbol"])
+                for target in all_targets
+            }
+            overlay_keys = set(overlay)
+            for candidate_index, candidate in enumerate(candidates or []):
+                symbol = str(
+                    getattr(candidate, "symbol", "") or ""
+                ).strip().upper()
+                candidate_keys = {
+                    (
+                        str(getattr(candidate, venue_attr, "") or "")
+                        .strip()
+                        .lower(),
+                        symbol,
+                    )
+                    for venue_attr in ("long_venue", "short_venue")
+                } & required_target_keys
+                _mark_entry_evidence_domain_state(
+                    evidence_coordinator,
+                    domain="quote",
+                    candidate_index=candidate_index,
+                    state=(
+                        "ready"
+                        if candidate_keys.issubset(overlay_keys)
+                        else "failed"
+                    ),
                 )
 
         self._entry_quote_truth_record_last_scan(stats)
@@ -2392,6 +2805,15 @@ class MarketDataRuntime:
     def _snapshot_quote_source(quote) -> str:
         return str(getattr(quote, "source", "") or "sidecar_quote")
 
+    @staticmethod
+    def _snapshot_publication_at_ms(snapshot) -> int:
+        """Use the verified V6 install watermark, with legacy compatibility."""
+        return int(
+            getattr(snapshot, "ready_at_ms", 0)
+            or getattr(snapshot, "published_at_ms", 0)
+            or 0
+        )
+
     def _snapshot_quote_observed_at_ms(self, snapshot, quote) -> int:
         return (
             self._snapshot_quote_direct_observed_at_ms(quote)
@@ -2585,6 +3007,7 @@ class MarketDataRuntime:
         if snapshot is None:
             return []
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
+        funding_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "funding")
         liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
         fallback_source = self._snapshot_fallback_source(snapshot)
         decisions: list[dict] = []
@@ -2599,6 +3022,88 @@ class MarketDataRuntime:
                 continue
 
             quote = quote_lookup.get((venue, symbol))
+            funding_row = funding_rows.get(venue)
+            funding_budget_ms = self._snapshot_domain_budget_ms(
+                "funding",
+                funding_row,
+            )
+            if quote is None:
+                decisions.append(
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "domain": "funding",
+                        "source": "sidecar_funding",
+                        "observed_at_ms": 0,
+                        "age_ms": 0,
+                        "budget_ms": funding_budget_ms,
+                        "decision": "skip_entry",
+                        "fallback_source": fallback_source,
+                        "reason": "missing_funding_rate_evidence",
+                        "blocking": True,
+                    }
+                )
+            else:
+                funding_observed_at_ms = _evidence_clock_or_zero(
+                    getattr(quote, "funding_rate_observed_at_ms", 0)
+                )
+                funding_received_at_ms = _evidence_clock_or_zero(
+                    getattr(quote, "funding_rate_received_at_ms", 0)
+                )
+                funding_event_at_ms = _evidence_clock_or_zero(
+                    getattr(quote, "funding_rate_event_at_ms", 0)
+                )
+                funding_age_ms = (
+                    max(now_ms - funding_observed_at_ms, 0)
+                    if funding_observed_at_ms > 0
+                    else 0
+                )
+                funding_rate = getattr(quote, "funding_rate_bps", None)
+                funding_source = str(
+                    getattr(quote, "funding_rate_source", "") or ""
+                )
+                funding_sample_id = str(
+                    getattr(quote, "funding_rate_sample_id", "") or ""
+                )
+                proof_reason = funding_rate_evidence_reason(
+                    venue=venue,
+                    symbol=symbol,
+                    rate_bps=funding_rate,
+                    funding_timestamp_ms=getattr(
+                        quote, "funding_timestamp_ms", 0
+                    ),
+                    observed_at_ms=funding_observed_at_ms,
+                    event_at_ms=funding_event_at_ms,
+                    received_at_ms=funding_received_at_ms,
+                    source=funding_source,
+                    sample_id=funding_sample_id,
+                    decision_at_ms=now_ms,
+                )
+                funding_reason = (
+                    "invalid_funding_rate_evidence" if proof_reason else ""
+                )
+                if not funding_reason and funding_age_ms > funding_budget_ms:
+                    funding_reason = "funding_rate_stale"
+                if funding_reason:
+                    decisions.append(
+                        {
+                            "venue": venue,
+                            "symbol": symbol,
+                            "domain": "funding",
+                            "source": funding_source or "sidecar_funding",
+                            "sample_id": funding_sample_id,
+                            "event_at_ms": funding_event_at_ms,
+                            "received_at_ms": funding_received_at_ms,
+                            "observed_at_ms": funding_observed_at_ms,
+                            "age_ms": funding_age_ms,
+                            "budget_ms": funding_budget_ms,
+                            "decision": "skip_entry",
+                            "fallback_source": fallback_source,
+                            "reason": funding_reason,
+                            "evidence_reason": proof_reason,
+                            "blocking": True,
+                        }
+                    )
             quote_budget_ms = self._snapshot_domain_budget_ms("quote")
             if quote is None:
                 decisions.append({
@@ -2803,6 +3308,7 @@ class MarketDataRuntime:
         now_ms: int,
         evidence_role: str = "entry_execution",
         candidate_scope: str = "",
+        evidence_coordinator: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         stats = {
             "evidence_role": evidence_role,
@@ -2815,13 +3321,14 @@ class MarketDataRuntime:
             "unsupported_count": 0,
             "timeout_count": 0,
             "entry_evidence_deadline_exceeded_count": 0,
+            "superseded_by_ready_candidate_count": 0,
+            "deferred_count": 0,
             "blocked_after_targeted_refresh_count": 0,
             "targets": [],
         }
         if (
             not candidates
             or snapshot is None
-            or self.ctx.config.runtime.mode != "live"
             or not self.ctx.config.strategy.execution_liquidity_enabled
         ):
             return stats
@@ -2848,6 +3355,10 @@ class MarketDataRuntime:
             )
         targets: list[tuple[str, str, Any, str]] = []
         seen: set[tuple[str, str]] = set()
+        target_candidate_identities: dict[
+            tuple[str, str],
+            dict[str, set[str]],
+        ] = {}
         for candidate in list(candidates or []):
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
             if not symbol:
@@ -2864,16 +3375,39 @@ class MarketDataRuntime:
                 if callable(floor_getter) and floor_getter(venue) <= 0.0:
                     continue
                 key = (venue, symbol)
-                if key in seen:
-                    continue
                 quote = quote_lookup.get(key)
                 if quote is None:
+                    continue
+                identities = target_candidate_identities.setdefault(
+                    key,
+                    {
+                        "candidate_revision_ids": set(),
+                        "opportunity_lease_ids": set(),
+                    },
+                )
+                candidate_revision_id = str(
+                    getattr(candidate, "candidate_revision_id", "") or ""
+                ).strip()
+                opportunity_lease_id = str(
+                    getattr(candidate, "opportunity_lease_id", "") or ""
+                ).strip()
+                if candidate_revision_id:
+                    identities["candidate_revision_ids"].add(candidate_revision_id)
+                if opportunity_lease_id:
+                    identities["opportunity_lease_ids"].add(opportunity_lease_id)
+                if key in seen:
                     continue
                 evidence_status = normalize_open_interest_status(
                     getattr(quote, "open_interest_evidence_status", "unavailable")
                 )
                 observed_at_ms = int(
                     getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                )
+                received_at_ms = int(
+                    getattr(quote, "open_interest_received_at_ms", 0) or 0
+                )
+                event_at_ms = int(
+                    getattr(quote, "open_interest_event_at_ms", 0) or 0
                 )
                 oi_max_age_ms = max(
                     int(
@@ -2886,10 +3420,12 @@ class MarketDataRuntime:
                     ),
                     1,
                 )
-                evidence_is_fresh = bool(
-                    observed_at_ms > 0
-                    and observed_at_ms <= now_ms
-                    and now_ms - observed_at_ms <= oi_max_age_ms
+                evidence_is_fresh = open_interest_timestamps_are_fresh(
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=received_at_ms,
+                    event_at_ms=event_at_ms,
+                    now_ms=now_ms,
+                    max_age_ms=oi_max_age_ms,
                 )
                 if (
                     evidence_status == "observed"
@@ -2900,16 +3436,53 @@ class MarketDataRuntime:
                 seen.add(key)
                 targets.append((venue, symbol, quote, evidence_status))
 
+        def _target_candidate_identity_fields(
+            venue: str,
+            symbol: str,
+        ) -> dict[str, Any]:
+            identities = target_candidate_identities.get((venue, symbol), {})
+            revision_ids = sorted(identities.get("candidate_revision_ids", set()))
+            lease_ids = sorted(identities.get("opportunity_lease_ids", set()))
+            limit = 24
+            fields: dict[str, Any] = {
+                "candidate_revision_ids": revision_ids[:limit],
+                "candidate_revision_ids_suppressed_count": max(
+                    len(revision_ids) - limit,
+                    0,
+                ),
+                "opportunity_lease_ids": lease_ids[:limit],
+                "opportunity_lease_ids_suppressed_count": max(
+                    len(lease_ids) - limit,
+                    0,
+                ),
+            }
+            # Preserve the established scalar leaf for the common one-candidate
+            # target without misrepresenting a shared target as one candidate.
+            if len(revision_ids) == 1:
+                fields["candidate_revision_id"] = revision_ids[0]
+            if len(lease_ids) == 1:
+                fields["opportunity_lease_id"] = lease_ids[0]
+            return fields
+
         stats["target_count"] = len(targets)
         stats["targets"] = [
             {
                 "venue": venue,
                 "symbol": symbol,
                 "open_interest_evidence_status": status,
+                **_target_candidate_identity_fields(venue, symbol),
             }
             for venue, symbol, _quote, status in targets[:24]
         ]
         if not targets:
+            if evidence_coordinator is not None:
+                for candidate_index, _candidate in enumerate(candidates):
+                    _mark_entry_evidence_domain_state(
+                        evidence_coordinator,
+                        domain="open_interest",
+                        candidate_index=candidate_index,
+                        state="ready",
+                    )
             if evidence_role == "prewarm_only":
                 self.ctx.state.last_scan["oi_prewarm_extra_candidate_count"] = stats[
                     "candidate_count"
@@ -2984,14 +3557,60 @@ class MarketDataRuntime:
             payload = {
                 "venue": venue,
                 "symbol": symbol,
+                "blocking_stage": "entry_oi_revalidation",
+                "blocking_domain": "open_interest",
+                "blocking_status": status,
+                "blocking_reason": reason if status != "observed" else "",
+                "sample_id": str(
+                    (result or {}).get("open_interest_sample_id", "") or ""
+                ),
                 "previous_open_interest_evidence_status": previous_status,
                 "open_interest_evidence_status": status,
                 "open_interest_evidence_reason": reason,
                 "open_interest_quote": open_interest_quote,
                 "elapsed_ms": elapsed_ms,
+                "oi_dns_ms": (result or {}).get("oi_dns_ms"),
+                "oi_connect_ms": int((result or {}).get("oi_connect_ms", 0) or 0),
+                "oi_pool_wait_ms": int(
+                    (result or {}).get("oi_pool_wait_ms", 0) or 0
+                ),
+                "oi_rate_limit_wait_ms": int(
+                    (result or {}).get("oi_rate_limit_wait_ms", 0) or 0
+                ),
+                "oi_transport_total_ms": int(
+                    (result or {}).get("oi_transport_total_ms", 0) or 0
+                ),
+                "oi_http_ms": int((result or {}).get("oi_http_ms", 0) or 0),
+                "oi_parse_ms": int((result or {}).get("oi_parse_ms", 0) or 0),
+                "oi_dns_timing_status": str(
+                    (result or {}).get("oi_dns_timing_status", "unavailable")
+                    or "unavailable"
+                ),
+                "oi_scheduler_inflight_count": int(
+                    (result or {}).get("inflight_count", 0) or 0
+                ),
+                "oi_scheduler_queued_count": int(
+                    (result or {}).get("queued_count", 0) or 0
+                ),
+                "oi_scheduler_max_inflight": int(
+                    (result or {}).get("max_inflight", 0) or 0
+                ),
+                "oi_scheduler_oldest_age_ms": int(
+                    (result or {}).get("oldest_age_ms", 0) or 0
+                ),
+                "oi_scheduler_reused_count": int(
+                    (result or {}).get("reused_count", 0) or 0
+                ),
+                "oi_scheduler_deferred_count": int(
+                    (result or {}).get("deferred_count", 0) or 0
+                ),
+                "oi_scheduler_cancelled_count": int(
+                    (result or {}).get("cancelled_count", 0) or 0
+                ),
                 "candidate_scope": candidate_scope,
                 "evidence_role": evidence_role,
                 "ts_ms": now_ms,
+                **_target_candidate_identity_fields(venue, symbol),
             }
             if status == "observed" and open_interest_quote is not None:
                 quote.open_interest = open_interest_quote
@@ -2999,6 +3618,7 @@ class MarketDataRuntime:
                 quote.open_interest_evidence_reason = reason or "targeted_refresh"
                 for field in (
                     "open_interest_observed_at_ms",
+                    "open_interest_event_at_ms",
                     "open_interest_received_at_ms",
                     "open_interest_source",
                     "open_interest_sample_id",
@@ -3039,12 +3659,66 @@ class MarketDataRuntime:
                         stats["entry_evidence_deadline_exceeded_count"] += 1
                 if status == "unsupported":
                     stats["unsupported_count"] += 1
+                if reason == "entry_evidence_scheduler_capacity_exceeded":
+                    stats["deferred_count"] += 1
                 self.ctx.journal.append(
                     "runtime.entry_oi_targeted_refresh_failed",
                     payload,
                 )
 
-        if callable(batch_refresh):
+        def _candidate_oi_ready(candidate) -> bool:
+            """Whether every OI-required leg has fresh observed evidence now."""
+            symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+            if not symbol:
+                return False
+            current_now_ms = wall_clock_now_ms()
+            for venue_attr in ("long_venue", "short_venue"):
+                venue = str(
+                    getattr(candidate, venue_attr, "") or ""
+                ).strip().lower()
+                if venue not in EntryOpenInterestRefresher.SUPPORTED_VENUES:
+                    continue
+                floor_getter = getattr(
+                    self.ctx,
+                    "_entry_liquidity_open_interest_floor_quote",
+                    None,
+                )
+                if callable(floor_getter) and floor_getter(venue) <= 0.0:
+                    continue
+                quote = quote_lookup.get((venue, symbol))
+                if quote is None:
+                    return False
+                status = normalize_open_interest_status(
+                    getattr(quote, "open_interest_evidence_status", "unavailable")
+                )
+                observed_at_ms = int(
+                    getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                )
+                received_at_ms = int(
+                    getattr(quote, "open_interest_received_at_ms", 0) or 0
+                )
+                event_at_ms = int(
+                    getattr(quote, "open_interest_event_at_ms", 0) or 0
+                )
+                if (
+                    status != "observed"
+                    or not open_interest_timestamps_are_fresh(
+                        observed_at_ms=observed_at_ms,
+                        received_at_ms=received_at_ms,
+                        event_at_ms=event_at_ms,
+                        now_ms=current_now_ms,
+                        max_age_ms=oi_max_age_ms,
+                    )
+                ):
+                    return False
+            return True
+
+        # Batch-only test doubles retain compatibility, but production uses
+        # target-isolated singleflight.  A slow symbol must not convert every
+        # symbol at the venue into the same synthetic timeout.
+        if callable(batch_refresh) and not isinstance(
+            refresher, EntryOpenInterestRefresher
+        ):
             grouped: dict[str, list[tuple[str, Any, str]]] = {}
             for venue, symbol, quote, previous_status in targets:
                 grouped.setdefault(venue, []).append((symbol, quote, previous_status))
@@ -3077,10 +3751,11 @@ class MarketDataRuntime:
                         for symbol in symbols
                     }
                 except Exception as exc:  # pragma: no cover - defensive telemetry
+                    status = _open_interest_exception_status(exc)
                     batch_results = {
                         symbol: {
                             "open_interest_quote": None,
-                            "open_interest_evidence_status": "timeout",
+                            "open_interest_evidence_status": status,
                             "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
                         }
                         for symbol in symbols
@@ -3121,14 +3796,48 @@ class MarketDataRuntime:
                 loop = asyncio.get_running_loop()
                 started_monotonic = loop.time()
                 try:
-                    result = await asyncio.wait_for(
-                        refresh(
+                    force_refresh = (venue, symbol) in structural_probe_due
+                    if force_refresh:
+                        # Throttle the *attempt*, not only successful low/high
+                        # observations.  A timeout/rate-limit must not cause a
+                        # structural target to force-refresh again every tick.
+                        probe_started_at_ms = wall_clock_now_ms()
+                        for record in (
+                            getattr(
+                                self.ctx.state,
+                                "entry_liquidity_qualification_records",
+                                [],
+                            )
+                            or []
+                        ):
+                            if not isinstance(record, dict):
+                                continue
+                            if (
+                                str(record.get("venue", "") or "").lower()
+                                == venue
+                                and str(record.get("symbol", "") or "").upper()
+                                == symbol
+                            ):
+                                record["last_structural_probe_at_ms"] = (
+                                    probe_started_at_ms
+                                )
+                                break
+                    try:
+                        refresh_coro = refresh(
                             venue,
                             symbol,
                             now_ms=wall_clock_now_ms(),
-                        ),
-                        timeout=0.750,
-                    )
+                            force_refresh=force_refresh,
+                            max_age_ms=oi_max_age_ms,
+                        )
+                    except TypeError:
+                        # Compatibility for injected legacy/test refreshers.
+                        refresh_coro = refresh(
+                            venue,
+                            symbol,
+                            now_ms=wall_clock_now_ms(),
+                        )
+                    result = await asyncio.wait_for(refresh_coro, timeout=0.750)
                 except asyncio.TimeoutError:
                     result = {
                         "open_interest_quote": None,
@@ -3138,10 +3847,12 @@ class MarketDataRuntime:
                         ),
                     }
                 except Exception as exc:  # pragma: no cover - defensive telemetry
+                    status = _open_interest_exception_status(exc)
                     result = {
                         "open_interest_quote": None,
-                        "open_interest_evidence_status": "timeout",
+                        "open_interest_evidence_status": status,
                         "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                        **_open_interest_exception_phase_timings(exc),
                     }
                 elapsed_ms = max(
                     int((loop.time() - started_monotonic) * 1_000),
@@ -3156,33 +3867,166 @@ class MarketDataRuntime:
                     elapsed_ms,
                 )
 
-            target_results = await asyncio.gather(
-                *(
-                    _refresh_single_target(
-                        venue,
-                        symbol,
-                        quote,
-                        previous_status,
+            target_rows = {
+                (venue, symbol): (venue, symbol, quote, previous_status)
+                for venue, symbol, quote, previous_status in targets
+            }
+            queued_keys = list(target_rows)
+            target_tasks: dict[tuple[str, str], asyncio.Task] = {}
+            task_keys: dict[asyncio.Task, tuple[str, str]] = {}
+            # Top-K already bounds this fan-out.  Start every target so a slow
+            # venue/symbol cannot occupy a global FIFO and prevent unrelated
+            # evidence from even being requested before the 750ms deadline.
+            max_in_flight = max(len(target_rows), 1)
+
+            def _launch_more_targets() -> None:
+                while queued_keys and len(task_keys) < max_in_flight:
+                    key = queued_keys.pop(0)
+                    venue, symbol, quote, previous_status = target_rows[key]
+                    task = asyncio.create_task(
+                        _refresh_single_target(
+                            venue,
+                            symbol,
+                            quote,
+                            previous_status,
+                        ),
+                        name=f"entry-oi-target:{venue}:{symbol}",
                     )
-                    for venue, symbol, quote, previous_status in targets
+                    target_tasks[key] = task
+                    task_keys[task] = key
+
+            _launch_more_targets()
+            target_keys = set(target_rows)
+            completed_keys: set[tuple[str, str]] = set()
+
+            def _highest_resolved_candidate_is_ready() -> bool:
+                selection_ready = False
+                for candidate_index, candidate in enumerate(candidates):
+                    symbol = str(
+                        getattr(candidate, "symbol", "") or ""
+                    ).strip().upper()
+                    unresolved = False
+                    for venue_attr in ("long_venue", "short_venue"):
+                        venue = str(
+                            getattr(candidate, venue_attr, "") or ""
+                        ).strip().lower()
+                        key = (venue, symbol)
+                        if key in target_keys and key not in completed_keys:
+                            unresolved = True
+                            break
+                    if unresolved:
+                        return selection_ready
+                    candidate_ready = _candidate_oi_ready(candidate)
+                    if evidence_coordinator is not None:
+                        selection_ready = (
+                            _mark_entry_evidence_domain_state(
+                                evidence_coordinator,
+                                domain="open_interest",
+                                candidate_index=candidate_index,
+                                state="ready" if candidate_ready else "failed",
+                            )
+                            or selection_ready
+                        )
+                    # Standalone domain refresh has no cross-domain economic
+                    # validator, so evidence-ready cannot authorize pruning.
+                    # This higher-ranked candidate is fully resolved but
+                    # failed OI evidence; continue to the next ranked row.
+                return selection_ready
+
+            deadline = asyncio.get_running_loop().time() + 0.750
+            pending = set(target_tasks.values())
+            _highest_resolved_candidate_is_ready()
+            while pending:
+                remaining_s = max(deadline - asyncio.get_running_loop().time(), 0.0)
+                if remaining_s <= 0.0:
+                    break
+                done, _still_pending = await asyncio.wait(
+                    pending,
+                    timeout=remaining_s,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            )
-            for (
-                venue,
-                symbol,
-                quote,
-                previous_status,
-                result,
-                elapsed_ms,
-            ) in target_results:
+                if not done:
+                    break
+                pending.difference_update(done)
+                for task in done:
+                    key = task_keys.pop(task)
+                    try:
+                        (
+                            venue,
+                            symbol,
+                            quote,
+                            previous_status,
+                            result,
+                            elapsed_ms,
+                        ) = task.result()
+                    except asyncio.CancelledError:
+                        continue
+                    _apply_refresh_result(
+                        venue=venue,
+                        symbol=symbol,
+                        quote=quote,
+                        previous_status=previous_status,
+                        result=result,
+                        default_elapsed_ms=elapsed_ms,
+                    )
+                    completed_keys.add(key)
+                _highest_resolved_candidate_is_ready()
+                _launch_more_targets()
+                pending.update(task_keys)
+
+            timed_out_tasks = list(pending)
+            for task in timed_out_tasks:
+                task.cancel()
+            if timed_out_tasks:
+                await asyncio.gather(*timed_out_tasks, return_exceptions=True)
+            for task in timed_out_tasks:
+                key = task_keys.get(task)
+                if key is None:
+                    continue
+                venue, symbol, quote, previous_status = target_rows[key]
                 _apply_refresh_result(
                     venue=venue,
                     symbol=symbol,
                     quote=quote,
                     previous_status=previous_status,
-                    result=result,
-                    default_elapsed_ms=elapsed_ms,
+                    result={
+                        "open_interest_quote": None,
+                        "open_interest_evidence_status": "timeout",
+                        "open_interest_evidence_reason": (
+                            "entry_evidence_deadline_exceeded"
+                        ),
+                    },
+                    default_elapsed_ms=750,
                 )
+                completed_keys.add(key)
+            for key in queued_keys:
+                venue, symbol, quote, previous_status = target_rows[key]
+                quote.open_interest = None
+                quote.open_interest_evidence_status = "deferred"
+                quote.open_interest_evidence_reason = (
+                    "entry_evidence_deadline_deferred"
+                )
+                stats["failed_count"] += 1
+                stats["blocked_after_targeted_refresh_count"] += 1
+                stats["deferred_count"] += 1
+                completed_keys.add(key)
+                self.ctx.journal.append(
+                    "runtime.entry_oi_targeted_refresh_deferred",
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "blocking_stage": "entry_oi_revalidation",
+                        "blocking_domain": "open_interest",
+                        "blocking_status": "deferred",
+                        "blocking_reason": "entry_evidence_deadline_deferred",
+                        "previous_open_interest_evidence_status": previous_status,
+                        "candidate_scope": candidate_scope,
+                        "evidence_role": evidence_role,
+                        "ts_ms": wall_clock_now_ms(),
+                        **_target_candidate_identity_fields(venue, symbol),
+                    },
+                )
+            _highest_resolved_candidate_is_ready()
 
         if evidence_role == "prewarm_only":
             self.ctx.state.last_scan["oi_prewarm_extra_candidate_scope"] = candidate_scope
@@ -3219,6 +4063,12 @@ class MarketDataRuntime:
             ]
             self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
                 "timeout_count"
+            ]
+            self.ctx.state.last_scan[
+                "oi_targeted_refresh_superseded_count"
+            ] = stats["superseded_by_ready_candidate_count"]
+            self.ctx.state.last_scan["oi_targeted_refresh_deferred_count"] = stats[
+                "deferred_count"
             ]
             self.ctx.state.last_scan[
                 "oi_entry_evidence_deadline_exceeded_count"
@@ -3462,7 +4312,7 @@ class MarketDataRuntime:
             self.ctx.config.runtime.max_market_age_ms or snapshot_max_age_ms
         )
         stale_overages: list[int] = []
-        published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
+        published_at_ms = self._snapshot_publication_at_ms(snapshot)
         market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
         if published_at_ms > 0:
             snapshot_publish_age_ms = max(now_ms - published_at_ms, 0)
@@ -3556,7 +4406,7 @@ class MarketDataRuntime:
             0,
         )
         snapshot_publish_age_ms = max(
-            now_ms - int(getattr(snapshot, "published_at_ms", 0) or 0),
+            now_ms - self._snapshot_publication_at_ms(snapshot),
             0,
         )
         for candidate in candidates:
@@ -3690,12 +4540,14 @@ class MarketDataRuntime:
     def _snapshot_freshness_decision_log_key(
         self,
         payload: dict,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, str, str, str, str, str]:
         return (
             str(payload.get("venue", "") or "").lower(),
             str(payload.get("symbol", "") or "").upper(),
             str(payload.get("domain", "") or ""),
             str(payload.get("reason", "") or payload.get("decision", "") or ""),
+            str(payload.get("candidate_revision_id", "") or ""),
+            str(payload.get("opportunity_lease_id", "") or ""),
         )
 
     def _append_snapshot_freshness_decision_event(
@@ -3706,6 +4558,20 @@ class MarketDataRuntime:
         now_ms: int,
     ) -> None:
         key = self._snapshot_freshness_decision_log_key(payload)
+        # Revisions and leases make the diagnostic exact, but they also make
+        # the key space generation-shaped.  Keep the rate-limit state bounded
+        # so a long-running process cannot retain every expired opportunity.
+        max_keys = 4_096
+        if (
+            key not in self._snapshot_freshness_decision_last_emit_ms
+            and len(self._snapshot_freshness_decision_last_emit_ms) >= max_keys
+        ):
+            oldest_key = min(
+                self._snapshot_freshness_decision_last_emit_ms,
+                key=self._snapshot_freshness_decision_last_emit_ms.get,
+            )
+            self._snapshot_freshness_decision_last_emit_ms.pop(oldest_key, None)
+            self._snapshot_freshness_decision_suppressed.pop(oldest_key, None)
         last_emit_ms = self._snapshot_freshness_decision_last_emit_ms.get(key)
         suppressed = int(self._snapshot_freshness_decision_suppressed.get(key, 0))
         due = (
@@ -3739,10 +4605,16 @@ class MarketDataRuntime:
         budgets: dict | None = None,
         publish_intervals: dict | None = None,
         entry_quote_truth_overlay: dict[tuple[str, str], Any] | None = None,
+        record_result: bool = True,
+        emit_events: bool = True,
+        mutate_liquidity_state: bool = True,
     ) -> list:
         filtered = []
-        self._last_snapshot_freshness_filter_blockers = Counter()
-        self._last_snapshot_freshness_filter_samples = []
+        blockers: Counter[str] = Counter()
+        samples: list[dict[str, Any]] = []
+        if record_result:
+            self._last_snapshot_freshness_filter_blockers = blockers
+            self._last_snapshot_freshness_filter_samples = samples
         fallback_duration_ms = self._snapshot_fallback_duration_ms(
             snapshot=snapshot,
             now_ms=now_ms,
@@ -3752,7 +4624,9 @@ class MarketDataRuntime:
                 candidate,
                 snapshot=snapshot,
                 now_ms=now_ms,
-                record_liquidity_qualification=True,
+                record_liquidity_qualification=(
+                    record_result and mutate_liquidity_state
+                ),
                 entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             if not decisions:
@@ -3793,15 +4667,31 @@ class MarketDataRuntime:
                 payload["fallback_duration_ms"] = fallback_duration_ms
                 payload["blocked"] = blocked
                 payload["block_reason"] = reason if blocked else ""
-                self._append_snapshot_freshness_decision_event(
-                    payload=payload,
-                    event_kind=event_kind,
-                    now_ms=now_ms,
+                payload.update(
+                    {
+                        "blocking_stage": "entry_snapshot_freshness",
+                        "blocking_domain": str(failure.get("domain", "")),
+                        "blocking_status": str(failure.get("decision", "")),
+                        "blocking_reason": reason if blocked else "",
+                        "sample_id": str(failure.get("sample_id", "") or ""),
+                        "candidate_revision_id": str(
+                            getattr(candidate, "candidate_revision_id", "") or ""
+                        ),
+                        "opportunity_lease_id": str(
+                            getattr(candidate, "opportunity_lease_id", "") or ""
+                        ),
+                    }
                 )
+                if record_result and emit_events:
+                    self._append_snapshot_freshness_decision_event(
+                        payload=payload,
+                        event_kind=event_kind,
+                        now_ms=now_ms,
+                    )
                 if failure.get("decision") == "skip_entry":
                     blocking = True
-                    self._last_snapshot_freshness_filter_blockers[reason] += 1
-                    if len(self._last_snapshot_freshness_filter_samples) < 24:
+                    blockers[reason] += 1
+                    if len(samples) < 24:
                         sample = {
                             "pair_id": pair_id,
                             "candidate_pair_id": pair_id,
@@ -3817,9 +4707,20 @@ class MarketDataRuntime:
                             "block_reason": reason,
                             "age_ms": int(failure.get("age_ms", 0) or 0),
                             "budget_ms": int(failure.get("budget_ms", 0) or 0),
+                            "blocking_stage": "entry_snapshot_freshness",
+                            "blocking_domain": str(failure.get("domain", "")),
+                            "blocking_status": str(failure.get("decision", "")),
+                            "blocking_reason": reason,
+                            "sample_id": str(failure.get("sample_id", "") or ""),
+                            "candidate_revision_id": str(
+                                getattr(candidate, "candidate_revision_id", "") or ""
+                            ),
+                            "opportunity_lease_id": str(
+                                getattr(candidate, "opportunity_lease_id", "") or ""
+                            ),
                         }
                         sample.update(self._snapshot_freshness_evidence_fields(failure))
-                        self._last_snapshot_freshness_filter_samples.append(sample)
+                        samples.append(sample)
             if not blocking:
                 filtered.append(candidate)
         return filtered
@@ -3847,7 +4748,7 @@ class MarketDataRuntime:
                 if venue:
                     per_venue_candidate_count[venue] += 1
 
-        published_at_ms = int(getattr(snapshot, "published_at_ms", 0) or 0)
+        published_at_ms = self._snapshot_publication_at_ms(snapshot)
         market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
         snapshot_publish_age_ms = now_ms - published_at_ms if published_at_ms > 0 else 0
         market_observed_age_ms = (

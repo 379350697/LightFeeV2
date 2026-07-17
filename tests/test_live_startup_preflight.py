@@ -41,6 +41,7 @@ from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
@@ -165,7 +166,7 @@ def _admissible_dispatch_candidate(
     long_venue: str,
     short_venue: str,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    candidate = SimpleNamespace(
         symbol=symbol,
         long_venue=long_venue,
         short_venue=short_venue,
@@ -200,6 +201,43 @@ def _admissible_dispatch_candidate(
         blocked=False,
         blocked_reasons=[],
     )
+    candidate.candidate_revision_id = (
+        f"test-revision:{symbol}:{long_venue}:{short_venue}:1778787000000"
+    )
+    def oi_leg(venue: str) -> dict:
+        source = "test_fixture"
+        value_quote = 2_000_000.0
+        return {
+            "venue": venue,
+            "canonical_symbol": symbol,
+            "venue_symbol": symbol,
+            "status": "observed",
+            "observed_at_ms": 1778787000000,
+            "event_at_ms": 0,
+            "received_at_ms": 1778787000000,
+            "sample_id": open_interest_sample_id(
+                venue=venue,
+                canonical_symbol=symbol,
+                venue_symbol=symbol,
+                observed_at_ms=1778787000000,
+                source=source,
+                raw_value=value_quote,
+                value_quote=value_quote,
+            ),
+            "value_quote": value_quote,
+            "raw_value": value_quote,
+            "raw_unit": "quote",
+            "source": source,
+            "contract_multiplier": 1.0,
+            "conversion_mark_price": None,
+        }
+
+    candidate.entry_open_interest_evidence = {
+        "candidate_revision_id": candidate.candidate_revision_id,
+        "long": oi_leg(long_venue),
+        "short": oi_leg(short_venue),
+    }
+    return candidate
 
 
 class _StaticFinalQuoteLeaseProvider:
@@ -225,6 +263,10 @@ class _StaticFinalQuoteLeaseProvider:
             created_at_ms=1778787000000,
             expires_at_ms=1778787005000,
             provider="quote_lease",
+            candidate_revision_id=(
+                f"test-revision:{symbol.upper()}:{long_venue}:{short_venue}:"
+                "1778787000000"
+            ),
         )
 
 
@@ -2730,6 +2772,93 @@ class TestRuntimePreflight:
             assert truth["open_orders"] == []
             adapter = runtime._venue_adapters[Venue.ASTER]
             assert adapter.open_order_symbol is None
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_truth_collector_has_no_entry_deadline(
+        self, monkeypatch,
+    ):
+        """Shared recovery truth must not inherit funding-entry time budgets."""
+
+        class AsterAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        async def forbidden_wait_for(awaitable, **_kwargs):
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise AssertionError("shared recovery truth must not use wait_for")
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={
+                    Venue.ASTER: AsterAccountTruthAdapter(Venue.ASTER),
+                },
+            )
+            monkeypatch.setattr(
+                "lightfee.engine.recovery_startup_runtime.asyncio.wait_for",
+                forbidden_wait_for,
+            )
+
+            truth = await runtime._collect_recovery_ledger_account_truth(
+                1700000005000
+            )
+
+            assert truth["truth_supported"] is True
+            assert truth["truth_available"] is True
+            assert truth["errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_truth_rejects_unknown_bulk_positions(self):
+        class UnknownPositionsAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return None
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={
+                    Venue.ASTER: UnknownPositionsAdapter(Venue.ASTER),
+                },
+            )
+
+            truth = await runtime._collect_recovery_ledger_account_truth(
+                1700000005000
+            )
+
+            assert truth["truth_available"] is False
+            assert any("positions" in error for error in truth["errors"])
+
+    @pytest.mark.asyncio
+    async def test_runtime_account_truth_rejects_unknown_open_orders(self):
+        class UnknownOpenOrdersAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return None
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={
+                    Venue.ASTER: UnknownOpenOrdersAdapter(Venue.ASTER),
+                },
+            )
+
+            truth = await runtime._collect_recovery_ledger_account_truth(
+                1700000005000
+            )
+
+            assert truth["truth_available"] is False
+            assert any("open_orders" in error for error in truth["errors"])
 
     @pytest.mark.asyncio
     async def test_runtime_unpaired_live_position_flat_truth_requires_open_order_truth(self):

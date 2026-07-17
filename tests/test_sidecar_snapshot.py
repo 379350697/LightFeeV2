@@ -10,7 +10,16 @@ import pytest
 from lightfee.config.schema import StrategyConfig
 from lightfee.ops.production_health import analyze_sidecar_snapshot
 from lightfee.sidecar.pairing import check_stale_snapshot
-from lightfee.sidecar.publisher import _dict_to_snapshot, load_snapshot, publish_snapshot
+from lightfee.sidecar.publisher import (
+    _dict_to_snapshot,
+    funding_entry_snapshot_identity,
+    funding_entry_snapshot_manifest_path,
+    funding_entry_snapshot_path,
+    load_funding_entry_snapshot,
+    load_snapshot,
+    publish_funding_entry_snapshot,
+    publish_snapshot,
+)
 from lightfee.sidecar.snapshot import (
     CandidateInput,
     FundingLifecycle,
@@ -18,6 +27,8 @@ from lightfee.sidecar.snapshot import (
     MarketLifecycle,
     QuoteSnapshot,
     SidecarSnapshot,
+    SnapshotFreshness,
+    decide_snapshot_freshness,
     validate_v4_snapshot_contract,
 )
 from lightfee.strategy.discovery import discover_tradeable_candidates
@@ -30,11 +41,7 @@ def _v3_snapshot_proof(
     input_quote_count: int = 0,
     output_candidate_count: int = 0,
 ) -> dict:
-    market_at_ms = (
-        published_at_ms
-        if market_observed_at_ms is None
-        else market_observed_at_ms
-    )
+    market_at_ms = published_at_ms if market_observed_at_ms is None else market_observed_at_ms
     lifecycle_kwargs = {
         "venue": "binance",
         "observed_at_ms": market_at_ms,
@@ -58,12 +65,8 @@ def _v3_snapshot_proof(
         },
         "source_mode": "direct_market",
         "acquisition_mode": "fresh_sidecar",
-        "funding_lifecycle": (
-            [FundingLifecycle(**lifecycle_kwargs)] if input_quote_count else []
-        ),
-        "market_lifecycle": (
-            [MarketLifecycle(**lifecycle_kwargs)] if input_quote_count else []
-        ),
+        "funding_lifecycle": ([FundingLifecycle(**lifecycle_kwargs)] if input_quote_count else []),
+        "market_lifecycle": ([MarketLifecycle(**lifecycle_kwargs)] if input_quote_count else []),
         "liquidity_lifecycle": (
             [LiquidityLifecycle(**lifecycle_kwargs)] if input_quote_count else []
         ),
@@ -187,9 +190,7 @@ class TestPublisher:
         quotes["binance:BTCUSDT"]["quantity_precision"] = 0
         quotes["okx:BTCUSDT"]["quantity_precision"] = 0
 
-        snapshot = _dict_to_snapshot(
-            {"schema_version": 4, "quotes": quotes, "candidates": [raw]}
-        )
+        snapshot = _dict_to_snapshot({"schema_version": 4, "quotes": quotes, "candidates": [raw]})
 
         assert snapshot.candidates[0].economics_complete is True
 
@@ -229,9 +230,7 @@ class TestPublisher:
             "v3_edge_formula_mismatch:expected_net_edge_bps"
         )
         assert candidate.blocked is True
-        assert "v3_edge_formula_mismatch:expected_net_edge_bps" in (
-            candidate.blocked_reasons
-        )
+        assert "v3_edge_formula_mismatch:expected_net_edge_bps" in (candidate.blocked_reasons)
 
     def test_schema_v3_cannot_hide_leg_fees_behind_zero_aggregates(self):
         raw = self._complete_v3_candidate()
@@ -249,9 +248,7 @@ class TestPublisher:
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
         assert candidate.blocked is True
-        assert candidate.economics_incomplete_reason == (
-            "v3_fee_contract_mismatch:entry_fee_bps"
-        )
+        assert candidate.economics_incomplete_reason == ("v3_fee_contract_mismatch:entry_fee_bps")
 
     def test_schema_v3_never_credits_self_asserted_maker_rebate(self):
         raw = self._complete_v3_candidate()
@@ -304,19 +301,22 @@ class TestPublisher:
 
         assert candidate.blocked is True
         assert "incomplete_v3_economics" in candidate.blocked_reasons
-        assert discover_tradeable_candidates(
-            [candidate],
-            StrategyConfig(
-                funding_new_entries_enabled=True,
-                max_scan_minutes_before_funding=0,
-                min_scan_minutes_before_funding=0,
-                min_funding_edge_bps=0.0,
-                min_expected_edge_bps=0.0,
-                min_worst_case_edge_bps=0.0,
-            ),
-            now_ms=9_000,
-            require_complete_economics=False,
-        ) == []
+        assert (
+            discover_tradeable_candidates(
+                [candidate],
+                StrategyConfig(
+                    funding_new_entries_enabled=True,
+                    max_scan_minutes_before_funding=0,
+                    min_scan_minutes_before_funding=0,
+                    min_funding_edge_bps=0.0,
+                    min_expected_edge_bps=0.0,
+                    min_worst_case_edge_bps=0.0,
+                ),
+                now_ms=9_000,
+                require_complete_economics=False,
+            )
+            == []
+        )
 
     def test_shared_v3_contract_rejects_formula_tampering_before_paper_load(self, tmp_path):
         raw_candidate = self._complete_v3_candidate()
@@ -375,8 +375,7 @@ class TestPublisher:
         errors = validate_v4_snapshot_contract(raw)
 
         assert (
-            "candidate_economics_contract_invalid:0:"
-            "v3_edge_formula_mismatch:expected_net_edge_bps"
+            "candidate_economics_contract_invalid:0:v3_edge_formula_mismatch:expected_net_edge_bps"
         ) in errors
         path = tmp_path / "tampered-v3.json"
         path.write_text(json.dumps(raw), encoding="utf-8")
@@ -423,9 +422,7 @@ class TestPublisher:
 
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
-        assert candidate.economics_incomplete_reason == (
-            "v3_fee_contract_mismatch:entry_fee_bps"
-        )
+        assert candidate.economics_incomplete_reason == ("v3_fee_contract_mismatch:entry_fee_bps")
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -445,9 +442,7 @@ class TestPublisher:
         quotes = self._complete_v3_contract_quotes()
         quotes["binance:BTCUSDT"][field] = value
 
-        snapshot = _dict_to_snapshot(
-            {"schema_version": 4, "quotes": quotes, "candidates": [raw]}
-        )
+        snapshot = _dict_to_snapshot({"schema_version": 4, "quotes": quotes, "candidates": [raw]})
 
         assert snapshot.candidates[0].economics_complete is False
         assert snapshot.candidates[0].economics_incomplete_reason == (
@@ -559,9 +554,7 @@ class TestPublisher:
         candidate = snapshot.candidates[0]
 
         assert candidate.economics_complete is False
-        assert candidate.economics_incomplete_reason == (
-            "invalid_v3_economics_observed_at_ms"
-        )
+        assert candidate.economics_incomplete_reason == ("invalid_v3_economics_observed_at_ms")
 
     def test_schema_v3_complete_candidate_requires_contract_evidence(self):
         raw = self._complete_v3_candidate()
@@ -569,48 +562,36 @@ class TestPublisher:
 
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
-        assert candidate.economics_incomplete_reason == (
-            "missing_v3_contract_evidence:long_quote"
-        )
+        assert candidate.economics_incomplete_reason == ("missing_v3_contract_evidence:long_quote")
 
     def test_schema_v3_rejects_mismatched_contract_multiplier(self):
         raw = self._complete_v3_candidate()
         quotes = self._complete_v3_contract_quotes()
         quotes["okx:BTCUSDT"]["contract_multiplier"] = 0.01
 
-        snapshot = _dict_to_snapshot(
-            {"schema_version": 4, "quotes": quotes, "candidates": [raw]}
-        )
+        snapshot = _dict_to_snapshot({"schema_version": 4, "quotes": quotes, "candidates": [raw]})
 
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
-        assert candidate.economics_incomplete_reason == (
-            "v3_contract_evidence:multiplier_mismatch"
-        )
+        assert candidate.economics_incomplete_reason == ("v3_contract_evidence:multiplier_mismatch")
 
     def test_schema_v3_rejects_fractional_contract_precision(self):
         raw = self._complete_v3_candidate()
         quotes = self._complete_v3_contract_quotes()
         quotes["binance:BTCUSDT"]["quantity_precision"] = 1.5
 
-        snapshot = _dict_to_snapshot(
-            {"schema_version": 4, "quotes": quotes, "candidates": [raw]}
-        )
+        snapshot = _dict_to_snapshot({"schema_version": 4, "quotes": quotes, "candidates": [raw]})
 
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
-        assert candidate.economics_incomplete_reason == (
-            "invalid_v3_contract_evidence:long_quote"
-        )
+        assert candidate.economics_incomplete_reason == ("invalid_v3_contract_evidence:long_quote")
 
     def test_schema_v3_rejects_ambiguous_same_market_contract_proof(self):
         raw = self._complete_v3_candidate()
         quotes = self._complete_v3_contract_quotes()
         quotes["duplicate"] = dict(quotes["binance:BTCUSDT"])
 
-        snapshot = _dict_to_snapshot(
-            {"schema_version": 4, "quotes": quotes, "candidates": [raw]}
-        )
+        snapshot = _dict_to_snapshot({"schema_version": 4, "quotes": quotes, "candidates": [raw]})
 
         candidate = snapshot.candidates[0]
         assert candidate.economics_complete is False
@@ -1013,10 +994,7 @@ class TestPublisher:
             loaded = load_snapshot(path)
 
             assert loaded is not None
-            assert (
-                loaded.quotes["binance:BTCUSDT"].funding_forecast_started_at_ms
-                == 100_000_000
-            )
+            assert loaded.quotes["binance:BTCUSDT"].funding_forecast_started_at_ms == 100_000_000
 
     def test_quote_evidence_rejects_truthy_string_booleans(self):
         snapshot = _dict_to_snapshot(
@@ -1383,9 +1361,7 @@ class TestPublisher:
             ),
         ),
     )
-    def test_v3_shape_and_lifecycle_proof_fail_closed_everywhere(
-        self, mutation, expected_error
-    ):
+    def test_v3_shape_and_lifecycle_proof_fail_closed_everywhere(self, mutation, expected_error):
         lifecycle = [
             {
                 "venue": "binance",
@@ -1448,9 +1424,7 @@ class TestPublisher:
             raw["quotes"]["binance:BTCUSDT"]["bid"] = 50_002
         elif mutation == "diagnostics_conservation":
             raw["candidate_build_diagnostics"]["directional_pair_count"] = 2
-            raw["candidate_build_diagnostics"]["rejection_counts"] = {
-                "invalid_trade_quote": 1
-            }
+            raw["candidate_build_diagnostics"]["rejection_counts"] = {"invalid_trade_quote": 1}
         elif mutation == "invalid_rejection_entry":
             raw["candidate_build_diagnostics"]["rejection_counts"] = {"": 0}
         elif mutation == "requested_count_mismatch":
@@ -1480,12 +1454,8 @@ class TestPublisher:
             raw["candidates"] = [
                 {
                     "long_venue": "binance",
-                    "short_venue": (
-                        "binance" if mutation == "candidate_same_venue" else "okx"
-                    ),
-                    "symbol": (
-                        "BTCUSDT" if mutation == "candidate_same_venue" else "ETHUSDT"
-                    ),
+                    "short_venue": ("binance" if mutation == "candidate_same_venue" else "okx"),
+                    "symbol": ("BTCUSDT" if mutation == "candidate_same_venue" else "ETHUSDT"),
                     "funding_diff_bps": 1.0,
                     "funding_edge_bps": 1.0,
                     "expected_edge_bps": 1.0,
@@ -1497,9 +1467,7 @@ class TestPublisher:
             raw["acquisition_mode"] = "degraded_sidecar"
             raw["degraded_symbols"] = {"binance": ["ETHUSDT"]}
             raw["funding_lifecycle"][0]["coverage_usable"] = 0
-            raw["funding_lifecycle"][0]["degraded_reason"] = (
-                "ETHUSDT: funding unavailable"
-            )
+            raw["funding_lifecycle"][0]["degraded_reason"] = "ETHUSDT: funding unavailable"
         elif mutation == "duplicate_lifecycle":
             raw["funding_lifecycle"].append(deepcopy(raw["funding_lifecycle"][0]))
         elif mutation == "transfer_not_requested":
@@ -1547,9 +1515,7 @@ class TestPublisher:
             ):
                 raw[field][0]["symbol_count"] = 2
             raw["funding_lifecycle"][0]["coverage_usable"] = 1
-            raw["funding_lifecycle"][0]["degraded_reason"] = (
-                "BTCUSDT: funding unavailable"
-            )
+            raw["funding_lifecycle"][0]["degraded_reason"] = "BTCUSDT: funding unavailable"
             raw["degraded_symbols"] = {"binance": ["BTC"]}
             raw["acquisition_mode"] = "degraded_sidecar"
         elif mutation == "degraded_symbol_bare_reason":
@@ -1564,9 +1530,7 @@ class TestPublisher:
             raw["market_lifecycle"][0]["coverage_usable"] = 0
             raw["market_lifecycle"][0]["degraded_reason"] = "ETHUSDT: crossed BBO"
             raw["liquidity_lifecycle"][0]["coverage_usable"] = 0
-            raw["liquidity_lifecycle"][0]["degraded_reason"] = (
-                "BTCUSDT: crossed BBO"
-            )
+            raw["liquidity_lifecycle"][0]["degraded_reason"] = "BTCUSDT: crossed BBO"
         else:
             raw["acquisition_mode"] = "unavailable"
             raw["degraded_venues"] = ["binance"]
@@ -1636,9 +1600,14 @@ class TestV2CandidateIdentity:
 
     def test_candidate_round_trip_all_identity_fields(self):
         c = CandidateInput(
-            long_venue="binance", short_venue="okx", symbol="BTCUSDT",
-            funding_diff_bps=10.0, funding_edge_bps=10.0,
-            expected_edge_bps=5.0, worst_case_edge_bps=2.0, ranking_edge_bps=5.0,
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=10.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=5.0,
             pair_id="btcusdt:binance->okx",
             funding_timestamp_ms=1700000001000,
             first_funding_timestamp_ms=1700000001000,
@@ -1660,9 +1629,14 @@ class TestV2CandidateIdentity:
 
     def test_snapshot_serialization_includes_v2_fields(self):
         c = CandidateInput(
-            long_venue="a", short_venue="b", symbol="X",
-            funding_diff_bps=5, funding_edge_bps=5,
-            expected_edge_bps=3, worst_case_edge_bps=1, ranking_edge_bps=3,
+            long_venue="a",
+            short_venue="b",
+            symbol="X",
+            funding_diff_bps=5,
+            funding_edge_bps=5,
+            expected_edge_bps=3,
+            worst_case_edge_bps=1,
+            ranking_edge_bps=3,
             pair_id="x:a->b",
             funding_timestamp_ms=1700000001000,
             first_funding_leg="long",
@@ -1738,10 +1712,16 @@ class TestV2CandidateIdentity:
     def test_loaded_snapshot_preserves_identity(self):
         import tempfile
         from pathlib import Path
+
         c = CandidateInput(
-            long_venue="a", short_venue="b", symbol="X",
-            funding_diff_bps=5, funding_edge_bps=5,
-            expected_edge_bps=3, worst_case_edge_bps=1, ranking_edge_bps=3,
+            long_venue="a",
+            short_venue="b",
+            symbol="X",
+            funding_diff_bps=5,
+            funding_edge_bps=5,
+            expected_edge_bps=3,
+            worst_case_edge_bps=1,
+            ranking_edge_bps=3,
             pair_id="x:a->b",
             funding_timestamp_ms=1700000001000,
             first_funding_timestamp_ms=1700000001000,
@@ -1832,6 +1812,248 @@ class TestStaleness:
         assert check_stale_snapshot(1000, 500, 2000)
         assert not check_stale_snapshot(1000, 2000, 2000)
         assert check_stale_snapshot(2001, 2000, 2000)
+
+
+def test_funding_entry_snapshot_manifest_is_installed_after_bounded_payload(
+    tmp_path,
+) -> None:
+    proof = _v3_snapshot_proof(1_000, input_quote_count=1)
+    snapshot = SidecarSnapshot(
+        **proof,
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=1_000,
+            )
+        },
+    )
+    path = tmp_path / "audit.json"
+
+    manifest = publish_funding_entry_snapshot(snapshot, path)
+
+    assert manifest["schema_version"] == 6
+    assert funding_entry_snapshot_identity(path) is not None
+    assert funding_entry_snapshot_manifest_path(path).exists()
+    assert funding_entry_snapshot_path(path).stat().st_size < 1_000_000
+    loaded = load_funding_entry_snapshot(path)
+    assert loaded is not None
+    assert loaded.ready_at_ms == manifest["ready_at_ms"]
+    assert loaded.acquisition_mode == "unavailable"
+    assert loaded.quotes == {}
+
+
+def test_funding_entry_snapshot_blocked_only_generation_is_unavailable(
+    tmp_path,
+) -> None:
+    proof = _v3_snapshot_proof(
+        1_000,
+        input_quote_count=2,
+        output_candidate_count=1,
+    )
+    proof["candidate_build_diagnostics"]["requested_venues"] = ["binance", "okx"]
+    lifecycle_rows = {
+        lifecycle_type.__name__: [
+            lifecycle_type(
+                venue=venue,
+                observed_at_ms=1_000,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("binance", "okx")
+        ]
+        for lifecycle_type in (FundingLifecycle, MarketLifecycle, LiquidityLifecycle)
+    }
+    proof["funding_lifecycle"] = lifecycle_rows["FundingLifecycle"]
+    proof["market_lifecycle"] = lifecycle_rows["MarketLifecycle"]
+    proof["liquidity_lifecycle"] = lifecycle_rows["LiquidityLifecycle"]
+    snapshot = SidecarSnapshot(
+        **proof,
+        quotes={
+            f"{venue}:BTCUSDT": QuoteSnapshot(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=1_000,
+                funding_rate_bps=1.0,
+                funding_rate_observed_at_ms=1_000,
+                funding_rate_event_at_ms=1_000,
+                funding_rate_received_at_ms=1_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=f"funding:{venue}:BTCUSDT:1000:1:2000",
+                funding_timestamp_ms=2_000,
+                funding_interval_ms=28_800_000,
+            )
+            for venue in ("binance", "okx")
+        },
+        candidates=[
+            CandidateInput(
+                long_venue="binance",
+                short_venue="okx",
+                symbol="BTCUSDT",
+                funding_diff_bps=1.0,
+                funding_edge_bps=1.0,
+                expected_edge_bps=0.0,
+                worst_case_edge_bps=-1.0,
+                ranking_edge_bps=-1.0,
+                funding_timestamp_ms=2_000,
+                first_funding_timestamp_ms=2_000,
+                long_funding_timestamp_ms=2_000,
+                short_funding_timestamp_ms=2_000,
+                blocked=True,
+                blocked_reasons=["economics_incomplete"],
+                economics_incomplete_reason="economics_incomplete",
+            )
+        ],
+    )
+    path = tmp_path / "audit.json"
+
+    publish_funding_entry_snapshot(snapshot, path)
+    loaded = load_funding_entry_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.acquisition_mode == "unavailable"
+    assert loaded.candidates == []
+    assert loaded.quotes == {}
+    assert loaded.candidate_build_diagnostics["diagnostics_only"] is True
+    assert loaded.candidate_build_diagnostics["source_candidate_count"] == 1
+    assert loaded.candidate_build_diagnostics["source_quote_count"] == 2
+
+
+def test_v6_freshness_age_starts_at_verified_ready_time() -> None:
+    snapshot = SidecarSnapshot(
+        published_at_ms=1_000,
+        ready_at_ms=10_000,
+        market_observed_at_ms=10_000,
+        candidate_build_observed_at_ms=10_000,
+        acquisition_mode="fresh_sidecar",
+    )
+
+    decision = decide_snapshot_freshness(
+        snapshot,
+        max_age_ms=1_000,
+        now_ms=10_500,
+        market_max_age_ms=1_000,
+        usable_payload=lambda _snapshot: True,
+    )
+
+    assert decision.freshness == SnapshotFreshness.FRESH
+
+
+def test_v6_ready_clock_starts_when_manifest_becomes_visible(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import time
+    import lightfee.sidecar.publisher as publisher
+
+    snapshot = SidecarSnapshot(
+        **_v3_snapshot_proof(1_000, input_quote_count=1),
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=1_000,
+            )
+        },
+    )
+    path = tmp_path / "audit.json"
+    real_atomic_write = publisher._atomic_write_json
+    install_started_at_ms = 0
+
+    def delayed_manifest_install(data, target, **kwargs):
+        nonlocal install_started_at_ms
+        if Path(target) == funding_entry_snapshot_manifest_path(path):
+            time.sleep(0.02)
+            install_started_at_ms = time.time_ns() // 1_000_000
+        return real_atomic_write(data, target, **kwargs)
+
+    monkeypatch.setattr(publisher, "_atomic_write_json", delayed_manifest_install)
+
+    manifest = publish_funding_entry_snapshot(snapshot, path)
+    loaded = load_funding_entry_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.ready_at_ms >= install_started_at_ms
+    assert manifest["ready_at_ms"] == loaded.ready_at_ms
+
+
+def test_funding_entry_snapshot_refuses_payload_over_hard_limit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import lightfee.sidecar.publisher as publisher
+
+    proof = _v3_snapshot_proof(1_000, input_quote_count=1)
+    snapshot = SidecarSnapshot(**proof)
+    path = tmp_path / "audit.json"
+    monkeypatch.setattr(publisher, "FUNDING_ENTRY_SNAPSHOT_MAX_BYTES", 1)
+
+    with pytest.raises(ValueError, match="exceeds hard limit"):
+        publish_funding_entry_snapshot(snapshot, path)
+
+    assert not funding_entry_snapshot_path(path).exists()
+    assert not funding_entry_snapshot_manifest_path(path).exists()
+
+
+def test_v6_manifest_failure_keeps_prior_generation_cold_start_readable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import lightfee.sidecar.publisher as publisher
+
+    path = tmp_path / "audit.json"
+    first = SidecarSnapshot(**_v3_snapshot_proof(1_000, input_quote_count=1))
+    first_manifest = publish_funding_entry_snapshot(first, path)
+    first_payload = path.parent / str(first_manifest["payload_path"])
+    real_atomic_write = publisher._atomic_write_json
+
+    def fail_before_manifest_install(data, target, **kwargs):
+        if Path(target) == funding_entry_snapshot_manifest_path(path):
+            raise RuntimeError("manifest install interrupted")
+        return real_atomic_write(data, target, **kwargs)
+
+    monkeypatch.setattr(
+        publisher,
+        "_atomic_write_json",
+        fail_before_manifest_install,
+    )
+
+    second = SidecarSnapshot(**_v3_snapshot_proof(2_000, input_quote_count=1))
+    with pytest.raises(RuntimeError, match="manifest install interrupted"):
+        publish_funding_entry_snapshot(second, path)
+
+    installed_manifest = json.loads(funding_entry_snapshot_manifest_path(path).read_text())
+    loaded = load_funding_entry_snapshot(path)
+    assert installed_manifest["generation_id"] == first_manifest["generation_id"]
+    assert first_payload.exists()
+    assert loaded is not None
+    assert loaded.published_at_ms == 1_000
+
+
+def test_v6_successful_manifest_install_prunes_prior_generation(tmp_path) -> None:
+    path = tmp_path / "audit.json"
+    first = SidecarSnapshot(**_v3_snapshot_proof(1_000, input_quote_count=1))
+    first_manifest = publish_funding_entry_snapshot(first, path)
+    first_payload = path.parent / str(first_manifest["payload_path"])
+
+    second = SidecarSnapshot(**_v3_snapshot_proof(2_000, input_quote_count=1))
+    second_manifest = publish_funding_entry_snapshot(second, path)
+    second_payload = path.parent / str(second_manifest["payload_path"])
+
+    assert first_manifest["generation_id"] != second_manifest["generation_id"]
+    assert first_payload != second_payload
+    assert not first_payload.exists()
+    assert second_payload.exists()
+    assert funding_entry_snapshot_path(path) == second_payload
+    loaded = load_funding_entry_snapshot(path)
+    assert loaded is not None
+    assert loaded.published_at_ms == 2_000
 
 
 def _snapshot_to_dict_for_test(s: SidecarSnapshot) -> dict:

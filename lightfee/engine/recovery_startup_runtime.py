@@ -1,6 +1,7 @@
 """Startup recovery helpers delegated from LiveRuntime."""
 
 from __future__ import annotations
+import asyncio
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -269,36 +270,69 @@ class RecoveryStartupRuntime:
         *,
         lifecycle_clear_reason: str = "current_account_truth_core_clean",
     ) -> RecoveryLedger | None:
+        ledger, _exchange_truth = (
+            await self._refresh_recovery_ledger_from_account_truth_with_evidence(
+                now_ms,
+                lifecycle_clear_reason=lifecycle_clear_reason,
+            )
+        )
+        return ledger
+
+    async def _refresh_recovery_ledger_from_account_truth_with_evidence(
+        self,
+        now_ms: int,
+        *,
+        lifecycle_clear_reason: str = "current_account_truth_core_clean",
+    ) -> tuple[RecoveryLedger | None, dict[str, Any]]:
+        """Refresh recovery state and return the exact account-truth receipt.
+
+        Recovery decisions may legally remain running with an evidence gap.
+        Funding-entry authorization must inspect the receipt independently and
+        therefore cannot infer complete private truth from the ledger result.
+        """
         if not self.ctx._venue_adapters:
-            return None
+            return None, {
+                "truth_supported": False,
+                "truth_available": False,
+                "venue_count": 0,
+                "complete_venue_count": 0,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+                "errors": ["venue_adapters_unavailable"],
+            }
         exchange_truth = await self.ctx._collect_recovery_ledger_account_truth(now_ms)
         if not exchange_truth.get("truth_supported", True):
-            return None
-        return self.ctx._refresh_recovery_ledger_from_exchange_truth(
+            return None, exchange_truth
+        return (
+            self.ctx._refresh_recovery_ledger_from_exchange_truth(
+                exchange_truth,
+                now_ms=now_ms,
+                lifecycle_clear_reason=lifecycle_clear_reason,
+            ),
             exchange_truth,
-            now_ms=now_ms,
-            lifecycle_clear_reason=lifecycle_clear_reason,
         )
 
     async def _collect_recovery_ledger_account_truth(
         self,
         now_ms: int,
     ) -> dict[str, Any]:
-        positions: list[dict[str, Any]] = []
-        open_orders: list[dict[str, Any]] = []
-        probe_evidence: list[dict[str, Any]] = []
-        errors: list[str] = []
-        truth_probe_count = 0
-
-        for venue, adapter in self.ctx._venue_adapters.items():
+        async def _collect_venue(venue, adapter) -> dict[str, Any]:
             venue_name = venue.value if hasattr(venue, "value") else str(venue)
+            venue_positions: list[dict[str, Any]] = []
+            venue_orders: list[dict[str, Any]] = []
+            venue_evidence: list[dict[str, Any]] = []
+            venue_errors: list[str] = []
+            venue_probe_count = 0
             fetch_all_positions = getattr(adapter, "fetch_all_positions", None)
             if not callable(fetch_all_positions):
                 transport = getattr(adapter, "_transport", None)
                 fetch_all_positions = getattr(transport, "fetch_all_positions", None)
             if not callable(fetch_all_positions):
-                errors.append(f"{venue_name}:*:positions:fetch_all_positions_unavailable")
-                probe_evidence.append(
+                venue_errors.append(
+                    f"{venue_name}:*:positions:fetch_all_positions_unavailable"
+                )
+                venue_evidence.append(
                     {
                         "venue": venue_name,
                         "symbol": "*",
@@ -312,17 +346,19 @@ class RecoveryStartupRuntime:
             else:
                 try:
                     rows = await fetch_all_positions()
-                    truth_probe_count += 1
+                    if rows is None:
+                        raise RuntimeError("fetch_all_positions_returned_none")
+                    venue_probe_count += 1
                     if isinstance(rows, (list, tuple, set)):
                         for position in rows:
-                            positions.append(
+                            venue_positions.append(
                                 self.ctx._recovery_ledger_position_payload(
                                     position,
                                     venue_name=venue_name,
                                     symbol="*",
                                 )
                             )
-                    probe_evidence.append(
+                    venue_evidence.append(
                         {
                             "venue": venue_name,
                             "symbol": "*",
@@ -336,9 +372,9 @@ class RecoveryStartupRuntime:
                         }
                     )
                 except Exception as exc:
-                    truth_probe_count += 1
-                    errors.append(f"{venue_name}:*:positions:{exc}")
-                    probe_evidence.append(
+                    venue_probe_count += 1
+                    venue_errors.append(f"{venue_name}:*:positions:{exc}")
+                    venue_evidence.append(
                         {
                             "venue": venue_name,
                             "symbol": "*",
@@ -355,14 +391,14 @@ class RecoveryStartupRuntime:
                     venue,
                     adapter,
                 )
-                truth_probe_count += 1
+                venue_probe_count += 1
                 for row in self.ctx._recovery_ledger_open_order_payloads(
                     rows,
                     venue_name=venue_name,
                     symbol="*",
                 ):
-                    open_orders.append(row)
-                probe_evidence.append(
+                    venue_orders.append(row)
+                venue_evidence.append(
                     {
                         "venue": venue_name,
                         "symbol": "*",
@@ -376,9 +412,9 @@ class RecoveryStartupRuntime:
                     }
                 )
             except Exception as exc:
-                truth_probe_count += 1
-                errors.append(f"{venue_name}:*:open_orders:{exc}")
-                probe_evidence.append(
+                venue_probe_count += 1
+                venue_errors.append(f"{venue_name}:*:open_orders:{exc}")
+                venue_evidence.append(
                     {
                         "venue": venue_name,
                         "symbol": "*",
@@ -390,9 +426,43 @@ class RecoveryStartupRuntime:
                     }
                 )
 
+            return {
+                "positions": venue_positions,
+                "open_orders": venue_orders,
+                "probe_evidence": venue_evidence,
+                "errors": venue_errors,
+                "truth_probe_count": venue_probe_count,
+            }
+
+        venue_results = await asyncio.gather(
+            *(
+                _collect_venue(venue, adapter)
+                for venue, adapter in self.ctx._venue_adapters.items()
+            )
+        )
+        positions = [
+            row for result in venue_results for row in result["positions"]
+        ]
+        open_orders = [
+            row for result in venue_results for row in result["open_orders"]
+        ]
+        probe_evidence = [
+            row for result in venue_results for row in result["probe_evidence"]
+        ]
+        errors = [row for result in venue_results for row in result["errors"]]
+        truth_probe_count = sum(
+            int(result["truth_probe_count"]) for result in venue_results
+        )
+        complete_venue_count = sum(
+            1
+            for result in venue_results
+            if not result["errors"] and int(result["truth_probe_count"]) >= 2
+        )
         return {
             "truth_supported": truth_probe_count > 0,
             "truth_available": not errors,
+            "venue_count": len(venue_results),
+            "complete_venue_count": complete_venue_count,
             "positions": positions,
             "open_orders": open_orders,
             "probe_evidence": probe_evidence,
@@ -411,6 +481,8 @@ class RecoveryStartupRuntime:
             fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
             if callable(fetch_open_orders):
                 rows = await fetch_open_orders(None)
+                if rows is None:
+                    raise RuntimeError("fetch_open_orders_returned_none")
                 if isinstance(rows, dict) and rows.get("error"):
                     raise RuntimeError(str(rows.get("error")))
                 return self.ctx._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
@@ -432,12 +504,16 @@ class RecoveryStartupRuntime:
                 account_address=account,
                 agent_wallet_address=agent_wallet,
             )
+            if raw is None:
+                raise RuntimeError("open_orders_request_returned_none")
             return self.ctx._recovery_ledger_order_rows(raw), contract_request.label
 
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if not callable(fetch_open_orders):
             raise RuntimeError("fetch_open_orders_unavailable")
         rows = await fetch_open_orders(None)
+        if rows is None:
+            raise RuntimeError("fetch_open_orders_returned_none")
         if isinstance(rows, dict) and rows.get("error"):
             raise RuntimeError(str(rows.get("error")))
         return self.ctx._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"

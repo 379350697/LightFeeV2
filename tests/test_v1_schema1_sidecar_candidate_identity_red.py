@@ -251,7 +251,7 @@ class TestV1Schema1CandidateIdentity:
             1700000000000,
             require_complete_economics=True,
         ) == []
-        assert all("incomplete_economics" in c.blocked_reasons for c in snap.candidates)
+        assert all("incomplete_economics" not in c.blocked_reasons for c in snap.candidates)
 
     def test_no_tradeable_candidate_has_zero_first_funding(self):
         """No candidate in the tradeable list may have first_funding_timestamp_ms=0."""

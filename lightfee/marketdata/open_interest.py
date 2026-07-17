@@ -13,6 +13,9 @@ from hashlib import sha256
 from math import isfinite
 
 
+OPEN_INTEREST_EVENT_FUTURE_SKEW_MS = 5_000
+
+
 class OpenInterestEvidenceStatus(str, Enum):
     OBSERVED = "observed"
     UNSUPPORTED = "unsupported"
@@ -68,6 +71,92 @@ def open_interest_sample_id(
     return sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
+def observed_open_interest_proof_reason(
+    *,
+    venue: str,
+    canonical_symbol: str,
+    venue_symbol: str,
+    value_quote: object,
+    raw_value: object,
+    raw_unit: str,
+    contract_multiplier: object,
+    conversion_mark_price: object,
+    observed_at_ms: object,
+    event_at_ms: object,
+    received_at_ms: object,
+    source: str,
+    sample_id: str,
+) -> str:
+    """Validate the common economic, time and identity OI proof contract."""
+    numeric_inputs = (value_quote, raw_value)
+    if any(isinstance(value, bool) for value in numeric_inputs):
+        return "invalid_numeric_value"
+    try:
+        value = float(value_quote)
+        raw = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid_numeric_value"
+    if not isfinite(value) or value < 0.0 or not isfinite(raw) or raw < 0.0:
+        return "invalid_numeric_value"
+
+    unit = str(raw_unit or "").strip().lower()
+
+    def positive(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if isfinite(parsed) and parsed > 0.0 else None
+
+    mark = positive(conversion_mark_price)
+    multiplier = positive(contract_multiplier)
+    if unit == "quote":
+        expected_quote = raw
+    elif unit == "base" and mark is not None:
+        expected_quote = raw * mark
+    elif unit == "contracts" and mark is not None and multiplier is not None:
+        expected_quote = raw * multiplier * mark
+    else:
+        return "invalid_unit_conversion"
+    if abs(value - expected_quote) > max(1e-6, abs(expected_quote) * 1e-9):
+        return "economic_identity_mismatch"
+
+    if any(
+        isinstance(value, bool)
+        for value in (observed_at_ms, event_at_ms, received_at_ms)
+    ):
+        return "invalid_timestamp"
+    try:
+        observed = int(observed_at_ms or 0)
+        event = int(event_at_ms or 0)
+        received = int(received_at_ms or 0)
+    except (TypeError, ValueError, OverflowError):
+        return "invalid_timestamp"
+    if (
+        observed <= 0
+        or received < observed
+        or event < 0
+        or event > received + OPEN_INTEREST_EVENT_FUTURE_SKEW_MS
+    ):
+        return "invalid_timestamp"
+    if not str(venue_symbol or "").strip() or not str(source or "").strip():
+        return "identity_unavailable"
+    expected_sample_id = open_interest_sample_id(
+        venue=venue,
+        canonical_symbol=canonical_symbol,
+        venue_symbol=venue_symbol,
+        observed_at_ms=event or observed,
+        source=source,
+        raw_value=raw,
+        value_quote=value,
+    )
+    if not str(sample_id or "").strip() or sample_id != expected_sample_id:
+        return "sample_id_mismatch"
+    return ""
+
+
 @dataclass(frozen=True)
 class OpenInterestEvidence:
     canonical_symbol: str
@@ -77,7 +166,10 @@ class OpenInterestEvidence:
     raw_unit: str
     contract_multiplier: float | None
     conversion_mark_price: float | None
+    # Local observation/receipt clock.  Exchange timestamps live in
+    # ``event_at_ms`` because vendor clocks are not ordered against this one.
     observed_at_ms: int | None
+    event_at_ms: int | None
     received_at_ms: int
     source: str
     status: str
@@ -96,6 +188,12 @@ class OpenInterestEvidence:
             and bool(self.venue_symbol)
             and int(self.observed_at_ms or 0) > 0
             and int(self.received_at_ms or 0) >= int(self.observed_at_ms or 0)
+            and (
+                int(self.event_at_ms or 0) <= 0
+                or int(self.event_at_ms or 0)
+                <= int(self.received_at_ms or 0)
+                + OPEN_INTEREST_EVENT_FUTURE_SKEW_MS
+            )
             and bool(self.source)
             and bool(self.sample_id)
         )
@@ -118,6 +216,12 @@ def validated_open_interest_evidence(
     timestamp_invalid = (
         int(evidence.observed_at_ms or 0) <= 0
         or int(evidence.received_at_ms or 0) < int(evidence.observed_at_ms or 0)
+        or (
+            int(evidence.event_at_ms or 0) > 0
+            and int(evidence.event_at_ms or 0)
+            > int(evidence.received_at_ms or 0)
+            + OPEN_INTEREST_EVENT_FUTURE_SKEW_MS
+        )
     )
     if status == OpenInterestEvidenceStatus.OBSERVED.value:
         if identity_invalid:
@@ -157,9 +261,42 @@ def validated_open_interest_evidence(
             if int(evidence.observed_at_ms or 0) > 0
             else None
         ),
+        event_at_ms=(
+            int(evidence.event_at_ms or 0)
+            if int(evidence.event_at_ms or 0) > 0
+            else None
+        ),
         received_at_ms=max(int(evidence.received_at_ms or 0), 0),
         source=str(evidence.source or ""),
         status=status,
         reason=str(evidence.reason or status),
         sample_id=sample_id,
     )
+
+
+def open_interest_timestamps_are_fresh(
+    *,
+    observed_at_ms: int,
+    received_at_ms: int,
+    event_at_ms: int = 0,
+    now_ms: int,
+    max_age_ms: int,
+    future_skew_ms: int = OPEN_INTEREST_EVENT_FUTURE_SKEW_MS,
+) -> bool:
+    """Validate local receipt freshness and the independent exchange clock."""
+    try:
+        observed = int(observed_at_ms)
+        received = int(received_at_ms)
+        event = int(event_at_ms or 0)
+        now = int(now_ms)
+        max_age = max(int(max_age_ms), 1)
+        skew = max(int(future_skew_ms), 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if observed <= 0 or received < observed:
+        return False
+    if observed > now or received > now or now - observed > max_age:
+        return False
+    if event > 0 and (event > now + skew or now - event > max_age):
+        return False
+    return True

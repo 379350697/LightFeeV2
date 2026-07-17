@@ -16,6 +16,7 @@ from lightfee.venues.market_data import (
     PublicTransportError,
     PublicTransportErrorCategory,
     _safe_float,
+    _PUBLIC_REQUEST_PHASE_COLLECTOR,
 )
 from lightfee.venues.specs import (
     binance_spec,
@@ -48,6 +49,68 @@ class TestMarketDataClientConstruction:
         spec = binance_spec()
         client = MarketDataClient(spec, exchange_http_timeout_ms=5000)
         assert client._exchange_http_timeout_ms == 5000
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "body", "expected_category"),
+        [
+            (429, "too many requests", "transport_failure"),
+            (500, "server error", "transport_failure"),
+            (200, "not-json", "parse_failure"),
+        ],
+    )
+    async def test_public_request_failure_carries_one_phase_receipt(
+        self,
+        status_code,
+        body,
+        expected_category,
+    ):
+        import httpx
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, text=body)
+
+        client = MarketDataClient(
+            binance_spec(),
+            consume_global_rate_limit_budget=False,
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        rows: list[dict] = []
+        token = _PUBLIC_REQUEST_PHASE_COLLECTOR.set(rows)
+        try:
+            with pytest.raises(PublicTransportError) as captured:
+                await client._public_get("/fapi/v1/openInterest")
+        finally:
+            _PUBLIC_REQUEST_PHASE_COLLECTOR.reset(token)
+            await client.close()
+
+        assert captured.value.category == expected_category
+        assert len(rows) == 1
+        assert captured.value.phase_timings == rows[0]
+        assert rows[0]["dns_timing_status"] == "included_in_connect"
+        assert rows[0]["transport_total_ms"] >= 0
+        assert rows[0]["parse_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_public_request_success_records_parse_and_transport_once(self):
+        import httpx
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"openInterest": "12"})
+
+        client = MarketDataClient(binance_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        rows: list[dict] = []
+        token = _PUBLIC_REQUEST_PHASE_COLLECTOR.set(rows)
+        try:
+            payload = await client._public_get("/fapi/v1/openInterest")
+        finally:
+            _PUBLIC_REQUEST_PHASE_COLLECTOR.reset(token)
+            await client.close()
+
+        assert payload == {"openInterest": "12"}
+        assert len(rows) == 1
+        assert rows[0]["parse_ms"] >= 0
 
     def test_close_does_not_raise_when_no_client(self):
         import asyncio
@@ -164,8 +227,10 @@ class TestEntryOpenInterestOnlyEndpoints:
             await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
         )[f"{venue_key}:BTCUSDT"]
 
-        assert first.open_interest_observed_at_ms == 1_000_000
-        assert second.open_interest_observed_at_ms == 1_000_000
+        assert first.open_interest_observed_at_ms == 2_000_000
+        assert second.open_interest_observed_at_ms == 2_000_100
+        assert first.open_interest_event_at_ms == 1_000_000
+        assert second.open_interest_event_at_ms == 1_000_000
         assert first.open_interest_received_at_ms == 2_000_000
         assert second.open_interest_received_at_ms == 2_000_100
         assert first.open_interest_sample_id == second.open_interest_sample_id
@@ -197,6 +262,7 @@ class TestEntryOpenInterestOnlyEndpoints:
 
         assert ticker.open_interest_evidence_status == "observed"
         assert ticker.open_interest_observed_at_ms == 2_000_000
+        assert ticker.open_interest_event_at_ms == 0
         assert ticker.open_interest_received_at_ms == 2_000_000
 
     @pytest.mark.asyncio
@@ -212,7 +278,7 @@ class TestEntryOpenInterestOnlyEndpoints:
         ("native_timestamp", "expected_status"),
         [
             ("not-a-timestamp", "parse_error"),
-            ("2000001", "stale"),
+            ("2005001", "stale"),
         ],
     )
     async def test_invalid_or_future_native_oi_timestamp_fails_closed(
@@ -236,8 +302,39 @@ class TestEntryOpenInterestOnlyEndpoints:
         assert ticker.open_interest_quote is None
         assert ticker.open_interest_evidence_status == expected_status
         assert ticker.open_interest_observed_at_ms == 0
+        assert ticker.open_interest_event_at_ms == 0
         assert ticker.open_interest_received_at_ms == 2_000_000
         assert ticker.open_interest_sample_id == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [
+            (okx_spec, "okx"),
+            (bybit_spec, "bybit"),
+            (bitget_spec, "bitget"),
+        ],
+    )
+    async def test_small_positive_native_clock_skew_is_preserved(
+        self,
+        monkeypatch,
+        spec_fn,
+        venue_key,
+    ):
+        monkeypatch.setattr(
+            "lightfee.venues.market_data._now_ms",
+            lambda: 2_000_000,
+        )
+        client = self._timestamp_client(spec_fn(), "2000500")
+
+        ticker = (
+            await client.fetch_entry_open_interest_evidence(["BTCUSDT"])
+        )[f"{venue_key}:BTCUSDT"]
+
+        assert ticker.open_interest_evidence_status == "observed"
+        assert ticker.open_interest_observed_at_ms == 2_000_000
+        assert ticker.open_interest_event_at_ms == 2_000_500
+        assert ticker.open_interest_received_at_ms == 2_000_000
 
     @pytest.mark.asyncio
     async def test_okx_entry_oi_scopes_each_request_by_inst_id(self):
@@ -721,6 +818,28 @@ class TestPerpLiquidityType:
         pl = PerpLiquidity(venue="x", symbol="y", volume_24h_quote=1, open_interest_quote=2, observed_at_ms=0)
         with pytest.raises(Exception):
             pl.volume_24h_quote = 3  # type: ignore
+
+    @pytest.mark.asyncio
+    async def test_fetch_perp_liquidity_preserves_market_receive_time(self, monkeypatch):
+        client = MarketDataClient(binance_spec())
+        ticker = FundingTicker(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=101.0,
+            volume_24h_quote=1_000_000.0,
+            open_interest_quote=500_000.0,
+            market_received_at_ms=1_700_000_000_123,
+        )
+
+        async def _fetch_funding_tickers(_symbols):
+            return {"binance:BTCUSDT": ticker}
+
+        monkeypatch.setattr(client, "fetch_funding_tickers", _fetch_funding_tickers)
+
+        result = await client.fetch_perp_liquidity(["BTCUSDT"])
+
+        assert result["binance:BTCUSDT"].observed_at_ms == 1_700_000_000_123
 
 
 class TestVenueSpecSidecarEndpoints:
@@ -1879,7 +1998,7 @@ class TestProductionSidecarParserRegressions:
     async def test_okx_funding_observation_uses_response_receipt_time(self, monkeypatch):
         import lightfee.venues.market_data as market_data
 
-        times = iter((1_000, 2_000, 3_000))
+        times = iter((1_000, 2_000, 3_000, 4_000))
         monkeypatch.setattr(market_data, "_now_ms", lambda: next(times))
 
         class FakeOkxClient(MarketDataClient):
@@ -1911,7 +2030,8 @@ class TestProductionSidecarParserRegressions:
 
         result = await FakeOkxClient(okx_spec())._fetch_okx_style(["BTCUSDT"])
 
-        assert result["okx:BTCUSDT"].funding_interval_observed_at_ms == 2_000
+        assert result["okx:BTCUSDT"].market_received_at_ms == 2_000
+        assert result["okx:BTCUSDT"].funding_interval_observed_at_ms == 3_000
 
     @pytest.mark.asyncio
     async def test_okx_batch_failure_bounds_per_symbol_fallback(self, monkeypatch):
@@ -2209,6 +2329,88 @@ class TestProductionSidecarParserRegressions:
         assert ticker.ask == 101.0
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.open_interest_evidence_status == "observed"
+
+    @pytest.mark.asyncio
+    async def test_bulk_oi_clocks_use_vendor_event_or_zero_and_transport_receipt(self):
+        class FixedReceiptClient(MarketDataClient):
+            def __init__(self, spec, ticker_payload, supplemental):
+                super().__init__(spec)
+                self.ticker_payload = ticker_payload
+                self.supplemental = supplemental
+
+            async def _public_get_with_received_at(self, path, params=None):
+                return self.ticker_payload, 9_000
+
+            async def _public_post_with_received_at(self, path, body=None):
+                return self.ticker_payload, 9_000
+
+            async def _public_get(self, path, params=None):
+                return self.supplemental.get(path, {})
+
+        bybit = FixedReceiptClient(
+            bybit_spec(),
+            {
+                "time": 1_234,
+                "result": {"list": [{
+                    "symbol": "BTCUSDT",
+                    "bid1Price": "100",
+                    "ask1Price": "101",
+                    "markPrice": "100.5",
+                    "openInterestValue": "2500000",
+                }]},
+            },
+            {},
+        )
+        bitget = FixedReceiptClient(
+            bitget_spec(),
+            {"requestTime": 1_235, "data": [{
+                "symbol": "BTCUSDT",
+                "bidPr": "100",
+                "askPr": "101",
+                "markPrice": "100.5",
+                "holdingAmount": "2500",
+            }]},
+            {},
+        )
+        gate = FixedReceiptClient(
+            gate_spec(),
+            [{
+                "contract": "BTC_USDT",
+                "highest_bid": "100",
+                "lowest_ask": "101",
+                "mark_price": "100.5",
+                "total_size": "2500",
+            }],
+            {"/api/v4/futures/usdt/contracts": [{
+                "name": "BTC_USDT",
+                "quanto_multiplier": "0.01",
+                "order_size_min": "1",
+                "order_price_round": "0.1",
+                "in_delisting": False,
+            }]},
+        )
+        hyperliquid = FixedReceiptClient(
+            hyperliquid_spec(),
+            [
+                {"universe": [{"name": "BTC", "szDecimals": 5}]},
+                [{"markPx": "100.5", "openInterest": "2500"}],
+            ],
+            {},
+        )
+
+        rows = [
+            (await bybit._fetch_bybit_style(["BTCUSDT"]))["bybit:BTCUSDT"],
+            (await bitget._fetch_bitget_style(["BTCUSDT"]))["bitget:BTCUSDT"],
+            (await gate._fetch_gate_style(["BTCUSDT"]))["gate:BTCUSDT"],
+            (await hyperliquid._fetch_hyperliquid_style(["BTCUSDT"]))[
+                "hyperliquid:BTCUSDT"
+            ],
+        ]
+
+        assert [row.open_interest_event_at_ms for row in rows] == [1_234, 1_235, 0, 0]
+        assert all(row.open_interest_observed_at_ms == 9_000 for row in rows)
+        assert all(row.open_interest_received_at_ms == 9_000 for row in rows)
+        assert rows[-1].funding_interval_observed_at_ms == 9_000
 
     @pytest.mark.asyncio
     async def test_bitget_current_fund_rate_supplies_future_funding_timestamp(self):

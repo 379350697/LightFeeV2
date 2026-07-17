@@ -56,6 +56,27 @@ def make_test_config(temp_dir: str) -> AppConfig:
     )
 
 
+def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
+    """Route orchestration fixtures through the live V6 loader contract."""
+    from lightfee.sidecar.publisher import load_snapshot
+
+    def identity(path):
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return ("test-v6-file", stat.st_mtime_ns, stat.st_size)
+
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.funding_entry_snapshot_identity",
+        identity,
+    )
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_funding_entry_snapshot",
+        load_snapshot,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Full loop smoke tests
 # ---------------------------------------------------------------------------
@@ -96,7 +117,7 @@ class TestLiveFullClosure:
             assert "runtime.started" in kinds
 
     @pytest.mark.asyncio
-    async def test_full_tick_loads_snapshot(self):
+    async def test_full_tick_loads_snapshot(self, monkeypatch):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
 
@@ -108,6 +129,7 @@ class TestLiveFullClosure:
                 "candidates": [],
                 "quotes": {},
             }))
+            _install_v6_file_snapshot_fixture(monkeypatch)
 
             runtime = LiveRuntime(config)
             await runtime.start()
@@ -119,9 +141,10 @@ class TestLiveFullClosure:
             records = runtime.journal.read_all()
             kinds = [r["kind"] for r in records]
             assert "runtime.snapshot_missing" not in kinds  # snapshot was found
+            await runtime.stop()
 
     @pytest.mark.asyncio
-    async def test_tick_with_stale_snapshot_logs_stale(self):
+    async def test_tick_with_stale_snapshot_logs_stale(self, monkeypatch):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.runtime.sidecar_snapshot_max_age_ms = 100  # very short max age
@@ -133,6 +156,7 @@ class TestLiveFullClosure:
                 "candidates": [],
                 "quotes": {},
             }))
+            _install_v6_file_snapshot_fixture(monkeypatch)
 
             runtime = LiveRuntime(config)
             await runtime.start()
@@ -142,6 +166,7 @@ class TestLiveFullClosure:
             records = runtime.journal.read_all()
             kinds = [r["kind"] for r in records]
             assert "runtime.snapshot_stale" in kinds
+            await runtime.stop()
 
     @pytest.mark.asyncio
     async def test_stop_persists_snapshot_and_journals_stopped(self):
@@ -701,6 +726,7 @@ class TestLiveStartupPreflight:
             assert "degraded_venues" in runtime.state.last_scan
             assert "no_entry_reason" in runtime.state.last_scan
             assert runtime.state.last_scan["ts_ms"] > 0
+            await runtime.stop()
 
 
 # ---------------------------------------------------------------------------

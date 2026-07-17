@@ -216,6 +216,10 @@ class StrategyConfig:
     funding_canary_require_account_fee_evidence: bool = False
     funding_canary_conservative_fee_max_entry_notional_quote: float = 15.0
     funding_canary_conservative_fee_buffer_bps: float = 2.0
+    # Cold-start admission only: require a minimally representative funding
+    # universe before allowing new entries. Candidate-level funding proof
+    # remains mandatory independently of this aggregate readiness signal.
+    funding_warmup_min_coverage_ratio: float = 0.5
     funding_economics_mode: str = "v1_exact"
     funding_forecast_mode: str = "shadow"
     funding_forecast_uncertainty_haircut_bps: float = 2.0

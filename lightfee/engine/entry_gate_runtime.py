@@ -21,6 +21,7 @@ from lightfee.engine.business_contract import (
     entry_route_key,
 )
 from lightfee.engine.runtime_context import EntryGateRuntimeContext
+from lightfee.marketdata.open_interest import open_interest_timestamps_are_fresh
 from lightfee.risk.modes import EngineLifecycle
 
 
@@ -1128,18 +1129,28 @@ class EntryGateRuntime:
                     venue_symbols.setdefault(venue, set()).add(symbol)
 
         supported_by_venue: dict[Venue, set[str] | None] = {}
+        catalog_unavailable_by_venue: dict[Venue, str] = {}
         for venue, symbols in venue_symbols.items():
             adapter = self.get_venue_adapter(venue)
             if adapter is None:
-                supported_by_venue[venue] = None
+                supported_by_venue[venue] = set()
+                catalog_unavailable_by_venue[venue] = "venue_adapter_unavailable"
                 continue
             filtered = await self._filter_symbols_supported_by_venue(
                 venue,
                 adapter,
                 sorted(symbols),
                 skip_event_kind="",
+                fail_closed_on_catalog_unavailable=True,
             )
             supported_by_venue[venue] = set(filtered)
+            unavailable = getattr(
+                self.ctx,
+                "_catalog_unavailable_reason_by_venue",
+                {},
+            )
+            if isinstance(unavailable, dict) and unavailable.get(venue):
+                catalog_unavailable_by_venue[venue] = str(unavailable[venue])
 
         filtered_candidates: list = []
         skipped = 0
@@ -1148,9 +1159,9 @@ class EntryGateRuntime:
 
             def venue_supports(venue: Venue | None) -> bool:
                 if venue is None:
-                    return True
+                    return False
                 supported = supported_by_venue.get(venue)
-                return supported is None or symbol in supported
+                return supported is not None and symbol in supported
 
             long_supported = venue_supports(long_venue)
             short_supported = venue_supports(short_venue)
@@ -1159,7 +1170,17 @@ class EntryGateRuntime:
                 continue
 
             skipped += 1
-            self._last_candidate_catalog_filter_blockers["unsupported_symbol"] += 1
+            catalog_reasons = [
+                catalog_unavailable_by_venue[venue]
+                for venue in (long_venue, short_venue)
+                if venue in catalog_unavailable_by_venue
+            ]
+            reason = (
+                "catalog_unavailable"
+                if catalog_reasons
+                else "unsupported_symbol"
+            )
+            self._last_candidate_catalog_filter_blockers[reason] += 1
             sample_payload = {
                 "symbol": symbol,
                 "candidate_pair_id": self._candidate_pair_id(candidate),
@@ -1176,7 +1197,17 @@ class EntryGateRuntime:
                 ),
                 "long_supported": long_supported,
                 "short_supported": short_supported,
-                "reason": "unsupported_symbol",
+                "reason": reason,
+                "long_catalog_status": (
+                    catalog_unavailable_by_venue.get(long_venue, "available")
+                    if long_venue is not None
+                    else "invalid_venue"
+                ),
+                "short_catalog_status": (
+                    catalog_unavailable_by_venue.get(short_venue, "available")
+                    if short_venue is not None
+                    else "invalid_venue"
+                ),
             }
             if len(self._last_candidate_catalog_filter_samples) < 24:
                 self._last_candidate_catalog_filter_samples.append(sample_payload)
@@ -1188,7 +1219,7 @@ class EntryGateRuntime:
                     key_parts=(
                         symbol,
                         self._candidate_pair_id(candidate),
-                        "unsupported_symbol",
+                        reason,
                         str(long_supported),
                         str(short_supported),
                     ),
@@ -1417,6 +1448,9 @@ class EntryGateRuntime:
             "open_interest_observed_at_ms": _safe_evidence_int(
                 getattr(quote, "open_interest_observed_at_ms", 0)
             ),
+            "open_interest_event_at_ms": _safe_evidence_int(
+                getattr(quote, "open_interest_event_at_ms", 0)
+            ),
             "open_interest_received_at_ms": _safe_evidence_int(
                 getattr(quote, "open_interest_received_at_ms", 0)
             ),
@@ -1544,6 +1578,9 @@ class EntryGateRuntime:
             oi_received_at_ms = _safe_evidence_int(
                 getattr(quote, "open_interest_received_at_ms", 0)
             )
+            oi_event_at_ms = _safe_evidence_int(
+                getattr(quote, "open_interest_event_at_ms", 0)
+            )
             oi_sample_id = str(
                 getattr(quote, "open_interest_sample_id", "") or ""
             ).strip()
@@ -1560,28 +1597,43 @@ class EntryGateRuntime:
             observed_proof_valid = bool(
                 open_interest_evidence_status == "observed"
                 and open_interest_value_valid
-                and oi_observed_at_ms > 0
-                and oi_received_at_ms >= oi_observed_at_ms
-                and oi_observed_at_ms <= now_ms
-                and oi_received_at_ms <= now_ms
+                and open_interest_timestamps_are_fresh(
+                    observed_at_ms=oi_observed_at_ms,
+                    received_at_ms=oi_received_at_ms,
+                    event_at_ms=oi_event_at_ms,
+                    now_ms=now_ms,
+                    max_age_ms=oi_budget_ms,
+                )
                 and oi_sample_id
                 and oi_source
                 and oi_venue_symbol
             )
-            if observed_proof_valid and (
-                oi_budget_ms > 0 and now_ms - oi_observed_at_ms > oi_budget_ms
-            ):
-                open_interest_evidence_status = "stale"
-                observed_proof_valid = False
-            elif open_interest_evidence_status == "observed" and not observed_proof_valid:
+            if open_interest_evidence_status == "observed" and not observed_proof_valid:
                 open_interest_evidence_status = (
                     "stale"
-                    if oi_observed_at_ms > now_ms or oi_received_at_ms > now_ms
+                    if (
+                        oi_observed_at_ms > now_ms
+                        or oi_received_at_ms > now_ms
+                        or oi_event_at_ms > now_ms + 5_000
+                        or (
+                            oi_event_at_ms > 0
+                            and now_ms - oi_event_at_ms > oi_budget_ms
+                        )
+                        or now_ms - oi_observed_at_ms > oi_budget_ms
+                    )
                     else "parse_error"
                 )
             volume_floor = self._entry_liquidity_volume_floor_quote(venue)
             open_interest_floor = self._entry_liquidity_open_interest_floor_quote(venue)
             current_class = state.current_class(venue, symbol, now_ms=now_ms)
+            observed_high_open_interest = bool(
+                observed_proof_valid
+                and open_interest_quote is not None
+                and (
+                    open_interest_floor <= 0.0
+                    or open_interest_quote >= open_interest_floor
+                )
+            )
 
             if record_result and observed_proof_valid:
                 state.note_open_interest_observation(
@@ -1591,6 +1643,18 @@ class EntryGateRuntime:
                     observed_at_ms=oi_observed_at_ms,
                     sample_id=oi_sample_id,
                 )
+            if record_result and observed_high_open_interest:
+                # A newly arrived, independently identified high-OI proof is
+                # stronger than the structural backoff memory.  Probe
+                # throttling controls active network refreshes; it must never
+                # suppress valid evidence that has already arrived.
+                state.record_result(
+                    venue,
+                    symbol,
+                    EntryLiquidityEligibilityClass.ELIGIBLE,
+                    now_ms=now_ms,
+                )
+                current_class = EntryLiquidityEligibilityClass.ELIGIBLE
 
             if (
                 open_interest_floor > 0.0
@@ -1643,7 +1707,10 @@ class EntryGateRuntime:
                 )
                 continue
 
-            if current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY:
+            if (
+                current_class is EntryLiquidityEligibilityClass.STRUCTURAL_INELIGIBILITY
+                and not observed_high_open_interest
+            ):
                 if not record_result or not state.should_probe_structural(
                     venue,
                     symbol,
@@ -2081,9 +2148,47 @@ class EntryGateRuntime:
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 
         blocked_reason_counts: Counter[str] = Counter()
+        candidate_blocked_samples: list[dict[str, Any]] = []
         for candidate in getattr(snapshot, "candidates", []) or []:
             for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
-                blocked_reason_counts[str(blocked_reason)] += 1
+                blocker = str(blocked_reason)
+                blocked_reason_counts[blocker] += 1
+                long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
+                short_venue = str(
+                    getattr(candidate, "short_venue", "") or ""
+                ).lower()
+                symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                pair_id = str(getattr(candidate, "pair_id", "") or "")
+                if not pair_id:
+                    pair_id = make_candidate_pair_id(
+                        symbol,
+                        long_venue,
+                        short_venue,
+                    )
+                candidate_blocked_samples.append(
+                    {
+                        "blocking_stage": "candidate_construction",
+                        "blocking_domain": (
+                            self._entry_selection_blocker_reason_family(blocker)
+                        ),
+                        "blocking_status": "blocked",
+                        "blocking_reason": blocker,
+                        "venue": f"{long_venue}->{short_venue}",
+                        "long_venue": long_venue,
+                        "short_venue": short_venue,
+                        "symbol": symbol,
+                        "sample_id": str(
+                            getattr(candidate, "open_interest_sample_id", "") or ""
+                        ),
+                        "pair_id": pair_id,
+                        "candidate_revision_id": str(
+                            getattr(candidate, "candidate_revision_id", "") or ""
+                        ),
+                        "opportunity_lease_id": str(
+                            getattr(candidate, "opportunity_lease_id", "") or ""
+                        ),
+                    }
+                )
         catalog_filter_blockers = Counter(
             getattr(self, "_last_candidate_catalog_filter_blockers", Counter())
         )
@@ -2092,6 +2197,20 @@ class EntryGateRuntime:
         )
         entry_admission_filter_blockers = Counter(
             getattr(self, "_last_entry_admission_filter_blockers", Counter())
+        )
+        last_scan = (
+            self.ctx.state.last_scan
+            if isinstance(self.ctx.state.last_scan, dict)
+            else {}
+        )
+        entry_reprice_blockers = Counter(
+            {
+                str(key): int(value)
+                for key, value in dict(
+                    last_scan.get("entry_reprice_blocker_counts", {}) or {}
+                ).items()
+                if int(value) > 0
+            }
         )
         if reason == "no_tradeable_candidates":
             if (
@@ -2114,6 +2233,18 @@ class EntryGateRuntime:
                 and not snapshot_freshness_blockers
             ):
                 reason = "tradeable_candidates_blocked_by_unsupported_symbol"
+            elif (
+                entry_reprice_blockers
+                and not blocked_reason_counts
+                and not catalog_filter_blockers
+                and not entry_admission_filter_blockers
+                and not snapshot_freshness_blockers
+            ):
+                reason = (
+                    next(iter(entry_reprice_blockers))
+                    if len(entry_reprice_blockers) == 1
+                    else "entry_reprice_rejected"
+                )
             else:
                 reason = self._no_tradeable_reason_from_candidate_blockers(
                     blocked_reason_counts,
@@ -2241,11 +2372,13 @@ class EntryGateRuntime:
             "entry_selection": sum(
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
+            "final_reprice": sum(
+                int(v) for v in entry_reprice_blockers.values()
+            ),
         }
         max_concurrent_positions = max(self.ctx.config.strategy.max_concurrent_positions, 1)
         open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
-        last_scan = self.ctx.state.last_scan if isinstance(self.ctx.state.last_scan, dict) else {}
         quote_truth_payload = {
             "quote_truth_must_resolve_count": int(
                 last_scan.get("quote_truth_must_resolve_count", 0) or 0
@@ -2333,6 +2466,10 @@ class EntryGateRuntime:
             and normalized_remaining_slots <= 0,
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
+            # One row per counted reason; unlike display samples this list is
+            # intentionally not truncated so aggregate counts are auditable.
+            "candidate_blocked_samples": candidate_blocked_samples,
+            "candidate_blocked_sample_count": len(candidate_blocked_samples),
             "unsupported_symbol_blocked_counts": dict(
                 sorted(catalog_filter_blockers.items())
             ),
@@ -2366,6 +2503,12 @@ class EntryGateRuntime:
             "entry_admission_blocker_counts": dict(
                 sorted(entry_admission_blocker_counts.items())
             ),
+            "entry_reprice_blocker_counts": dict(
+                sorted(entry_reprice_blockers.items())
+            ),
+            "entry_reprice_blocker_samples": list(
+                last_scan.get("entry_reprice_blocker_samples", []) or []
+            )[:32],
             "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
             **quote_truth_payload,
             "selection_bucket_counts": selection_bucket_counts,
@@ -2442,6 +2585,9 @@ class EntryGateRuntime:
             ),
             "entry_admission_blocker_keys": sorted(
                 payload.get("entry_admission_blocker_counts", {}).keys()
+            ),
+            "entry_reprice_blocker_keys": sorted(
+                payload.get("entry_reprice_blocker_counts", {}).keys()
             ),
         })
         full_due = (
@@ -2670,6 +2816,7 @@ class EntryGateRuntime:
         candidate_blockers: dict[str, str],
         market_quotes=None,
         admission_blocker_counts: Counter | None = None,
+        emit_events: bool = True,
     ) -> list:
         """V1 select_entry_candidates_from_refs parity for the final entry list."""
         from lightfee.engine.v1_lifecycle import V1TradingLifecycle
@@ -2720,15 +2867,16 @@ class EntryGateRuntime:
                 readiness_evidence["source"] = "initial_entry"
                 readiness_evidence["candidate_pair_id"] = pair_id
                 readiness_evidence["pair_id"] = pair_id
-                self.ctx.journal.append(
-                    "runtime.entry_admission_blocked",
-                    {
-                        **readiness_evidence,
-                        "long_venue": getattr(candidate, "long_venue", ""),
-                        "short_venue": getattr(candidate, "short_venue", ""),
-                        "ts_ms": now_ms,
-                    },
-                )
+                if emit_events:
+                    self.ctx.journal.append(
+                        "runtime.entry_admission_blocked",
+                        {
+                            **readiness_evidence,
+                            "long_venue": getattr(candidate, "long_venue", ""),
+                            "short_venue": getattr(candidate, "short_venue", ""),
+                            "ts_ms": now_ms,
+                        },
+                    )
             decision = None
             if not blocker:
                 decision = V1TradingLifecycle.entry_admissibility(
@@ -2773,7 +2921,7 @@ class EntryGateRuntime:
                 else:
                     selection_blocker_counts[blocker_str] += 1
                 candidate_blockers[pair_id] = blocker_str
-                if blocker_str not in {
+                if emit_events and blocker_str not in {
                     "entry_waiting_for_finalization_window_too_early",
                     "entry_finalization_window_expired",
                 }:

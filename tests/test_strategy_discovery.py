@@ -36,6 +36,33 @@ class TestMarketView:
 
 
 class TestDiscovery:
+    def test_transient_rejection_does_not_mutate_cached_candidate(self):
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="BTCUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=10.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=2.5,
+            entry_notional_quote=30.0,
+            first_funding_timestamp_ms=FUNDING_TS_MS,
+        )
+        rejecting = StrategyConfig(
+            funding_new_entries_enabled=True,
+            min_expected_edge_bps=6.0,
+        )
+        accepting = StrategyConfig(
+            funding_new_entries_enabled=True,
+            min_expected_edge_bps=1.0,
+        )
+
+        for _ in range(100):
+            assert discover_tradeable_candidates([candidate], rejecting, 0) == []
+        assert candidate.blocked_reasons == []
+        assert discover_tradeable_candidates([candidate], accepting, 0) == [candidate]
+
     def test_entry_freeze_blocks_only_new_funding_candidates(self):
         config = StrategyConfig(funding_new_entries_enabled=False)
         candidate = CandidateInput(
@@ -47,7 +74,7 @@ class TestDiscovery:
         )
 
         assert discover_tradeable_candidates([candidate], config, 0) == []
-        assert BlockReason.FUNDING_NEW_ENTRIES_DISABLED.value in candidate.blocked_reasons
+        assert candidate.blocked_reasons == []
 
     def test_entry_freeze_treats_non_boolean_config_as_disabled(self):
         config = StrategyConfig(funding_new_entries_enabled="false")  # type: ignore[arg-type]
@@ -60,7 +87,7 @@ class TestDiscovery:
         )
 
         assert discover_tradeable_candidates([candidate], config, 0) == []
-        assert BlockReason.FUNDING_NEW_ENTRIES_DISABLED.value in candidate.blocked_reasons
+        assert candidate.blocked_reasons == []
 
     def test_live_discovery_requires_complete_economics(self):
         config = StrategyConfig()
@@ -75,7 +102,7 @@ class TestDiscovery:
         assert discover_tradeable_candidates(
             [candidate], config, 0, require_complete_economics=True
         ) == []
-        assert BlockReason.INCOMPLETE_ECONOMICS.value in candidate.blocked_reasons
+        assert candidate.blocked_reasons == []
 
     def test_live_discovery_rejects_truthy_non_boolean_economics_flag(self):
         config = StrategyConfig(funding_new_entries_enabled=True)
@@ -92,7 +119,7 @@ class TestDiscovery:
         assert discover_tradeable_candidates(
             [candidate], config, 0, require_complete_economics=True
         ) == []
-        assert BlockReason.INCOMPLETE_ECONOMICS.value in candidate.blocked_reasons
+        assert candidate.blocked_reasons == []
 
     def test_filters_below_funding_edge_floor(self):
         config = StrategyConfig(min_funding_edge_bps=6.0, max_concurrent_positions=8)
@@ -164,12 +191,9 @@ class TestDiscovery:
         )
 
         assert result == [allowed]
-        assert (
-            BlockReason.FUNDING_CANARY_VENUE_NOT_ALLOWED.value
-            in disallowed.blocked_reasons
-        )
+        assert disallowed.blocked_reasons == []
 
-    def test_canary_static_economics_and_notional_are_filtered_before_tracking(self):
+    def test_canary_static_economics_filter_but_notional_is_a_sizing_constraint(self):
         config = StrategyConfig(
             funding_new_entries_enabled=True,
             funding_canary_enabled=True,
@@ -208,12 +232,12 @@ class TestDiscovery:
             NOW_IN_SCAN_WINDOW_MS,
         )
 
-        assert result == [eligible]
-        assert BlockReason.EXPECTED_EDGE_BELOW_FLOOR.value in low_expected.blocked_reasons
-        assert BlockReason.WORST_CASE_EDGE_BELOW_FLOOR.value in low_worst.blocked_reasons
+        assert result == [oversized, eligible]
+        assert low_expected.blocked_reasons == []
+        assert low_worst.blocked_reasons == []
         assert (
             BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED.value
-            in oversized.blocked_reasons
+            not in oversized.blocked_reasons
         )
 
     def test_ranks_by_ranking_edge_desc(self):
@@ -287,7 +311,7 @@ class TestDiscovery:
         result = discover_tradeable_candidates([candidate], config, 0)
 
         assert result == []
-        assert BlockReason.OUTSIDE_SCAN_WINDOW.value in candidate.blocked_reasons
+        assert candidate.blocked_reasons == []
 
 
 class TestZeroSizeGate:

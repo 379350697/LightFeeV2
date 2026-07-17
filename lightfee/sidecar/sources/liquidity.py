@@ -50,6 +50,24 @@ class LiquiditySource:
                 venue=Venue.from_str(pl.venue),
                 symbol=pl.symbol,
                 observed_at_ms=pl.observed_at_ms,
+                volume_24h_quote=pl.volume_24h_quote,
+                open_interest_quote=pl.open_interest_quote,
+                open_interest_evidence_status=pl.open_interest_evidence_status,
+                open_interest_evidence_reason=pl.open_interest_evidence_reason,
+                open_interest_observed_at_ms=pl.open_interest_observed_at_ms,
+                open_interest_event_at_ms=pl.open_interest_event_at_ms,
+                open_interest_received_at_ms=pl.open_interest_received_at_ms,
+                open_interest_source=pl.open_interest_source,
+                open_interest_sample_id=pl.open_interest_sample_id,
+                open_interest_venue_symbol=pl.open_interest_venue_symbol,
+                raw_open_interest=pl.raw_open_interest,
+                raw_open_interest_unit=pl.raw_open_interest_unit,
+                open_interest_contract_multiplier=(
+                    pl.open_interest_contract_multiplier
+                ),
+                open_interest_conversion_mark_price=(
+                    pl.open_interest_conversion_mark_price
+                ),
             )
         return result
 

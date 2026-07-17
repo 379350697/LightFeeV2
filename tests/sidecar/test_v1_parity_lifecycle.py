@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 
 import pytest
 
 from lightfee.config.schema import RuntimeConfig, StrategyConfig, VenueConfig
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -18,7 +21,92 @@ from lightfee.sidecar.snapshot import (
     SnapshotFreshness,
     TransferLifecycle,
     evaluate_snapshot_freshness,
+    funding_rate_sample_id,
 )
+
+
+def _strict_liquidity_quote(**overrides) -> QuoteSnapshot:
+    """Return a quote carrying an explicit, typed volume/OI proof."""
+    values = {
+        "venue": "binance",
+        "symbol": "BTCUSDT",
+        "bid": 100.0,
+        "ask": 101.0,
+        "observed_at_ms": 1_000,
+        "funding_rate_bps": 1.0,
+        "funding_rate_observed_at_ms": 1_000,
+        "funding_rate_received_at_ms": 1_000,
+        "funding_rate_source": "test_fixture",
+        "funding_rate_sample_id": "funding:binance:BTCUSDT:1000:0:0",
+        "funding_timestamp_ms": 2_000,
+        "funding_interval_ms": 28_800_000,
+        "volume_24h_quote": 10_000_000.0,
+        "open_interest": 2_000_000.0,
+        "open_interest_evidence_status": "observed",
+        "open_interest_evidence_reason": "test_fixture",
+        "open_interest_observed_at_ms": 1_000,
+        "open_interest_event_at_ms": 0,
+        "open_interest_received_at_ms": 1_000,
+        "open_interest_source": "test_fixture",
+        "open_interest_sample_id": "",
+        "open_interest_venue_symbol": "BTCUSDT",
+        "raw_open_interest": 2_000_000.0,
+        "raw_open_interest_unit": "quote",
+        "open_interest_contract_multiplier": 1.0,
+        "underlying": "BTC",
+        "quote_currency": "USDT",
+        "contract_type": "linear",
+        "contract_multiplier": 1.0,
+        "mark_index_source": "test_fixture",
+        "price_precision": 2,
+        "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
+        "venue_status": "active",
+        "contract_normalization_complete": True,
+    }
+    values.update(overrides)
+    if "funding_rate_observed_at_ms" not in overrides:
+        values["funding_rate_observed_at_ms"] = int(values["observed_at_ms"])
+    if "funding_rate_received_at_ms" not in overrides:
+        values["funding_rate_received_at_ms"] = int(
+            values["funding_rate_observed_at_ms"]
+        )
+    try:
+        values["funding_rate_sample_id"] = funding_rate_sample_id(
+            venue=str(values["venue"]),
+            symbol=str(values["symbol"]),
+            observed_at_ms=int(values["funding_rate_observed_at_ms"]),
+            rate_bps=float(values["funding_rate_bps"]),
+            funding_timestamp_ms=int(values["funding_timestamp_ms"]),
+        )
+    except (TypeError, ValueError, OverflowError):
+        values["funding_rate_sample_id"] = ""
+    if "underlying" not in overrides:
+        values["underlying"] = str(values["symbol"]).removesuffix("USDT")
+    values["open_interest_sample_id"] = open_interest_sample_id(
+        venue=str(values["venue"]),
+        canonical_symbol=str(values["symbol"]),
+        venue_symbol=str(values["open_interest_venue_symbol"]),
+        observed_at_ms=int(
+            values.get("open_interest_event_at_ms")
+            or values["open_interest_observed_at_ms"]
+        ),
+        source=str(values["open_interest_source"]),
+        raw_value=float(values["raw_open_interest"]),
+        value_quote=float(values["open_interest"]),
+    )
+    return QuoteSnapshot(**values)
+
+
+async def _wait_for_full_audit_publish(service) -> None:
+    """Wait only in tests that assert the asynchronous audit artifact."""
+    task = service._audit_publish_task
+    if task is not None:
+        await task
 
 
 class TestLifecycleCoverageDegradation:
@@ -588,15 +676,12 @@ class TestLiquiditySourceWiredIntoRefresh:
         class MissingAndCrossedSource:
             async def fetch_all(self, symbols):
                 return {
-                    "binance:BTCUSDT": QuoteSnapshot(
-                        venue="binance",
-                        symbol="BTCUSDT",
+                    "binance:BTCUSDT": _strict_liquidity_quote(
                         bid=101.0,
                         ask=100.0,
                         observed_at_ms=123,
-                        funding_rate_bps=1.0,
-                        funding_timestamp_ms=2_000,
-                        funding_interval_ms=28_800_000,
+                        open_interest_observed_at_ms=123,
+                        open_interest_received_at_ms=123,
                     )
                 }
 
@@ -614,6 +699,7 @@ class TestLiquiditySourceWiredIntoRefresh:
 
         try:
             snapshot = await service.refresh_once()
+            await _wait_for_full_audit_publish(service)
         finally:
             await service.close()
 
@@ -627,7 +713,7 @@ class TestLiquiditySourceWiredIntoRefresh:
         assert snapshot.market_lifecycle[0].coverage_usable == 0
         assert "BTCUSDT: crossed BBO" in snapshot.market_lifecycle[0].degraded_reason
         assert snapshot.liquidity_lifecycle[0].symbol_count == 1
-        assert snapshot.liquidity_lifecycle[0].coverage_usable == 0
+        assert snapshot.liquidity_lifecycle[0].coverage_usable == 1
         assert load_snapshot(snapshot_path) is not None
 
     @pytest.mark.parametrize(
@@ -644,25 +730,22 @@ class TestLiquiditySourceWiredIntoRefresh:
         class InvalidBboSource:
             async def fetch_all(self, symbols):
                 return {
-                    "binance:BTCUSDT": QuoteSnapshot(
-                        venue="binance",
-                        symbol="BTCUSDT",
+                    "binance:BTCUSDT": _strict_liquidity_quote(
                         bid=invalid_bid,
                         ask=100.0,
                         observed_at_ms=123,
-                        funding_rate_bps=1.0,
-                        funding_timestamp_ms=2_000,
-                        funding_interval_ms=28_800_000,
+                        open_interest_observed_at_ms=123,
+                        open_interest_received_at_ms=123,
                     ),
-                    "binance:ETHUSDT": QuoteSnapshot(
-                        venue="binance",
+                    "binance:ETHUSDT": _strict_liquidity_quote(
                         symbol="ETHUSDT",
                         bid=50.0,
                         ask=51.0,
                         observed_at_ms=123,
                         funding_rate_bps=2.0,
-                        funding_timestamp_ms=2_000,
-                        funding_interval_ms=28_800_000,
+                        open_interest_observed_at_ms=123,
+                        open_interest_received_at_ms=123,
+                        open_interest_venue_symbol="ETHUSDT",
                     ),
                 }
 
@@ -680,6 +763,7 @@ class TestLiquiditySourceWiredIntoRefresh:
 
         try:
             snapshot = await service.refresh_once()
+            await _wait_for_full_audit_publish(service)
         finally:
             await service.close()
 
@@ -705,15 +789,16 @@ class TestLiquiditySourceWiredIntoRefresh:
 
             async def fetch_all(self, symbols):
                 return {
-                    f"{self.venue}:BTCUSDT": QuoteSnapshot(
+                    f"{self.venue}:BTCUSDT": _strict_liquidity_quote(
                         venue=self.venue,
                         symbol="BTCUSDT",
                         bid=100.0,
                         ask=101.0,
                         observed_at_ms=123,
                         funding_rate_bps=self.funding_rate,
-                        funding_timestamp_ms=2_000,
-                        funding_interval_ms=28_800_000,
+                        open_interest_observed_at_ms=123,
+                        open_interest_received_at_ms=123,
+                        open_interest_venue_symbol="BTCUSDT",
                     )
                 }
 
@@ -735,6 +820,7 @@ class TestLiquiditySourceWiredIntoRefresh:
 
         try:
             snapshot = await service.refresh_once()
+            await _wait_for_full_audit_publish(service)
         finally:
             await service.close()
 
@@ -743,9 +829,7 @@ class TestLiquiditySourceWiredIntoRefresh:
         assert "BTCUSDT: funding_rate_invalid" in funding["binance"].degraded_reason
         assert snapshot.degraded_symbols == {"binance": ["BTCUSDT"]}
         assert snapshot.candidates == []
-        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {
-            "invalid_trade_quote": 2
-        }
+        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {}
         assert load_snapshot(snapshot_path) is not None
 
     @pytest.mark.asyncio
@@ -758,15 +842,10 @@ class TestLiquiditySourceWiredIntoRefresh:
         class FakeExchangeSource:
             async def fetch_all(self, symbols):
                 return {
-                    "binance:BTCUSDT": QuoteSnapshot(
-                        venue="binance",
-                        symbol="BTCUSDT",
-                        bid=100.0,
-                        ask=101.0,
+                    "binance:BTCUSDT": _strict_liquidity_quote(
                         observed_at_ms=123,
-                        funding_rate_bps=1.0,
-                        funding_timestamp_ms=2_000,
-                        funding_interval_ms=28_800_000,
+                        open_interest_observed_at_ms=123,
+                        open_interest_received_at_ms=123,
                     )
                 }
 
@@ -832,7 +911,7 @@ class TestRefreshPublicationSemantics:
                 (
                     "binance",
                     {
-                        "binance:BTCUSDT": QuoteSnapshot(
+                        "binance:BTCUSDT": _strict_liquidity_quote(
                             venue="binance",
                             symbol="BTCUSDT",
                             bid=50000,
@@ -886,6 +965,81 @@ class TestRefreshPublicationSemantics:
         assert snapshot.liquidity_lifecycle[0].source == "sidecar_perp_liquidity"
 
     @pytest.mark.asyncio
+    async def test_slow_venue_does_not_block_live_entry_generation(self, tmp_path):
+        from lightfee.config.schema import AppConfig
+        from lightfee.sidecar.publisher import funding_entry_snapshot_path
+        from lightfee.sidecar.service import SidecarService
+
+        release_slow = asyncio.Event()
+        fetch_counts: dict[str, int] = {}
+
+        class Source:
+            def __init__(self, venue: str, *, wait: bool = False) -> None:
+                self.venue = venue
+                self.wait = wait
+
+            async def fetch_all(self, symbols):
+                fetch_counts[self.venue] = fetch_counts.get(self.venue, 0) + 1
+                if self.wait:
+                    await release_slow.wait()
+                now_ms = int(time.time() * 1_000)
+                return {
+                    f"{self.venue}:BTCUSDT": _strict_liquidity_quote(
+                        venue=self.venue,
+                        observed_at_ms=now_ms,
+                        open_interest_observed_at_ms=now_ms,
+                        open_interest_received_at_ms=now_ms,
+                    )
+                }
+
+            async def close(self):
+                return None
+
+        snapshot_path = tmp_path / "sidecar.json"
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(snapshot_path),
+                    sidecar_funding_timeout_s=5.0,
+                ),
+                venues=[
+                    VenueConfig(venue="binance"),
+                    VenueConfig(venue="okx"),
+                    VenueConfig(venue="bybit"),
+                ],
+            )
+        )
+        service._exchange_sources = {
+            "binance": Source("binance"),
+            "okx": Source("okx"),
+            "bybit": Source("bybit", wait=True),
+        }
+
+        started = time.monotonic()
+        first = await service.refresh_once()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.55
+        assert {"binance:BTCUSDT", "okx:BTCUSDT"} <= set(first.quotes)
+        assert "bybit" in first.degraded_venues
+        assert funding_entry_snapshot_path(snapshot_path).exists()
+
+        release_slow.set()
+        await asyncio.wait_for(
+            service.entry_venue_republish_event.wait(),
+            timeout=0.5,
+        )
+        republish_started = time.monotonic()
+        second = await service.refresh_entry_from_latest_cache()
+        republish_elapsed = time.monotonic() - republish_started
+        assert republish_elapsed < 0.5
+        assert "bybit:BTCUSDT" in second.quotes
+        assert "bybit" not in second.degraded_venues
+        assert fetch_counts == {"binance": 1, "okx": 1, "bybit": 1}
+        await service.close()
+
+    @pytest.mark.asyncio
     async def test_liquidity_success_publish_interval_ignores_failed_refresh(
         self, monkeypatch, tmp_path
     ):
@@ -909,12 +1063,19 @@ class TestRefreshPublicationSemantics:
         svc._last_good_at_ms = 0
         svc._last_liquidity_publish_at_ms = 1000
 
+        quote_has_liquidity_proof = False
+
         async def fake_fetch_all_venues(symbols, timeout_s):
+            quote_factory = (
+                _strict_liquidity_quote
+                if quote_has_liquidity_proof
+                else QuoteSnapshot
+            )
             return [
                 (
                     "binance",
                     {
-                        "binance:BTCUSDT": QuoteSnapshot(
+                        "binance:BTCUSDT": quote_factory(
                             venue="binance",
                             symbol="BTCUSDT",
                             bid=50000,
@@ -951,6 +1112,7 @@ class TestRefreshPublicationSemantics:
         assert failed.liquidity_lifecycle[0].publish_interval_ms == 0
         assert svc._last_liquidity_publish_at_ms == 1000
 
+        quote_has_liquidity_proof = True
         svc._fetch_liquidity_all_venues = successful_liquidity
         times = iter([8.0, 9.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
@@ -995,7 +1157,7 @@ class TestRefreshPublicationSemantics:
                 (
                     "okx",
                     {
-                        "okx:BTCUSDT": QuoteSnapshot(
+                        "okx:BTCUSDT": _strict_liquidity_quote(
                             venue="okx",
                             symbol="BTCUSDT",
                             bid=50000,
@@ -1185,7 +1347,7 @@ class TestRefreshPublicationSemantics:
                 (
                     "okx",
                     {
-                        "okx:BTCUSDT": QuoteSnapshot(
+                        "okx:BTCUSDT": _strict_liquidity_quote(
                             venue="okx",
                             symbol="BTCUSDT",
                             bid=50010,
@@ -1193,7 +1355,8 @@ class TestRefreshPublicationSemantics:
                             observed_at_ms=1000,
                             funding_rate_bps=2.0,
                             funding_timestamp_ms=1000,
-                            funding_interval_ms=28_800_000,
+                            open_interest_observed_at_ms=1000,
+                            open_interest_received_at_ms=1000,
                         )
                     },
                     None,

@@ -15,6 +15,7 @@ from lightfee.sidecar.snapshot import (
     LiquidityLifecycle,
     QuoteSnapshot,
     SidecarSnapshot,
+    funding_rate_sample_id,
 )
 
 
@@ -30,6 +31,24 @@ def _isolate_non_canary_snapshot_incident(monkeypatch):
         EntryDispatchRuntime,
         "_funding_canary_submission_reason",
         lambda *_args, **_kwargs: "",
+    )
+
+    async def complete_account_truth(_runtime):
+        return True
+
+    monkeypatch.setattr(
+        LiveRuntime,
+        "_entry_account_truth_ready_for_tick",
+        complete_account_truth,
+    )
+
+    async def preserve_snapshot_scope(_runtime, candidates, **_kwargs):
+        return list(candidates)
+
+    monkeypatch.setattr(
+        LiveRuntime,
+        "_filter_candidates_supported_by_venue_catalog",
+        preserve_snapshot_scope,
     )
 
 
@@ -94,6 +113,7 @@ def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
     # economically admissible under the real final-entry repricing gate.
     bid = 102.0 if venue == "bybit" else 100.0
     ask = 103.0 if venue == "bybit" else 101.0
+    funding_rate_bps = 5.0 if venue == "bybit" else -5.0
     open_interest = 2_000_000.0
     oi_source = "incident_fixture"
     return QuoteSnapshot(
@@ -105,6 +125,17 @@ def _quote(venue: str, symbol: str, observed_at_ms: int) -> QuoteSnapshot:
         source="sidecar_quote",
         bid_size=100.0,
         ask_size=100.0,
+        funding_rate_bps=funding_rate_bps,
+        funding_rate_observed_at_ms=observed_at_ms,
+        funding_rate_received_at_ms=observed_at_ms,
+        funding_rate_source="incident_fixture",
+        funding_rate_sample_id=funding_rate_sample_id(
+            venue=venue,
+            symbol=symbol,
+            observed_at_ms=observed_at_ms,
+            rate_bps=funding_rate_bps,
+            funding_timestamp_ms=400_000,
+        ),
         funding_timestamp_ms=400_000,
         funding_interval_ms=28_800_000,
         volume_24h_quote=10_000_000.0,
@@ -170,7 +201,14 @@ def _runtime(tmp_path) -> LiveRuntime:
 
 async def _run_tick(tmp_path, monkeypatch, snapshot: SidecarSnapshot) -> tuple[LiveRuntime, list[dict]]:
     runtime = _runtime(tmp_path)
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.funding_entry_snapshot_identity",
+        lambda _path: ("test-v6-generation", 1, 1),
+    )
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_funding_entry_snapshot",
+        lambda _path: snapshot,
+    )
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -227,12 +265,13 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     # final executable BBO economics.  This fixture intentionally supplies no
     # quote lease, so the new admission contract must fail closed here.
     assert len(runtime.entry_executor.contexts) == 0
-    final_blocks = [
+    quote_blocks = [
         record for record in records
-        if record["kind"] == "entry.dispatch_viability_blocked"
-        and record["payload"].get("source") == "final_entry_economics"
+        if record["kind"] == "runtime.entry_quote_revalidate_failed"
+        and record["payload"].get("source") == "entry_quote_truth"
     ]
-    assert final_blocks and final_blocks[0]["payload"]["reason"] == "missing_final_executable_bbo"
+    assert quote_blocks
+    assert quote_blocks[0]["payload"]["reason"] == "last_good_sidecar"
 
 
 @pytest.mark.asyncio
@@ -284,12 +323,13 @@ async def test_degraded_other_symbol_does_not_reject_selected_candidate(
     assert liquidity_scope["block_reason"] == ""
     assert len(runtime.entry_executor.contexts) == 0
     assert any(
-        record["kind"] == "entry.dispatch_viability_blocked"
-        and record["payload"].get("source") == "final_entry_economics"
+        record["kind"] == "runtime.entry_quote_revalidate_failed"
+        and record["payload"].get("source") == "entry_quote_truth"
+        and record["payload"].get("reason") == "entry_final_revalidation"
         for record in records
     )
     diagnostics = [record for record in records if record["kind"] == "scan.no_entry_diagnostics"]
-    assert diagnostics and diagnostics[0]["payload"]["reason"] == "no_entry_dispatched"
+    assert diagnostics and diagnostics[0]["payload"]["reason"] == "no_tradeable_candidates"
 
 
 @pytest.mark.asyncio

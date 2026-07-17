@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from enum import Enum
 
 from lightfee.config.schema import StrategyConfig
@@ -9,7 +10,6 @@ from lightfee.sidecar.snapshot import CandidateInput
 from lightfee.strategy.funding_canary_policy import (
     canary_edge_floors,
     canary_fee_assurance_tier,
-    canary_notional_cap,
 )
 
 
@@ -42,6 +42,7 @@ def discover_tradeable_candidates(
     now_ms: int,
     *,
     require_complete_economics: bool = False,
+    blocked_reason_counts: MutableMapping[str, int] | None = None,
 ) -> list[CandidateInput]:
     """Filter and rank candidates through strategy gates (V1 parity).
 
@@ -58,10 +59,17 @@ def discover_tradeable_candidates(
         config.funding_new_entries_enabled is True
         and config.funding_canary_enabled is True
     )
+
+    def record_blocker(reason: str) -> None:
+        if blocked_reason_counts is None or not reason:
+            return
+        blocked_reason_counts[reason] = int(blocked_reason_counts.get(reason, 0)) + 1
+
     for c in candidates:
         if c.blocked:
-            if "missing_candidate_identity_or_funding_timestamp" in c.blocked_reasons:
-                continue
+            reasons = list(c.blocked_reasons or []) or ["candidate_blocked"]
+            for reason in reasons:
+                record_blocker(str(reason))
             continue
 
         reasons: list[BlockReason] = []
@@ -84,16 +92,10 @@ def discover_tradeable_candidates(
         assurance_tier = canary_fee_assurance_tier(c, config)
         if canary_venue_filter_enabled and assurance_tier == "unavailable":
             reasons.append(BlockReason.FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE)
-        if (
-            canary_venue_filter_enabled
-            and (
-                c.entry_max_leg_notional_quote
-                if c.entry_max_leg_notional_quote > 0.0
-                else c.entry_notional_quote
-            )
-            > canary_notional_cap(c, config)
-        ):
-            reasons.append(BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED)
+        # Canary notional is a sizing constraint, not a discovery predicate.
+        # The risk allocator/final-price clamp reduces quantity and recomputes
+        # economics; an exceeded value here is only meaningful later as an
+        # invariant breach after that clamp has run.
         if require_complete_economics and (
             c.economics_complete is not True
             or c.economics_observed_at_ms <= 0
@@ -139,7 +141,8 @@ def discover_tradeable_candidates(
             reasons.append(BlockReason.ZERO_ORDER_SIZE)
 
         if reasons:
-            c.blocked_reasons = list(c.blocked_reasons) + [r.value for r in reasons]
+            for reason in reasons:
+                record_blocker(reason.value)
             continue
 
         passed.append((c, []))

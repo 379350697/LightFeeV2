@@ -11,6 +11,7 @@ from lightfee.core.domain import Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
+from lightfee.venues.market_data import FundingTicker
 from lightfee.venues.specs import binance_spec, okx_spec
 
 
@@ -70,6 +71,75 @@ class TestExchangeSource:
         src = ExchangeSource(binance_spec(), rate_limiter=limiter)
 
         assert src._client._rate_limiter is limiter
+
+    @pytest.mark.asyncio
+    async def test_failed_final_bbo_cannot_reuse_aged_funding_ticker_price(self):
+        class FakeClient:
+            async def fetch_funding_tickers(self, symbols, *, include_open_interest):
+                return {
+                    "binance:BTCUSDT": FundingTicker(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        market_received_at_ms=123,
+                        funding_rate_bps=50.0,
+                    )
+                }
+
+            async def fetch_top_book_quotes(self, symbols):
+                raise TimeoutError("final BBO unavailable")
+
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+        src._client = FakeClient()
+
+        quotes = await src.fetch_market_quotes(["BTCUSDT"])
+        quote = quotes["binance:BTCUSDT"]
+
+        assert quote.bid == 0.0
+        assert quote.ask == 0.0
+        assert quote.observed_at_ms == 0
+        assert quote.source == "sidecar_bbo_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_partial_final_bbo_invalidates_only_missing_symbol(self):
+        class FakeClient:
+            async def fetch_funding_tickers(self, symbols, *, include_open_interest):
+                return {
+                    f"binance:{symbol}": FundingTicker(
+                        venue="binance",
+                        symbol=symbol,
+                        bid=100.0,
+                        ask=101.0,
+                        market_received_at_ms=123,
+                    )
+                    for symbol in symbols
+                }
+
+            async def fetch_top_book_quotes(self, symbols):
+                from lightfee.marketdata.ws_bbo import TopBookQuote
+
+                return {
+                    "binance:BTCUSDT": TopBookQuote(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=200.0,
+                        ask=201.0,
+                        received_at_ms=456,
+                    )
+                }
+
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+        src._client = FakeClient()
+
+        quotes = await src.fetch_market_quotes(["BTCUSDT", "ETHUSDT"])
+
+        assert quotes["binance:BTCUSDT"].bid == 200.0
+        assert quotes["binance:BTCUSDT"].observed_at_ms == 456
+        assert quotes["binance:ETHUSDT"].bid == 0.0
+        assert quotes["binance:ETHUSDT"].source == "sidecar_bbo_unavailable"
 
 
 class TestLiquiditySource:
@@ -175,9 +245,9 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.bid == 100.0
         assert quote.ask == 101.0
         assert quote.open_interest is None
-        assert quote.open_interest_evidence_status == "deferred"
-        assert quote.open_interest_evidence_reason == "background_refresh_inflight"
-        assert quote.oi_refresh_attempt_count == 1
+        assert quote.open_interest_evidence_status == "unavailable"
+        assert quote.open_interest_evidence_reason == "entry_targeted_revalidation_required"
+        assert quote.oi_refresh_attempt_count == 0
         assert quote.oi_timeout_count == 0
 
     @pytest.mark.asyncio
@@ -207,9 +277,27 @@ class TestSidecarServiceRateLimitWiring:
                 bid_size=10.0,
                 ask_size=10.0,
                 funding_rate_bps=1.0,
+                funding_rate_observed_at_ms=10_100,
+                funding_rate_received_at_ms=10_100,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id="funding:binance:BTCUSDT:10100:1:20000",
                 funding_timestamp_ms=20_000,
                 funding_interval_ms=28_800_000,
                 observed_at_ms=10_100,
+                underlying="BTC",
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="test_fixture",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
             ),
             "bybit:BTCUSDT": QuoteSnapshot(
                 venue="bybit",
@@ -219,9 +307,27 @@ class TestSidecarServiceRateLimitWiring:
                 bid_size=10.0,
                 ask_size=10.0,
                 funding_rate_bps=10.0,
+                funding_rate_observed_at_ms=10_200,
+                funding_rate_received_at_ms=10_200,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id="funding:bybit:BTCUSDT:10200:10:20000",
                 funding_timestamp_ms=20_000,
                 funding_interval_ms=28_800_000,
                 observed_at_ms=10_200,
+                underlying="BTC",
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="test_fixture",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
             ),
         }
 

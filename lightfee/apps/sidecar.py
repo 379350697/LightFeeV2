@@ -57,8 +57,13 @@ async def _run(
     cleanup_shutdown_handlers = install_shutdown_handlers(stop_event)
     bbo_task: asyncio.Task[None] | None = None
 
-    async def refresh_once_until_stop() -> bool:
-        refresh_task = asyncio.create_task(service.refresh_once())
+    async def refresh_once_until_stop(*, cache_only: bool = False) -> bool:
+        refresh_call = (
+            getattr(service, "refresh_entry_from_latest_cache")
+            if cache_only
+            else service.refresh_once
+        )
+        refresh_task = asyncio.create_task(refresh_call())
         stop_task = asyncio.create_task(stop_event.wait())
         try:
             waiters: set[asyncio.Task] = {refresh_task, stop_task}
@@ -113,39 +118,72 @@ async def _run(
             # Establish compact-snapshot ownership before the slower metadata
             # loop can publish its one-shot compatibility view.
             await asyncio.sleep(0)
+        cache_only_next = False
         while not stop_event.is_set():
-            completed_refresh = await refresh_once_until_stop()
+            completed_refresh = await refresh_once_until_stop(
+                cache_only=cache_only_next
+            )
+            cache_only_next = False
             if stop_event.is_set():
                 break
             if not completed_refresh:
                 break
+            republish_event = getattr(
+                service,
+                "entry_venue_republish_event",
+                None,
+            )
+            republish_task = (
+                asyncio.create_task(republish_event.wait())
+                if isinstance(republish_event, asyncio.Event)
+                else None
+            )
             if bbo_task is None:
                 try:
-                    await asyncio.wait_for(
-                        stop_event.wait(),
+                    stop_task = asyncio.create_task(stop_event.wait())
+                    waiters = {stop_task}
+                    if republish_task is not None:
+                        waiters.add(republish_task)
+                    done, _pending = await asyncio.wait(
+                        waiters,
                         timeout=refresh_interval_s,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                except asyncio.TimeoutError:
-                    continue
-                break
+                    if republish_task is not None and republish_task in done:
+                        republish_event.clear()
+                        cache_only_next = True
+                        continue
+                    if stop_task not in done:
+                        continue
+                    break
+                finally:
+                    for task in (stop_task, republish_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
             try:
                 stop_task = asyncio.create_task(stop_event.wait())
+                waiters = {stop_task, bbo_task}
+                if republish_task is not None:
+                    waiters.add(republish_task)
                 done, _pending = await asyncio.wait(
-                    {stop_task, bbo_task},
+                    waiters,
                     timeout=refresh_interval_s,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                if republish_task is not None and republish_task in done:
+                    republish_event.clear()
+                    cache_only_next = True
+                    continue
                 if bbo_task in done:
                     await bbo_task
                 if stop_task in done:
                     break
             finally:
-                if not stop_task.done():
-                    stop_task.cancel()
-                    try:
-                        await stop_task
-                    except asyncio.CancelledError:
-                        pass
+                for task in (stop_task, republish_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
     finally:
         stop_event.set()
         if bbo_task is not None:

@@ -32,6 +32,47 @@ if TYPE_CHECKING:
     from lightfee.sidecar.snapshot import CandidateInput
 
 
+def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
+    """Expose legacy JSON fixtures through the live-only V6 test boundary."""
+    from pathlib import Path
+
+    from lightfee.sidecar.publisher import load_snapshot
+
+    def identity(path):
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return ("test-v6-file", stat.st_mtime_ns, stat.st_size)
+
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.funding_entry_snapshot_identity",
+        identity,
+    )
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_funding_entry_snapshot",
+        load_snapshot,
+    )
+
+
+def _install_v6_object_snapshot_fixture(monkeypatch, snapshot) -> None:
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.funding_entry_snapshot_identity",
+        lambda _path: ("test-v6-object", 1, 1),
+    )
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_funding_entry_snapshot",
+        lambda _path: snapshot,
+    )
+
+
+def _allow_test_entry_account_truth(monkeypatch, runtime) -> None:
+    async def ready() -> bool:
+        return True
+
+    monkeypatch.setattr(runtime, "_entry_account_truth_ready_for_tick", ready)
+
+
 def _complete_v3_economics_fields(
     funding_edge_bps: float,
     observed_at_ms: int,
@@ -1087,7 +1128,14 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         )
         monkeypatch.setattr(rt, "get_venue_adapter", lambda _venue: object())
 
-        async def fake_supported_symbols(venue, _adapter, symbols, *, skip_event_kind=""):
+        async def fake_supported_symbols(
+            venue,
+            _adapter,
+            symbols,
+            *,
+            skip_event_kind="",
+            fail_closed_on_catalog_unavailable=False,
+        ):
             if venue == Venue.BYBIT:
                 return []
             return list(symbols)
@@ -1728,6 +1776,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     open_interest=2_000_000.0,
                     funding_rate_bps=10.0,
                     funding_timestamp_ms=370000,
+                    quantity_precision=4,
+                    quantity_step_base=0.0001,
+                    min_quantity_base=0.0001,
                 ),
                 "bybit:BTCUSDT": _complete_v3_contract_quote(
                     "bybit",
@@ -1739,6 +1790,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     open_interest=2_000_000.0,
                     funding_rate_bps=-5.0,
                     funding_timestamp_ms=370000,
+                    quantity_precision=4,
+                    quantity_step_base=0.0001,
+                    min_quantity_base=0.0001,
                 ),
             },
             "candidates": [{
@@ -1772,9 +1826,49 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
+        async def preserve_catalog(candidates, **_kwargs):
+            return list(candidates)
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_supported_by_venue_catalog",
+            preserve_catalog,
+        )
+        monkeypatch.setattr(
+            rt,
+            "_reprice_entry_candidates_for_selection",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_by_snapshot_freshness",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            rt,
+            "_entry_candidate_lease_is_live",
+            lambda _candidate, **_kwargs: True,
+        )
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        for venue, bid, ask in (
+            ("binance", 50_000.0, 50_010.0),
+            ("bybit", 50_005.0, 50_015.0),
+        ):
+            rt.ws_bbo_cache.update_quote(TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source="test_ws_bbo",
+            ))
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
+        _install_v6_file_snapshot_fixture(monkeypatch)
+        _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
         await rt.tick()
@@ -1894,6 +1988,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     open_interest=2_000_000.0,
                     funding_rate_bps=10.0,
                     funding_timestamp_ms=funding_ts,
+                    quantity_precision=4,
+                    quantity_step_base=0.0001,
+                    min_quantity_base=0.0001,
                 ),
                 "bybit:BTCUSDT": _complete_v3_contract_quote(
                     "bybit",
@@ -1905,6 +2002,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     open_interest=2_000_000.0,
                     funding_rate_bps=-5.0,
                     funding_timestamp_ms=funding_ts,
+                    quantity_precision=4,
+                    quantity_step_base=0.0001,
+                    min_quantity_base=0.0001,
                 ),
             },
             "candidates": [{
@@ -1938,9 +2038,49 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
+        async def preserve_catalog(candidates, **_kwargs):
+            return list(candidates)
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_supported_by_venue_catalog",
+            preserve_catalog,
+        )
+        monkeypatch.setattr(
+            rt,
+            "_reprice_entry_candidates_for_selection",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_by_snapshot_freshness",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            rt,
+            "_entry_candidate_lease_is_live",
+            lambda _candidate, **_kwargs: True,
+        )
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        for venue, bid, ask in (
+            ("binance", 50_000.0, 50_010.0),
+            ("bybit", 50_005.0, 50_015.0),
+        ):
+            rt.ws_bbo_cache.update_quote(TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source="test_ws_bbo",
+            ))
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
+        _install_v6_file_snapshot_fixture(monkeypatch)
+        _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
         await rt.tick()
@@ -2065,9 +2205,18 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
+        async def preserve_catalog(candidates, **_kwargs):
+            return list(candidates)
+        monkeypatch.setattr(
+            rt,
+            "_filter_candidates_supported_by_venue_catalog",
+            preserve_catalog,
+        )
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
+        _install_v6_file_snapshot_fixture(monkeypatch)
+        _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
         activated_symbols = []
@@ -2411,6 +2560,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
+        _install_v6_file_snapshot_fixture(monkeypatch)
         rt.journal.open()
 
         snapshot_path.write_text(json.dumps(base_snapshot))
@@ -2423,6 +2573,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         stale_snapshot["degraded_symbols"] = {}
         rt._last_good_snapshot = None
         snapshot_path.write_text(json.dumps(stale_snapshot))
+        rt._ensure_sidecar_snapshot_load()
+        if rt._sidecar_snapshot_load_task is not None:
+            await rt._sidecar_snapshot_load_task
         await rt.tick()
         rt.journal.close()
 
@@ -4236,7 +4389,8 @@ class TestEntryReadinessProviderFactory:
             return list(candidates)
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-        monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _: snapshot)
+        _install_v6_object_snapshot_fixture(monkeypatch, snapshot)
+        _allow_test_entry_account_truth(monkeypatch, rt)
         monkeypatch.setattr(
             rt,
             "_filter_candidates_supported_by_venue_catalog",

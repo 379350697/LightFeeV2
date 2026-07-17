@@ -10,6 +10,78 @@ from typing import Callable, Optional
 
 SNAPSHOT_SCHEMA_VERSION = 5
 LEGACY_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+
+
+def funding_rate_sample_id(
+    *,
+    venue: str,
+    symbol: str,
+    observed_at_ms: int,
+    rate_bps: float,
+    funding_timestamp_ms: int,
+) -> str:
+    """Canonical identity for one funding-rate observation."""
+    return (
+        f"funding:{str(venue).strip().lower()}:"
+        f"{str(symbol).strip().upper()}:{int(observed_at_ms)}:"
+        f"{float(rate_bps):.17g}:{int(funding_timestamp_ms or 0)}"
+    )
+
+
+def funding_rate_evidence_reason(
+    *,
+    venue: str,
+    symbol: str,
+    rate_bps: object,
+    funding_timestamp_ms: object,
+    observed_at_ms: object,
+    event_at_ms: object,
+    received_at_ms: object,
+    source: object,
+    sample_id: object,
+    decision_at_ms: int,
+    future_skew_ms: int = 5_000,
+) -> str:
+    """Validate funding alpha, clocks and immutable sample identity."""
+    if (
+        isinstance(rate_bps, bool)
+        or not isinstance(rate_bps, (int, float))
+        or not isfinite(float(rate_bps))
+    ):
+        return "funding_rate_invalid"
+    for name, value in (
+        ("observed", observed_at_ms),
+        ("event", event_at_ms),
+        ("received", received_at_ms),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"funding_rate_{name}_at_ms_invalid"
+    observed = int(observed_at_ms)
+    event = int(event_at_ms)
+    received = int(received_at_ms)
+    decision = int(decision_at_ms)
+    skew = max(int(future_skew_ms), 0)
+    if observed <= 0 or observed > decision + skew:
+        return "funding_rate_observed_at_ms_invalid"
+    if received < observed or received > decision + skew:
+        return "funding_rate_received_at_ms_invalid"
+    if event < 0 or event > received + skew or event > decision + skew:
+        return "funding_rate_event_at_ms_invalid"
+    if not str(source or "").strip():
+        return "funding_rate_source_invalid"
+    actual_sample_id = str(sample_id or "").strip()
+    if not actual_sample_id:
+        return "funding_rate_sample_id_invalid"
+    expected_sample_id = funding_rate_sample_id(
+        venue=venue,
+        symbol=symbol,
+        observed_at_ms=observed,
+        rate_bps=float(rate_bps),
+        funding_timestamp_ms=int(funding_timestamp_ms or 0),
+    )
+    if actual_sample_id != expected_sample_id:
+        return "funding_rate_sample_id_mismatch"
+    return ""
 _V3_SOURCE_MODES = {
     "coarse_sidecar",
     "direct_market",
@@ -367,10 +439,46 @@ def _validate_snapshot_contract(
             errors.append(f"quote_symbol_not_canonical:{key}")
         elif isinstance(venue, str) and venue.strip():
             quote_symbols_by_venue.setdefault(venue, set()).add(symbol)
+            funding_proof_reason = ""
+            funding_proof_present = any(
+                quote.get(field_name) not in (None, "", 0)
+                for field_name in (
+                    "funding_rate_observed_at_ms",
+                    "funding_rate_event_at_ms",
+                    "funding_rate_received_at_ms",
+                    "funding_rate_source",
+                    "funding_rate_sample_id",
+                )
+            )
+            if require_open_interest_proof and funding_proof_present:
+                funding_proof_reason = funding_rate_evidence_reason(
+                    venue=venue,
+                    symbol=symbol,
+                    rate_bps=quote.get("funding_rate_bps"),
+                    funding_timestamp_ms=quote.get("funding_timestamp_ms"),
+                    observed_at_ms=quote.get("funding_rate_observed_at_ms"),
+                    event_at_ms=quote.get("funding_rate_event_at_ms"),
+                    received_at_ms=quote.get("funding_rate_received_at_ms"),
+                    source=quote.get("funding_rate_source"),
+                    sample_id=quote.get("funding_rate_sample_id"),
+                    decision_at_ms=(
+                        int(candidate_build_at_ms)
+                        if _nonnegative_int(
+                            candidate_build_at_ms, positive=True
+                        )
+                        else 0
+                    ),
+                )
+                if funding_proof_reason:
+                    errors.append(
+                        f"quote_funding_evidence_invalid:{key}:"
+                        f"{funding_proof_reason}"
+                    )
             if (
                 _finite_number(quote.get("funding_rate_bps"))
                 and _nonnegative_int(quote.get("funding_timestamp_ms"), positive=True)
                 and _nonnegative_int(quote.get("funding_interval_ms"), positive=True)
+                and not funding_proof_reason
             ):
                 funding_usable_symbols_by_venue.setdefault(venue, set()).add(symbol)
         if not _finite_number(bid, positive=True):
@@ -479,10 +587,13 @@ def _validate_snapshot_contract(
                 maximum_provable_coverage = len(
                     symbols & funding_usable_symbols_by_venue.get(venue, set())
                 )
-            else:
-                maximum_provable_coverage = len(
-                    symbols - crossed_symbols_by_venue.get(venue, set())
-                )
+            elif domain in {"market", "liquidity"}:
+                # Market and liquidity proofs are independent venue
+                # lifecycles.  A symbol can retain a valid BBO and/or OI
+                # observation while malformed funding evidence is quarantined
+                # from the strict executable quote payload, so quote-row
+                # cardinality is not their upper bound.
+                maximum_provable_coverage = symbol_count
             if coverage_usable > maximum_provable_coverage:
                 errors.append(
                     f"lifecycle_coverage_exceeds_quote_symbols:{domain}:{venue}"
@@ -836,6 +947,7 @@ class QuoteSnapshot:
     bid: float
     ask: float
     observed_at_ms: int = 0
+    market_event_at_ms: int = 0
     source: str = "sidecar_quote"
     bid_size: float = 0.0
     ask_size: float = 0.0
@@ -848,6 +960,11 @@ class QuoteSnapshot:
     bid_depth: tuple[tuple[float, float], ...] = ()
     ask_depth: tuple[tuple[float, float], ...] = ()
     funding_rate_bps: float = 0.0
+    funding_rate_observed_at_ms: int = 0
+    funding_rate_event_at_ms: int = 0
+    funding_rate_received_at_ms: int = 0
+    funding_rate_source: str = ""
+    funding_rate_sample_id: str = ""
     funding_timestamp_ms: int = 0
     funding_interval_ms: int = 0
     predicted_funding_rate_bps: Optional[float] = None
@@ -875,6 +992,7 @@ class QuoteSnapshot:
     open_interest_evidence_status: str = "unavailable"
     open_interest_evidence_reason: str = ""
     open_interest_observed_at_ms: int = 0
+    open_interest_event_at_ms: int = 0
     open_interest_received_at_ms: int = 0
     open_interest_source: str = ""
     open_interest_sample_id: str = ""
@@ -971,7 +1089,11 @@ def _quote_field_contract_errors(
     }
     integer_fields = {
         "observed_at_ms",
+        "market_event_at_ms",
         "funding_timestamp_ms",
+        "funding_rate_observed_at_ms",
+        "funding_rate_event_at_ms",
+        "funding_rate_received_at_ms",
         "funding_interval_ms",
         "funding_forecast_sample_count",
         "funding_forecast_started_at_ms",
@@ -984,6 +1106,7 @@ def _quote_field_contract_errors(
         "oi_timeout_count",
         "oi_refresh_elapsed_ms",
         "open_interest_observed_at_ms",
+        "open_interest_event_at_ms",
         "open_interest_received_at_ms",
         "price_precision",
         "quantity_precision",
@@ -998,6 +1121,8 @@ def _quote_field_contract_errors(
         "symbol",
         "source",
         "funding_forecast_source",
+        "funding_rate_source",
+        "funding_rate_sample_id",
         "funding_forecast_stability_reason",
         "open_interest_evidence_status",
         "open_interest_evidence_reason",
@@ -1079,9 +1204,13 @@ def _quote_field_contract_errors(
                 and float(quote.get("raw_open_interest")) >= 0.0
                 and type(quote.get("open_interest_observed_at_ms")) is int
                 and int(quote.get("open_interest_observed_at_ms", 0)) > 0
+                and type(quote.get("open_interest_event_at_ms", 0)) is int
+                and int(quote.get("open_interest_event_at_ms", 0)) >= 0
                 and type(quote.get("open_interest_received_at_ms")) is int
                 and int(quote.get("open_interest_received_at_ms", 0))
                 >= int(quote.get("open_interest_observed_at_ms", 0))
+                and int(quote.get("open_interest_event_at_ms", 0))
+                <= int(quote.get("open_interest_received_at_ms", 0)) + 5_000
                 and isinstance(quote.get("open_interest_source"), str)
                 and bool(str(quote.get("open_interest_source", "")).strip())
                 and isinstance(quote.get("open_interest_sample_id"), str)
@@ -1130,7 +1259,11 @@ def _quote_field_contract_errors(
                     venue=str(quote.get("venue") or ""),
                     canonical_symbol=str(quote.get("symbol") or ""),
                     venue_symbol=str(quote.get("open_interest_venue_symbol") or ""),
-                    observed_at_ms=int(quote.get("open_interest_observed_at_ms") or 0),
+                    observed_at_ms=int(
+                        quote.get("open_interest_event_at_ms")
+                        or quote.get("open_interest_observed_at_ms")
+                        or 0
+                    ),
                     source=str(quote.get("open_interest_source") or ""),
                     raw_value=raw_value,
                     value_quote=value_quote,
@@ -1267,7 +1400,14 @@ class CandidateInput:
     funding_canary_fee_assurance_tier: str = "unavailable"
     funding_canary_hard_max_entry_notional_quote: float = 0.0
     funding_canary_size_constrained: bool = False
+    funding_canary_requested_quantity: float = 0.0
+    funding_canary_requested_max_leg_notional_quote: float = 0.0
+    contract_price_consistency_ratio: float = 1.0
+    contract_price_consistency_long_price: float = 0.0
+    contract_price_consistency_short_price: float = 0.0
     candidate_revision_id: str = ""
+    opportunity_lease_id: str = ""
+    candidate_built_at_ms: int = 0
     # V1 parity fields (CONTRACT OPP-002: candidate identity + prewarm)
     pair_id: str = ""
     funding_timestamp_ms: int = 0
@@ -1315,6 +1455,8 @@ class CandidateInput:
     venue_risk_haircut_bps: float = 0.0
     transfer_or_inventory_bias_bps: float = 0.0
     expected_net_edge_bps: float = 0.0
+    expected_profit_quote: float = 0.0
+    worst_case_profit_quote: float = 0.0
     economics_observed_at_ms: int = 0
     # A hand-built or older-schema candidate must never inherit permission to
     # trade merely because the field was omitted.  Publishers explicitly set
@@ -1395,6 +1537,9 @@ class SidecarSnapshot:
 
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
     published_at_ms: int = 0
+    # Consumer-only V6 installation watermark. It is authenticated by the
+    # adjacent manifest and deliberately excluded from the inner V5 payload.
+    ready_at_ms: int = 0
     market_observed_at_ms: int = 0
     funding_lifecycle: list[FundingLifecycle] = field(default_factory=list)
     market_lifecycle: list[MarketLifecycle] = field(default_factory=list)
@@ -1464,6 +1609,7 @@ def has_usable_funding_payload(snapshot: SidecarSnapshot | None) -> bool:
     # preventing an expired schedule from refreshing funding-live last-good
     # state and creating a misleading "healthy but no candidates" loop.
     evidence_at_ms = max(
+        int(snapshot.ready_at_ms or 0),
         int(snapshot.published_at_ms or 0),
         int(snapshot.market_observed_at_ms or 0),
         int(snapshot.candidate_build_observed_at_ms or 0),
@@ -1539,7 +1685,8 @@ def decide_snapshot_freshness(
         if not usable_payload(candidate):
             return False
         assert candidate is not None
-        publish_age_ms = now_ms - candidate.published_at_ms
+        publication_at_ms = int(candidate.ready_at_ms or candidate.published_at_ms or 0)
+        publish_age_ms = now_ms - publication_at_ms
         if publish_age_ms < 0 or publish_age_ms > last_good_limit_ms:
             return False
         market_age_ms = now_ms - candidate.market_observed_at_ms
@@ -1557,7 +1704,8 @@ def decide_snapshot_freshness(
     if snapshot.acquisition_mode == "unavailable":
         return SnapshotFreshnessDecision(SnapshotFreshness.DEGRADED, snapshot)
 
-    age_ms = now_ms - snapshot.published_at_ms
+    publication_at_ms = int(snapshot.ready_at_ms or snapshot.published_at_ms or 0)
+    age_ms = now_ms - publication_at_ms
     if age_ms < 0:
         return SnapshotFreshnessDecision(SnapshotFreshness.STALE, snapshot)
 

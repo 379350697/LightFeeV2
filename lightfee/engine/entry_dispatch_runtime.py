@@ -43,6 +43,11 @@ from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     is_client_order_id_duplicate,
 )
+from lightfee.marketdata.open_interest import (
+    observed_open_interest_proof_reason,
+    open_interest_sample_id,
+    open_interest_timestamps_are_fresh,
+)
 from lightfee.engine.runtime_context import EntryDispatchRuntimeContext
 from lightfee.engine.task_cancellation import (
     DEFAULT_TASK_CANCEL_DRAIN_S,
@@ -69,6 +74,7 @@ from lightfee.strategy.funding_canary_policy import (
     canary_notional_cap,
     canonical_venue_pair,
 )
+from lightfee.strategy.candidate_identity import final_candidate_revision_id
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 from lightfee.venues.cid import generate_exchange_cid
 from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
@@ -301,6 +307,33 @@ def _standard_ioc_price_hints(quote_lease: QuoteLease | None) -> tuple[float, fl
     if long_sweep_limit > 0.0 and short_sweep_limit > 0.0:
         return long_sweep_limit, short_sweep_limit
     return long_hint, short_hint
+
+
+def _ws_bbo_ioc_price_hints(
+    quote_lease: QuoteLease | None,
+    candidate: Any,
+) -> tuple[float, float]:
+    """Bind BBO-only IOC limits to the same per-leg slippage budget.
+
+    WS-BBO readiness deliberately has no local depth claim.  It therefore
+    submits bounded IOC limits derived from the fresh lease and the immutable
+    per-leg shortlist slippage allowance instead of pretending an L2 sweep
+    was observed.
+    """
+    long_ask = float(getattr(quote_lease, "long_ask", 0.0) or 0.0)
+    short_bid = float(getattr(quote_lease, "short_bid", 0.0) or 0.0)
+    long_slippage_bps = max(
+        float(getattr(candidate, "long_entry_slippage_bps", 0.0) or 0.0),
+        0.0,
+    )
+    short_slippage_bps = max(
+        float(getattr(candidate, "short_entry_slippage_bps", 0.0) or 0.0),
+        0.0,
+    )
+    return (
+        long_ask * (1.0 + long_slippage_bps / 10_000.0),
+        short_bid * (1.0 - short_slippage_bps / 10_000.0),
+    )
 
 
 def _l2_base_capacity(levels: object) -> float:
@@ -2143,6 +2176,152 @@ class EntryDispatchRuntime:
         )
         return reason, {"pair_minimum_failures": failures}
 
+    @staticmethod
+    def _entry_normalized_price_consistency_reason(
+        *, long_price: float, short_price: float
+    ) -> str:
+        """Fail closed when the two canonical contract prices cannot be peers."""
+        try:
+            long_value = float(long_price)
+            short_value = float(short_price)
+        except (TypeError, ValueError, OverflowError):
+            return "entry_normalized_price_invalid"
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (long_value, short_value)
+        ):
+            return "entry_normalized_price_invalid"
+        if max(long_value, short_value) / min(long_value, short_value) > 2.0:
+            return "cross_venue_price_normalization_mismatch"
+        return ""
+
+    @staticmethod
+    def _apply_final_entry_economics(
+        candidate,
+        *,
+        quantity: float,
+        long_price: float,
+        short_price: float,
+    ) -> str:
+        """Synchronise all quantity-dependent economics to the final order plan."""
+        try:
+            final_quantity = float(quantity)
+            final_long_price = float(long_price)
+            final_short_price = float(short_price)
+            expected_edge_bps = float(
+                getattr(candidate, "expected_edge_bps", 0.0) or 0.0
+            )
+            worst_case_edge_bps = float(
+                getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return "final_entry_economics_invalid"
+        if not all(
+            math.isfinite(value)
+            for value in (
+                final_quantity,
+                final_long_price,
+                final_short_price,
+                expected_edge_bps,
+                worst_case_edge_bps,
+            )
+        ) or min(final_quantity, final_long_price, final_short_price) <= 0.0:
+            return "final_entry_economics_invalid"
+        average_notional = (
+            final_quantity * (final_long_price + final_short_price) / 2.0
+        )
+        candidate.entry_target_quantity = final_quantity
+        candidate.entry_notional_quote = average_notional
+        candidate.entry_max_leg_notional_quote = final_quantity * max(
+            final_long_price, final_short_price
+        )
+        candidate.expected_profit_quote = (
+            average_notional * expected_edge_bps / 10_000.0
+        )
+        candidate.worst_case_profit_quote = (
+            average_notional * worst_case_edge_bps / 10_000.0
+        )
+        return ""
+
+    @staticmethod
+    def _final_entry_economics_binding_reason(
+        candidate,
+        *,
+        quantity: float,
+        long_price: float,
+        short_price: float,
+    ) -> str:
+        """Verify that serialized final economics derive from the order plan."""
+        raw_values = (
+            quantity,
+            long_price,
+            short_price,
+            getattr(candidate, "entry_target_quantity", None),
+            getattr(candidate, "entry_notional_quote", None),
+            getattr(candidate, "entry_max_leg_notional_quote", None),
+            getattr(candidate, "expected_edge_bps", None),
+            getattr(candidate, "worst_case_edge_bps", None),
+            getattr(candidate, "expected_profit_quote", None),
+            getattr(candidate, "worst_case_profit_quote", None),
+        )
+        if any(isinstance(value, bool) for value in raw_values):
+            return "final_entry_economics_binding_invalid"
+        try:
+            (
+                final_quantity,
+                final_long_price,
+                final_short_price,
+                candidate_quantity,
+                candidate_notional,
+                candidate_max_leg_notional,
+                expected_edge_bps,
+                worst_case_edge_bps,
+                expected_profit,
+                worst_case_profit,
+            ) = (float(value) for value in raw_values)
+        except (TypeError, ValueError, OverflowError):
+            return "final_entry_economics_binding_invalid"
+        values = (
+            final_quantity,
+            final_long_price,
+            final_short_price,
+            candidate_quantity,
+            candidate_notional,
+            candidate_max_leg_notional,
+            expected_edge_bps,
+            worst_case_edge_bps,
+            expected_profit,
+            worst_case_profit,
+        )
+        if not all(math.isfinite(value) for value in values):
+            return "final_entry_economics_binding_invalid"
+        if min(final_quantity, final_long_price, final_short_price) <= 0.0:
+            return "final_entry_economics_binding_invalid"
+
+        derived_notional = (
+            final_quantity * (final_long_price + final_short_price) / 2.0
+        )
+        derived_max_leg_notional = final_quantity * max(
+            final_long_price, final_short_price
+        )
+        derived_expected_profit = derived_notional * expected_edge_bps / 10_000.0
+        derived_worst_case_profit = (
+            derived_notional * worst_case_edge_bps / 10_000.0
+        )
+        expected_values = (
+            (candidate_quantity, final_quantity),
+            (candidate_notional, derived_notional),
+            (candidate_max_leg_notional, derived_max_leg_notional),
+            (expected_profit, derived_expected_profit),
+            (worst_case_profit, derived_worst_case_profit),
+        )
+        if any(
+            not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+            for actual, expected in expected_values
+        ):
+            return "final_entry_economics_binding_mismatch"
+        return ""
+
     async def _resolve_live_margin_quantity(
         self,
         *,
@@ -2325,7 +2504,9 @@ class EntryDispatchRuntime:
             "short_venue": str(getattr(candidate, "short_venue", "")),
             "max_age_ms": self._entry_quote_lease_max_age_ms(),
             "candidate_revision_id": str(
-                getattr(candidate, "candidate_revision_id", "") or ""
+                getattr(candidate, "evidence_candidate_revision_id", "")
+                or getattr(candidate, "candidate_revision_id", "")
+                or ""
             ),
         }
         def blocked(reason: str, lease: object | None):
@@ -2426,7 +2607,9 @@ class EntryDispatchRuntime:
         if lease.pair_id != self._candidate_pair_id(candidate):
             return "final_quote_lease_pair_mismatch"
         candidate_revision_id = str(
-            getattr(candidate, "candidate_revision_id", "") or ""
+            getattr(candidate, "evidence_candidate_revision_id", "")
+            or getattr(candidate, "candidate_revision_id", "")
+            or ""
         )
         if (
             candidate_revision_id
@@ -2597,6 +2780,7 @@ class EntryDispatchRuntime:
                     policy_reason = self._funding_canary_admission_reason(
                         candidate,
                         now_ms,
+                        check_notional=False,
                     )
             if policy_reason:
                 self._emit_entry_dispatch_viability_blocked(
@@ -3750,12 +3934,16 @@ class EntryDispatchRuntime:
             l2_vwap_complete=(
                 getattr(quote_lease, "l2_vwap_complete", False) is True
             ),
-            # Allocator-backed candidates have an executable common quantity
-            # and must prove it against L2.  The remaining V1 compatibility
-            # adapters retain their historic BBO path for recovery harnesses.
+            # Require L2 only when the configured readiness data plane owns
+            # fresh local books. WS-BBO mode deliberately prices from BBO plus
+            # the conservative shortlist slippage; treating every allocator
+            # quantity as proof that local L2 exists permanently blocked that
+            # valid production mode before first-leg submit.
             require_l2_vwap=(
-                float(getattr(candidate, "entry_target_quantity", 0.0) or 0.0)
-                > 0.0
+                self._local_l2_effective_enabled()
+                and float(
+                    getattr(candidate, "entry_target_quantity", 0.0) or 0.0
+                ) > 0.0
             ),
             execution_is_passive=execution_is_passive,
         )
@@ -3801,6 +3989,23 @@ class EntryDispatchRuntime:
             final_economics.edge.entry_fee_bps
             + final_economics.edge.exit_fee_bps
         )
+        if float(required_base_quantity or 0.0) > 0.0:
+            final_economics_reason = self._apply_final_entry_economics(
+                candidate,
+                quantity=required_base_quantity,
+                long_price=final_economics.long_entry_price,
+                short_price=final_economics.short_entry_price,
+            )
+            if final_economics_reason:
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason=final_economics_reason,
+                    blocked_reasons=[final_economics_reason],
+                    source=source,
+                    decision="skip_before_first_leg",
+                )
+                return False
 
         # The shortlist may have passed the 8/3 bps canary floors while fresh
         # executable BBO/VWAP repricing puts the actual first leg below them.
@@ -4428,6 +4633,290 @@ class EntryDispatchRuntime:
         value = self.ctx.config.strategy.selected_submit_deadline_ms
         return value if value > 0 else 0
 
+    def _entry_open_interest_submit_reason(
+        self,
+        candidate,
+        *,
+        now_ms: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Revalidate the exact two-leg OI receipt bound at final submit."""
+        evidence = getattr(candidate, "entry_open_interest_evidence", None)
+        if not isinstance(evidence, dict):
+            return "entry_open_interest_evidence_unavailable", {}
+        revision_id = str(
+            getattr(candidate, "evidence_candidate_revision_id", "")
+            or getattr(candidate, "candidate_revision_id", "")
+            or ""
+        )
+        if not revision_id:
+            return "entry_open_interest_revision_unavailable", evidence
+        if str(evidence.get("candidate_revision_id") or "") != revision_id:
+            return "entry_open_interest_revision_mismatch", evidence
+        max_age_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.runtime,
+                    "sidecar_perp_liquidity_budget_ms",
+                    30_000,
+                )
+                or 0
+            ),
+            1,
+        )
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
+        expected_venues = {
+            "long": str(getattr(candidate, "long_venue", "") or "").lower(),
+            "short": str(getattr(candidate, "short_venue", "") or "").lower(),
+        }
+        for leg, expected_venue in expected_venues.items():
+            row = evidence.get(leg)
+            if not isinstance(row, dict):
+                return "entry_open_interest_evidence_unavailable", {"leg": leg}
+            if (
+                str(row.get("venue") or "").lower() != expected_venue
+                or str(row.get("canonical_symbol") or "").upper() != symbol
+            ):
+                return "entry_open_interest_identity_mismatch", {"leg": leg, **row}
+            if str(row.get("status") or "").lower() != "observed":
+                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
+            try:
+                observed_at_ms = int(row.get("observed_at_ms") or 0)
+                event_at_ms = int(row.get("event_at_ms") or 0)
+                received_at_ms = int(row.get("received_at_ms") or 0)
+                value_quote = float(row.get("value_quote"))
+                raw_value = float(row.get("raw_value"))
+            except (TypeError, ValueError, OverflowError):
+                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
+            if (
+                observed_at_ms <= 0
+                or received_at_ms < observed_at_ms
+                or event_at_ms < 0
+                or not math.isfinite(value_quote)
+                or value_quote < 0.0
+                or not math.isfinite(raw_value)
+                or raw_value < 0.0
+                or not str(row.get("raw_unit") or "").strip()
+                or not str(row.get("source") or "").strip()
+                or not str(row.get("venue_symbol") or "").strip()
+                or not str(row.get("sample_id") or "").strip()
+            ):
+                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
+            expected_sample_id = open_interest_sample_id(
+                venue=expected_venue,
+                canonical_symbol=symbol,
+                venue_symbol=str(row.get("venue_symbol") or ""),
+                observed_at_ms=event_at_ms or observed_at_ms,
+                source=str(row.get("source") or ""),
+                raw_value=raw_value,
+                value_quote=value_quote,
+            )
+            if str(row.get("sample_id") or "") != expected_sample_id:
+                return "entry_open_interest_sample_id_mismatch", {
+                    "leg": leg,
+                    **row,
+                }
+            proof_reason = observed_open_interest_proof_reason(
+                venue=expected_venue,
+                canonical_symbol=symbol,
+                venue_symbol=str(row.get("venue_symbol") or ""),
+                value_quote=value_quote,
+                raw_value=raw_value,
+                raw_unit=str(row.get("raw_unit") or ""),
+                contract_multiplier=row.get("contract_multiplier"),
+                conversion_mark_price=row.get("conversion_mark_price"),
+                observed_at_ms=observed_at_ms,
+                event_at_ms=event_at_ms,
+                received_at_ms=received_at_ms,
+                source=str(row.get("source") or ""),
+                sample_id=str(row.get("sample_id") or ""),
+            )
+            if proof_reason:
+                return "entry_open_interest_proof_invalid", {
+                    "leg": leg,
+                    "proof_reason": proof_reason,
+                    **row,
+                }
+            open_interest_floor = float(
+                self.ctx.config.strategy.entry_open_interest_floor_quote(
+                    expected_venue
+                )
+            )
+            if value_quote + 1e-9 < open_interest_floor:
+                return "entry_open_interest_below_floor", {
+                    "leg": leg,
+                    "value_quote": value_quote,
+                    "floor_quote": open_interest_floor,
+                    **row,
+                }
+            if not open_interest_timestamps_are_fresh(
+                observed_at_ms=observed_at_ms,
+                received_at_ms=received_at_ms,
+                event_at_ms=event_at_ms,
+                now_ms=now_ms,
+                max_age_ms=max_age_ms,
+            ):
+                return "entry_open_interest_evidence_stale", {
+                    "leg": leg,
+                    "age_ms": now_ms - observed_at_ms,
+                    "event_age_ms": (
+                        now_ms - event_at_ms if event_at_ms > 0 else None
+                    ),
+                    "max_age_ms": max_age_ms,
+                    **row,
+                }
+        return "", evidence
+
+    def _bind_final_entry_candidate_revision(
+        self,
+        candidate,
+        *,
+        quantity: float,
+        long_price: float,
+        short_price: float,
+        entry_route: str,
+    ) -> str:
+        """Freeze the exact submitted quantity/prices without forging new proof."""
+        if self._final_entry_economics_binding_reason(
+            candidate,
+            quantity=quantity,
+            long_price=long_price,
+            short_price=short_price,
+        ):
+            return ""
+        evidence_revision_id = str(
+            getattr(candidate, "evidence_candidate_revision_id", "")
+            or getattr(candidate, "candidate_revision_id", "")
+            or ""
+        )
+        if not evidence_revision_id:
+            return ""
+        candidate.evidence_candidate_revision_id = evidence_revision_id
+        final_revision_id = final_candidate_revision_id(
+            evidence_candidate_revision_id=evidence_revision_id,
+            quantity=quantity,
+            long_price=long_price,
+            short_price=short_price,
+            entry_route=entry_route,
+            economics={
+                "entry_notional_quote": getattr(
+                    candidate, "entry_notional_quote", 0.0
+                ),
+                "entry_max_leg_notional_quote": getattr(
+                    candidate, "entry_max_leg_notional_quote", 0.0
+                ),
+                "entry_fee_bps": getattr(candidate, "entry_fee_bps", 0.0),
+                "entry_slippage_bps": getattr(
+                    candidate, "entry_slippage_bps", 0.0
+                ),
+                "expected_edge_bps": getattr(
+                    candidate, "expected_edge_bps", 0.0
+                ),
+                "worst_case_edge_bps": getattr(
+                    candidate, "worst_case_edge_bps", 0.0
+                ),
+                "ranking_edge_bps": getattr(
+                    candidate, "ranking_edge_bps", 0.0
+                ),
+                "expected_profit_quote": getattr(
+                    candidate, "expected_profit_quote", 0.0
+                ),
+                "worst_case_profit_quote": getattr(
+                    candidate, "worst_case_profit_quote", 0.0
+                ),
+            },
+        )
+        candidate.candidate_revision_id = final_revision_id
+        return final_revision_id
+
+    def _entry_open_interest_submit_blocked(self, candidate, *, now_ms: int) -> bool:
+        reason, evidence = self._entry_open_interest_submit_reason(
+            candidate,
+            now_ms=now_ms,
+        )
+        if not reason:
+            return False
+        pair_id = self._candidate_pair_id(candidate)
+        receipt = getattr(candidate, "entry_open_interest_evidence", None)
+        receipt = receipt if isinstance(receipt, dict) else {}
+        long_receipt = receipt.get("long")
+        short_receipt = receipt.get("short")
+        long_receipt = long_receipt if isinstance(long_receipt, dict) else {}
+        short_receipt = short_receipt if isinstance(short_receipt, dict) else {}
+        evidence_revision_id = str(
+            getattr(candidate, "evidence_candidate_revision_id", "")
+            or receipt.get("candidate_revision_id")
+            or ""
+        )
+        self.ctx.journal.append(
+            "runtime.entry_open_interest_submit_blocked",
+            {
+                "candidate_pair_id": pair_id,
+                "pair_id": pair_id,
+                "symbol": str(getattr(candidate, "symbol", "") or ""),
+                "blocking_stage": "executor_submit",
+                "blocking_domain": "open_interest",
+                "blocking_status": "rejected",
+                "blocking_reason": reason,
+                "reason": reason,
+                "evidence": evidence,
+                "candidate_revision_id": str(
+                    getattr(candidate, "candidate_revision_id", "") or ""
+                ),
+                "evidence_candidate_revision_id": evidence_revision_id,
+                "opportunity_lease_id": str(
+                    getattr(candidate, "opportunity_lease_id", "") or ""
+                ),
+                "long_sample_id": str(long_receipt.get("sample_id") or ""),
+                "short_sample_id": str(short_receipt.get("sample_id") or ""),
+                "ts_ms": now_ms,
+            },
+        )
+        return True
+
+    def _selected_pre_submit_deadline_exceeded(
+        self,
+        candidate,
+        *,
+        selected_deadline_monotonic: float | None,
+        selected_at_ms: int,
+        stage: str,
+    ) -> bool:
+        if selected_deadline_monotonic is None:
+            return False
+        if asyncio.get_running_loop().time() < selected_deadline_monotonic:
+            return False
+        deadline_ms = self._selected_submit_deadline_ms()
+        candidate_pair_id = self._candidate_pair_id(candidate)
+        self.ctx.journal.append(
+            "runtime.entry_selected_submit_deadline_exceeded",
+            {
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
+                "symbol": str(getattr(candidate, "symbol", "") or ""),
+                "deadline_ms": deadline_ms,
+                "blocking_stage": stage,
+                "blocking_domain": "entry_dispatch",
+                "blocking_status": "timeout",
+                "blocking_reason": "selected_submit_deadline_exceeded",
+                "reason": "selected_submit_deadline_exceeded",
+                "ts_ms": int(selected_at_ms) + deadline_ms,
+            },
+        )
+        self.ctx.journal.append(
+            "review.candidate_rejected",
+            {
+                "candidate_pair_id": candidate_pair_id,
+                "pair_id": candidate_pair_id,
+                "symbol": str(getattr(candidate, "symbol", "") or ""),
+                "long_venue": str(getattr(candidate, "long_venue", "") or ""),
+                "short_venue": str(getattr(candidate, "short_venue", "") or ""),
+                "rejected_stage": stage,
+                "rejected_reason": "selected_submit_deadline_exceeded",
+                "ts_ms": int(selected_at_ms) + deadline_ms,
+            },
+        )
+        return True
+
     @staticmethod
     def _payload_matches_entry(payload: dict[str, Any], entry_id: str) -> bool:
         for key in ("entry_id", "position_id", "internal_entry_id", "pending_id"):
@@ -4475,15 +4964,25 @@ class EntryDispatchRuntime:
         candidate,
         selected_seq: int,
         selected_at_ms: int,
+        selected_deadline_monotonic: float | None = None,
     ):
         deadline_ms = self._selected_submit_deadline_ms()
         if deadline_ms <= 0:
             return await self.ctx.entry_executor.execute(ctx)
 
+        remaining_s = deadline_ms / 1_000.0
+        if selected_deadline_monotonic is not None:
+            remaining_s = max(
+                selected_deadline_monotonic - asyncio.get_running_loop().time(),
+                0.0,
+            )
+        if remaining_s <= 0.0:
+            return None
+
         task = asyncio.create_task(self.ctx.entry_executor.execute(ctx))
         done, _pending = await asyncio.wait(
             {task},
-            timeout=deadline_ms / 1000.0,
+            timeout=remaining_s,
         )
         if done:
             return task.result()
@@ -4550,6 +5049,11 @@ class EntryDispatchRuntime:
         now_ms: int,
         quote_lease: QuoteLease | None = None,
         requires_final_quote_lease: bool = False,
+        selected_deadline_monotonic: float | None = None,
+        selected_at_ms: int | None = None,
+        leverage_evidence_for_sizing: dict[
+            Venue, EntryLeverageEvidence
+        ] | None = None,
     ) -> bool:
         try:
             # V1: execution.entry_selected — engine decided to open this candidate
@@ -4749,11 +5253,62 @@ class EntryDispatchRuntime:
                         },
                     )
                     return False
+
+            # Reserve a small executor handoff window before the first
+            # exchange-side mutation.  A leverage preparation that cannot
+            # finish inside this budget is cancelled; its transaction waits
+            # for verified rollback before propagating cancellation.
+            if selected_deadline_monotonic is not None:
+                leverage_budget_s = (
+                    selected_deadline_monotonic
+                    - asyncio.get_running_loop().time()
+                    - 0.05
+                )
+                if leverage_budget_s <= 0.0:
+                    return False
+            else:
+                leverage_budget_s = None
+            prepare_awaitable = self._prepare_live_entry_leverage_for_candidate(
+                candidate=candidate,
+                now_ms=executor_submit_now_ms,
+                long_venue=ctx.long_venue,
+                short_venue=ctx.short_venue,
+                notional_quote=max(ctx.long_price_hint, ctx.short_price_hint)
+                * effective_quantity,
+                minimum_evidence_by_venue=(
+                    leverage_evidence_for_sizing or {}
+                ),
+            )
+            try:
+                if leverage_budget_s is None:
+                    leverage_ready, _final_leverage_evidence = (
+                        await prepare_awaitable
+                    )
+                else:
+                    leverage_ready, _final_leverage_evidence = await asyncio.wait_for(
+                        prepare_awaitable,
+                        timeout=leverage_budget_s,
+                    )
+            except asyncio.TimeoutError:
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    executor_submit_now_ms,
+                    reason="entry_leverage_prepare_deadline_exceeded",
+                    blocked_reasons=[
+                        "entry_leverage_prepare_deadline_exceeded"
+                    ],
+                    source="entry_leverage_prepare",
+                    decision="skip_before_first_leg",
+                )
+                return False
+            if not leverage_ready:
+                return False
             result = await self._execute_entry_with_selected_deadline(
                 ctx=ctx,
                 candidate=candidate,
                 selected_seq=selected_seq,
-                selected_at_ms=executor_submit_now_ms,
+                selected_at_ms=int(selected_at_ms or executor_submit_now_ms),
+                selected_deadline_monotonic=selected_deadline_monotonic,
             )
             if result is None:
                 return False
@@ -4884,14 +5439,26 @@ class EntryDispatchRuntime:
 
         return True
 
-    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
+    async def _dispatch_entry(
+        self,
+        candidate,
+        now_ms: int,
+        price_hint: float = 0.0,
+        selected_deadline_monotonic: float | None = None,
+        selected_at_ms: int | None = None,
+    ) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
         V1: entry route/maker-leg/price gate from config and execution planner.
         Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
         Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
         """
-        if self._entry_initial_gate_blocked(candidate, now_ms):
+        if self._selected_pre_submit_deadline_exceeded(
+            candidate,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=int(selected_at_ms or now_ms),
+            stage="dispatch_start",
+        ) or self._entry_initial_gate_blocked(candidate, now_ms):
             return False
 
         # A local-L2 candidate is only eligible for final economics if both
@@ -4912,6 +5479,24 @@ class EntryDispatchRuntime:
         if price_resolution is None:
             return False
         price_hint, long_order_price_hint, short_order_price_hint, quote_lease = price_resolution
+        price_consistency_reason = self._entry_normalized_price_consistency_reason(
+            long_price=long_order_price_hint,
+            short_price=short_order_price_hint,
+        )
+        if price_consistency_reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=price_consistency_reason,
+                blocked_reasons=[price_consistency_reason],
+                source="final_entry_price_normalization",
+                decision="skip_before_first_leg",
+                extra={
+                    "long_order_price_hint": long_order_price_hint,
+                    "short_order_price_hint": short_order_price_hint,
+                },
+            )
+            return False
 
         # The sidecar is only a shortlist.  A live first leg is admissible
         # only after repricing the complete economics contract from the fresh
@@ -4940,6 +5525,13 @@ class EntryDispatchRuntime:
             price_hint=price_hint,
             now_ms=now_ms,
         )
+        if self._selected_pre_submit_deadline_exceeded(
+            candidate,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=int(selected_at_ms or now_ms),
+            stage="quantity_step_resolution",
+        ):
+            return False
         if quantity_resolution is None:
             return False
         (
@@ -5160,6 +5752,13 @@ class EntryDispatchRuntime:
                     * quantity,
                 )
             )
+            if self._selected_pre_submit_deadline_exceeded(
+                candidate,
+                selected_deadline_monotonic=selected_deadline_monotonic,
+                selected_at_ms=int(selected_at_ms or now_ms),
+                stage="leverage_inspection",
+            ):
+                return False
             if not leverage_ready:
                 return False
             margin_resolution = await self._resolve_live_margin_quantity(
@@ -5175,6 +5774,13 @@ class EntryDispatchRuntime:
                 short_quantity_step=short_quantity_step,
                 leverage_evidence_by_venue=leverage_evidence_for_sizing,
             )
+            if self._selected_pre_submit_deadline_exceeded(
+                candidate,
+                selected_deadline_monotonic=selected_deadline_monotonic,
+                selected_at_ms=int(selected_at_ms or now_ms),
+                stage="margin_quantity_resolution",
+            ):
+                return False
             if margin_resolution is None:
                 return False
             quantity, margin_constrained = margin_resolution
@@ -5353,6 +5959,10 @@ class EntryDispatchRuntime:
                 decision="skip_before_first_leg",
             )
             return False
+        canary_size_constrained = bool(
+            quantity + 1e-12 < pre_canary_quantity
+            or getattr(candidate, "funding_canary_size_constrained", False)
+        )
         pair_minimum_reason, pair_minimum_evidence = (
             self._entry_pair_minimum_reason(
                 quantity=quantity,
@@ -5361,12 +5971,7 @@ class EntryDispatchRuntime:
                 long_metadata=long_quantity_metadata,
                 short_metadata=short_quantity_metadata,
                 strategy_min_notional=min_notional,
-                canary_constrained=(
-                    quantity + 1e-12 < pre_canary_quantity
-                    or bool(
-                        getattr(candidate, "funding_canary_size_constrained", False)
-                    )
-                ),
+                canary_constrained=canary_size_constrained,
             )
         )
         if pair_minimum_reason:
@@ -5494,33 +6099,37 @@ class EntryDispatchRuntime:
         # the *actual* standard-IOC quantity, recalculate the same immutable
         # economics contract, and derive bounded limits from those exact
         # levels. A passive route deliberately retains V1 post-only pricing.
+        local_l2_execution = self._local_l2_effective_enabled()
         if enhanced_live_candidate and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            execution_quote_lease = self._local_l2_final_quote_lease(
-                candidate,
-                now_ms,
-                target_quantity=effective_quantity,
+            execution_quote_lease = (
+                self._local_l2_final_quote_lease(
+                    candidate,
+                    now_ms,
+                    target_quantity=effective_quantity,
+                )
+                if local_l2_execution
+                else quote_lease
             )
             if execution_quote_lease is None:
                 self._emit_entry_dispatch_viability_blocked(
                     candidate,
                     now_ms,
-                    reason="final_l2_execution_quote_unavailable",
-                    blocked_reasons=["final_l2_execution_quote_unavailable"],
+                    reason="final_execution_quote_unavailable",
+                    blocked_reasons=["final_execution_quote_unavailable"],
                     source="final_submit_economics",
                     decision="skip_before_first_leg",
                     extra={"effective_quantity": effective_quantity},
                 )
                 return False
-            final_long_price = float(
-                getattr(execution_quote_lease, "long_buy_vwap", 0.0)
-                or getattr(execution_quote_lease, "long_ask", 0.0)
-                or 0.0
-            )
-            final_short_price = float(
-                getattr(execution_quote_lease, "short_sell_vwap", 0.0)
-                or getattr(execution_quote_lease, "short_bid", 0.0)
-                or 0.0
-            )
+            if local_l2_execution:
+                final_long_price, final_short_price = (
+                    _standard_ioc_price_hints(execution_quote_lease)
+                )
+            else:
+                final_long_price, final_short_price = _ws_bbo_ioc_price_hints(
+                    execution_quote_lease,
+                    candidate,
+                )
             clamped_quantity, clamp_reason = self._funding_canary_clamp_quantity(
                 candidate,
                 now_ms,
@@ -5540,21 +6149,23 @@ class EntryDispatchRuntime:
                 )
                 return False
             if clamped_quantity + 1e-12 < effective_quantity:
+                canary_size_constrained = True
                 effective_quantity = clamped_quantity
                 plan.full_target_quantity = clamped_quantity
                 plan.initial_maker_target_quantity = clamped_quantity
-                execution_quote_lease = self._local_l2_final_quote_lease(
-                    candidate,
-                    now_ms,
-                    target_quantity=effective_quantity,
-                )
+                if local_l2_execution:
+                    execution_quote_lease = self._local_l2_final_quote_lease(
+                        candidate,
+                        now_ms,
+                        target_quantity=effective_quantity,
+                    )
                 if execution_quote_lease is None:
                     self._emit_entry_dispatch_viability_blocked(
                         candidate,
                         now_ms,
-                        reason="final_l2_execution_quote_unavailable_after_canary_clamp",
+                        reason="final_execution_quote_unavailable_after_canary_clamp",
                         blocked_reasons=[
-                            "final_l2_execution_quote_unavailable_after_canary_clamp"
+                            "final_execution_quote_unavailable_after_canary_clamp"
                         ],
                         source="final_submit_canary",
                         decision="skip_before_first_leg",
@@ -5576,9 +6187,14 @@ class EntryDispatchRuntime:
             # bounds.  Re-clamp on those prices and rebuild L2 for the smaller
             # quantity until the fixed point is stable.
             for _iteration in range(3):
-                long_order_price_hint, short_order_price_hint = (
-                    _standard_ioc_price_hints(quote_lease)
-                )
+                if local_l2_execution:
+                    long_order_price_hint, short_order_price_hint = (
+                        _standard_ioc_price_hints(quote_lease)
+                    )
+                else:
+                    long_order_price_hint, short_order_price_hint = (
+                        _ws_bbo_ioc_price_hints(quote_lease, candidate)
+                    )
                 clamped_quantity, clamp_reason = self._funding_canary_clamp_quantity(
                     candidate,
                     now_ms,
@@ -5599,14 +6215,16 @@ class EntryDispatchRuntime:
                     return False
                 if clamped_quantity + 1e-12 >= effective_quantity:
                     break
+                canary_size_constrained = True
                 effective_quantity = clamped_quantity
                 plan.full_target_quantity = clamped_quantity
                 plan.initial_maker_target_quantity = clamped_quantity
-                quote_lease = self._local_l2_final_quote_lease(
-                    candidate,
-                    now_ms,
-                    target_quantity=effective_quantity,
-                )
+                if local_l2_execution:
+                    quote_lease = self._local_l2_final_quote_lease(
+                        candidate,
+                        now_ms,
+                        target_quantity=effective_quantity,
+                    )
                 if quote_lease is None or not self._revalidate_final_entry_economics(
                     candidate=candidate,
                     quote_lease=quote_lease,
@@ -5634,6 +6252,21 @@ class EntryDispatchRuntime:
                     + float(getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0)
                 ) / 2.0
 
+        price_consistency_reason = self._entry_normalized_price_consistency_reason(
+            long_price=long_order_price_hint,
+            short_price=short_order_price_hint,
+        )
+        if price_consistency_reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=price_consistency_reason,
+                blocked_reasons=[price_consistency_reason],
+                source="final_submit_price_normalization",
+                decision="skip_before_first_leg",
+            )
+            return False
+
         final_pair_minimum_reason, final_pair_minimum_evidence = (
             self._entry_pair_minimum_reason(
                 quantity=(
@@ -5646,9 +6279,7 @@ class EntryDispatchRuntime:
                 long_metadata=long_quantity_metadata,
                 short_metadata=short_quantity_metadata,
                 strategy_min_notional=min_notional,
-                canary_constrained=bool(
-                    getattr(candidate, "funding_canary_size_constrained", False)
-                ),
+                canary_constrained=canary_size_constrained,
             )
         )
         if final_pair_minimum_reason:
@@ -5869,7 +6500,7 @@ class EntryDispatchRuntime:
             )
             return False
 
-        if not await self._precheck_entry_admission(
+        admission_ready = await self._precheck_entry_admission(
             candidate=candidate,
             now_ms=now_ms,
             long_venue=long_venue,
@@ -5881,7 +6512,15 @@ class EntryDispatchRuntime:
             entry_type=entry_type,
             maker_client_order_id=maker_cid,
             hedge_client_order_id=hedge_cid,
+        )
+        if self._selected_pre_submit_deadline_exceeded(
+            candidate,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=int(selected_at_ms or now_ms),
+            stage="entry_admission_precheck",
         ):
+            return False
+        if not admission_ready:
             return False
 
         maker_bbo_evidence: dict = {}
@@ -5969,13 +6608,14 @@ class EntryDispatchRuntime:
                 clamped_passive_quantity + 1e-12 < passive_target_quantity
             )
             if passive_quantity_changed:
+                canary_size_constrained = True
                 plan.full_target_quantity = clamped_passive_quantity
                 plan.initial_maker_target_quantity = min(
                     plan.initial_maker_target_quantity,
                     clamped_passive_quantity,
                 )
                 effective_quantity = plan.initial_maker_target_quantity
-                if enhanced_live_candidate:
+                if enhanced_live_candidate and local_l2_execution:
                     resized_quote_lease = self._local_l2_final_quote_lease(
                         candidate,
                         now_ms,
@@ -6034,6 +6674,23 @@ class EntryDispatchRuntime:
                 ):
                     return False
 
+            passive_price_consistency_reason = (
+                self._entry_normalized_price_consistency_reason(
+                    long_price=long_order_price_hint,
+                    short_price=short_order_price_hint,
+                )
+            )
+            if passive_price_consistency_reason:
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason=passive_price_consistency_reason,
+                    blocked_reasons=[passive_price_consistency_reason],
+                    source="final_passive_price_normalization",
+                    decision="skip_before_first_leg",
+                )
+                return False
+
             passive_minimum_reason, passive_minimum_evidence = (
                 self._entry_pair_minimum_reason(
                     quantity=plan.full_target_quantity,
@@ -6042,9 +6699,7 @@ class EntryDispatchRuntime:
                     long_metadata=long_quantity_metadata,
                     short_metadata=short_quantity_metadata,
                     strategy_min_notional=min_notional,
-                    canary_constrained=bool(
-                        getattr(candidate, "funding_canary_size_constrained", False)
-                    ),
+                    canary_constrained=canary_size_constrained,
                 )
             )
             if passive_minimum_reason:
@@ -6077,55 +6732,64 @@ class EntryDispatchRuntime:
                 )
                 return False
 
-        # This is the first potentially mutating leverage operation.  Every
-        # preceding rejection is venue-side-effect free; a partial two-venue
-        # prepare below is compensated back to its just-inspected setting
-        # before the candidate is rejected.  The successful post-set evidence
-        # must not be weaker than the GET-only evidence used for sizing.
-        leverage_ready, final_leverage_evidence = (
-            await self._prepare_live_entry_leverage_for_candidate(
-                candidate=candidate,
-                now_ms=now_ms,
-                long_venue=long_venue,
-                short_venue=short_venue,
-                notional_quote=max(long_order_price_hint, short_order_price_hint)
-                * effective_quantity,
-                minimum_evidence_by_venue=leverage_evidence_for_sizing,
-            )
+        final_submission_quantity = (
+            plan.full_target_quantity
+            if entry_type == EntryType.PASSIVE_INCREMENTAL
+            else effective_quantity
         )
-        if not leverage_ready:
-            return False
-        for venue, inspected in leverage_evidence_for_sizing.items():
-            final = final_leverage_evidence.get(venue)
-            if (
-                inspected.evidence_complete
-                and (
-                    not isinstance(final, EntryLeverageEvidence)
-                    or not final.evidence_complete
-                    or final.effective_leverage < inspected.effective_leverage
-                )
-            ):
+        if enhanced_live_candidate:
+            final_economics_reason = self._apply_final_entry_economics(
+                candidate,
+                quantity=final_submission_quantity,
+                long_price=long_order_price_hint,
+                short_price=short_order_price_hint,
+            )
+            if final_economics_reason:
                 self._emit_entry_dispatch_viability_blocked(
                     candidate,
                     now_ms,
-                    reason="entry_leverage_weakened_after_sizing",
-                    blocked_reasons=["entry_leverage_weakened_after_sizing"],
-                    source="entry_leverage_prepare",
+                    reason=final_economics_reason,
+                    blocked_reasons=[final_economics_reason],
+                    source="final_candidate_economics_binding",
                     decision="skip_before_first_leg",
-                    extra={
-                        "venue": venue.value,
-                        "inspected_leverage": _entry_leverage_evidence_payload(
-                            inspected
-                        ),
-                        "final_leverage": _entry_leverage_evidence_payload(final),
-                        "final_evidence_complete": bool(
-                            isinstance(final, EntryLeverageEvidence)
-                            and final.evidence_complete
-                        ),
-                    },
                 )
                 return False
-
+        final_binding_reason = ""
+        if enhanced_live_candidate:
+            final_binding_reason = self._final_entry_economics_binding_reason(
+                candidate,
+                quantity=final_submission_quantity,
+                long_price=long_order_price_hint,
+                short_price=short_order_price_hint,
+            )
+        if final_binding_reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=final_binding_reason,
+                blocked_reasons=[final_binding_reason],
+                source="final_candidate_revision_binding",
+                decision="skip_before_first_leg",
+            )
+            return False
+        final_candidate_revision = self._bind_final_entry_candidate_revision(
+            candidate,
+            quantity=final_submission_quantity,
+            long_price=long_order_price_hint,
+            short_price=short_order_price_hint,
+            entry_route=route.value,
+        )
+        if enhanced_live_candidate and not final_candidate_revision:
+            reason = "final_candidate_revision_unavailable"
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=reason,
+                blocked_reasons=[reason],
+                source="final_candidate_revision_binding",
+                decision="skip_before_first_leg",
+            )
+            return False
         submit_clock = getattr(self.ctx, "_entry_wall_clock_now_ms", None)
         submit_now_ms = int(
             submit_clock() if callable(submit_clock) else time.time() * 1_000
@@ -6200,6 +6864,14 @@ class EntryDispatchRuntime:
                 )
                 return False
         now_ms = submit_now_ms
+        if (
+            self.ctx.config.runtime.mode == "live"
+            and self._entry_open_interest_submit_blocked(
+            candidate,
+            now_ms=now_ms,
+            )
+        ):
+            return False
 
         ctx = self._build_entry_context(
             candidate=candidate,
@@ -6219,6 +6891,14 @@ class EntryDispatchRuntime:
             common_base_quantity_step=common_canary_step,
         )
 
+        if self._selected_pre_submit_deadline_exceeded(
+            candidate,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=int(selected_at_ms or now_ms),
+            stage="executor_submit",
+        ):
+            return False
+
         return await self._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
@@ -6231,4 +6911,7 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
             quote_lease=quote_lease,
             requires_final_quote_lease=requires_final_quote_lease,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=int(selected_at_ms or now_ms),
+            leverage_evidence_for_sizing=leverage_evidence_for_sizing,
         )

@@ -149,6 +149,7 @@ class MarketDataRuntimeContext(RuntimeCommonContext, Protocol):
         symbols: list[str],
         *,
         skip_event_kind: str,
+        fail_closed_on_catalog_unavailable: bool = False,
     ) -> list[str]: ...
 
     def _append_runtime_diagnostic_event(self, *args: Any, **kwargs: Any) -> None: ...

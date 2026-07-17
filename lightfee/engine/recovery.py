@@ -634,6 +634,30 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
         snap.get("funding_settlement_statement_claim_ledger", [])
     )
     state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
+    raw_lease_ledger = snap.get("entry_opportunity_lease_ledger", {})
+    if isinstance(raw_lease_ledger, dict):
+        restored_lease_ledger: dict[str, dict[str, int]] = {}
+        for lease_id, row in raw_lease_ledger.items():
+            if not str(lease_id) or not isinstance(row, dict):
+                continue
+            try:
+                started_at_ms = max(
+                    int(row.get("started_at_ms", 0) or 0),
+                    0,
+                )
+                last_seen_at_ms = max(
+                    int(row.get("last_seen_at_ms", 0) or 0),
+                    0,
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if started_at_ms <= 0:
+                continue
+            restored_lease_ledger[str(lease_id)] = {
+                "started_at_ms": started_at_ms,
+                "last_seen_at_ms": last_seen_at_ms,
+            }
+        state.entry_opportunity_lease_ledger = restored_lease_ledger
 
     # Restore operator control state
     op = snap.get("operator", {})

@@ -203,12 +203,81 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
     mode, lifecycle, global_risk_mode, global_risk_reason, open_position_count,
     open_positions (detailed), last_scan.
     """
+    data = build_current_state_snapshot_payload(state, config)
+    write_json_atomic(path, data)
+
+
+def _freeze_current_state_value(
+    value: Any,
+    *,
+    budget: list[int],
+    depth: int = 0,
+) -> Any:
+    """Bound and detach diagnostic state while the event loop owns mutation."""
+    if budget[0] <= 0:
+        return {"truncated": True, "reason": "current_state_node_budget"}
+    budget[0] -= 1
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:4_096]
+    if depth >= 12:
+        return str(value)[:512]
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        original_count = len(value)
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 1_024 or budget[0] <= 0:
+                break
+            result[str(key)] = _freeze_current_state_value(
+                item,
+                budget=budget,
+                depth=depth + 1,
+            )
+        if len(result) < original_count:
+            result["__truncated_items__"] = original_count - len(result)
+        return result
+    if isinstance(value, (list, tuple, set, frozenset)):
+        source = list(value)
+        result = [
+            _freeze_current_state_value(
+                item,
+                budget=budget,
+                depth=depth + 1,
+            )
+            for item in source[:256]
+            if budget[0] > 0
+        ]
+        if len(result) < len(source):
+            result.append(
+                {"truncated_items": len(source) - len(result)}
+            )
+        return result
+    if hasattr(value, "value"):
+        return _freeze_current_state_value(
+            value.value,
+            budget=budget,
+            depth=depth + 1,
+        )
+    return str(value)[:512]
+
+
+def build_current_state_snapshot_payload(
+    state: EngineState,
+    config: Optional[AppConfig] = None,
+    *,
+    generated_at_ms: int | None = None,
+) -> dict[str, Any]:
+    """Build one bounded immutable current-state DTO on the owner thread."""
     import time
 
-    now_ms = int(time.time() * 1000)
+    now_ms = int(generated_at_ms or time.time() * 1000)
     if config is None:
         config = AppConfig()
     stale_after_ms = current_state_export_interval_ms(config) * 3
+    # One global budget prevents a large last_scan/audit map from turning the
+    # health export back into a megabyte-scale GIL workload.
+    freeze_budget = [20_000]
 
     open_positions = []
     for pos in state.open_positions.values():
@@ -222,7 +291,12 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
 
     mode = config.runtime.mode
 
-    runtime_progress = dict(getattr(state, "runtime_progress", {}) or {})
+    runtime_progress = _freeze_current_state_value(
+        getattr(state, "runtime_progress", {}) or {},
+        budget=freeze_budget,
+    )
+    if not isinstance(runtime_progress, dict):
+        runtime_progress = {}
     active_lane = str(runtime_progress.get("active_lane") or "")
     try:
         active_lane_started_ms = int(runtime_progress.get("active_lane_started_ms") or 0)
@@ -236,7 +310,12 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         runtime_progress["active_lane_overdue"] = (
             now_ms - active_lane_started_ms > active_lane_budget_ms
         )
-    v1_lifecycle_closure = dict(getattr(state, "v1_lifecycle_closure", {}) or {})
+    v1_lifecycle_closure = _freeze_current_state_value(
+        getattr(state, "v1_lifecycle_closure", {}) or {},
+        budget=freeze_budget,
+    )
+    if not isinstance(v1_lifecycle_closure, dict):
+        v1_lifecycle_closure = {}
     if not v1_lifecycle_closure:
         from lightfee.engine.v1_lifecycle_closure import (
             build_v1_lifecycle_closure_table,
@@ -285,17 +364,30 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "pending_passive_close_count": len(state.pending_passive_closes),
         **pending_close_reconciliation,
         "pending_residual_repair_count": len(getattr(state, "pending_residual_repairs", []) or []),
-        "pending_residual_repairs": list(getattr(state, "pending_residual_repairs", []) or []),
-        "live_recovery_reduce_only_pairs": list(getattr(state, "live_recovery_reduce_only_pairs", []) or []),
-        "venue_entry_cooldowns": dict(getattr(state, "venue_entry_cooldowns", {}) or {}),
-        "last_scan": getattr(state, "last_scan", None),
+        "pending_residual_repairs": _freeze_current_state_value(
+            getattr(state, "pending_residual_repairs", []) or [],
+            budget=freeze_budget,
+        ),
+        "live_recovery_reduce_only_pairs": _freeze_current_state_value(
+            getattr(state, "live_recovery_reduce_only_pairs", []) or [],
+            budget=freeze_budget,
+        ),
+        "venue_entry_cooldowns": _freeze_current_state_value(
+            getattr(state, "venue_entry_cooldowns", {}) or {},
+            budget=freeze_budget,
+        ),
+        "last_scan": _freeze_current_state_value(
+            getattr(state, "last_scan", None),
+            budget=freeze_budget,
+        ),
         "runtime_progress": runtime_progress,
-        "runtime_market_data_config": dict(
-            getattr(state, "runtime_market_data_config", {}) or {}
+        "runtime_market_data_config": _freeze_current_state_value(
+            getattr(state, "runtime_market_data_config", {}) or {},
+            budget=freeze_budget,
         ),
         "v1_lifecycle_closure": v1_lifecycle_closure,
     }
-    write_json_atomic(path, data)
+    return data
 
 
 def _build_prometheus_metric_samples(state: EngineState) -> list[str]:

@@ -4,6 +4,8 @@ from dataclasses import replace
 import hashlib
 import math
 import json
+import random
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,11 @@ from lightfee.strategy.economics import (
     FundingForecast,
     build_edge_breakdown,
     conservative_funding_edge_bps,
+)
+from lightfee.strategy.candidate_identity import (
+    candidate_revision_id,
+    final_candidate_revision_id,
+    opportunity_lease_id,
 )
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
@@ -108,6 +115,625 @@ def _verified_fee_provenance_candidate_fields(
     }
 
 
+def _identity_quote(venue: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        venue=venue,
+        symbol="BTCUSDT",
+        observed_at_ms=1_000,
+        funding_timestamp_ms=100_000,
+        funding_interval_ms=28_800_000,
+        bid=99.9,
+        ask=100.0,
+        underlying="BTC",
+        quote_currency="USDT",
+        contract_type="linear",
+        contract_multiplier=1.0,
+        mark_index_source="venue_index",
+        price_tick=0.01,
+        quantity_step_base=0.001,
+        min_quantity_base=0.001,
+        min_notional_quote=5.0,
+        min_notional_evidence_complete=True,
+        venue_status="active",
+        contract_normalization_complete=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("funding_interval_ms", 14_400_000),
+        ("price_tick", 0.1),
+        ("quantity_step_base", 0.01),
+        ("min_quantity_base", 0.01),
+        ("min_notional_quote", 10.0),
+        ("contract_multiplier", 1_000.0),
+        ("venue_status", "reduce_only"),
+        ("contract_normalization_complete", False),
+    ],
+)
+def test_candidate_revision_changes_with_every_execution_contract_rule(
+    field: str,
+    changed: object,
+) -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+
+    def revision() -> str:
+        return candidate_revision_id(
+            pair_id="btcusdt:cheap->rich",
+            long_quote=long_quote,
+            short_quote=short_quote,
+            settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
+            entry_route="taker_both",
+            exit_route="taker_both",
+            fee_evidence_fingerprint="fee-v1",
+            fee_assurance_tier="account",
+            model_epoch="model-v1",
+            economics={"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
+        )
+
+    baseline = revision()
+    setattr(short_quote, field, changed)
+    assert revision() != baseline
+
+
+def test_candidate_revision_and_lease_split_build_clock_from_route_cycle() -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+    revision_kwargs = {
+        "pair_id": "btcusdt:cheap->rich",
+        "long_quote": long_quote,
+        "short_quote": short_quote,
+        "settlement_timestamps_ms": (100_000, 100_000, 100_000, 100_000),
+        "entry_route": "taker_both",
+        "exit_route": "taker_both",
+        "fee_evidence_fingerprint": "fee-v1",
+        "fee_assurance_tier": "account",
+        "model_epoch": "model-v1",
+        "economics": {"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
+    }
+    lease_kwargs = {
+        "pair_id": "btcusdt:cheap->rich",
+        "long_quote": long_quote,
+        "short_quote": short_quote,
+        "first_funding_timestamp_ms": 100_000,
+        "second_funding_timestamp_ms": 100_000,
+        "entry_route": "taker_both",
+        "exit_route": "taker_both",
+        "model_epoch": "model-v1",
+    }
+
+    assert candidate_revision_id(**revision_kwargs) == candidate_revision_id(
+        **revision_kwargs
+    )
+    baseline_lease = opportunity_lease_id(**lease_kwargs)
+    long_quote.observed_at_ms = 2_000
+    long_quote.bid = 99.8
+    assert opportunity_lease_id(**lease_kwargs) == baseline_lease
+    assert opportunity_lease_id(
+        **{**lease_kwargs, "entry_route": "maker_long"}
+    ) != baseline_lease
+    long_quote.funding_interval_ms = 14_400_000
+    assert opportunity_lease_id(**lease_kwargs) != baseline_lease
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [True, False, None, "1.0", "invalid", float("nan"), float("inf"), 10**1_000],
+)
+def test_candidate_revision_rejects_invalid_numeric_identity_inputs(
+    invalid: object,
+) -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+
+    assert candidate_revision_id(
+        pair_id="btcusdt:cheap->rich",
+        long_quote=long_quote,
+        short_quote=short_quote,
+        settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
+        entry_route="taker_both",
+        exit_route="taker_both",
+        fee_evidence_fingerprint="fee-v1",
+        fee_assurance_tier="account",
+        model_epoch="model-v1",
+        economics={"entry_target_quantity": invalid},
+    ) == ""
+
+
+def test_candidate_revision_preserves_distinct_adjacent_float_economics() -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+
+    def revision(quantity: float) -> str:
+        return candidate_revision_id(
+            pair_id="btcusdt:cheap->rich",
+            long_quote=long_quote,
+            short_quote=short_quote,
+            settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
+            entry_route="taker_both",
+            exit_route="taker_both",
+            fee_evidence_fingerprint="fee-v1",
+            fee_assurance_tier="account",
+            model_epoch="model-v1",
+            economics={"entry_target_quantity": quantity},
+        )
+
+    baseline = 1.0
+    adjacent = math.nextafter(baseline, math.inf)
+    assert adjacent != baseline
+    assert revision(adjacent) != revision(baseline)
+
+
+def test_final_candidate_revision_rejects_invalid_numeric_identity_inputs() -> None:
+    assert final_candidate_revision_id(
+        evidence_candidate_revision_id="evidence-v1",
+        quantity=1.0,
+        long_price=100.0,
+        short_price=100.0,
+        entry_route="taker_both",
+        economics={"worst_case_profit_quote": float("nan")},
+    ) == ""
+
+
+def test_final_candidate_revision_changes_with_worst_case_profit() -> None:
+    kwargs = {
+        "evidence_candidate_revision_id": "evidence-v1",
+        "quantity": 1.0,
+        "long_price": 99.0,
+        "short_price": 101.0,
+        "entry_route": "taker_both",
+    }
+    assert final_candidate_revision_id(
+        **kwargs,
+        economics={"worst_case_profit_quote": 0.03},
+    ) != final_candidate_revision_id(
+        **kwargs,
+        economics={"worst_case_profit_quote": 0.031},
+    )
+
+
+def test_final_candidate_revision_binding_rejects_tampered_derived_profit() -> None:
+    candidate = _candidate(
+        entry_target_quantity=1.0,
+        entry_notional_quote=100.0,
+        entry_max_leg_notional_quote=101.0,
+        expected_edge_bps=5.0,
+        worst_case_edge_bps=3.0,
+        expected_profit_quote=0.05,
+        worst_case_profit_quote=0.031,
+    )
+    candidate.evidence_candidate_revision_id = "evidence-v1"
+    candidate.candidate_revision_id = "evidence-v1"
+    dispatch = EntryDispatchRuntime(SimpleNamespace())
+
+    assert dispatch._bind_final_entry_candidate_revision(
+        candidate,
+        quantity=1.0,
+        long_price=99.0,
+        short_price=101.0,
+        entry_route="taker_both",
+    ) == ""
+    assert candidate.candidate_revision_id == "evidence-v1"
+
+
+def test_opportunity_lease_tags_settlement_time_by_leg() -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+    long_quote.funding_timestamp_ms = 100_000
+    short_quote.funding_timestamp_ms = 200_000
+    kwargs = {
+        "pair_id": "btcusdt:cheap->rich",
+        "long_quote": long_quote,
+        "short_quote": short_quote,
+        "first_funding_timestamp_ms": 100_000,
+        "second_funding_timestamp_ms": 200_000,
+        "entry_route": "taker_both",
+        "exit_route": "taker_both",
+        "model_epoch": "model-v1",
+    }
+    baseline = opportunity_lease_id(**kwargs)
+    long_quote.funding_timestamp_ms = 200_000
+    short_quote.funding_timestamp_ms = 100_000
+    assert opportunity_lease_id(**kwargs) != baseline
+
+
+def test_bounded_candidate_build_cannot_prune_cross_driven_global_best() -> None:
+    quotes: dict[str, QuoteSnapshot] = {}
+    symbols = [f"BAD{index}USDT" for index in range(300)] + ["SPECIALUSDT"]
+
+    def quote(
+        venue: str,
+        symbol: str,
+        *,
+        bid: float,
+        ask: float,
+        funding_rate_bps: float,
+    ) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            venue=venue,
+            symbol=symbol,
+            bid=bid,
+            ask=ask,
+            bid_size=10.0,
+            ask_size=10.0,
+            funding_rate_bps=funding_rate_bps,
+            funding_rate_observed_at_ms=1_000,
+            funding_rate_event_at_ms=1_000,
+            funding_rate_received_at_ms=1_000,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:{venue}:{symbol}:1000:{funding_rate_bps:.17g}:100000"
+            ),
+            funding_timestamp_ms=100_000,
+            funding_interval_ms=28_800_000,
+            observed_at_ms=1_000,
+            underlying=symbol.removesuffix("USDT"),
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
+
+    for symbol in symbols[:-1]:
+        quotes[f"cheap:{symbol}"] = quote(
+            "cheap", symbol, bid=99.99, ask=100.0, funding_rate_bps=0.0
+        )
+        quotes[f"rich:{symbol}"] = quote(
+            "rich", symbol, bid=100.01, ask=100.02, funding_rate_bps=100.0
+        )
+    quotes["cheap:SPECIALUSDT"] = quote(
+        "cheap", "SPECIALUSDT", bid=99.99, ask=100.0, funding_rate_bps=0.0
+    )
+    quotes["rich:SPECIALUSDT"] = quote(
+        "rich", "SPECIALUSDT", bid=130.0, ask=130.01, funding_rate_bps=1.0
+    )
+    kwargs = {
+        "venue_fee_bps": {"cheap": 1.0, "rich": 1.0},
+        "venue_maker_fee_bps": {"cheap": 1.0, "rich": 1.0},
+        "observed_at_ms": 1_000,
+    }
+
+    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
+    diagnostics: dict[str, object] = {}
+    bounded = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        max_candidates=32,
+        diagnostics=diagnostics,
+        **kwargs,
+    )
+
+    assert full[0].symbol == "SPECIALUSDT"
+    assert bounded[0].symbol == full[0].symbol
+    assert bounded[0].ranking_edge_bps == pytest.approx(full[0].ranking_edge_bps)
+    assert len(bounded) == 32
+    assert diagnostics["seed_pair_count"] > 256
+    assert diagnostics["seed_frontier_count"] <= 64
+    assert diagnostics["seed_bound_violation"] is False
+
+
+def test_bounded_candidate_build_keeps_seven_venue_frontier_under_500ms() -> None:
+    quotes: dict[str, QuoteSnapshot] = {}
+    venues = [f"venue{index}" for index in range(7)]
+    symbols = [f"S{index}USDT" for index in range(216)]
+    for symbol_index, symbol in enumerate(symbols):
+        reference = 100.0 + symbol_index / 100.0
+        for venue_index, venue in enumerate(venues):
+            quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=reference - 0.01,
+                ask=reference + 0.01,
+                bid_size=10.0,
+                ask_size=10.0,
+                funding_rate_bps=float(venue_index),
+                funding_rate_observed_at_ms=1_000,
+                funding_rate_event_at_ms=1_000,
+                funding_rate_received_at_ms=1_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=(
+                    f"funding:{venue}:{symbol}:1000:{float(venue_index):.17g}:100000"
+                ),
+                funding_timestamp_ms=100_000,
+                funding_interval_ms=28_800_000,
+                observed_at_ms=1_000,
+                underlying=symbol.removesuffix("USDT"),
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="venue_mark_index",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+    diagnostics: dict[str, object] = {}
+    started = time.perf_counter()
+    candidates = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        venue_fee_bps={venue: 1.0 for venue in venues},
+        venue_maker_fee_bps={venue: 1.0 for venue in venues},
+        observed_at_ms=1_000,
+        max_candidates=32,
+        diagnostics=diagnostics,
+    )
+    elapsed_s = time.perf_counter() - started
+
+    assert len(candidates) == 32
+    assert diagnostics["seed_pair_count"] == 216 * 21
+    assert diagnostics["seed_frontier_count"] <= 64
+    assert diagnostics["seed_bound_violation"] is False
+    assert elapsed_s <= 0.5
+
+
+def test_bounded_candidate_build_fails_closed_at_exact_work_budget() -> None:
+    venues = [f"venue{index}" for index in range(7)]
+    symbols = [f"B{index}USDT" for index in range(8)]
+    quotes = {
+        f"{venue}:{symbol}": QuoteSnapshot(
+            venue=venue,
+            symbol=symbol,
+            bid=99.99,
+            ask=100.01,
+            bid_size=10.0,
+            ask_size=10.0,
+            funding_rate_bps=float(venue_index),
+            funding_rate_observed_at_ms=1_000,
+            funding_rate_event_at_ms=1_000,
+            funding_rate_received_at_ms=1_000,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:{venue}:{symbol}:1000:{float(venue_index):.17g}:100000"
+            ),
+            funding_timestamp_ms=100_000,
+            funding_interval_ms=28_800_000,
+            observed_at_ms=1_000,
+            underlying=symbol.removesuffix("USDT"),
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
+        for symbol in symbols
+        for venue_index, venue in enumerate(venues)
+    }
+    diagnostics: dict[str, object] = {}
+
+    candidates = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        strategy=StrategyConfig(
+            entry_notional_cap_quote=0.0,
+            live_entry_notional_cap_quote=0.0,
+            funding_missing_margin_fallback_notional_quote=0.0,
+        ),
+        venue_fee_bps={venue: 1.0 for venue in venues},
+        venue_maker_fee_bps={venue: 1.0 for venue in venues},
+        observed_at_ms=1_000,
+        max_candidates=8,
+        diagnostics=diagnostics,
+    )
+
+    assert candidates == []
+    assert diagnostics["seed_pair_count"] == len(symbols) * 21
+    assert diagnostics["seed_frontier_limit"] == 16
+    assert diagnostics["seed_frontier_count"] == 16
+    assert diagnostics["seed_frontier_complete"] is False
+    assert diagnostics["seed_frontier_stop_reason"] == "exact_frontier_limit_reached"
+
+
+def test_enhanced_live_signed_bound_keeps_large_frontier_bounded() -> None:
+    venues = [f"venue{index}" for index in range(7)]
+    symbols = [f"E{index}USDT" for index in range(80)]
+    quotes: dict[str, QuoteSnapshot] = {}
+    for symbol_index, symbol in enumerate(symbols):
+        reference = 100.0 + symbol_index / 100.0
+        for venue in venues:
+            quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=reference - 0.01,
+                ask=reference + 0.01,
+                bid_size=10.0,
+                ask_size=10.0,
+                funding_rate_bps=100.0,
+                funding_rate_observed_at_ms=10_000,
+                funding_rate_event_at_ms=10_000,
+                funding_rate_received_at_ms=10_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=(
+                    f"funding:{venue}:{symbol}:10000:100:100000"
+                ),
+                funding_timestamp_ms=100_000,
+                funding_interval_ms=28_800_000,
+                predicted_funding_rate_bps=100.0,
+                funding_forecast_source="test_calibrator",
+                funding_forecast_sample_count=32,
+                funding_forecast_uncertainty_bps=1.0,
+                funding_forecast_started_at_ms=1,
+                funding_forecast_distribution_stable=True,
+                funding_forecast_stability_reason="stable",
+                observed_at_ms=10_000,
+                underlying=symbol.removesuffix("USDT"),
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="venue_mark_index",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+    diagnostics: dict[str, object] = {}
+
+    candidates = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        strategy=StrategyConfig(
+            funding_economics_mode="enhanced_live",
+            funding_forecast_mode="live",
+            entry_notional_cap_quote=200.0,
+            funding_forecast_min_samples=3,
+            funding_forecast_shadow_min_days=0,
+        ),
+        venue_fee_bps={venue: 1.0 for venue in venues},
+        venue_maker_fee_bps={venue: 1.0 for venue in venues},
+        observed_at_ms=10_000,
+        max_candidates=32,
+        diagnostics=diagnostics,
+    )
+
+    assert len(candidates) == 32
+    assert all(not row.blocked and row.economics_complete for row in candidates)
+    assert diagnostics["seed_pair_count"] == len(symbols) * 42
+    assert diagnostics["seed_frontier_count"] <= 64
+    assert diagnostics["seed_bound_violation"] is False
+    assert diagnostics["seed_frontier_complete"] is True
+    assert diagnostics["seed_frontier_stop_reason"] == "remaining_upper_bounds_dominated"
+
+
+@pytest.mark.parametrize(
+    ("seed", "economics_mode", "passive_execution_enabled"),
+    [
+        (7, "v1_exact", False),
+        (19, "v1_exact", True),
+        (37, "enhanced_shadow", False),
+        (53, "enhanced_live", False),
+    ],
+)
+def test_bounded_candidate_build_matches_randomized_full_top32(
+    seed: int,
+    economics_mode: str,
+    passive_execution_enabled: bool,
+) -> None:
+    rng = random.Random(seed)
+    venues = [f"venue{index}" for index in range(7)]
+    symbols = [f"R{index}USDT" for index in range(24)]
+    quotes: dict[str, QuoteSnapshot] = {}
+    for symbol_index, symbol in enumerate(symbols):
+        reference = 50.0 + symbol_index * 3.0
+        for venue_index, venue in enumerate(venues):
+            venue_mid = reference * (1.0 + rng.uniform(-0.008, 0.008))
+            half_spread = venue_mid * rng.uniform(0.00002, 0.0005)
+            rate_bps = rng.uniform(-35.0, 35.0) + venue_index * 0.001
+            funding_timestamp_ms = 100_000 + rng.choice((0, 30_000, 180_000))
+            quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=venue_mid - half_spread,
+                ask=venue_mid + half_spread,
+                bid_size=rng.uniform(0.05, 20.0),
+                ask_size=rng.uniform(0.05, 20.0),
+                funding_rate_bps=rate_bps,
+                funding_rate_observed_at_ms=10_000,
+                funding_rate_event_at_ms=10_000,
+                funding_rate_received_at_ms=10_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=(
+                    f"funding:{venue}:{symbol}:10000:{rate_bps:.17g}:"
+                    f"{funding_timestamp_ms}"
+                ),
+                funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=28_800_000,
+                predicted_funding_rate_bps=(
+                    rate_bps + ((symbol_index + venue_index) % 7 - 3) * 0.25
+                ),
+                funding_forecast_source="test_calibrator",
+                funding_forecast_sample_count=32,
+                funding_forecast_uncertainty_bps=1.0,
+                funding_forecast_started_at_ms=1,
+                funding_forecast_distribution_stable=True,
+                funding_forecast_stability_reason="stable",
+                observed_at_ms=10_000,
+                underlying=symbol.removesuffix("USDT"),
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="venue_mark_index",
+                price_precision=4,
+                quantity_precision=6,
+                price_tick=0.0001,
+                quantity_step_base=0.000001,
+                min_quantity_base=0.000001,
+                min_notional_quote=0.01,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+    fees = {venue: rng.uniform(0.5, 4.0) for venue in venues}
+    maker_fees = {venue: rng.uniform(0.0, fees[venue]) for venue in venues}
+    caps = {venue: rng.uniform(25.0, 250.0) for venue in venues}
+    kwargs = {
+        "strategy": StrategyConfig(
+            funding_economics_mode=economics_mode,
+            entry_notional_cap_quote=200.0,
+            funding_forecast_min_samples=3,
+            funding_forecast_shadow_min_days=0,
+        ),
+        "venue_fee_bps": fees,
+        "venue_maker_fee_bps": maker_fees,
+        "venue_notional_caps": caps,
+        "passive_execution_enabled": passive_execution_enabled,
+        "observed_at_ms": 10_000,
+    }
+
+    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
+    diagnostics: dict[str, object] = {}
+    bounded = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        diagnostics=diagnostics,
+        max_candidates=32,
+        **kwargs,
+    )
+    full_top32 = [
+        row for row in full if not row.blocked and row.economics_complete
+    ][:32]
+    bounded_top32 = [
+        row for row in bounded if not row.blocked and row.economics_complete
+    ][:32]
+
+    assert [row.pair_id for row in bounded_top32] == [
+        row.pair_id for row in full_top32
+    ]
+    assert [row.ranking_edge_bps for row in bounded_top32] == pytest.approx(
+        [row.ranking_edge_bps for row in full_top32]
+    )
+    assert diagnostics["seed_bound_violation"] is False
+    assert diagnostics["seed_frontier_complete"] is True
+
+
 def test_edge_breakdown_has_one_expected_and_worst_formula() -> None:
     edge = build_edge_breakdown(
         gross_signal_edge_bps=3.0,
@@ -158,11 +784,13 @@ def test_live_funding_selection_uses_v1_depth_risk_priority_before_ranking_tiebr
     higher_edge = SimpleNamespace(
         ranking_edge_bps=8.0,
         worst_case_edge_bps=8.0,
+        expected_profit_quote=100.0,
         pair_id="higher",
     )
     lower_edge = SimpleNamespace(
         ranking_edge_bps=5.0,
         worst_case_edge_bps=5.0,
+        expected_profit_quote=1.0,
         pair_id="lower",
     )
 
@@ -175,16 +803,19 @@ def test_live_funding_selection_uses_v1_depth_risk_priority_before_ranking_tiebr
     tied_higher = SimpleNamespace(
         ranking_edge_bps=12.0,
         worst_case_edge_bps=8.0,
+        expected_profit_quote=1.0,
         pair_id="z-higher",
     )
     tied_lower = SimpleNamespace(
         ranking_edge_bps=6.0,
         worst_case_edge_bps=6.0,
+        expected_profit_quote=100.0,
         pair_id="a-lower",
     )
     risk_by_pair.update({"z-higher": 1.0, "a-lower": 0.0})
 
-    # Both have priority 6 bps; raw V1 ranking must win before lexical ID.
+    # Absolute quote profit deliberately conflicts in both comparisons.  V1
+    # still orders by ranking_edge_bps / (1 + risk), then raw ranking.
     assert gate._candidate_final_selection_sort_key(
         tied_higher
     ) < gate._candidate_final_selection_sort_key(tied_lower)
@@ -278,6 +909,7 @@ def test_non_finite_sidecar_quote_is_excluded_before_funding_candidate_ranking()
             symbol="BTCUSDT",
             bid=99.9,
             ask=100.0,
+            observed_at_ms=10,
             funding_rate_bps=2.0,
             funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
@@ -312,6 +944,7 @@ def test_crossed_sidecar_quote_is_excluded_before_funding_candidate_ranking() ->
             symbol="BTCUSDT",
             bid=100.3,
             ask=100.4,
+            observed_at_ms=10,
             funding_rate_bps=8.0,
             funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
@@ -813,7 +1446,13 @@ def test_v1_and_shadow_keep_quoted_funding_gate_until_enhanced_live_is_calibrate
             symbol="BTCUSDT",
             bid=99.9,
             ask=100.0,
+            observed_at_ms=10,
             funding_rate_bps=2.0,
+            funding_rate_observed_at_ms=10,
+            funding_rate_event_at_ms=10,
+            funding_rate_received_at_ms=10,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id="funding:cheap:BTCUSDT:10:2:1000000",
             predicted_funding_rate_bps=1.0,
             funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
@@ -840,7 +1479,13 @@ def test_v1_and_shadow_keep_quoted_funding_gate_until_enhanced_live_is_calibrate
             symbol="BTCUSDT",
             bid=100.3,
             ask=100.4,
+            observed_at_ms=10,
             funding_rate_bps=8.0,
+            funding_rate_observed_at_ms=10,
+            funding_rate_event_at_ms=10,
+            funding_rate_received_at_ms=10,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id="funding:rich:BTCUSDT:10:8:1000000",
             predicted_funding_rate_bps=20.0,
             funding_timestamp_ms=1_000_000,
             funding_interval_ms=28_800_000,
@@ -938,6 +1583,7 @@ def test_enhanced_live_discovers_a_direction_reversed_by_calibrated_forecast() -
         "funding_interval_ms": 28_800_000,
         "funding_forecast_sample_count": 1,
         "funding_forecast_distribution_stable": True,
+        "observed_at_ms": 10,
         "underlying": "BTC",
         "quote_currency": "USDT",
         "contract_type": "linear",
@@ -960,6 +1606,11 @@ def test_enhanced_live_discovers_a_direction_reversed_by_calibrated_forecast() -
             ask=100.0,
             ask_size=10.0,
             funding_rate_bps=8.0,
+            funding_rate_observed_at_ms=10,
+            funding_rate_event_at_ms=10,
+            funding_rate_received_at_ms=10,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id="funding:a:BTCUSDT:10:8:1000000",
             predicted_funding_rate_bps=1.0,
             **common,
         ),
@@ -969,6 +1620,11 @@ def test_enhanced_live_discovers_a_direction_reversed_by_calibrated_forecast() -
             ask=100.3,
             bid_size=10.0,
             funding_rate_bps=1.0,
+            funding_rate_observed_at_ms=10,
+            funding_rate_event_at_ms=10,
+            funding_rate_received_at_ms=10,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id="funding:b:BTCUSDT:10:1:1000000",
             predicted_funding_rate_bps=10.0,
             **common,
         ),
@@ -1021,7 +1677,15 @@ def test_enhanced_live_requires_the_configured_shadow_duration() -> None:
             symbol="BTCUSDT",
             bid=99.9,
             ask=100.0,
+            observed_at_ms=now_ms,
             funding_rate_bps=2.0,
+            funding_rate_observed_at_ms=now_ms,
+            funding_rate_event_at_ms=now_ms,
+            funding_rate_received_at_ms=now_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:cheap:BTCUSDT:{now_ms}:2:{now_ms + 1_000_000}"
+            ),
             predicted_funding_rate_bps=1.0,
             funding_timestamp_ms=now_ms + 1_000_000,
             funding_interval_ms=28_800_000,
@@ -1049,7 +1713,15 @@ def test_enhanced_live_requires_the_configured_shadow_duration() -> None:
             symbol="BTCUSDT",
             bid=100.3,
             ask=100.4,
+            observed_at_ms=now_ms,
             funding_rate_bps=8.0,
+            funding_rate_observed_at_ms=now_ms,
+            funding_rate_event_at_ms=now_ms,
+            funding_rate_received_at_ms=now_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:rich:BTCUSDT:{now_ms}:8:{now_ms + 1_000_000}"
+            ),
             predicted_funding_rate_bps=20.0,
             funding_timestamp_ms=now_ms + 1_000_000,
             funding_interval_ms=28_800_000,
