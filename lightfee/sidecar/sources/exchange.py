@@ -149,21 +149,23 @@ class ExchangeSource:
             include_open_interest=False,
         )
         result: dict[str, QuoteSnapshot] = {}
+        absent_row_candidates: set[str] = set()
         for key, ft in tickers.items():
             listing_status = str(
                 ft.open_interest_evidence_status or ""
             ).strip().lower()
             if (
-                listing_status in {"symbol_not_listed", "ambiguous_mapping"}
+                listing_status
+                in {"symbol_not_listed", "ambiguous_mapping", "unavailable"}
                 and float(ft.bid or 0.0) <= 0.0
                 and float(ft.ask or 0.0) <= 0.0
+                and str(ft.venue_status or "").strip().lower() != "active"
+                and ft.contract_normalization_complete is not True
             ):
                 # Venue-wide requests receive the cross-venue symbol union.
-                # Known non-listings and non-unique venue mappings are absent
-                # rows, not failed market observations.  Keep a genuinely
-                # listed row with a missing final BBO below so it still fails
-                # closed as degraded evidence.
-                continue
+                # Keep the row provisionally: a fresh final BBO can still
+                # prove that it is listed despite an empty first response.
+                absent_row_candidates.add(key)
             result[key] = self._from_funding_ticker(ft)
         # Funding, contract, and fee metadata are slow variables. Reacquire a
         # lightweight BBO after that work so candidate prices keep the actual
@@ -172,9 +174,15 @@ class ExchangeSource:
             top_books = await self._client.fetch_top_book_quotes(symbols)
         except Exception:
             top_books = {}
-        for key, quote in result.items():
+        for key, quote in list(result.items()):
             top = top_books.get(key)
             if top is None:
+                if key in absent_row_candidates:
+                    # Both independent BBO reads omitted the row and there is
+                    # no active contract identity.  This is a cross-venue
+                    # union absence, not degraded market evidence.
+                    result.pop(key, None)
+                    continue
                 # The funding ticker remains useful for slow funding/contract
                 # metadata, but its embedded price was observed before that
                 # work completed.  It must never masquerade as a fresh Top-K

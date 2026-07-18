@@ -329,7 +329,10 @@ async def test_hyperliquid_ws_source_rejects_stale_cached_quote() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hyperliquid_ws_source_refreshes_connected_stale_quote_via_rest() -> None:
+@pytest.mark.parametrize("connected", [True, False])
+async def test_hyperliquid_ws_source_refreshes_started_stale_quote_via_rest(
+    connected,
+) -> None:
     now_ms = int(time.time() * 1000)
     refreshed = TopBookQuote(
         venue="hyperliquid",
@@ -345,7 +348,7 @@ async def test_hyperliquid_ws_source_refreshes_connected_stale_quote_via_rest() 
     )
 
     class ConnectedClient:
-        is_connected = True
+        is_connected = connected
 
     class RestFallback:
         def __init__(self) -> None:

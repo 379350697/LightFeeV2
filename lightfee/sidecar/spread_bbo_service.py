@@ -83,8 +83,9 @@ class HyperliquidSpreadBboSource:
             symbol = str(raw_symbol or "").strip().upper()
             quote = self._cache.get_quote(self.venue, symbol)
             if quote is None:
-                client = self._clients.get(symbol)
-                if client is not None and client.is_connected:
+                # Keep the fallback scoped to symbols already started by this
+                # source, while allowing REST to bridge WS reconnect windows.
+                if symbol in self._clients:
                     fallback_symbols.append(symbol)
                 continue
             received_at_ms = int(quote.received_at_ms or 0)
@@ -93,8 +94,7 @@ class HyperliquidSpreadBboSource:
                 or received_at_ms > now_ms
                 or now_ms - received_at_ms > self.max_age_ms
             ):
-                client = self._clients.get(symbol)
-                if client is not None and client.is_connected:
+                if symbol in self._clients:
                     fallback_symbols.append(symbol)
                 continue
             # The spread producer contract uses the local receipt timestamp as
