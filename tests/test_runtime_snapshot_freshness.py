@@ -677,6 +677,60 @@ async def test_runtime_unavailable_snapshot_resets_streak_and_preserves_last_goo
     assert any(record["kind"] == "runtime.snapshot_unavailable" for record in records)
 
 
+@pytest.mark.asyncio
+async def test_runtime_names_incomplete_candidate_frontier_explicitly(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="paper"),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    unavailable = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        candidate_build_observed_at_ms=1_000,
+        acquisition_mode="unavailable",
+        candidate_build_diagnostics={
+            "source_data_ready": True,
+            "seed_frontier_complete": False,
+            "entry_frontier_ready": False,
+            "seed_frontier_count": 64,
+            "seed_pair_count": 4_811,
+            "seed_frontier_stop_reason": "exact_frontier_limit_reached",
+        },
+    )
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: unavailable)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 1_050)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime.state.last_scan["no_entry_reason"] == "candidate_frontier_incomplete"
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(
+        record
+        for record in records
+        if record["kind"] == "runtime.candidate_frontier_incomplete"
+    )
+    assert event["payload"]["seed_frontier_complete"] is False
+    assert event["payload"]["seed_frontier_count"] == 64
+    assert event["payload"]["seed_pair_count"] == 4_811
+    assert event["payload"]["seed_frontier_stop_reason"] == (
+        "exact_frontier_limit_reached"
+    )
+
+
 class OkxMetadataAdapter:
     okx_base_quantity_step = 0.0
     trading_capability_trusted = True

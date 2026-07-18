@@ -134,6 +134,89 @@ def build_same_symbol_pairs(
     )
 
 
+def _pair_fee_assurance(
+    long_q: QuoteSnapshot,
+    short_q: QuoteSnapshot,
+    *,
+    config: StrategyConfig,
+    fee_by_venue: dict[str, float],
+    fee_evidence: FeeEvidenceBook | None,
+    expected_fee_identity_hashes: dict[str, str] | None,
+) -> tuple[str, bool, bool, bool, str]:
+    """Resolve one fee contract shared by frontier and exact evaluation.
+
+    The conservative canary tier deliberately accepts a symbol that was not
+    covered by the latest private-account schedule, provided both configured
+    taker fees are explicit.  It remains conservative because the caller adds
+    the per-unverified-leg buffer, removes that leg's maker discount and
+    applies the smaller notional cap.
+    """
+
+    taker_complete = _taker_fee_evidence_complete(
+        fee_by_venue,
+        long_q.venue,
+        short_q.venue,
+    )
+    long_authoritative = bool(
+        fee_evidence is not None
+        and fee_evidence.account_authoritative_for(
+            expected_fee_identity_hashes or {},
+            long_q.venue,
+            symbol=long_q.symbol,
+        )
+    )
+    short_authoritative = bool(
+        fee_evidence is not None
+        and fee_evidence.account_authoritative_for(
+            expected_fee_identity_hashes or {},
+            short_q.venue,
+            symbol=short_q.symbol,
+        )
+    )
+    if long_authoritative and short_authoritative:
+        return "account", taker_complete, True, True, ""
+
+    unavailable_reason = "account_fee_evidence_unavailable"
+    if (
+        fee_evidence is not None
+        and fee_evidence.complete_for(long_q.venue, short_q.venue)
+        and expected_fee_identity_hashes is not None
+    ):
+        schedules = (
+            fee_evidence.schedule_for(long_q.venue),
+            fee_evidence.schedule_for(short_q.venue),
+        )
+        symbol = str(long_q.symbol).strip().upper()
+        if any(
+            schedule is not None
+            and schedule.covered_symbols
+            and symbol not in schedule.covered_symbols
+            for schedule in schedules
+        ):
+            unavailable_reason = "account_fee_symbol_coverage_missing"
+        else:
+            unavailable_reason = "account_fee_account_identity_mismatch"
+
+    if (
+        config.funding_canary_require_account_fee_evidence is not True
+        and taker_complete
+    ):
+        return (
+            "conservative",
+            taker_complete,
+            long_authoritative,
+            short_authoritative,
+            unavailable_reason,
+        )
+    return (
+        "unavailable",
+        taker_complete,
+        long_authoritative,
+        short_authoritative,
+        unavailable_reason,
+    )
+
+
 def _optimistic_candidate_rank_upper(
     long_q: QuoteSnapshot,
     short_q: QuoteSnapshot,
@@ -238,25 +321,23 @@ def _optimistic_candidate_rank_upper(
         maker_fee_by_venue.get(short_venue, short_fee),
         short_fee,
     )
-    long_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            long_q.venue,
-            symbol=long_q.symbol,
-        )
-    )
-    short_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            short_q.venue,
-            symbol=short_q.symbol,
-        )
+    (
+        assurance_tier,
+        _taker_fee_complete,
+        long_authoritative,
+        short_authoritative,
+        _fee_unavailable_reason,
+    ) = _pair_fee_assurance(
+        long_q,
+        short_q,
+        config=config,
+        fee_by_venue=fee_by_venue,
+        fee_evidence=fee_evidence,
+        expected_fee_identity_hashes=expected_fee_identity_hashes,
     )
     if (
         config.funding_canary_enabled is True
-        and config.funding_canary_require_account_fee_evidence is not True
+        and assurance_tier == "conservative"
     ):
         conservative_buffer = max(
             _finite(config.funding_canary_conservative_fee_buffer_bps),
@@ -268,21 +349,6 @@ def _optimistic_candidate_rank_upper(
         if not short_authoritative:
             short_fee += conservative_buffer
             short_maker_fee = short_fee
-    taker_fee_complete = _taker_fee_evidence_complete(
-        fee_by_venue,
-        long_q.venue,
-        short_q.venue,
-    )
-    assurance_tier = (
-        "account"
-        if long_authoritative and short_authoritative
-        else "conservative"
-        if (
-            config.funding_canary_require_account_fee_evidence is not True
-            and taker_fee_complete
-        )
-        else "unavailable"
-    )
     canary_cap = (
         canary_notional_cap_for_tier(assurance_tier, config)
         if config.funding_canary_enabled is True
@@ -537,56 +603,31 @@ def _seed_is_potentially_live(
             >= required_shadow_age_ms
         ):
             return False
-    if not _taker_fee_evidence_complete(
-        fee_by_venue,
-        long_q.venue,
-        short_q.venue,
-    ):
+    (
+        assurance_tier,
+        taker_fee_complete,
+        long_authoritative,
+        short_authoritative,
+        fee_unavailable_reason,
+    ) = _pair_fee_assurance(
+        long_q,
+        short_q,
+        config=config,
+        fee_by_venue=fee_by_venue,
+        fee_evidence=fee_evidence,
+        expected_fee_identity_hashes=expected_fee_identity_hashes,
+    )
+    if not taker_fee_complete:
         return False
     if (
         bool(config.funding_canary_require_account_fee_evidence)
-        and
-        fee_evidence is not None
-        and fee_evidence.complete_for(long_q.venue, short_q.venue)
-        and expected_fee_identity_hashes is not None
-        and not (
-            fee_evidence.account_authoritative_for(
-                expected_fee_identity_hashes,
-                long_q.venue,
-                symbol=long_q.symbol,
-            )
-            and fee_evidence.account_authoritative_for(
-                expected_fee_identity_hashes,
-                short_q.venue,
-                symbol=short_q.symbol,
-            )
-        )
+        and assurance_tier == "unavailable"
+        and fee_unavailable_reason != "account_fee_evidence_unavailable"
     ):
         return False
+    if config.funding_canary_enabled is True and assurance_tier == "unavailable":
+        return False
     if config.funding_canary_enabled is True:
-        long_authoritative = bool(
-            fee_evidence is not None
-            and fee_evidence.account_authoritative_for(
-                expected_fee_identity_hashes or {},
-                long_q.venue,
-                symbol=long_q.symbol,
-            )
-        )
-        short_authoritative = bool(
-            fee_evidence is not None
-            and fee_evidence.account_authoritative_for(
-                expected_fee_identity_hashes or {},
-                short_q.venue,
-                symbol=short_q.symbol,
-            )
-        )
-        assurance_tier = (
-            "account"
-            if long_authoritative and short_authoritative
-            else "conservative"
-            if config.funding_canary_require_account_fee_evidence is not True
-            else "unavailable"
-        )
         canary_cap = (
             canary_notional_cap_for_tier(assurance_tier, config)
             if assurance_tier != "unavailable"
@@ -1066,30 +1107,23 @@ def _candidate_for_pair(
     calculation_version = economics_mode
     long_fee = fee_by_venue.get(str(long_q.venue).lower(), 0.0)
     short_fee = fee_by_venue.get(str(short_q.venue).lower(), 0.0)
-    taker_fee_evidence_complete = _taker_fee_evidence_complete(
-        fee_by_venue,
-        long_q.venue,
-        short_q.venue,
+    (
+        canary_assurance_tier,
+        taker_fee_evidence_complete,
+        long_account_fee_authoritative,
+        short_account_fee_authoritative,
+        account_fee_unavailable_reason,
+    ) = _pair_fee_assurance(
+        long_q,
+        short_q,
+        config=config,
+        fee_by_venue=fee_by_venue,
+        fee_evidence=fee_evidence,
+        expected_fee_identity_hashes=expected_fee_identity_hashes,
     )
     account_fee_evidence_base_complete = bool(
         fee_evidence is not None
         and fee_evidence.complete_for(long_q.venue, short_q.venue)
-    )
-    long_account_fee_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            long_q.venue,
-            symbol=long_q.symbol,
-        )
-    )
-    short_account_fee_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            short_q.venue,
-            symbol=short_q.symbol,
-        )
     )
     account_fee_identity_matches = (
         long_account_fee_authoritative and short_account_fee_authoritative
@@ -1099,7 +1133,7 @@ def _candidate_for_pair(
     short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
     if (
         config.funding_canary_enabled is True
-        and config.funding_canary_require_account_fee_evidence is not True
+        and canary_assurance_tier == "conservative"
     ):
         # The fallback tier is a property of this symbol/venue leg, not of the
         # venue as a whole.  A daily-universe symbol that was not covered by
@@ -1152,16 +1186,6 @@ def _candidate_for_pair(
     configured_cap = min(
         max(float(config.entry_notional_cap_quote or 0.0), 0.0),
         max(float(config.live_entry_notional_cap_quote or 0.0), 0.0),
-    )
-    canary_assurance_tier = (
-        "account"
-        if account_fee_evidence_complete
-        else "conservative"
-        if (
-            config.funding_canary_require_account_fee_evidence is not True
-            and taker_fee_evidence_complete
-        )
-        else "unavailable"
     )
     canary_hard_cap = (
         canary_notional_cap_for_tier(canary_assurance_tier, config)
@@ -1250,24 +1274,23 @@ def _candidate_for_pair(
         health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
     )
     candidate_block_reasons = list(contract_block_reasons)
-    if (
-        account_fee_evidence_base_complete
-        and expected_fee_identity_hashes is not None
-        and not account_fee_identity_matches
-    ):
-        schedules = (
-            fee_evidence.schedule_for(long_q.venue),
-            fee_evidence.schedule_for(short_q.venue),
-        ) if fee_evidence is not None else ()
-        if any(
-            schedule is not None
-            and schedule.covered_symbols
-            and str(long_q.symbol).strip().upper() not in schedule.covered_symbols
-            for schedule in schedules
-        ):
-            candidate_block_reasons.append("account_fee_symbol_coverage_missing")
-        else:
-            candidate_block_reasons.append("account_fee_account_identity_mismatch")
+    if not account_fee_identity_matches:
+        conservative_canary = bool(
+            config.funding_canary_enabled is True
+            and canary_assurance_tier == "conservative"
+        )
+        legacy_account_mismatch = bool(
+            config.funding_canary_enabled is not True
+            and account_fee_evidence_base_complete
+            and expected_fee_identity_hashes is not None
+        )
+        unavailable_canary = bool(
+            config.funding_canary_enabled is True
+            and canary_assurance_tier == "unavailable"
+            and taker_fee_evidence_complete
+        )
+        if not conservative_canary and (legacy_account_mismatch or unavailable_canary):
+            candidate_block_reasons.append(account_fee_unavailable_reason)
     if not taker_fee_evidence_complete:
         # A zero fee can be a valid explicitly configured VIP tier, but an
         # omitted, non-finite, or negative taker fee is not evidence.  The
@@ -1319,18 +1342,28 @@ def _candidate_for_pair(
         and quantity + 1e-12
         < float(pre_canary_allocation.base_quantity or 0.0)
     )
-    if canary_size_constrained and not contract_block_reasons:
-        canary_below_pair_minimum = any(
-            quantity + 1e-12 < float(quote.min_quantity_base or 0.0)
-            or quantity * price + 1e-9 < float(quote.min_notional_quote or 0.0)
-            for quote, price in (
-                (long_q, float(long_q.ask)),
-                (short_q, float(short_q.bid)),
+    if config.funding_canary_enabled is True and not contract_block_reasons:
+        def _below_pair_minimum(target_quantity: float) -> bool:
+            return any(
+                target_quantity + 1e-12
+                < float(quote.min_quantity_base or 0.0)
+                or target_quantity * price + 1e-9
+                < float(quote.min_notional_quote or 0.0)
+                for quote, price in (
+                    (long_q, float(long_q.ask)),
+                    (short_q, float(short_q.bid)),
+                )
             )
-        )
-        if canary_below_pair_minimum:
+
+        if _below_pair_minimum(quantity):
+            pre_canary_below_pair_minimum = _below_pair_minimum(
+                float(pre_canary_allocation.base_quantity or 0.0)
+            )
             candidate_block_reasons.append(
                 "funding_canary_cap_below_pair_minimum"
+                if canary_size_constrained
+                and not pre_canary_below_pair_minimum
+                else "entry_pair_minimum_not_met"
             )
             candidate_blocked = True
     long_entry_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=True)

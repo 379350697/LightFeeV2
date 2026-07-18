@@ -5490,6 +5490,18 @@ class LiveRuntime:
         self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
 
+    @staticmethod
+    def _unusable_snapshot_reason(snapshot) -> tuple[str, str]:
+        diagnostics = dict(
+            getattr(snapshot, "candidate_build_diagnostics", {}) or {}
+        )
+        if diagnostics.get("seed_frontier_complete") is False:
+            return (
+                "candidate_frontier_incomplete",
+                "runtime.candidate_frontier_incomplete",
+            )
+        return "snapshot_unavailable", "runtime.snapshot_unavailable"
+
     def _current_sidecar_snapshot_generation(self) -> tuple[object, bool | None]:
         path = self.config.runtime.sidecar_snapshot_path
         entry_identity = funding_entry_snapshot_identity(path)
@@ -5723,14 +5735,15 @@ class LiveRuntime:
             # Some venues degraded but can still trade on healthy ones
             if not has_usable_funding_payload(snapshot):
                 self._live_scan_success_streak = 0
+                no_entry_reason, event_kind = self._unusable_snapshot_reason(snapshot)
                 self._finalize_unusable_snapshot_scan(
                     snapshot=snapshot,
                     now_ms=now_ms,
                     freshness="unavailable",
-                    no_entry_reason="snapshot_unavailable",
+                    no_entry_reason=no_entry_reason,
                 )
                 self.journal.append(
-                    "runtime.snapshot_unavailable",
+                    event_kind,
                     self._snapshot_health_payload(
                         snapshot=snapshot,
                         now_ms=now_ms,
@@ -5764,14 +5777,15 @@ class LiveRuntime:
                 return
             if not has_usable_funding_payload(snapshot):
                 self._live_scan_success_streak = 0
+                no_entry_reason, event_kind = self._unusable_snapshot_reason(snapshot)
                 self._finalize_unusable_snapshot_scan(
                     snapshot=snapshot,
                     now_ms=now_ms,
                     freshness="unavailable",
-                    no_entry_reason="snapshot_unavailable",
+                    no_entry_reason=no_entry_reason,
                 )
                 self.journal.append(
-                    "runtime.snapshot_unavailable",
+                    event_kind,
                     self._snapshot_health_payload(
                         snapshot=snapshot,
                         now_ms=now_ms,

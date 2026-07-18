@@ -4758,6 +4758,19 @@ class MarketDataRuntime:
         degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
         degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
         degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
+        candidate_diagnostics = dict(
+            getattr(snapshot, "candidate_build_diagnostics", {}) or {}
+        )
+
+        def _diagnostic_int(name: str) -> int:
+            value = candidate_diagnostics.get(name, 0)
+            if isinstance(value, bool):
+                return 0
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
         top_degraded_symbols: list[str] = []
         if isinstance(degraded_symbols, dict):
             for symbols in degraded_symbols.values():
@@ -4838,6 +4851,18 @@ class MarketDataRuntime:
             "per_venue_candidate_count": dict(sorted(per_venue_candidate_count.items())),
             "source_mode": str(getattr(snapshot, "source_mode", "") or ""),
             "acquisition_mode": str(getattr(snapshot, "acquisition_mode", "") or ""),
+            "source_data_ready": candidate_diagnostics.get("source_data_ready") is True,
+            "seed_frontier_complete": (
+                candidate_diagnostics.get("seed_frontier_complete") is True
+            ),
+            "entry_frontier_ready": (
+                candidate_diagnostics.get("entry_frontier_ready") is True
+            ),
+            "seed_frontier_count": _diagnostic_int("seed_frontier_count"),
+            "seed_pair_count": _diagnostic_int("seed_pair_count"),
+            "seed_frontier_stop_reason": str(
+                candidate_diagnostics.get("seed_frontier_stop_reason", "") or ""
+            ),
             "snapshot_path": snapshot_path,
             "config_hash": config_hash,
             "ts_ms": now_ms,

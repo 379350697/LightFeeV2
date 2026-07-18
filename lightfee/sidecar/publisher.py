@@ -647,6 +647,10 @@ def publish_funding_entry_snapshot(
     requested_venues = sorted({venue for venue, _ in targets}) or list(
         original_diagnostics.get("requested_venues", [])
     )
+    source_data_ready = bool(snapshot.quotes)
+    seed_frontier_complete = (
+        original_diagnostics.get("seed_frontier_complete") is True
+    )
     entry_diagnostics = {
         "input_quote_count": len(quotes),
         "requested_symbol_count": len(requested_symbols),
@@ -668,8 +672,9 @@ def publish_funding_entry_snapshot(
         "diagnostics_only": not bool(candidates),
         "source_candidate_count": len(snapshot.candidates),
         "source_quote_count": len(snapshot.quotes),
-        "source_data_ready": bool(snapshot.quotes),
-        "seed_frontier_complete": bool(original_diagnostics.get("seed_frontier_complete", True)),
+        "source_data_ready": source_data_ready,
+        "seed_frontier_complete": seed_frontier_complete,
+        "entry_frontier_ready": source_data_ready and seed_frontier_complete,
         "seed_frontier_stop_reason": str(
             original_diagnostics.get("seed_frontier_stop_reason", "") or ""
         ),

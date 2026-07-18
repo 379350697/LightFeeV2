@@ -1847,6 +1847,8 @@ def test_funding_entry_snapshot_manifest_is_installed_after_bounded_payload(
     assert loaded.acquisition_mode == "unavailable"
     assert loaded.quotes == {}
     assert loaded.candidate_build_diagnostics["source_data_ready"] is True
+    assert loaded.candidate_build_diagnostics["seed_frontier_complete"] is False
+    assert loaded.candidate_build_diagnostics["entry_frontier_ready"] is False
 
 
 def test_funding_entry_snapshot_blocked_only_generation_is_unavailable(

@@ -40,6 +40,8 @@ from lightfee.strategy.candidate_identity import (
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.strategy.fee_evidence import (
+    FeeEvidenceBook,
+    FeeScheduleEvidence,
     LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
     load_fee_evidence,
     sign_fee_evidence_payload,
@@ -518,6 +520,227 @@ def test_bounded_candidate_build_keeps_seven_venue_frontier_under_500ms() -> Non
     assert diagnostics["seed_frontier_count"] <= 64
     assert diagnostics["seed_bound_violation"] is False
     assert elapsed_s <= 0.5
+
+
+def test_bounded_canary_frontier_treats_uncovered_symbols_as_conservative() -> None:
+    quotes: dict[str, QuoteSnapshot] = {}
+    venues = [f"venue{index}" for index in range(7)]
+    symbols = [f"C{index}USDT" for index in range(96)]
+    for symbol_index, symbol in enumerate(symbols):
+        reference = 100.0 + symbol_index / 100.0
+        for venue_index, venue in enumerate(venues):
+            quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=reference - 0.01,
+                ask=reference + 0.01,
+                bid_size=10.0,
+                ask_size=10.0,
+                funding_rate_bps=float(venue_index),
+                funding_rate_observed_at_ms=1_000,
+                funding_rate_event_at_ms=1_000,
+                funding_rate_received_at_ms=1_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=(
+                    f"funding:{venue}:{symbol}:1000:{float(venue_index):.17g}:100000"
+                ),
+                funding_timestamp_ms=100_000,
+                funding_interval_ms=28_800_000,
+                observed_at_ms=1_000,
+                underlying=symbol.removesuffix("USDT"),
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="venue_mark_index",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+    fee_evidence = FeeEvidenceBook(
+        schedules={
+            venue: FeeScheduleEvidence(
+                venue=venue,
+                taker_fee_bps=1.0,
+                maker_fee_bps=0.5,
+                observed_at_ms=1_000,
+                source="account_fee_api",
+                evidence_ref=f"test:{venue}",
+                covered_symbols=("COVEREDUSDT",),
+            )
+            for venue in venues
+        },
+        reason="",
+        schema_version=LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
+        local_file_verified=True,
+    )
+    kwargs = {
+        "strategy": StrategyConfig(
+            funding_canary_enabled=True,
+            funding_canary_require_account_fee_evidence=False,
+            funding_canary_conservative_fee_buffer_bps=2.0,
+            funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+        ),
+        "venue_fee_bps": {venue: 1.0 for venue in venues},
+        "venue_maker_fee_bps": {venue: 0.5 for venue in venues},
+        "fee_evidence": fee_evidence,
+        "expected_fee_identity_hashes": {},
+        "passive_execution_enabled": True,
+        "observed_at_ms": 1_000,
+    }
+
+    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
+    diagnostics: dict[str, object] = {}
+    started = time.perf_counter()
+    bounded = build_same_symbol_pairs(
+        quotes,
+        symbols,
+        max_candidates=32,
+        diagnostics=diagnostics,
+        **kwargs,
+    )
+    elapsed_s = time.perf_counter() - started
+    full_top32 = [row for row in full if not row.blocked and row.economics_complete][
+        :32
+    ]
+
+    assert len(bounded) == len(full_top32) == 32
+    assert all(not row.blocked and row.economics_complete for row in bounded)
+    assert [row.pair_id for row in bounded] == [row.pair_id for row in full_top32]
+    assert [row.ranking_edge_bps for row in bounded] == pytest.approx(
+        [row.ranking_edge_bps for row in full_top32]
+    )
+    assert all(
+        row.funding_canary_fee_assurance_tier == "conservative" for row in bounded
+    )
+    assert diagnostics["seed_frontier_complete"] is True
+    assert diagnostics["seed_frontier_count"] <= 64
+    assert elapsed_s <= 0.5
+
+
+def test_bounded_canary_frontier_excludes_final_quantity_below_pair_minimum() -> None:
+    def quote(
+        *,
+        venue: str,
+        symbol: str,
+        funding_rate_bps: float,
+        depth_quantity: float,
+        min_quantity_base: float,
+        min_notional_quote: float,
+    ) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            venue=venue,
+            symbol=symbol,
+            bid=0.999,
+            ask=1.001,
+            bid_size=depth_quantity,
+            ask_size=depth_quantity,
+            funding_rate_bps=funding_rate_bps,
+            funding_rate_observed_at_ms=1_000,
+            funding_rate_event_at_ms=1_000,
+            funding_rate_received_at_ms=1_000,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:{venue}:{symbol}:1000:{funding_rate_bps:.17g}:100000"
+            ),
+            funding_timestamp_ms=100_000,
+            funding_interval_ms=28_800_000,
+            observed_at_ms=1_000,
+            underlying=symbol.removesuffix("USDT"),
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=3,
+            quantity_precision=3,
+            price_tick=0.001,
+            quantity_step_base=0.001,
+            min_quantity_base=min_quantity_base,
+            min_notional_quote=min_notional_quote,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
+
+    quotes = {
+        "long:THINUSDT": quote(
+            venue="long",
+            symbol="THINUSDT",
+            funding_rate_bps=0.0,
+            depth_quantity=1.0,
+            min_quantity_base=10.0,
+            min_notional_quote=5.0,
+        ),
+        "short:THINUSDT": quote(
+            venue="short",
+            symbol="THINUSDT",
+            funding_rate_bps=20.0,
+            depth_quantity=1.0,
+            min_quantity_base=10.0,
+            min_notional_quote=5.0,
+        ),
+        "long:GOODUSDT": quote(
+            venue="long",
+            symbol="GOODUSDT",
+            funding_rate_bps=0.0,
+            depth_quantity=100.0,
+            min_quantity_base=1.0,
+            min_notional_quote=1.0,
+        ),
+        "short:GOODUSDT": quote(
+            venue="short",
+            symbol="GOODUSDT",
+            funding_rate_bps=10.0,
+            depth_quantity=100.0,
+            min_quantity_base=1.0,
+            min_notional_quote=1.0,
+        ),
+    }
+    kwargs = {
+        "strategy": StrategyConfig(
+            funding_canary_enabled=True,
+            funding_canary_require_account_fee_evidence=False,
+            funding_canary_conservative_fee_buffer_bps=2.0,
+            funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+        ),
+        "venue_fee_bps": {"long": 1.0, "short": 1.0},
+        "observed_at_ms": 1_000,
+    }
+
+    full = build_same_symbol_pairs(
+        quotes,
+        ["THINUSDT", "GOODUSDT"],
+        **kwargs,
+    )
+    thin = next(row for row in full if row.symbol == "THINUSDT")
+    full_top1 = [row for row in full if not row.blocked and row.economics_complete][
+        :1
+    ]
+    diagnostics: dict[str, object] = {}
+    bounded = build_same_symbol_pairs(
+        quotes,
+        ["THINUSDT", "GOODUSDT"],
+        max_candidates=1,
+        diagnostics=diagnostics,
+        **kwargs,
+    )
+    bounded_viable = [
+        row for row in bounded if not row.blocked and row.economics_complete
+    ]
+
+    assert thin.blocked is True
+    assert thin.economics_complete is False
+    assert "entry_pair_minimum_not_met" in thin.blocked_reasons
+    assert [row.pair_id for row in bounded_viable] == [
+        row.pair_id for row in full_top1
+    ]
+    assert [row.symbol for row in bounded_viable] == ["GOODUSDT"]
+    assert diagnostics["seed_frontier_complete"] is True
 
 
 def test_bounded_candidate_build_fails_closed_at_exact_work_budget() -> None:
@@ -2269,7 +2492,33 @@ def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
     )
 
     uncovered_quotes = {
-        key.replace("BTCUSDT", "SOLUSDT"): replace(quote, symbol="SOLUSDT")
+        key.replace("BTCUSDT", "SOLUSDT"): replace(
+            quote,
+            symbol="SOLUSDT",
+            observed_at_ms=1_000,
+            funding_rate_observed_at_ms=1_000,
+            funding_rate_event_at_ms=1_000,
+            funding_rate_received_at_ms=1_000,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:{quote.venue}:SOLUSDT:1000:"
+                f"{float(quote.funding_rate_bps):.17g}:1000000"
+            ),
+            underlying="SOL",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
         for key, quote in quotes.items()
     }
     uncovered_candidate = build_same_symbol_pairs(
@@ -2289,10 +2538,35 @@ def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
     )[0]
 
     assert uncovered_candidate.account_fee_evidence_complete is False
+    assert uncovered_candidate.blocked is False
+    assert uncovered_candidate.economics_complete is True
+    assert "account_fee_symbol_coverage_missing" not in uncovered_candidate.blocked_reasons
+    assert uncovered_candidate.funding_canary_fee_assurance_tier == "conservative"
+    assert uncovered_candidate.funding_canary_hard_max_entry_notional_quote == 15.0
+    assert uncovered_candidate.entry_max_leg_notional_quote <= 15.0 + 1e-9
     assert uncovered_candidate.long_taker_fee_bps == pytest.approx(3.0)
     assert uncovered_candidate.short_taker_fee_bps == pytest.approx(3.0)
     assert uncovered_candidate.entry_fee_bps == pytest.approx(6.0)
     assert uncovered_candidate.exit_fee_bps == pytest.approx(6.0)
+
+    strict_candidate = build_same_symbol_pairs(
+        uncovered_quotes,
+        ["SOLUSDT"],
+        strategy=StrategyConfig(
+            funding_canary_enabled=True,
+            funding_canary_require_account_fee_evidence=True,
+        ),
+        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
+        venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},
+        fee_evidence=local_evidence,
+        expected_fee_identity_hashes={},
+        passive_execution_enabled=True,
+        observed_at_ms=1_100,
+    )[0]
+
+    assert strict_candidate.blocked is True
+    assert strict_candidate.economics_complete is False
+    assert "account_fee_symbol_coverage_missing" in strict_candidate.blocked_reasons
 
 
 def test_risk_allocator_returns_one_common_base_quantity_and_falls_back_on_missing_margin() -> None:

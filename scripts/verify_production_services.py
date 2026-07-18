@@ -87,6 +87,15 @@ def _funding_entry_snapshot_report(
         except (TypeError, ValueError):
             return default
 
+    def _diagnostic_int(name: str) -> int:
+        value = candidate_diagnostics.get(name, 0)
+        if isinstance(value, bool):
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     fingerprints: list[str] = []
     manifest_path = funding_entry_snapshot_manifest_path(path)
     manifest: dict = {}
@@ -132,6 +141,15 @@ def _funding_entry_snapshot_report(
         getattr(snapshot, "candidate_build_diagnostics", {}) or {}
     )
     source_data_ready = candidate_diagnostics.get("source_data_ready") is True
+    seed_frontier_complete = (
+        candidate_diagnostics.get("seed_frontier_complete") is True
+    )
+    entry_frontier_ready = source_data_ready and seed_frontier_complete
+    seed_frontier_count = _diagnostic_int("seed_frontier_count")
+    seed_pair_count = _diagnostic_int("seed_pair_count")
+    seed_frontier_stop_reason = str(
+        candidate_diagnostics.get("seed_frontier_stop_reason", "") or ""
+    )
     if payload_size < 0 or payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
         fingerprints.append("funding_entry_payload_size_invalid")
     if (
@@ -146,15 +164,46 @@ def _funding_entry_snapshot_report(
         for candidate in candidates
     ):
         fingerprints.append("funding_entry_candidate_not_executable")
+    candidate_venues = {
+        str(venue or "").strip().lower()
+        for candidate in candidates
+        for venue in (
+            getattr(candidate, "long_venue", ""),
+            getattr(candidate, "short_venue", ""),
+        )
+        if str(venue or "").strip()
+    }
+    degraded_venues = {
+        str(venue or "").strip().lower()
+        for venue in (getattr(snapshot, "degraded_venues", []) or [])
+        if str(venue or "").strip()
+    }
+    degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
+    symbol_degraded_venues = {
+        str(venue or "").strip().lower()
+        for venue, symbols in (
+            degraded_symbols.items() if isinstance(degraded_symbols, dict) else []
+        )
+        if str(venue or "").strip() and symbols
+    }
+    scoped_degraded_venues = degraded_venues | symbol_degraded_venues
+    unscoped_degradation = bool(
+        not scoped_degraded_venues
+        and (
+            getattr(snapshot, "degraded_domains", [])
+            or (degraded_symbols and not isinstance(degraded_symbols, dict))
+        )
+    )
     if candidates and (
         str(getattr(snapshot, "acquisition_mode", "") or "") != "fresh_sidecar"
-        or bool(getattr(snapshot, "degraded_venues", []))
-        or bool(getattr(snapshot, "degraded_domains", []))
-        or bool(getattr(snapshot, "degraded_symbols", {}))
+        or bool(candidate_venues & scoped_degraded_venues)
+        or unscoped_degradation
     ):
         fingerprints.append("funding_entry_candidate_evidence_degraded")
     if not candidates and not source_data_ready:
         fingerprints.append("funding_entry_source_data_unavailable")
+    if not seed_frontier_complete:
+        fingerprints.append("funding_entry_frontier_incomplete")
 
     return HealthReport(
         name="sidecar_snapshot",
@@ -174,6 +223,11 @@ def _funding_entry_snapshot_report(
             "quote_count": len(quotes),
             "diagnostics_only": not bool(candidates),
             "source_data_ready": source_data_ready,
+            "seed_frontier_complete": seed_frontier_complete,
+            "entry_frontier_ready": entry_frontier_ready,
+            "seed_frontier_count": seed_frontier_count,
+            "seed_pair_count": seed_pair_count,
+            "seed_frontier_stop_reason": seed_frontier_stop_reason,
         },
     )
 

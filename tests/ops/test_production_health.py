@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from lightfee.ops.production_health import (
     analyze_current_state,
     analyze_resolver_config,
@@ -239,7 +241,14 @@ def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generati
         degraded_venues=["binance"],
         degraded_domains=["funding", "market", "liquidity"],
         degraded_symbols={},
-        candidate_build_diagnostics={"source_data_ready": True},
+        candidate_build_diagnostics={
+            "source_data_ready": True,
+            "seed_frontier_complete": True,
+            "entry_frontier_ready": True,
+            "seed_frontier_count": 0,
+            "seed_pair_count": 0,
+            "seed_frontier_stop_reason": "empty_seed_set",
+        },
     )
 
     monkeypatch.setattr(vps, "_read_json", lambda _path: next(manifests))
@@ -258,6 +267,128 @@ def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generati
 
     assert report.ok
     assert report.details["generation_id"] == "generation-2"
+
+
+@pytest.mark.parametrize("frontier_value", [None, False])
+def test_funding_entry_health_rejects_incomplete_frontier_with_ready_source_data(
+    monkeypatch,
+    tmp_path,
+    frontier_value,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    diagnostics = {
+        "source_data_ready": True,
+        "seed_frontier_count": 64,
+        "seed_pair_count": 4_811,
+        "seed_frontier_stop_reason": "exact_frontier_limit_reached",
+    }
+    if frontier_value is not None:
+        diagnostics["seed_frontier_complete"] = frontier_value
+    snapshot = SimpleNamespace(
+        ready_at_ms=now_ms,
+        candidates=[],
+        quotes={},
+        acquisition_mode="unavailable",
+        degraded_venues=[],
+        degraded_domains=[],
+        degraded_symbols={},
+        candidate_build_diagnostics=diagnostics,
+    )
+    monkeypatch.setattr(
+        vps,
+        "_read_json",
+        lambda _path: {
+            "generation_id": "generation-1",
+            "payload_size_bytes": 100,
+            "candidate_count": 0,
+            "quote_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        vps,
+        "funding_entry_snapshot_identity",
+        lambda _path, *, verify_digest: ("generation-1", 1, 100),
+    )
+    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
+
+    report = vps._funding_entry_snapshot_report(
+        tmp_path / "opportunity-input-snapshot.json",
+        now_ms=now_ms,
+        max_age_ms=1_000,
+    )
+
+    assert report.ok is False
+    assert "funding_entry_frontier_incomplete" in report.fingerprints
+    assert report.details["source_data_ready"] is True
+    assert report.details["entry_frontier_ready"] is False
+    assert report.details["seed_frontier_count"] == 64
+    assert report.details["seed_pair_count"] == 4_811
+    assert report.details["seed_frontier_stop_reason"] == "exact_frontier_limit_reached"
+
+
+@pytest.mark.parametrize(
+    ("degraded_venues", "degraded_symbols"),
+    [
+        (["okx"], {}),
+        ([], {"okx": ["TRXUSDT"]}),
+    ],
+)
+def test_funding_entry_health_allows_complete_candidate_with_unrelated_degradation(
+    monkeypatch,
+    tmp_path,
+    degraded_venues,
+    degraded_symbols,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    snapshot = SimpleNamespace(
+        ready_at_ms=now_ms,
+        candidates=[
+            SimpleNamespace(
+                long_venue="binance",
+                short_venue="bybit",
+                blocked=False,
+                economics_complete=True,
+            )
+        ],
+        quotes={},
+        acquisition_mode="fresh_sidecar",
+        degraded_venues=degraded_venues,
+        degraded_domains=["market"],
+        degraded_symbols=degraded_symbols,
+        candidate_build_diagnostics={
+            "source_data_ready": True,
+            "seed_frontier_complete": True,
+            "entry_frontier_ready": True,
+            "seed_frontier_count": 32,
+            "seed_pair_count": 200,
+            "seed_frontier_stop_reason": "remaining_upper_bounds_dominated",
+        },
+    )
+    monkeypatch.setattr(
+        vps,
+        "_read_json",
+        lambda _path: {
+            "generation_id": "generation-1",
+            "payload_size_bytes": 100,
+            "candidate_count": 1,
+            "quote_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        vps,
+        "funding_entry_snapshot_identity",
+        lambda _path, *, verify_digest: ("generation-1", 1, 100),
+    )
+    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
+
+    report = vps._funding_entry_snapshot_report(
+        tmp_path / "opportunity-input-snapshot.json",
+        now_ms=now_ms,
+        max_age_ms=1_000,
+    )
+
+    assert report.ok is True
+    assert "funding_entry_candidate_evidence_degraded" not in report.fingerprints
 
 
 def _complete_unblocked_candidate() -> dict:
