@@ -12,6 +12,7 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.marketdata.ws_bbo import (
     HyperliquidBboWsClient,
+    RestTopBookQuoteRefresher,
     TopBookQuote,
     VenueBboCache,
 )
@@ -35,11 +36,19 @@ class HyperliquidSpreadBboSource:
 
     venue = "hyperliquid"
 
-    def __init__(self, *, max_age_ms: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_age_ms: int,
+        rest_fallback: RestTopBookQuoteRefresher | None = None,
+    ) -> None:
         self.max_age_ms = max(int(max_age_ms or 0), 1)
         self._cache = VenueBboCache()
         self._clients: dict[str, HyperliquidBboWsClient] = {}
         self._spec = get_spec(Venue.HYPERLIQUID)
+        self._rest_fallback = rest_fallback or RestTopBookQuoteRefresher(
+            timeout_ms=min(self.max_age_ms, 750),
+        )
 
     def _new_client(self, symbol: str) -> HyperliquidBboWsClient:
         canonical = str(symbol or "").strip().upper()
@@ -68,10 +77,14 @@ class HyperliquidSpreadBboSource:
     ) -> dict[str, TopBookQuote]:
         now_ms = int(time.time() * 1000)
         quotes: dict[str, TopBookQuote] = {}
+        fallback_symbols: list[str] = []
         for raw_symbol in symbols:
             symbol = str(raw_symbol or "").strip().upper()
             quote = self._cache.get_quote(self.venue, symbol)
             if quote is None:
+                client = self._clients.get(symbol)
+                if client is not None and client.is_connected:
+                    fallback_symbols.append(symbol)
                 continue
             received_at_ms = int(quote.received_at_ms or 0)
             if (
@@ -79,6 +92,9 @@ class HyperliquidSpreadBboSource:
                 or received_at_ms > now_ms
                 or now_ms - received_at_ms > self.max_age_ms
             ):
+                client = self._clients.get(symbol)
+                if client is not None and client.is_connected:
+                    fallback_symbols.append(symbol)
                 continue
             # The spread producer contract uses the local receipt timestamp as
             # its anti-skew decision clock. The exchange event timestamp stays
@@ -91,18 +107,70 @@ class HyperliquidSpreadBboSource:
                     quote.exchange_event_at_ms or quote.observed_at_ms or 0
                 ),
             )
+        if fallback_symbols:
+            results = await asyncio.gather(
+                *(
+                    self._rest_fallback.arefresh_quote_result(
+                        self.venue,
+                        symbol,
+                        now_ms=now_ms,
+                    )
+                    for symbol in fallback_symbols
+                )
+            )
+            received_now_ms = int(time.time() * 1000)
+            for symbol, result in zip(fallback_symbols, results, strict=True):
+                quote = result.quote
+                received_at_ms = int(getattr(quote, "received_at_ms", 0) or 0)
+                if (
+                    quote is None
+                    or str(quote.venue or "").strip().lower() != self.venue
+                    or str(quote.symbol or "").strip().upper() != symbol
+                    or received_at_ms <= 0
+                    or received_at_ms > received_now_ms
+                    or received_now_ms - received_at_ms > self.max_age_ms
+                ):
+                    continue
+                normalized = replace(
+                    quote,
+                    observed_at_ms=received_at_ms,
+                    received_at_ms=received_at_ms,
+                )
+                self._cache.update_quote(
+                    normalized,
+                    now_ms=received_now_ms,
+                    current_max_age_ms=self.max_age_ms,
+                )
+                quotes[f"{self.venue}:{symbol}"] = normalized
         return quotes
 
     async def close(self) -> None:
         clients = list(self._clients.items())
-        if not clients:
-            return
         results = await asyncio.gather(
+            self._rest_fallback.aclose(),
             *(client.stop() for _symbol, client in clients),
             return_exceptions=True,
         )
         failures: list[Exception] = []
-        for (symbol, client), result in zip(clients, results, strict=True):
+        fallback_result, *client_results = results
+        if isinstance(fallback_result, BaseException):
+            failure = (
+                fallback_result
+                if isinstance(fallback_result, Exception)
+                else RuntimeError(
+                    f"{type(fallback_result).__name__}: {fallback_result}"
+                )
+            )
+            failures.append(failure)
+            logger.error(
+                "Hyperliquid spread BBO REST fallback close failed",
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+        for (symbol, client), result in zip(
+            clients,
+            client_results,
+            strict=True,
+        ):
             if isinstance(result, BaseException):
                 failure = (
                     result

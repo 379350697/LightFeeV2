@@ -8,7 +8,7 @@ import time
 import pytest
 
 from lightfee.config.schema import AppConfig, VenueConfig
-from lightfee.marketdata.ws_bbo import TopBookQuote
+from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult, TopBookQuote
 from lightfee.sidecar.service import SidecarService
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.spread_bbo import SpreadBboDataPlane
@@ -326,6 +326,68 @@ async def test_hyperliquid_ws_source_rejects_stale_cached_quote() -> None:
     )
 
     assert await source.fetch_spread_bbo(["BTCUSDT"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_refreshes_connected_stale_quote_via_rest() -> None:
+    now_ms = int(time.time() * 1000)
+    refreshed = TopBookQuote(
+        venue="hyperliquid",
+        symbol="BTCUSDT",
+        bid=99.5,
+        ask=100.5,
+        bid_size=4.0,
+        ask_size=5.0,
+        observed_at_ms=now_ms,
+        received_at_ms=now_ms,
+        exchange_event_at_ms=now_ms - 10,
+        source="hyperliquid_rest_top_book",
+    )
+
+    class ConnectedClient:
+        is_connected = True
+
+    class RestFallback:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        async def arefresh_quote_result(self, venue, symbol, *, now_ms):
+            self.calls.append((venue, symbol, now_ms))
+            return RestTopBookQuoteResult(
+                venue=venue,
+                symbol=symbol,
+                outcome="resolved",
+                quote=refreshed,
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    fallback = RestFallback()
+    source = HyperliquidSpreadBboSource(
+        max_age_ms=100,
+        rest_fallback=fallback,
+    )
+    source._clients["BTCUSDT"] = ConnectedClient()
+    assert source._cache.update_quote(
+        TopBookQuote(
+            venue="hyperliquid",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=101.0,
+            observed_at_ms=now_ms - 500,
+            received_at_ms=now_ms - 500,
+            source="hyperliquid_bbo",
+        )
+    )
+
+    quotes = await source.fetch_spread_bbo(["BTCUSDT"])
+
+    assert len(fallback.calls) == 1
+    assert fallback.calls[0][:2] == ("hyperliquid", "BTCUSDT")
+    assert now_ms <= fallback.calls[0][2] <= int(time.time() * 1000)
+    assert quotes == {"hyperliquid:BTCUSDT": refreshed}
+    assert source._cache.get_quote("hyperliquid", "BTCUSDT") == refreshed
 
 
 @pytest.mark.asyncio
