@@ -10594,6 +10594,8 @@ def main() -> None:
                        help="Comma-separated venues for exchange-truth checks")
     parser.add_argument("--since-deploy", action="store_true", default=False,
                        help="Limit to events since last deploy")
+    parser.add_argument("--require-gate-pass", action="store_true", default=False,
+                       help="Exit nonzero when the production acceptance gate does not pass")
     parser.add_argument("--runtime-dir", type=str, default=DEFAULT_RUNTIME_DIR,
                        help="Runtime directory (default: {})".format(DEFAULT_RUNTIME_DIR))
     parser.add_argument("--current-state", type=str, default="",
@@ -10652,6 +10654,10 @@ def main() -> None:
         sys.stdout.write("\n")
     else:
         _print_summary(result)
+    if args.require_gate_pass and result.get("production_acceptance_gate", {}).get(
+        "gate_passed"
+    ) is not True:
+        raise SystemExit(1)
 
 
 def _print_summary(result: dict[str, Any]) -> None:

@@ -363,7 +363,7 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
     env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy
     exit 1
   fi
-  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy
+  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy --require-gate-pass
 
   echo "=== Deploy complete: $DEPLOY_VERSION ==="
   exit 0
@@ -398,7 +398,7 @@ if ! verify_remote_production_health; then
   ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
   exit 1
 fi
-ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy --require-gate-pass"
 
 echo "=== Deploy complete: $DEPLOY_VERSION ==="
 """

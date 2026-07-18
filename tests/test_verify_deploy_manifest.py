@@ -92,6 +92,9 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
         'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy'
         in script
     )
+    assert script.count(
+        "scripts/diagnose_live.py --json --since-deploy --require-gate-pass"
+    ) == 2
     assert (
         "env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"
         in script

@@ -84,7 +84,7 @@ def _fresh_seven_venue_snapshot() -> dict:
     }
 
 
-def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
+def test_funding_entry_health_rejects_empty_generation_when_source_data_is_degraded(
     tmp_path,
 ) -> None:
     from lightfee.sidecar.publisher import (
@@ -178,7 +178,8 @@ def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
         max_age_ms=1_000,
     )
 
-    assert report.ok
+    assert not report.ok
+    assert "funding_entry_source_data_unavailable" in report.fingerprints
     assert report.name == "sidecar_snapshot"
     assert report.details["data_plane"] == "funding_entry_v6"
     assert report.details["candidate_count"] == 0
@@ -189,7 +190,11 @@ def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
         now_ms=report.details["ready_at_ms"] - 500,
         max_age_ms=1_000,
     )
-    assert concurrent_publish_report.ok
+    assert not concurrent_publish_report.ok
+    assert (
+        "funding_entry_source_data_unavailable"
+        in concurrent_publish_report.fingerprints
+    )
 
     manifest_path = vps.funding_entry_snapshot_manifest_path(path)
     manifest = json.loads(manifest_path.read_text())
@@ -203,6 +208,56 @@ def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
     )
     assert not malformed_report.ok
     assert "funding_entry_manifest_count_mismatch" in malformed_report.fingerprints
+
+
+def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    manifests = iter(
+        [
+            {
+                "generation_id": "generation-1",
+                "payload_size_bytes": 100,
+                "candidate_count": 1,
+                "quote_count": 0,
+            },
+            {
+                "generation_id": "generation-2",
+                "payload_size_bytes": 100,
+                "candidate_count": 0,
+                "quote_count": 0,
+            },
+        ]
+    )
+    snapshot = SimpleNamespace(
+        ready_at_ms=now_ms,
+        candidates=[],
+        quotes={},
+        acquisition_mode="unavailable",
+        degraded_venues=["binance"],
+        degraded_domains=["funding", "market", "liquidity"],
+        degraded_symbols={},
+        candidate_build_diagnostics={"source_data_ready": True},
+    )
+
+    monkeypatch.setattr(vps, "_read_json", lambda _path: next(manifests))
+    monkeypatch.setattr(
+        vps,
+        "funding_entry_snapshot_identity",
+        lambda _path, *, verify_digest: ("generation-2", 1, 100),
+    )
+    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
+
+    report = vps._funding_entry_snapshot_report(
+        tmp_path / "opportunity-input-snapshot.json",
+        now_ms=now_ms,
+        max_age_ms=1_000,
+    )
+
+    assert report.ok
+    assert report.details["generation_id"] == "generation-2"
 
 
 def _complete_unblocked_candidate() -> dict:

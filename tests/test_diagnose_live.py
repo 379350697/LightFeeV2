@@ -202,7 +202,11 @@ def test_main_profile_gate_outputs_minimal_gate_report(monkeypatch, capsys):
         }
 
     monkeypatch.setattr(diagnose_live, "run_diagnose", fake_run_diagnose)
-    monkeypatch.setattr(sys, "argv", ["diagnose_live.py", "--profile", "gate"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["diagnose_live.py", "--profile", "gate", "--require-gate-pass"],
+    )
 
     diagnose_live.main()
 
@@ -233,6 +237,34 @@ def test_main_profile_gate_outputs_minimal_gate_report(monkeypatch, capsys):
             "blocking_reasons": [],
             "fingerprints": [],
         }
+
+
+def test_main_require_gate_pass_exits_nonzero_after_rendering_failed_gate(
+    monkeypatch,
+    capsys,
+):
+    import scripts.diagnose_live as diagnose_live
+
+    monkeypatch.setattr(
+        diagnose_live,
+        "run_diagnose",
+        lambda **_kwargs: {
+            "production_acceptance_gate": {"gate_passed": False},
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["diagnose_live.py", "--require-gate-pass"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        diagnose_live.main()
+
+    assert exc_info.value.code == 1
+    assert json.loads(capsys.readouterr().out)["production_acceptance_gate"] == {
+        "gate_passed": False,
+    }
 
 
 def test_run_diagnose_reports_spread_sidecar_snapshot_source():

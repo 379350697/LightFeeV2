@@ -89,12 +89,28 @@ def _funding_entry_snapshot_report(
 
     fingerprints: list[str] = []
     manifest_path = funding_entry_snapshot_manifest_path(path)
-    try:
-        manifest = _read_json(str(manifest_path))
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        manifest = {}
-    identity = funding_entry_snapshot_identity(path, verify_digest=True)
-    snapshot = load_funding_entry_snapshot(path)
+    manifest: dict = {}
+    identity = None
+    snapshot = None
+    for _attempt in range(2):
+        try:
+            candidate_manifest = _read_json(str(manifest_path))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        identity_before = funding_entry_snapshot_identity(path, verify_digest=True)
+        candidate_snapshot = load_funding_entry_snapshot(path)
+        identity_after = funding_entry_snapshot_identity(path, verify_digest=True)
+        if (
+            identity_before is not None
+            and identity_before == identity_after
+            and candidate_snapshot is not None
+            and str(candidate_manifest.get("generation_id", "") or "")
+            == identity_before[0]
+        ):
+            manifest = candidate_manifest
+            identity = identity_before
+            snapshot = candidate_snapshot
+            break
     if identity is None or snapshot is None or not manifest:
         fingerprints.append("funding_entry_generation_missing_or_invalid")
 
@@ -112,6 +128,10 @@ def _funding_entry_snapshot_report(
     manifest_quote_count = _manifest_int("quote_count")
     candidates = list(getattr(snapshot, "candidates", []) or [])
     quotes = dict(getattr(snapshot, "quotes", {}) or {})
+    candidate_diagnostics = dict(
+        getattr(snapshot, "candidate_build_diagnostics", {}) or {}
+    )
+    source_data_ready = candidate_diagnostics.get("source_data_ready") is True
     if payload_size < 0 or payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
         fingerprints.append("funding_entry_payload_size_invalid")
     if (
@@ -133,6 +153,8 @@ def _funding_entry_snapshot_report(
         or bool(getattr(snapshot, "degraded_symbols", {}))
     ):
         fingerprints.append("funding_entry_candidate_evidence_degraded")
+    if not candidates and not source_data_ready:
+        fingerprints.append("funding_entry_source_data_unavailable")
 
     return HealthReport(
         name="sidecar_snapshot",
@@ -151,6 +173,7 @@ def _funding_entry_snapshot_report(
             "candidate_limit": FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
             "quote_count": len(quotes),
             "diagnostics_only": not bool(candidates),
+            "source_data_ready": source_data_ready,
         },
     )
 
