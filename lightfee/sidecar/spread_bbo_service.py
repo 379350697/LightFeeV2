@@ -43,12 +43,14 @@ class HyperliquidSpreadBboSource:
         rest_fallback: RestTopBookQuoteRefresher | None = None,
     ) -> None:
         self.max_age_ms = max(int(max_age_ms or 0), 1)
+        self.refresh_age_ms = max(self.max_age_ms * 3 // 4, 1)
         self._cache = VenueBboCache()
         self._clients: dict[str, HyperliquidBboWsClient] = {}
         self._spec = get_spec(Venue.HYPERLIQUID)
         self._rest_fallback = rest_fallback or RestTopBookQuoteRefresher(
             timeout_ms=min(self.max_age_ms, 750),
             venue_async_concurrency=RestTopBookQuoteRefresher.GLOBAL_ASYNC_CONCURRENCY,
+            min_attempt_interval_ms=max(min(self.max_age_ms // 4, 250), 50),
         )
 
     def _new_client(self, symbol: str) -> HyperliquidBboWsClient:
@@ -108,6 +110,14 @@ class HyperliquidSpreadBboSource:
                     quote.exchange_event_at_ms or quote.observed_at_ms or 0
                 ),
             )
+            if (
+                now_ms - received_at_ms >= self.refresh_age_ms
+                and symbol in self._clients
+            ):
+                # Refresh before the execution TTL expires. A transient REST
+                # failure still leaves the current WS quote usable for this
+                # generation and gets another bounded attempt next cycle.
+                fallback_symbols.append(symbol)
         if fallback_symbols:
             results = await asyncio.gather(
                 *(

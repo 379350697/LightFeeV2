@@ -84,6 +84,120 @@ def _fresh_seven_venue_snapshot() -> dict:
     }
 
 
+def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
+    tmp_path,
+) -> None:
+    from lightfee.sidecar.publisher import (
+        publish_funding_entry_snapshot,
+    )
+    from lightfee.sidecar.snapshot import (
+        FundingLifecycle,
+        LiquidityLifecycle,
+        MarketLifecycle,
+        SidecarSnapshot,
+    )
+
+    now_ms = int(time.time() * 1000)
+    path = tmp_path / "opportunity-input-snapshot.json"
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms - 120_000,
+        market_observed_at_ms=now_ms - 121_000,
+        candidate_build_observed_at_ms=now_ms - 120_500,
+        candidate_build_diagnostics={
+            "input_quote_count": 0,
+            "requested_symbol_count": 1,
+            "requested_symbols": ["BTCUSDT"],
+            "requested_venues": [
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "okx",
+            ],
+            "directional_pair_count": 0,
+            "output_candidate_count": 0,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+        },
+        funding_lifecycle=[
+            FundingLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
+            for venue in (
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "okx",
+            )
+        ],
+        market_lifecycle=[
+            MarketLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
+            for venue in (
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "okx",
+            )
+        ],
+        liquidity_lifecycle=[
+            LiquidityLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
+            for venue in (
+                "aster",
+                "binance",
+                "bitget",
+                "bybit",
+                "gate",
+                "hyperliquid",
+                "okx",
+            )
+        ],
+        degraded_venues=[
+            "aster",
+            "binance",
+            "bitget",
+            "bybit",
+            "gate",
+            "hyperliquid",
+            "okx",
+        ],
+        degraded_domains=["funding", "market", "liquidity"],
+        source_mode="direct_market",
+        acquisition_mode="fresh_sidecar",
+    )
+    publish_funding_entry_snapshot(snapshot, path)
+
+    report = vps._funding_entry_snapshot_report(
+        path,
+        now_ms=int(time.time() * 1000),
+        max_age_ms=1_000,
+    )
+
+    assert report.ok
+    assert report.name == "sidecar_snapshot"
+    assert report.details["data_plane"] == "funding_entry_v6"
+    assert report.details["candidate_count"] == 0
+    assert report.details["quote_count"] == 0
+
+    manifest_path = vps.funding_entry_snapshot_manifest_path(path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["candidate_count"] = "invalid"
+    manifest_path.write_text(json.dumps(manifest))
+
+    malformed_report = vps._funding_entry_snapshot_report(
+        path,
+        now_ms=int(time.time() * 1000),
+        max_age_ms=1_000,
+    )
+    assert not malformed_report.ok
+    assert "funding_entry_manifest_count_mismatch" in malformed_report.fingerprints
+
+
 def _complete_unblocked_candidate() -> dict:
     return {
         "long_venue": "binance",

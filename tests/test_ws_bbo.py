@@ -736,6 +736,55 @@ def test_rest_top_book_refresher_reports_structured_resolved_and_throttled_resul
     assert throttled.quote is None
 
 
+def test_rest_top_book_refresher_allows_a_shorter_explicit_attempt_interval():
+    import httpx
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher
+
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "time": 1_000,
+                "levels": [
+                    [{"px": "99.0", "sz": "2"}],
+                    [{"px": "101.0", "sz": "3"}],
+                ],
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    refresher = RestTopBookQuoteRefresher(
+        client=client,
+        timeout_ms=250,
+        min_attempt_interval_ms=250,
+    )
+
+    first = refresher.refresh_quote_result(
+        "hyperliquid",
+        "BTCUSDT",
+        now_ms=1_000,
+    )
+    throttled = refresher.refresh_quote_result(
+        "hyperliquid",
+        "BTCUSDT",
+        now_ms=1_249,
+    )
+    retried = refresher.refresh_quote_result(
+        "hyperliquid",
+        "BTCUSDT",
+        now_ms=1_250,
+    )
+
+    assert first.outcome == "resolved"
+    assert throttled.outcome == "throttled"
+    assert retried.outcome == "resolved"
+    assert request_count == 2
+
+
 @pytest.mark.asyncio
 async def test_rest_top_book_refresher_async_path_uses_shared_async_client():
     import httpx

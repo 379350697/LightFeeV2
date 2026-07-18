@@ -393,6 +393,57 @@ async def test_hyperliquid_ws_source_refreshes_started_stale_quote_via_rest(
     assert source._cache.get_quote("hyperliquid", "BTCUSDT") == refreshed
 
 
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_source_prewarms_before_ttl_and_keeps_fresh_cache_on_error(
+) -> None:
+    now_ms = int(time.time() * 1000)
+
+    class ConnectedClient:
+        is_connected = True
+
+        async def stop(self) -> None:
+            return None
+
+    class FailedRestFallback:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, int]] = []
+
+        async def arefresh_quote_result(self, venue, symbol, *, now_ms):
+            self.calls.append((venue, symbol, now_ms))
+            return RestTopBookQuoteResult(
+                venue=venue,
+                symbol=symbol,
+                outcome="transport_failure",
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    fallback = FailedRestFallback()
+    source = HyperliquidSpreadBboSource(
+        max_age_ms=1_000,
+        rest_fallback=fallback,
+    )
+    source._clients["BTCUSDT"] = ConnectedClient()
+    assert source._cache.update_quote(
+        TopBookQuote(
+            venue="hyperliquid",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=101.0,
+            received_at_ms=now_ms - 800,
+            observed_at_ms=now_ms - 800,
+            source="hyperliquid_bbo",
+        )
+    )
+
+    quotes = await source.fetch_spread_bbo(["BTCUSDT"])
+
+    assert len(fallback.calls) == 1
+    assert quotes["hyperliquid:BTCUSDT"].received_at_ms == now_ms - 800
+    await source.close()
+
+
 def test_hyperliquid_ws_source_uses_bounded_parallel_rest_fallback() -> None:
     source = HyperliquidSpreadBboSource(max_age_ms=1_000)
 

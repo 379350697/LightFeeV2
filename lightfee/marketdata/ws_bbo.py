@@ -215,12 +215,18 @@ class RestTopBookQuoteRefresher:
         async_client: httpx.AsyncClient | None = None,
         timeout_ms: int = 750,
         venue_async_concurrency: int | None = None,
+        min_attempt_interval_ms: int | None = None,
     ) -> None:
         self._client = client
         self._owns_client = client is None
         self._async_client = async_client
         self._owns_async_client = async_client is None
         self._timeout_s = max(min(int(timeout_ms or 750), 1_000), 100) / 1000.0
+        self._min_attempt_interval_ms = (
+            self.MIN_ATTEMPT_INTERVAL_MS
+            if min_attempt_interval_ms is None
+            else max(int(min_attempt_interval_ms), 1)
+        )
         self._last_attempt_ms: dict[tuple[str, str], int] = {}
         self._global_async_semaphore = asyncio.Semaphore(
             self.GLOBAL_ASYNC_CONCURRENCY
@@ -426,7 +432,10 @@ class RestTopBookQuoteRefresher:
             )
         key = (venue, symbol)
         last_attempt_ms = int(self._last_attempt_ms.get(key, 0) or 0)
-        if last_attempt_ms > 0 and now_ms - last_attempt_ms < self.MIN_ATTEMPT_INTERVAL_MS:
+        if (
+            last_attempt_ms > 0
+            and now_ms - last_attempt_ms < self._min_attempt_interval_ms
+        ):
             return RestTopBookQuoteResult(
                 venue=venue,
                 symbol=symbol,

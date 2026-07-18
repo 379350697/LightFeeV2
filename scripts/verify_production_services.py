@@ -31,6 +31,13 @@ from lightfee.ops.production_health import (
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
+from lightfee.sidecar.publisher import (
+    FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+    FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
+    funding_entry_snapshot_identity,
+    funding_entry_snapshot_manifest_path,
+    load_funding_entry_snapshot,
+)
 from lightfee.spread.quote_snapshot import (
     SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
     load_spread_quote_snapshot,
@@ -60,6 +67,130 @@ def _read_json(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root must be object: {path}")
     return data
+
+
+def _funding_entry_snapshot_report(
+    path: str | Path,
+    *,
+    now_ms: int,
+    max_age_ms: int,
+) -> HealthReport:
+    """Verify the atomic bounded live-entry generation, not the slow audit."""
+
+    def _manifest_int(name: str, *, default: int = -1) -> int:
+        value = manifest.get(name, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    fingerprints: list[str] = []
+    manifest_path = funding_entry_snapshot_manifest_path(path)
+    try:
+        manifest = _read_json(str(manifest_path))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        manifest = {}
+    identity = funding_entry_snapshot_identity(path, verify_digest=True)
+    snapshot = load_funding_entry_snapshot(path)
+    if identity is None or snapshot is None or not manifest:
+        fingerprints.append("funding_entry_generation_missing_or_invalid")
+
+    ready_at_ms = int(getattr(snapshot, "ready_at_ms", 0) or 0)
+    ready_age_ms = now_ms - ready_at_ms if ready_at_ms > 0 else None
+    if (
+        ready_age_ms is None
+        or ready_age_ms < 0
+        or ready_age_ms > max(int(max_age_ms), 0)
+    ):
+        fingerprints.append("funding_entry_generation_stale")
+
+    payload_size = _manifest_int("payload_size_bytes")
+    manifest_candidate_count = _manifest_int("candidate_count")
+    manifest_quote_count = _manifest_int("quote_count")
+    candidates = list(getattr(snapshot, "candidates", []) or [])
+    quotes = dict(getattr(snapshot, "quotes", {}) or {})
+    if payload_size < 0 or payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
+        fingerprints.append("funding_entry_payload_size_invalid")
+    if (
+        manifest_candidate_count != len(candidates)
+        or manifest_quote_count != len(quotes)
+        or len(candidates) > FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES
+    ):
+        fingerprints.append("funding_entry_manifest_count_mismatch")
+    if any(
+        bool(getattr(candidate, "blocked", True))
+        or getattr(candidate, "economics_complete", False) is not True
+        for candidate in candidates
+    ):
+        fingerprints.append("funding_entry_candidate_not_executable")
+    if candidates and (
+        str(getattr(snapshot, "acquisition_mode", "") or "") != "fresh_sidecar"
+        or bool(getattr(snapshot, "degraded_venues", []))
+        or bool(getattr(snapshot, "degraded_domains", []))
+        or bool(getattr(snapshot, "degraded_symbols", {}))
+    ):
+        fingerprints.append("funding_entry_candidate_evidence_degraded")
+
+    return HealthReport(
+        name="sidecar_snapshot",
+        ok=not fingerprints,
+        severity="critical" if fingerprints else "info",
+        fingerprints=fingerprints,
+        details={
+            "data_plane": "funding_entry_v6",
+            "manifest_path": str(manifest_path),
+            "generation_id": identity[0] if identity is not None else "",
+            "ready_at_ms": ready_at_ms,
+            "ready_age_ms": ready_age_ms,
+            "payload_size_bytes": payload_size,
+            "payload_max_bytes": FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+            "candidate_count": len(candidates),
+            "candidate_limit": FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
+            "quote_count": len(quotes),
+            "diagnostics_only": not bool(candidates),
+        },
+    )
+
+
+def _sidecar_audit_observation(report: HealthReport) -> HealthReport:
+    """Expose background audit health without making it the live liveness gate."""
+
+    source = report.details
+    degraded_symbols = source.get("degraded_symbols", {})
+    degraded_symbol_counts = (
+        {
+            str(venue): len(symbols)
+            for venue, symbols in degraded_symbols.items()
+            if isinstance(symbols, list)
+        }
+        if isinstance(degraded_symbols, dict)
+        else {}
+    )
+    return HealthReport(
+        name="sidecar_audit_snapshot",
+        ok=True,
+        severity="info",
+        fingerprints=[],
+        details={
+            "data_plane": "background_full_audit",
+            "audit_ok": report.ok,
+            "audit_fingerprints": list(report.fingerprints),
+            "observed_at_ms": source.get("observed_at_ms"),
+            "age_ms": source.get("age_ms"),
+            "quote_venues": source.get("quote_venues", []),
+            "missing_venues": source.get("missing_venues", []),
+            "degraded_venues": source.get("degraded_venues", []),
+            "degraded_domains": source.get("degraded_domains", []),
+            "degraded_symbol_counts": degraded_symbol_counts,
+            "candidate_count": source.get("candidate_count", 0),
+            "unblocked_candidate_count": source.get(
+                "unblocked_candidate_count",
+                0,
+            ),
+        },
+    )
 
 
 def _resolve_spread_snapshot_max_age_ms(
@@ -620,10 +751,47 @@ def main() -> None:
         )
     )
 
-    if Path(args.snapshot).exists():
+    entry_manifest_path = funding_entry_snapshot_manifest_path(args.snapshot)
+    if entry_manifest_path.exists():
+        reports.append(
+            _funding_entry_snapshot_report(
+                args.snapshot,
+                now_ms=now_ms,
+                max_age_ms=args.snapshot_max_age_ms,
+            )
+        )
+        if Path(args.snapshot).exists():
+            reports.append(
+                _sidecar_audit_observation(
+                    analyze_sidecar_snapshot(
+                        _read_json(args.snapshot),
+                        now_ms=now_ms,
+                        max_age_ms=args.snapshot_max_age_ms,
+                    )
+                )
+            )
+        else:
+            reports.append(
+                HealthReport(
+                    name="sidecar_audit_snapshot",
+                    ok=True,
+                    severity="info",
+                    fingerprints=[],
+                    details={
+                        "data_plane": "background_full_audit",
+                        "audit_ok": False,
+                        "audit_fingerprints": ["snapshot_file_missing"],
+                        "path": args.snapshot,
+                    },
+                )
+            )
+    elif Path(args.snapshot).exists():
+        # Backward-compatible diagnostics for pre-V6 and explicit fixture paths.
         reports.append(
             analyze_sidecar_snapshot(
-                _read_json(args.snapshot), now_ms=now_ms, max_age_ms=args.snapshot_max_age_ms
+                _read_json(args.snapshot),
+                now_ms=now_ms,
+                max_age_ms=args.snapshot_max_age_ms,
             )
         )
     else:
