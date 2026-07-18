@@ -20,6 +20,7 @@ from lightfee.sidecar.snapshot import (
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
 KNOWN_GOOD_RESOLVERS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"}
 FIXTURE_MARKET_OBSERVED_AT_MS = 1710000075000
+RUNTIME_TIMESTAMP_MAX_FUTURE_SKEW_MS = 1_000
 
 
 @dataclass(frozen=True)
@@ -1237,7 +1238,11 @@ def analyze_current_state(
         last_scan_age_ms=last_scan_age_ms,
         current_state_age_ms=current_state_age_ms,
     )
-    tick_stale = tick_age_ms is None or tick_age_ms < 0 or tick_age_ms > max_tick_age_ms
+    tick_stale = (
+        tick_age_ms is None
+        or tick_age_ms < -RUNTIME_TIMESTAMP_MAX_FUTURE_SKEW_MS
+        or tick_age_ms > max_tick_age_ms
+    )
     tick_stale_suppressed_by_runtime_progress = (
         tick_stale and clean and exchange_truth_available_flat and recent_runtime_progress
     )

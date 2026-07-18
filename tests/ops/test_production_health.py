@@ -2942,6 +2942,78 @@ def test_current_state_tick_stale_remains_critical_with_exporter_only_heartbeat(
     assert report.details["exporter_only_progress"] is True
 
 
+def test_current_state_accepts_concurrent_tick_within_future_skew_tolerance():
+    now_ms = 1_778_787_000_000
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "generated_at_ms": now_ms + 900,
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": now_ms + 900,
+        "last_scan": {"ts_ms": now_ms + 900},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=now_ms,
+        max_tick_age_ms=15_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is True
+    assert "live_tick_stale" not in report.fingerprints
+    assert report.details["tick_age_ms"] == -900
+
+
+def test_current_state_rejects_tick_beyond_future_skew_tolerance():
+    now_ms = 1_778_787_000_000
+    state = {
+        "schema": "lightfee.current_state.v1",
+        "generated_at_ms": now_ms + 1_001,
+        "mode": "live",
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": now_ms + 1_001,
+        "last_scan": {"ts_ms": now_ms + 1_001},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=now_ms,
+        max_tick_age_ms=15_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert "live_tick_stale" in report.fingerprints
+    assert report.details["tick_age_ms"] == -1_001
+
+
 def test_current_state_tick_stale_is_not_critical_with_recent_runtime_lane_progress():
     state = {
         "schema": "lightfee.current_state.v1",
