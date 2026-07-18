@@ -301,9 +301,23 @@ def _spread_bbo_runtime_report(
             for venue in getattr(app_config, "venues", [])
             if str(venue.venue or "").strip()
         }
-        observed_venues = {quote.venue for quote in snapshot.quotes.values()}
+        ttl_ms = max(
+            int(getattr(getattr(app_config, "strategy", None), "spread_signal_ttl_ms", 0) or 0),
+            1,
+        )
+        publish_age_ms = checked_at_ms - int(snapshot.published_at_ms or 0)
+        quote_ages_by_key = {
+            key: checked_at_ms - int(quote.observed_at_ms or 0)
+            for key, quote in snapshot.quotes.items()
+        }
+        fresh_quotes = {
+            key: quote
+            for key, quote in snapshot.quotes.items()
+            if 0 <= quote_ages_by_key[key] <= ttl_ms
+        }
+        observed_venues = {quote.venue for quote in fresh_quotes.values()}
         venues_by_symbol: dict[str, set[str]] = {}
-        for quote in snapshot.quotes.values():
+        for quote in fresh_quotes.values():
             symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
             venue = str(getattr(quote, "venue", "") or "").strip().lower()
             if symbol and venue:
@@ -336,21 +350,22 @@ def _spread_bbo_runtime_report(
             for venue, symbols in getattr(snapshot, "degraded_symbols", {}).items()
             if str(venue).strip() and symbols
         }
-        ttl_ms = max(
-            int(getattr(getattr(app_config, "strategy", None), "spread_signal_ttl_ms", 0) or 0),
-            1,
+        quote_ages_ms = list(quote_ages_by_key.values())
+        strict_symbol_completeness = bool(
+            getattr(
+                getattr(app_config, "strategy", None),
+                "spread_live_enabled",
+                False,
+            )
         )
-        publish_age_ms = checked_at_ms - int(snapshot.published_at_ms or 0)
-        quote_ages_ms = [
-            checked_at_ms - int(quote.observed_at_ms or 0)
-            for quote in snapshot.quotes.values()
-        ]
         details.update(
             {
                 "published_at_ms": snapshot.published_at_ms,
                 "publish_age_ms": publish_age_ms,
                 "batch_started_at_ms": snapshot.batch_started_at_ms,
                 "quote_count": len(snapshot.quotes),
+                "fresh_quote_count": len(fresh_quotes),
+                "stale_quote_count": len(snapshot.quotes) - len(fresh_quotes),
                 "configured_venues": sorted(configured_venues),
                 "observed_venues": sorted(observed_venues),
                 "degraded_venues": degraded_venues,
@@ -364,6 +379,10 @@ def _spread_bbo_runtime_report(
                 "observed_pair_count": observed_pair_count,
                 "evaluated_pair_bound": evaluated_pair_bound,
                 "evaluated_pair_limit": SPREAD_SAMPLING_MAX_PAIR_COUNT,
+                "strict_symbol_completeness": strict_symbol_completeness,
+                "execution_contract": (
+                    "live" if strict_symbol_completeness else "paper_only"
+                ),
             }
         )
         if getattr(snapshot, "schema_version", 0) != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
@@ -376,13 +395,15 @@ def _spread_bbo_runtime_report(
             fingerprints.append("spread_bbo_configured_venue_mismatch")
         if observed_venues != expected_venues:
             fingerprints.append("spread_bbo_venue_coverage_incomplete")
-        if degraded_venues:
+        if strict_symbol_completeness and degraded_venues:
             fingerprints.append("spread_bbo_venue_degraded")
-        if degraded_symbols:
+        if strict_symbol_completeness and degraded_symbols:
             fingerprints.append("spread_bbo_symbol_degraded")
         if publish_age_ms < 0 or publish_age_ms > ttl_ms:
             fingerprints.append("spread_bbo_publication_stale")
-        if any(age < 0 or age > ttl_ms for age in quote_ages_ms):
+        if strict_symbol_completeness and any(
+            age < 0 or age > ttl_ms for age in quote_ages_ms
+        ):
             fingerprints.append("spread_bbo_quote_stale")
 
         try:

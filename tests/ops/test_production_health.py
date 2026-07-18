@@ -1314,7 +1314,10 @@ def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
     )
     config = SimpleNamespace(
         venues=[SimpleNamespace(venue="binance"), SimpleNamespace(venue="okx")],
-        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
+        strategy=SimpleNamespace(
+            spread_signal_ttl_ms=1_000,
+            spread_live_enabled=True,
+        ),
     )
     monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
     monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
@@ -1332,6 +1335,65 @@ def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
     assert "spread_bbo_symbol_degraded" in report.fingerprints
     assert report.details["degraded_venues"] == ["okx"]
     assert report.details["degraded_symbols"] == {"binance": ["ETHUSDT"]}
+
+
+def test_spread_bbo_runtime_keeps_paper_only_symbol_gaps_observable_not_blocking(
+    monkeypatch,
+):
+    now_ms = 2_000
+    snapshot = SimpleNamespace(
+        schema_version=5,
+        published_at_ms=now_ms - 100,
+        batch_started_at_ms=now_ms - 200,
+        producer_generation_id="boot:42",
+        configured_venues=["binance", "hyperliquid"],
+        sampling_symbols=["BTCUSDT", "ETHUSDT"],
+        degraded_venues=[],
+        degraded_symbols={"hyperliquid": ["ETHUSDT"]},
+        quotes={
+            "binance:BTCUSDT": SimpleNamespace(
+                venue="binance",
+                symbol="BTCUSDT",
+                observed_at_ms=now_ms - 100,
+            ),
+            "hyperliquid:BTCUSDT": SimpleNamespace(
+                venue="hyperliquid",
+                symbol="BTCUSDT",
+                observed_at_ms=now_ms - 100,
+            ),
+            "hyperliquid:ETHUSDT": SimpleNamespace(
+                venue="hyperliquid",
+                symbol="ETHUSDT",
+                observed_at_ms=now_ms - 1_100,
+            ),
+        },
+    )
+    config = SimpleNamespace(
+        venues=[
+            SimpleNamespace(venue="binance"),
+            SimpleNamespace(venue="hyperliquid"),
+        ],
+        strategy=SimpleNamespace(
+            spread_signal_ttl_ms=1_000,
+            spread_live_enabled=False,
+        ),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=now_ms,
+    )
+
+    assert report.ok
+    assert report.details["execution_contract"] == "paper_only"
+    assert report.details["fresh_quote_count"] == 2
+    assert report.details["stale_quote_count"] == 1
+    assert report.details["degraded_symbols"] == {"hyperliquid": ["ETHUSDT"]}
 
 
 def test_spread_bbo_runtime_rejects_declared_budget_despite_missing_venues(monkeypatch):

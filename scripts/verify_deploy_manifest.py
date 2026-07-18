@@ -279,6 +279,38 @@ DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse HEAD)"
 REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
+HEALTH_ATTEMPTS=6
+HEALTH_RETRY_SECONDS=5
+
+verify_local_production_health() {{
+  local attempt
+  for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+    if env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json; then
+      return 0
+    fi
+    if ((attempt < HEALTH_ATTEMPTS)); then
+      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\n' \
+        "$attempt" "$HEALTH_ATTEMPTS" "$HEALTH_RETRY_SECONDS"
+      sleep "$HEALTH_RETRY_SECONDS"
+    fi
+  done
+  return 1
+}}
+
+verify_remote_production_health() {{
+  local attempt
+  for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
+    if ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+      return 0
+    fi
+    if ((attempt < HEALTH_ATTEMPTS)); then
+      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\n' \
+        "$attempt" "$HEALTH_ATTEMPTS" "$HEALTH_RETRY_SECONDS"
+      sleep "$HEALTH_RETRY_SECONDS"
+    fi
+  done
+  return 1
+}}
 
 install_systemd_units() {{
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-sidecar.service" /etc/systemd/system/lightfee-sidecar.service
@@ -322,7 +354,7 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
 
   echo "=== Verifying production health ==="
   env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/check_process_singleton.py --strict
-  if ! env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json; then
+  if ! verify_local_production_health; then
     echo "=== Production health failed; collecting diagnose evidence ==="
     env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy
     exit 1
@@ -357,7 +389,7 @@ sleep 12
 
 echo "=== Verifying production health ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
-if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+if ! verify_remote_production_health; then
   echo "=== Production health failed; collecting diagnose evidence ==="
   ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
   exit 1
