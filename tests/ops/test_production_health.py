@@ -184,6 +184,13 @@ def test_funding_entry_health_uses_atomic_v6_generation_not_slow_audit_age(
     assert report.details["candidate_count"] == 0
     assert report.details["quote_count"] == 0
 
+    concurrent_publish_report = vps._funding_entry_snapshot_report(
+        path,
+        now_ms=report.details["ready_at_ms"] - 500,
+        max_age_ms=1_000,
+    )
+    assert concurrent_publish_report.ok
+
     manifest_path = vps.funding_entry_snapshot_manifest_path(path)
     manifest = json.loads(manifest_path.read_text())
     manifest["candidate_count"] = "invalid"

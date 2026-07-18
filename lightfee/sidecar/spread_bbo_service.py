@@ -43,7 +43,10 @@ class HyperliquidSpreadBboSource:
         rest_fallback: RestTopBookQuoteRefresher | None = None,
     ) -> None:
         self.max_age_ms = max(int(max_age_ms or 0), 1)
-        self.refresh_age_ms = max(self.max_age_ms * 3 // 4, 1)
+        # Leave enough time for two bounded REST attempts before the execution
+        # lease expires.  A 75% threshold produced intermittent stale
+        # generations whenever the first request crossed the remaining 250ms.
+        self.refresh_age_ms = max(self.max_age_ms // 2, 1)
         self._cache = VenueBboCache()
         self._clients: dict[str, HyperliquidBboWsClient] = {}
         self._spec = get_spec(Venue.HYPERLIQUID)

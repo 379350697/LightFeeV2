@@ -431,8 +431,8 @@ async def test_hyperliquid_ws_source_prewarms_before_ttl_and_keeps_fresh_cache_o
             symbol="BTCUSDT",
             bid=99.0,
             ask=101.0,
-            received_at_ms=now_ms - 800,
-            observed_at_ms=now_ms - 800,
+            received_at_ms=now_ms - 600,
+            observed_at_ms=now_ms - 600,
             source="hyperliquid_bbo",
         )
     )
@@ -440,7 +440,7 @@ async def test_hyperliquid_ws_source_prewarms_before_ttl_and_keeps_fresh_cache_o
     quotes = await source.fetch_spread_bbo(["BTCUSDT"])
 
     assert len(fallback.calls) == 1
-    assert quotes["hyperliquid:BTCUSDT"].received_at_ms == now_ms - 800
+    assert quotes["hyperliquid:BTCUSDT"].received_at_ms == now_ms - 600
     await source.close()
 
 

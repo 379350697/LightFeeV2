@@ -53,6 +53,7 @@ from scripts.diagnose_live import _build_stale_risk_state_alignment_summary
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS = 60_000
+FUNDING_ENTRY_MAX_FUTURE_SKEW_MS = 1_000
 PRODUCTION_SERVICE_NAMES = (
     "lightfee-sidecar.service",
     "lightfee-spread-bbo.service",
@@ -101,7 +102,7 @@ def _funding_entry_snapshot_report(
     ready_age_ms = now_ms - ready_at_ms if ready_at_ms > 0 else None
     if (
         ready_age_ms is None
-        or ready_age_ms < 0
+        or ready_age_ms < -FUNDING_ENTRY_MAX_FUTURE_SKEW_MS
         or ready_age_ms > max(int(max_age_ms), 0)
     ):
         fingerprints.append("funding_entry_generation_stale")
