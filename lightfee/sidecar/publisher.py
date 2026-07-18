@@ -668,11 +668,7 @@ def publish_funding_entry_snapshot(
         "diagnostics_only": not bool(candidates),
         "source_candidate_count": len(snapshot.candidates),
         "source_quote_count": len(snapshot.quotes),
-        "source_data_ready": bool(snapshot.quotes)
-        and snapshot.acquisition_mode == "fresh_sidecar"
-        and not snapshot.degraded_venues
-        and not snapshot.degraded_domains
-        and not snapshot.degraded_symbols,
+        "source_data_ready": bool(snapshot.quotes),
         "seed_frontier_complete": bool(original_diagnostics.get("seed_frontier_complete", True)),
         "seed_frontier_stop_reason": str(
             original_diagnostics.get("seed_frontier_stop_reason", "") or ""

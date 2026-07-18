@@ -1818,8 +1818,11 @@ def test_funding_entry_snapshot_manifest_is_installed_after_bounded_payload(
     tmp_path,
 ) -> None:
     proof = _v3_snapshot_proof(1_000, input_quote_count=1)
+    proof["acquisition_mode"] = "degraded_sidecar"
     snapshot = SidecarSnapshot(
         **proof,
+        degraded_venues=["okx"],
+        degraded_domains=["liquidity"],
         quotes={
             "binance:BTCUSDT": QuoteSnapshot(
                 venue="binance",
@@ -1843,6 +1846,7 @@ def test_funding_entry_snapshot_manifest_is_installed_after_bounded_payload(
     assert loaded.ready_at_ms == manifest["ready_at_ms"]
     assert loaded.acquisition_mode == "unavailable"
     assert loaded.quotes == {}
+    assert loaded.candidate_build_diagnostics["source_data_ready"] is True
 
 
 def test_funding_entry_snapshot_blocked_only_generation_is_unavailable(
