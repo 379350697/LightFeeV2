@@ -390,6 +390,15 @@ async def test_hyperliquid_ws_source_refreshes_connected_stale_quote_via_rest() 
     assert source._cache.get_quote("hyperliquid", "BTCUSDT") == refreshed
 
 
+def test_hyperliquid_ws_source_uses_bounded_parallel_rest_fallback() -> None:
+    source = HyperliquidSpreadBboSource(max_age_ms=1_000)
+
+    assert (
+        source._rest_fallback._venue_async_semaphores["hyperliquid"]._value
+        == source._rest_fallback.GLOBAL_ASYNC_CONCURRENCY
+    )
+
+
 @pytest.mark.asyncio
 async def test_hyperliquid_ws_source_close_attempts_all_and_retains_failures() -> None:
     class StubClient:

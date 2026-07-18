@@ -48,6 +48,7 @@ class HyperliquidSpreadBboSource:
         self._spec = get_spec(Venue.HYPERLIQUID)
         self._rest_fallback = rest_fallback or RestTopBookQuoteRefresher(
             timeout_ms=min(self.max_age_ms, 750),
+            venue_async_concurrency=RestTopBookQuoteRefresher.GLOBAL_ASYNC_CONCURRENCY,
         )
 
     def _new_client(self, symbol: str) -> HyperliquidBboWsClient:

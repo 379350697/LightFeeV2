@@ -141,6 +141,52 @@ class TestExchangeSource:
         assert quotes["binance:ETHUSDT"].bid == 0.0
         assert quotes["binance:ETHUSDT"].source == "sidecar_bbo_unavailable"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["symbol_not_listed", "ambiguous_mapping"])
+    async def test_known_unlisted_or_ambiguous_placeholder_is_not_a_degraded_quote(
+        self,
+        status,
+    ):
+        class FakeClient:
+            async def fetch_funding_tickers(self, symbols, *, include_open_interest):
+                return {
+                    "binance:BTCUSDT": FundingTicker(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        market_received_at_ms=123,
+                    ),
+                    "binance:NOTLISTEDUSDT": FundingTicker(
+                        venue="binance",
+                        symbol="NOTLISTEDUSDT",
+                        bid=0.0,
+                        ask=0.0,
+                        open_interest_evidence_status=status,
+                    ),
+                }
+
+            async def fetch_top_book_quotes(self, symbols):
+                from lightfee.marketdata.ws_bbo import TopBookQuote
+
+                return {
+                    "binance:BTCUSDT": TopBookQuote(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=200.0,
+                        ask=201.0,
+                        received_at_ms=456,
+                    )
+                }
+
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+        src._client = FakeClient()
+
+        quotes = await src.fetch_market_quotes(["BTCUSDT", "NOTLISTEDUSDT"])
+
+        assert set(quotes) == {"binance:BTCUSDT"}
+
 
 class TestLiquiditySource:
     """LiquiditySource wraps MarketDataClient's fetch_perp_liquidity."""

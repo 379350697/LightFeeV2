@@ -214,6 +214,7 @@ class RestTopBookQuoteRefresher:
         client: httpx.Client | None = None,
         async_client: httpx.AsyncClient | None = None,
         timeout_ms: int = 750,
+        venue_async_concurrency: int | None = None,
     ) -> None:
         self._client = client
         self._owns_client = client is None
@@ -224,8 +225,16 @@ class RestTopBookQuoteRefresher:
         self._global_async_semaphore = asyncio.Semaphore(
             self.GLOBAL_ASYNC_CONCURRENCY
         )
+        per_venue_concurrency = (
+            self.VENUE_ASYNC_CONCURRENCY
+            if venue_async_concurrency is None
+            else max(
+                min(int(venue_async_concurrency), self.GLOBAL_ASYNC_CONCURRENCY),
+                1,
+            )
+        )
         self._venue_async_semaphores = {
-            venue: asyncio.Semaphore(self.VENUE_ASYNC_CONCURRENCY)
+            venue: asyncio.Semaphore(per_venue_concurrency)
             for venue in self.SUPPORTED_VENUES
         }
         self._async_inflight: dict[

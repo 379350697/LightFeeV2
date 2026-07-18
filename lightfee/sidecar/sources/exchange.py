@@ -150,6 +150,20 @@ class ExchangeSource:
         )
         result: dict[str, QuoteSnapshot] = {}
         for key, ft in tickers.items():
+            listing_status = str(
+                ft.open_interest_evidence_status or ""
+            ).strip().lower()
+            if (
+                listing_status in {"symbol_not_listed", "ambiguous_mapping"}
+                and float(ft.bid or 0.0) <= 0.0
+                and float(ft.ask or 0.0) <= 0.0
+            ):
+                # Venue-wide requests receive the cross-venue symbol union.
+                # Known non-listings and non-unique venue mappings are absent
+                # rows, not failed market observations.  Keep a genuinely
+                # listed row with a missing final BBO below so it still fails
+                # closed as degraded evidence.
+                continue
             result[key] = self._from_funding_ticker(ft)
         # Funding, contract, and fee metadata are slow variables. Reacquire a
         # lightweight BBO after that work so candidate prices keep the actual
