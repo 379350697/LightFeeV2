@@ -354,6 +354,100 @@ def test_hyperliquid_bbo_parser_uses_bbo_channel():
     assert quote.ask == 113397.0
 
 
+def test_hyperliquid_multiplex_bbo_routes_each_coin_to_its_canonical_symbol():
+    import json
+
+    from lightfee.marketdata.ws_bbo import (
+        HyperliquidMultiplexBboWsClient,
+        VenueBboCache,
+    )
+
+    cache = VenueBboCache()
+    client = HyperliquidMultiplexBboWsClient(cache)
+    client._symbol_by_wire = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+    client._wire_by_symbol = {"BTCUSDT": "BTC", "ETHUSDT": "ETH"}
+
+    client._handle_message(
+        json.dumps(
+            {
+                "channel": "bbo",
+                "data": {
+                    "coin": "ETH",
+                    "time": 1754450974231,
+                    "bbo": [
+                        {"px": "3377.0", "sz": "7.6"},
+                        {"px": "3397.0", "sz": "0.1"},
+                    ],
+                },
+            }
+        )
+    )
+
+    quote = cache.get_quote("hyperliquid", "ETHUSDT")
+    assert quote is not None
+    assert quote.bid == 3377.0
+    assert quote.ask == 3397.0
+    assert quote.source == "hyperliquid_bbo_multiplex"
+    assert cache.get_quote("hyperliquid", "BTCUSDT") is None
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_multiplex_bbo_subscribes_all_symbols_on_one_connection(
+    monkeypatch,
+):
+    import json
+
+    from lightfee.marketdata import ws_bbo
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+            self.messages = [
+                json.dumps(
+                    {
+                        "channel": "bbo",
+                        "data": {
+                            "coin": "ETH",
+                            "time": 1754450974231,
+                            "bbo": [
+                                {"px": "3377.0", "sz": "7.6"},
+                                {"px": "3397.0", "sz": "0.1"},
+                            ],
+                        },
+                    }
+                )
+            ]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.messages:
+                raise StopAsyncIteration
+            return self.messages.pop(0)
+
+    fake = FakeWebSocket()
+    monkeypatch.setattr(ws_bbo.websockets, "connect", lambda *_a, **_k: fake)
+    cache = ws_bbo.VenueBboCache()
+    client = ws_bbo.HyperliquidMultiplexBboWsClient(cache)
+    await client.add_symbols({"BTCUSDT": "BTC", "ETHUSDT": "ETH"})
+
+    await client._connect_and_read()
+
+    assert [item["subscription"]["coin"] for item in fake.sent] == ["BTC", "ETH"]
+    assert cache.get_quote("hyperliquid", "ETHUSDT") is not None
+    assert not client.is_connected
+
+
 def test_rest_top_book_refresher_fetches_aster_bookticker_official_path():
     import httpx
     from lightfee.marketdata.ws_bbo import RestTopBookQuoteRefresher

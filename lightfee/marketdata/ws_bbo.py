@@ -1297,6 +1297,144 @@ class HyperliquidBboWsClient(BboWsClient):
         return None
 
 
+class HyperliquidMultiplexBboWsClient:
+    """One Hyperliquid WebSocket carrying a bounded set of BBO subscriptions."""
+
+    OPEN_TIMEOUT_SECONDS = 10.0
+
+    def __init__(self, cache: VenueBboCache) -> None:
+        self.cache = cache
+        self._symbol_by_wire: dict[str, str] = {}
+        self._wire_by_symbol: dict[str, str] = {}
+        self._task: asyncio.Task | None = None
+        self._ws: Any = None
+        self._closed = False
+        self._connected = False
+        self._last_error = ""
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected and self._ws is not None
+
+    async def add_symbols(self, symbols: dict[str, str]) -> None:
+        added_wires: list[str] = []
+        for raw_symbol, raw_wire in symbols.items():
+            symbol = str(raw_symbol or "").strip().upper()
+            wire = str(raw_wire or "").strip()
+            if not symbol or not wire or symbol in self._wire_by_symbol:
+                continue
+            self._wire_by_symbol[symbol] = wire
+            self._symbol_by_wire[wire] = symbol
+            added_wires.append(wire)
+        if self.is_connected:
+            for wire in added_wires:
+                await self._send_subscribe(self._ws, wire)
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        self._closed = False
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def stop(self) -> None:
+        self._closed = True
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+        await self._close_ws()
+
+    async def _run_loop(self) -> None:
+        delay = 1.0
+        while not self._closed:
+            try:
+                await self._connect_and_read()
+                delay = 1.0
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+            if self._closed:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+
+    async def _connect_and_read(self) -> None:
+        try:
+            async with websockets.connect(
+                hyperliquid_bbo_stream_url(),
+                ping_interval=20.0,
+                open_timeout=self.OPEN_TIMEOUT_SECONDS,
+                close_timeout=5,
+                max_size=2**20,
+            ) as ws:
+                self._ws = ws
+                self._connected = True
+                for wire in tuple(self._symbol_by_wire):
+                    await self._send_subscribe(ws, wire)
+                async for raw_msg in ws:
+                    self._handle_message(raw_msg)
+        finally:
+            self._connected = False
+            self._ws = None
+
+    @staticmethod
+    async def _send_subscribe(ws: Any, wire: str) -> None:
+        await ws.send(
+            json.dumps(
+                {
+                    "method": "subscribe",
+                    "subscription": {"type": "bbo", "coin": wire},
+                }
+            )
+        )
+
+    def _handle_message(self, raw_msg: str | bytes) -> None:
+        try:
+            if isinstance(raw_msg, bytes):
+                raw_msg = raw_msg.decode("utf-8")
+            payload = json.loads(raw_msg)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("channel") != "bbo":
+            return
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return
+        wire = str(data.get("coin") or "").strip()
+        symbol = self._symbol_by_wire.get(wire)
+        bbo = data.get("bbo")
+        if symbol is None or not isinstance(bbo, list):
+            return
+        bid_row = bbo[0] if len(bbo) > 0 and isinstance(bbo[0], dict) else {}
+        ask_row = bbo[1] if len(bbo) > 1 and isinstance(bbo[1], dict) else {}
+        received_at_ms = int(time.time() * 1000)
+        quote = TopBookQuote(
+            venue="hyperliquid",
+            symbol=symbol,
+            bid=_float_value(bid_row.get("px")),
+            ask=_float_value(ask_row.get("px")),
+            bid_size=_float_value(bid_row.get("sz")),
+            ask_size=_float_value(ask_row.get("sz")),
+            observed_at_ms=received_at_ms,
+            received_at_ms=received_at_ms,
+            exchange_event_at_ms=_int_ms(data.get("time")),
+            source="hyperliquid_bbo_multiplex",
+        )
+        if quote.bid <= 0.0 or quote.ask <= 0.0 or quote.bid >= quote.ask:
+            return
+        self.cache.update_quote(quote)
+
+    async def _close_ws(self) -> None:
+        self._connected = False
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+
+
 BBO_CLIENT_REGISTRY: dict[str, type[BboWsClient]] = {
     "binance": BinanceBboWsClient,
     "okx": OkxBboWsClient,

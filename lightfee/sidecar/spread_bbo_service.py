@@ -11,7 +11,7 @@ import time
 from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.marketdata.ws_bbo import (
-    HyperliquidBboWsClient,
+    HyperliquidMultiplexBboWsClient,
     RestTopBookQuoteRefresher,
     TopBookQuote,
     VenueBboCache,
@@ -48,7 +48,8 @@ class HyperliquidSpreadBboSource:
         # generations whenever the first request crossed the remaining 250ms.
         self.refresh_age_ms = max(self.max_age_ms // 2, 1)
         self._cache = VenueBboCache()
-        self._clients: dict[str, HyperliquidBboWsClient] = {}
+        self._clients: dict[str, HyperliquidMultiplexBboWsClient] = {}
+        self._multiplex_client: HyperliquidMultiplexBboWsClient | None = None
         self._spec = get_spec(Venue.HYPERLIQUID)
         self._rest_fallback = rest_fallback or RestTopBookQuoteRefresher(
             timeout_ms=min(self.max_age_ms, 750),
@@ -56,26 +57,26 @@ class HyperliquidSpreadBboSource:
             min_attempt_interval_ms=max(min(self.max_age_ms // 4, 250), 50),
         )
 
-    def _new_client(self, symbol: str) -> HyperliquidBboWsClient:
-        canonical = str(symbol or "").strip().upper()
-        venue_symbol = canonical
-        if self._spec.symbol_to_venue is not None:
-            venue_symbol = self._spec.symbol_to_venue(canonical)
-        return HyperliquidBboWsClient(
-            venue=self.venue,
-            symbol=canonical,
-            venue_symbol=str(venue_symbol or canonical),
-            cache=self._cache,
-        )
-
     async def start(self, symbols: list[str]) -> None:
+        mappings: dict[str, str] = {}
         for raw_symbol in symbols:
             symbol = str(raw_symbol or "").strip().upper()
             if not symbol or symbol in self._clients:
                 continue
-            client = self._new_client(symbol)
+            venue_symbol = symbol
+            if self._spec.symbol_to_venue is not None:
+                venue_symbol = self._spec.symbol_to_venue(symbol)
+            mappings[symbol] = str(venue_symbol or symbol)
+        if not mappings:
+            return
+        client = self._multiplex_client
+        if client is None:
+            client = HyperliquidMultiplexBboWsClient(self._cache)
+            self._multiplex_client = client
+        await client.add_symbols(mappings)
+        for symbol in mappings:
             self._clients[symbol] = client
-            await client.start()
+        await client.start()
 
     async def fetch_spread_bbo(
         self,
@@ -159,10 +160,21 @@ class HyperliquidSpreadBboSource:
         return quotes
 
     async def close(self) -> None:
-        clients = list(self._clients.items())
+        clients: list[tuple[list[str], object]] = []
+        for client in {id(value): value for value in self._clients.values()}.values():
+            clients.append(
+                (
+                    [
+                        symbol
+                        for symbol, current in self._clients.items()
+                        if current is client
+                    ],
+                    client,
+                )
+            )
         results = await asyncio.gather(
             self._rest_fallback.aclose(),
-            *(client.stop() for _symbol, client in clients),
+            *(client.stop() for _symbols, client in clients),
             return_exceptions=True,
         )
         failures: list[Exception] = []
@@ -180,7 +192,7 @@ class HyperliquidSpreadBboSource:
                 "Hyperliquid spread BBO REST fallback close failed",
                 exc_info=(type(failure), failure, failure.__traceback__),
             )
-        for (symbol, client), result in zip(
+        for (symbols, client), result in zip(
             clients,
             client_results,
             strict=True,
@@ -194,12 +206,15 @@ class HyperliquidSpreadBboSource:
                 failures.append(failure)
                 logger.error(
                     "Hyperliquid spread BBO client stop failed: symbol=%s",
-                    symbol,
+                    ",".join(symbols),
                     exc_info=(type(failure), failure, failure.__traceback__),
                 )
                 continue
-            if self._clients.get(symbol) is client:
-                self._clients.pop(symbol, None)
+            for symbol in symbols:
+                if self._clients.get(symbol) is client:
+                    self._clients.pop(symbol, None)
+        if not self._clients:
+            self._multiplex_client = None
         if failures:
             raise ExceptionGroup(
                 "Hyperliquid spread BBO client shutdown failed",

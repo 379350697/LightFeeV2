@@ -249,11 +249,11 @@ async def test_bbo_process_routes_hyperliquid_to_bbo_websocket_not_rest(tmp_path
         assert source is service.hyperliquid_source
         assert isinstance(source, HyperliquidSpreadBboSource)
         assert not isinstance(source, type(service.sources["binance"]))
-        client = source._new_client("BTCUSDT")
-        assert client.build_subscribe_message() == {
-            "method": "subscribe",
-            "subscription": {"type": "bbo", "coin": "BTC"},
-        }
+        from lightfee.marketdata.ws_bbo import HyperliquidMultiplexBboWsClient
+
+        client = HyperliquidMultiplexBboWsClient(source._cache)
+        await client.add_symbols({"BTCUSDT": "BTC"})
+        assert client._wire_by_symbol == {"BTCUSDT": "BTC"}
     finally:
         await service.close()
 
@@ -293,11 +293,19 @@ async def test_hyperliquid_ws_source_starts_the_complete_bounded_universe(
 
     started: list[str] = []
 
+    async def add_symbols(client, symbols) -> None:
+        started.extend(symbols)
+
     async def start(client) -> None:
-        started.append(client.symbol)
+        return None
 
     monkeypatch.setattr(
-        spread_bbo_service.HyperliquidBboWsClient,
+        spread_bbo_service.HyperliquidMultiplexBboWsClient,
+        "add_symbols",
+        add_symbols,
+    )
+    monkeypatch.setattr(
+        spread_bbo_service.HyperliquidMultiplexBboWsClient,
         "start",
         start,
     )
