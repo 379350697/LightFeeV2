@@ -2142,6 +2142,8 @@ class EntryGateRuntime:
         candidate_blockers: dict[str, str],
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
+        strategy_blocked_reason_counts: Counter | None = None,
+        strategy_blocked_reason_samples: list[dict[str, object]] | None = None,
     ) -> None:
         if getattr(self.ctx.journal, "_file", None) is None:
             return
@@ -2149,25 +2151,35 @@ class EntryGateRuntime:
 
         blocked_reason_counts: Counter[str] = Counter()
         candidate_blocked_samples: list[dict[str, Any]] = []
-        for candidate in getattr(snapshot, "candidates", []) or []:
-            for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
-                blocker = str(blocked_reason)
-                blocked_reason_counts[blocker] += 1
-                long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
-                short_venue = str(
-                    getattr(candidate, "short_venue", "") or ""
-                ).lower()
-                symbol = str(getattr(candidate, "symbol", "") or "").upper()
-                pair_id = str(getattr(candidate, "pair_id", "") or "")
-                if not pair_id:
-                    pair_id = make_candidate_pair_id(
-                        symbol,
-                        long_venue,
-                        short_venue,
-                    )
+        strategy_counts = Counter(
+            {
+                str(reason): int(count)
+                for reason, count in (strategy_blocked_reason_counts or {}).items()
+                if str(reason) and int(count) > 0
+            }
+        )
+        if strategy_blocked_reason_counts is not None:
+            blocked_reason_counts.update(strategy_counts)
+            remaining_samples = Counter(strategy_counts)
+            normalized_strategy_samples: list[dict[str, Any]] = []
+            for raw_sample in strategy_blocked_reason_samples or []:
+                blocker = str(raw_sample.get("blocking_reason", "") or "")
+                if not blocker or remaining_samples[blocker] <= 0:
+                    continue
+                remaining_samples[blocker] -= 1
+                normalized_strategy_samples.append(dict(raw_sample))
+            for blocker, missing_count in remaining_samples.items():
+                normalized_strategy_samples.extend(
+                    {"blocking_reason": blocker}
+                    for _ in range(max(int(missing_count), 0))
+                )
+            for sample in normalized_strategy_samples:
+                blocker = str(sample.get("blocking_reason", "") or "")
+                long_venue = str(sample.get("long_venue", "") or "").lower()
+                short_venue = str(sample.get("short_venue", "") or "").lower()
                 candidate_blocked_samples.append(
                     {
-                        "blocking_stage": "candidate_construction",
+                        "blocking_stage": "strategy_discovery",
                         "blocking_domain": (
                             self._entry_selection_blocker_reason_family(blocker)
                         ),
@@ -2176,19 +2188,58 @@ class EntryGateRuntime:
                         "venue": f"{long_venue}->{short_venue}",
                         "long_venue": long_venue,
                         "short_venue": short_venue,
-                        "symbol": symbol,
-                        "sample_id": str(
-                            getattr(candidate, "open_interest_sample_id", "") or ""
-                        ),
-                        "pair_id": pair_id,
+                        "symbol": str(sample.get("symbol", "") or "").upper(),
+                        "sample_id": str(sample.get("sample_id", "") or ""),
+                        "pair_id": str(sample.get("pair_id", "") or ""),
                         "candidate_revision_id": str(
-                            getattr(candidate, "candidate_revision_id", "") or ""
+                            sample.get("candidate_revision_id", "") or ""
                         ),
                         "opportunity_lease_id": str(
-                            getattr(candidate, "opportunity_lease_id", "") or ""
+                            sample.get("opportunity_lease_id", "") or ""
                         ),
                     }
                 )
+        else:
+            for candidate in getattr(snapshot, "candidates", []) or []:
+                for blocked_reason in getattr(candidate, "blocked_reasons", []) or []:
+                    blocker = str(blocked_reason)
+                    blocked_reason_counts[blocker] += 1
+                    long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
+                    short_venue = str(
+                        getattr(candidate, "short_venue", "") or ""
+                    ).lower()
+                    symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                    pair_id = str(getattr(candidate, "pair_id", "") or "")
+                    if not pair_id:
+                        pair_id = make_candidate_pair_id(
+                            symbol,
+                            long_venue,
+                            short_venue,
+                        )
+                    candidate_blocked_samples.append(
+                        {
+                            "blocking_stage": "candidate_construction",
+                            "blocking_domain": (
+                                self._entry_selection_blocker_reason_family(blocker)
+                            ),
+                            "blocking_status": "blocked",
+                            "blocking_reason": blocker,
+                            "venue": f"{long_venue}->{short_venue}",
+                            "long_venue": long_venue,
+                            "short_venue": short_venue,
+                            "symbol": symbol,
+                            "sample_id": str(
+                                getattr(candidate, "open_interest_sample_id", "") or ""
+                            ),
+                            "pair_id": pair_id,
+                            "candidate_revision_id": str(
+                                getattr(candidate, "candidate_revision_id", "") or ""
+                            ),
+                            "opportunity_lease_id": str(
+                                getattr(candidate, "opportunity_lease_id", "") or ""
+                            ),
+                        }
+                    )
         catalog_filter_blockers = Counter(
             getattr(self, "_last_candidate_catalog_filter_blockers", Counter())
         )

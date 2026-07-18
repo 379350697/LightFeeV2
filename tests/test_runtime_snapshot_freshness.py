@@ -3878,6 +3878,37 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
     assert runtime.state.last_scan["candidate_count"] == 64
     assert runtime.state.last_scan["tradeable_count"] == 0
     assert runtime.state.last_scan["no_entry_reason"] == "candidate_edge_insufficient"
+    diagnostic = next(
+        record["payload"]
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "scan.no_entry_diagnostics"
+    )
+    assert diagnostic["blocked_reason_counts"] == {
+        "expected_edge_below_floor": 64,
+        "funding_new_entries_disabled": 64,
+    }
+    assert diagnostic["candidate_blocked_sample_count"] == sum(
+        diagnostic["blocked_reason_counts"].values()
+    )
+    assert len(diagnostic["candidate_blocked_samples"]) == 128
+    assert all(
+        {
+            "blocking_stage",
+            "blocking_domain",
+            "blocking_status",
+            "blocking_reason",
+            "venue",
+            "long_venue",
+            "short_venue",
+            "symbol",
+            "sample_id",
+            "pair_id",
+            "candidate_revision_id",
+            "opportunity_lease_id",
+        }
+        <= sample.keys()
+        for sample in diagnostic["candidate_blocked_samples"]
+    )
 
 
 @pytest.mark.asyncio

@@ -6015,6 +6015,7 @@ class LiveRuntime:
 
         if can_enter_new_positions(self.state) and self.entry_executor is not None:
             strategy_blocked_reason_counts: Counter[str] = Counter()
+            strategy_blocked_reason_samples: list[dict[str, object]] = []
             tradeable = discover_tradeable_candidates(
                 snapshot.candidates,
                 self.config.strategy,
@@ -6023,6 +6024,7 @@ class LiveRuntime:
                     self.config.runtime.mode in {"live", "paper"}
                 ),
                 blocked_reason_counts=strategy_blocked_reason_counts,
+                blocked_reason_samples=strategy_blocked_reason_samples,
             )
             strategy_tradeable_count = len(tradeable)
             # The live entry payload contract is Top-32. Legacy V5 snapshots
@@ -7040,6 +7042,12 @@ class LiveRuntime:
                         candidate_blockers=candidate_blockers,
                         now_ms=now_ms,
                         admission_blocker_counts=admission_blocker_counts,
+                        strategy_blocked_reason_counts=(
+                            strategy_blocked_reason_counts
+                        ),
+                        strategy_blocked_reason_samples=(
+                            strategy_blocked_reason_samples
+                        ),
                     )
             elif can_enter_new_positions(self.state) and self.entry_executor is not None:
                 self._emit_scan_no_entry_diagnostics(
@@ -7058,6 +7066,8 @@ class LiveRuntime:
                     tradeable_selection_blocker_counts=Counter(),
                     candidate_blockers={},
                     now_ms=now_ms,
+                    strategy_blocked_reason_counts=strategy_blocked_reason_counts,
+                    strategy_blocked_reason_samples=strategy_blocked_reason_samples,
                 )
 
     # ------------------------------------------------------------------
@@ -15049,6 +15059,8 @@ class LiveRuntime:
         candidate_blockers: dict[str, str],
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
+        strategy_blocked_reason_counts: Counter | None = None,
+        strategy_blocked_reason_samples: list[dict[str, object]] | None = None,
     ) -> None:
         return self.entry_gate_runtime._emit_scan_no_entry_diagnostics(
             reason=reason,
@@ -15061,6 +15073,8 @@ class LiveRuntime:
             candidate_blockers=candidate_blockers,
             now_ms=now_ms,
             admission_blocker_counts=admission_blocker_counts,
+            strategy_blocked_reason_counts=strategy_blocked_reason_counts,
+            strategy_blocked_reason_samples=strategy_blocked_reason_samples,
         )
 
     def _emit_entry_opportunity_funnel(

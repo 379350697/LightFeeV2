@@ -43,6 +43,7 @@ def discover_tradeable_candidates(
     *,
     require_complete_economics: bool = False,
     blocked_reason_counts: MutableMapping[str, int] | None = None,
+    blocked_reason_samples: list[dict[str, object]] | None = None,
 ) -> list[CandidateInput]:
     """Filter and rank candidates through strategy gates (V1 parity).
 
@@ -60,16 +61,49 @@ def discover_tradeable_candidates(
         and config.funding_canary_enabled is True
     )
 
-    def record_blocker(reason: str) -> None:
-        if blocked_reason_counts is None or not reason:
+    def record_blocker(reason: str, candidate: CandidateInput) -> None:
+        if not reason:
             return
-        blocked_reason_counts[reason] = int(blocked_reason_counts.get(reason, 0)) + 1
+        if blocked_reason_counts is not None:
+            blocked_reason_counts[reason] = (
+                int(blocked_reason_counts.get(reason, 0)) + 1
+            )
+        if blocked_reason_samples is None:
+            return
+        long_venue = str(candidate.long_venue or "").strip().lower()
+        short_venue = str(candidate.short_venue or "").strip().lower()
+        symbol = str(candidate.symbol or "").strip().upper()
+        pair_id = str(candidate.pair_id or "").strip()
+        if not pair_id:
+            pair_id = f"{symbol.lower()}:{long_venue}->{short_venue}"
+        evidence = getattr(candidate, "entry_open_interest_evidence", {})
+        sample_id = (
+            str(evidence.get("sample_id", "") or "")
+            if isinstance(evidence, dict)
+            else ""
+        )
+        blocked_reason_samples.append(
+            {
+                "blocking_reason": reason,
+                "long_venue": long_venue,
+                "short_venue": short_venue,
+                "symbol": symbol,
+                "sample_id": sample_id,
+                "pair_id": pair_id,
+                "candidate_revision_id": str(
+                    candidate.candidate_revision_id or ""
+                ),
+                "opportunity_lease_id": str(
+                    candidate.opportunity_lease_id or ""
+                ),
+            }
+        )
 
     for c in candidates:
         if c.blocked:
             reasons = list(c.blocked_reasons or []) or ["candidate_blocked"]
             for reason in reasons:
-                record_blocker(str(reason))
+                record_blocker(str(reason), c)
             continue
 
         reasons: list[BlockReason] = []
@@ -142,7 +176,7 @@ def discover_tradeable_candidates(
 
         if reasons:
             for reason in reasons:
-                record_blocker(reason.value)
+                record_blocker(reason.value, c)
             continue
 
         passed.append((c, []))

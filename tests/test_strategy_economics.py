@@ -218,6 +218,43 @@ def test_candidate_revision_and_lease_split_build_clock_from_route_cycle() -> No
     assert opportunity_lease_id(**lease_kwargs) != baseline_lease
 
 
+def test_candidate_revision_ignores_observation_and_receipt_wall_clocks() -> None:
+    long_quote = _identity_quote("cheap")
+    short_quote = _identity_quote("rich")
+    for quote, prefix in ((long_quote, "cheap"), (short_quote, "rich")):
+        quote.funding_rate_observed_at_ms = 1_000
+        quote.funding_rate_event_at_ms = 900
+        quote.funding_rate_received_at_ms = 1_001
+        quote.funding_rate_source = "venue_api"
+        quote.funding_rate_sample_id = f"funding:{prefix}:BTCUSDT:1000:1:100000"
+
+    kwargs = {
+        "pair_id": "btcusdt:cheap->rich",
+        "long_quote": long_quote,
+        "short_quote": short_quote,
+        "settlement_timestamps_ms": (100_000, 100_000, 100_000, 100_000),
+        "entry_route": "taker_both",
+        "exit_route": "taker_both",
+        "fee_evidence_fingerprint": "fee-v1",
+        "fee_assurance_tier": "account",
+        "model_epoch": "model-v1",
+        "economics": {"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
+    }
+    baseline = candidate_revision_id(**kwargs)
+
+    long_quote.observed_at_ms = 2_000
+    long_quote.funding_rate_observed_at_ms = 2_000
+    long_quote.funding_rate_event_at_ms = 1_900
+    long_quote.funding_rate_received_at_ms = 2_001
+    long_quote.funding_rate_sample_id = (
+        "funding:cheap:BTCUSDT:2000:1:100000"
+    )
+    assert candidate_revision_id(**kwargs) == baseline
+
+    long_quote.bid = 99.8
+    assert candidate_revision_id(**kwargs) != baseline
+
+
 @pytest.mark.parametrize(
     "invalid",
     [True, False, None, "1.0", "invalid", float("nan"), float("inf"), 10**1_000],

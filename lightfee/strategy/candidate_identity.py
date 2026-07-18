@@ -40,21 +40,13 @@ def _quote_contract(quote: object) -> dict[str, object]:
     return {
         "venue": _text(getattr(quote, "venue", "")).lower(),
         "symbol": _text(getattr(quote, "symbol", "")).upper(),
-        "observed_at_ms": _integer(getattr(quote, "observed_at_ms", 0)),
-        "funding_rate_observed_at_ms": _integer(
-            getattr(quote, "funding_rate_observed_at_ms", 0)
-        ),
-        "funding_rate_event_at_ms": _integer(
-            getattr(quote, "funding_rate_event_at_ms", 0)
-        ),
-        "funding_rate_received_at_ms": _integer(
-            getattr(quote, "funding_rate_received_at_ms", 0)
-        ),
+        # Observation/receipt clocks and funding sample IDs are deliberately
+        # excluded.  The sample ID embeds observed_at_ms, so retaining it would
+        # reintroduce wall-clock revision churn even after removing the explicit
+        # timestamp fields.  Executable prices, settlement period, contract
+        # rules, evidence source and derived economics remain authoritative.
         "funding_rate_source": _text(
             getattr(quote, "funding_rate_source", "")
-        ),
-        "funding_rate_sample_id": _text(
-            getattr(quote, "funding_rate_sample_id", "")
         ),
         "funding_timestamp_ms": _integer(
             getattr(quote, "funding_timestamp_ms", 0)
@@ -123,7 +115,7 @@ def candidate_revision_id(
     try:
         return _digest(
             {
-                "identity_version": "funding_candidate_revision_v4",
+                "identity_version": "funding_candidate_revision_v5",
                 "pair_id": _text(pair_id).lower(),
                 "long_contract": _quote_contract(long_quote),
                 "short_contract": _quote_contract(short_quote),
