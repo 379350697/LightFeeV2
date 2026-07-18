@@ -572,6 +572,15 @@ def publish_funding_entry_snapshot(
         for key, quote in snapshot.quotes.items()
         if (quote.venue.lower(), quote.symbol.lower()) in targets
     }
+    # The full audit watermark can belong to a quote that is intentionally
+    # omitted from this bounded payload.  Bind the compact snapshot's market
+    # watermark to the evidence it actually retains; malformed/future quote
+    # clocks still reach the strict V5 validator and fail closed below.
+    entry_market_observed_at_ms = (
+        max(quote.observed_at_ms for quote in quotes.values())
+        if quotes
+        else snapshot.market_observed_at_ms
+    )
     degraded_symbols = {
         venue: [symbol for symbol in symbols if (venue.lower(), symbol.lower()) in targets]
         for venue, symbols in snapshot.degraded_symbols.items()
@@ -724,6 +733,7 @@ def publish_funding_entry_snapshot(
     )
     entry_snapshot = replace(
         snapshot,
+        market_observed_at_ms=entry_market_observed_at_ms,
         funding_lifecycle=funding_lifecycle,
         market_lifecycle=market_lifecycle,
         liquidity_lifecycle=liquidity_lifecycle,

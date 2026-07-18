@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from lightfee.config.schema import StrategyConfig
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.ops.production_health import analyze_sidecar_snapshot
 from lightfee.sidecar.pairing import check_stale_snapshot
 from lightfee.sidecar.publisher import (
@@ -29,6 +30,7 @@ from lightfee.sidecar.snapshot import (
     SidecarSnapshot,
     SnapshotFreshness,
     decide_snapshot_freshness,
+    funding_rate_sample_id,
     validate_v4_snapshot_contract,
 )
 from lightfee.strategy.discovery import discover_tradeable_candidates
@@ -1849,6 +1851,129 @@ def test_funding_entry_snapshot_manifest_is_installed_after_bounded_payload(
     assert loaded.candidate_build_diagnostics["source_data_ready"] is True
     assert loaded.candidate_build_diagnostics["seed_frontier_complete"] is False
     assert loaded.candidate_build_diagnostics["entry_frontier_ready"] is False
+
+
+def test_funding_entry_snapshot_rebinds_market_watermark_to_retained_quotes(
+    tmp_path,
+) -> None:
+    selected_observed_at_ms = 9_000
+    candidate_build_at_ms = 10_000
+    funding_timestamp_ms = 20_000
+    quotes: dict[str, QuoteSnapshot] = {}
+    for venue, funding_rate_bps in (("binance", 5.0), ("okx", -5.0)):
+        raw_quote = TestPublisher._complete_v3_contract_quotes()[
+            f"{venue}:BTCUSDT"
+        ]
+        open_interest = 2_000_000.0
+        raw_quote.update(
+            observed_at_ms=selected_observed_at_ms,
+            funding_rate_bps=funding_rate_bps,
+            funding_rate_observed_at_ms=selected_observed_at_ms,
+            funding_rate_event_at_ms=selected_observed_at_ms,
+            funding_rate_received_at_ms=selected_observed_at_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=funding_rate_sample_id(
+                venue=venue,
+                symbol="BTCUSDT",
+                observed_at_ms=selected_observed_at_ms,
+                rate_bps=funding_rate_bps,
+                funding_timestamp_ms=funding_timestamp_ms,
+            ),
+            funding_timestamp_ms=funding_timestamp_ms,
+            volume_24h_quote=10_000_000.0,
+            open_interest=open_interest,
+            open_interest_evidence_status="observed",
+            open_interest_evidence_reason="fixture_observed",
+            open_interest_observed_at_ms=selected_observed_at_ms,
+            open_interest_event_at_ms=selected_observed_at_ms,
+            open_interest_received_at_ms=selected_observed_at_ms,
+            open_interest_source="test_fixture",
+            open_interest_sample_id=open_interest_sample_id(
+                venue=venue,
+                canonical_symbol="BTCUSDT",
+                venue_symbol="BTCUSDT",
+                observed_at_ms=selected_observed_at_ms,
+                source="test_fixture",
+                raw_value=open_interest,
+                value_quote=open_interest,
+            ),
+            open_interest_venue_symbol="BTCUSDT",
+            raw_open_interest=open_interest,
+            raw_open_interest_unit="quote",
+        )
+        quotes[f"{venue}:BTCUSDT"] = QuoteSnapshot(**raw_quote)
+    # This unrelated quote owns the full audit snapshot's newest market
+    # observation but is intentionally absent from the bounded Top-32 payload.
+    quotes["bybit:ETHUSDT"] = QuoteSnapshot(
+        venue="bybit",
+        symbol="ETHUSDT",
+        bid=2_000.0,
+        ask=2_001.0,
+        observed_at_ms=candidate_build_at_ms,
+    )
+    raw_candidate = TestPublisher._complete_v3_candidate()
+    raw_candidate.update(
+        funding_timestamp_ms=funding_timestamp_ms,
+        first_funding_timestamp_ms=funding_timestamp_ms,
+        long_funding_timestamp_ms=funding_timestamp_ms,
+        short_funding_timestamp_ms=funding_timestamp_ms,
+    )
+    snapshot = SidecarSnapshot(
+        published_at_ms=candidate_build_at_ms,
+        market_observed_at_ms=candidate_build_at_ms,
+        candidate_build_observed_at_ms=candidate_build_at_ms,
+        candidate_build_diagnostics={
+            "input_quote_count": len(quotes),
+            "requested_symbol_count": 2,
+            "requested_symbols": ["BTCUSDT", "ETHUSDT"],
+            "requested_venues": ["binance", "bybit", "okx"],
+            "directional_pair_count": 1,
+            "output_candidate_count": 1,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+            "seed_frontier_complete": True,
+        },
+        source_mode="direct_market",
+        acquisition_mode="fresh_sidecar",
+        funding_lifecycle=[
+            FundingLifecycle(
+                venue=venue,
+                observed_at_ms=candidate_build_at_ms,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("binance", "bybit", "okx")
+        ],
+        market_lifecycle=[
+            MarketLifecycle(
+                venue=venue,
+                observed_at_ms=candidate_build_at_ms,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("binance", "bybit", "okx")
+        ],
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue=venue,
+                observed_at_ms=candidate_build_at_ms,
+                symbol_count=1,
+                coverage_usable=1,
+            )
+            for venue in ("binance", "bybit", "okx")
+        ],
+        quotes=quotes,
+        candidates=[CandidateInput(**raw_candidate)],
+    )
+    path = tmp_path / "audit.json"
+
+    publish_funding_entry_snapshot(snapshot, path)
+    loaded = load_funding_entry_snapshot(path)
+
+    assert loaded is not None
+    assert set(loaded.quotes) == {"binance:BTCUSDT", "okx:BTCUSDT"}
+    assert loaded.market_observed_at_ms == selected_observed_at_ms
+    assert loaded.candidate_build_observed_at_ms == candidate_build_at_ms
 
 
 def test_funding_entry_snapshot_blocked_only_generation_is_unavailable(
