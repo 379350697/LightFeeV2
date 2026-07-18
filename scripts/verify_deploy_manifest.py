@@ -279,36 +279,40 @@ DEPLOY_VERSION="$(git -C "$LOCAL" rev-parse HEAD)"
 REMOTE_PYTHON="$REMOTE_PATH/.venv/bin/python3"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
-HEALTH_ATTEMPTS=6
+HEALTH_ATTEMPTS=37
 HEALTH_RETRY_SECONDS=5
 
 verify_local_production_health() {{
-  local attempt
+  local attempt output
   for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-    if env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json; then
+    if output="$(env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/verify_production_services.py --json)"; then
+      printf '%s\\n' "$output"
       return 0
     fi
     if ((attempt < HEALTH_ATTEMPTS)); then
-      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\n' \
+      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\\n' \
         "$attempt" "$HEALTH_ATTEMPTS" "$HEALTH_RETRY_SECONDS"
       sleep "$HEALTH_RETRY_SECONDS"
     fi
   done
+  printf '%s\\n' "$output"
   return 1
 }}
 
 verify_remote_production_health() {{
-  local attempt
+  local attempt output
   for ((attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++)); do
-    if ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+    if output="$(ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_production_services.py --json")"; then
+      printf '%s\\n' "$output"
       return 0
     fi
     if ((attempt < HEALTH_ATTEMPTS)); then
-      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\n' \
+      printf 'production health warming: attempt=%s/%s retry_in_seconds=%s\\n' \
         "$attempt" "$HEALTH_ATTEMPTS" "$HEALTH_RETRY_SECONDS"
       sleep "$HEALTH_RETRY_SECONDS"
     fi
   done
+  printf '%s\\n' "$output"
   return 1
 }}
 

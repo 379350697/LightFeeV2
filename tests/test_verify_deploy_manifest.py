@@ -99,6 +99,10 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
     assert (
         "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
     )
+    assert "HEALTH_ATTEMPTS=37" in script
+    assert 'if output="$(env PYTHONPATH=' in script
+    assert 'if output="$(ssh $SSH_OPTS' in script
+    assert "printf '%s\\n' \"$output\"" in script
 
 
 def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execution(
