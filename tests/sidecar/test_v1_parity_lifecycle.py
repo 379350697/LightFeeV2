@@ -109,6 +109,21 @@ async def _wait_for_full_audit_publish(service) -> None:
         await task
 
 
+def _stub_auxiliary_market_sources(service) -> None:
+    """Keep lifecycle-unit tests on their explicit quote fixtures."""
+
+    async def empty_bbo(_symbols):
+        return {}
+
+    async def empty_liquidity(_symbols):
+        return {}
+
+    for source in service._funding_entry_bbo_sources.values():
+        source.fetch_spread_bbo = empty_bbo
+    for source in service._liquidity_sources.values():
+        source.fetch_perp_liquidity = empty_liquidity
+
+
 class TestLifecycleCoverageDegradation:
     """Lifecycle dataclasses must carry coverage_usable and degraded_reason."""
 
@@ -695,6 +710,7 @@ class TestLiquiditySourceWiredIntoRefresh:
             venues=[VenueConfig(venue="binance")],
         )
         service = SidecarService(config)
+        _stub_auxiliary_market_sources(service)
         service._exchange_sources["binance"] = MissingAndCrossedSource()
 
         try:
@@ -759,6 +775,7 @@ class TestLiquiditySourceWiredIntoRefresh:
             venues=[VenueConfig(venue="binance")],
         )
         service = SidecarService(config)
+        _stub_auxiliary_market_sources(service)
         service._exchange_sources["binance"] = InvalidBboSource()
 
         try:
@@ -815,6 +832,7 @@ class TestLiquiditySourceWiredIntoRefresh:
             ],
         )
         service = SidecarService(config)
+        _stub_auxiliary_market_sources(service)
         service._exchange_sources["binance"] = QuoteSource("binance", "bad")
         service._exchange_sources["okx"] = QuoteSource("okx", 2.0)
 
@@ -867,6 +885,7 @@ class TestLiquiditySourceWiredIntoRefresh:
             venues=[VenueConfig(venue="binance")],
         )
         service = SidecarService(config)
+        _stub_auxiliary_market_sources(service)
         service._exchange_sources["binance"] = FakeExchangeSource()
         service._liquidity_sources["binance"] = DuplicateLiquidityFetch()
 
@@ -1010,6 +1029,7 @@ class TestRefreshPublicationSemantics:
                 ],
             )
         )
+        _stub_auxiliary_market_sources(service)
         service._exchange_sources = {
             "binance": Source("binance"),
             "okx": Source("okx"),

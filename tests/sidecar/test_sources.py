@@ -72,6 +72,95 @@ class TestExchangeSource:
 
         assert src._client._rate_limiter is limiter
 
+    def test_funding_entry_bbo_overlay_requires_strict_identity_and_receipt_clock(self):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        from lightfee.sidecar.service import _overlay_funding_entry_top_books
+
+        base = QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=99.0,
+            ask=102.0,
+            bid_size=7.0,
+            ask_size=8.0,
+            bid_depth=((99.0, 7.0),),
+            ask_depth=((102.0, 8.0),),
+            observed_at_ms=100,
+            funding_rate_bps=3.0,
+        )
+        top = TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            bid_size=2.0,
+            ask_size=3.0,
+            observed_at_ms=200,
+            received_at_ms=200,
+            exchange_event_at_ms=190,
+            source="sidecar_bulk_bbo_rest",
+        )
+
+        merged = _overlay_funding_entry_top_books(
+            "binance",
+            {"binance:BTCUSDT": base},
+            {"binance:BTCUSDT": top},
+            requested_symbols={"BTCUSDT"},
+        )
+
+        quote = merged["binance:BTCUSDT"]
+        assert quote.bid == 100.0
+        assert quote.ask == 101.0
+        assert quote.observed_at_ms == 200
+        assert quote.market_event_at_ms == 190
+        assert quote.funding_rate_bps == 3.0
+        assert quote.bid_depth == ()
+        assert quote.ask_depth == ()
+
+        for rejected in (
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=200.0,
+                ask=201.0,
+                observed_at_ms=99,
+                received_at_ms=99,
+            ),
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=200.0,
+                ask=201.0,
+                observed_at_ms=201,
+                received_at_ms=202,
+            ),
+            TopBookQuote(
+                venue="bybit",
+                symbol="BTCUSDT",
+                bid=200.0,
+                ask=201.0,
+                observed_at_ms=202,
+                received_at_ms=202,
+            ),
+        ):
+            rejected_merge = _overlay_funding_entry_top_books(
+                "binance",
+                {"binance:BTCUSDT": base},
+                {"binance:BTCUSDT": rejected},
+                requested_symbols={"BTCUSDT"},
+            )
+            assert rejected_merge["binance:BTCUSDT"] == base
+
+        assert (
+            _overlay_funding_entry_top_books(
+                "binance",
+                {},
+                {"binance:BTCUSDT": top},
+                requested_symbols={"BTCUSDT"},
+            )
+            == {}
+        )
+
     @pytest.mark.asyncio
     async def test_failed_final_bbo_cannot_reuse_aged_funding_ticker_price(self):
         class FakeClient:
@@ -251,7 +340,7 @@ class TestLiquiditySource:
 
 
 class TestSidecarServiceRateLimitWiring:
-    def test_service_shares_public_rate_limiter_per_venue(self):
+    def test_service_isolates_funding_bbo_from_slow_and_audit_lanes(self):
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
         from lightfee.sidecar.service import SidecarService
 
@@ -264,12 +353,323 @@ class TestSidecarServiceRateLimitWiring:
 
         binance_limiter = service._exchange_sources["binance"]._client._rate_limiter
         aster_limiter = service._exchange_sources["aster"]._client._rate_limiter
+        binance_audit_limiter = service._liquidity_sources["binance"]._client._rate_limiter
+        aster_audit_limiter = service._liquidity_sources["aster"]._client._rate_limiter
+        binance_bbo_limiter = service._funding_entry_bbo_sources["binance"]._client._rate_limiter
+        aster_bbo_limiter = service._funding_entry_bbo_sources["aster"]._client._rate_limiter
 
-        assert binance_limiter is service._liquidity_sources["binance"]._client._rate_limiter
-        assert aster_limiter is service._liquidity_sources["aster"]._client._rate_limiter
+        assert binance_limiter is not binance_audit_limiter
+        assert aster_limiter is not aster_audit_limiter
+        assert binance_limiter is not binance_bbo_limiter
+        assert aster_limiter is not aster_bbo_limiter
+        assert binance_audit_limiter is not binance_bbo_limiter
+        assert aster_audit_limiter is not aster_bbo_limiter
         assert binance_limiter is not aster_limiter
+        assert binance_audit_limiter is not aster_audit_limiter
+        assert binance_bbo_limiter is not aster_bbo_limiter
         assert binance_limiter is not None
         assert aster_limiter is not None
+        assert (
+            service._exchange_sources["binance"]._client._consume_global_rate_limit_budget is True
+        )
+        assert (
+            service._liquidity_sources["binance"]._client._consume_global_rate_limit_budget is True
+        )
+        assert (
+            service._funding_entry_bbo_sources["binance"]._client._consume_global_rate_limit_budget
+            is False
+        )
+
+        binance_audit_limiter.record_rate_limit_for_scopes(["venue:binance"], retry_after_ms=1_000)
+        assert (
+            binance_audit_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is not None
+        )
+        assert binance_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is None
+        assert binance_bbo_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is None
+
+    @pytest.mark.asyncio
+    async def test_funding_entry_bbo_cache_republish_never_starts_network(self, tmp_path):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        from lightfee.sidecar.service import SidecarService
+
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                venues=[VenueConfig(venue="binance")],
+            ),
+            enable_spread_bbo=False,
+        )
+        calls = 0
+
+        async def unexpected_fetch(_symbols):
+            nonlocal calls
+            calls += 1
+            return {}
+
+        service._funding_entry_bbo_sources["binance"].fetch_spread_bbo = unexpected_fetch
+        cached = TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=123,
+            received_at_ms=123,
+        )
+        service._funding_entry_bbo_latest_results = {
+            "binance": (
+                "binance",
+                {"binance:BTCUSDT": cached},
+                None,
+                set(),
+            )
+        }
+        service._entry_cache_only_refresh = True
+
+        try:
+            results = await service._fetch_funding_entry_bbo_all_venues(["BTCUSDT"])
+        finally:
+            await service.close()
+
+        assert calls == 0
+        assert results == [
+            (
+                "binance",
+                {"binance:BTCUSDT": cached},
+                None,
+                set(),
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_late_funding_entry_bbo_completes_singleflight_and_wakes_republish(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        from lightfee.sidecar.service import SidecarService
+
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                venues=[VenueConfig(venue="binance")],
+            ),
+            enable_spread_bbo=False,
+        )
+        release = asyncio.Event()
+        calls = 0
+        top = TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=123,
+            received_at_ms=123,
+        )
+
+        async def slow_fetch(_symbols):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {"binance:BTCUSDT": top}
+
+        service._funding_entry_bbo_sources["binance"].fetch_spread_bbo = slow_fetch
+        monkeypatch.setattr(
+            "lightfee.sidecar.service.FUNDING_ENTRY_BBO_FRONTIER_S",
+            0.01,
+        )
+
+        try:
+            first = await service._fetch_funding_entry_bbo_all_venues(
+                ["BTCUSDT"]
+            )
+            assert isinstance(first[0][2], TimeoutError)
+            assert calls == 1
+            assert not service._funding_entry_bbo_fetch_tasks["binance"].done()
+
+            release.set()
+            await asyncio.wait_for(
+                service.entry_venue_republish_event.wait(),
+                timeout=0.2,
+            )
+            service._entry_cache_only_refresh = True
+            cached = await service._fetch_funding_entry_bbo_all_venues(
+                ["BTCUSDT"]
+            )
+        finally:
+            release.set()
+            await service.close()
+
+        assert calls == 1
+        assert cached == [
+            (
+                "binance",
+                {"binance:BTCUSDT": top},
+                None,
+                set(),
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_slow_funding_refresh_cannot_age_live_entry_bbo(
+        self,
+        tmp_path,
+    ):
+        from lightfee.config.schema import (
+            AppConfig,
+            RuntimeConfig,
+            StrategyConfig,
+            VenueConfig,
+        )
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        from lightfee.sidecar.publisher import load_funding_entry_snapshot
+        from lightfee.sidecar.service import SidecarService
+        from lightfee.sidecar.snapshot import funding_rate_sample_id
+
+        now_ms = int(time.time() * 1_000)
+        funding_observed_at_ms = now_ms - 1_000
+        old_market_observed_at_ms = now_ms - 10_000
+        funding_timestamp_ms = now_ms + 28_800_000
+
+        def metadata_quote(venue: str, rate_bps: float) -> QuoteSnapshot:
+            return QuoteSnapshot(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=90.0,
+                ask=110.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=old_market_observed_at_ms,
+                source="slow_funding_metadata_cache",
+                funding_rate_bps=rate_bps,
+                funding_rate_observed_at_ms=funding_observed_at_ms,
+                funding_rate_event_at_ms=funding_observed_at_ms,
+                funding_rate_received_at_ms=funding_observed_at_ms,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=funding_rate_sample_id(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    observed_at_ms=funding_observed_at_ms,
+                    rate_bps=rate_bps,
+                    funding_timestamp_ms=funding_timestamp_ms,
+                ),
+                funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=28_800_000,
+                underlying="BTC",
+                quote_currency="USDT",
+                contract_type="linear",
+                contract_multiplier=1.0,
+                mark_index_source="test_fixture",
+                price_precision=2,
+                quantity_precision=3,
+                price_tick=0.01,
+                quantity_step_base=0.001,
+                min_quantity_base=0.001,
+                min_notional_quote=1.0,
+                min_notional_evidence_complete=True,
+                venue_status="active",
+                contract_normalization_complete=True,
+            )
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                max_market_age_ms=3_000,
+            ),
+            strategy=StrategyConfig(
+                funding_new_entries_enabled=True,
+                funding_canary_enabled=True,
+                min_funding_edge_bps=1.0,
+                min_expected_edge_bps=0.0,
+            ),
+            venues=[
+                VenueConfig(venue="binance", taker_fee_bps=1.0),
+                VenueConfig(venue="bybit", taker_fee_bps=1.0),
+            ],
+        )
+        service = SidecarService(config, enable_spread_bbo=False)
+        release_slow_funding = asyncio.Event()
+        slow_started = {"binance": asyncio.Event(), "bybit": asyncio.Event()}
+
+        async def slow_fetch(venue: str, _symbols):
+            slow_started[venue].set()
+            await release_slow_funding.wait()
+            return {f"{venue}:BTCUSDT": metadata_quote(venue, 0.0)}
+
+        for venue in ("binance", "bybit"):
+            source = service._exchange_sources[venue]
+            source.fetch_all = lambda symbols, current_venue=venue: slow_fetch(
+                current_venue,
+                symbols,
+            )
+
+            async def fresh_bbo(_symbols, current_venue=venue):
+                return {
+                    f"{current_venue}:BTCUSDT": TopBookQuote(
+                        venue=current_venue,
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=100.1,
+                        bid_size=10.0,
+                        ask_size=10.0,
+                        observed_at_ms=now_ms,
+                        received_at_ms=now_ms,
+                        exchange_event_at_ms=now_ms - 1,
+                        source="funding_entry_bbo_test",
+                    )
+                }
+
+            service._funding_entry_bbo_sources[venue].fetch_spread_bbo = fresh_bbo
+
+        service._entry_venue_latest_results = {
+            "binance": (
+                "binance",
+                {"binance:BTCUSDT": metadata_quote("binance", -50.0)},
+                None,
+                set(),
+            ),
+            "bybit": (
+                "bybit",
+                {"bybit:BTCUSDT": metadata_quote("bybit", 50.0)},
+                None,
+                set(),
+            ),
+        }
+        service._schedule_audit_snapshot_publish = lambda *_args, **_kwargs: None
+
+        started_at = time.monotonic()
+        try:
+            snapshot = await asyncio.wait_for(service.refresh_once(), timeout=1.0)
+            elapsed_s = time.monotonic() - started_at
+            assert all(event.is_set() for event in slow_started.values())
+            assert all(not task.done() for task in service._entry_venue_fetch_tasks.values())
+            compact = load_funding_entry_snapshot(service.snapshot_path)
+        finally:
+            release_slow_funding.set()
+            await service.close()
+
+        assert elapsed_s < 0.8
+        assert len(snapshot.candidates) == 1
+        assert compact is not None
+        assert len(compact.candidates) == 1
+        assert set(compact.quotes) == {
+            "binance:BTCUSDT",
+            "bybit:BTCUSDT",
+        }
+        for quote in compact.quotes.values():
+            assert quote.observed_at_ms == now_ms
+            assert quote.source == "funding_entry_bbo_test"
+            assert compact.published_at_ms - quote.observed_at_ms < 1_000
 
     @pytest.mark.asyncio
     async def test_refresh_once_keeps_binance_quotes_when_open_interest_is_slow(self, tmp_path):
@@ -314,10 +714,17 @@ class TestSidecarServiceRateLimitWiring:
         )
         service = SidecarService(config)
         service._exchange_sources["binance"]._client = FakeBinanceClient(binance_spec())
-        service._exchange_sources["binance"]._client._funding_interval_by_key[
-            "binance:BTCUSDT"
-        ] = (28_800_000, "test_fixture", int(time.time() * 1_000))
+        service._exchange_sources["binance"]._client._funding_interval_by_key["binance:BTCUSDT"] = (
+            28_800_000,
+            "test_fixture",
+            int(time.time() * 1_000),
+        )
         service._liquidity_sources["binance"] = FakeLiquiditySource()
+
+        async def fake_bbo(*_args, **_kwargs):
+            return [("binance", {}, None, set())]
+
+        service._fetch_funding_entry_bbo_all_venues = fake_bbo
 
         try:
             snapshot = await service.refresh_once()
@@ -428,9 +835,16 @@ class TestSidecarServiceRateLimitWiring:
                 ("bybit", {}, None, set()),
             ]
 
+        async def fake_bbo(*_args, **_kwargs):
+            return [
+                ("binance", {}, None, set()),
+                ("bybit", {}, None, set()),
+            ]
+
         clock = iter((10.0, 10.25, 10.3, 10.35))
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
         service._fetch_all_venues = fake_funding
+        service._fetch_funding_entry_bbo_all_venues = fake_bbo
         service._fetch_liquidity_all_venues = fake_liquidity
 
         try:
@@ -486,9 +900,13 @@ class TestSidecarServiceRateLimitWiring:
             assert compact.quotes["binance:BTCUSDT"].observed_at_ms == 1_100
             return [("binance", {}, None, set())]
 
+        async def fake_bbo(*_args, **_kwargs):
+            return [("binance", {}, None, set())]
+
         clock = iter((1.0, 1.2, 1.3, 1.4))
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
         service._fetch_all_venues = fake_funding
+        service._fetch_funding_entry_bbo_all_venues = fake_bbo
         service._fetch_liquidity_all_venues = fake_liquidity
 
         try:

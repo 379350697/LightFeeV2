@@ -16,6 +16,7 @@ from typing import Optional
 
 from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.core.domain import PerpLiquiditySnapshot, Venue
+from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import (
     load_snapshot,
@@ -61,6 +62,8 @@ DEFAULT_FUNDING_TIMEOUT_S = (
 DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
+FUNDING_AUDIT_MIN_INTERVAL_S = 60.0
+FUNDING_ENTRY_BBO_FRONTIER_S = 0.45
 
 logger = logging.getLogger("lightfee.sidecar.service")
 
@@ -98,18 +101,25 @@ class SidecarService:
             thread_name_prefix="lightfee-funding-audit",
         )
         self._audit_pending_build: dict[str, object] | None = None
+        self._last_audit_schedule_monotonic: float = 0.0
         self._entry_venue_fetch_tasks: dict[str, asyncio.Task] = {}
         self._entry_venue_latest_results: dict[str, tuple] = {}
         self._entry_venue_late_tasks: set[asyncio.Task] = set()
+        self._funding_entry_bbo_fetch_tasks: dict[str, asyncio.Task] = {}
+        self._funding_entry_bbo_latest_results: dict[str, tuple] = {}
+        self._funding_entry_bbo_late_tasks: set[asyncio.Task] = set()
         self.entry_venue_republish_event = asyncio.Event()
         self._entry_cache_only_refresh = False
 
         self._exchange_sources: dict[str, ExchangeSource] = {}
+        self._funding_entry_bbo_sources: dict[str, ExchangeSource] = {}
         self._spread_bbo_sources: dict[str, ExchangeSource] = {}
         self._liquidity_sources: dict[str, LiquiditySource] = {}
         from lightfee.venues.transport import EndpointRateLimiter
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
+        self._funding_entry_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
+        self._liquidity_rate_limiters: dict[str, EndpointRateLimiter] = {}
         self._spread_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
         # V1 parity: last-good fallback cache.  Initialise before reading the
@@ -125,10 +135,31 @@ class SidecarService:
             spec = get_spec(venue)
             rate_limiter = EndpointRateLimiter(1000, 8000, 50)
             self._public_rate_limiters[venue_name] = rate_limiter
+            # Slow funding/contract metadata remains governed by the shared
+            # exchange budget.  Only its local cooldown is isolated from the
+            # diagnostic liquidity/OI client below.
             self._exchange_sources[venue_name] = ExchangeSource(
                 spec,
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+            )
+            # Funding entry prices have their own sparse BBO-only lane.  One
+            # bulk request per refresh cannot inherit slow funding/OI waits,
+            # while 250ms local pacing bounds the lane to four requests/sec.
+            entry_bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
+            self._funding_entry_bbo_rate_limiters[
+                venue_name
+            ] = entry_bbo_rate_limiter
+            self._funding_entry_bbo_sources[venue_name] = ExchangeSource(
+                spec,
+                rate_limiter=entry_bbo_rate_limiter,
+                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
+                consume_global_rate_limit_budget=False,
+            )
+            self._funding_entry_bbo_sources[
+                venue_name
+            ].share_contract_metadata_cache_from(
+                self._exchange_sources[venue_name]
             )
             # BBO owns a reserved, per-venue public budget.  It still paces
             # requests and honours any 429 it receives, but funding/OI cannot
@@ -148,9 +179,11 @@ class SidecarService:
                 ].share_contract_metadata_cache_from(
                     self._exchange_sources[venue_name]
                 )
+            liquidity_rate_limiter = EndpointRateLimiter(1000, 8000, 50)
+            self._liquidity_rate_limiters[venue_name] = liquidity_rate_limiter
             self._liquidity_sources[venue_name] = LiquiditySource(
                 spec,
-                rate_limiter=rate_limiter,
+                rate_limiter=liquidity_rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
 
@@ -208,13 +241,19 @@ class SidecarService:
         entry_fetch_tasks = list(
             getattr(self, "_entry_venue_fetch_tasks", {}).values()
         )
-        for task in entry_fetch_tasks:
+        entry_bbo_fetch_tasks = list(
+            getattr(self, "_funding_entry_bbo_fetch_tasks", {}).values()
+        )
+        for task in [*entry_fetch_tasks, *entry_bbo_fetch_tasks]:
             if not task.done():
                 task.cancel()
-        if entry_fetch_tasks:
-            await asyncio.gather(*entry_fetch_tasks, return_exceptions=True)
+        all_entry_tasks = [*entry_fetch_tasks, *entry_bbo_fetch_tasks]
+        if all_entry_tasks:
+            await asyncio.gather(*all_entry_tasks, return_exceptions=True)
         self._entry_venue_fetch_tasks = {}
         self._entry_venue_late_tasks = set()
+        self._funding_entry_bbo_fetch_tasks = {}
+        self._funding_entry_bbo_late_tasks = set()
         republish_event = getattr(self, "entry_venue_republish_event", None)
         if isinstance(republish_event, asyncio.Event):
             republish_event.clear()
@@ -235,6 +274,10 @@ class SidecarService:
         self._audit_executor = None
         for group_name, sources in (
             ("exchange", list(getattr(self, "_exchange_sources", {}).values())),
+            (
+                "funding_entry_bbo",
+                list(getattr(self, "_funding_entry_bbo_sources", {}).values()),
+            ),
             ("spread_bbo", list(getattr(self, "_spread_bbo_sources", {}).values())),
             ("liquidity", list(getattr(self, "_liquidity_sources", {}).values())),
         ):
@@ -332,12 +375,23 @@ class SidecarService:
         listed_symbols_by_venue: dict[str, set[str]] = {}
 
         # --- Funding + Market fetch (per venue, funding timeout) ---
-        funding_results = await self._fetch_all_venues(
-            symbols,
-            timeout_s=self._funding_timeout_s,
+        funding_results, entry_bbo_results = await asyncio.gather(
+            self._fetch_all_venues(
+                symbols,
+                timeout_s=self._funding_timeout_s,
+            ),
+            self._fetch_funding_entry_bbo_all_venues(symbols),
         )
+        entry_bbo_by_venue = {
+            venue_name: (venue_quotes, error)
+            for venue_name, venue_quotes, error, _failed_symbols in entry_bbo_results
+        }
 
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
+            entry_bbo_quotes, _entry_bbo_error = entry_bbo_by_venue.get(
+                venue_name,
+                (None, RuntimeError("funding entry BBO result unavailable")),
+            )
             if error is not None:
                 degraded_venues.add(venue_name)
                 spread_market_degraded_venues.add(venue_name)
@@ -346,6 +400,12 @@ class SidecarService:
                     venue_name,
                     symbols,
                     now_ms=refresh_started_at_ms,
+                )
+                raw_fallback = _overlay_funding_entry_top_books(
+                    venue_name,
+                    raw_fallback,
+                    entry_bbo_quotes,
+                    requested_symbols=_canonical_symbol_set(symbols),
                 )
                 fallback_market_failures = _market_failure_reasons(raw_fallback)
                 fallback_crossed_symbols = {
@@ -468,6 +528,12 @@ class SidecarService:
             venue_quotes, identity_failures = _canonicalize_venue_quotes(
                 venue_name,
                 venue_quotes,
+                requested_symbols=_canonical_symbol_set(symbols),
+            )
+            venue_quotes = _overlay_funding_entry_top_books(
+                venue_name,
+                venue_quotes,
+                entry_bbo_quotes,
                 requested_symbols=_canonical_symbol_set(symbols),
             )
             listed_symbols = _snapshot_map_symbols(venue_quotes)
@@ -1001,7 +1067,21 @@ class SidecarService:
         listed_symbols_by_venue: dict[str, set[str]],
         market_quality_failed_symbols: dict[str, set[str]],
     ) -> None:
-        """Coalesce full candidate construction and audit publication."""
+        """Schedule a bounded-rate audit without delaying live entry quotes."""
+        if bool(getattr(self, "_entry_cache_only_refresh", False)):
+            return
+        task = getattr(self, "_audit_publish_task", None)
+        if task is not None and not task.done():
+            return
+        now_monotonic = time.monotonic()
+        last_schedule = float(
+            getattr(self, "_last_audit_schedule_monotonic", 0.0) or 0.0
+        )
+        if (
+            last_schedule > 0.0
+            and now_monotonic - last_schedule < FUNDING_AUDIT_MIN_INTERVAL_S
+        ):
+            return
         self._audit_pending_build = {
             "snapshot": snapshot,
             "candidate_service": candidate_service,
@@ -1022,12 +1102,11 @@ class SidecarService:
                 for venue, rows in market_quality_failed_symbols.items()
             },
         }
-        task = getattr(self, "_audit_publish_task", None)
-        if task is None or task.done():
-            self._audit_publish_task = asyncio.create_task(
-                self._run_audit_snapshot_writer(),
-                name="funding-audit-snapshot-writer",
-            )
+        self._last_audit_schedule_monotonic = now_monotonic
+        self._audit_publish_task = asyncio.create_task(
+            self._run_audit_snapshot_writer(),
+            name="funding-audit-snapshot-writer",
+        )
 
     async def _run_audit_snapshot_writer(self) -> None:
         while True:
@@ -1424,6 +1503,171 @@ class SidecarService:
                     ),
                     set(),
                 )
+        for task in task_to_venue:
+            if not task.done() and task not in pending:
+                late_tasks.add(task)
+        for venue_name in venue_names:
+            if venue_name not in results_by_venue and venue_name in latest:
+                results_by_venue[venue_name] = latest[venue_name]
+        return [results_by_venue[venue_name] for venue_name in venue_names]
+
+    async def _fetch_funding_entry_bbo_all_venues(
+        self,
+        symbols: list[str],
+    ) -> list[
+        tuple[
+            str,
+            Optional[dict[str, TopBookQuote]],
+            Optional[Exception],
+            set[str],
+        ]
+    ]:
+        """Refresh entry BBO without waiting for slow funding metadata.
+
+        Funding and contract requests remain alive as singleflight work in
+        ``_fetch_all_venues``.  This sparse lane reacquires top-of-book on its
+        own bounded schedule so cached funding rows do not inherit the age of
+        a slow metadata request.
+        """
+
+        requested = _canonical_symbol_set(symbols)
+
+        async def _fetch_one(
+            venue_name: str,
+        ) -> tuple[
+            str,
+            Optional[dict[str, TopBookQuote]],
+            Optional[Exception],
+            set[str],
+        ]:
+            sources = getattr(self, "_funding_entry_bbo_sources", {})
+            source = sources.get(venue_name) if isinstance(sources, dict) else None
+            if source is None:
+                return (
+                    venue_name,
+                    None,
+                    RuntimeError("funding entry BBO source unavailable"),
+                    set(requested),
+                )
+            try:
+                result = await source.fetch_spread_bbo(symbols)
+                filtered = {
+                    key: quote
+                    for key, quote in (result or {}).items()
+                    if _snapshot_item_symbol(key, quote) in requested
+                }
+                return (venue_name, filtered, None, set())
+            except Exception as exc:
+                return (venue_name, None, exc, set())
+
+        venue_names = self._configured_venue_names()
+        inflight = getattr(self, "_funding_entry_bbo_fetch_tasks", None)
+        if not isinstance(inflight, dict):
+            inflight = {}
+            self._funding_entry_bbo_fetch_tasks = inflight
+        latest = getattr(self, "_funding_entry_bbo_latest_results", None)
+        if not isinstance(latest, dict):
+            latest = {}
+            self._funding_entry_bbo_latest_results = latest
+        late_tasks = getattr(self, "_funding_entry_bbo_late_tasks", None)
+        if not isinstance(late_tasks, set):
+            late_tasks = set()
+            self._funding_entry_bbo_late_tasks = late_tasks
+        republish_event = getattr(self, "entry_venue_republish_event", None)
+        if not isinstance(republish_event, asyncio.Event):
+            republish_event = asyncio.Event()
+            self.entry_venue_republish_event = republish_event
+        if bool(getattr(self, "_entry_cache_only_refresh", False)):
+            return [
+                latest.get(
+                    venue_name,
+                    (
+                        venue_name,
+                        None,
+                        RuntimeError("funding entry BBO latest cache unavailable"),
+                        set(),
+                    ),
+                )
+                for venue_name in venue_names
+            ]
+
+        def _record_completion(task: asyncio.Task, venue_name: str) -> None:
+            if not task.cancelled():
+                try:
+                    latest[venue_name] = task.result()
+                except Exception as exc:
+                    latest[venue_name] = (venue_name, None, exc, set())
+            if task in late_tasks:
+                late_tasks.discard(task)
+                republish_event.set()
+
+        task_to_venue: dict[asyncio.Task, str] = {}
+        for venue_name in venue_names:
+            task = inflight.get(venue_name)
+            if task is not None and task.done():
+                _record_completion(task, venue_name)
+                inflight.pop(venue_name, None)
+                task = None
+            if task is None:
+                task = asyncio.create_task(
+                    _fetch_one(venue_name),
+                    name=f"funding-entry-bbo-fetch:{venue_name}",
+                )
+                inflight[venue_name] = task
+                task.add_done_callback(
+                    lambda completed, venue=venue_name: _record_completion(
+                        completed, venue
+                    )
+                )
+                if venue_name in latest:
+                    late_tasks.add(task)
+            task_to_venue[task] = venue_name
+
+        missing_tasks = {
+            task
+            for task, venue_name in task_to_venue.items()
+            if venue_name not in latest
+        }
+        if missing_tasks:
+            done, pending = await asyncio.wait(
+                missing_tasks,
+                timeout=FUNDING_ENTRY_BBO_FRONTIER_S,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+        else:
+            done, pending = set(), set()
+
+        results_by_venue: dict[
+            str,
+            tuple[
+                str,
+                Optional[dict[str, TopBookQuote]],
+                Optional[Exception],
+                set[str],
+            ],
+        ] = {}
+        for task in done:
+            venue_name = task_to_venue[task]
+            if inflight.get(venue_name) is task:
+                inflight.pop(venue_name, None)
+            _record_completion(task, venue_name)
+            results_by_venue[venue_name] = latest[venue_name]
+        for task in pending:
+            venue_name = task_to_venue[task]
+            late_tasks.add(task)
+            results_by_venue[venue_name] = latest.get(
+                venue_name,
+                (
+                    venue_name,
+                    None,
+                    TimeoutError(
+                        "funding entry BBO evidence deadline "
+                        f"{FUNDING_ENTRY_BBO_FRONTIER_S:.3f}s; "
+                        "background fetch inflight"
+                    ),
+                    set(),
+                ),
+            )
         for task in task_to_venue:
             if not task.done() and task not in pending:
                 late_tasks.add(task)
@@ -1867,6 +2111,97 @@ def _canonicalize_venue_quotes(
         accepted.pop(f"{identity[0]}:{identity[1]}", None)
         failures[identity[1]] = "duplicate_quote_identity"
     return accepted, failures
+
+
+def _overlay_funding_entry_top_books(
+    venue_name: str,
+    metadata_quotes: dict[str, QuoteSnapshot] | None,
+    top_books: dict[str, TopBookQuote] | None,
+    *,
+    requested_symbols: set[str],
+) -> dict[str, QuoteSnapshot]:
+    """Overlay only identity-safe, receipt-clock BBO on metadata rows.
+
+    A BBO row cannot create funding evidence by itself.  It may only refresh
+    the executable market fields of an existing funding/contract row, and only
+    when the local receipt clock proves that it is at least as new as the
+    embedded market observation.
+    """
+
+    expected_venue = str(venue_name or "").strip().lower()
+    merged = dict(metadata_quotes or {})
+    for raw_key, top in (top_books or {}).items():
+        top_venue = str(getattr(top, "venue", "") or "").strip().lower()
+        top_symbol = str(getattr(top, "symbol", "") or "").strip().upper()
+        expected_key = f"{expected_venue}:{top_symbol}"
+        if (
+            not top_symbol
+            or top_symbol not in requested_symbols
+            or top_venue != expected_venue
+            or str(raw_key).strip() != expected_key
+        ):
+            continue
+        base = merged.get(expected_key)
+        if base is None:
+            continue
+        received_raw = getattr(top, "received_at_ms", None)
+        observed_raw = getattr(top, "observed_at_ms", None)
+        if (
+            isinstance(received_raw, bool)
+            or not isinstance(received_raw, int)
+            or received_raw <= 0
+            or isinstance(observed_raw, bool)
+            or not isinstance(observed_raw, int)
+            or observed_raw != received_raw
+            or received_raw < int(getattr(base, "observed_at_ms", 0) or 0)
+        ):
+            continue
+        values: list[float] = []
+        invalid_number = False
+        for raw_value in (
+            getattr(top, "bid", None),
+            getattr(top, "ask", None),
+            getattr(top, "bid_size", None),
+            getattr(top, "ask_size", None),
+        ):
+            if isinstance(raw_value, bool):
+                invalid_number = True
+                break
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError, OverflowError):
+                invalid_number = True
+                break
+            if not isfinite(value):
+                invalid_number = True
+                break
+            values.append(value)
+        if invalid_number:
+            continue
+        bid, ask, bid_size, ask_size = values
+        if (
+            bid <= 0.0
+            or ask <= 0.0
+            or bid > ask
+            or bid_size < 0.0
+            or ask_size < 0.0
+        ):
+            continue
+        merged[expected_key] = replace(
+            base,
+            bid=bid,
+            ask=ask,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            bid_depth=(),
+            ask_depth=(),
+            observed_at_ms=received_raw,
+            market_event_at_ms=int(
+                getattr(top, "exchange_event_at_ms", 0) or 0
+            ),
+            source=str(getattr(top, "source", "") or "funding_entry_bbo"),
+        )
+    return merged
 
 
 def _market_failure_reasons(

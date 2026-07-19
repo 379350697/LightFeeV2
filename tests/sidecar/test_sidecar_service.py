@@ -451,7 +451,7 @@ def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_audit_writer_is_nonblocking_and_coalesces_to_latest_generation(
+async def test_audit_writer_is_nonblocking_and_drops_overlapping_generations(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -461,6 +461,7 @@ async def test_audit_writer_is_nonblocking_and_coalesces_to_latest_generation(
     service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
     async def no_liquidity(*_args, **_kwargs):
@@ -501,11 +502,10 @@ async def test_audit_writer_is_nonblocking_and_coalesces_to_latest_generation(
             await asyncio.sleep(0.001)
         assert started.is_set()
 
-        # Scheduling later generations returns while G1 is still blocked, and
-        # only the newest pending generation survives the coalescing slot.
+        # A running diagnostic audit does not queue more OI work behind itself.
         _schedule_audit_build(service, SidecarSnapshot(published_at_ms=2), builder)
         _schedule_audit_build(service, SidecarSnapshot(published_at_ms=3), builder)
-        assert service._audit_pending_build["snapshot"].published_at_ms == 3
+        assert service._audit_pending_build is None
         assert not task.done()
 
         release.set()
@@ -514,9 +514,50 @@ async def test_audit_writer_is_nonblocking_and_coalesces_to_latest_generation(
         release.set()
         service._audit_executor.shutdown(wait=True, cancel_futures=True)
 
-    assert published_generations == [1, 3]
-    assert builder.calls == 2
+    assert published_generations == [1]
+    assert builder.calls == 1
     assert service._audit_publish_task is None
+
+
+@pytest.mark.asyncio
+async def test_audit_schedule_skips_cache_republish_and_respects_minimum_interval(
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
+    service._entry_cache_only_refresh = True
+    runs = 0
+
+    async def run_once() -> None:
+        nonlocal runs
+        runs += 1
+        service._audit_pending_build = None
+        service._audit_publish_task = None
+
+    service._run_audit_snapshot_writer = run_once
+    clock = 100.0
+    monkeypatch.setattr("lightfee.sidecar.service.time.monotonic", lambda: clock)
+
+    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=1), object())
+    await asyncio.sleep(0)
+    assert runs == 0
+
+    service._entry_cache_only_refresh = False
+    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=2), object())
+    await asyncio.sleep(0)
+    assert runs == 1
+
+    clock += 59.0
+    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=3), object())
+    await asyncio.sleep(0)
+    assert runs == 1
+
+    clock += 1.0
+    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=4), object())
+    await asyncio.sleep(0)
+    assert runs == 2
 
 
 @pytest.mark.asyncio
@@ -530,6 +571,7 @@ async def test_audit_failure_does_not_poison_next_generation(
     service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
     async def no_liquidity(*_args, **_kwargs):
@@ -565,6 +607,7 @@ async def test_audit_failure_does_not_poison_next_generation(
         await asyncio.wait_for(failed_task, timeout=2.0)
         assert published_generations == []
 
+        service._last_audit_schedule_monotonic = 0.0
         _schedule_audit_build(
             service,
             SidecarSnapshot(published_at_ms=2),
