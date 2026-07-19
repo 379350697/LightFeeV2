@@ -1452,3 +1452,50 @@ class TestRefreshPublicationSemantics:
         assert snapshot.candidates == []
         assert snapshot.acquisition_mode == "unavailable"
         assert load_snapshot(svc.snapshot_path) is not None
+
+
+def test_liquidity_lifecycle_keeps_deferred_oi_separate_from_proof_failure():
+    """The audit must not call a deliberate OI handoff a missing proof."""
+    from lightfee.sidecar.service import _liquidity_lifecycle_from_quotes
+
+    deferred = QuoteSnapshot(
+        venue="binance",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest_evidence_status="unavailable",
+        open_interest_evidence_reason="entry_targeted_revalidation_required",
+    )
+    actual_gap = QuoteSnapshot(
+        venue="binance",
+        symbol="ETHUSDT",
+        bid=50.0,
+        ask=51.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest_evidence_status="timeout",
+        open_interest_evidence_reason="timeout_waiting_for_oi",
+    )
+
+    deferred_only = _liquidity_lifecycle_from_quotes(
+        configured_venues=["binance"],
+        quotes={"binance:BTCUSDT": deferred},
+        listed_symbols_by_venue={"binance": {"BTCUSDT"}},
+        market_quality_failed_symbols={},
+        observed_at_ms=1_000,
+    )
+    lifecycle = _liquidity_lifecycle_from_quotes(
+        configured_venues=["binance"],
+        quotes={
+            "binance:BTCUSDT": deferred,
+            "binance:ETHUSDT": actual_gap,
+        },
+        listed_symbols_by_venue={"binance": {"BTCUSDT", "ETHUSDT"}},
+        market_quality_failed_symbols={},
+        observed_at_ms=1_000,
+    )
+
+    assert deferred_only[0].coverage_usable == 0
+    assert deferred_only[0].degraded_reason == ""
+    assert lifecycle[0].coverage_usable == 0
+    assert lifecycle[0].degraded_reason == "strict_liquidity_proof_missing:1"

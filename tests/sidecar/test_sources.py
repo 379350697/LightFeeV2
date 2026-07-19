@@ -7,8 +7,8 @@ import time
 
 import pytest
 
-from lightfee.core.domain import Venue
-from lightfee.sidecar.snapshot import QuoteSnapshot
+from lightfee.core.domain import PerpLiquiditySnapshot, Venue
+from lightfee.sidecar.snapshot import QuoteSnapshot, funding_rate_sample_id
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.venues.market_data import FundingTicker
@@ -959,3 +959,127 @@ class TestSidecarServiceRateLimitWiring:
         bybit = next(row for row in results if row[0] == "bybit")
         assert isinstance(bybit[2], RuntimeError)
         assert "market data degradation" in str(bybit[2])
+
+    @pytest.mark.asyncio
+    async def test_liquidity_fetch_does_not_refetch_explicit_deferred_oi_symbols(
+        self, tmp_path
+    ):
+        """Only genuine evidence gaps may reach the slow liquidity source."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        calls: list[list[str]] = []
+
+        class FakeLiquiditySource:
+            async def fetch_perp_liquidity(self, symbols):
+                calls.append(list(symbols))
+                return {}
+
+            async def close(self):
+                return None
+
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT", "ETHUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                venues=[VenueConfig(venue="binance")],
+            )
+        )
+        service._liquidity_sources = {"binance": FakeLiquiditySource()}
+        deferred_btc = PerpLiquiditySnapshot(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            observed_at_ms=1_000,
+            volume_24h_quote=10_000_000.0,
+            open_interest_evidence_status="unavailable",
+            open_interest_evidence_reason="entry_targeted_revalidation_required",
+        )
+
+        try:
+            await service._fetch_liquidity_all_venues(
+                ["BTCUSDT", "ETHUSDT"],
+                timeout_s=0.1,
+                quote_liquidity_by_venue={
+                    "binance": {"binance:BTCUSDT": deferred_btc}
+                },
+            )
+        finally:
+            await service.close()
+
+        assert calls == [["ETHUSDT"]]
+
+    @pytest.mark.asyncio
+    async def test_background_audit_does_not_refetch_fully_deferred_oi_venue(
+        self, tmp_path
+    ):
+        """The producer must put its own deferred marker into the audit map."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+
+        calls: list[list[str]] = []
+
+        class FakeLiquiditySource:
+            async def fetch_perp_liquidity(self, symbols):
+                calls.append(list(symbols))
+                return {}
+
+            async def close(self):
+                return None
+
+        service = SidecarService(
+            AppConfig(
+                symbols=["BTCUSDT"],
+                runtime=RuntimeConfig(
+                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                venues=[VenueConfig(venue="binance")],
+            )
+        )
+        service._liquidity_sources = {"binance": FakeLiquiditySource()}
+        now_ms = int(time.time() * 1_000)
+        funding_timestamp_ms = now_ms + 28_800_000
+        quote = QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            observed_at_ms=now_ms,
+            funding_rate_bps=1.0,
+            funding_rate_observed_at_ms=now_ms,
+            funding_rate_event_at_ms=now_ms,
+            funding_rate_received_at_ms=now_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=funding_rate_sample_id(
+                venue="binance",
+                symbol="BTCUSDT",
+                observed_at_ms=now_ms,
+                rate_bps=1.0,
+                funding_timestamp_ms=funding_timestamp_ms,
+            ),
+            funding_timestamp_ms=funding_timestamp_ms,
+            funding_interval_ms=28_800_000,
+            volume_24h_quote=10_000_000.0,
+            open_interest_evidence_status="unavailable",
+            open_interest_evidence_reason="entry_targeted_revalidation_required",
+        )
+
+        async def fake_funding(_symbols, timeout_s):
+            assert timeout_s > 0.0
+            return [("binance", {"binance:BTCUSDT": quote}, None, set())]
+
+        async def fake_bbo(_symbols):
+            return [("binance", {}, None, set())]
+
+        service._fetch_all_venues = fake_funding
+        service._fetch_funding_entry_bbo_all_venues = fake_bbo
+        try:
+            await service.refresh_once()
+            audit_task = service._audit_publish_task
+            assert audit_task is not None
+            await audit_task
+        finally:
+            await service.close()
+
+        assert calls == []

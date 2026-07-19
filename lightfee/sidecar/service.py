@@ -31,6 +31,7 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
     TransferLifecycle,
+    entry_targeted_oi_revalidation_required,
     funding_rate_evidence_reason,
 )
 from lightfee.spread.quote_snapshot import (
@@ -717,6 +718,41 @@ class SidecarService:
                                 None,
                             ),
                         )
+                    elif _quote_requires_entry_targeted_oi_revalidation(q):
+                        # This quote has usable volume but intentionally omits
+                        # broad-universe OI.  Its strict OI proof belongs to
+                        # live admission for the selected candidate.  Keep it
+                        # in the audit's derived map so the background writer
+                        # does not immediately reintroduce the prohibited
+                        # all-symbol OI scan merely to rediscover this marker.
+                        derived_liquidity[key] = PerpLiquiditySnapshot(
+                            venue=Venue.from_str(
+                                getattr(q, "venue", venue_name) or venue_name
+                            ),
+                            symbol=getattr(
+                                q, "symbol", key.split(":", 1)[-1]
+                            ),
+                            observed_at_ms=int(
+                                getattr(q, "observed_at_ms", 0) or 0
+                            ),
+                            volume_24h_quote=float(volume_value),
+                            open_interest_evidence_status=str(
+                                getattr(
+                                    q,
+                                    "open_interest_evidence_status",
+                                    "unavailable",
+                                )
+                                or "unavailable"
+                            ),
+                            open_interest_evidence_reason=str(
+                                getattr(
+                                    q,
+                                    "open_interest_evidence_reason",
+                                    "",
+                                )
+                                or ""
+                            ),
+                        )
                 if derived_liquidity:
                     quote_liquidity_by_venue[venue_name] = derived_liquidity
 
@@ -1219,6 +1255,22 @@ class SidecarService:
                     transport_errors=liquidity_errors,
                 )
                 audit_diagnostics: dict[str, object] = {}
+                deferred_oi_targets = sorted(
+                    {
+                        (quote.venue.lower(), quote.symbol.upper())
+                        for quote in audit_quotes.values()
+                        if _quote_requires_entry_targeted_oi_revalidation(quote)
+                    }
+                )
+                # Audit consumers need to distinguish an intentional
+                # candidate-scoped OI handoff from a failed source request.
+                # The actual handoff remains fail-closed in live admission.
+                audit_diagnostics[
+                    "entry_targeted_oi_revalidation_required_count"
+                ] = len(deferred_oi_targets)
+                audit_diagnostics[
+                    "entry_targeted_oi_revalidation_required_venues"
+                ] = sorted({venue for venue, _symbol in deferred_oi_targets})
                 loop = asyncio.get_running_loop()
                 executor = getattr(self, "_audit_executor", None)
                 candidates = await loop.run_in_executor(
@@ -2270,6 +2322,20 @@ def _quote_has_strict_liquidity_evidence(quote: QuoteSnapshot) -> bool:
     )
 
 
+def _quote_requires_entry_targeted_oi_revalidation(quote: QuoteSnapshot) -> bool:
+    """Return whether OI is deliberately deferred to live admission.
+
+    This is the shared marker for both compact entry publication and the
+    full-audit path.  It is never a substitute for the runtime's strict OI
+    fetch before an order is admitted.
+    """
+    return entry_targeted_oi_revalidation_required(
+        evidence_status=quote.open_interest_evidence_status,
+        evidence_reason=quote.open_interest_evidence_reason,
+        volume_24h_quote=quote.volume_24h_quote,
+    )
+
+
 def _liquidity_lifecycle_from_quotes(
     *,
     configured_venues: list[str],
@@ -2290,10 +2356,18 @@ def _liquidity_lifecycle_from_quotes(
             if str(quote.venue or "").lower() == venue_key
         ]
         usable = sum(_quote_has_strict_liquidity_evidence(q) for q in venue_quotes)
+        deferred_oi = sum(
+            _quote_requires_entry_targeted_oi_revalidation(q)
+            for q in venue_quotes
+        )
         listed = set(listed_symbols_by_venue.get(venue_key, set()))
         listed.update(str(q.symbol or "").upper() for q in venue_quotes)
         failed = set(market_quality_failed_symbols.get(venue_key, set()))
-        proof_missing = max(len(venue_quotes) - usable, 0)
+        # An explicit deferred marker carries valid volume evidence and is
+        # revalidated by the runtime for the candidate that reaches admission.
+        # It must not be reported as a global strict-proof failure, while all
+        # other missing proof remains fail-closed and visible to the audit.
+        proof_missing = max(len(venue_quotes) - usable - deferred_oi, 0)
         reasons: list[str] = []
         error = transport_errors.get(venue_key)
         if error is not None:
