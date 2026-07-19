@@ -16,6 +16,7 @@ from lightfee.sidecar.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     QuoteSnapshot,
     SidecarSnapshot,
+    entry_targeted_oi_revalidation_required,
     validate_v4_snapshot_contract,
     validate_v5_snapshot_contract,
 )
@@ -572,6 +573,46 @@ def publish_funding_entry_snapshot(
         for key, quote in snapshot.quotes.items()
         if (quote.venue.lower(), quote.symbol.lower()) in targets
     }
+
+    def _requires_targeted_oi_revalidation(quote: QuoteSnapshot) -> bool:
+        """Identify the explicit handoff from sidecar ranking to live admission.
+
+        Binance-compatible venues intentionally omit broad-universe OI from
+        the fast entry snapshot.  The runtime re-fetches it for the selected
+        candidate before admitting an order.  This marker is therefore not a
+        failed liquidity proof; every other absent or malformed proof remains
+        a real compact-snapshot degradation.
+        """
+        return entry_targeted_oi_revalidation_required(
+            evidence_status=quote.open_interest_evidence_status,
+            evidence_reason=quote.open_interest_evidence_reason,
+            volume_24h_quote=quote.volume_24h_quote,
+        )
+
+    def _has_strict_liquidity_evidence(quote: QuoteSnapshot) -> bool:
+        return bool(
+            isfinite(float(quote.volume_24h_quote or 0.0))
+            and float(quote.volume_24h_quote or 0.0) > 0.0
+            and quote.open_interest_evidence_status == "observed"
+            and quote.open_interest is not None
+            and isfinite(float(quote.open_interest))
+            and float(quote.open_interest) >= 0.0
+            and int(quote.open_interest_observed_at_ms or 0) > 0
+            and int(quote.open_interest_received_at_ms or 0)
+            >= int(quote.open_interest_observed_at_ms or 0)
+            and int(quote.open_interest_event_at_ms or 0)
+            <= int(quote.open_interest_received_at_ms or 0) + 5_000
+            and bool(str(quote.open_interest_sample_id or "").strip())
+            and bool(str(quote.open_interest_venue_symbol or "").strip())
+        )
+
+    targeted_oi_revalidation_targets = sorted(
+        {
+            (quote.venue.lower(), quote.symbol.upper())
+            for quote in quotes.values()
+            if _requires_targeted_oi_revalidation(quote)
+        }
+    )
     # The full audit watermark can belong to a quote that is intentionally
     # omitted from this bounded payload.  Bind the compact snapshot's market
     # watermark to the evidence it actually retains; malformed/future quote
@@ -596,6 +637,7 @@ def publish_funding_entry_snapshot(
             venue_quotes = quotes_by_venue.get(row.venue, [])
             if not venue_quotes and targets:
                 continue
+            has_non_deferred_liquidity_failure = False
             if domain == "funding":
                 usable = sum(
                     q.funding_timestamp_ms > 0 and q.funding_interval_ms > 0 for q in venue_quotes
@@ -603,36 +645,28 @@ def publish_funding_entry_snapshot(
             elif domain == "market":
                 usable = sum(q.bid > 0 and q.ask > 0 and q.bid <= q.ask for q in venue_quotes)
             else:
-                usable = sum(
-                    bool(
-                        isfinite(float(q.volume_24h_quote or 0.0))
-                        and float(q.volume_24h_quote or 0.0) > 0.0
-                        and q.open_interest_evidence_status == "observed"
-                        and q.open_interest is not None
-                        and isfinite(float(q.open_interest))
-                        and float(q.open_interest) >= 0.0
-                        and int(q.open_interest_observed_at_ms or 0) > 0
-                        and int(q.open_interest_received_at_ms or 0)
-                        >= int(q.open_interest_observed_at_ms or 0)
-                        and int(q.open_interest_event_at_ms or 0)
-                        <= int(q.open_interest_received_at_ms or 0) + 5_000
-                        and bool(str(q.open_interest_sample_id or "").strip())
-                        and bool(str(q.open_interest_venue_symbol or "").strip())
-                    )
+                usable = sum(_has_strict_liquidity_evidence(q) for q in venue_quotes)
+                has_non_deferred_liquidity_failure = any(
+                    not _has_strict_liquidity_evidence(q)
+                    and not _requires_targeted_oi_revalidation(q)
                     for q in venue_quotes
                 )
             selected_symbol_degraded = any(
                 (row.venue.lower(), str(symbol).lower()) in targets
                 for symbol in snapshot.degraded_symbols.get(row.venue, [])
             )
+            evidence_unavailable = bool(
+                usable < len(venue_quotes)
+                and (domain != "liquidity" or has_non_deferred_liquidity_failure)
+            )
             selected_reason = (
                 row.degraded_reason
-                if (not targets or selected_symbol_degraded or usable < len(venue_quotes))
+                if (not targets or selected_symbol_degraded or evidence_unavailable)
                 else ""
             )
             if (
                 venue_quotes
-                and usable < len(venue_quotes)
+                and evidence_unavailable
                 and not str(selected_reason or "").strip()
             ):
                 selected_reason = f"entry_snapshot_{domain}_evidence_unavailable"
@@ -689,6 +723,15 @@ def publish_funding_entry_snapshot(
         ),
         "seed_frontier_count": int(original_diagnostics.get("seed_frontier_count", 0) or 0),
         "seed_pair_count": int(original_diagnostics.get("seed_pair_count", 0) or 0),
+        # This is intentionally separate from degradation. The runtime owns
+        # this candidate-scoped network proof and blocks the candidate when it
+        # cannot obtain it before the entry deadline.
+        "entry_targeted_oi_revalidation_required_count": len(
+            targeted_oi_revalidation_targets
+        ),
+        "entry_targeted_oi_revalidation_required_venues": sorted(
+            {venue for venue, _symbol in targeted_oi_revalidation_targets}
+        ),
     }
     funding_lifecycle = _lifecycle(snapshot.funding_lifecycle, "funding")
     market_lifecycle = _lifecycle(snapshot.market_lifecycle, "market")

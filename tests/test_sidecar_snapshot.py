@@ -1976,6 +1976,181 @@ def test_funding_entry_snapshot_rebinds_market_watermark_to_retained_quotes(
     assert loaded.candidate_build_observed_at_ms == candidate_build_at_ms
 
 
+@pytest.mark.parametrize(
+    ("oi_status", "oi_reason", "volume_24h_quote", "expect_degraded"),
+    [
+        (
+            "unavailable",
+            "entry_targeted_revalidation_required",
+            10_000_000.0,
+            False,
+        ),
+        ("timeout", "timeout_waiting_for_oi", 10_000_000.0, True),
+        (
+            "unavailable",
+            "entry_targeted_revalidation_required",
+            0.0,
+            True,
+        ),
+    ],
+)
+def test_funding_entry_snapshot_distinguishes_deferred_and_failed_candidate_oi(
+    tmp_path,
+    oi_status,
+    oi_reason,
+    volume_24h_quote,
+    expect_degraded,
+) -> None:
+    """Only the runtime's explicit deferred-OI marker may stay health-neutral.
+
+    Binance-style venue OI is intentionally fetched by the live candidate
+    revalidator.  A transport failure is different: it remains visible in the
+    compact entry health and must continue to fail closed.
+    """
+    now_ms = 10_000
+    funding_timestamp_ms = 20_000
+    quotes: dict[str, QuoteSnapshot] = {}
+    for venue, funding_rate_bps in (("binance", 5.0), ("okx", -5.0)):
+        raw_quote = TestPublisher._complete_v3_contract_quotes()[
+            f"{venue}:BTCUSDT"
+        ]
+        raw_quote.update(
+            observed_at_ms=now_ms,
+            funding_rate_bps=funding_rate_bps,
+            funding_rate_observed_at_ms=now_ms,
+            funding_rate_event_at_ms=now_ms,
+            funding_rate_received_at_ms=now_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=funding_rate_sample_id(
+                venue=venue,
+                symbol="BTCUSDT",
+                observed_at_ms=now_ms,
+                rate_bps=funding_rate_bps,
+                funding_timestamp_ms=funding_timestamp_ms,
+            ),
+            funding_timestamp_ms=funding_timestamp_ms,
+            volume_24h_quote=(
+                volume_24h_quote if venue == "binance" else 10_000_000.0
+            ),
+        )
+        if venue == "binance":
+            raw_quote.update(
+                open_interest=None,
+                open_interest_evidence_status=oi_status,
+                open_interest_evidence_reason=oi_reason,
+                open_interest_observed_at_ms=0,
+                open_interest_event_at_ms=0,
+                open_interest_received_at_ms=now_ms,
+                open_interest_source="binance_style_open_interest",
+                open_interest_sample_id="",
+                open_interest_venue_symbol="BTCUSDT",
+            )
+        else:
+            open_interest = 2_000_000.0
+            raw_quote.update(
+                open_interest=open_interest,
+                open_interest_evidence_status="observed",
+                open_interest_evidence_reason="fixture_observed",
+                open_interest_observed_at_ms=now_ms,
+                open_interest_event_at_ms=now_ms,
+                open_interest_received_at_ms=now_ms,
+                open_interest_source="test_fixture",
+                open_interest_sample_id=open_interest_sample_id(
+                    venue=venue,
+                    canonical_symbol="BTCUSDT",
+                    venue_symbol="BTCUSDT",
+                    observed_at_ms=now_ms,
+                    source="test_fixture",
+                    raw_value=open_interest,
+                    value_quote=open_interest,
+                ),
+                open_interest_venue_symbol="BTCUSDT",
+                raw_open_interest=open_interest,
+                raw_open_interest_unit="quote",
+            )
+        quotes[f"{venue}:BTCUSDT"] = QuoteSnapshot(**raw_quote)
+
+    raw_candidate = TestPublisher._complete_v3_candidate()
+    raw_candidate.update(
+        funding_timestamp_ms=funding_timestamp_ms,
+        first_funding_timestamp_ms=funding_timestamp_ms,
+        long_funding_timestamp_ms=funding_timestamp_ms,
+        short_funding_timestamp_ms=funding_timestamp_ms,
+    )
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        candidate_build_observed_at_ms=now_ms,
+        candidate_build_diagnostics={
+            "input_quote_count": len(quotes),
+            "requested_symbol_count": 1,
+            "requested_symbols": ["BTCUSDT"],
+            "requested_venues": ["binance", "okx"],
+            "directional_pair_count": 1,
+            "output_candidate_count": 1,
+            "future_input_quote_count": 0,
+            "rejection_counts": {},
+            "seed_frontier_complete": True,
+        },
+        source_mode="direct_market",
+        acquisition_mode="fresh_sidecar",
+        funding_lifecycle=[
+            FundingLifecycle(venue, now_ms, 1, 1) for venue in ("binance", "okx")
+        ],
+        market_lifecycle=[
+            MarketLifecycle(venue, now_ms, 1, 1) for venue in ("binance", "okx")
+        ],
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue,
+                now_ms,
+                1,
+                0 if venue == "binance" else 1,
+                "strict_liquidity_proof_missing:1" if venue == "binance" else "",
+            )
+            for venue in ("binance", "okx")
+        ],
+        quotes=quotes,
+        candidates=[CandidateInput(**raw_candidate)],
+    )
+    path = tmp_path / "audit.json"
+
+    publish_funding_entry_snapshot(snapshot, path)
+    loaded = load_funding_entry_snapshot(path)
+
+    assert loaded is not None
+    binance_liquidity = next(
+        row for row in loaded.liquidity_lifecycle if row.venue == "binance"
+    )
+    assert binance_liquidity.coverage_usable == 0
+    assert (
+        loaded.candidate_build_diagnostics[
+            "entry_targeted_oi_revalidation_required_count"
+        ]
+        == (0 if expect_degraded else 1)
+    )
+    from scripts import verify_production_services as vps
+
+    health = vps._funding_entry_snapshot_report(
+        path,
+        now_ms=loaded.ready_at_ms,
+        max_age_ms=1_000,
+    )
+    if expect_degraded:
+        assert loaded.acquisition_mode == "degraded_sidecar"
+        assert loaded.degraded_venues == ["binance"]
+        assert loaded.degraded_domains == ["liquidity"]
+        assert binance_liquidity.degraded_reason == "strict_liquidity_proof_missing:1"
+        assert health.ok is False
+        assert "funding_entry_candidate_evidence_degraded" in health.fingerprints
+    else:
+        assert loaded.acquisition_mode == "fresh_sidecar"
+        assert loaded.degraded_venues == []
+        assert loaded.degraded_domains == []
+        assert binance_liquidity.degraded_reason == ""
+        assert health.ok is True
+
+
 def test_funding_entry_snapshot_blocked_only_generation_is_unavailable(
     tmp_path,
 ) -> None:

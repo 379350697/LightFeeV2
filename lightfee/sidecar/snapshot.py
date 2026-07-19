@@ -95,6 +95,34 @@ _V3_ACQUISITION_MODES = {
     "last_good_sidecar",
     "unavailable",
 }
+ENTRY_TARGETED_OI_REVALIDATION_REASON = "entry_targeted_revalidation_required"
+
+
+def entry_targeted_oi_revalidation_required(
+    *,
+    evidence_status: object,
+    evidence_reason: object,
+    volume_24h_quote: object,
+) -> bool:
+    """Return whether a quote has the explicit, safe OI handoff marker.
+
+    A deferred OI proof is valid only when the otherwise-required liquidity
+    evidence (24-hour quote volume) is present.  This prevents an OI handoff
+    marker from concealing a separate liquidity data failure.
+    """
+    try:
+        volume_valid = bool(
+            isfinite(float(volume_24h_quote or 0.0))
+            and float(volume_24h_quote or 0.0) > 0.0
+        )
+    except (TypeError, ValueError):
+        volume_valid = False
+    return bool(
+        volume_valid
+        and str(evidence_status or "").strip().lower() == "unavailable"
+        and str(evidence_reason or "").strip().lower()
+        == ENTRY_TARGETED_OI_REVALIDATION_REASON
+    )
 
 
 def _validate_snapshot_contract(
@@ -154,6 +182,28 @@ def _validate_snapshot_contract(
             if separator and prefix.strip() == symbol and detail.strip():
                 return True
         return False
+
+    def _is_entry_targeted_oi_revalidation(quote: object) -> bool:
+        if not isinstance(quote, dict):
+            return False
+        return entry_targeted_oi_revalidation_required(
+            evidence_status=quote.get("open_interest_evidence_status"),
+            evidence_reason=quote.get("open_interest_evidence_reason"),
+            volume_24h_quote=quote.get("volume_24h_quote"),
+        )
+
+    targeted_oi_revalidation_symbols_by_venue: dict[str, set[str]] = {}
+    raw_quotes = raw.get("quotes")
+    if isinstance(raw_quotes, dict):
+        for quote in raw_quotes.values():
+            if not _is_entry_targeted_oi_revalidation(quote):
+                continue
+            venue = str(quote.get("venue", "") or "").strip().lower()
+            symbol = str(quote.get("symbol", "") or "").strip().upper()
+            if venue and symbol:
+                targeted_oi_revalidation_symbols_by_venue.setdefault(venue, set()).add(
+                    symbol
+                )
 
     published_at_ms = raw.get("published_at_ms")
     market_observed_at_ms = raw.get("market_observed_at_ms")
@@ -333,7 +383,24 @@ def _validate_snapshot_contract(
                 if lifecycle_field == "transfer_lifecycle"
                 else symbol_count == 0 or coverage_usable < symbol_count
             )
-            if insufficient_coverage and not degraded_reason.strip():
+            deferred_oi_coverage_explained = bool(
+                lifecycle_field == "liquidity_lifecycle"
+                and symbol_count > 0
+                and coverage_usable < symbol_count
+                and coverage_usable
+                + len(
+                    targeted_oi_revalidation_symbols_by_venue.get(
+                        str(record.get("venue", "") or "").lower(),
+                        set(),
+                    )
+                )
+                >= symbol_count
+            )
+            if (
+                insufficient_coverage
+                and not degraded_reason.strip()
+                and not deferred_oi_coverage_explained
+            ):
                 errors.append(
                     f"lifecycle_insufficient_coverage_unexplained:{lifecycle_field}:{index}"
                 )
@@ -605,6 +672,15 @@ def _validate_snapshot_contract(
             if (
                 coverage_usable < len(symbols)
                 and not degraded_reason.strip()
+                and not (
+                    domain == "liquidity"
+                    and coverage_usable
+                    + len(
+                        targeted_oi_revalidation_symbols_by_venue.get(venue, set())
+                        & symbols
+                    )
+                    >= len(symbols)
+                )
             ):
                 errors.append(f"quote_coverage_unproved:{domain}:{venue}")
 
