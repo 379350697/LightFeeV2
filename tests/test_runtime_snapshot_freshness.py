@@ -1959,7 +1959,7 @@ async def test_quote_revalidation_overlay_keeps_ws_that_superseded_delayed_rest(
 
 
 @pytest.mark.asyncio
-async def test_runtime_ws_bbo_quote_revalidate_uses_complete_eligible_frontier(
+async def test_runtime_ws_bbo_quote_revalidate_uses_active_execution_queue(
     tmp_path,
     monkeypatch,
 ):
@@ -2114,26 +2114,31 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_complete_eligible_frontier(
         if record["kind"] == "runtime.entry_quote_revalidate_probe"
     ][-1]
 
-    # The independent preparation generation activates the complete eligible
-    # frontier once; the 750ms evidence phase must not repeat activation.
-    assert prewarm_candidate_counts == [50]
-    assert quote_revalidate_calls == [
-        {
-            "candidate_count": 50,
-            "candidate_scope": "complete_eligible_frontier",
-            "evidence_role": "entry_execution",
-            "skipped_untracked_count": 0,
-        },
+    # Full-pair discovery remains intact, but each live proof batch is
+    # limited to the 2 primary + 1 shadow execution queue.  When a batch is
+    # terminal it may backfill from the full queue, never revalidate all 50
+    # routes at once.
+    assert prewarm_candidate_counts[0] == 3
+    assert all(count <= 27 for count in prewarm_candidate_counts)
+    execution_calls = [
+        call
+        for call in quote_revalidate_calls
+        if call["evidence_role"] == "entry_execution"
     ]
-    assert len(refresher.calls) == 100
-    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "complete_eligible_frontier"
-    assert runtime.state.last_scan["quote_revalidate_candidate_count"] == 50
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 100
-    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 0
-    assert runtime.state.last_scan["quote_prewarm_extra_candidate_count"] == 0
-    assert probe["candidate_scope"] == "complete_eligible_frontier"
-    assert probe["candidate_count"] == 50
-    assert probe["skipped_untracked_count"] == 0
+    assert execution_calls
+    assert all(
+        call["candidate_count"] <= 3
+        and call["candidate_scope"] == "active_execution_queue"
+        for call in execution_calls
+    )
+    assert not any(call["candidate_count"] == 50 for call in quote_revalidate_calls)
+    assert len(refresher.calls) <= 100
+    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "active_execution_queue"
+    assert runtime.state.last_scan["quote_revalidate_candidate_count"] <= 3
+    assert runtime.state.last_scan["quote_revalidate_target_count"] <= 6
+    assert any(call["skipped_untracked_count"] > 0 for call in execution_calls)
+    assert probe["candidate_scope"] == "active_execution_queue"
+    assert probe["candidate_count"] <= 3
 
 
 @pytest.mark.asyncio
@@ -4044,7 +4049,7 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
 
 
 @pytest.mark.asyncio
-async def test_runtime_snapshot_freshness_filter_uses_complete_eligible_frontier(
+async def test_runtime_snapshot_freshness_filter_uses_active_execution_queue(
     tmp_path,
     monkeypatch,
 ):
@@ -4131,14 +4136,18 @@ async def test_runtime_snapshot_freshness_filter_uses_complete_eligible_frontier
     finally:
         runtime.journal.close()
 
-    assert authoritative_filter_counts == [64, 64]
-    assert incremental_filter_counts == [1] * 64
+    assert authoritative_filter_counts[:2] == [8, 8]
+    assert all(count <= 8 for count in authoritative_filter_counts)
+    assert all(count == 1 for count in incremental_filter_counts)
     assert runtime.state.last_scan["snapshot_freshness_filter_candidate_scope"] == (
-        "complete_eligible_frontier"
+        "active_execution_queue"
     )
-    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] == 64
+    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] <= 8
     assert runtime.state.last_scan["snapshot_freshness_filter_all_candidate_count"] == 64
-    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] == 0
+    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] >= 56
+    assert runtime.state.last_scan["complete_eligible_frontier_count"] == 64
+    assert runtime.state.last_scan["active_execution_queue_candidate_count"] <= 8
+    assert runtime.state.last_scan["deferred_execution_queue_candidate_count"] >= 56
 
 
 def test_runtime_snapshot_fallback_health_scope_uses_v1_primary_shadow_candidates(
@@ -5626,7 +5635,7 @@ async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(
 
 
 @pytest.mark.asyncio
-async def test_tick_reselects_beyond_rank_32_after_front_evidence_and_final_failures(
+async def test_tick_backfills_complete_queue_beyond_128_after_front_evidence_failures(
     tmp_path,
     monkeypatch,
 ):
@@ -5654,7 +5663,10 @@ async def test_tick_reselects_beyond_rank_32_after_front_evidence_and_final_fail
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime.entry_executor = object()
-    candidates = [_freshness_candidate(f"RANK{index}USDT") for index in range(40)]
+    # A complete frontier can be much larger than the 6 primary + 2 shadow
+    # execution window.  Every front route below is conclusively rejected;
+    # the only dispatchable route sits past the old Top-128 boundary.
+    candidates = [_freshness_candidate(f"RANK{index}USDT") for index in range(129)]
     snapshot = SidecarSnapshot(
         published_at_ms=69_000,
         market_observed_at_ms=69_000,
@@ -5688,20 +5700,22 @@ async def test_tick_reselects_beyond_rank_32_after_front_evidence_and_final_fail
 
     async def complete_oi(rows, *, evidence_coordinator=None, **_kwargs):
         assert evidence_coordinator is not None
-        for index, _candidate in enumerate(rows):
+        for index, candidate in enumerate(rows):
+            rank = int(str(candidate.symbol)[4:-4])
             evidence_coordinator["open_interest"][index] = (
-                "failed" if index < 16 else "ready"
+                "failed" if rank < 64 else "ready"
             )
         return {}
 
     async def complete_quotes(rows, *, evidence_coordinator=None, **_kwargs):
         assert evidence_coordinator is not None
-        for index, _candidate in enumerate(rows):
+        for index, candidate in enumerate(rows):
+            rank = int(str(candidate.symbol)[4:-4])
             evidence_coordinator["quote"][index] = (
-                "failed" if 16 <= index < 32 else "ready"
+                "failed" if 64 <= rank < 128 else "ready"
             )
             evidence_coordinator["economics"][index] = (
-                "failed" if index < 32 else "ready"
+                "failed" if rank < 128 else "ready"
             )
         evidence_coordinator["selection_ready_event"].set()
         return {}, runtime._entry_quote_truth_empty_stats()
@@ -5751,25 +5765,31 @@ async def test_tick_reselects_beyond_rank_32_after_front_evidence_and_final_fail
 
     dispatch_attempts: list[str] = []
 
-    async def reject_until_rank_39(candidate, *_args, **_kwargs):
+    async def reject_until_rank_128(candidate, *_args, **_kwargs):
         dispatch_attempts.append(candidate.symbol)
-        return candidate.symbol == "RANK39USDT"
+        return candidate.symbol == "RANK128USDT"
 
     monkeypatch.setattr(runtime, "_select_entry_candidates", select_four)
-    monkeypatch.setattr(runtime, "_dispatch_entry", reject_until_rank_39)
+    monkeypatch.setattr(runtime, "_dispatch_entry", reject_until_rank_128)
 
     runtime.journal.open()
     try:
-        await runtime.tick()
+        # Each terminal active page is handed back to the ordinary runtime
+        # loop.  This deliberately proves queue promotion without recursive
+        # tick() re-entry, so every page gets a fresh snapshot/account-truth
+        # generation before it can dispatch.
+        for _ in range(129):
+            await runtime.tick()
+            if dispatch_attempts:
+                break
     finally:
         runtime.journal.close()
 
     assert dispatch_attempts == [
-        candidate.symbol for candidate in candidates[32:]
+        candidate.symbol for candidate in candidates[128:]
     ]
-    assert selection_inputs == [
-        [candidate.symbol for candidate in candidates[32:]],
-        [candidate.symbol for candidate in candidates[36:]],
+    assert [rows[0] for rows in selection_inputs if rows] == [
+        candidate.symbol for candidate in candidates[128:]
     ]
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
 

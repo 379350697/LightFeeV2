@@ -1016,6 +1016,144 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             now_ms=now_ms,
         )
 
+    def test_runtime_ws_bbo_primary_failure_backfills_lower_route(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        """WS-BBO failures must release the active slot without losing discovery."""
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        runtime_with_l2.config.strategy.entry_readiness_provider = (
+            "ws_bbo_quote_lease"
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 0
+        candidates = [
+            self._make_real_candidate(
+                symbol=f"WS{index}USDT",
+                pair_id=f"ws{index}usdt:binance->bybit",
+                ranking_edge_bps=100.0 - index,
+            )
+            for index in range(3)
+        ]
+
+        first, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+        assert first[0].pair_id == "ws0usdt:binance->bybit"
+        assert first[0].class_ == TrackedOpportunityClass.PRIMARY
+        assert runtime_with_l2._record_entry_primary_backfill_failure(
+            candidates[0],
+            reason="entry_quote_revalidation_failed",
+            now_ms=now_ms,
+        )
+
+        reselected, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            candidates
+        )
+        assert reselected[0].pair_id == "ws1usdt:binance->bybit"
+        assert reselected[0].class_ == TrackedOpportunityClass.PRIMARY
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_data_plane_serializes_latest_promoted_scope(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        """A promotion during activation must receive its own BBO scope."""
+        import asyncio
+
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        runtime_with_l2.config.strategy.entry_readiness_provider = (
+            "ws_bbo_quote_lease"
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 0
+        first = self._make_real_candidate(
+            symbol="FIRSTUSDT",
+            pair_id="firstusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+        )
+        promoted = self._make_real_candidate(
+            symbol="NEXTUSDT",
+            pair_id="nextusdt:binance->bybit",
+            ranking_edge_bps=9.0,
+        )
+        first_started = asyncio.Event()
+        allow_first_finish = asyncio.Event()
+        activated_scopes: list[list[str]] = []
+
+        async def activate(rows, _now_ms):
+            activated_scopes.append([candidate.symbol for candidate in rows])
+            if len(activated_scopes) == 1:
+                first_started.set()
+                await allow_first_finish.wait()
+
+        monkeypatch.setattr(
+            runtime_with_l2,
+            "_ensure_entry_bbo_active_for_candidates",
+            activate,
+        )
+
+        runtime_with_l2._schedule_entry_data_plane_preparation([first])
+        await first_started.wait()
+        runtime_with_l2._schedule_entry_data_plane_preparation([promoted])
+        allow_first_finish.set()
+        task = runtime_with_l2._entry_data_plane_preparation_task
+        assert task is not None
+        await task
+
+        assert activated_scopes == [["FIRSTUSDT"], ["NEXTUSDT"]]
+        assert runtime_with_l2._tracked_primary_pair_ids == {
+            "nextusdt:binance->bybit"
+        }
+
+    def test_execution_queue_keeps_unseen_routes_ahead_of_expired_failure(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        """A large frontier cannot restart at rank one when a TTL expires."""
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        candidates = [
+            self._make_real_candidate(
+                symbol=f"QUEUE{index}USDT",
+                pair_id=f"queue{index}usdt:binance->bybit",
+                ranking_edge_bps=100.0 - index,
+            )
+            for index in range(3)
+        ]
+        assert runtime_with_l2._record_entry_primary_backfill_failure(
+            candidates[0],
+            reason="entry_quote_revalidation_failed",
+            now_ms=now_ms,
+        )
+
+        # The transient primary exclusion has elapsed, but this fair-queue
+        # round still owes the two lower-ranked routes their first evidence
+        # attempt before retrying rank one.
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms + 1_000_000,
+        )
+        ordered = runtime_with_l2._ordered_entry_execution_queue(candidates)
+
+        assert [candidate.symbol for candidate in ordered] == [
+            "QUEUE1USDT",
+            "QUEUE2USDT",
+            "QUEUE0USDT",
+        ]
+
     def test_lower_finalization_ready_route_owns_primary_and_reaches_final_selection(
         self,
         runtime_with_l2,

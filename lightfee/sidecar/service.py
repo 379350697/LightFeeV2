@@ -2539,6 +2539,12 @@ def _liquidity_lifecycle_from_quotes(
         listed = set(listed_symbols_by_venue.get(venue_key, set()))
         listed.update(str(q.symbol or "").upper() for q in venue_quotes)
         failed = set(market_quality_failed_symbols.get(venue_key, set()))
+        quoted_symbols = {
+            str(q.symbol or "").upper()
+            for q in venue_quotes
+            if str(q.symbol or "").strip()
+        }
+        unavailable_quote_symbols = (listed | failed) - quoted_symbols
         # An explicit deferred marker carries valid volume evidence and is
         # revalidated by the runtime for the candidate that reaches admission.
         # It must not be reported as a global strict-proof failure, while all
@@ -2550,6 +2556,14 @@ def _liquidity_lifecycle_from_quotes(
             reasons.append(f"transport:{type(error).__name__}:{error}"[:200])
         if failed:
             reasons.append(f"market_failed_symbols:{len(failed)}")
+        if unavailable_quote_symbols:
+            # The authoritative quote data plane intentionally excludes rows
+            # with invalid/stale funding or unusable market identity.  They
+            # remain in the listed-symbol denominator, so record that real
+            # source gap rather than publishing an unexplained coverage hole.
+            reasons.append(
+                f"liquidity_quote_unavailable:{len(unavailable_quote_symbols)}"
+            )
         if proof_missing:
             reasons.append(f"strict_liquidity_proof_missing:{proof_missing}")
         if not venue_quotes:

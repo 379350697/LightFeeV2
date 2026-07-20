@@ -411,6 +411,11 @@ class LiveRuntime:
         # so a repaired route can clear its failure while tracked as shadow or
         # while receiving public quote/OI evidence outside the L2 window.
         self._entry_primary_backfill_failures: dict[str, dict[str, object]] = {}
+        # Stable per-round queue state: a terminally rejected active route is
+        # moved behind every not-yet-tested route.  This is deliberately
+        # independent from the short failure TTL, otherwise a large frontier
+        # can starve below-rank opportunities when early failures expire.
+        self._entry_execution_queue_attempted_pair_ids: set[str] = set()
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
         self._last_entry_l2_readiness_diag_fingerprint: str = ""
         self._last_entry_l2_readiness_diag_ts_ms: int = 0
@@ -440,6 +445,14 @@ class LiveRuntime:
         self._entry_account_truth_ready_at_ms: int = 0
         self._entry_data_plane_preparation_task: asyncio.Task | None = None
         self._entry_data_plane_preparation_key: tuple[str, ...] | None = None
+        # A newer active queue can arrive while the previous data-plane
+        # activation is connecting.  Keep only the latest complete scope and
+        # let the single worker reconcile it before it exits.  This prevents a
+        # backfilled primary from being logically selected without ever being
+        # subscribed on the WS-BBO/L2 data plane.
+        self._entry_data_plane_preparation_pending: (
+            tuple[list, tuple[str, ...]] | None
+        ) = None
         self._prescan_l2_sync_task: asyncio.Task | None = None
         self._snapshot_freshness_decision_last_emit_ms: dict[
             tuple[str, str, str, str, str, str], int
@@ -4450,6 +4463,8 @@ class LiveRuntime:
             return False
         previous = self._entry_primary_backfill_failures.get(pair_id)
         normalized_reason = str(reason or "entry_pair_evidence_failed")
+        if self._entry_execution_queue_terminal_failure(normalized_reason):
+            self._entry_execution_queue_attempted_pair_ids.add(pair_id)
         if (
             previous is not None
             and str(previous.get("reason", "")) == normalized_reason
@@ -4480,7 +4495,59 @@ class LiveRuntime:
             and str(failure.get("reason", "")) not in expected_reasons
         ):
             return False
-        return self._entry_primary_backfill_failures.pop(pair_id, None) is not None
+        cleared = self._entry_primary_backfill_failures.pop(pair_id, None) is not None
+        if cleared:
+            self._entry_execution_queue_attempted_pair_ids.discard(pair_id)
+        return cleared
+
+    @staticmethod
+    def _entry_execution_queue_terminal_failure(reason: str) -> bool:
+        """Whether a route consumed one fair-queue evidence attempt."""
+        normalized = str(reason or "")
+        if normalized in {
+            "entry_quote_revalidation_failed",
+            "entry_open_interest_revalidation_failed",
+            "entry_economics_revalidation_failed",
+            "entry_final_reprice_failed",
+            "entry_final_revalidation_failed",
+        }:
+            return True
+        return normalized in {
+            "entry_ws_bbo_quote_lease_missing_quote",
+            "entry_ws_bbo_quote_lease_stale_quote",
+            "entry_ws_bbo_quote_lease_missing_ws_evidence",
+        }
+
+    def _ordered_entry_execution_queue(self, candidates) -> list:
+        """Return one fair full-frontier queue without ranking-based omission."""
+        source_candidates = list(candidates or [])
+        present_pair_ids = {
+            pair_id
+            for candidate in source_candidates
+            if (pair_id := self._candidate_pair_id(candidate))
+        }
+        self._entry_execution_queue_attempted_pair_ids.intersection_update(
+            present_pair_ids
+        )
+        # A full unsuccessful pass is a new round.  Clear both ordering and
+        # temporary primary exclusions, so every still-present route can be
+        # observed again instead of becoming permanently unselectable.
+        if (
+            present_pair_ids
+            and present_pair_ids.issubset(
+                self._entry_execution_queue_attempted_pair_ids
+            )
+        ):
+            self._entry_execution_queue_attempted_pair_ids.clear()
+            for pair_id in present_pair_ids:
+                self._entry_primary_backfill_failures.pop(pair_id, None)
+        return sorted(
+            source_candidates,
+            key=lambda candidate: (
+                self._candidate_pair_id(candidate)
+                in self._entry_execution_queue_attempted_pair_ids,
+            ),
+        )
 
     def _select_v1_entry_tracked_scope(self, candidates) -> tuple[list, list]:
         """Allocate the primary+shadow L2 window from the full frontier."""
@@ -4496,16 +4563,20 @@ class LiveRuntime:
         )
         shadow_count = max(self.config.strategy.shadow_entry_opportunity_count, 0)
         primary_excluded_pair_ids: set[str] = set()
+        now_ms = wall_clock_now_ms()
+        # A final quote/OI/economics failure belongs to the active execution
+        # queue regardless of whether its readiness source is local L2 or
+        # WS-BBO.  Keep the complete discovery frontier intact, but let the
+        # next queue allocation replace a failed primary with a lower route.
+        # Previously this exclusion was accidentally limited to local L2,
+        # leaving WS-BBO primaries pinned until their lease expired.
+        self._entry_primary_backfill_failures = {
+            pair_id: failure
+            for pair_id, failure in self._entry_primary_backfill_failures.items()
+            if int(failure.get("expires_at_ms", 0) or 0) > now_ms
+        }
+        primary_excluded_pair_ids.update(self._entry_primary_backfill_failures)
         if self._local_l2_effective_enabled():
-            now_ms = wall_clock_now_ms()
-            self._entry_primary_backfill_failures = {
-                pair_id: failure
-                for pair_id, failure in self._entry_primary_backfill_failures.items()
-                if int(failure.get("expires_at_ms", 0) or 0) > now_ms
-            }
-            primary_excluded_pair_ids.update(
-                self._entry_primary_backfill_failures
-            )
             finalization_ready_pair_ids: set[str] = set()
             timestamped_pair_ids: set[str] = set()
             for candidate in source_candidates:
@@ -4661,12 +4732,6 @@ class LiveRuntime:
     def _schedule_entry_data_plane_preparation(self, candidates: list) -> None:
         """Refresh L2/BBO subscriptions independently from safety eligibility."""
         prepared = list(candidates or [])
-        tracked, tracked_candidates = self._select_v1_entry_tracked_scope(prepared)
-        self._tracked_primary_pair_ids = {
-            opportunity.pair_id
-            for opportunity in tracked
-            if opportunity.class_.value == "primary_tracked"
-        }
         generation_key = tuple(sorted(
             self._candidate_pair_id(candidate) for candidate in prepared
         ))
@@ -4679,35 +4744,62 @@ class LiveRuntime:
             self._entry_data_plane_preparation_task = None
             task = None
         if task is not None:
+            # The worker is intentionally single-flight: venue subscription
+            # clients are not safe to race.  It consumes this latest request
+            # before completing, so a queue promotion cannot be stranded on
+            # the old primary scope.
+            self._entry_data_plane_preparation_pending = (
+                prepared,
+                generation_key,
+            )
             return
         if not prepared:
             self._entry_data_plane_preparation_key = generation_key
+            self._entry_data_plane_preparation_pending = None
             return
 
         async def _prepare() -> None:
-            if self._local_l2_effective_enabled() and tracked_candidates:
-                await self._ensure_l2_active_for_candidates(
-                    tracked_candidates,
-                    wall_clock_now_ms(),
-                    tracked_opportunities=tracked,
+            pending_prepared = prepared
+            pending_generation_key = generation_key
+            while True:
+                tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+                    pending_prepared
                 )
-                for opportunity in tracked:
-                    self.entry_l2_sessions.track_opportunity(
-                        opportunity,
+                self._tracked_primary_pair_ids = {
+                    opportunity.pair_id
+                    for opportunity in tracked
+                    if opportunity.class_.value == "primary_tracked"
+                }
+                if self._local_l2_effective_enabled() and tracked_candidates:
+                    await self._ensure_l2_active_for_candidates(
+                        tracked_candidates,
+                        wall_clock_now_ms(),
+                        tracked_opportunities=tracked,
+                    )
+                    for opportunity in tracked:
+                        self.entry_l2_sessions.track_opportunity(
+                            opportunity,
+                            wall_clock_now_ms(),
+                        )
+                    await self._sync_local_l2_data(
+                        wall_clock_now_ms(),
+                        scan_promoted=True,
+                    )
+                    ready_now_ms = wall_clock_now_ms()
+                    self._refresh_entry_l2_session_readiness(ready_now_ms)
+                    self._apply_shadow_promotion_if_eligible(tracked, ready_now_ms)
+                elif self._entry_readiness_provider_uses_ws_bbo():
+                    await self._ensure_entry_bbo_active_for_candidates(
+                        tracked_candidates,
                         wall_clock_now_ms(),
                     )
-                await self._sync_local_l2_data(
-                    wall_clock_now_ms(),
-                    scan_promoted=True,
-                )
-                ready_now_ms = wall_clock_now_ms()
-                self._refresh_entry_l2_session_readiness(ready_now_ms)
-                self._apply_shadow_promotion_if_eligible(tracked, ready_now_ms)
-            elif self._entry_readiness_provider_uses_ws_bbo():
-                await self._ensure_entry_bbo_active_for_candidates(
-                    prepared,
-                    wall_clock_now_ms(),
-                )
+
+                pending = self._entry_data_plane_preparation_pending
+                self._entry_data_plane_preparation_pending = None
+                if pending is None:
+                    return
+                pending_prepared, pending_generation_key = pending
+                self._entry_data_plane_preparation_key = pending_generation_key
 
         self._entry_data_plane_preparation_key = generation_key
         self._entry_data_plane_preparation_task = asyncio.create_task(
@@ -5390,6 +5482,7 @@ class LiveRuntime:
                 with suppress(asyncio.CancelledError):
                     await task
             setattr(self, task_name, None)
+        self._entry_data_plane_preparation_pending = None
         shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + shutdown_timeout_s
@@ -6431,7 +6524,6 @@ class LiveRuntime:
             self.state.last_scan["catalog_admission_balance_passed_count"] = len(
                 tradeable
             )
-            self._schedule_entry_data_plane_preparation(tradeable)
             if (
                 self.config.runtime.mode == "live"
                 and tradeable
@@ -6456,18 +6548,19 @@ class LiveRuntime:
                     },
                 )
                 return
-            entry_quote_keys: set[tuple[str, str]] = set()
-            for candidate in tradeable:
-                symbol = str(getattr(candidate, "symbol", "") or "").upper()
-                if not symbol:
-                    continue
-                for venue_attr in ("long_venue", "short_venue"):
-                    venue = str(getattr(candidate, venue_attr, "") or "").lower()
-                    if venue:
-                        entry_quote_keys.add((venue, symbol))
+            # The whole published frontier remains available to the execution
+            # queue.  V1-compatible failed-route suppression is persisted in
+            # the selector, so the next ordinary tick promotes the next page
+            # without recursively re-entering tick() or reusing stale data.
             l2_tracking_tradeable = list(tradeable)
-            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+            entry_execution_queue_candidates = self._ordered_entry_execution_queue(
                 l2_tracking_tradeable
+            )
+            self._schedule_entry_data_plane_preparation(
+                entry_execution_queue_candidates
+            )
+            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+                entry_execution_queue_candidates
             )
             # Tracking identity belongs to the current ranked frontier even
             # while its background activation generation is still missing a
@@ -6482,15 +6575,49 @@ class LiveRuntime:
             self.state.last_scan["eligible_frontier_balance_passed_count"] = len(
                 l2_tracking_tradeable
             )
-            # Quote/OI operate on the complete eligible frontier; rows
-            # outside the scarce L2 primary/shadow pool are no longer a
-            # separate evidence-prewarm class.
-            prewarm_extra_candidates: list = []
-            self.state.last_scan["quote_prewarm_extra_candidate_count"] = 0
+            # Discovery stays complete: ``l2_tracking_tradeable`` is the
+            # full V7 eligible frontier and remains the source of every later
+            # queue allocation.  Only network revalidation is bounded to the
+            # active primary+shadow window; optional prewarm is best-effort
+            # background work and never determines opportunity discovery.
+            prewarm_extra_candidates = self._select_entry_prewarm_extra_candidates(
+                l2_tracking_tradeable,
+                tracked_candidates,
+            )
+            self.state.last_scan["complete_eligible_frontier_count"] = len(
+                l2_tracking_tradeable
+            )
+            self.state.last_scan["active_execution_queue_candidate_count"] = len(
+                tracked_candidates
+            )
+            self.state.last_scan["deferred_execution_queue_candidate_count"] = max(
+                len(l2_tracking_tradeable) - len(tracked_candidates),
+                0,
+            )
+            self.state.last_scan["entry_execution_queue_attempted_count"] = len(
+                self._entry_execution_queue_attempted_pair_ids
+            )
+            self.state.last_scan["quote_prewarm_extra_candidate_count"] = len(
+                prewarm_extra_candidates
+            )
             self.state.last_scan["quote_prewarm_extra_target_count"] = 0
             self.state.last_scan["quote_prewarm_extra_resolved_count"] = 0
             self.state.last_scan["quote_prewarm_extra_failed_count"] = 0
-            if l2_tracking_tradeable:
+            entry_quote_keys: set[tuple[str, str]] = set()
+            for candidate in tracked_candidates:
+                symbol = str(getattr(candidate, "symbol", "") or "").upper()
+                if not symbol:
+                    continue
+                for venue_attr in ("long_venue", "short_venue"):
+                    venue = str(getattr(candidate, venue_attr, "") or "").lower()
+                    if venue:
+                        entry_quote_keys.add((venue, symbol))
+            snapshot_freshness_metrics: dict = {}
+            snapshot_freshness_ages: dict = {}
+            snapshot_freshness_budgets: dict = {}
+            snapshot_freshness_publish_intervals: dict = {}
+            snapshot_freshness_status: dict = {}
+            if tracked_candidates:
                 (
                     snapshot_freshness_metrics,
                     snapshot_freshness_ages,
@@ -6499,7 +6626,7 @@ class LiveRuntime:
                     snapshot_freshness_status,
                 ) = self._snapshot_freshness_observability(
                     snapshot=snapshot,
-                    candidates=l2_tracking_tradeable,
+                    candidates=tracked_candidates,
                     now_ms=now_ms,
                 )
                 self.state.last_scan["snapshot_freshness_metrics"] = (
@@ -6518,15 +6645,18 @@ class LiveRuntime:
                     snapshot_freshness_status
                 )
                 self.state.last_scan["snapshot_freshness_candidate_scope"] = (
-                    "complete_eligible_frontier"
+                    "active_execution_queue"
                 )
                 self.state.last_scan["snapshot_freshness_candidate_count"] = len(
-                    l2_tracking_tradeable
+                    tracked_candidates
                 )
                 self.state.last_scan["snapshot_freshness_all_candidate_count"] = len(
                     l2_tracking_tradeable
                 )
-                self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = 0
+                self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = max(
+                    len(l2_tracking_tradeable) - len(tracked_candidates),
+                    0,
+                )
             entry_bbo_prewarm_attempted = (
                 self._entry_readiness_provider_uses_ws_bbo()
                 and bool(tracked_candidates)
@@ -6540,7 +6670,7 @@ class LiveRuntime:
                     now_ms=now_ms,
                 )
                 tracked_quote_targets = self._entry_quote_revalidate_targets(
-                    l2_tracking_tradeable,
+                    tracked_candidates,
                     snapshot=snapshot,
                     now_ms=now_ms,
                 )
@@ -6556,8 +6686,8 @@ class LiveRuntime:
                     - prewarm_extra_quote_target_count,
                     0,
                 )
-            entry_freshness_filter_candidates = l2_tracking_tradeable
-            entry_freshness_filter_scope = "complete_eligible_frontier"
+            entry_freshness_filter_candidates = tracked_candidates
+            entry_freshness_filter_scope = "active_execution_queue"
             self.state.last_scan["snapshot_freshness_filter_candidate_scope"] = (
                 entry_freshness_filter_scope
             )
@@ -6750,12 +6880,12 @@ class LiveRuntime:
                         entry_freshness_filter_candidates,
                         snapshot=snapshot,
                         now_ms=now_ms,
-                        candidate_scope="complete_eligible_frontier",
+                        candidate_scope=entry_freshness_filter_scope,
                         skipped_untracked_count=skipped_untracked_quote_count,
                         evidence_role="entry_execution",
                         # The completed preparation generation already
-                        # activated the tracked data plane.  L2 ownership must
-                        # never decide whether the full frontier gets final BBO evidence.
+                        # activated the active primary+shadow data plane.
+                        # The full frontier remains queued for later backfill.
                         activation_candidates=[],
                         evidence_coordinator=evidence_coordinator,
                     )
@@ -6879,22 +7009,23 @@ class LiveRuntime:
                         )
                         continue
                     pair_id = self._candidate_pair_id(candidate)
-                    session = self.entry_l2_sessions.sessions.get(pair_id)
-                    primary_l2_ready = (
-                        self._local_l2_effective_enabled()
-                        and pair_id in self._tracked_primary_pair_ids
-                        and session is not None
-                        and session.both_legs_ready(
-                            failure_now_ms,
-                            self._entry_local_l2_stale_after_ms(),
-                        )
-                    )
-                    if not primary_l2_ready:
-                        # Bootstrap/promotion owns this case.  Public evidence
-                        # cannot evict a primary until its scarce L2 resource
-                        # is actually ready; otherwise every first activation
-                        # churns before the books have a chance to arm.
+                    if pair_id not in self._tracked_primary_pair_ids:
                         continue
+                    if self._local_l2_effective_enabled():
+                        session = self.entry_l2_sessions.sessions.get(pair_id)
+                        primary_l2_ready = (
+                            session is not None
+                            and session.both_legs_ready(
+                                failure_now_ms,
+                                self._entry_local_l2_stale_after_ms(),
+                            )
+                        )
+                        if not primary_l2_ready:
+                            # Bootstrap/promotion owns this case.  Public
+                            # evidence cannot evict a primary until its scarce
+                            # L2 resource is actually ready; otherwise every
+                            # first activation churns before books can arm.
+                            continue
                     if quote_state == "failed":
                         changed = self._record_entry_primary_backfill_failure(
                             candidate,
@@ -6915,7 +7046,9 @@ class LiveRuntime:
                         ) or changed
                 if changed and self._local_l2_effective_enabled():
                     self._schedule_entry_data_plane_preparation(
-                        l2_tracking_tradeable
+                        self._ordered_entry_execution_queue(
+                            l2_tracking_tradeable
+                        )
                     )
                 return changed
 
@@ -7092,7 +7225,9 @@ class LiveRuntime:
                 and self._local_l2_effective_enabled()
             ):
                 self._schedule_entry_data_plane_preparation(
-                    l2_tracking_tradeable
+                    self._ordered_entry_execution_queue(
+                        l2_tracking_tradeable
+                    )
                 )
             tradeable = self._filter_expired_entry_candidate_leases(
                 tradeable,
@@ -7104,6 +7239,78 @@ class LiveRuntime:
             now_ms = wall_clock_now_ms()
             if not tradeable:
                 await _settle_entry_evidence_tasks(wait=False)
+                # The primary+shadow pool limits concurrent proof work, not
+                # opportunity discovery.  Persist terminal failures so the
+                # next ordinary V1 scan promotes the next rows from the
+                # complete frontier.  Do not recursively re-enter tick(): a
+                # fresh scan must establish its own snapshot/account truth.
+                backfill_excluded_pair_ids: set[str] = set()
+                newly_excluded_pair_ids: set[str] = set()
+                quote_states = evidence_coordinator.get("quote", {})
+                oi_states = evidence_coordinator.get("open_interest", {})
+                for index, candidate in enumerate(
+                    entry_freshness_filter_candidates
+                ):
+                    pair_id = self._candidate_pair_id(candidate)
+                    if not pair_id or pair_id in backfill_excluded_pair_ids:
+                        continue
+                    if quote_states.get(index) == "failed":
+                        reason = "entry_quote_revalidation_failed"
+                    elif oi_states.get(index) == "failed":
+                        reason = "entry_open_interest_revalidation_failed"
+                    else:
+                        continue
+                    self._record_entry_primary_backfill_failure(
+                        candidate,
+                        reason=reason,
+                        now_ms=wall_clock_now_ms(),
+                    )
+                    backfill_excluded_pair_ids.add(pair_id)
+                    newly_excluded_pair_ids.add(pair_id)
+                for candidate in pre_reprice_tradeable:
+                    pair_id = self._candidate_pair_id(candidate)
+                    if (
+                        not pair_id
+                        or pair_id in repriced_pair_ids
+                        or pair_id in backfill_excluded_pair_ids
+                    ):
+                        continue
+                    self._record_entry_primary_backfill_failure(
+                        candidate,
+                        reason="entry_final_reprice_failed",
+                        now_ms=wall_clock_now_ms(),
+                    )
+                    backfill_excluded_pair_ids.add(pair_id)
+                    newly_excluded_pair_ids.add(pair_id)
+                remaining_backfill_count = sum(
+                    self._candidate_pair_id(candidate)
+                    not in backfill_excluded_pair_ids
+                    for candidate in l2_tracking_tradeable
+                )
+                if (
+                    newly_excluded_pair_ids
+                    and remaining_backfill_count > 0
+                    and not self._local_l2_effective_enabled()
+                ):
+                    self.journal.append(
+                        "runtime.entry_execution_queue_backfill",
+                        {
+                            "complete_eligible_frontier_count": len(
+                                l2_tracking_tradeable
+                            ),
+                            "failed_batch_candidate_count": len(
+                                newly_excluded_pair_ids
+                            ),
+                            "remaining_queue_candidate_count": (
+                                remaining_backfill_count
+                            ),
+                            "active_execution_queue_candidate_count": len(
+                                tracked_candidates
+                            ),
+                            "handoff": "next_full_tick",
+                            "ts_ms": wall_clock_now_ms(),
+                        },
+                    )
                 evidence_deadline_count = int(
                     self.state.last_scan.get(
                         "entry_evidence_deadline_exceeded_count",
@@ -7216,7 +7423,7 @@ class LiveRuntime:
                 for candidate in tradeable:
                     pair_id = self._candidate_pair_id(candidate)
                     blocker = str(candidate_blockers.get(pair_id, "") or "")
-                    if not blocker.startswith("entry_ws_bbo_quote_lease_"):
+                    if not self._entry_execution_queue_terminal_failure(blocker):
                         continue
                     selection_failure_state_changed = (
                         self._record_entry_primary_backfill_failure(
@@ -7231,7 +7438,9 @@ class LiveRuntime:
                     and self._local_l2_effective_enabled()
                 ):
                     self._schedule_entry_data_plane_preparation(
-                        l2_tracking_tradeable
+                        self._ordered_entry_execution_queue(
+                            l2_tracking_tradeable
+                        )
                     )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = 0
@@ -7434,12 +7643,51 @@ class LiveRuntime:
                     if not attempted_fallback:
                         break
                 await _settle_entry_evidence_tasks(wait=False)
+                attempted_backfill_pair_ids = {
+                    pair_id
+                    for pair_id in attempted_pair_ids
+                    if pair_id
+                }
+                remaining_dispatch_backfill_count = sum(
+                    self._candidate_pair_id(candidate)
+                    not in attempted_backfill_pair_ids
+                    for candidate in l2_tracking_tradeable
+                )
+                if (
+                    dispatched == 0
+                    and attempted_backfill_pair_ids
+                    and not account_truth_blocked_before_dispatch
+                    and remaining_dispatch_backfill_count > 0
+                    and not self._local_l2_effective_enabled()
+                ):
+                    self.journal.append(
+                        "runtime.entry_execution_queue_backfill",
+                        {
+                            "complete_eligible_frontier_count": len(
+                                l2_tracking_tradeable
+                            ),
+                            "failed_batch_candidate_count": len(
+                                attempted_backfill_pair_ids
+                            ),
+                            "remaining_queue_candidate_count": (
+                                remaining_dispatch_backfill_count
+                            ),
+                            "active_execution_queue_candidate_count": len(
+                                tracked_candidates
+                            ),
+                            "reason": "entry_final_revalidation_failed",
+                            "handoff": "next_full_tick",
+                            "ts_ms": wall_clock_now_ms(),
+                        },
+                    )
                 if (
                     dispatch_failure_state_changed
                     and self._local_l2_effective_enabled()
                 ):
                     self._schedule_entry_data_plane_preparation(
-                        l2_tracking_tradeable
+                        self._ordered_entry_execution_queue(
+                            l2_tracking_tradeable
+                        )
                     )
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
                 if dispatched > 0:

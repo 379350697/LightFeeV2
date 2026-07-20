@@ -19,6 +19,7 @@ from lightfee.sidecar.service import (
     SidecarService,
     _canonical_venue_configs,
     _canonicalize_venue_quotes,
+    _liquidity_lifecycle_from_quotes,
     _market_failure_reasons,
     _quote_cache_contract_eligible,
     _restorable_prior_last_good_quotes,
@@ -111,6 +112,37 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
 
     assert first == second
     assert id(service._allocator) == allocator_id
+
+
+def test_liquidity_lifecycle_explains_source_quote_excluded_from_data_plane() -> None:
+    """Listed symbols without an executable quote must not publish a blank gap."""
+    quote = QuoteSnapshot(
+        venue="okx",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest=2_000_000.0,
+        open_interest_evidence_status="observed",
+        open_interest_observed_at_ms=10_000,
+        open_interest_event_at_ms=10_000,
+        open_interest_received_at_ms=10_000,
+        open_interest_source="okx_open_interest",
+        open_interest_sample_id="okx:BTCUSDT:10000",
+        open_interest_venue_symbol="BTC-USDT-SWAP",
+    )
+
+    lifecycle = _liquidity_lifecycle_from_quotes(
+        configured_venues=["okx"],
+        quotes={"okx:BTCUSDT": quote},
+        listed_symbols_by_venue={"okx": {"BTCUSDT", "ETHUSDT"}},
+        market_quality_failed_symbols={},
+        observed_at_ms=10_000,
+    )
+
+    assert lifecycle[0].symbol_count == 2
+    assert lifecycle[0].coverage_usable == 1
+    assert lifecycle[0].degraded_reason == "liquidity_quote_unavailable:1"
 
 
 def test_canary_conservative_tier_defers_symbol_specific_buffer_to_pairing(
