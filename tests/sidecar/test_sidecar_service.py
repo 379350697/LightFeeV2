@@ -24,7 +24,12 @@ from lightfee.sidecar.service import (
     _quote_cache_contract_eligible,
     _restorable_prior_last_good_quotes,
 )
-from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
+from lightfee.sidecar.snapshot import (
+    CandidateInput,
+    LiquidityLifecycle,
+    QuoteSnapshot,
+    SidecarSnapshot,
+)
 
 
 def _schedule_audit_build(
@@ -38,10 +43,6 @@ def _schedule_audit_build(
         quotes={},
         symbols=[],
         observed_at_ms=snapshot.published_at_ms,
-        quote_liquidity_by_venue={},
-        skip_venues=set(),
-        listed_symbols_by_venue={},
-        market_quality_failed_symbols={},
     )
 
 
@@ -490,16 +491,11 @@ async def test_audit_writer_is_nonblocking_and_drops_overlapping_generations(
     service = object.__new__(SidecarService)
     service.config = AppConfig(venues=[])
     service.snapshot_path = tmp_path / "sidecar.json"
-    service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
     service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
-    async def no_liquidity(*_args, **_kwargs):
-        return []
-
-    service._fetch_liquidity_all_venues = no_liquidity
     service._configured_venue_names = lambda: []
     started = threading.Event()
     release = threading.Event()
@@ -600,16 +596,11 @@ async def test_audit_failure_does_not_poison_next_generation(
     service = object.__new__(SidecarService)
     service.config = AppConfig(venues=[])
     service.snapshot_path = tmp_path / "sidecar.json"
-    service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
     service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
-    async def no_liquidity(*_args, **_kwargs):
-        return []
-
-    service._fetch_liquidity_all_venues = no_liquidity
     service._configured_venue_names = lambda: []
 
     class FailingBuilder:
@@ -656,6 +647,62 @@ async def test_audit_failure_does_not_poison_next_generation(
 
 
 @pytest.mark.asyncio
+async def test_audit_preserves_symbol_scoped_liquidity_degradation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(venues=[])
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
+    service._audit_executor = ThreadPoolExecutor(max_workers=1)
+
+    class EmptyBuilder:
+        def build(self, *_args, **_kwargs):
+            return []
+
+    published: list[SidecarSnapshot] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_snapshot",
+        lambda snapshot, _path: published.append(snapshot),
+    )
+    entry_snapshot = SidecarSnapshot(
+        published_at_ms=1,
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=1,
+                symbol_count=5,
+                coverage_usable=4,
+                degraded_reason="liquidity_quote_unavailable:1",
+            )
+        ],
+        degraded_venues=[],
+        degraded_domains=[],
+        degraded_symbols={"okx": ["MISSINGUSDT"]},
+    )
+
+    try:
+        _schedule_audit_build(service, entry_snapshot, EmptyBuilder())
+        task = service._audit_publish_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        service._audit_executor.shutdown(wait=True, cancel_futures=True)
+
+    assert len(published) == 1
+    audited = published[0]
+    assert audited.degraded_venues == []
+    assert audited.degraded_domains == []
+    assert audited.degraded_symbols == {"okx": ["MISSINGUSDT"]}
+    assert audited.liquidity_lifecycle[0].degraded_reason == (
+        "liquidity_quote_unavailable:1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_blocked_audit_without_hanging() -> None:
     service = object.__new__(SidecarService)
     service._entry_venue_fetch_tasks = {}
@@ -664,7 +711,6 @@ async def test_close_cancels_blocked_audit_without_hanging() -> None:
     service._audit_pending_build = {"snapshot": object()}
     service._exchange_sources = {}
     service._spread_bbo_sources = {}
-    service._liquidity_sources = {}
     cancelled = asyncio.Event()
 
     async def blocked_audit() -> None:
@@ -864,16 +910,7 @@ async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
             ),
         ]
 
-    async def liquidity_results(
-        symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None,
-    ):
-        return [
-            ("binance", {"binance:BTCUSDT": object()}, None, set()),
-            ("okx", {"okx:BTCUSDT": object()}, None, set()),
-        ]
-
     service._fetch_all_venues = funding_results
-    service._fetch_liquidity_all_venues = liquidity_results
     clock = iter([1.0, 1.5, 2.0, 3.0])
     monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
 
