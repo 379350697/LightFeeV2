@@ -5967,8 +5967,20 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     budgets = phase_budgets_from_strategy()
     horizon_ms = 0
     artifacts: dict[str, dict[str, Any]] = {}
+    # Candidate discovery is an observation before an entry has a durable
+    # order/position identity.  Keep fallback pair-id observations in a
+    # separate run-scoped map, otherwise the same pair in a later deployment
+    # can overwrite an earlier deployment's lease policy in ``artifacts``.
+    candidate_phase_artifacts: dict[str, dict[str, Any]] = {}
+    active_candidate_phase_artifact_ids: dict[str, str] = {}
     quote_rewarm_scheduled: list[tuple[int, tuple[str, str], dict[str, Any]]] = []
     quote_rewarm_followups: list[tuple[int, str, tuple[str, str], dict[str, Any]]] = []
+    # Logs written before the full-frontier fix have no policy marker and keep
+    # their historical candidate-lease interpretation. New runtime starts mark
+    # the old pre-evidence lease as retired, so repeated candidate revisions
+    # are not misreported as a missing lifecycle handoff.
+    candidate_discovery_lease_enforced = True
+    candidate_policy_scope = "legacy"
 
     def artifact_for(artifact_id: str) -> dict[str, Any]:
         return artifacts.setdefault(
@@ -5987,9 +5999,70 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
                 "recovery_terminal_at_ms": 0,
                 "candidate_created_at_ms": 0,
                 "candidate_terminal_at_ms": 0,
+                "candidate_discovery_lease_enforced": True,
                 "maker_resting": False,
                 "observed_actions": {},
             },
+        )
+
+    def candidate_phase_artifact_for(
+        artifact_id: str,
+        *,
+        base_artifact_id: str,
+    ) -> dict[str, Any]:
+        return candidate_phase_artifacts.setdefault(
+            artifact_id,
+            {
+                # Keep the public diagnostic id familiar while the internal
+                # map key adds the run scope needed for fallback pair ids.
+                "artifact_id": base_artifact_id,
+                "symbol": "",
+                "venue": "",
+                "candidate_created_at_ms": 0,
+                "candidate_terminal_at_ms": 0,
+                "candidate_discovery_lease_enforced": True,
+                "observed_actions": {},
+            },
+        )
+
+    def has_stable_candidate_artifact_id(payload: dict[str, Any]) -> bool:
+        """Return whether the normal artifact id is unique across runs."""
+        return any(
+            payload.get(field)
+            for field in (
+                "entry_id",
+                "pending_id",
+                "position_id",
+                "internal_entry_id",
+                "candidate_id",
+                "recovery_id",
+            )
+        )
+
+    def candidate_phase_artifact(
+        artifact: dict[str, Any],
+        *,
+        base_artifact_id: str,
+        payload: dict[str, Any],
+        create: bool,
+    ) -> dict[str, Any] | None:
+        """Resolve the candidate lifecycle without joining fallback pairs across runs."""
+        if has_stable_candidate_artifact_id(payload):
+            candidate_phase_artifacts.setdefault(
+                f"stable_candidate_phase:{base_artifact_id}",
+                artifact,
+            )
+            return artifact
+        if create:
+            scoped_id = f"candidate_phase:{candidate_policy_scope}:{base_artifact_id}"
+            active_candidate_phase_artifact_ids[base_artifact_id] = scoped_id
+        else:
+            scoped_id = active_candidate_phase_artifact_ids.get(base_artifact_id)
+        if scoped_id is None:
+            return None
+        return candidate_phase_artifact_for(
+            scoped_id,
+            base_artifact_id=base_artifact_id,
         )
 
     def note_observed_action(
@@ -6077,6 +6150,13 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         ts_ms = _event_ts_ms(rec, payload)
         horizon_ms = max(horizon_ms, ts_ms)
         kind = str(rec.get("kind") or "")
+        if kind == "startup.strategy_entry_policy":
+            configured = payload.get("candidate_discovery_lease_enforced")
+            if isinstance(configured, bool):
+                candidate_discovery_lease_enforced = configured
+                candidate_policy_scope = str(
+                    payload.get("run_id") or f"startup:{ts_ms}"
+                )
         venue_symbol_key = _event_venue_symbol_key(payload)
         if (
             kind == "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
@@ -6112,14 +6192,43 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             current = int(artifact["submitted_at_ms"] or 0)
             artifact["submitted_at_ms"] = min(current or ts_ms, ts_ms)
         if kind in candidate_start_kinds:
-            current = int(artifact["candidate_created_at_ms"] or 0)
-            artifact["candidate_created_at_ms"] = min(current or ts_ms, ts_ms)
+            candidate_artifact = candidate_phase_artifact(
+                artifact,
+                base_artifact_id=artifact_id,
+                payload=payload,
+                create=True,
+            )
+            assert candidate_artifact is not None
+            if symbol and not candidate_artifact["symbol"]:
+                candidate_artifact["symbol"] = symbol
+            if venue and not candidate_artifact["venue"]:
+                candidate_artifact["venue"] = venue
+            current = int(candidate_artifact["candidate_created_at_ms"] or 0)
+            candidate_artifact["candidate_created_at_ms"] = min(
+                current or ts_ms,
+                ts_ms,
+            )
+            candidate_artifact["candidate_discovery_lease_enforced"] = (
+                candidate_discovery_lease_enforced
+            )
         elif (
             kind in candidate_terminal_kinds
-            and int(artifact["candidate_created_at_ms"] or 0)
         ):
-            current = int(artifact["candidate_terminal_at_ms"] or 0)
-            artifact["candidate_terminal_at_ms"] = min(current or ts_ms, ts_ms)
+            candidate_artifact = candidate_phase_artifact(
+                artifact,
+                base_artifact_id=artifact_id,
+                payload=payload,
+                create=False,
+            )
+            if (
+                candidate_artifact is not None
+                and int(candidate_artifact["candidate_created_at_ms"] or 0)
+            ):
+                current = int(candidate_artifact["candidate_terminal_at_ms"] or 0)
+                candidate_artifact["candidate_terminal_at_ms"] = min(
+                    current or ts_ms,
+                    ts_ms,
+                )
         if kind == "runtime.pending_entry_registered":
             artifact["pending_created_at_ms"] = ts_ms
             outcome = str(payload.get("outcome") or "")
@@ -6152,9 +6261,23 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         if kind == "runtime.entry_selected_submit_deadline_exceeded":
             note_observed_action(artifact, "selected_pre_submit", kind)
         if kind == "runtime.candidate_lease_expired":
-            note_observed_action(artifact, "candidate_lease", kind)
+            candidate_artifact = candidate_phase_artifact(
+                artifact,
+                base_artifact_id=artifact_id,
+                payload=payload,
+                create=False,
+            )
+            if candidate_artifact is not None:
+                note_observed_action(candidate_artifact, "candidate_lease", kind)
         if kind == "runtime.candidate_symbol_skipped":
-            note_observed_action(artifact, "candidate_lease", kind)
+            candidate_artifact = candidate_phase_artifact(
+                artifact,
+                base_artifact_id=artifact_id,
+                payload=payload,
+                create=False,
+            )
+            if candidate_artifact is not None:
+                note_observed_action(candidate_artifact, "candidate_lease", kind)
         if kind in {
             "passive_maintenance.cancel_rest_timeout",
             "passive_maintenance.cancel_try_window",
@@ -6240,15 +6363,6 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         close_terminal_at_ms = int(artifact["close_terminal_at_ms"] or 0)
         recovery_created_at_ms = int(artifact["recovery_created_at_ms"] or 0)
         recovery_terminal_at_ms = int(artifact["recovery_terminal_at_ms"] or 0)
-        candidate_created_at_ms = int(artifact["candidate_created_at_ms"] or 0)
-        candidate_terminal_at_ms = int(artifact["candidate_terminal_at_ms"] or 0)
-
-        add_record(
-            artifact,
-            "candidate_lease",
-            candidate_created_at_ms,
-            candidate_terminal_at_ms,
-        )
         selected_pre_submit_end_ms = min(
             (
                 value
@@ -6298,6 +6412,15 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             recovery_created_at_ms,
             recovery_terminal_at_ms,
         )
+
+    for artifact in candidate_phase_artifacts.values():
+        if bool(artifact.get("candidate_discovery_lease_enforced", True)):
+            add_record(
+                artifact,
+                "candidate_lease",
+                int(artifact["candidate_created_at_ms"] or 0),
+                int(artifact["candidate_terminal_at_ms"] or 0),
+            )
 
     for scheduled_at_ms, key, _payload in quote_rewarm_scheduled:
         terminal_at_ms = 0

@@ -448,6 +448,8 @@ class StrategyConfig:
     pending_entry_phase_zero_fill_budget: int = 2
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
+    # Legacy diagnostic compatibility only. Full-frontier revalidation must
+    # not use this as a candidate-discovery cutoff.
     candidate_lease_ms: int = 60000
     selected_submit_deadline_ms: int = 15000
     maker_resting_soft_ms: int = 30000

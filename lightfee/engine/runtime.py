@@ -60,7 +60,6 @@ from lightfee.engine.lifecycle import (
     transition_to_reconciling,
 )
 from lightfee.engine.business_contract import pending_entry_has_unhedged_maker_exposure
-from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.loop_control import (
     ExportState,
     build_current_state_snapshot_payload,
@@ -432,8 +431,6 @@ class LiveRuntime:
         self._last_entry_admission_filter_samples: list[dict] = []
         self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
         self._last_snapshot_freshness_filter_samples: list[dict] = []
-        self._entry_candidate_lease_started_at_ms: dict[str, int] = {}
-        self._entry_candidate_lease_last_seen_at_ms: dict[str, int] = {}
         self._funding_canary_clamp_event_keys: dict[str, int] = {}
         self._entry_preparation_task: asyncio.Task | None = None
         self._entry_preparation_key: tuple[str, ...] | None = None
@@ -2213,6 +2210,10 @@ class LiveRuntime:
             "funding_economics_mode": self.config.strategy.funding_economics_mode,
             "funding_forecast_mode": self.config.strategy.funding_forecast_mode,
             "live_economics_required": self.config.runtime.mode == "live",
+            # Full-frontier discovery is revalidated on every generation.
+            # Persistent pending-order/exchange-truth state, rather than a
+            # pre-evidence candidate timeout, owns duplicate-submit safety.
+            "candidate_discovery_lease_enforced": False,
             "spread_live_enabled": self.config.strategy.spread_live_enabled is True,
             "spread_paper_enabled": self.config.strategy.spread_paper_enabled is True,
             "ts_ms": self.state.started_at_ms,
@@ -2233,7 +2234,20 @@ class LiveRuntime:
 
         # Phase 3 – Recover or start fresh
         self.state = recover_from_snapshot(self.snapshot_store, self.journal)
-        self._restore_entry_opportunity_lease_ledger()
+        retired_candidate_lease_count = (
+            self._retire_legacy_entry_opportunity_lease_ledger()
+        )
+        if retired_candidate_lease_count:
+            self.journal.append(
+                "runtime.entry_candidate_lease_ledger_retired",
+                {
+                    "retired_row_count": retired_candidate_lease_count,
+                    "reason": "candidate_discovery_lease_removed",
+                    "action_taken": "clear_legacy_tombstones_and_revalidate_full_frontier",
+                    "ts_ms": wall_clock_now_ms(),
+                },
+                flush=True,
+            )
         self.state.hyperliquid_trading_disabled_reason = (
             hyperliquid_trading_disabled_reason
         )
@@ -3019,179 +3033,23 @@ class LiveRuntime:
             skip_event_kind=skip_event_kind,
         )
 
-    def _filter_expired_entry_candidate_leases(
-        self,
-        candidates: list,
-        *,
-        now_ms: int,
-    ) -> list:
-        budget = phase_budgets_from_strategy(self.config.strategy)["candidate_lease"]
-        hard_ms = int(budget.hard_ms or 0)
-        if hard_ms <= 0:
-            return list(candidates)
+    def _retire_legacy_entry_opportunity_lease_ledger(self) -> int:
+        """Clear obsolete pre-evidence candidate tombstones during recovery.
 
-        active_keys: set[str] = set()
-        allowed: list = []
-        expired_count = 0
-        for candidate in candidates:
-            pair_id = self._candidate_pair_id(candidate)
-            if not pair_id:
-                allowed.append(candidate)
-                continue
-            revision_id = self._bind_entry_candidate_revision_id(candidate)
-            lease_key = self._bind_entry_opportunity_lease_id(candidate)
-            if (
-                lease_key not in self._entry_candidate_lease_started_at_ms
-                and revision_id in self._entry_candidate_lease_started_at_ms
-            ):
-                self._entry_candidate_lease_started_at_ms[lease_key] = (
-                    self._entry_candidate_lease_started_at_ms.pop(revision_id)
-                )
-            active_keys.add(lease_key)
-            self._entry_candidate_lease_last_seen_at_ms[lease_key] = now_ms
-            started_at_ms = int(
-                self._entry_candidate_lease_started_at_ms.get(lease_key, 0) or 0
-            )
-            if started_at_ms <= 0:
-                self._entry_candidate_lease_started_at_ms[lease_key] = now_ms
-                allowed.append(candidate)
-                continue
-            age_ms = max(now_ms - started_at_ms, 0)
-            if age_ms < hard_ms:
-                allowed.append(candidate)
-                continue
+        A candidate's funding-epoch identity is stable by design, while its
+        quote, OI and economics evidence is not.  The old durable ledger used
+        that stable identity as a global 60-second rejection deadline, so a
+        temporary proof failure could suppress all later revisions until the
+        next funding epoch.  Pending-entry, order-id and exchange-truth
+        guards remain the authoritative duplicate-submit protections.
 
-            expired_count += 1
-            symbol = str(getattr(candidate, "symbol", "") or "").upper()
-            long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
-            short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
-            payload = {
-                "candidate_pair_id": pair_id,
-                "candidate_revision_id": revision_id,
-                "opportunity_lease_id": lease_key,
-                "pair_id": pair_id,
-                "symbol": symbol,
-                "long_venue": long_venue,
-                "short_venue": short_venue,
-                "started_at_ms": started_at_ms,
-                "age_ms": age_ms,
-                "hard_ms": hard_ms,
-                "reason": "candidate_lease_hard_expired",
-                "action_taken": budget.action,
-                "source": "entry_candidate_lease",
-                "ts_ms": now_ms,
-            }
-            self.journal.append("runtime.candidate_lease_expired", payload)
-            self.journal.append(
-                "review.candidate_rejected",
-                {
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "symbol": symbol,
-                    "long_venue": long_venue,
-                    "short_venue": short_venue,
-                    "rejected_stage": "candidate_lease",
-                    "rejected_reason": "candidate_lease_hard_expired",
-                    "action_taken": budget.action,
-                    "ts_ms": now_ms,
-                },
-            )
-            # Keep the original start as an expiry tombstone. Removing it here
-            # would let the identical opportunity restart its 60s lease on
-            # the next tick and therefore live forever one tick at a time.
-
-        known_active_keys = getattr(self, "_entry_candidate_active_lease_ids", active_keys)
-        tombstone_retention_ms = max(hard_ms * 10, 24 * 60 * 60 * 1_000)
-        for lease_key in list(self._entry_candidate_lease_started_at_ms):
-            if lease_key in known_active_keys:
-                continue
-            last_seen_at_ms = int(
-                self._entry_candidate_lease_last_seen_at_ms.get(lease_key, 0) or 0
-            )
-            if last_seen_at_ms <= 0 or now_ms - last_seen_at_ms >= tombstone_retention_ms:
-                self._entry_candidate_lease_started_at_ms.pop(lease_key, None)
-                self._entry_candidate_lease_last_seen_at_ms.pop(lease_key, None)
-        # This filter runs both before evidence acquisition and after fresh
-        # repricing. Preserve expiries found by the first pass instead of
-        # letting the second (usually empty) pass overwrite the audit count.
-        self.state.last_scan["candidate_lease_expired_count"] = (
-            int(self.state.last_scan.get("candidate_lease_expired_count", 0) or 0)
-            + expired_count
-        )
-        self._persist_entry_opportunity_lease_ledger()
-        return allowed
-
-    def _entry_candidate_lease_is_live(self, candidate, *, now_ms: int) -> bool:
-        """Read-only lease check for incremental evidence selection.
-
-        The authoritative filter below owns lease creation, last-seen updates,
-        tombstones, persistence and audit events.  Evidence completion may call
-        this predicate repeatedly, so it may only inspect the established
-        ledger and a copied candidate's deterministic identity.
+        Keep the state field readable solely to migrate existing snapshots;
+        newly recovered runtimes must never restore it as an admission gate.
         """
-        hard_ms = int(
-            phase_budgets_from_strategy(self.config.strategy)[
-                "candidate_lease"
-            ].hard_ms
-            or 0
-        )
-        if hard_ms <= 0:
-            return True
-        pair_id = self._candidate_pair_id(candidate)
-        if not pair_id:
-            return True
-        lease_id = self._bind_entry_opportunity_lease_id(candidate)
-        started_at_ms = int(
-            self._entry_candidate_lease_started_at_ms.get(lease_id, 0) or 0
-        )
-        return started_at_ms <= 0 or max(now_ms - started_at_ms, 0) < hard_ms
-
-    def _restore_entry_opportunity_lease_ledger(self) -> None:
         raw = getattr(self.state, "entry_opportunity_lease_ledger", {}) or {}
-        if not isinstance(raw, dict):
-            raw = {}
-        rows: list[tuple[str, int, int]] = []
-        for lease_id, value in raw.items():
-            if not str(lease_id) or not isinstance(value, dict):
-                continue
-            try:
-                started_at_ms = max(int(value.get("started_at_ms", 0) or 0), 0)
-                last_seen_at_ms = max(int(value.get("last_seen_at_ms", 0) or 0), 0)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if started_at_ms <= 0:
-                continue
-            rows.append((str(lease_id), started_at_ms, last_seen_at_ms))
-        # A corrupt or ancient snapshot cannot grow live memory without bound.
-        rows.sort(key=lambda row: (row[2], row[1], row[0]), reverse=True)
-        self._entry_candidate_lease_started_at_ms = {
-            lease_id: started for lease_id, started, _last_seen in rows[:4096]
-        }
-        self._entry_candidate_lease_last_seen_at_ms = {
-            lease_id: last_seen for lease_id, _started, last_seen in rows[:4096]
-        }
-
-    def _persist_entry_opportunity_lease_ledger(self) -> None:
-        rows = sorted(
-            self._entry_candidate_lease_started_at_ms,
-            key=lambda lease_id: (
-                int(self._entry_candidate_lease_last_seen_at_ms.get(lease_id, 0) or 0),
-                int(self._entry_candidate_lease_started_at_ms.get(lease_id, 0) or 0),
-                lease_id,
-            ),
-            reverse=True,
-        )[:4096]
-        self.state.entry_opportunity_lease_ledger = {
-            lease_id: {
-                "started_at_ms": int(
-                    self._entry_candidate_lease_started_at_ms.get(lease_id, 0) or 0
-                ),
-                "last_seen_at_ms": int(
-                    self._entry_candidate_lease_last_seen_at_ms.get(lease_id, 0) or 0
-                ),
-            }
-            for lease_id in rows
-        }
+        retired_count = len(raw) if isinstance(raw, dict) else 0
+        self.state.entry_opportunity_lease_ledger = {}
+        return retired_count
 
     def _bind_entry_candidate_revision_id(self, candidate) -> str:
         """Return a stable economic revision and persist it on the candidate.
@@ -3199,7 +3057,8 @@ class LiveRuntime:
         Fresh V5 sidecars publish this identity directly.  Older compatible
         snapshots do not, so derive the same semantic unit before quote/OI
         evidence starts.  A raw pair id is deliberately insufficient because
-        a new funding epoch or model observation must invalidate old leases.
+        a new funding epoch or model observation must be distinguishable from
+        earlier evidence revisions.
         """
         revision_id = str(
             getattr(candidate, "candidate_revision_id", "") or ""
@@ -3297,7 +3156,7 @@ class LiveRuntime:
         )
 
     def _bind_entry_opportunity_lease_id(self, candidate) -> str:
-        """Bind the 60s lifecycle to a funding epoch, not a quote rebuild."""
+        """Bind the stable funding-epoch identity used for audit grouping."""
         lease_id = str(
             getattr(candidate, "opportunity_lease_id", "") or ""
         ).strip()
@@ -3318,17 +3177,6 @@ class LiveRuntime:
         )
         lease_id = sha256(material.encode("utf-8")).hexdigest()[:32]
         setattr(candidate, "opportunity_lease_id", lease_id)
-        revision_id = str(
-            getattr(candidate, "candidate_revision_id", "") or ""
-        ).strip()
-        if (
-            revision_id
-            and lease_id not in self._entry_candidate_lease_started_at_ms
-            and revision_id in self._entry_candidate_lease_started_at_ms
-        ):
-            self._entry_candidate_lease_started_at_ms[lease_id] = (
-                self._entry_candidate_lease_started_at_ms.pop(revision_id)
-            )
         return lease_id
 
     async def _fetch_startup_live_position_snapshots(
@@ -6469,28 +6317,17 @@ class LiveRuntime:
                 _record_deadline_exceeded()
                 raise asyncio.TimeoutError(stage)
 
-            # Bind legacy-compatible candidates to an economic revision before
-            # any quote/OI evidence can be leased.  This prevents a later
-            # funding/model observation on the same pair from reusing evidence
-            # created for an older candidate.
-            active_opportunity_lease_ids: set[str] = set()
+            # Bind legacy-compatible candidates to their economic revision
+            # before evidence acquisition.  The funding-epoch identity is an
+            # audit grouping key only: every current revision must receive its
+            # own quote/OI/final-reprice decision before it can be rejected.
             for candidate in tradeable:
                 self._bind_entry_candidate_revision_id(candidate)
                 self._emit_sidecar_canary_clamp_if_needed(
                     candidate,
                     now_ms=wall_clock_now_ms(),
                 )
-                active_opportunity_lease_ids.add(
-                    self._bind_entry_opportunity_lease_id(candidate)
-                )
-            self._entry_candidate_active_lease_ids = active_opportunity_lease_ids
-            # Remove hard-expired opportunities before quote/OI early-stop
-            # logic. Otherwise an expired rank-1 row can cancel rank-2
-            # evidence and only then be removed from final selection.
-            tradeable = self._filter_expired_entry_candidate_leases(
-                tradeable,
-                now_ms=wall_clock_now_ms(),
-            )
+                self._bind_entry_opportunity_lease_id(candidate)
             preparation = await self._entry_preparation_for_tick(
                 tradeable,
                 snapshot=snapshot,
@@ -6821,14 +6658,6 @@ class LiveRuntime:
                     now_ms=wall_clock_now_ms(),
                     record_result=False,
                 )
-                viable = [
-                    row
-                    for row in viable
-                    if self._entry_candidate_lease_is_live(
-                        row,
-                        now_ms=wall_clock_now_ms(),
-                    )
-                ]
                 if not viable:
                     return False
                 first_funding_timestamp_ms = int(
@@ -7229,10 +7058,6 @@ class LiveRuntime:
                         l2_tracking_tradeable
                     )
                 )
-            tradeable = self._filter_expired_entry_candidate_leases(
-                tradeable,
-                now_ms=wall_clock_now_ms(),
-            )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
             self.state.last_scan["dispatched_candidate_count"] = 0
@@ -7571,10 +7396,6 @@ class LiveRuntime:
                         row
                         for row in fallback_tradeable_base
                         if self._candidate_pair_id(row) not in attempted_pair_ids
-                        and self._entry_candidate_lease_is_live(
-                            row,
-                            now_ms=wall_clock_now_ms(),
-                        )
                     ]
                     fallback_finalists = self._select_entry_candidates(
                         fallback_tradeable,

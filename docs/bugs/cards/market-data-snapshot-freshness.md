@@ -114,12 +114,14 @@ expires. Runtime and diagnose must get `action_taken` and
 `action_evidence_kind` from `quote_rewarm_handoff_contract` so a hard timeout
 cannot appear as an over-budget phase with a blank takeover action.
 
-Candidate lease has the same active-handoff contract. A tradeable candidate
-that exceeds the hard `candidate_lease` budget without being selected, rejected,
-or admission-blocked must emit `runtime.candidate_lease_expired`, record
-`review.candidate_rejected rejected_stage=candidate_lease`, leave the current
-tick, and force rescan. Diagnose must expose `phase_handoff_quality` so
-operators can distinguish active takeover from passive over-budget drift.
+Historical candidate lease records retain their active-handoff interpretation.
+They must not be introduced for full-frontier discovery: a stable funding epoch
+can contain later quote, OI and economics revisions, so a pre-evidence deadline
+would suppress a real opportunity. New runtimes keep duplicate-submit safety in
+pending-entry, order-id and exchange-truth state, revalidate every current
+candidate revision, and mark the retired lease policy at startup so Diagnose
+does not report a false handoff gap. Diagnose continues to interpret old,
+unmarked records using the historical contract.
 Catalog-level skips such as `runtime.candidate_symbol_skipped
 reason=unsupported_symbol` are pre-candidate rejections. They must not create a
 candidate lease by themselves; if they follow an existing shortlist artifact,

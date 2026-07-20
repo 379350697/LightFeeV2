@@ -2809,7 +2809,7 @@ def test_runtime_entry_quote_rewarm_cooldown_suppresses_revalidate_target(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
+async def test_runtime_revalidates_candidate_despite_legacy_epoch_lease(
     tmp_path,
     monkeypatch,
 ):
@@ -2830,7 +2830,8 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     )
     candidate = _freshness_candidate("LEASEUSDT")
     candidate.pair_id = "leaseusdt:okx->bybit"
-    candidate.candidate_revision_id = "lease-revision-1"
+    candidate.candidate_revision_id = "lease-revision-after-initial-proof-failure"
+    candidate.opportunity_lease_id = "leaseusdt:okx->bybit:funding-epoch"
     runtime = LiveRuntime(
         config,
         venue_adapters={
@@ -2842,12 +2843,72 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime._live_scan_success_streak = 3
     runtime.entry_executor = CapturingEntryExecutor()
-    runtime._entry_candidate_lease_started_at_ms[candidate.candidate_revision_id] = 1_000
+    runtime.state.entry_opportunity_lease_ledger = {
+        candidate.opportunity_lease_id: {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_000,
+        }
+    }
 
     now_ms = 2_500
+    funding_timestamp_ms = now_ms + 60_000
+    candidate.first_funding_timestamp_ms = funding_timestamp_ms
+    candidate.funding_timestamp_ms = funding_timestamp_ms
+    candidate.long_funding_timestamp_ms = funding_timestamp_ms
+    candidate.short_funding_timestamp_ms = funding_timestamp_ms
     snapshot = _candidate_lease_snapshot(candidate, now_ms)
     _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+
+    async def complete_preparation(rows, **_kwargs):
+        return {
+            "allowed_pair_ids": {
+                runtime._candidate_pair_id(row) for row in rows
+            }
+        }
+
+    async def complete_oi(rows, *, evidence_coordinator=None, **_kwargs):
+        assert evidence_coordinator is not None
+        for index, _row in enumerate(rows):
+            evidence_coordinator["open_interest"][index] = "ready"
+        return {}
+
+    async def complete_quotes(rows, *, evidence_coordinator=None, **_kwargs):
+        assert evidence_coordinator is not None
+        for index, _row in enumerate(rows):
+            evidence_coordinator["quote"][index] = "ready"
+            evidence_coordinator["economics"][index] = "ready"
+        evidence_coordinator["selection_ready_event"].set()
+        return {}, runtime._entry_quote_truth_empty_stats()
+
+    dispatched_pair_ids = []
+
+    async def dispatch_after_fresh_revalidation(row, *_args, **_kwargs):
+        dispatched_pair_ids.append(runtime._candidate_pair_id(row))
+        return True
+
+    monkeypatch.setattr(runtime, "_entry_preparation_for_tick", complete_preparation)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_entry_candidate_open_interest_evidence",
+        complete_oi,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_entry_quote_revalidate_for_candidates",
+        complete_quotes,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_filter_candidates_by_snapshot_freshness",
+        lambda rows, **_kwargs: list(rows),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_reprice_entry_candidates_for_selection",
+        lambda rows, **_kwargs: list(rows),
+    )
+    monkeypatch.setattr(runtime, "_dispatch_entry", dispatch_after_fresh_revalidation)
 
     runtime.journal.open()
     try:
@@ -2857,22 +2918,12 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
 
     records = _read_journal_records(tmp_path / "events.jsonl")
     kinds = [record["kind"] for record in records]
-    assert runtime.entry_executor.contexts == []
-    assert runtime.state.last_scan["tradeable_count"] == 0
-    assert runtime.state.last_scan["candidate_lease_expired_count"] == 1
-    assert "runtime.candidate_lease_expired" in kinds
-    assert "review.candidate_rejected" in kinds
-    assert "execution.entry_selected" not in kinds
-    expired = next(
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.candidate_lease_expired"
-    )
-    assert expired["action_taken"] == "expire_candidate_and_rescan"
-    assert expired["reason"] == "candidate_lease_hard_expired"
+    assert dispatched_pair_ids == [candidate.pair_id]
+    assert runtime.state.last_scan["tradeable_count"] == 1
+    assert "runtime.candidate_lease_expired" not in kinds
 
 
-def test_expired_opportunity_lease_remains_expired_across_ticks(tmp_path):
+def test_legacy_opportunity_lease_ledger_is_discarded_during_recovery(tmp_path):
     config = AppConfig(
         strategy=StrategyConfig(candidate_lease_ms=1_000),
         persistence=PersistenceConfig(
@@ -2881,32 +2932,17 @@ def test_expired_opportunity_lease_remains_expired_across_ticks(tmp_path):
         ),
     )
     runtime = LiveRuntime(config)
-    candidate = _freshness_candidate("LEASESTABLEUSDT")
-    candidate.pair_id = "leasestableusdt:okx->bybit"
-    candidate.candidate_revision_id = "revision-stable"
-    candidate.opportunity_lease_id = "opportunity-stable"
-    runtime.state.last_scan = {}
-    runtime.journal.open()
-    try:
-        runtime._entry_candidate_active_lease_ids = {"opportunity-stable"}
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=1_000
-        ) == [candidate]
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=2_000
-        ) == []
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=2_100
-        ) == []
-    finally:
-        runtime.journal.close()
-
-    assert runtime._entry_candidate_lease_started_at_ms == {
-        "opportunity-stable": 1_000
+    runtime.state.entry_opportunity_lease_ledger = {
+        "opportunity-stable": {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_500,
+        }
     }
+    assert runtime._retire_legacy_entry_opportunity_lease_ledger() == 1
+    assert runtime.state.entry_opportunity_lease_ledger == {}
 
 
-def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
+def test_legacy_opportunity_lease_ledger_is_not_restored_after_snapshot_restart(tmp_path):
     config = AppConfig(
         strategy=StrategyConfig(candidate_lease_ms=60_000),
         persistence=PersistenceConfig(
@@ -2915,14 +2951,12 @@ def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
         ),
     )
     first = LiveRuntime(config)
-    candidate = _freshness_candidate("LEASEPERSISTUSDT")
-    candidate.opportunity_lease_id = "lease-persist"
-    first.state.last_scan = {}
-    first._entry_candidate_active_lease_ids = {"lease-persist"}
-    assert first._filter_expired_entry_candidate_leases(
-        [candidate], now_ms=1_000
-    ) == [candidate]
-    first._persist_entry_opportunity_lease_ledger()
+    first.state.entry_opportunity_lease_ledger = {
+        "lease-persist": {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_000,
+        }
+    }
 
     store = SnapshotStore(tmp_path / "lease-state.json")
     store.write(first.state.to_dict())
@@ -2932,16 +2966,8 @@ def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
 
     second = LiveRuntime(config)
     second.state = restored
-    second.state.last_scan = {}
-    second._restore_entry_opportunity_lease_ledger()
-    second._entry_candidate_active_lease_ids = {"lease-persist"}
-    second.journal.open()
-    try:
-        assert second._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=61_999
-        ) == []
-    finally:
-        second.journal.close()
+    assert second._retire_legacy_entry_opportunity_lease_ledger() == 1
+    assert second.state.entry_opportunity_lease_ledger == {}
 
 
 def test_corrupt_opportunity_lease_row_does_not_block_snapshot_recovery(tmp_path):
@@ -5746,17 +5772,6 @@ async def test_tick_backfills_complete_queue_beyond_128_after_front_evidence_fai
         "_reprice_entry_candidates_for_selection",
         lambda rows, **_kwargs: list(rows),
     )
-    monkeypatch.setattr(
-        runtime,
-        "_filter_expired_entry_candidate_leases",
-        lambda rows, **_kwargs: list(rows),
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_entry_candidate_lease_is_live",
-        lambda _candidate, **_kwargs: True,
-    )
-
     selection_inputs: list[list[str]] = []
 
     def select_four(rows, **_kwargs):

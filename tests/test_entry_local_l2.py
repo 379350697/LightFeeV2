@@ -2276,11 +2276,6 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "_filter_candidates_by_snapshot_freshness",
             lambda candidates, **_kwargs: list(candidates),
         )
-        monkeypatch.setattr(
-            rt,
-            "_entry_candidate_lease_is_live",
-            lambda _candidate, **_kwargs: True,
-        )
         from lightfee.marketdata.ws_bbo import TopBookQuote
         for venue, bid, ask in (
             ("binance", 50_000.0, 50_010.0),
@@ -2487,11 +2482,6 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             rt,
             "_filter_candidates_by_snapshot_freshness",
             lambda candidates, **_kwargs: list(candidates),
-        )
-        monkeypatch.setattr(
-            rt,
-            "_entry_candidate_lease_is_live",
-            lambda _candidate, **_kwargs: True,
         )
         from lightfee.marketdata.ws_bbo import TopBookQuote
         for venue, bid, ask in (
