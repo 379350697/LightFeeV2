@@ -32,8 +32,8 @@ if TYPE_CHECKING:
     from lightfee.sidecar.snapshot import CandidateInput
 
 
-def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
-    """Expose legacy JSON fixtures through the live-only V6 test boundary."""
+def _install_v7_file_snapshot_fixture(monkeypatch) -> None:
+    """Expose legacy JSON fixtures through the live V7 entry boundary."""
     from pathlib import Path
 
     from lightfee.sidecar.publisher import load_snapshot
@@ -43,7 +43,7 @@ def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
             stat = Path(path).stat()
         except OSError:
             return None
-        return ("test-v6-file", stat.st_mtime_ns, stat.st_size)
+        return ("test-v7-file", stat.st_mtime_ns, stat.st_size)
 
     monkeypatch.setattr(
         "lightfee.engine.runtime.funding_entry_snapshot_identity",
@@ -55,10 +55,10 @@ def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
     )
 
 
-def _install_v6_object_snapshot_fixture(monkeypatch, snapshot) -> None:
+def _install_v7_object_snapshot_fixture(monkeypatch, snapshot) -> None:
     monkeypatch.setattr(
         "lightfee.engine.runtime.funding_entry_snapshot_identity",
-        lambda _path: ("test-v6-object", 1, 1),
+        lambda _path: ("test-v7-object", 1, 1),
     )
     monkeypatch.setattr(
         "lightfee.engine.runtime.load_funding_entry_snapshot",
@@ -565,6 +565,9 @@ class TestSessionRuntime:
         session = rt.track_opportunity(opp, now_ms=10000)
         assert session.primary_assigned_at_ms == 10000
 
+        rt.track_opportunity(opp, now_ms=20000)
+        assert session.primary_assigned_at_ms == 10000
+
     def test_track_opportunity_does_not_timestamp_or_mark_legs_ready(self):
         rt = EntryLocalL2SessionRuntime()
         opp = TrackedOpportunity(
@@ -718,6 +721,101 @@ class TestSelectTrackedOpportunities:
         assert result[1].class_ == TrackedOpportunityClass.PRIMARY
         assert result[2].class_ == TrackedOpportunityClass.SHADOW
 
+    def test_primary_symbols_are_unique_and_alternate_routes_remain_shadowed(self):
+        class MockCandidate:
+            def __init__(self, pair_id, symbol, short_venue, edge):
+                self.pair_id = pair_id
+                self.symbol = symbol
+                self.long_venue = "binance"
+                self.short_venue = short_venue
+                self.ranking_edge_bps = edge
+
+        candidates = [
+            MockCandidate("btc-binance-bybit", "BTCUSDT", "bybit", 30.0),
+            MockCandidate("btc-binance-okx", "BTCUSDT", "okx", 29.0),
+            MockCandidate("eth-binance-bybit", "ETHUSDT", "bybit", 28.0),
+            MockCandidate("sol-binance-bybit", "SOLUSDT", "bybit", 27.0),
+        ]
+
+        tracked = select_tracked_opportunities(
+            candidates,
+            primary_count=2,
+            shadow_count=2,
+        )
+
+        assert [row.pair_id for row in tracked] == [
+            "btc-binance-bybit",
+            "eth-binance-bybit",
+            "btc-binance-okx",
+            "sol-binance-bybit",
+        ]
+        assert [row.class_ for row in tracked] == [
+            TrackedOpportunityClass.PRIMARY,
+            TrackedOpportunityClass.PRIMARY,
+            TrackedOpportunityClass.SHADOW,
+            TrackedOpportunityClass.SHADOW,
+        ]
+
+    def test_primary_window_scans_beyond_thirty_two_surface_routes(self):
+        class MockCandidate:
+            def __init__(self, index, symbol):
+                self.pair_id = f"pair-{index}"
+                self.symbol = symbol
+                self.long_venue = "binance"
+                self.short_venue = "bybit"
+                self.ranking_edge_bps = 100.0 - index
+
+        candidates = [
+            MockCandidate(index, "BTCUSDT") for index in range(40)
+        ] + [
+            MockCandidate(40 + index, f"ALT{index}USDT")
+            for index in range(5)
+        ]
+
+        tracked = select_tracked_opportunities(
+            candidates,
+            primary_count=6,
+            shadow_count=2,
+        )
+
+        primaries = [
+            row for row in tracked
+            if row.class_ == TrackedOpportunityClass.PRIMARY
+        ]
+        assert [row.pair_id for row in primaries] == [
+            "pair-0",
+            "pair-40",
+            "pair-41",
+            "pair-42",
+            "pair-43",
+            "pair-44",
+        ]
+
+    def test_primary_exclusion_backfills_without_removing_route_from_shadow(self):
+        class MockCandidate:
+            def __init__(self, pair_id, symbol):
+                self.pair_id = pair_id
+                self.symbol = symbol
+                self.long_venue = "binance"
+                self.short_venue = "bybit"
+                self.ranking_edge_bps = 10.0
+
+        candidates = [
+            MockCandidate("p1", "BTCUSDT"),
+            MockCandidate("p2", "ETHUSDT"),
+            MockCandidate("p3", "SOLUSDT"),
+        ]
+
+        tracked = select_tracked_opportunities(
+            candidates,
+            primary_count=2,
+            shadow_count=1,
+            primary_excluded_pair_ids={"p1"},
+        )
+
+        assert [row.pair_id for row in tracked] == ["p2", "p3", "p1"]
+        assert tracked[-1].class_ == TrackedOpportunityClass.SHADOW
+
 
 class TestMakeCandidatePairId:
     def test_stable_format(self):
@@ -799,6 +897,203 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                                           snapshot_path=str(tmp_path / "state.json")),
         )
         return LiveRuntime(config)
+
+    def test_pending_entry_canonical_pair_id_is_never_reassigned(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        from types import SimpleNamespace
+        from lightfee.core.domain import Venue
+
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        runtime_with_l2.state.pending_entries["entry-1"] = SimpleNamespace(
+            pair_id="BTCUSDT:BINANCE->BYBIT",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+        )
+
+        assert runtime_with_l2._tracked_pair_is_executing(
+            "btcusdt:binance->bybit"
+        )
+        assert runtime_with_l2._tracked_pair_is_executing(
+            "BTCUSDT:BINANCE->BYBIT"
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 0
+        candidate = self._make_real_candidate(
+            pair_id="btcusdt:binance->bybit",
+            first_funding_timestamp_ms=20_000,
+        )
+        assert runtime_with_l2._record_entry_primary_backfill_failure(
+            candidate,
+            reason="entry_final_revalidation_failed",
+            now_ms=now_ms,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [candidate]
+        )
+
+        assert [opportunity.pair_id for opportunity in tracked] == [
+            "btcusdt:binance->bybit"
+        ]
+        assert tracked[0].class_ == TrackedOpportunityClass.PRIMARY
+
+    def test_runtime_ready_primary_evidence_failure_backfills_lower_route(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 2
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 1
+        candidates = [
+            self._make_real_candidate(
+                symbol=f"S{index}USDT",
+                pair_id=f"s{index}usdt:binance->bybit",
+                ranking_edge_bps=100.0 - index,
+            )
+            for index in range(5)
+        ]
+
+        tracked, _tracked_candidates = (
+            runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+        )
+        for opportunity in tracked:
+            runtime_with_l2.entry_l2_sessions.track_opportunity(
+                opportunity,
+                now_ms,
+            )
+        failed_pair_id = runtime_with_l2._candidate_pair_id(candidates[0])
+        failed_session = runtime_with_l2.entry_l2_sessions.sessions[
+            failed_pair_id
+        ]
+        for leg in failed_session.legs.values():
+            leg.mark_ready(now_ms)
+        failed_session.refresh_state(
+            now_ms,
+            runtime_with_l2._entry_local_l2_stale_after_ms(),
+        )
+        runtime_with_l2._tracked_primary_pair_ids = {
+            opportunity.pair_id
+            for opportunity in tracked
+            if opportunity.class_ == TrackedOpportunityClass.PRIMARY
+        }
+
+        assert runtime_with_l2._record_entry_primary_backfill_failure(
+            candidates[0],
+            reason="entry_open_interest_revalidation_failed",
+            now_ms=now_ms,
+        )
+        reselected, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            candidates
+        )
+        classes = {
+            opportunity.pair_id: opportunity.class_
+            for opportunity in reselected
+        }
+
+        assert classes["s1usdt:binance->bybit"] == (
+            TrackedOpportunityClass.PRIMARY
+        )
+        assert classes["s2usdt:binance->bybit"] == (
+            TrackedOpportunityClass.PRIMARY
+        )
+        assert classes[failed_pair_id] == TrackedOpportunityClass.SHADOW
+        assert not runtime_with_l2._record_entry_primary_backfill_failure(
+            candidates[1],
+            reason="entry_local_l2_waiting_for_primary_tracking",
+            now_ms=now_ms,
+        )
+
+    def test_lower_finalization_ready_route_owns_primary_and_reaches_final_selection(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        """Higher-ranked early rows cannot monopolize the scarce L2 window."""
+        from collections import Counter
+
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        runtime_with_l2.config.strategy.max_concurrent_positions = 6
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 6
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 2
+        early_candidates = [
+            self._make_real_candidate(
+                symbol=f"EARLY{index}USDT",
+                pair_id=f"early{index}usdt:binance->bybit",
+                ranking_edge_bps=100.0 - index,
+                first_funding_timestamp_ms=now_ms + 600_000,
+                entry_notional_quote=15.0,
+            )
+            for index in range(7)
+        ]
+        ready_candidate = self._make_real_candidate(
+            symbol="READYUSDT",
+            pair_id="readyusdt:binance->bybit",
+            ranking_edge_bps=1.0,
+            first_funding_timestamp_ms=now_ms + 300_000,
+            entry_notional_quote=15.0,
+        )
+        candidates = [*early_candidates, ready_candidate]
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+        primary_pair_ids = {
+            opportunity.pair_id
+            for opportunity in tracked
+            if opportunity.class_ == TrackedOpportunityClass.PRIMARY
+        }
+
+        assert primary_pair_ids == {"readyusdt:binance->bybit"}
+        for opportunity in tracked:
+            runtime_with_l2.entry_l2_sessions.track_opportunity(
+                opportunity,
+                now_ms,
+            )
+        ready_session = runtime_with_l2.entry_l2_sessions.sessions[
+            "readyusdt:binance->bybit"
+        ]
+        for leg in ready_session.legs.values():
+            leg.mark_ready(now_ms)
+        ready_session.refresh_state(
+            now_ms,
+            runtime_with_l2._entry_local_l2_stale_after_ms(),
+        )
+        runtime_with_l2._tracked_primary_pair_ids = primary_pair_ids
+
+        assert runtime_with_l2._entry_local_l2_selection_blocker(
+            ready_candidate,
+            now_ms,
+        ) is None
+        selection_blockers: Counter = Counter()
+        candidate_blockers: dict[str, str] = {}
+        selected = runtime_with_l2._select_entry_candidates(
+            candidates,
+            now_ms=now_ms,
+            remaining_slots=1,
+            selection_blocker_counts=selection_blockers,
+            candidate_blockers=candidate_blockers,
+            emit_events=False,
+        )
+
+        assert selected == [ready_candidate]
+        assert selection_blockers[
+            "entry_waiting_for_finalization_window_too_early"
+        ] == len(early_candidates)
 
     @staticmethod
     def _make_real_candidate(**overrides) -> "CandidateInput":
@@ -1867,7 +2162,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
-        _install_v6_file_snapshot_fixture(monkeypatch)
+        _install_v7_file_snapshot_fixture(monkeypatch)
         _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
@@ -2079,7 +2374,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
-        _install_v6_file_snapshot_fixture(monkeypatch)
+        _install_v7_file_snapshot_fixture(monkeypatch)
         _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
@@ -2215,7 +2510,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt.state.lifecycle = EngineLifecycle.RUNNING
         rt.state.risk_mode = GlobalRiskMode.RUNNING
         rt.entry_executor = object()
-        _install_v6_file_snapshot_fixture(monkeypatch)
+        _install_v7_file_snapshot_fixture(monkeypatch)
         _allow_test_entry_account_truth(monkeypatch, rt)
         rt.journal.open()
 
@@ -2560,7 +2855,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
-        _install_v6_file_snapshot_fixture(monkeypatch)
+        _install_v7_file_snapshot_fixture(monkeypatch)
         rt.journal.open()
 
         snapshot_path.write_text(json.dumps(base_snapshot))
@@ -4389,7 +4684,7 @@ class TestEntryReadinessProviderFactory:
             return list(candidates)
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-        _install_v6_object_snapshot_fixture(monkeypatch, snapshot)
+        _install_v7_object_snapshot_fixture(monkeypatch, snapshot)
         _allow_test_entry_account_truth(monkeypatch, rt)
         monkeypatch.setattr(
             rt,

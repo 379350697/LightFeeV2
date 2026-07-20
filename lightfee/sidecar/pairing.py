@@ -18,6 +18,10 @@ from lightfee.strategy.candidate_identity import (
 )
 from lightfee.strategy.fee_evidence import FeeEvidenceBook
 from lightfee.strategy.funding_canary_policy import canary_notional_cap_for_tier
+from lightfee.strategy.discovery import (
+    funding_entry_policy_fingerprint,
+    funding_entry_static_block_reasons,
+)
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -70,7 +74,6 @@ class FundingCandidateService:
         *,
         observed_at_ms: int = 0,
         diagnostics: dict[str, object] | None = None,
-        max_candidates: int | None = None,
     ) -> list[CandidateInput]:
         return _build_same_symbol_pairs(
             quotes,
@@ -85,7 +88,6 @@ class FundingCandidateService:
             expected_fee_identity_hashes=self._expected_fee_identity_hashes,
             observed_at_ms=observed_at_ms,
             diagnostics=diagnostics,
-            max_candidates=max_candidates,
         )
 
 
@@ -102,7 +104,6 @@ def build_same_symbol_pairs(
     expected_fee_identity_hashes: dict[str, str] | None = None,
     observed_at_ms: int = 0,
     diagnostics: dict[str, object] | None = None,
-    max_candidates: int | None = None,
 ) -> list[CandidateInput]:
     """Build directed funding pairs using a common base quantity.
 
@@ -130,7 +131,6 @@ def build_same_symbol_pairs(
         expected_fee_identity_hashes=expected_fee_identity_hashes,
         observed_at_ms=observed_at_ms,
         diagnostics=diagnostics,
-        max_candidates=max_candidates,
     )
 
 
@@ -217,440 +217,6 @@ def _pair_fee_assurance(
     )
 
 
-def _optimistic_candidate_rank_upper(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    *,
-    config: StrategyConfig,
-    fee_by_venue: dict[str, float],
-    maker_fee_by_venue: dict[str, float],
-    caps_by_venue: dict[str, float],
-    allocator: StrategyRiskAllocator,
-    passive_execution_enabled: bool,
-    fee_evidence: FeeEvidenceBook | None,
-    expected_fee_identity_hashes: dict[str, str] | None,
-) -> float:
-    """Cheap mathematical upper bound for the exact worst-case rank.
-
-    The bound deliberately computes every cheap, already-known signed term:
-    first-settlement funding, executable cross, a lower bound on route fees,
-    and fixed risk buffers.  Only depth-dependent slippage remains at its
-    mathematical lower bound of zero.  This keeps branch-and-bound both safe
-    and useful on the full seven-venue universe.
-    """
-
-    def _finite(value: object, default: float = 0.0) -> float:
-        if isinstance(value, bool):
-            return default
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return default
-        return parsed if isfinite(parsed) else default
-
-    long_ask = _finite(long_q.ask)
-    short_bid = _finite(short_q.bid)
-    reference_mid = (long_ask + short_bid) / 2.0
-    if long_ask <= 0.0 or short_bid <= 0.0 or reference_mid <= 0.0:
-        return float("inf")
-    raw_cross = ((short_bid - long_ask) / reference_mid) * 10_000.0
-    configured_uncertainty = max(
-        _finite(config.funding_forecast_uncertainty_haircut_bps),
-        0.0,
-    )
-
-    def _enhanced_live_component(
-        quote: QuoteSnapshot,
-        *,
-        long_leg: bool,
-    ) -> float:
-        quoted = _finite(quote.funding_rate_bps)
-        predicted = _finite(
-            quote.predicted_funding_rate_bps,
-            quoted,
-        )
-        uncertainty = max(
-            configured_uncertainty,
-            _finite_nonnegative(quote.funding_forecast_uncertainty_bps),
-        )
-        # Ranking uses the conservative signed forecast, not the magnitude of
-        # each leg independently. A long pays the upper forecast bound while a
-        # short receives the lower bound. This is the exact enhanced-live
-        # funding component for an admissible seed and therefore remains a safe
-        # upper bound without making equal positive rates look like 2x alpha.
-        return -(predicted + uncertainty) if long_leg else predicted - uncertainty
-
-    long_ts = max(int(_finite(long_q.funding_timestamp_ms)), 0)
-    short_ts = max(int(_finite(short_q.funding_timestamp_ms)), 0)
-    interval_aligned = bool(
-        long_ts > 0
-        and short_ts > 0
-        and abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS
-    )
-    economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
-    if economics_mode == "enhanced_live":
-        # `_seed_is_potentially_live` admits only calibrated, stable forecasts
-        # to exact evaluation. Non-admissible rows are sorted behind that set
-        # and never rely on this signed bound for publication.
-        long_component_upper = _enhanced_live_component(long_q, long_leg=True)
-        short_component_upper = _enhanced_live_component(short_q, long_leg=False)
-    else:
-        # V1/shadow uses the signed quoted funding contract exactly.
-        long_component_upper = -_finite(long_q.funding_rate_bps)
-        short_component_upper = _finite(short_q.funding_rate_bps)
-    if interval_aligned:
-        first_stage_funding_upper = (
-            long_component_upper + short_component_upper
-        )
-    elif long_ts > 0 and short_ts > 0 and long_ts <= short_ts:
-        first_stage_funding_upper = long_component_upper
-    elif long_ts > 0 and short_ts > 0:
-        first_stage_funding_upper = short_component_upper
-    else:
-        first_stage_funding_upper = 0.0
-
-    long_venue = str(long_q.venue).lower()
-    short_venue = str(short_q.venue).lower()
-    long_fee = _finite(fee_by_venue.get(long_venue, 0.0))
-    short_fee = _finite(fee_by_venue.get(short_venue, 0.0))
-    long_maker_fee = _finite(
-        maker_fee_by_venue.get(long_venue, long_fee),
-        long_fee,
-    )
-    short_maker_fee = _finite(
-        maker_fee_by_venue.get(short_venue, short_fee),
-        short_fee,
-    )
-    (
-        assurance_tier,
-        _taker_fee_complete,
-        long_authoritative,
-        short_authoritative,
-        _fee_unavailable_reason,
-    ) = _pair_fee_assurance(
-        long_q,
-        short_q,
-        config=config,
-        fee_by_venue=fee_by_venue,
-        fee_evidence=fee_evidence,
-        expected_fee_identity_hashes=expected_fee_identity_hashes,
-    )
-    if (
-        config.funding_canary_enabled is True
-        and assurance_tier == "conservative"
-    ):
-        conservative_buffer = max(
-            _finite(config.funding_canary_conservative_fee_buffer_bps),
-            0.0,
-        )
-        if not long_authoritative:
-            long_fee += conservative_buffer
-            long_maker_fee = long_fee
-        if not short_authoritative:
-            short_fee += conservative_buffer
-            short_maker_fee = short_fee
-    canary_cap = (
-        canary_notional_cap_for_tier(assurance_tier, config)
-        if config.funding_canary_enabled is True
-        and assurance_tier != "unavailable"
-        else 0.0
-    )
-    configured_cap = min(
-        max(_finite(config.entry_notional_cap_quote), 0.0),
-        max(_finite(config.live_entry_notional_cap_quote), 0.0),
-    )
-    if canary_cap > 0.0:
-        configured_cap = min(configured_cap, canary_cap)
-    conservative_quantity = (
-        configured_cap / reference_mid if configured_cap > 0.0 else 0.0
-    )
-    long_depth = max(_finite(long_q.ask_size), 0.0) * max(
-        _finite(config.max_top_book_usage_ratio),
-        0.0,
-    )
-    short_depth = max(_finite(short_q.bid_size), 0.0) * max(
-        _finite(config.max_top_book_usage_ratio),
-        0.0,
-    )
-    long_max_quantity = long_depth if long_depth > 0.0 else conservative_quantity
-    short_max_quantity = short_depth if short_depth > 0.0 else conservative_quantity
-    if canary_cap > 0.0:
-        canary_quantity = canary_cap / max(long_ask, short_bid)
-        long_max_quantity = min(long_max_quantity, canary_quantity)
-        short_max_quantity = min(short_max_quantity, canary_quantity)
-    venue_cap = _minimum_positive(
-        caps_by_venue.get(long_venue, 0.0),
-        caps_by_venue.get(short_venue, 0.0),
-        config.max_single_venue_exposure_quote,
-    )
-    global_reference_cap = _minimum_positive(
-        (
-            _finite(config.funding_max_global_gross_exposure_quote) / 2.0
-            if _finite(config.funding_max_global_gross_exposure_quote) > 0.0
-            else 0.0
-        ),
-        config.funding_max_correlation_group_exposure_quote,
-        (
-            _finite(config.funding_expected_shortfall_budget_quote)
-            * 10_000.0
-            / _finite(config.funding_expected_shortfall_bps)
-            if _finite(config.funding_expected_shortfall_bps) > 0.0
-            else 0.0
-        ),
-    )
-    allocation = allocator.allocate(
-        long_entry_price=long_ask,
-        short_entry_price=short_bid,
-        long_max_quantity=long_max_quantity,
-        short_max_quantity=short_max_quantity,
-        configured_notional_cap_quote=configured_cap,
-        venue_notional_cap_quote=venue_cap,
-        symbol_risk_budget_quote=_finite(config.max_symbol_exposure_quote),
-        venue_pair_risk_budget_quote=_finite(
-            config.funding_max_venue_pair_exposure_quote
-        ),
-        global_risk_budget_quote=global_reference_cap,
-        fallback_notional_quote=_finite(
-            config.funding_missing_margin_fallback_notional_quote
-        ),
-        health_buffer_ratio=_finite(config.funding_risk_health_buffer_ratio),
-    )
-    quantity = max(float(allocation.base_quantity or 0.0), 0.0)
-    long_entry_slippage = _heuristic_slippage_bps(
-        long_q,
-        quantity,
-        taking_ask=True,
-    )
-    short_entry_slippage = _heuristic_slippage_bps(
-        short_q,
-        quantity,
-        taking_ask=False,
-    )
-    long_exit_slippage = _heuristic_slippage_bps(
-        long_q,
-        quantity,
-        taking_ask=False,
-    )
-    short_exit_slippage = _heuristic_slippage_bps(
-        short_q,
-        quantity,
-        taking_ask=True,
-    )
-    entry_maker_leg = _select_maker_leg(
-        long_entry_slippage,
-        short_entry_slippage,
-    )
-    exit_maker_leg = _select_maker_leg(
-        long_exit_slippage,
-        short_exit_slippage,
-    )
-    fee_floor = _effective_fee_bps(
-        long_taker_fee_bps=long_fee,
-        long_maker_fee_bps=long_maker_fee,
-        short_taker_fee_bps=short_fee,
-        short_maker_fee_bps=short_maker_fee,
-        maker_leg=entry_maker_leg,
-        passive_execution_enabled=passive_execution_enabled,
-    ) + _effective_fee_bps(
-        long_taker_fee_bps=long_fee,
-        long_maker_fee_bps=long_maker_fee,
-        short_taker_fee_bps=short_fee,
-        short_maker_fee_bps=short_maker_fee,
-        maker_leg=exit_maker_leg,
-        passive_execution_enabled=passive_execution_enabled,
-    )
-    slippage_floor = _effective_slippage_bps(
-        long_entry_slippage,
-        short_entry_slippage,
-        entry_maker_leg,
-        passive_execution_enabled,
-    ) + _effective_slippage_bps(
-        long_exit_slippage,
-        short_exit_slippage,
-        exit_maker_leg,
-        passive_execution_enabled,
-    )
-
-    venue_haircut = max(
-        _finite(
-            config.funding_venue_risk_haircut_bps_by_venue.get(long_venue, 0.0)
-        ),
-        0.0,
-    ) + max(
-        _finite(
-            config.funding_venue_risk_haircut_bps_by_venue.get(short_venue, 0.0)
-        ),
-        0.0,
-    )
-    fixed_costs = (
-        max(_finite(config.entry_exit_reserve_bps), 0.0)
-        + max(_finite(config.capital_buffer_bps), 0.0)
-        + max(_finite(config.execution_buffer_bps), 0.0)
-        + venue_haircut
-    )
-    upper = (
-        raw_cross
-        + first_stage_funding_upper
-        - fee_floor
-        - slippage_floor
-        - fixed_costs
-    )
-    if passive_execution_enabled:
-        upper += _pair_spread_bps(
-            long_q,
-            short_q,
-            reference_mid,
-            entry_maker_leg,
-        )
-    return upper
-
-
-def _seed_is_potentially_live(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    *,
-    config: StrategyConfig,
-    fee_by_venue: dict[str, float],
-    fee_evidence: FeeEvidenceBook | None,
-    expected_fee_identity_hashes: dict[str, str] | None,
-    observed_at_ms: int,
-) -> bool:
-    """Cheap fail-closed classification before the exact Top-K contract.
-
-    A bounded frontier must not be filled by rows already known to be
-    structurally untradeable while a lower-edge executable row sits just
-    outside the cap. Keep this predicate limited to deterministic blockers
-    whose inputs are already available without allocation or slippage work.
-    """
-
-    if _funding_contract_block_reasons(long_q, short_q):
-        return False
-    funding_decision_at_ms = max(int(observed_at_ms or 0), 0)
-    for quote in (long_q, short_q):
-        if funding_rate_evidence_reason(
-            venue=str(getattr(quote, "venue", "") or ""),
-            symbol=str(getattr(quote, "symbol", "") or ""),
-            rate_bps=getattr(quote, "funding_rate_bps", None),
-            funding_timestamp_ms=getattr(quote, "funding_timestamp_ms", 0),
-            observed_at_ms=getattr(quote, "funding_rate_observed_at_ms", 0),
-            event_at_ms=getattr(quote, "funding_rate_event_at_ms", 0),
-            received_at_ms=getattr(quote, "funding_rate_received_at_ms", 0),
-            source=getattr(quote, "funding_rate_source", ""),
-            sample_id=getattr(quote, "funding_rate_sample_id", ""),
-            decision_at_ms=funding_decision_at_ms,
-        ):
-            return False
-    if str(config.funding_economics_mode or "v1_exact").lower() == "enhanced_live":
-        if not (
-            long_q.funding_forecast_distribution_stable is True
-            and short_q.funding_forecast_distribution_stable is True
-        ):
-            return False
-        # Use the same decision wall clock as the exact constructor.  Using
-        # the quote timestamp here could classify a forecast as live while
-        # the exact pass rejects the same row for insufficient shadow age.
-        now_ms = max(int(observed_at_ms or 0), 0)
-        uncertainty = max(
-            float(config.funding_forecast_uncertainty_haircut_bps or 0.0),
-            0.0,
-        )
-        long_forecast = FundingForecast.from_quote(
-            venue=long_q.venue,
-            symbol=long_q.symbol,
-            quoted_rate_bps=long_q.funding_rate_bps,
-            predicted_settled_rate_bps=long_q.predicted_funding_rate_bps,
-            next_funding_timestamp_ms=int(long_q.funding_timestamp_ms or 0),
-            funding_interval_ms=long_q.funding_interval_ms,
-            observed_at_ms=now_ms,
-            uncertainty_haircut_bps=max(
-                uncertainty,
-                float(long_q.funding_forecast_uncertainty_bps or 0.0),
-            ),
-            sample_count=long_q.funding_forecast_sample_count,
-            min_samples=config.funding_forecast_min_samples,
-            source=long_q.funding_forecast_source,
-        )
-        short_forecast = FundingForecast.from_quote(
-            venue=short_q.venue,
-            symbol=short_q.symbol,
-            quoted_rate_bps=short_q.funding_rate_bps,
-            predicted_settled_rate_bps=short_q.predicted_funding_rate_bps,
-            next_funding_timestamp_ms=int(short_q.funding_timestamp_ms or 0),
-            funding_interval_ms=short_q.funding_interval_ms,
-            observed_at_ms=now_ms,
-            uncertainty_haircut_bps=max(
-                uncertainty,
-                float(short_q.funding_forecast_uncertainty_bps or 0.0),
-            ),
-            sample_count=short_q.funding_forecast_sample_count,
-            min_samples=config.funding_forecast_min_samples,
-            source=short_q.funding_forecast_source,
-        )
-        required_shadow_age_ms = (
-            max(int(config.funding_forecast_shadow_min_days or 0), 0)
-            * 24
-            * 60
-            * 60
-            * 1_000
-        )
-        if not (
-            long_forecast.confidence > 0.0
-            and short_forecast.confidence > 0.0
-            and min(
-                _forecast_shadow_age_ms(long_q, now_ms),
-                _forecast_shadow_age_ms(short_q, now_ms),
-            )
-            >= required_shadow_age_ms
-        ):
-            return False
-    (
-        assurance_tier,
-        taker_fee_complete,
-        long_authoritative,
-        short_authoritative,
-        fee_unavailable_reason,
-    ) = _pair_fee_assurance(
-        long_q,
-        short_q,
-        config=config,
-        fee_by_venue=fee_by_venue,
-        fee_evidence=fee_evidence,
-        expected_fee_identity_hashes=expected_fee_identity_hashes,
-    )
-    if not taker_fee_complete:
-        return False
-    if (
-        bool(config.funding_canary_require_account_fee_evidence)
-        and assurance_tier == "unavailable"
-        and fee_unavailable_reason != "account_fee_evidence_unavailable"
-    ):
-        return False
-    if config.funding_canary_enabled is True and assurance_tier == "unavailable":
-        return False
-    if config.funding_canary_enabled is True:
-        canary_cap = (
-            canary_notional_cap_for_tier(assurance_tier, config)
-            if assurance_tier != "unavailable"
-            else 0.0
-        )
-        if canary_cap > 0.0:
-            canary_quantity = canary_cap / max(
-                float(long_q.ask),
-                float(short_q.bid),
-            )
-            if any(
-                canary_quantity + 1e-12 < float(quote.min_quantity_base or 0.0)
-                or canary_quantity * price + 1e-9
-                < float(quote.min_notional_quote or 0.0)
-                for quote, price in (
-                    (long_q, float(long_q.ask)),
-                    (short_q, float(short_q.bid)),
-                )
-            ):
-                return False
-    return True
-
-
 def _build_same_symbol_pairs(
     quotes: dict[str, QuoteSnapshot],
     symbols: list[str],
@@ -665,11 +231,18 @@ def _build_same_symbol_pairs(
     expected_fee_identity_hashes: dict[str, str] | None,
     observed_at_ms: int,
     diagnostics: dict[str, object] | None,
-    max_candidates: int | None,
 ) -> list[CandidateInput]:
     candidates: list[CandidateInput] = []
+    pair_decisions: list[dict[str, object]] = []
+    # ``rejection_counts`` is deliberately a cardinality-conserving terminal
+    # ledger for the V5 audit contract: a count is recorded only when no
+    # CandidateInput exists for that pair.  ``blocked_reason_counts`` is the
+    # complete explanatory histogram, including static blocks on retained
+    # audit rows (a row can legitimately have more than one such reason).
     rejection_counts: dict[str, int] = {}
-    directional_pair_count = 0
+    blocked_reason_counts: dict[str, int] = {}
+    seed_pair_count = 0
+    eligible_candidate_count = 0
     future_input_quote_count = sum(
         1
         for quote in quotes.values()
@@ -679,7 +252,6 @@ def _build_same_symbol_pairs(
     quotes_by_symbol: dict[str, list[QuoteSnapshot]] = {}
     seen_quote_identities: set[tuple[str, str]] = set()
     duplicate_quote_identities: set[tuple[str, str]] = set()
-    seed_pairs: list[tuple[bool, float, QuoteSnapshot, QuoteSnapshot]] = []
     for quote in quotes.values():
         identity = (
             str(quote.venue).strip().lower(),
@@ -715,65 +287,79 @@ def _build_same_symbol_pairs(
         venue_quotes = quotes_by_symbol.get(str(symbol).upper(), [])
         if len(venue_quotes) < 2:
             continue
-        economics_mode = str(config.funding_economics_mode or "v1_exact").lower()
         for long_q in venue_quotes:
             for short_q in venue_quotes:
                 if long_q is short_q or str(long_q.venue).strip().lower() == str(
                     short_q.venue
                 ).strip().lower():
                     continue
+                # Every distinct-venue direction belongs to the generation's
+                # decision universe, including the direction whose quoted
+                # funding looks unattractive.  Ranking is never allowed to
+                # decide whether a pair receives an admission decision.
+                seed_pair_count += 1
+                pair_id = make_candidate_pair_id(
+                    long_q.symbol,
+                    long_q.venue,
+                    short_q.venue,
+                )
                 # Validate both records before any arithmetic or ordering.
                 # A malformed funding scalar must reject only this directed
                 # pair, never abort publication of unrelated venue/symbols.
                 if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
-                    directional_pair_count += 1
                     _record_rejection(rejection_counts, "invalid_trade_quote")
-                    continue
-                # V1 and the shadow comparison must preserve the legacy
-                # quoted-rate discovery universe exactly.  Once calibrated
-                # enhanced-live is explicitly selected, however, the
-                # prediction may reverse the quoted ordering.  Enumerate both
-                # directions there so the actual forecast gate can evaluate
-                # the positive direction instead of silently omitting it.
-                if (
-                    economics_mode != "enhanced_live"
-                    and short_q.funding_rate_bps <= long_q.funding_rate_bps
-                ):
-                    continue
-                directional_pair_count += 1
-                if max_candidates is not None:
-                    seed_pairs.append(
-                        (
-                            _seed_is_potentially_live(
-                                long_q,
-                                short_q,
-                                config=config,
-                                fee_by_venue=fee_by_venue,
-                                fee_evidence=fee_evidence,
-                                expected_fee_identity_hashes=(
-                                    expected_fee_identity_hashes
-                                ),
-                                observed_at_ms=observed_at_ms,
-                            ),
-                            _optimistic_candidate_rank_upper(
-                                long_q,
-                                short_q,
-                                config=config,
-                                fee_by_venue=fee_by_venue,
-                                maker_fee_by_venue=maker_fee_by_venue,
-                                caps_by_venue=caps_by_venue,
-                                allocator=allocator,
-                                passive_execution_enabled=passive_execution_enabled,
-                                fee_evidence=fee_evidence,
-                                expected_fee_identity_hashes=(
-                                    expected_fee_identity_hashes
-                                ),
-                            ),
-                            long_q,
-                            short_q,
-                        )
+                    _record_rejection(blocked_reason_counts, "invalid_trade_quote")
+                    pair_decisions.append(
+                        {
+                            "pair_id": pair_id,
+                            "decision": "blocked",
+                            "blocked_reasons": ["invalid_trade_quote"],
+                        }
                     )
                     continue
+                economics_mode = str(
+                    config.funding_economics_mode or "v1_exact"
+                ).lower()
+                if economics_mode != "enhanced_live":
+                    long_ts = int(long_q.funding_timestamp_ms or 0)
+                    short_ts = int(short_q.funding_timestamp_ms or 0)
+                    if abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS:
+                        first_stage_funding_edge_bps = float(
+                            short_q.funding_rate_bps
+                        ) - float(long_q.funding_rate_bps)
+                    elif long_ts < short_ts:
+                        first_stage_funding_edge_bps = -float(
+                            long_q.funding_rate_bps
+                        )
+                    else:
+                        first_stage_funding_edge_bps = float(
+                            short_q.funding_rate_bps
+                        )
+                    # This is an exact necessary gate, not a ranking bound.  A
+                    # pair below the configured raw-funding floor can never be
+                    # rescued by cross or fee economics, so it receives its
+                    # final decision without allocating a full candidate.
+                    if (
+                        first_stage_funding_edge_bps
+                        < config.min_funding_edge_bps
+                    ):
+                        _record_rejection(
+                            rejection_counts,
+                            "funding_edge_below_floor",
+                        )
+                        _record_rejection(
+                            blocked_reason_counts,
+                            "funding_edge_below_floor",
+                        )
+                        pair_decisions.append(
+                            {
+                                "pair_id": pair_id,
+                                "decision": "blocked",
+                                "blocked_reasons": ["funding_edge_below_floor"],
+                            }
+                        )
+                        continue
+                rejection_counts_before = dict(rejection_counts)
                 candidate = _candidate_for_pair(
                     long_q=long_q,
                     short_q=short_q,
@@ -788,123 +374,80 @@ def _build_same_symbol_pairs(
                     observed_at_ms=observed_at_ms,
                     rejection_counts=rejection_counts,
                 )
-                if candidate is not None:
-                    candidates.append(candidate)
-
-    if max_candidates is not None:
-        limit = max(int(max_candidates), 1)
-        # The live entry artifact is a latency-bounded seed frontier, not a
-        # second full-market audit build. Two exact rows per output slot is a
-        # hard work budget. If the remaining optimistic bounds cannot be proven
-        # dominated inside that budget, fail this generation closed instead of
-        # publishing an approximate Top-K or moving a full audit onto the live
-        # refresh path.
-        exact_frontier_limit = min(len(seed_pairs), limit * 2)
-        evaluated_seed_count = 0
-        bound_violation = False
-        frontier_complete = not seed_pairs
-        frontier_stop_reason = "empty_seed_set" if not seed_pairs else ""
-        ordered_seeds = sorted(
-            seed_pairs,
-            # Potentially executable seeds always consume the bounded exact
-            # budget before deterministic blocked diagnostics. Edge remains
-            # the order within each class.
-            key=lambda item: (item[0], item[1]),
-            reverse=True,
-        )
-        for index, (
-            _potentially_live,
-            seed_upper,
-            long_q,
-            short_q,
-        ) in enumerate(ordered_seeds):
-            # The sort groups deterministic cheap blockers after every seed
-            # that can still enter the live Top-K.  Their exact diagnostics
-            # belong to the background audit artifact, not the latency-bound
-            # entry data plane.
-            if not _potentially_live:
-                frontier_complete = True
-                frontier_stop_reason = "potentially_live_seed_set_exhausted"
-                break
-            candidate = _candidate_for_pair(
-                long_q=long_q,
-                short_q=short_q,
-                config=config,
-                fee_by_venue=fee_by_venue,
-                maker_fee_by_venue=maker_fee_by_venue,
-                caps_by_venue=caps_by_venue,
-                allocator=allocator,
-                passive_execution_enabled=passive_execution_enabled,
-                fee_evidence=fee_evidence,
-                expected_fee_identity_hashes=expected_fee_identity_hashes,
-                observed_at_ms=observed_at_ms,
-                rejection_counts=rejection_counts,
-            )
-            evaluated_seed_count += 1
-            if candidate is not None:
-                candidates.append(candidate)
-                if candidate.ranking_edge_bps > seed_upper + 1e-7:
-                    # A future economics component must never silently make
-                    # the optimistic bound unsafe.  Finishing the whole market
-                    # here would put an unbounded audit calculation back on the
-                    # live publication path, so fail this generation closed.
-                    bound_violation = True
-                    frontier_complete = False
-                    frontier_stop_reason = "optimistic_upper_bound_violated"
-                    break
-            viable = sorted(
-                (
-                    row
-                    for row in candidates
-                    if not row.blocked and row.economics_complete
-                ),
-                key=lambda row: row.ranking_edge_bps,
-                reverse=True,
-            )
-            if (
-                len(viable) >= limit
-                and index + 1 < len(ordered_seeds)
-                and ordered_seeds[index + 1][1]
-                <= viable[limit - 1].ranking_edge_bps + 1e-12
-            ):
-                frontier_complete = True
-                frontier_stop_reason = "remaining_upper_bounds_dominated"
-                break
-            if evaluated_seed_count >= exact_frontier_limit:
-                next_index = index + 1
-                if next_index >= len(ordered_seeds):
-                    frontier_complete = True
-                    frontier_stop_reason = "seed_set_exhausted"
-                elif not ordered_seeds[next_index][0]:
-                    frontier_complete = True
-                    frontier_stop_reason = "potentially_live_seed_set_exhausted"
+                if candidate is None:
+                    construction_reasons = [
+                        reason
+                        for reason, count in rejection_counts.items()
+                        if count > int(rejection_counts_before.get(reason, 0))
+                    ]
+                    if not construction_reasons:
+                        construction_reasons = ["candidate_construction_failed"]
+                        _record_rejection(
+                            rejection_counts,
+                            "candidate_construction_failed",
+                        )
+                    for reason in construction_reasons:
+                        _record_rejection(blocked_reason_counts, reason)
+                    pair_decisions.append(
+                        {
+                            "pair_id": pair_id,
+                            "decision": "blocked",
+                            "blocked_reasons": construction_reasons,
+                        }
+                    )
+                    continue
+                admission_reasons = funding_entry_static_block_reasons(
+                    candidate,
+                    config,
+                    observed_at_ms,
+                    require_complete_economics=True,
+                    include_entry_control=False,
+                )
+                if admission_reasons:
+                    candidate.blocked = True
+                    candidate.blocked_reasons = list(admission_reasons)
+                    for reason in admission_reasons:
+                        _record_rejection(blocked_reason_counts, reason)
+                    pair_decisions.append(
+                        {
+                            "pair_id": candidate.pair_id or pair_id,
+                            "decision": "blocked",
+                            "blocked_reasons": list(admission_reasons),
+                        }
+                    )
                 else:
-                    frontier_complete = False
-                    frontier_stop_reason = "exact_frontier_limit_reached"
-                break
-        else:
-            frontier_complete = True
-            frontier_stop_reason = "seed_set_exhausted"
+                    eligible_candidate_count += 1
+                    pair_decisions.append(
+                        {
+                            "pair_id": candidate.pair_id or pair_id,
+                            "decision": "eligible",
+                            "blocked_reasons": [],
+                        }
+                    )
+                candidates.append(candidate)
 
-        # Never publish a live ranking whose optimistic bound was disproved or
-        # could not be proven inside the hard 2x exact-work budget.
-        if not frontier_complete:
-            candidates.clear()
-
-    if max_candidates is not None:
-        viable = sorted(
-            (row for row in candidates if not row.blocked and row.economics_complete),
-            key=lambda row: row.ranking_edge_bps,
-            reverse=True,
-        )
-        blocked = sorted(
-            (row for row in candidates if row.blocked or not row.economics_complete),
-            key=lambda row: row.ranking_edge_bps,
-            reverse=True,
-        )
-        ordered = (viable + blocked)[: max(int(max_candidates), 1)]
-    else:
-        ordered = sorted(candidates, key=lambda c: c.ranking_edge_bps, reverse=True)
+    eligible = sorted(
+        (
+            candidate
+            for candidate in candidates
+            if not candidate.blocked and candidate.economics_complete is True
+        ),
+        key=lambda candidate: (-candidate.ranking_edge_bps, candidate.pair_id),
+    )
+    blocked = sorted(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.blocked or candidate.economics_complete is not True
+        ),
+        key=lambda candidate: (-candidate.ranking_edge_bps, candidate.pair_id),
+    )
+    ordered = eligible + blocked
+    # Derive the published count from the auditable ledger itself.  If a new
+    # branch ever forgets to append its per-pair result, completeness turns
+    # false instead of the generation reporting a false green.
+    pair_decision_count = len(pair_decisions)
+    frontier_complete = pair_decision_count == seed_pair_count
     if diagnostics is not None:
         requested_symbols = sorted(canonical_symbols)
         diagnostics.clear()
@@ -913,45 +456,20 @@ def _build_same_symbol_pairs(
                 "input_quote_count": len(quotes),
                 "requested_symbol_count": len(requested_symbols),
                 "requested_symbols": requested_symbols,
-                "directional_pair_count": directional_pair_count,
+                "directional_pair_count": seed_pair_count,
                 "output_candidate_count": len(ordered),
-                "seed_frontier_count": (
-                    evaluated_seed_count
-                    if max_candidates is not None
-                    else directional_pair_count
-                ),
-                "seed_pair_count": len(seed_pairs),
-                "seed_potentially_live_count": sum(
-                    1 for potentially_live, *_rest in seed_pairs
-                    if potentially_live
-                ),
-                "seed_cheap_blocked_count": sum(
-                    1 for potentially_live, *_rest in seed_pairs
-                    if not potentially_live
-                ),
-                "seed_frontier_limit": (
-                    exact_frontier_limit
-                    if max_candidates is not None
-                    else directional_pair_count
-                ),
-                "seed_frontier_truncated": bool(
-                    max_candidates is not None
-                    and evaluated_seed_count < len(seed_pairs)
-                ),
-                "seed_bound_violation": (
-                    bound_violation if max_candidates is not None else False
-                ),
-                "seed_frontier_complete": (
-                    frontier_complete if max_candidates is not None else True
-                ),
-                "seed_frontier_stop_reason": (
-                    frontier_stop_reason
-                    if max_candidates is not None
-                    else "unbounded_audit_build"
-                ),
+                "seed_pair_count": seed_pair_count,
+                "pair_decision_count": pair_decision_count,
+                "pair_decisions": pair_decisions,
+                "eligible_candidate_count": eligible_candidate_count,
+                "omitted_eligible_count": 0,
+                "eligible_frontier_complete": frontier_complete,
+                "entry_policy_fingerprint": funding_entry_policy_fingerprint(config),
+                "frontier_stop_reason": "all_pairs_decided",
                 "future_input_quote_count": future_input_quote_count,
                 "duplicate_input_quote_count": len(duplicate_quote_identities),
                 "rejection_counts": dict(sorted(rejection_counts.items())),
+                "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             }
         )
     return ordered

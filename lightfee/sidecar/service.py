@@ -19,6 +19,8 @@ from lightfee.core.domain import PerpLiquiditySnapshot, Venue
 from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import (
+    funding_entry_snapshot_identity,
+    load_funding_entry_snapshot,
     load_snapshot,
     publish_funding_entry_snapshot,
     publish_snapshot,
@@ -103,6 +105,7 @@ class SidecarService:
         )
         self._audit_pending_build: dict[str, object] | None = None
         self._last_audit_schedule_monotonic: float = 0.0
+        self._entry_frontier_oracle_tasks: set[asyncio.Task] = set()
         self._entry_venue_fetch_tasks: dict[str, asyncio.Task] = {}
         self._entry_venue_latest_results: dict[str, tuple] = {}
         self._entry_venue_late_tasks: set[asyncio.Task] = set()
@@ -265,6 +268,15 @@ class SidecarService:
                 audit_task.cancel()
             await asyncio.gather(audit_task, return_exceptions=True)
         self._audit_publish_task = None
+        frontier_oracle_tasks = list(
+            getattr(self, "_entry_frontier_oracle_tasks", set())
+        )
+        for task in frontier_oracle_tasks:
+            if not task.done():
+                task.cancel()
+        if frontier_oracle_tasks:
+            await asyncio.gather(*frontier_oracle_tasks, return_exceptions=True)
+        self._entry_frontier_oracle_tasks = set()
         audit_executor = getattr(self, "_audit_executor", None)
         if audit_executor is not None:
             # Full audit files are installed atomically and are not part of
@@ -941,7 +953,6 @@ class SidecarService:
             symbols,
             observed_at_ms=candidate_build_observed_at_ms,
             diagnostics=candidate_build_diagnostics,
-            max_candidates=32,
         )
         candidate_build_diagnostics["quarantined_future_quote_count"] = len(
             future_quote_keys
@@ -1055,14 +1066,22 @@ class SidecarService:
             candidates=candidates,
         )
 
-        # Install the bounded live-entry generation first.  The full snapshot
-        # remains the audit/compatibility surface and may be tens of megabytes;
-        # it must not define when funding-live can observe this generation.
-        await asyncio.to_thread(
+        # Install the complete live-entry generation first.  V7 pages the
+        # payload by bytes only; it must not define opportunity discovery by
+        # a candidate-count or ranking boundary.
+        entry_manifest = await asyncio.to_thread(
             publish_funding_entry_snapshot,
             snapshot,
             self.snapshot_path,
         )
+        if not isinstance(entry_manifest, dict):
+            entry_manifest = {}
+        generation_id = str(entry_manifest.get("generation_id", "") or "")
+        if (
+            generation_id
+            and entry_manifest.get("eligible_frontier_complete") is True
+        ):
+            self._schedule_entry_frontier_oracle(snapshot, generation_id)
         if not snapshot.quotes and not snapshot.candidates:
             # The fail-closed unavailable artifact is tiny and contains no
             # full candidate work. Preserve the synchronous operational
@@ -1082,8 +1101,165 @@ class SidecarService:
             )
         return snapshot
 
+    def _schedule_entry_frontier_oracle(
+        self,
+        snapshot: SidecarSnapshot,
+        generation_id: str,
+    ) -> None:
+        """Verify every published eligible pair without delaying live entry.
+
+        Pair construction already examines the full directed universe.  This
+        independent, post-install read verifies the separate serialization and
+        manifest path did not omit, reorder, or duplicate one of those eligible
+        rows.  A discrepancy replaces the current generation with an empty,
+        explicitly incomplete frontier before another entry cycle can use it.
+        """
+        expected_ids = tuple(
+            str(candidate.pair_id or "").strip().lower()
+            for candidate in snapshot.candidates
+            if not candidate.blocked and candidate.economics_complete is True
+        )
+        if any(not pair_id for pair_id in expected_ids):
+            # Do not leave a syntactically publishable but unauditable row
+            # executable while waiting for the asynchronous transport oracle.
+            # Pair identity is the join key used by every later admission,
+            # recovery and omission check, so a missing value is itself a
+            # complete-frontier violation.
+            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
+            failed_diagnostics.update(
+                {
+                    "eligible_frontier_complete": False,
+                    "omitted_eligible_count": max(
+                        int(
+                            failed_diagnostics.get(
+                                "omitted_eligible_count",
+                                0,
+                            )
+                            or 0
+                        ),
+                        1,
+                    ),
+                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
+                    "entry_frontier_oracle_expected_count": len(expected_ids),
+                    "entry_frontier_oracle_observed_count": 0,
+                }
+            )
+            publish_funding_entry_snapshot(
+                replace(
+                    snapshot,
+                    candidate_build_diagnostics=failed_diagnostics,
+                ),
+                self.snapshot_path,
+            )
+            logger.critical(
+                "funding_entry_opportunity_omitted: eligible candidate missing pair_id"
+            )
+            return
+        task = asyncio.create_task(
+            self._verify_entry_frontier_oracle(
+                snapshot,
+                generation_id=generation_id,
+                expected_ids=expected_ids,
+            ),
+            name=f"funding-entry-frontier-oracle:{generation_id[:12]}",
+        )
+        tasks = getattr(self, "_entry_frontier_oracle_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._entry_frontier_oracle_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _verify_entry_frontier_oracle(
+        self,
+        snapshot: SidecarSnapshot,
+        *,
+        generation_id: str,
+        expected_ids: tuple[str, ...],
+    ) -> None:
+        """Fail closed if the complete eligible frontier changes in transit."""
+        try:
+            identity = await asyncio.to_thread(
+                funding_entry_snapshot_identity,
+                self.snapshot_path,
+                verify_digest=True,
+            )
+            if identity is None or identity[0] != generation_id:
+                # A newer refresh is authoritative (or the manifest is already
+                # invalid and therefore fail-closed in the runtime); never let
+                # an old observer overwrite a later generation.
+                return
+            loaded = await asyncio.to_thread(
+                load_funding_entry_snapshot,
+                self.snapshot_path,
+            )
+            identity_after_load = await asyncio.to_thread(
+                funding_entry_snapshot_identity,
+                self.snapshot_path,
+                verify_digest=True,
+            )
+            if (
+                identity_after_load is None
+                or identity_after_load[0] != generation_id
+            ):
+                # The manifest advanced while the page set was being loaded.
+                # G2 is authoritative; an observer for G1 must not replace
+                # it with G1's fail-closed artifact based on a mixed read.
+                return
+            actual_ids = (
+                tuple(
+                    str(candidate.pair_id or "").strip().lower()
+                    for candidate in loaded.candidates
+                )
+                if loaded is not None
+                else ()
+            )
+            if loaded is not None and actual_ids == expected_ids:
+                return
+
+            omitted = len(set(expected_ids) - set(actual_ids))
+            unexpected = len(set(actual_ids) - set(expected_ids))
+            # A reorder or duplicate is an omission of the ordered frontier
+            # contract even when its two sets happen to match.
+            mismatch_count = max(omitted + unexpected, 1)
+            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
+            failed_diagnostics.update(
+                {
+                    "eligible_frontier_complete": False,
+                    "omitted_eligible_count": max(
+                        int(failed_diagnostics.get("omitted_eligible_count", 0) or 0),
+                        mismatch_count,
+                    ),
+                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
+                    "entry_frontier_oracle_expected_count": len(expected_ids),
+                    "entry_frontier_oracle_observed_count": len(actual_ids),
+                    "entry_frontier_oracle_reordered": (
+                        omitted == 0 and unexpected == 0
+                    ),
+                }
+            )
+            failed_snapshot = replace(
+                snapshot,
+                candidate_build_diagnostics=failed_diagnostics,
+            )
+            await asyncio.to_thread(
+                publish_funding_entry_snapshot,
+                failed_snapshot,
+                self.snapshot_path,
+            )
+            logger.critical(
+                "funding_entry_opportunity_omitted: generation=%s expected=%s observed=%s",
+                generation_id,
+                len(expected_ids),
+                len(actual_ids),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("funding entry complete-frontier oracle failed")
+
     async def refresh_entry_from_latest_cache(self) -> SidecarSnapshot:
-        """Republish the coalesced V6 view without starting public HTTP work."""
+        """Republish the coalesced V7 view without starting public HTTP work."""
         self._entry_cache_only_refresh = True
         try:
             return await self.refresh_once()

@@ -420,12 +420,17 @@ def _v3_nonnegative_int(value: object) -> int | None:
     return value
 
 
-FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION = 6
-FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES = 32
+FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION = 7
+FUNDING_ENTRY_SNAPSHOT_LEGACY_SCHEMA_VERSION = 6
 FUNDING_ENTRY_SNAPSHOT_MAX_BYTES = 1_000_000
 
 
 def _funding_entry_snapshot_base_path(path: str | Path) -> Path:
+    target = Path(path)
+    return target.with_name(f"{target.name}.funding-entry-v7.json")
+
+
+def _legacy_funding_entry_snapshot_base_path(path: str | Path) -> Path:
     target = Path(path)
     return target.with_name(f"{target.name}.funding-entry-v6.json")
 
@@ -435,27 +440,51 @@ def funding_entry_snapshot_manifest_path(path: str | Path) -> Path:
     return target.with_name(f"{target.name}.manifest.json")
 
 
+def _legacy_funding_entry_snapshot_manifest_path(path: str | Path) -> Path:
+    target = _legacy_funding_entry_snapshot_base_path(path)
+    return target.with_name(f"{target.name}.manifest.json")
+
+
+def _read_json_file_with_stat(
+    path: Path,
+) -> tuple[dict[str, object], os.stat_result] | None:
+    try:
+        with open(path, "rb") as source:
+            raw = source.read()
+            stat = os.fstat(source.fileno())
+        value = json.loads(raw)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return (value, stat) if isinstance(value, dict) else None
+
+
 def _read_funding_entry_manifest(
     path: str | Path,
 ) -> tuple[dict[str, object], os.stat_result] | None:
+    """Read the authoritative entry manifest without unsafe downgrade.
+
+    Once a V7 manifest path exists it is authoritative even when malformed.
+    Falling back to a stale V6 generation in that state would turn corruption
+    or a partial operator edit into live-entry permission.  V6 is consulted
+    only before the first V7 manifest has ever been installed.
+    """
     manifest_path = funding_entry_snapshot_manifest_path(path)
-    try:
-        with open(manifest_path, "rb") as manifest_file:
-            raw = manifest_file.read()
-            stat = os.fstat(manifest_file.fileno())
-        manifest = json.loads(raw)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not isinstance(manifest, dict):
-        return None
-    return manifest, stat
+    if manifest_path.exists():
+        return _read_json_file_with_stat(manifest_path)
+    return _read_json_file_with_stat(_legacy_funding_entry_snapshot_manifest_path(path))
 
 
 def _funding_entry_payload_path_from_manifest(
     path: str | Path,
     manifest: dict[str, object],
 ) -> Path | None:
-    base = _funding_entry_snapshot_base_path(path)
+    schema_version = manifest.get("schema_version")
+    if schema_version == FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION:
+        paths = _funding_entry_page_paths_from_manifest(path, manifest)
+        return paths[0] if paths else None
+    if schema_version != FUNDING_ENTRY_SNAPSHOT_LEGACY_SCHEMA_VERSION:
+        return None
+    base = _legacy_funding_entry_snapshot_base_path(path)
     generation_id = str(manifest.get("generation_id", "") or "")
     payload_name = str(manifest.get("payload_path", "") or "")
     if not generation_id or len(generation_id) != 64:
@@ -466,6 +495,38 @@ def _funding_entry_payload_path_from_manifest(
     if payload_name != expected_name or Path(payload_name).name != payload_name:
         return None
     return base.with_name(payload_name)
+
+
+def _funding_entry_page_paths_from_manifest(
+    path: str | Path,
+    manifest: dict[str, object],
+) -> list[Path] | None:
+    if manifest.get("schema_version") != FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION:
+        return None
+    base = _funding_entry_snapshot_base_path(path)
+    generation_id = str(manifest.get("generation_id", "") or "")
+    if len(generation_id) != 64 or any(ch not in "0123456789abcdef" for ch in generation_id):
+        return None
+    raw_pages = manifest.get("pages")
+    page_count = manifest.get("page_count")
+    if (
+        isinstance(page_count, bool)
+        or not isinstance(page_count, int)
+        or page_count <= 0
+        or not isinstance(raw_pages, list)
+        or len(raw_pages) != page_count
+    ):
+        return None
+    paths: list[Path] = []
+    for page_index, descriptor in enumerate(raw_pages):
+        if not isinstance(descriptor, dict) or descriptor.get("page_index") != page_index:
+            return None
+        payload_name = str(descriptor.get("payload_path", "") or "")
+        expected_name = f"{base.name}.{generation_id}.page-{page_index:05d}.json"
+        if payload_name != expected_name or Path(payload_name).name != payload_name:
+            return None
+        paths.append(base.with_name(payload_name))
+    return paths
 
 
 def funding_entry_snapshot_path(path: str | Path) -> Path:
@@ -480,6 +541,12 @@ def funding_entry_snapshot_path(path: str | Path) -> Path:
         payload_path = _funding_entry_payload_path_from_manifest(path, installed[0])
         if payload_path is not None:
             return payload_path
+    # During a reader-first rollout the old V6 manifest remains readable until
+    # V7 is installed.  An invalid existing V7 manifest must not expose V6.
+    if not funding_entry_snapshot_manifest_path(path).exists():
+        legacy = _legacy_funding_entry_snapshot_base_path(path)
+        if _legacy_funding_entry_snapshot_manifest_path(path).exists():
+            return legacy
     return _funding_entry_snapshot_base_path(path)
 
 
@@ -540,33 +607,254 @@ def publish_snapshot(snapshot: SidecarSnapshot, path: str | Path) -> None:
     _atomic_write_json(data, Path(path), indent=2)
 
 
-def _funding_entry_candidates(snapshot: SidecarSnapshot, limit: int) -> list:
-    """Keep only executable rows in the bounded live-entry payload."""
-    viable = [c for c in snapshot.candidates if not c.blocked and c.economics_complete]
-    return viable[: max(int(limit), 1)]
+def _funding_entry_candidates(snapshot: SidecarSnapshot) -> list:
+    """Return every executable row without a cardinality limit."""
+    return [c for c in snapshot.candidates if not c.blocked and c.economics_complete]
+
+
+def _is_sha256_hex(value: object) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _funding_entry_policy_fingerprint(
+    snapshot: SidecarSnapshot,
+    candidates: list,
+) -> tuple[str, str]:
+    """Bind every page to one deterministic entry-policy contract.
+
+    New producers should provide ``entry_policy_fingerprint`` from the frozen
+    strategy configuration.  During reader-first rollout an older producer
+    can still create a cryptographically bound V7 generation: its derived
+    fingerprint includes the inner schema plus every candidate economics
+    model and fee-assurance tier.  A malformed explicit fingerprint is never
+    silently replaced with a derived value.
+    """
+    diagnostics = dict(snapshot.candidate_build_diagnostics or {})
+    explicit = diagnostics.get("entry_policy_fingerprint")
+    if explicit not in (None, ""):
+        if not _is_sha256_hex(explicit):
+            raise ValueError("invalid funding entry policy fingerprint")
+        return str(explicit), "explicit"
+    contract = {
+        "contract": "funding_entry_frontier_v7",
+        "inner_snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "candidate_models": sorted(
+            {
+                (
+                    str(getattr(candidate, "calculation_version", "") or ""),
+                    str(getattr(candidate, "model_epoch", "") or ""),
+                    str(
+                        getattr(
+                            candidate,
+                            "funding_canary_fee_assurance_tier",
+                            "unavailable",
+                        )
+                        or "unavailable"
+                    ),
+                    bool(getattr(candidate, "account_fee_evidence_complete", False)),
+                    bool(getattr(candidate, "taker_fee_evidence_complete", False)),
+                )
+                for candidate in candidates
+            }
+        ),
+    }
+    encoded = _json_text(contract, indent=None).encode("utf-8")
+    return sha256(encoded).hexdigest(), "derived"
+
+
+def _funding_entry_candidate_identity(candidate: dict[str, object]) -> str:
+    pair_id = str(candidate.get("pair_id", "") or "").strip().lower()
+    if pair_id:
+        return pair_id
+    symbol = str(candidate.get("symbol", "") or "").strip().lower()
+    long_venue = str(candidate.get("long_venue", "") or "").strip().lower()
+    short_venue = str(candidate.get("short_venue", "") or "").strip().lower()
+    if not symbol or not long_venue or not short_venue:
+        return ""
+    return f"{symbol}:{long_venue}->{short_venue}"
+
+
+def _funding_entry_page_data(
+    *,
+    generation_id: str,
+    policy_fingerprint: str,
+    decision_at_ms: int,
+    page_index: int,
+    page_count: int,
+    common: dict[str, object] | None,
+    quotes: dict[str, object],
+    candidates: list[dict[str, object]],
+) -> dict[str, object]:
+    page: dict[str, object] = {
+        "schema_version": FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION,
+        "generation_id": generation_id,
+        "policy_fingerprint": policy_fingerprint,
+        "decision_at_ms": decision_at_ms,
+        "page_index": page_index,
+        "page_count": page_count,
+        "quotes": quotes,
+        "candidates": candidates,
+    }
+    if common is not None:
+        page["snapshot_common"] = common
+    return page
+
+
+def _split_funding_entry_pages(
+    data: dict[str, object],
+    *,
+    generation_id: str,
+    policy_fingerprint: str,
+    decision_at_ms: int,
+    max_bytes: int,
+) -> list[dict[str, object]]:
+    """Greedily shard one complete V5 payload by its encoded byte size."""
+    raw_quotes = data.get("quotes")
+    raw_candidates = data.get("candidates")
+    if not isinstance(raw_quotes, dict) or not isinstance(raw_candidates, list):
+        raise ValueError("funding entry payload collections are invalid")
+    common = {key: value for key, value in data.items() if key not in {"quotes", "candidates"}}
+    items: list[tuple[str, str | None, object, int]] = []
+    for key, value in sorted(raw_quotes.items()):
+        text_key = str(key)
+        encoded_size = len(_json_text(text_key, indent=None).encode("utf-8"))
+        encoded_size += 1 + len(_json_text(value, indent=None).encode("utf-8"))
+        items.append(("quote", text_key, value, encoded_size))
+    for value in raw_candidates:
+        if not isinstance(value, dict):
+            raise ValueError("funding entry candidate page item is invalid")
+        encoded_size = len(_json_text(value, indent=None).encode("utf-8"))
+        items.append(("candidate", None, value, encoded_size))
+    # The placeholder is an upper bound on the decimal width of page_count;
+    # replacing it with the final count cannot make a page larger.
+    page_count_placeholder = max(len(items) + 1, 1)
+    pages: list[dict[str, object]] = []
+    page_quotes: dict[str, object] = {}
+    page_candidates: list[dict[str, object]] = []
+
+    def _candidate_page(
+        index: int,
+        quotes: dict[str, object],
+        candidates: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return _funding_entry_page_data(
+            generation_id=generation_id,
+            policy_fingerprint=policy_fingerprint,
+            decision_at_ms=decision_at_ms,
+            page_index=index,
+            page_count=page_count_placeholder,
+            common=common if index == 0 else None,
+            quotes=quotes,
+            candidates=candidates,
+        )
+
+    def _empty_page_size(index: int) -> int:
+        return len(_json_text(_candidate_page(index, {}, []), indent=None).encode("utf-8"))
+
+    page_size = _empty_page_size(0)
+    if page_size > max_bytes:
+        raise ValueError("funding entry V7 snapshot metadata exceeds hard limit per page")
+
+    def _item_delta(item_type: str, encoded_size: int) -> int:
+        has_same_collection_item = page_quotes if item_type == "quote" else page_candidates
+        return encoded_size + (1 if has_same_collection_item else 0)
+
+    def _start_next_page() -> None:
+        nonlocal page_quotes, page_candidates, page_size
+        pages.append(_candidate_page(len(pages), page_quotes, page_candidates))
+        page_quotes = {}
+        page_candidates = []
+        page_size = _empty_page_size(len(pages))
+        if page_size > max_bytes:
+            raise ValueError("funding entry V7 page metadata exceeds hard limit per page")
+
+    for item_type, item_key, item_value, encoded_size in items:
+        delta = _item_delta(item_type, encoded_size)
+        if page_size + delta > max_bytes:
+            # Page zero owns the common snapshot envelope.  If that envelope
+            # leaves insufficient room for the first collection item, retain a
+            # metadata-only first page and continue on a normal data page.
+            _start_next_page()
+            delta = _item_delta(item_type, encoded_size)
+            if page_size + delta > max_bytes:
+                raise ValueError("funding entry V7 page item exceeds hard limit per page")
+        if item_type == "quote":
+            assert item_key is not None
+            page_quotes[item_key] = item_value
+        else:
+            assert isinstance(item_value, dict)
+            page_candidates.append(item_value)
+        page_size += delta
+    pages.append(_candidate_page(len(pages), page_quotes, page_candidates))
+
+    page_count = len(pages)
+    final_pages: list[dict[str, object]] = []
+    for page_index, page in enumerate(pages):
+        final_page = dict(page)
+        final_page["page_index"] = page_index
+        final_page["page_count"] = page_count
+        if len(_json_text(final_page, indent=None).encode("utf-8")) > max_bytes:
+            raise ValueError("funding entry V7 page exceeds hard limit per page")
+        final_pages.append(final_page)
+    return final_pages
 
 
 def publish_funding_entry_snapshot(
     snapshot: SidecarSnapshot,
     path: str | Path,
-    *,
-    max_candidates: int = FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
 ) -> dict[str, object]:
-    """Publish the bounded live-entry data plane before the full audit snapshot.
+    """Publish the complete live-entry frontier before the full audit snapshot.
 
     The payload deliberately remains a strict V5 contract so all existing
-    parsing and evidence validation stays authoritative.  The V6 manifest is
-    the generation/install contract: consumers only adopt a payload whose
-    size, mtime and digest match a manifest written after atomic installation.
+    parsing and evidence validation stays authoritative.  V7 splits that
+    payload into byte-bounded immutable pages.  The manifest is the sole
+    generation/install contract and is written only after every page is
+    durable. Candidate cardinality is never a publication boundary.
     """
-    candidates = _funding_entry_candidates(snapshot, max_candidates)
     original_diagnostics = dict(snapshot.candidate_build_diagnostics)
+    candidates = _funding_entry_candidates(snapshot)
+
+    def _frontier_count(name: str) -> int:
+        value = original_diagnostics.get(name, -1)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return -1
+        return value
+
+    seed_pair_count = _frontier_count("seed_pair_count")
+    pair_decision_count = _frontier_count("pair_decision_count")
+    eligible_candidate_count = _frontier_count("eligible_candidate_count")
+    omitted_eligible_count = _frontier_count("omitted_eligible_count")
+    reported_stop_reason = str(original_diagnostics.get("frontier_stop_reason", "") or "").strip()
+    eligible_frontier_complete = bool(
+        original_diagnostics.get("eligible_frontier_complete") is True
+        and seed_pair_count >= 0
+        and pair_decision_count == seed_pair_count
+        and eligible_candidate_count == len(candidates)
+        and omitted_eligible_count == 0
+        and reported_stop_reason in {"", "all_pairs_decided"}
+    )
+    if eligible_frontier_complete:
+        frontier_stop_reason = reported_stop_reason or "all_pairs_decided"
+    elif reported_stop_reason and reported_stop_reason != "all_pairs_decided":
+        frontier_stop_reason = reported_stop_reason
+    else:
+        frontier_stop_reason = "pair_decision_incomplete"
+    policy_fingerprint, policy_fingerprint_source = _funding_entry_policy_fingerprint(
+        snapshot,
+        candidates,
+    )
+    # An incomplete generation may still be published for diagnostics, but it
+    # must carry no executable rows.  This prevents a consumer that predates
+    # the V7 readiness field from accidentally admitting a partial frontier.
+    if not eligible_frontier_complete:
+        candidates = []
     targets = {(c.long_venue.lower(), c.symbol.lower()) for c in candidates} | {
         (c.short_venue.lower(), c.symbol.lower()) for c in candidates
     }
     # With no executable candidate, the live data plane is deliberately
     # empty/unavailable.  Rejection counts and source cardinalities remain in
-    # the bounded diagnostics, while quote/lifecycle evidence stays in the
+    # the entry diagnostics, while quote/lifecycle evidence stays in the
     # background audit artifact and cannot masquerade as an entry payload.
     quotes = {
         key: quote
@@ -614,7 +902,7 @@ def publish_funding_entry_snapshot(
         }
     )
     # The full audit watermark can belong to a quote that is intentionally
-    # omitted from this bounded payload.  Bind the compact snapshot's market
+    # omitted from this eligible-only payload. Bind the entry snapshot's market
     # watermark to the evidence it actually retains; malformed/future quote
     # clocks still reach the strict V5 validator and fail closed below.
     entry_market_observed_at_ms = (
@@ -664,11 +952,7 @@ def publish_funding_entry_snapshot(
                 if (not targets or selected_symbol_degraded or evidence_unavailable)
                 else ""
             )
-            if (
-                venue_quotes
-                and evidence_unavailable
-                and not str(selected_reason or "").strip()
-            ):
+            if venue_quotes and evidence_unavailable and not str(selected_reason or "").strip():
                 selected_reason = f"entry_snapshot_{domain}_evidence_unavailable"
             compact.append(
                 replace(
@@ -691,44 +975,60 @@ def publish_funding_entry_snapshot(
         original_diagnostics.get("requested_venues", [])
     )
     source_data_ready = bool(snapshot.quotes)
-    seed_frontier_complete = (
-        original_diagnostics.get("seed_frontier_complete") is True
+    source_rejection_counts = {
+        str(reason): int(count)
+        for reason, count in sorted(
+            dict(
+                original_diagnostics.get(
+                    "blocked_reason_counts",
+                    original_diagnostics.get("rejection_counts", {}),
+                )
+                or {}
+            ).items()
+        )
+        if int(count or 0) > 0
+    }
+    # The V5 payload contract models rejection counts as one terminal decision
+    # per omitted row.  Full-pair discovery can retain several blocked reasons
+    # for one pair, so its reason histogram is not cardinality-conserving.  Keep
+    # that source histogram separately and use one transport-level terminal
+    # bucket for the V7 eligible-only projection.
+    not_published_pair_count = max(seed_pair_count - len(candidates), 0)
+    rejection_counts = (
+        {"not_eligible_for_entry_frontier": not_published_pair_count}
+        if not_published_pair_count > 0
+        else {}
     )
     entry_diagnostics = {
         "input_quote_count": len(quotes),
         "requested_symbol_count": len(requested_symbols),
         "requested_symbols": requested_symbols,
         "requested_venues": requested_venues,
-        "directional_pair_count": len(candidates),
+        "directional_pair_count": max(seed_pair_count, 0),
         "output_candidate_count": len(candidates),
         "future_input_quote_count": sum(
             quote.observed_at_ms > snapshot.candidate_build_observed_at_ms
             for quote in quotes.values()
         ),
-        "rejection_counts": {
-            str(reason): int(count)
-            for reason, count in sorted(
-                dict(original_diagnostics.get("rejection_counts", {}) or {}).items()
-            )[:64]
-            if int(count or 0) >= 0
-        },
+        "rejection_counts": rejection_counts,
+        "source_rejection_counts": source_rejection_counts,
         "diagnostics_only": not bool(candidates),
         "source_candidate_count": len(snapshot.candidates),
         "source_quote_count": len(snapshot.quotes),
         "source_data_ready": source_data_ready,
-        "seed_frontier_complete": seed_frontier_complete,
-        "entry_frontier_ready": source_data_ready and seed_frontier_complete,
-        "seed_frontier_stop_reason": str(
-            original_diagnostics.get("seed_frontier_stop_reason", "") or ""
-        ),
-        "seed_frontier_count": int(original_diagnostics.get("seed_frontier_count", 0) or 0),
-        "seed_pair_count": int(original_diagnostics.get("seed_pair_count", 0) or 0),
+        "pair_decision_count": max(pair_decision_count, 0),
+        "eligible_candidate_count": max(eligible_candidate_count, 0),
+        "omitted_eligible_count": max(omitted_eligible_count, 0),
+        "eligible_frontier_complete": eligible_frontier_complete,
+        "entry_frontier_ready": source_data_ready and eligible_frontier_complete,
+        "entry_policy_fingerprint": policy_fingerprint,
+        "entry_policy_fingerprint_source": policy_fingerprint_source,
+        "frontier_stop_reason": frontier_stop_reason,
+        "seed_pair_count": max(seed_pair_count, 0),
         # This is intentionally separate from degradation. The runtime owns
         # this candidate-scoped network proof and blocks the candidate when it
         # cannot obtain it before the entry deadline.
-        "entry_targeted_oi_revalidation_required_count": len(
-            targeted_oi_revalidation_targets
-        ),
+        "entry_targeted_oi_revalidation_required_count": len(targeted_oi_revalidation_targets),
         "entry_targeted_oi_revalidation_required_venues": sorted(
             {venue for venue, _symbol in targeted_oi_revalidation_targets}
         ),
@@ -803,27 +1103,94 @@ def publish_funding_entry_snapshot(
         path,
         verify_digest=False,
     )
-    payload_content = _json_text(data, indent=None).encode("utf-8")
-    payload_size = len(payload_content)
-    if payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
-        raise ValueError(
-            "snapshot payload exceeds hard limit: "
-            f"{payload_size}>{FUNDING_ENTRY_SNAPSHOT_MAX_BYTES}"
-        )
-    payload_digest = sha256(payload_content).hexdigest()
-    generation_id = sha256(f"{payload_digest}:{time.time_ns()}:{os.getpid()}".encode()).hexdigest()
-    payload_base = _funding_entry_snapshot_base_path(path)
-    payload_path = payload_base.with_name(f"{payload_base.name}.{generation_id}.json")
-    payload_size = _atomic_write_json(
+    previous_payload_paths = (
+        _verified_generation_payload_paths(path, previous_generation[0])
+        if previous_generation is not None
+        else []
+    )
+    raw_candidates = data.get("candidates", [])
+    if not isinstance(raw_candidates, list):
+        raise ValueError("funding entry candidates are invalid")
+    candidate_identities = [
+        _funding_entry_candidate_identity(candidate) if isinstance(candidate, dict) else ""
+        for candidate in raw_candidates
+    ]
+    if any(not identity for identity in candidate_identities):
+        raise ValueError("funding entry candidate identity is missing")
+    if len(set(candidate_identities)) != len(candidate_identities):
+        raise ValueError("funding entry candidate identity is duplicated")
+    frontier_digest = sha256(_json_text(raw_candidates, indent=None).encode("utf-8")).hexdigest()
+    generation_id = sha256(
+        (
+            f"{policy_fingerprint}:{snapshot.candidate_build_observed_at_ms}:"
+            f"{frontier_digest}:{time.time_ns()}:{os.getpid()}"
+        ).encode()
+    ).hexdigest()
+    pages = _split_funding_entry_pages(
         data,
-        payload_path,
-        indent=None,
+        generation_id=generation_id,
+        policy_fingerprint=policy_fingerprint,
+        decision_at_ms=int(snapshot.candidate_build_observed_at_ms),
         max_bytes=FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
     )
-    stat = payload_path.stat()
-    if sha256(payload_path.read_bytes()).hexdigest() != payload_digest:
-        raise OSError("funding entry payload digest changed during installation")
+    payload_base = _funding_entry_snapshot_base_path(path)
+    installed_page_paths: list[Path] = []
+    page_descriptors: list[dict[str, object]] = []
+    try:
+        for page_index, page in enumerate(pages):
+            payload_path = payload_base.with_name(
+                f"{payload_base.name}.{generation_id}.page-{page_index:05d}.json"
+            )
+            payload_content = _json_text(page, indent=None).encode("utf-8")
+            payload_digest = sha256(payload_content).hexdigest()
+            payload_size = _atomic_write_json(
+                page,
+                payload_path,
+                indent=None,
+                max_bytes=FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+            )
+            stat = payload_path.stat()
+            if sha256(payload_path.read_bytes()).hexdigest() != payload_digest:
+                raise OSError("funding entry page digest changed during installation")
+            raw_page_candidates = page.get("candidates", [])
+            raw_page_quotes = page.get("quotes", {})
+            page_descriptors.append(
+                {
+                    "page_index": page_index,
+                    "payload_path": payload_path.name,
+                    "payload_size_bytes": payload_size,
+                    "payload_mtime_ns": stat.st_mtime_ns,
+                    "payload_sha256": payload_digest,
+                    "candidate_count": (
+                        len(raw_page_candidates) if isinstance(raw_page_candidates, list) else -1
+                    ),
+                    "quote_count": (
+                        len(raw_page_quotes) if isinstance(raw_page_quotes, dict) else -1
+                    ),
+                }
+            )
+            installed_page_paths.append(payload_path)
+    except Exception:
+        for installed_page_path in installed_page_paths:
+            try:
+                installed_page_path.unlink()
+            except OSError:
+                pass
+        raise
+    page_set_digest = sha256(
+        _json_text(
+            [
+                {
+                    "page_index": descriptor["page_index"],
+                    "payload_sha256": descriptor["payload_sha256"],
+                }
+                for descriptor in page_descriptors
+            ],
+            indent=None,
+        ).encode("utf-8")
+    ).hexdigest()
     manifest_prepared_at_ms = time.time_ns() // 1_000_000
+    first_page = page_descriptors[0]
     manifest = {
         "schema_version": FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION,
         "generation_id": generation_id,
@@ -832,12 +1199,32 @@ def publish_funding_entry_snapshot(
         # below; this field is diagnostic preparation time only.
         "manifest_prepared_at_ms": manifest_prepared_at_ms,
         "ready_clock_source": "manifest_install_ctime",
-        "payload_path": payload_path.name,
-        "payload_size_bytes": payload_size,
-        "payload_mtime_ns": stat.st_mtime_ns,
-        "payload_sha256": payload_digest,
+        # Compatibility aliases point at page zero; V7 readers validate the
+        # complete ordered ``pages`` array and aggregate byte count.
+        "payload_path": first_page["payload_path"],
+        "payload_size_bytes": sum(
+            int(descriptor["payload_size_bytes"]) for descriptor in page_descriptors
+        ),
+        "payload_mtime_ns": first_page["payload_mtime_ns"],
+        "payload_sha256": first_page["payload_sha256"],
+        "page_count": len(page_descriptors),
+        "pages": page_descriptors,
+        "max_page_size_bytes": max(
+            int(descriptor["payload_size_bytes"]) for descriptor in page_descriptors
+        ),
+        "page_set_sha256": page_set_digest,
+        "frontier_sha256": frontier_digest,
+        "policy_fingerprint": policy_fingerprint,
+        "policy_fingerprint_source": policy_fingerprint_source,
+        "decision_at_ms": int(snapshot.candidate_build_observed_at_ms),
         "candidate_count": len(candidates),
         "quote_count": len(quotes),
+        "seed_pair_count": max(seed_pair_count, 0),
+        "pair_decision_count": max(pair_decision_count, 0),
+        "eligible_candidate_count": max(eligible_candidate_count, 0),
+        "omitted_eligible_count": max(omitted_eligible_count, 0),
+        "eligible_frontier_complete": eligible_frontier_complete,
+        "frontier_stop_reason": entry_diagnostics["frontier_stop_reason"],
     }
     manifest_path = funding_entry_snapshot_manifest_path(path)
     try:
@@ -848,10 +1235,11 @@ def publish_funding_entry_snapshot(
         # at it; a directory-fsync failure can happen after rename visibility.
         current = _verified_funding_entry_generation(path, verify_digest=False)
         if current is None or current[4][0] != generation_id:
-            try:
-                payload_path.unlink()
-            except OSError:
-                pass
+            for installed_page_path in installed_page_paths:
+                try:
+                    installed_page_path.unlink()
+                except OSError:
+                    pass
         raise
     installed = _verified_funding_entry_generation(path, verify_digest=True)
     if installed is None or installed[4][0] != generation_id:
@@ -868,13 +1256,24 @@ def publish_funding_entry_snapshot(
     # previously selected immutable file cannot make a cold start miss the new
     # generation, and the loader retries if it raced the pointer swap.
     if previous_generation is not None:
-        previous_payload = previous_generation[1]
-        if previous_payload != payload_path:
+        for previous_payload in previous_payload_paths:
+            if previous_payload in installed_page_paths:
+                continue
             try:
                 previous_payload.unlink()
             except OSError:
                 pass
     return {**manifest, "ready_at_ms": installed_at_ms}
+
+
+def _verified_generation_payload_paths(
+    path: str | Path,
+    manifest: dict[str, object],
+) -> list[Path]:
+    if manifest.get("schema_version") == FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION:
+        return _funding_entry_page_paths_from_manifest(path, manifest) or []
+    payload_path = _funding_entry_payload_path_from_manifest(path, manifest)
+    return [payload_path] if payload_path is not None else []
 
 
 def _verified_funding_entry_generation(
@@ -896,28 +1295,144 @@ def _verified_funding_entry_generation(
         return None
     manifest, manifest_stat = installed
     schema_version = manifest.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION:
+    if isinstance(schema_version, bool) or schema_version not in {
+        FUNDING_ENTRY_SNAPSHOT_LEGACY_SCHEMA_VERSION,
+        FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION,
+    }:
         return None
-    payload_path = _funding_entry_payload_path_from_manifest(path, manifest)
-    if payload_path is None:
+    generation_id = str(manifest.get("generation_id", "") or "")
+    if not _is_sha256_hex(generation_id):
         return None
+    if schema_version == FUNDING_ENTRY_SNAPSHOT_LEGACY_SCHEMA_VERSION:
+        payload_path = _funding_entry_payload_path_from_manifest(path, manifest)
+        if payload_path is None:
+            return None
+        try:
+            payload_stat = payload_path.stat()
+            if int(manifest.get("payload_size_bytes", -1)) != payload_stat.st_size:
+                return None
+            if int(manifest.get("payload_mtime_ns", -1)) != payload_stat.st_mtime_ns:
+                return None
+            if verify_digest:
+                expected_digest = str(manifest.get("payload_sha256", "") or "")
+                if not expected_digest or sha256(payload_path.read_bytes()).hexdigest() != (
+                    expected_digest
+                ):
+                    return None
+        except (OSError, TypeError, ValueError):
+            return None
+        identity = (generation_id, payload_stat.st_mtime_ns, payload_stat.st_size)
+        return manifest, payload_path, payload_stat, manifest_stat, identity
+
+    policy_fingerprint = manifest.get("policy_fingerprint")
+    policy_fingerprint_source = manifest.get("policy_fingerprint_source")
+    decision_at_ms = manifest.get("decision_at_ms")
+    frontier_stop_reason = manifest.get("frontier_stop_reason")
+    if (
+        not _is_sha256_hex(policy_fingerprint)
+        or policy_fingerprint_source not in {"explicit", "derived"}
+        or not isinstance(frontier_stop_reason, str)
+        or not frontier_stop_reason.strip()
+        or (
+            isinstance(decision_at_ms, bool)
+            or not isinstance(decision_at_ms, int)
+            or decision_at_ms <= 0
+        )
+    ):
+        return None
+    count_names = (
+        "candidate_count",
+        "quote_count",
+        "seed_pair_count",
+        "pair_decision_count",
+        "eligible_candidate_count",
+        "omitted_eligible_count",
+    )
+    counts: dict[str, int] = {}
+    for name in count_names:
+        value = manifest.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        counts[name] = value
+    frontier_complete = manifest.get("eligible_frontier_complete")
+    if not isinstance(frontier_complete, bool):
+        return None
+    if frontier_complete and (
+        counts["pair_decision_count"] != counts["seed_pair_count"]
+        or counts["eligible_candidate_count"] != counts["candidate_count"]
+        or counts["omitted_eligible_count"] != 0
+        or frontier_stop_reason != "all_pairs_decided"
+    ):
+        return None
+    if not frontier_complete and (
+        counts["candidate_count"] != 0 or frontier_stop_reason == "all_pairs_decided"
+    ):
+        return None
+    page_paths = _funding_entry_page_paths_from_manifest(path, manifest)
+    raw_descriptors = manifest.get("pages")
+    if not page_paths or not isinstance(raw_descriptors, list):
+        return None
+    total_size = 0
+    descriptor_candidate_count = 0
+    descriptor_quote_count = 0
+    page_stats: list[os.stat_result] = []
+    digest_rows: list[dict[str, object]] = []
     try:
-        payload_stat = payload_path.stat()
-        if int(manifest.get("payload_size_bytes", -1)) != payload_stat.st_size:
-            return None
-        if int(manifest.get("payload_mtime_ns", -1)) != payload_stat.st_mtime_ns:
-            return None
-        generation_id = str(manifest.get("generation_id", "") or "")
-        if verify_digest:
-            expected_digest = str(manifest.get("payload_sha256", "") or "")
-            if not expected_digest or sha256(payload_path.read_bytes()).hexdigest() != (
-                expected_digest
+        for page_index, (page_path, descriptor) in enumerate(
+            zip(page_paths, raw_descriptors, strict=True)
+        ):
+            if not isinstance(descriptor, dict):
+                return None
+            payload_size = descriptor.get("payload_size_bytes")
+            payload_mtime = descriptor.get("payload_mtime_ns")
+            candidate_count = descriptor.get("candidate_count")
+            quote_count = descriptor.get("quote_count")
+            expected_digest = descriptor.get("payload_sha256")
+            if (
+                isinstance(payload_size, bool)
+                or not isinstance(payload_size, int)
+                or payload_size <= 0
+                or payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES
+                or isinstance(payload_mtime, bool)
+                or not isinstance(payload_mtime, int)
+                or payload_mtime <= 0
+                or isinstance(candidate_count, bool)
+                or not isinstance(candidate_count, int)
+                or candidate_count < 0
+                or isinstance(quote_count, bool)
+                or not isinstance(quote_count, int)
+                or quote_count < 0
+                or not _is_sha256_hex(expected_digest)
             ):
                 return None
+            page_stat = page_path.stat()
+            if payload_size != page_stat.st_size or payload_mtime != page_stat.st_mtime_ns:
+                return None
+            if verify_digest and sha256(page_path.read_bytes()).hexdigest() != expected_digest:
+                return None
+            page_stats.append(page_stat)
+            total_size += payload_size
+            descriptor_candidate_count += candidate_count
+            descriptor_quote_count += quote_count
+            digest_rows.append({"page_index": page_index, "payload_sha256": expected_digest})
     except (OSError, TypeError, ValueError):
         return None
-    identity = (generation_id, payload_stat.st_mtime_ns, payload_stat.st_size)
-    return manifest, payload_path, payload_stat, manifest_stat, identity
+    if (
+        total_size != manifest.get("payload_size_bytes")
+        or descriptor_candidate_count != counts["candidate_count"]
+        or descriptor_quote_count != counts["quote_count"]
+        or max(page_stat.st_size for page_stat in page_stats) != manifest.get("max_page_size_bytes")
+        or str(manifest.get("payload_path", "") or "")
+        != str(raw_descriptors[0].get("payload_path", "") or "")
+        or manifest.get("payload_mtime_ns") != raw_descriptors[0].get("payload_mtime_ns")
+        or manifest.get("payload_sha256") != raw_descriptors[0].get("payload_sha256")
+        or sha256(_json_text(digest_rows, indent=None).encode("utf-8")).hexdigest()
+        != manifest.get("page_set_sha256")
+        or not _is_sha256_hex(manifest.get("frontier_sha256"))
+    ):
+        return None
+    identity = (generation_id, manifest_stat.st_mtime_ns, total_size)
+    return manifest, page_paths[0], page_stats[0], manifest_stat, identity
 
 
 def funding_entry_snapshot_identity(
@@ -933,6 +1448,114 @@ def funding_entry_snapshot_identity(
     return None if installed is None else installed[4]
 
 
+def _load_v7_funding_entry_generation(
+    path: str | Path,
+    manifest: dict[str, object],
+) -> SidecarSnapshot | None:
+    page_paths = _funding_entry_page_paths_from_manifest(path, manifest)
+    descriptors = manifest.get("pages")
+    if not page_paths or not isinstance(descriptors, list):
+        return None
+    generation_id = str(manifest.get("generation_id", "") or "")
+    policy_fingerprint = str(manifest.get("policy_fingerprint", "") or "")
+    decision_at_ms = manifest.get("decision_at_ms")
+    page_count = len(page_paths)
+    common: dict[str, object] | None = None
+    quotes: dict[str, object] = {}
+    candidates: list[dict[str, object]] = []
+    candidate_identities: set[str] = set()
+    allowed_page_keys = {
+        "schema_version",
+        "generation_id",
+        "policy_fingerprint",
+        "decision_at_ms",
+        "page_index",
+        "page_count",
+        "snapshot_common",
+        "quotes",
+        "candidates",
+    }
+    try:
+        for page_index, (page_path, descriptor) in enumerate(
+            zip(page_paths, descriptors, strict=True)
+        ):
+            with open(page_path, "rb") as page_file:
+                page = json.loads(page_file.read())
+            if not isinstance(page, dict) or set(page) - allowed_page_keys:
+                return None
+            if (
+                page.get("schema_version") != FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION
+                or page.get("generation_id") != generation_id
+                or page.get("policy_fingerprint") != policy_fingerprint
+                or page.get("decision_at_ms") != decision_at_ms
+                or page.get("page_index") != page_index
+                or page.get("page_count") != page_count
+            ):
+                return None
+            page_common = page.get("snapshot_common")
+            if page_index == 0:
+                if not isinstance(page_common, dict):
+                    return None
+                common = page_common
+            elif "snapshot_common" in page:
+                return None
+            page_quotes = page.get("quotes")
+            page_candidates = page.get("candidates")
+            if not isinstance(page_quotes, dict) or not isinstance(page_candidates, list):
+                return None
+            if not isinstance(descriptor, dict) or (
+                descriptor.get("quote_count") != len(page_quotes)
+                or descriptor.get("candidate_count") != len(page_candidates)
+            ):
+                return None
+            for quote_key, quote in page_quotes.items():
+                if not isinstance(quote_key, str) or quote_key in quotes:
+                    return None
+                quotes[quote_key] = quote
+            for candidate in page_candidates:
+                if not isinstance(candidate, dict):
+                    return None
+                identity = _funding_entry_candidate_identity(candidate)
+                if not identity or identity in candidate_identities:
+                    return None
+                candidate_identities.add(identity)
+                candidates.append(candidate)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, OverflowError):
+        return None
+    if common is None:
+        return None
+    data = {**common, "quotes": quotes, "candidates": candidates}
+    diagnostics = data.get("candidate_build_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return None
+    manifest_diagnostic_fields = (
+        "seed_pair_count",
+        "pair_decision_count",
+        "eligible_candidate_count",
+        "omitted_eligible_count",
+        "eligible_frontier_complete",
+    )
+    if (
+        data.get("candidate_build_observed_at_ms") != decision_at_ms
+        or diagnostics.get("entry_policy_fingerprint") != policy_fingerprint
+        or diagnostics.get("entry_policy_fingerprint_source")
+        != manifest.get("policy_fingerprint_source")
+        or diagnostics.get("frontier_stop_reason") != manifest.get("frontier_stop_reason")
+        or any(diagnostics.get(name) != manifest.get(name) for name in manifest_diagnostic_fields)
+        or len(candidates) != manifest.get("candidate_count")
+        or len(quotes) != manifest.get("quote_count")
+        or sha256(_json_text(candidates, indent=None).encode("utf-8")).hexdigest()
+        != manifest.get("frontier_sha256")
+    ):
+        return None
+    if validate_v5_snapshot_contract(data):
+        return None
+    try:
+        return _dict_to_snapshot(data)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def load_funding_entry_snapshot(path: str | Path) -> SidecarSnapshot | None:
     # A reader can capture G1 immediately before G2 installs and prunes G1.
     # Re-reading the manifest once turns that benign race into a G2 cold start
@@ -941,7 +1564,11 @@ def load_funding_entry_snapshot(path: str | Path) -> SidecarSnapshot | None:
         first = _verified_funding_entry_generation(path, verify_digest=True)
         if first is None:
             continue
-        loaded = load_snapshot(first[1])
+        loaded = (
+            _load_v7_funding_entry_generation(path, first[0])
+            if first[0].get("schema_version") == FUNDING_ENTRY_SNAPSHOT_SCHEMA_VERSION
+            else load_snapshot(first[1])
+        )
         if loaded is None:
             continue
         second = _verified_funding_entry_generation(path, verify_digest=True)

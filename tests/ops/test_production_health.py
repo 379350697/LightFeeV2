@@ -86,6 +86,34 @@ def _fresh_seven_venue_snapshot() -> dict:
     }
 
 
+def _v7_entry_manifest(
+    generation_id: str,
+    *,
+    candidate_count: int,
+    quote_count: int,
+    seed_pair_count: int = 0,
+    pair_decision_count: int = 0,
+    eligible_candidate_count: int = 0,
+    omitted_eligible_count: int = 0,
+    eligible_frontier_complete: bool = True,
+) -> dict:
+    """Minimal verified-shape manifest for isolated health-report tests."""
+    return {
+        "schema_version": 7,
+        "generation_id": generation_id,
+        "payload_size_bytes": 100,
+        "candidate_count": candidate_count,
+        "quote_count": quote_count,
+        "page_count": 1,
+        "max_page_size_bytes": 100,
+        "seed_pair_count": seed_pair_count,
+        "pair_decision_count": pair_decision_count,
+        "eligible_candidate_count": eligible_candidate_count,
+        "omitted_eligible_count": omitted_eligible_count,
+        "eligible_frontier_complete": eligible_frontier_complete,
+    }
+
+
 def test_funding_entry_health_rejects_empty_generation_when_source_data_is_degraded(
     tmp_path,
 ) -> None:
@@ -183,7 +211,7 @@ def test_funding_entry_health_rejects_empty_generation_when_source_data_is_degra
     assert not report.ok
     assert "funding_entry_source_data_unavailable" in report.fingerprints
     assert report.name == "sidecar_snapshot"
-    assert report.details["data_plane"] == "funding_entry_v6"
+    assert report.details["data_plane"] == "funding_entry_v7"
     assert report.details["candidate_count"] == 0
     assert report.details["quote_count"] == 0
 
@@ -209,7 +237,7 @@ def test_funding_entry_health_rejects_empty_generation_when_source_data_is_degra
         max_age_ms=1_000,
     )
     assert not malformed_report.ok
-    assert "funding_entry_manifest_count_mismatch" in malformed_report.fingerprints
+    assert "funding_entry_generation_missing_or_invalid" in malformed_report.fingerprints
 
 
 def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generation(
@@ -219,18 +247,8 @@ def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generati
     now_ms = int(time.time() * 1000)
     manifests = iter(
         [
-            {
-                "generation_id": "generation-1",
-                "payload_size_bytes": 100,
-                "candidate_count": 1,
-                "quote_count": 0,
-            },
-            {
-                "generation_id": "generation-2",
-                "payload_size_bytes": 100,
-                "candidate_count": 0,
-                "quote_count": 0,
-            },
+            _v7_entry_manifest("generation-1", candidate_count=1, quote_count=0),
+            _v7_entry_manifest("generation-2", candidate_count=0, quote_count=0),
         ]
     )
     snapshot = SimpleNamespace(
@@ -243,11 +261,13 @@ def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generati
         degraded_symbols={},
         candidate_build_diagnostics={
             "source_data_ready": True,
-            "seed_frontier_complete": True,
+            "eligible_frontier_complete": True,
             "entry_frontier_ready": True,
-            "seed_frontier_count": 0,
             "seed_pair_count": 0,
-            "seed_frontier_stop_reason": "empty_seed_set",
+            "pair_decision_count": 0,
+            "eligible_candidate_count": 0,
+            "omitted_eligible_count": 0,
+            "frontier_stop_reason": "all_pairs_decided",
         },
     )
 
@@ -278,12 +298,14 @@ def test_funding_entry_health_rejects_incomplete_frontier_with_ready_source_data
     now_ms = int(time.time() * 1000)
     diagnostics = {
         "source_data_ready": True,
-        "seed_frontier_count": 64,
         "seed_pair_count": 4_811,
-        "seed_frontier_stop_reason": "exact_frontier_limit_reached",
+        "pair_decision_count": 64,
+        "eligible_candidate_count": 0,
+        "omitted_eligible_count": 0,
+        "frontier_stop_reason": "candidate_frontier_incomplete",
     }
     if frontier_value is not None:
-        diagnostics["seed_frontier_complete"] = frontier_value
+        diagnostics["eligible_frontier_complete"] = frontier_value
     snapshot = SimpleNamespace(
         ready_at_ms=now_ms,
         candidates=[],
@@ -297,12 +319,14 @@ def test_funding_entry_health_rejects_incomplete_frontier_with_ready_source_data
     monkeypatch.setattr(
         vps,
         "_read_json",
-        lambda _path: {
-            "generation_id": "generation-1",
-            "payload_size_bytes": 100,
-            "candidate_count": 0,
-            "quote_count": 0,
-        },
+        lambda _path: _v7_entry_manifest(
+            "generation-1",
+            candidate_count=0,
+            quote_count=0,
+            seed_pair_count=4_811,
+            pair_decision_count=64,
+            eligible_frontier_complete=False,
+        ),
     )
     monkeypatch.setattr(
         vps,
@@ -321,9 +345,71 @@ def test_funding_entry_health_rejects_incomplete_frontier_with_ready_source_data
     assert "funding_entry_frontier_incomplete" in report.fingerprints
     assert report.details["source_data_ready"] is True
     assert report.details["entry_frontier_ready"] is False
-    assert report.details["seed_frontier_count"] == 64
     assert report.details["seed_pair_count"] == 4_811
-    assert report.details["seed_frontier_stop_reason"] == "exact_frontier_limit_reached"
+    assert report.details["pair_decision_count"] == 64
+    assert report.details["frontier_stop_reason"] == "candidate_frontier_incomplete"
+
+
+def test_funding_entry_health_rejects_an_omitted_eligible_pair(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    now_ms = int(time.time() * 1000)
+    snapshot = SimpleNamespace(
+        ready_at_ms=now_ms,
+        candidates=[
+            SimpleNamespace(
+                long_venue="binance",
+                short_venue="bybit",
+                blocked=False,
+                economics_complete=True,
+            )
+        ],
+        quotes={},
+        acquisition_mode="fresh_sidecar",
+        degraded_venues=[],
+        degraded_domains=[],
+        degraded_symbols={},
+        candidate_build_diagnostics={
+            "source_data_ready": True,
+            "eligible_frontier_complete": False,
+            "seed_pair_count": 2,
+            "pair_decision_count": 2,
+            "eligible_candidate_count": 2,
+            "omitted_eligible_count": 1,
+            "frontier_stop_reason": "funding_entry_opportunity_omitted",
+        },
+    )
+    monkeypatch.setattr(
+        vps,
+        "_read_json",
+        lambda _path: _v7_entry_manifest(
+            "generation-1",
+            candidate_count=1,
+            quote_count=0,
+            seed_pair_count=2,
+            pair_decision_count=2,
+            eligible_candidate_count=2,
+            omitted_eligible_count=1,
+            eligible_frontier_complete=False,
+        ),
+    )
+    monkeypatch.setattr(
+        vps,
+        "funding_entry_snapshot_identity",
+        lambda _path, *, verify_digest: ("generation-1", 1, 100),
+    )
+    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
+
+    report = vps._funding_entry_snapshot_report(
+        tmp_path / "opportunity-input-snapshot.json",
+        now_ms=now_ms,
+        max_age_ms=1_000,
+    )
+
+    assert report.ok is False
+    assert "funding_entry_opportunity_omitted" in report.fingerprints
+    assert report.details["omitted_eligible_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -357,22 +443,26 @@ def test_funding_entry_health_allows_complete_candidate_with_unrelated_degradati
         degraded_symbols=degraded_symbols,
         candidate_build_diagnostics={
             "source_data_ready": True,
-            "seed_frontier_complete": True,
+            "eligible_frontier_complete": True,
             "entry_frontier_ready": True,
-            "seed_frontier_count": 32,
             "seed_pair_count": 200,
-            "seed_frontier_stop_reason": "remaining_upper_bounds_dominated",
+            "pair_decision_count": 200,
+            "eligible_candidate_count": 1,
+            "omitted_eligible_count": 0,
+            "frontier_stop_reason": "all_pairs_decided",
         },
     )
     monkeypatch.setattr(
         vps,
         "_read_json",
-        lambda _path: {
-            "generation_id": "generation-1",
-            "payload_size_bytes": 100,
-            "candidate_count": 1,
-            "quote_count": 0,
-        },
+        lambda _path: _v7_entry_manifest(
+            "generation-1",
+            candidate_count=1,
+            quote_count=0,
+            seed_pair_count=200,
+            pair_decision_count=200,
+            eligible_candidate_count=1,
+        ),
     )
     monkeypatch.setattr(
         vps,

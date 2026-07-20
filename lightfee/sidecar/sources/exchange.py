@@ -185,9 +185,8 @@ class ExchangeSource:
                     continue
                 # The funding ticker remains useful for slow funding/contract
                 # metadata, but its embedded price was observed before that
-                # work completed.  It must never masquerade as a fresh Top-K
-                # ranking seed when the final BBO request failed or omitted the
-                # symbol.
+                # work completed.  It must never masquerade as a fresh entry
+                # quote when the final BBO request failed or omitted the symbol.
                 quote.bid = 0.0
                 quote.ask = 0.0
                 quote.bid_size = 0.0

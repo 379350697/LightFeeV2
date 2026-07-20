@@ -233,6 +233,13 @@ def _payload(records: list[dict], kind: str) -> dict:
 async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_blocking(
     tmp_path, monkeypatch,
 ):
+    # This is a fail-closed incident test, not a live REST integration test.
+    # Without this seam, a coincidental external BBO response changes the
+    # scenario from “no executable quote lease” into a successful recovery.
+    monkeypatch.setattr(
+        "lightfee.marketdata.ws_bbo.RestTopBookQuoteRefresher",
+        lambda **_kwargs: object(),
+    )
     candidate = _candidate("RIVERUSDT")
     snapshot = SidecarSnapshot(
         published_at_ms=69000,

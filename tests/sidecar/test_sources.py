@@ -661,15 +661,11 @@ class TestSidecarServiceRateLimitWiring:
         assert elapsed_s < 0.8
         assert len(snapshot.candidates) == 1
         assert compact is not None
-        assert len(compact.candidates) == 1
-        assert set(compact.quotes) == {
-            "binance:BTCUSDT",
-            "bybit:BTCUSDT",
-        }
-        for quote in compact.quotes.values():
-            assert quote.observed_at_ms == now_ms
-            assert quote.source == "funding_entry_bbo_test"
-            assert compact.published_at_ms - quote.observed_at_ms < 1_000
+        # The funding event is eight hours away, so complete static admission
+        # decides this pair as outside the scan window.  V7 publishes every
+        # eligible candidate, which correctly means an empty entry page here.
+        assert compact.candidates == []
+        assert compact.quotes == {}
 
     @pytest.mark.asyncio
     async def test_refresh_once_keeps_binance_quotes_when_open_interest_is_slow(self, tmp_path):
@@ -855,9 +851,18 @@ class TestSidecarServiceRateLimitWiring:
         assert len(snapshot.candidates) == 1
         assert snapshot.market_observed_at_ms == 10_200
         assert snapshot.candidate_build_observed_at_ms >= 10_200
-        assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 1
+        assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 2
+        assert snapshot.candidate_build_diagnostics["seed_pair_count"] == 2
+        assert snapshot.candidate_build_diagnostics["pair_decision_count"] == 2
+        assert snapshot.candidate_build_diagnostics["eligible_frontier_complete"] is True
         assert snapshot.candidate_build_diagnostics["output_candidate_count"] == 1
-        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {}
+        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {
+            "funding_edge_below_floor": 1,
+        }
+        assert snapshot.candidate_build_diagnostics["blocked_reason_counts"] == {
+            "funding_edge_below_floor": 1,
+            "outside_scan_window": 1,
+        }
 
     @pytest.mark.asyncio
     async def test_refresh_publishes_compact_spread_quotes_before_liquidity_work(

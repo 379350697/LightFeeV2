@@ -33,7 +33,6 @@ from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
 from lightfee.sidecar.publisher import (
     FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
-    FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
     funding_entry_snapshot_identity,
     funding_entry_snapshot_manifest_path,
     load_funding_entry_snapshot,
@@ -76,7 +75,7 @@ def _funding_entry_snapshot_report(
     now_ms: int,
     max_age_ms: int,
 ) -> HealthReport:
-    """Verify the atomic bounded live-entry generation, not the slow audit."""
+    """Verify the atomic complete live-entry generation, not the slow audit."""
 
     def _manifest_int(name: str, *, default: int = -1) -> int:
         value = manifest.get(name, default)
@@ -135,29 +134,46 @@ def _funding_entry_snapshot_report(
     payload_size = _manifest_int("payload_size_bytes")
     manifest_candidate_count = _manifest_int("candidate_count")
     manifest_quote_count = _manifest_int("quote_count")
+    manifest_schema_version = _manifest_int("schema_version")
+    page_count = _manifest_int("page_count")
+    max_page_size_bytes = _manifest_int("max_page_size_bytes")
     candidates = list(getattr(snapshot, "candidates", []) or [])
     quotes = dict(getattr(snapshot, "quotes", {}) or {})
     candidate_diagnostics = dict(
         getattr(snapshot, "candidate_build_diagnostics", {}) or {}
     )
     source_data_ready = candidate_diagnostics.get("source_data_ready") is True
-    seed_frontier_complete = (
-        candidate_diagnostics.get("seed_frontier_complete") is True
+    eligible_frontier_complete = (
+        candidate_diagnostics.get("eligible_frontier_complete") is True
     )
-    entry_frontier_ready = source_data_ready and seed_frontier_complete
-    seed_frontier_count = _diagnostic_int("seed_frontier_count")
+    entry_frontier_ready = source_data_ready and eligible_frontier_complete
     seed_pair_count = _diagnostic_int("seed_pair_count")
-    seed_frontier_stop_reason = str(
-        candidate_diagnostics.get("seed_frontier_stop_reason", "") or ""
+    pair_decision_count = _diagnostic_int("pair_decision_count")
+    eligible_candidate_count = _diagnostic_int("eligible_candidate_count")
+    omitted_eligible_count = _diagnostic_int("omitted_eligible_count")
+    frontier_stop_reason = str(
+        candidate_diagnostics.get("frontier_stop_reason", "") or ""
     )
-    if payload_size < 0 or payload_size > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES:
+    if payload_size < 0:
         fingerprints.append("funding_entry_payload_size_invalid")
+    if (
+        manifest_schema_version != 7
+        or page_count <= 0
+        or max_page_size_bytes <= 0
+        or max_page_size_bytes > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES
+    ):
+        fingerprints.append("funding_entry_page_manifest_invalid")
     if (
         manifest_candidate_count != len(candidates)
         or manifest_quote_count != len(quotes)
-        or len(candidates) > FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES
     ):
         fingerprints.append("funding_entry_manifest_count_mismatch")
+    if (
+        pair_decision_count != seed_pair_count
+        or eligible_candidate_count != len(candidates)
+        or omitted_eligible_count != 0
+    ):
+        fingerprints.append("funding_entry_opportunity_omitted")
     if any(
         bool(getattr(candidate, "blocked", True))
         or getattr(candidate, "economics_complete", False) is not True
@@ -202,7 +218,7 @@ def _funding_entry_snapshot_report(
         fingerprints.append("funding_entry_candidate_evidence_degraded")
     if not candidates and not source_data_ready:
         fingerprints.append("funding_entry_source_data_unavailable")
-    if not seed_frontier_complete:
+    if not eligible_frontier_complete:
         fingerprints.append("funding_entry_frontier_incomplete")
 
     return HealthReport(
@@ -211,23 +227,26 @@ def _funding_entry_snapshot_report(
         severity="critical" if fingerprints else "info",
         fingerprints=fingerprints,
         details={
-            "data_plane": "funding_entry_v6",
+            "data_plane": "funding_entry_v7",
             "manifest_path": str(manifest_path),
             "generation_id": identity[0] if identity is not None else "",
             "ready_at_ms": ready_at_ms,
             "ready_age_ms": ready_age_ms,
             "payload_size_bytes": payload_size,
-            "payload_max_bytes": FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+            "page_max_bytes": FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
+            "page_count": page_count,
+            "max_page_size_bytes": max_page_size_bytes,
             "candidate_count": len(candidates),
-            "candidate_limit": FUNDING_ENTRY_SNAPSHOT_MAX_CANDIDATES,
             "quote_count": len(quotes),
             "diagnostics_only": not bool(candidates),
             "source_data_ready": source_data_ready,
-            "seed_frontier_complete": seed_frontier_complete,
+            "eligible_frontier_complete": eligible_frontier_complete,
             "entry_frontier_ready": entry_frontier_ready,
-            "seed_frontier_count": seed_frontier_count,
             "seed_pair_count": seed_pair_count,
-            "seed_frontier_stop_reason": seed_frontier_stop_reason,
+            "pair_decision_count": pair_decision_count,
+            "eligible_candidate_count": eligible_candidate_count,
+            "omitted_eligible_count": omitted_eligible_count,
+            "frontier_stop_reason": frontier_stop_reason,
         },
     )
 
