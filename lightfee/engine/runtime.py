@@ -319,10 +319,6 @@ class LiveRuntime:
         self._entry_evidence_prewarm_generation: int = 0
         self._entry_evidence_prewarm_task: asyncio.Task | None = None
         self._entry_evidence_cancel_cleanup_tasks: set[asyncio.Task] = set()
-        self._sidecar_snapshot_cache = None
-        self._sidecar_snapshot_identity: object | None = None
-        self._sidecar_snapshot_load_identity: object | None = None
-        self._sidecar_snapshot_load_task: asyncio.Task | None = None
         self._sidecar_entry_installing_since_ms: int = 0
         self._sidecar_entry_install_status: str = ""
         self._sidecar_entry_invalid_reported: bool = False
@@ -2279,12 +2275,6 @@ class LiveRuntime:
     async def start(self) -> None:
         """Booting sequence: phased private→market→local-L2 startup (V1 parity)."""
         self.journal.open()
-        # Parse/validate the immutable generation off the event loop.  Ticks
-        # consume the last installed object and never synchronously decode the
-        # full audit snapshot.
-        if not self._uses_single_process_entry_input():
-            self._ensure_sidecar_snapshot_load()
-
         # Phase 1 – BOOTING
         set_lifecycle(self.state, EngineLifecycle.BOOTING)
         self.state.run_id = self.journal.run_id
@@ -5482,12 +5472,6 @@ class LiveRuntime:
             with suppress(asyncio.CancelledError):
                 await prewarm_task
         self._entry_evidence_prewarm_task = None
-        snapshot_load_task = getattr(self, "_sidecar_snapshot_load_task", None)
-        if snapshot_load_task is not None and not snapshot_load_task.done():
-            snapshot_load_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await snapshot_load_task
-        self._sidecar_snapshot_load_task = None
         in_process_entry_task = getattr(self, "_in_process_entry_refresh_task", None)
         if in_process_entry_task is not None and not in_process_entry_task.done():
             in_process_entry_task.cancel()
@@ -5992,92 +5976,27 @@ class LiveRuntime:
         except OSError:
             return ("missing",), False
 
-    def _ensure_sidecar_snapshot_load(self) -> None:
-        identity, use_entry_snapshot = self._current_sidecar_snapshot_generation()
+    async def _sidecar_snapshot_for_tick(self):
+        # V1 reads the current sidecar file for every scan, then falls back only
+        # when that read cannot provide a usable snapshot.  V7's loader already
+        # validates one immutable manifest/page generation before returning, so
+        # its result must be consumed directly instead of being compared with a
+        # later filesystem generation.  That comparison let a fast publisher
+        # permanently strand the runtime on an old cache.
+        _identity, use_entry_snapshot = self._current_sidecar_snapshot_generation()
         if use_entry_snapshot is None:
-            return
-        task = self._sidecar_snapshot_load_task
-        if task is not None:
-            if not task.done() and self._sidecar_snapshot_load_identity != identity:
-                # Do not cancel an in-flight thread; its result is simply
-                # ignored when a newer immutable generation wins.
-                return
-            # A completed task must be adopted by
-            # ``_sidecar_snapshot_for_tick`` before another generation starts.
-            return
-        if identity == self._sidecar_snapshot_identity:
-            return
+            return None
         path = self.config.runtime.sidecar_snapshot_path
         loader = (
             (lambda: load_funding_entry_snapshot(path))
             if use_entry_snapshot
             else (lambda: load_snapshot(path))
         )
-        self._sidecar_snapshot_load_identity = identity
-        self._sidecar_snapshot_load_task = asyncio.create_task(
-            asyncio.to_thread(loader),
-            name="funding-entry-snapshot-loader",
-        )
-
-    async def _sidecar_snapshot_for_tick(self):
-        self._ensure_sidecar_snapshot_load()
-        current_identity, current_loader_mode = (
-            self._current_sidecar_snapshot_generation()
-        )
-        if (
-            current_loader_mode is None
-            and isinstance(current_identity, tuple)
-            and current_identity
-            and current_identity[0] == "funding-entry-v7-missing"
-        ):
-            return None
-        task = self._sidecar_snapshot_load_task
-        if task is not None and task.done():
-            loaded_identity = self._sidecar_snapshot_load_identity
-            try:
-                loaded = task.result()
-            except Exception:
-                logger.exception("funding entry snapshot background load failed")
-                loaded = None
-            self._sidecar_snapshot_load_task = None
-            if loaded is not None:
-                current_identity, _ = self._current_sidecar_snapshot_generation()
-                if current_identity == loaded_identity:
-                    self._sidecar_snapshot_cache = loaded
-                    self._sidecar_snapshot_identity = loaded_identity
-            self._ensure_sidecar_snapshot_load()
-        if self._sidecar_snapshot_cache is not None:
-            # Legacy/full snapshots have no entry ready manifest and are retained
-            # only for compatibility/tests.  Observe an explicit file change
-            # in this tick so no detached loader outlives a one-shot owner.
-            # Production V7 generations keep the non-blocking last-installed
-            # object while the paged entry payload is parsed.
-            load_identity = self._sidecar_snapshot_load_identity
-            if (
-                task is not None
-                and not task.done()
-                and isinstance(load_identity, tuple)
-                and load_identity
-                and load_identity[0] == "legacy-full"
-            ):
-                await task
-                return await self._sidecar_snapshot_for_tick()
-            return self._sidecar_snapshot_cache
-        task = self._sidecar_snapshot_load_task
-        if task is None:
-            return None
-        loaded_identity = self._sidecar_snapshot_load_identity
         try:
-            loaded = await task
+            return await asyncio.to_thread(loader)
         except Exception:
-            logger.exception("funding entry snapshot initial load failed")
-            loaded = None
-        self._sidecar_snapshot_load_task = None
-        current_identity, _ = self._current_sidecar_snapshot_generation()
-        if loaded is not None and current_identity == loaded_identity:
-            self._sidecar_snapshot_cache = loaded
-            self._sidecar_snapshot_identity = loaded_identity
-        return self._sidecar_snapshot_cache
+            logger.exception("funding entry snapshot tick read failed")
+            return None
 
     async def tick(self) -> None:
         """Full engine tick: consume snapshot, scan, supervise, manage positions."""

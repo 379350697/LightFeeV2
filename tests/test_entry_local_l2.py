@@ -3476,9 +3476,6 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         stale_snapshot["degraded_symbols"] = {}
         rt._last_good_snapshot = None
         snapshot_path.write_text(json.dumps(stale_snapshot))
-        rt._ensure_sidecar_snapshot_load()
-        if rt._sidecar_snapshot_load_task is not None:
-            await rt._sidecar_snapshot_load_task
         await rt.tick()
         rt.journal.close()
 

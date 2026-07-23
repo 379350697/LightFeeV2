@@ -210,7 +210,6 @@ async def test_single_process_entry_snapshot_uses_runtime_ws_bbo_without_handoff
         now_ms=1_001,
     )
     assert set(runtime.ws_bbo_data_plane._clients) == expected_keys
-    assert runtime._sidecar_snapshot_load_task is None
 
 
 @pytest.mark.asyncio
@@ -556,7 +555,7 @@ async def test_entry_oi_queue_allows_64_targets_without_slow_venue_starvation():
 
 
 @pytest.mark.asyncio
-async def test_runtime_snapshot_generation_is_parsed_once_off_event_loop(
+async def test_runtime_snapshot_is_read_each_tick_off_event_loop(
     tmp_path,
     monkeypatch,
 ):
@@ -585,12 +584,66 @@ async def test_runtime_snapshot_generation_is_parsed_once_off_event_loop(
     first = await load_task
     second = await runtime._sidecar_snapshot_for_tick()
 
-    assert calls == 1
-    assert first is second
+    assert calls == 2
+    assert first is not second
 
 
 @pytest.mark.asyncio
-async def test_runtime_keeps_verified_v7_cache_during_two_file_install_window(
+async def test_runtime_uses_verified_v7_generation_for_each_tick(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    generation_b = SidecarSnapshot(published_at_ms=2)
+    generation_c = SidecarSnapshot(published_at_ms=3)
+    generations = iter(
+        [
+            ("b" * 64, 2, 2),
+            ("c" * 64, 3, 3),
+            ("c" * 64, 3, 3),
+        ]
+    )
+    loaded_generations = iter([generation_b, generation_c])
+    loads = 0
+
+    def load_generation(_path):
+        nonlocal loads
+        loads += 1
+        return next(loaded_generations)
+
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.funding_entry_snapshot_identity",
+        lambda _path: next(generations),
+    )
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_funding_entry_snapshot",
+        load_generation,
+    )
+
+    # The former asynchronous path could discard B after C published before
+    # its background task was adopted.  A V1-style tick must consume the
+    # immutable generation it just verified.
+
+    first = await runtime._sidecar_snapshot_for_tick()
+    second = await runtime._sidecar_snapshot_for_tick()
+
+    assert first is generation_b
+    assert second is generation_c
+    assert loads == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_returns_none_during_v7_install_window_for_v1_fallback(
     tmp_path,
     monkeypatch,
 ):
@@ -605,9 +658,6 @@ async def test_runtime_keeps_verified_v7_cache_during_two_file_install_window(
         ),
     )
     runtime = LiveRuntime(config)
-    cached = SidecarSnapshot(published_at_ms=1)
-    runtime._sidecar_snapshot_cache = cached
-    runtime._sidecar_snapshot_identity = ("funding-entry-v7", "old", 1, 1)
     legacy_loads = 0
 
     def legacy_load(_path):
@@ -619,9 +669,8 @@ async def test_runtime_keeps_verified_v7_cache_during_two_file_install_window(
 
     loaded = await runtime._sidecar_snapshot_for_tick()
 
-    assert loaded is cached
+    assert loaded is None
     assert legacy_loads == 0
-    assert runtime._sidecar_snapshot_load_task is None
 
 
 @pytest.mark.asyncio
