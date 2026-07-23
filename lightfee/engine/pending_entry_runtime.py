@@ -195,6 +195,76 @@ def pending_entry_edge_headroom_bps(pending: Any, strategy: Any) -> float | None
     return min(expected_edge - min_expected, worst_case_edge - min_worst)
 
 
+def _serializable_l2_levels(levels: object) -> list[dict[str, float]]:
+    if not isinstance(levels, list):
+        return []
+    serialized: list[dict[str, float]] = []
+    for level in levels:
+        try:
+            price = float(getattr(level, "price", 0.0) or 0.0)
+            quantity = float(
+                getattr(level, "quantity", None)
+                if getattr(level, "quantity", None) is not None
+                else getattr(level, "size", 0.0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(price) and price > 0.0 and math.isfinite(quantity) and quantity > 0.0:
+            serialized.append({"price": price, "quantity": quantity})
+    return serialized
+
+
+def _pending_l2_vwap_and_sweep_limit(
+    levels: object,
+    target_quantity: float,
+) -> tuple[float, float, float]:
+    target = max(float(target_quantity or 0.0), 0.0)
+    if target <= 0.0 or not isinstance(levels, list):
+        return 0.0, 0.0, 0.0
+    filled = 0.0
+    notional = 0.0
+    sweep_limit = 0.0
+    for level in levels:
+        try:
+            price = float(
+                level.get("price", 0.0)
+                if isinstance(level, dict)
+                else getattr(level, "price", 0.0)
+            )
+            raw_quantity = (
+                level.get("quantity", None)
+                if isinstance(level, dict)
+                else getattr(level, "quantity", None)
+            )
+            if raw_quantity is None:
+                raw_quantity = (
+                    level.get("size", 0.0)
+                    if isinstance(level, dict)
+                    else getattr(level, "size", 0.0)
+                )
+            available = float(raw_quantity or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not (
+            math.isfinite(price)
+            and price > 0.0
+            and math.isfinite(available)
+            and available > 0.0
+        ):
+            continue
+        take = min(available, target - filled)
+        if take <= 0.0:
+            continue
+        filled += take
+        notional += take * price
+        sweep_limit = price
+        if filled >= target:
+            break
+    if filled <= 0.0:
+        return 0.0, 0.0, 0.0
+    return notional / filled, filled, sweep_limit
+
+
 class PendingEntryRuntime:
     def __init__(self, ctx: RuntimeContext) -> None:
         self.ctx = ctx
@@ -237,7 +307,6 @@ class PendingEntryRuntime:
                 return None
             snapshot = execution_liquidity_from_local_l2(
                 book,
-                max_depth=1,
                 max_age_ms=max_age_ms,
                 now_ms=now_ms,
                 require_ready=True,
@@ -258,7 +327,7 @@ class PendingEntryRuntime:
             or ask <= bid
         ):
             return None
-        return bid, ask, {
+        evidence = {
             "venue": venue_value,
             "bid": bid,
             "ask": ask,
@@ -266,6 +335,10 @@ class PendingEntryRuntime:
             "max_age_ms": max_age_ms,
             "source": source,
         }
+        if source == "local_l2_final_bbo":
+            evidence["bids"] = _serializable_l2_levels(snapshot.bids)
+            evidence["asks"] = _serializable_l2_levels(snapshot.asks)
+        return bid, ask, evidence
 
     def _pending_entry_post_first_fill_decision(
         self,
@@ -304,8 +377,90 @@ class PendingEntryRuntime:
         unwind_fee_bps = revalidator.taker_fee_bps_for_venue(
             unwind_venue, self.ctx.config.venues
         )
+        maker_side = pending.maker_side()
+        hedge_execution_price = 0.0
+        unwind_execution_price = 0.0
+        hedge_submit_price = 0.0
+        unwind_submit_price = 0.0
+        depth_evidence: dict[str, Any] = {}
+        if (
+            maker_evidence.get("source") == "local_l2_final_bbo"
+            and hedge_evidence.get("source") == "local_l2_final_bbo"
+        ):
+            if maker_side == Side.BUY:
+                hedge_levels = hedge_evidence.get("bids", [])
+                unwind_levels = maker_evidence.get("bids", [])
+            else:
+                hedge_levels = hedge_evidence.get("asks", [])
+                unwind_levels = maker_evidence.get("asks", [])
+            hedge_vwap, hedge_filled, hedge_sweep_limit = (
+                _pending_l2_vwap_and_sweep_limit(hedge_levels, quantity)
+            )
+            unwind_vwap, unwind_filled, unwind_sweep_limit = (
+                _pending_l2_vwap_and_sweep_limit(unwind_levels, quantity)
+            )
+            hedge_complete = hedge_filled + 1e-12 >= quantity and hedge_vwap > 0.0
+            unwind_complete = (
+                unwind_filled + 1e-12 >= quantity and unwind_vwap > 0.0
+            )
+            depth_evidence = {
+                "source": "local_l2_multilevel_vwap",
+                "remaining_base_quantity": quantity,
+                "hedge_vwap": hedge_vwap,
+                "hedge_filled_base_quantity": hedge_filled,
+                "hedge_sweep_limit": hedge_sweep_limit,
+                "hedge_l2_complete": hedge_complete,
+                "unwind_vwap": unwind_vwap,
+                "unwind_filled_base_quantity": unwind_filled,
+                "unwind_sweep_limit": unwind_sweep_limit,
+                "unwind_l2_complete": unwind_complete,
+            }
+            if not hedge_complete and not unwind_complete:
+                return {
+                    "action": "unwind_first_leg",
+                    "reason": "pending_post_first_fill_incomplete_l2_depth_residual_repair",
+                    "hedge_price": hedge_bid if maker_side == Side.BUY else hedge_ask,
+                    "unwind_price": maker_bid if maker_side == Side.BUY else maker_ask,
+                    "market_evidence": {
+                        "entry_id": entry_id,
+                        "maker": maker_evidence,
+                        "hedge": hedge_evidence,
+                        "l2_depth": depth_evidence,
+                    },
+                }
+            if hedge_complete:
+                hedge_execution_price = hedge_vwap
+                hedge_submit_price = hedge_sweep_limit
+            if unwind_complete:
+                unwind_execution_price = unwind_vwap
+                unwind_submit_price = unwind_sweep_limit
+            if hedge_complete and not unwind_complete:
+                return {
+                    "action": "complete_hedge",
+                    "reason": "pending_post_first_fill_incomplete_unwind_l2_depth_complete_hedge",
+                    "hedge_price": hedge_submit_price,
+                    "market_evidence": {
+                        "entry_id": entry_id,
+                        "maker": maker_evidence,
+                        "hedge": hedge_evidence,
+                        "l2_depth": depth_evidence,
+                    },
+                }
+            if unwind_complete and not hedge_complete:
+                return {
+                    "action": "unwind_first_leg",
+                    "reason": "pending_post_first_fill_incomplete_hedge_l2_depth_unwind",
+                    "hedge_price": hedge_bid if maker_side == Side.BUY else hedge_ask,
+                    "unwind_price": unwind_submit_price,
+                    "market_evidence": {
+                        "entry_id": entry_id,
+                        "maker": maker_evidence,
+                        "hedge": hedge_evidence,
+                        "l2_depth": depth_evidence,
+                    },
+                }
         market_decision = revalidator.decide_from_first_fill_market(
-            maker_side=pending.maker_side(),
+            maker_side=maker_side,
             maker_fill_price=maker_price,
             quantity=quantity,
             maker_bid=maker_bid,
@@ -314,6 +469,8 @@ class PendingEntryRuntime:
             hedge_ask=hedge_ask,
             hedge_fee_bps=hedge_fee_bps,
             unwind_fee_bps=unwind_fee_bps,
+            hedge_execution_price=hedge_execution_price,
+            unwind_execution_price=unwind_execution_price,
         )
         if market_decision is None:
             return {
@@ -332,8 +489,8 @@ class PendingEntryRuntime:
         return {
             "action": choice.action,
             "reason": f"pending_post_first_fill_{choice.reason}",
-            "hedge_price": market_decision.hedge_price,
-            "unwind_price": market_decision.unwind_price,
+            "hedge_price": hedge_submit_price or market_decision.hedge_price,
+            "unwind_price": unwind_submit_price or market_decision.unwind_price,
             "complete_hedge_loss_quote": choice.complete_hedge_loss_quote,
             "unwind_first_leg_loss_quote": choice.unwind_first_leg_loss_quote,
             "complete_hedge_price_loss_quote": choice.complete_hedge_price_loss_quote,
@@ -344,6 +501,7 @@ class PendingEntryRuntime:
                 "entry_id": entry_id,
                 "maker": maker_evidence,
                 "hedge": hedge_evidence,
+                "l2_depth": depth_evidence,
                 "hedge_taker_fee_bps": market_decision.hedge_fee_bps,
                 "unwind_taker_fee_bps": market_decision.unwind_fee_bps,
             },

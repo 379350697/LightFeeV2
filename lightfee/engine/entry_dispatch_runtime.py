@@ -45,6 +45,7 @@ from lightfee.engine.recovery import (
 )
 from lightfee.marketdata.open_interest import (
     observed_open_interest_proof_reason,
+    open_interest_max_age_ms_for_evidence,
     open_interest_sample_id,
     open_interest_timestamps_are_fresh,
 )
@@ -334,6 +335,138 @@ def _ws_bbo_ioc_price_hints(
         long_ask * (1.0 + long_slippage_bps / 10_000.0),
         short_bid * (1.0 - short_slippage_bps / 10_000.0),
     )
+
+
+def _candidate_quote_lease_required_base_quantity(
+    candidate: Any,
+    lease: QuoteLease | None,
+) -> float:
+    for field_name in ("entry_target_quantity", "entry_max_executable_quantity"):
+        try:
+            quantity = float(getattr(candidate, field_name, 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            quantity = 0.0
+        if math.isfinite(quantity) and quantity > 0.0:
+            return quantity
+    try:
+        notional = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        notional = 0.0
+    if not math.isfinite(notional) or notional <= 0.0 or lease is None:
+        return 0.0
+    reference_prices: list[float] = []
+    for field_name in ("long_bid", "long_ask", "short_bid", "short_ask"):
+        try:
+            reference_prices.append(float(getattr(lease, field_name, 0.0) or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    reference_price = max(
+        (price for price in reference_prices if math.isfinite(price) and price > 0.0),
+        default=0.0,
+    )
+    if reference_price <= 0.0:
+        return 0.0
+    return notional / reference_price
+
+
+def _quote_lease_side_capacity_checks(
+    candidate: Any,
+    lease: QuoteLease | None,
+) -> tuple[str, dict[str, Any]]:
+    required_quantity = _candidate_quote_lease_required_base_quantity(
+        candidate,
+        lease,
+    )
+    evidence: dict[str, Any] = {
+        "quote_lease_required_base_quantity": required_quantity,
+        "quote_lease_capacity_checks": [],
+        "quote_lease_capacity_failed_legs": [],
+    }
+    if lease is None or required_quantity <= 0.0:
+        return "", evidence
+
+    maker_leg = str(
+        getattr(candidate, "entry_maker_leg", "")
+        or getattr(candidate, "maker_leg", "")
+        or ""
+    ).strip().lower()
+    provider = str(getattr(lease, "provider", "") or "")
+    if provider == "local_l2_final_vwap":
+        if maker_leg == "long":
+            requirements = (
+                ("long", "maker", "bid", "long_bid_size"),
+                (
+                    "short",
+                    "hedge",
+                    "sell_depth",
+                    "short_l2_capacity_quantity",
+                ),
+            )
+        elif maker_leg == "short":
+            requirements = (
+                ("short", "maker", "ask", "short_ask_size"),
+                (
+                    "long",
+                    "hedge",
+                    "buy_depth",
+                    "long_l2_capacity_quantity",
+                ),
+            )
+        else:
+            requirements = (
+                (
+                    "long",
+                    "taker",
+                    "buy_depth",
+                    "long_l2_capacity_quantity",
+                ),
+                (
+                    "short",
+                    "taker",
+                    "sell_depth",
+                    "short_l2_capacity_quantity",
+                ),
+            )
+    elif maker_leg == "long":
+        requirements = (
+            ("long", "maker", "bid", "long_bid_size"),
+            ("short", "hedge", "bid", "short_bid_size"),
+        )
+    elif maker_leg == "short":
+        requirements = (
+            ("short", "maker", "ask", "short_ask_size"),
+            ("long", "hedge", "ask", "long_ask_size"),
+        )
+    else:
+        requirements = (
+            ("long", "taker", "ask", "long_ask_size"),
+            ("short", "taker", "bid", "short_bid_size"),
+        )
+
+    failed: list[dict[str, Any]] = []
+    for leg, role, side, size_field in requirements:
+        try:
+            available_quantity = float(getattr(lease, size_field, 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            available_quantity = 0.0
+        if not math.isfinite(available_quantity):
+            available_quantity = 0.0
+        check = {
+            "leg": leg,
+            "role": role,
+            "side": side,
+            "size_field": size_field,
+            "available_base_quantity": max(available_quantity, 0.0),
+            "required_base_quantity": required_quantity,
+        }
+        evidence["quote_lease_capacity_checks"].append(check)
+        if max(available_quantity, 0.0) + 1e-12 < required_quantity:
+            failed.append(check)
+
+    if failed:
+        evidence["quote_lease_capacity_failed_legs"] = failed
+        return "quote_lease_insufficient_bbo_capacity", evidence
+    return "", evidence
 
 
 def _l2_base_capacity(levels: object) -> float:
@@ -645,13 +778,79 @@ class EntryDispatchRuntime:
         if ctx.maker_leg == Side.BUY:
             maker_bid, maker_ask = long_bid, long_ask
             hedge_bid, hedge_ask = short_bid, short_ask
+            hedge_levels = short_snapshot.bids
+            unwind_levels = long_snapshot.bids
             hedge_venue = ctx.short_venue
             unwind_venue = ctx.long_venue
         else:
             maker_bid, maker_ask = short_bid, short_ask
             hedge_bid, hedge_ask = long_bid, long_ask
+            hedge_levels = long_snapshot.asks
+            unwind_levels = short_snapshot.asks
             hedge_venue = ctx.long_venue
             unwind_venue = ctx.short_venue
+        hedge_vwap, hedge_filled, hedge_sweep_limit = (
+            _l2_vwap_and_sweep_limit_for_base_quantity(hedge_levels, quantity)
+        )
+        unwind_vwap, unwind_filled, unwind_sweep_limit = (
+            _l2_vwap_and_sweep_limit_for_base_quantity(unwind_levels, quantity)
+        )
+        quantity_tolerance = max(1e-12, quantity * 1e-9)
+        hedge_complete = hedge_filled + quantity_tolerance >= quantity
+        unwind_complete = unwind_filled + quantity_tolerance >= quantity
+        hedge_submit_price = (
+            hedge_sweep_limit
+            if hedge_complete and hedge_sweep_limit > 0.0
+            else hedge_bid if ctx.maker_leg == Side.BUY else hedge_ask
+        )
+        unwind_submit_price = (
+            unwind_sweep_limit
+            if unwind_complete and unwind_sweep_limit > 0.0
+            else maker_bid if ctx.maker_leg == Side.BUY else maker_ask
+        )
+        base_market_evidence = {
+            "source": "local_l2_multilevel_vwap",
+            "long_bid": long_bid,
+            "long_ask": long_ask,
+            "short_bid": short_bid,
+            "short_ask": short_ask,
+            "long_observed_at_ms": long_observed_at_ms,
+            "short_observed_at_ms": short_observed_at_ms,
+            "max_age_ms": max_age_ms,
+            "remaining_base_quantity": quantity,
+            "hedge_l2_filled_base_quantity": hedge_filled,
+            "unwind_l2_filled_base_quantity": unwind_filled,
+            "hedge_l2_vwap": hedge_vwap,
+            "unwind_l2_vwap": unwind_vwap,
+            "hedge_sweep_limit": hedge_sweep_limit,
+            "unwind_sweep_limit": unwind_sweep_limit,
+            "hedge_l2_complete": hedge_complete,
+            "unwind_l2_complete": unwind_complete,
+        }
+        if not hedge_complete and not unwind_complete:
+            return {
+                "action": "unwind_first_leg",
+                "reason": "post_first_fill_incomplete_l2_depth_residual_repair",
+                "hedge_price": hedge_submit_price,
+                "unwind_price": unwind_submit_price,
+                "market_evidence": base_market_evidence,
+            }
+        if not hedge_complete and unwind_complete:
+            return {
+                "action": "unwind_first_leg",
+                "reason": "post_first_fill_incomplete_hedge_depth_unwind",
+                "hedge_price": hedge_submit_price,
+                "unwind_price": unwind_submit_price,
+                "market_evidence": base_market_evidence,
+            }
+        if hedge_complete and not unwind_complete:
+            return {
+                "action": "complete_hedge",
+                "reason": "post_first_fill_incomplete_unwind_depth_complete_hedge",
+                "hedge_price": hedge_submit_price,
+                "unwind_price": unwind_submit_price,
+                "market_evidence": base_market_evidence,
+            }
 
         revalidator = FundingEntryRevalidator()
         hedge_fee_bps = revalidator.taker_fee_bps_for_venue(
@@ -670,21 +869,16 @@ class EntryDispatchRuntime:
             hedge_ask=hedge_ask,
             hedge_fee_bps=hedge_fee_bps,
             unwind_fee_bps=unwind_fee_bps,
+            hedge_execution_price=hedge_vwap,
+            unwind_execution_price=unwind_vwap,
         )
         if market_decision is None:
             return {
                 **default,
                 "reason": "post_first_fill_fee_evidence_unavailable_complete_hedge",
-                "hedge_price": hedge_bid if ctx.maker_leg == Side.BUY else hedge_ask,
+                "hedge_price": hedge_submit_price,
                 "market_evidence": {
-                    "source": "local_l2_final_bbo",
-                    "long_bid": long_bid,
-                    "long_ask": long_ask,
-                    "short_bid": short_bid,
-                    "short_ask": short_ask,
-                    "long_observed_at_ms": long_observed_at_ms,
-                    "short_observed_at_ms": short_observed_at_ms,
-                    "max_age_ms": max_age_ms,
+                    **base_market_evidence,
                     "hedge_taker_fee_evidence": hedge_fee_bps is not None,
                     "unwind_taker_fee_evidence": unwind_fee_bps is not None,
                 },
@@ -693,8 +887,8 @@ class EntryDispatchRuntime:
         return {
             "action": choice.action,
             "reason": f"post_first_fill_{choice.reason}",
-            "hedge_price": market_decision.hedge_price,
-            "unwind_price": market_decision.unwind_price,
+            "hedge_price": hedge_submit_price,
+            "unwind_price": unwind_submit_price,
             "complete_hedge_loss_quote": choice.complete_hedge_loss_quote,
             "unwind_first_leg_loss_quote": choice.unwind_first_leg_loss_quote,
             "complete_hedge_price_loss_quote": choice.complete_hedge_price_loss_quote,
@@ -702,14 +896,7 @@ class EntryDispatchRuntime:
             "complete_hedge_fee_quote": choice.complete_hedge_fee_quote,
             "unwind_first_leg_fee_quote": choice.unwind_first_leg_fee_quote,
             "market_evidence": {
-                "source": "local_l2_final_bbo",
-                "long_bid": long_bid,
-                "long_ask": long_ask,
-                "short_bid": short_bid,
-                "short_ask": short_ask,
-                "long_observed_at_ms": long_observed_at_ms,
-                "short_observed_at_ms": short_observed_at_ms,
-                "max_age_ms": max_age_ms,
+                **base_market_evidence,
                 "hedge_taker_fee_bps": market_decision.hedge_fee_bps,
                 "unwind_taker_fee_bps": market_decision.unwind_fee_bps,
             },
@@ -767,13 +954,28 @@ class EntryDispatchRuntime:
         return self.ctx._quote_lease_blocker_family(*args, **kwargs)
 
     def _entry_readiness_provider_name(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_readiness_provider_name(*args, **kwargs)
+        resolver = getattr(
+            self.ctx,
+            "_entry_effective_readiness_provider_name",
+            self.ctx._entry_readiness_provider_name,
+        )
+        return resolver(*args, **kwargs)
 
     def _entry_readiness_provider_uses_quote_lease(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_readiness_provider_uses_quote_lease(*args, **kwargs)
+        resolver = getattr(
+            self.ctx,
+            "_entry_effective_readiness_provider_uses_quote_lease",
+            self.ctx._entry_readiness_provider_uses_quote_lease,
+        )
+        return resolver(*args, **kwargs)
 
     def _local_l2_effective_enabled(self, *args: Any, **kwargs: Any):
-        return self.ctx._local_l2_effective_enabled(*args, **kwargs)
+        resolver = getattr(
+            self.ctx,
+            "_entry_local_l2_effective_enabled",
+            self.ctx._local_l2_effective_enabled,
+        )
+        return resolver(*args, **kwargs)
 
     def _post_only_maker_bbo_guard(self, *args: Any, **kwargs: Any):
         return self.ctx._post_only_maker_bbo_guard(*args, **kwargs)
@@ -2492,6 +2694,8 @@ class EntryDispatchRuntime:
         self,
         candidate,
         now_ms: int,
+        *,
+        enforce_side_capacity: bool = True,
     ) -> tuple[str, object | None, dict]:
         provider_name = self._entry_readiness_provider_name()
         evidence = {
@@ -2544,9 +2748,24 @@ class EntryDispatchRuntime:
                 "long_ask": float(getattr(lease, "long_ask", 0.0) or 0.0),
                 "short_bid": float(getattr(lease, "short_bid", 0.0) or 0.0),
                 "short_ask": float(getattr(lease, "short_ask", 0.0) or 0.0),
+                "long_bid_size": float(
+                    getattr(lease, "long_bid_size", 0.0) or 0.0
+                ),
+                "long_ask_size": float(
+                    getattr(lease, "long_ask_size", 0.0) or 0.0
+                ),
+                "short_bid_size": float(
+                    getattr(lease, "short_bid_size", 0.0) or 0.0
+                ),
+                "short_ask_size": float(
+                    getattr(lease, "short_ask_size", 0.0) or 0.0
+                ),
             }
         )
-        if evidence["lease_provider"] != provider_name:
+        expected_lease_provider = provider_name
+        if provider_name == "ws_bbo_l2_on_demand":
+            expected_lease_provider = "ws_bbo_quote_lease"
+        if evidence["lease_provider"] != expected_lease_provider:
             return blocked("quote_lease_provider_mismatch", lease)
         if str(getattr(lease, "symbol", "")) != evidence["symbol"]:
             return blocked("quote_lease_symbol_mismatch", lease)
@@ -2587,6 +2806,26 @@ class EntryDispatchRuntime:
             ):
                 return blocked("stale_quote_lease", lease)
 
+        max_skew_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "entry_final_gate_max_skew_ms",
+                    0,
+                )
+                or 0
+            ),
+            0,
+        )
+        quote_skew_ms = abs(
+            int(evidence["long_observed_at_ms"] or 0)
+            - int(evidence["short_observed_at_ms"] or 0)
+        )
+        evidence["quote_observation_skew_ms"] = quote_skew_ms
+        evidence["quote_observation_max_skew_ms"] = max_skew_ms
+        if quote_skew_ms > max_skew_ms:
+            return blocked("quote_lease_skew_exceeded", lease)
+
         if (
             evidence["long_bid"] <= 0.0
             or evidence["long_ask"] <= evidence["long_bid"]
@@ -2594,6 +2833,17 @@ class EntryDispatchRuntime:
             or evidence["short_ask"] <= evidence["short_bid"]
         ):
             return blocked("invalid_quote_lease", lease)
+        if enforce_side_capacity:
+            capacity_reason, capacity_evidence = _quote_lease_side_capacity_checks(
+                candidate,
+                lease,
+            )
+            evidence.update(capacity_evidence)
+            if capacity_reason:
+                return blocked(capacity_reason, lease)
+        else:
+            evidence["quote_lease_capacity_deferred"] = True
+            evidence["quote_lease_capacity_deferred_to"] = "final_quote_lease"
         return "", lease, evidence
 
     def _final_quote_lease_reason(
@@ -2630,6 +2880,19 @@ class EntryDispatchRuntime:
                 or now_ms - observed_at_ms > max_age_ms
             ):
                 return "stale_final_quote_lease"
+        max_skew_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "entry_final_gate_max_skew_ms",
+                    0,
+                )
+                or 0
+            ),
+            0,
+        )
+        if abs(lease.long_observed_at_ms - lease.short_observed_at_ms) > max_skew_ms:
+            return "final_quote_lease_skew_exceeded"
         if (
             lease.long_bid <= 0.0
             or lease.long_ask <= lease.long_bid
@@ -2637,6 +2900,12 @@ class EntryDispatchRuntime:
             or lease.short_ask <= lease.short_bid
         ):
             return "invalid_final_quote_lease"
+        capacity_reason, _capacity_evidence = _quote_lease_side_capacity_checks(
+            candidate,
+            lease,
+        )
+        if capacity_reason:
+            return "final_quote_lease_insufficient_bbo_capacity"
         return ""
 
     def _refresh_entry_quote_lease_for_execution(
@@ -2646,10 +2915,12 @@ class EntryDispatchRuntime:
         quote_lease_reason: str,
         quote_lease: object | None,
         quote_lease_evidence: dict,
+        *,
+        enforce_side_capacity: bool = True,
     ) -> tuple[str, object | None, dict]:
         if quote_lease_reason not in {"expired_quote_lease", "stale_quote_lease"}:
             return quote_lease_reason, quote_lease, quote_lease_evidence
-        if self._entry_readiness_provider_name() != "ws_bbo_quote_lease":
+        if self._entry_readiness_provider_name() != "ws_bbo_l2_on_demand":
             return quote_lease_reason, quote_lease, quote_lease_evidence
 
         decide = getattr(self.ctx.entry_readiness_provider, "decide", None)
@@ -2679,6 +2950,7 @@ class EntryDispatchRuntime:
         new_reason, new_lease, new_evidence = self._entry_quote_lease_execution_check(
             candidate,
             now_ms,
+            enforce_side_capacity=enforce_side_capacity,
         )
         new_evidence = dict(new_evidence)
         new_evidence["execution_refresh_attempted"] = True
@@ -3562,8 +3834,13 @@ class EntryDispatchRuntime:
     ) -> tuple[float, float, float, Any] | None:
         quote_lease = None
         quote_lease_evidence: dict = {}
+        defer_quote_lease_side_capacity = self._local_l2_effective_enabled()
         quote_lease_reason, quote_lease, quote_lease_evidence = (
-            self._entry_quote_lease_execution_check(candidate, now_ms)
+            self._entry_quote_lease_execution_check(
+                candidate,
+                now_ms,
+                enforce_side_capacity=not defer_quote_lease_side_capacity,
+            )
         )
         if quote_lease_reason:
             quote_lease_reason, quote_lease, quote_lease_evidence = (
@@ -3573,6 +3850,7 @@ class EntryDispatchRuntime:
                     quote_lease_reason,
                     quote_lease,
                     quote_lease_evidence,
+                    enforce_side_capacity=not defer_quote_lease_side_capacity,
                 )
             )
         if quote_lease_reason:
@@ -3703,6 +3981,18 @@ class EntryDispatchRuntime:
         short_bid = short_snapshot.bids[0].price
         short_ask = short_snapshot.asks[0].price
 
+        def top_level_quantity(level: object) -> float:
+            raw_quantity = getattr(level, "quantity", None)
+            if raw_quantity is None:
+                raw_quantity = getattr(level, "size", 0.0)
+            try:
+                quantity = float(raw_quantity or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            if not math.isfinite(quantity):
+                return 0.0
+            return max(quantity, 0.0)
+
         requested_quantity = max(
             float(
                 target_quantity
@@ -3744,6 +4034,10 @@ class EntryDispatchRuntime:
             short_observed_at_ms=short_observed_at_ms,
             created_at_ms=now_ms,
             expires_at_ms=now_ms + max_age_ms,
+            long_bid_size=top_level_quantity(long_snapshot.bids[0]),
+            long_ask_size=top_level_quantity(long_snapshot.asks[0]),
+            short_bid_size=top_level_quantity(short_snapshot.bids[0]),
+            short_ask_size=top_level_quantity(short_snapshot.asks[0]),
             provider="local_l2_final_vwap",
             candidate_revision_id=str(
                 getattr(candidate, "candidate_revision_id", "") or ""
@@ -3856,6 +4150,7 @@ class EntryDispatchRuntime:
         source: str,
         execution_is_passive: bool | None = None,
         enforce_canary_notional: bool = True,
+        select_passive_maker_orientation: bool = False,
     ) -> bool:
         """Apply the sole live first-leg economics gate from a fresh lease.
 
@@ -3918,35 +4213,128 @@ class EntryDispatchRuntime:
             )
             return False
 
-        final_economics = FundingEntryRevalidator().revalidate_before_first_leg(
-            candidate,
-            long_ask=float(getattr(quote_lease, "long_ask", 0.0) or 0.0),
-            short_bid=float(getattr(quote_lease, "short_bid", 0.0) or 0.0),
-            long_bid=float(getattr(quote_lease, "long_bid", 0.0) or 0.0),
-            short_ask=float(getattr(quote_lease, "short_ask", 0.0) or 0.0),
-            now_ms=now_ms,
-            config=self.ctx.config.strategy,
-            long_buy_vwap=float(getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0),
-            short_sell_vwap=float(
-                getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0
-            ),
-            required_base_quantity=max(float(required_base_quantity or 0.0), 0.0),
-            l2_vwap_complete=(
-                getattr(quote_lease, "l2_vwap_complete", False) is True
-            ),
-            # Require L2 only when the configured readiness data plane owns
-            # fresh local books. WS-BBO mode deliberately prices from BBO plus
-            # the conservative shortlist slippage; treating every allocator
-            # quantity as proof that local L2 exists permanently blocked that
-            # valid production mode before first-leg submit.
-            require_l2_vwap=(
-                self._local_l2_effective_enabled()
-                and float(
-                    getattr(candidate, "entry_target_quantity", 0.0) or 0.0
-                ) > 0.0
-            ),
-            execution_is_passive=execution_is_passive,
+        revalidator = FundingEntryRevalidator()
+        required_quantity = max(float(required_base_quantity or 0.0), 0.0)
+        local_l2_required = (
+            self._local_l2_effective_enabled()
+            and float(getattr(candidate, "entry_target_quantity", 0.0) or 0.0)
+            > 0.0
         )
+
+        def revalidate_orientation(
+            maker_leg_override: str | None = None,
+        ):
+            return revalidator.revalidate_before_first_leg(
+                candidate,
+                long_ask=float(getattr(quote_lease, "long_ask", 0.0) or 0.0),
+                short_bid=float(getattr(quote_lease, "short_bid", 0.0) or 0.0),
+                long_bid=float(getattr(quote_lease, "long_bid", 0.0) or 0.0),
+                short_ask=float(getattr(quote_lease, "short_ask", 0.0) or 0.0),
+                now_ms=now_ms,
+                config=self.ctx.config.strategy,
+                long_buy_vwap=float(
+                    getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0
+                ),
+                short_sell_vwap=float(
+                    getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0
+                ),
+                required_base_quantity=required_quantity,
+                l2_vwap_complete=(
+                    getattr(quote_lease, "l2_vwap_complete", False) is True
+                ),
+                # Require L2 only when the configured readiness data plane owns
+                # fresh local books. WS-BBO mode deliberately prices from BBO plus
+                # the conservative shortlist slippage; treating every allocator
+                # quantity as proof that local L2 exists permanently blocked that
+                # valid production mode before first-leg submit.
+                require_l2_vwap=local_l2_required,
+                execution_is_passive=execution_is_passive,
+                passive_maker_leg_override=maker_leg_override,
+                long_buy_l2_capacity=float(
+                    getattr(quote_lease, "long_l2_capacity_quantity", 0.0) or 0.0
+                ),
+                short_sell_l2_capacity=float(
+                    getattr(quote_lease, "short_l2_capacity_quantity", 0.0) or 0.0
+                ),
+            )
+
+        def orientation_has_capacity(maker_leg: str) -> bool:
+            if quote_lease is None or required_quantity <= 0.0:
+                return False
+            if maker_leg == "long":
+                maker_capacity = float(
+                    getattr(quote_lease, "long_bid_size", 0.0) or 0.0
+                )
+                hedge_capacity = float(
+                    getattr(quote_lease, "short_l2_capacity_quantity", 0.0)
+                    or 0.0
+                )
+            else:
+                maker_capacity = float(
+                    getattr(quote_lease, "short_ask_size", 0.0) or 0.0
+                )
+                hedge_capacity = float(
+                    getattr(quote_lease, "long_l2_capacity_quantity", 0.0)
+                    or 0.0
+                )
+            return (
+                maker_capacity + 1e-12 >= required_quantity
+                and hedge_capacity + 1e-12 >= required_quantity
+            )
+
+        selected_orientation = ""
+        original_maker_leg = str(
+            getattr(candidate, "entry_maker_leg", "") or ""
+        ).lower()
+        final_economics = None
+        if (
+            select_passive_maker_orientation
+            and execution_is_passive is not False
+            and original_maker_leg in {"long", "short"}
+            and str(getattr(quote_lease, "provider", "") or "")
+            == "local_l2_final_vwap"
+        ):
+            orientation_results = []
+            for maker_leg_override in ("long", "short"):
+                if not orientation_has_capacity(maker_leg_override):
+                    continue
+                result = revalidate_orientation(maker_leg_override)
+                if result.allowed:
+                    orientation_results.append((maker_leg_override, result))
+            if orientation_results:
+                selected_orientation, final_economics = max(
+                    orientation_results,
+                    key=lambda item: (
+                        item[1].edge.worst_case_edge_bps,
+                        item[1].edge.expected_net_edge_bps,
+                        1 if item[0] == "long" else 0,
+                    ),
+                )
+                if selected_orientation != original_maker_leg:
+                    candidate.entry_maker_leg = selected_orientation
+                    if hasattr(candidate, "maker_leg"):
+                        candidate.maker_leg = selected_orientation
+                    self.ctx.journal.append(
+                        "runtime.entry_passive_maker_orientation_selected",
+                        {
+                            "symbol": str(getattr(candidate, "symbol", "") or ""),
+                            "candidate_pair_id": self._candidate_pair_id(candidate),
+                            "pair_id": self._candidate_pair_id(candidate),
+                            "previous_entry_maker_leg": original_maker_leg,
+                            "selected_entry_maker_leg": selected_orientation,
+                            "expected_net_edge_bps": (
+                                final_economics.edge.expected_net_edge_bps
+                            ),
+                            "worst_case_edge_bps": (
+                                final_economics.edge.worst_case_edge_bps
+                            ),
+                            "required_base_quantity": required_quantity,
+                            "source": source,
+                            "ts_ms": now_ms,
+                        },
+                    )
+        if final_economics is None:
+            final_economics = revalidate_orientation(None)
         if not final_economics.allowed:
             self._emit_entry_dispatch_viability_blocked(
                 candidate,
@@ -4753,7 +5141,10 @@ class EntryDispatchRuntime:
                 received_at_ms=received_at_ms,
                 event_at_ms=event_at_ms,
                 now_ms=now_ms,
-                max_age_ms=max_age_ms,
+                max_age_ms=open_interest_max_age_ms_for_evidence(
+                    row,
+                    default_max_age_ms=max_age_ms,
+                ),
             ):
                 return "entry_open_interest_evidence_stale", {
                     "leg": leg,
@@ -5207,10 +5598,18 @@ class EntryDispatchRuntime:
                 else time.time() * 1_000
             )
             if requires_final_quote_lease:
+                provider_side_capacity_proven_by_final_l2 = (
+                    isinstance(quote_lease, QuoteLease)
+                    and str(getattr(quote_lease, "provider", "") or "")
+                    == "local_l2_final_vwap"
+                )
                 provider_reason, _provider_lease, provider_evidence = (
                     self._entry_quote_lease_execution_check(
                         candidate,
                         executor_submit_now_ms,
+                        enforce_side_capacity=(
+                            not provider_side_capacity_proven_by_final_l2
+                        ),
                     )
                 )
                 if provider_reason:
@@ -5515,6 +5914,7 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
             source="final_entry_economics",
             enforce_canary_notional=False,
+            select_passive_maker_orientation=True,
         ):
             return False
 
@@ -6803,8 +7203,19 @@ class EntryDispatchRuntime:
             )
         )
         if requires_final_quote_lease:
+            provider_side_capacity_proven_by_final_l2 = (
+                isinstance(quote_lease, QuoteLease)
+                and str(getattr(quote_lease, "provider", "") or "")
+                == "local_l2_final_vwap"
+            )
             provider_reason, _provider_lease, provider_evidence = (
-                self._entry_quote_lease_execution_check(candidate, submit_now_ms)
+                self._entry_quote_lease_execution_check(
+                    candidate,
+                    submit_now_ms,
+                    enforce_side_capacity=(
+                        not provider_side_capacity_proven_by_final_l2
+                    ),
+                )
             )
             if provider_reason:
                 self._emit_entry_dispatch_viability_blocked(

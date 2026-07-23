@@ -260,7 +260,8 @@ def _entry_quote_lease_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
     config = _mapping(_get(local_state, "runtime_market_data_config", {}))
     last_scan = _mapping(_get(local_state, "last_scan", {}))
     provider = str(config.get("entry_readiness_provider_effective", "") or "")
-    ws_bbo_effective = (
+    composed_frontier = provider == "ws_bbo_l2_on_demand"
+    ws_bbo_effective = composed_frontier or (
         provider == "ws_bbo_quote_lease"
         and config.get("local_l2_effective_enabled") is False
     )
@@ -305,6 +306,7 @@ def _entry_quote_lease_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
     )
     full_universe = bool(
         ws_bbo_effective
+        and not composed_frontier
         and scope
         and not tracked_scope
         and candidate_count > 0
@@ -323,11 +325,15 @@ def _entry_quote_lease_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
                 if full_universe
                 else "fail_closed_quote_gap"
                 if missing_or_stale
+                else "composed_frontier_scope"
+                if composed_frontier
                 else "tracked_scope"
             ),
             entry_policy=(
                 "diagnostic_only"
                 if full_universe
+                else "allow_frontier_candidates"
+                if composed_frontier and not missing_or_stale
                 else "fail_closed_tracked_candidates"
                 if missing_or_stale
                 else "allow_tracked_candidates"
@@ -337,6 +343,16 @@ def _entry_quote_lease_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
             v1_anchor="V1 entry data plane tracks primary plus shadow only",
             details={
                 "provider": provider,
+                "entry_readiness_provider_raw": str(
+                    config.get("entry_readiness_provider_raw", "") or ""
+                ),
+                "entry_readiness_provider_effective": provider,
+                "entry_readiness_provider_defaulted": bool(
+                    config.get("entry_readiness_provider_defaulted", False)
+                ),
+                "entry_readiness_provider_migrated": bool(
+                    config.get("entry_readiness_provider_migrated", False)
+                ),
                 "scope": scope,
                 "candidate_count": candidate_count,
                 "all_count": all_count,

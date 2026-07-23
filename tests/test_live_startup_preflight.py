@@ -42,6 +42,7 @@ from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.marketdata.open_interest import open_interest_sample_id
+from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
@@ -256,13 +257,17 @@ class _StaticFinalQuoteLeaseProvider:
             short_venue=short_venue,
             long_bid=99.9,
             long_ask=100.0,
+            long_bid_size=10.0,
+            long_ask_size=10.0,
             short_bid=100.1,
             short_ask=100.2,
+            short_bid_size=10.0,
+            short_ask_size=10.0,
             long_observed_at_ms=1778787000000,
             short_observed_at_ms=1778787000000,
             created_at_ms=1778787000000,
             expires_at_ms=1778787005000,
-            provider="quote_lease",
+            provider="ws_bbo_quote_lease",
             candidate_revision_id=(
                 f"test-revision:{symbol.upper()}:{long_venue}:{short_venue}:"
                 "1778787000000"
@@ -279,6 +284,28 @@ def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
     # not become stale merely because wall time advances.
     runtime._entry_wall_clock_now_ms = lambda: 1778787000000
     return runtime
+
+
+def _seed_dispatch_bbo(
+    runtime: LiveRuntime,
+    candidate: SimpleNamespace,
+    *,
+    now_ms: int = 1778787000000,
+) -> None:
+    for venue in (candidate.long_venue, candidate.short_venue):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol=candidate.symbol,
+                bid=99.9,
+                ask=100.1,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
 
 
 def _fake_adapters_for_venues(
@@ -413,6 +440,7 @@ class TestRuntimePreflight:
                 long_venue="bybit",
                 short_venue="binance",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
             second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
@@ -469,6 +497,7 @@ class TestRuntimePreflight:
                 long_venue="binance",
                 short_venue="bybit",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             dispatched = await runtime._dispatch_entry(
                 candidate,
@@ -547,6 +576,7 @@ class TestRuntimePreflight:
                 long_venue="binance",
                 short_venue="bybit",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             dispatched = await runtime._dispatch_entry(
                 candidate,
@@ -615,6 +645,7 @@ class TestRuntimePreflight:
                 long_venue="binance",
                 short_venue="aster",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             dispatched = await runtime._dispatch_entry(
                 candidate,
@@ -671,6 +702,7 @@ class TestRuntimePreflight:
                 long_venue="binance",
                 short_venue="aster",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             dispatched = await runtime._dispatch_entry(
                 candidate,
@@ -727,6 +759,7 @@ class TestRuntimePreflight:
                 long_venue="aster",
                 short_venue="bybit",
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
             second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
@@ -822,6 +855,7 @@ class TestRuntimePreflight:
                 long_venue=venue,
                 short_venue=short_venue,
             )
+            _seed_dispatch_bbo(runtime, candidate)
 
             assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0) is True
             assert await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0) is False
@@ -2086,15 +2120,53 @@ class TestRuntimePreflight:
             binance = SupportedOnlyAdapter()
             runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance})
 
+            symbol = "SYSUSDT"
+            now_ms = 1700000010000
+            revision_id = f"test-revision:{symbol}:binance:binance:{now_ms}"
+            value_quote = 2_000_000.0
+            source = "test_fixture"
+
+            def oi_leg() -> dict:
+                return {
+                    "venue": "binance",
+                    "canonical_symbol": symbol,
+                    "venue_symbol": symbol,
+                    "status": "observed",
+                    "observed_at_ms": now_ms,
+                    "event_at_ms": 0,
+                    "received_at_ms": now_ms,
+                    "sample_id": open_interest_sample_id(
+                        venue="binance",
+                        canonical_symbol=symbol,
+                        venue_symbol=symbol,
+                        observed_at_ms=now_ms,
+                        source=source,
+                        raw_value=value_quote,
+                        value_quote=value_quote,
+                    ),
+                    "value_quote": value_quote,
+                    "raw_value": value_quote,
+                    "raw_unit": "quote",
+                    "source": source,
+                    "contract_multiplier": 1.0,
+                    "conversion_mark_price": None,
+                }
+
             await runtime._ensure_l2_active_for_candidates(
                 [
                     SimpleNamespace(
-                        symbol="SYSUSDT",
+                        symbol=symbol,
                         long_venue="binance",
                         short_venue="binance",
+                        candidate_revision_id=revision_id,
+                        entry_open_interest_evidence={
+                            "candidate_revision_id": revision_id,
+                            "long": oi_leg(),
+                            "short": oi_leg(),
+                        },
                     )
                 ],
-                now_ms=1700000010000,
+                now_ms=now_ms,
             )
 
             assert binance.loaded is True
@@ -2201,10 +2273,10 @@ class TestRuntimePreflight:
             assert runtime.local_l2_runtime.get_book("binance", "SYSUSDT") is None
 
     @pytest.mark.asyncio
-    async def test_ws_bbo_effective_mode_skips_local_l2_startup_despite_legacy_flag(
+    async def test_legacy_ws_bbo_provider_migrates_to_composed_l2_startup(
         self,
     ):
-        """WS BBO provider must suppress Local-L2 data-plane startup noise."""
+        """A legacy BBO provider must activate the composed L2 data plane."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -2243,24 +2315,23 @@ class TestRuntimePreflight:
                 for line in Path(config.persistence.event_log_path).read_text().splitlines()
                 if line.strip()
             ]
-            assert started == []
-            assert binance.loaded is False
-            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
-            assert all(
-                not str(record["kind"]).startswith("runtime.local_l2_")
-                for record in records
-            )
+            assert binance.loaded is True
+            assert started[0]["venue"] == "binance"
+            assert started[0]["symbols"] == ["BTCUSDT"]
+            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is not None
             state = runtime.state.to_dict()
             effective = state["runtime_market_data_config"]
-            assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+            assert effective["entry_readiness_provider_raw"] == "ws_bbo_quote_lease"
+            assert effective["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
+            assert effective["entry_readiness_provider_migrated"] is True
             assert effective["local_l2_configured_enabled"] is True
-            assert effective["local_l2_effective_enabled"] is False
+            assert effective["local_l2_effective_enabled"] is True
 
     @pytest.mark.asyncio
-    async def test_ws_bbo_effective_mode_drops_local_l2_snapshot_restore_and_persistence(
+    async def test_legacy_ws_bbo_provider_preserves_composed_l2_snapshot_restore_and_persistence(
         self,
     ):
-        """WS BBO provider must not resurrect or persist Local-L2 snapshots."""
+        """A legacy WS-BBO provider migrates to the composed BBO and L2 mode."""
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -2305,11 +2376,15 @@ class TestRuntimePreflight:
             finally:
                 runtime.journal.close()
 
-            assert binance.loaded is False
-            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
-            assert runtime.state.retained_local_l2_books == []
-            assert runtime.state.local_l2_books_snapshot == []
-            assert runtime.state.local_l2_session_snapshot == []
+            assert binance.loaded is True
+            assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is not None
+            assert runtime.state.retained_local_l2_books == [
+                {"venue": "binance", "symbol": "BTCUSDT"},
+            ]
+            assert runtime.state.local_l2_books_snapshot
+            assert runtime.state.local_l2_session_snapshot == [
+                {"venue": "binance", "symbol": "BTCUSDT"},
+            ]
 
             runtime.local_l2_runtime.ensure_book("binance", "BTCUSDT")
             runtime.state.local_l2_session_snapshot = [
@@ -2319,7 +2394,7 @@ class TestRuntimePreflight:
             runtime._snapshot_local_l2_state()
 
             assert runtime.state.retained_local_l2_books == []
-            assert runtime.state.local_l2_books_snapshot == []
+            assert runtime.state.local_l2_books_snapshot
             assert runtime.state.local_l2_session_snapshot == []
 
     @pytest.mark.asyncio

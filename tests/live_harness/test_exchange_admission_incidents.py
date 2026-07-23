@@ -12,6 +12,7 @@ from lightfee.engine.entry_sync import EntryExecutionResult
 from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
+from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
     EntryLeverageEvidence,
@@ -96,6 +97,26 @@ class StaticQuoteLeaseProvider:
 def _with_final_quote_lease(runtime: LiveRuntime) -> LiveRuntime:
     runtime.entry_readiness_provider = StaticQuoteLeaseProvider()
     return runtime
+
+
+def _seed_dispatch_bbo(
+    runtime: LiveRuntime,
+    candidate: SimpleNamespace,
+    *,
+    now_ms: int = 1778787000000,
+) -> None:
+    for venue in (candidate.long_venue, candidate.short_venue):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol=candidate.symbol,
+                bid=0.999,
+                ask=1.002,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
 
 
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
@@ -419,6 +440,7 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
 
         other_venue = "bybit" if venue != "bybit" else "binance"
         candidate = _candidate(symbol, venue, other_venue)
+        _seed_dispatch_bbo(runtime, candidate)
 
         first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
         second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
@@ -512,6 +534,7 @@ async def test_aster_submit_reject_evidence_creates_symbol_admission_block():
         )
         runtime.entry_executor = executor
         candidate = _candidate("ESPORTSUSDT", "aster", "binance")
+        _seed_dispatch_bbo(runtime, candidate)
 
         first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.08)
         second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=0.08)
@@ -576,6 +599,7 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
         runtime.entry_executor = executor
         bybit_candidate = _candidate("AUTHUSDT", "binance", "bybit")
         clean_candidate = _candidate("CLEANUSDT", "binance", "aster")
+        _seed_dispatch_bbo(runtime, bybit_candidate)
 
         first = await runtime._dispatch_entry(
             bybit_candidate,
@@ -641,6 +665,7 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
         executor = CountingExecutor()
         runtime.entry_executor = executor
         candidate = _candidate("HUSDT", "binance", "aster")
+        _seed_dispatch_bbo(runtime, candidate)
 
         dispatched = await runtime._dispatch_entry(
             candidate,
@@ -737,9 +762,11 @@ async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth
 
         executor = CountingExecutor()
         runtime.entry_executor = executor
+        candidate = _candidate("HUSDT", "binance", "aster")
+        _seed_dispatch_bbo(runtime, candidate)
 
         dispatched = await runtime._dispatch_entry(
-            _candidate("HUSDT", "binance", "aster"),
+            candidate,
             1778787000000,
             price_hint=1.0,
         )
@@ -1905,6 +1932,7 @@ async def test_binance_5022_exception_path_creates_cooldown_without_admission_bl
         executor = RaisingExecutor()
         runtime.entry_executor = executor
         candidate = _candidate("GTXUSDT", "binance", "bybit")
+        _seed_dispatch_bbo(runtime, candidate)
 
         first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
         second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)

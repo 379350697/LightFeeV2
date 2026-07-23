@@ -6,15 +6,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from lightfee.config.compatibility import (
+    ENTRY_READINESS_PROVIDER_ON_DEMAND,
+    ENTRY_READINESS_PROVIDERS as _ENTRY_READINESS_PROVIDERS,
+)
+
 # V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
 _GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
-ENTRY_READINESS_PROVIDERS = (
-    "local_l2",
-    "rest_top_book",
-    "quote_lease",
-    "ws_top_book",
-    "ws_bbo_quote_lease",
-)
+ENTRY_READINESS_PROVIDERS = tuple(sorted(_ENTRY_READINESS_PROVIDERS))
 V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE = 1_000_000.0
 V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
     "bitget": 2_000_000.0,
@@ -23,6 +22,7 @@ V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
     "okx": 5_000_000.0,
 }
 V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE = 1_000_000.0
+_OPPORTUNITY_INPUT_MODE_UNSET = object()
 
 
 def _is_valid_generate_time(s: str) -> bool:
@@ -67,7 +67,14 @@ class DailyUniverseConfig:
 @dataclass
 class RuntimeConfig:
     mode: str = "paper"
-    opportunity_input_mode: str = "coarse_sidecar"
+    opportunity_input_mode: str = field(default=_OPPORTUNITY_INPUT_MODE_UNSET)  # type: ignore[assignment]
+    # Distinguish a direct legacy fixture from an explicit production migration
+    # setting without exposing provenance in the TOML schema.
+    _opportunity_input_mode_configured: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+    )
     # V1 directed_pairs: pair direction restriction (CONFIG-001)
     directed_pairs: list[DirectedPairConfig] = field(default_factory=list)
     # V1 daily_universe: generated symbol universe (CONFIG-002)
@@ -76,6 +83,8 @@ class RuntimeConfig:
     sidecar_snapshot_max_age_ms: int = 10000
     sidecar_refresh_ms: int = 3000
     sidecar_perp_liquidity_budget_ms: int = 30000
+    entry_open_interest_refresh_timeout_ms: int = 750
+    entry_open_interest_cache_fallback_max_age_ms: int = 30 * 60 * 1000
     sidecar_funding_timeout_s: float = 30.0
     sidecar_liquidity_timeout_s: float = 10.0
     sidecar_hint_budget_ms: int = 500
@@ -145,6 +154,12 @@ class RuntimeConfig:
     maker_event_lane_enabled: bool = True
     maker_event_lane_min_wake_interval_ms: int = 40
     shutdown_grace_period_ms: int = 3000
+
+    def __post_init__(self) -> None:
+        if self.opportunity_input_mode is _OPPORTUNITY_INPUT_MODE_UNSET:
+            self.opportunity_input_mode = "single_process_entry"
+            return
+        self._opportunity_input_mode_configured = True
 
 
 @dataclass
@@ -405,9 +420,9 @@ class StrategyConfig:
     entry_sizing_mode: str = "fixed_notional"
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
-    entry_local_l2_primary_count: int = 6  # V1 default (V2 was 8 — misaligned)
-    shadow_entry_opportunity_count: int = 2  # V1 default
-    maker_entry_max_reposts: int = 2
+    entry_local_l2_primary_count: int = 3
+    shadow_entry_opportunity_count: int = 0
+    maker_entry_max_reposts: int = 1
     maker_entry_reconcile_backoff_ms: int = 1000
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False
@@ -479,12 +494,12 @@ class StrategyConfig:
     maker_try_window_ms: int = 1500
     maker_min_fill_ratio: float = 0.25
     maker_entry_progress_poll_ms: int = 500  # V1: 1000; V2: 500 for tighter active polling
-    maker_initial_slice_ratio: float = 0.5
+    maker_initial_slice_ratio: float = 0.25
     entry_max_initial_clip_ratio: float = 0.8
     maker_leg_default: str = "buy"
-    entry_readiness_provider: str = "local_l2"
+    entry_readiness_provider: str = ENTRY_READINESS_PROVIDER_ON_DEMAND
     entry_quote_lease_ttl_ms: int = 1500
-    entry_quote_prewarm_extra_candidate_count: int = 24
+    entry_quote_prewarm_extra_candidate_count: int = 0
     entry_ws_bbo_per_venue_budget: int = 10
     entry_volume_floor_default_quote: float = V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
     entry_volume_floor_quote_by_venue: dict[str, float] = field(

@@ -193,24 +193,26 @@ def main() -> None:
     # Check sidecar processes
     print("\n--- Sidecar Processes ---")
     sidecars = count_matching(processes, SIDECAR_PATTERNS)
-    min_required = 1 if args.strict else 0
-    sidecar_ok = check_singleton("sidecar", sidecars, min_required=min_required)
+    required_min = 1 if args.strict else 0
+    # Funding entry is runtime-owned in production. Keep the legacy process
+    # bounded for diagnostics, but never require it for strict readiness.
+    sidecar_ok = check_singleton("sidecar", sidecars, min_required=0)
 
     # Check spread sidecar processes
     print("\n--- Spread Sidecar Processes ---")
     spread_sidecars = count_matching(processes, SPREAD_SIDECAR_PATTERNS)
     spread_sidecar_ok = check_singleton(
-        "spread-sidecar", spread_sidecars, min_required=min_required
+        "spread-sidecar", spread_sidecars, min_required=required_min
     )
 
     print("\n--- Spread BBO Processes ---")
     spread_bbos = count_matching(processes, SPREAD_BBO_PATTERNS)
-    spread_bbo_ok = check_singleton("spread-bbo", spread_bbos, min_required=min_required)
+    spread_bbo_ok = check_singleton("spread-bbo", spread_bbos, min_required=required_min)
 
     # Check live runtime processes
     print("\n--- Live Runtime Processes ---")
     lives = count_matching(processes, LIVE_PATTERNS)
-    live_ok = check_singleton("live", lives, min_required=min_required)
+    live_ok = check_singleton("live", lives, min_required=required_min)
 
     # Check snapshot writers
     print("\n--- Snapshot Writers ---")
@@ -256,10 +258,9 @@ def main() -> None:
         spread_bbos2 = count_matching(processes2, SPREAD_BBO_PATTERNS)
         lives2 = count_matching(processes2, LIVE_PATTERNS)
         required_counts = {1} if args.strict else {0, 1}
-        all_ok = all(
+        all_ok = len(sidecars2) <= 1 and all(
             count in required_counts
             for count in (
-                len(sidecars2),
                 len(spread_bbos2),
                 len(spread_sidecars2),
                 len(lives2),

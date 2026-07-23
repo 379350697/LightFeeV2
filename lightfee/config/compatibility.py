@@ -1,5 +1,79 @@
 """Chillybot field rejection and legacy config alias mapping."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+ENTRY_READINESS_PROVIDER_ON_DEMAND = "ws_bbo_l2_on_demand"
+LEGACY_ENTRY_READINESS_PROVIDERS = frozenset(
+    {
+        "local_l2",
+        "rest_top_book",
+        "quote_lease",
+        "ws_top_book",
+        "ws_bbo_quote_lease",
+    }
+)
+ENTRY_READINESS_PROVIDERS = frozenset(
+    {*LEGACY_ENTRY_READINESS_PROVIDERS, ENTRY_READINESS_PROVIDER_ON_DEMAND}
+)
+
+
+@dataclass(frozen=True)
+class EntryReadinessProviderResolution:
+    """Raw configuration provenance plus the entry-only effective mode."""
+
+    raw: str
+    effective: str
+    defaulted: bool
+    migrated: bool
+
+
+def entry_readiness_provider_configured(
+    provider: Any,
+    provenance: object | None,
+) -> bool:
+    """Derive loader provenance for programmatic config fixtures as well."""
+    if provenance is not None:
+        return bool(provenance)
+    return str(provider or "").strip().lower() != ENTRY_READINESS_PROVIDER_ON_DEMAND
+
+
+def resolve_entry_readiness_provider(
+    provider: Any,
+    *,
+    configured: bool = True,
+) -> EntryReadinessProviderResolution:
+    """Resolve legacy provider strings without changing the stored config value.
+
+    All recognized legacy values execute through the composed entry-only path.
+    Unknown values remain visible to validation instead of silently defaulting.
+    """
+    raw = str(provider or "").strip().lower()
+    defaulted = not configured or not raw
+    if defaulted:
+        return EntryReadinessProviderResolution(
+            raw="",
+            effective=ENTRY_READINESS_PROVIDER_ON_DEMAND,
+            defaulted=True,
+            migrated=False,
+        )
+    if raw in LEGACY_ENTRY_READINESS_PROVIDERS:
+        return EntryReadinessProviderResolution(
+            raw=raw,
+            effective=ENTRY_READINESS_PROVIDER_ON_DEMAND,
+            defaulted=False,
+            migrated=True,
+        )
+    return EntryReadinessProviderResolution(
+        raw=raw,
+        effective=raw,
+        defaulted=False,
+        migrated=False,
+    )
+
 # Fields whose presence must trigger a migration error
 CHILLYBOT_FIELDS = frozenset(
     {
@@ -61,8 +135,9 @@ LEGACY_FIELD_ALIASES: dict[str, str] = {
 }
 
 # Acceptable opportunity_input_mode values for the Python runtime (CONFIG-003)
-# V1 parity: direct_market, coarse_sidecar, sidecar_scan, disabled, non_parity
+# V1 parity retains coarse_sidecar; single_process_entry is the production default.
 VALID_OPPORTUNITY_INPUT_MODES = frozenset({
+    "single_process_entry",
     "direct_market",
     "coarse_sidecar",
     "sidecar_backed",  # alias for coarse_sidecar (V1 compat)

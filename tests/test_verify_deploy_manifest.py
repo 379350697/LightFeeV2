@@ -23,6 +23,7 @@ def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch
 
 def test_spread_sidecar_template_is_deploy_critical():
     assert "deploy/systemd/lightfee-spread-sidecar.service" in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-sidecar.service" not in manifest.CRITICAL_FILES
 
 
 def test_trade_optimization_timer_assets_are_deploy_critical():
@@ -128,12 +129,12 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert (
         "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer "
         "&& systemctl enable --now lightfee-fee-evidence-refresh.timer "
-        "&& systemctl restart lightfee-sidecar.service "
         "&& systemctl enable lightfee-spread-bbo.service "
         "&& systemctl restart lightfee-spread-bbo.service "
         "&& systemctl restart lightfee-spread-sidecar.service "
         "&& systemctl restart lightfee-live.service"
     ) in script
+    assert "lightfee-sidecar.service" not in script
     assert "sleep 12" in script
 
 

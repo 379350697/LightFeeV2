@@ -3013,6 +3013,14 @@ def test_deploy_systemd_templates_pass_contract():
     assert analyze_systemd_unit("lightfee-live.service", live).ok
 
 
+def test_production_live_and_spread_bbo_units_do_not_depend_on_funding_sidecar():
+    live = Path("deploy/systemd/lightfee-live.service").read_text()
+    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
+
+    assert "lightfee-sidecar.service" not in live
+    assert "lightfee-sidecar.service" not in spread_bbo
+
+
 def test_trade_optimization_report_timer_is_six_hour_readonly_job():
     service = Path("deploy/systemd/lightfee-trade-optimization-report.service").read_text()
     timer = Path("deploy/systemd/lightfee-trade-optimization-report.timer").read_text()
@@ -3495,7 +3503,7 @@ def test_current_state_tick_stale_remains_critical_without_runtime_progress():
     assert report.details["tick_stale_suppressed_by_runtime_progress"] is False
 
 
-def test_cli_reports_missing_snapshot_and_current_state(tmp_path):
+def test_cli_allows_missing_funding_handoff_and_reports_missing_current_state(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()
     (unit_dir / "lightfee-sidecar.service").write_text(
@@ -3544,7 +3552,65 @@ def test_cli_reports_missing_snapshot_and_current_state(tmp_path):
     )
     assert result.returncode == 1, result.stderr + result.stdout
     payload = json.loads(result.stdout)
-    assert payload["critical_count"] >= 2  # snapshot + current-state both critical
+    assert payload["critical_count"] >= 1
     fingerprints = [fp for r in payload["reports"] for fp in r.get("fingerprints", [])]
-    assert "snapshot_file_missing" in fingerprints
+    handoff = next(
+        report
+        for report in payload["reports"]
+        if report["name"] == "funding_entry_handoff"
+    )
+    assert handoff["details"]["status"] == "not_required"
     assert "current_state_file_missing" in fingerprints
+
+
+def test_cli_single_process_entry_ignores_stale_retired_funding_handoff(tmp_path):
+    snapshot = tmp_path / "opportunity-input-snapshot.json"
+    snapshot.write_text('{"published_at_ms": 1}')
+    manifest_path = vps.funding_entry_snapshot_manifest_path(snapshot)
+    manifest_path.write_text('{"generation_id": "retired", "ready_at_ms": 1}')
+    config = tmp_path / "live.toml"
+    config.write_text(
+        'symbols = ["BTCUSDT"]\n\n'
+        '[runtime]\n'
+        'opportunity_input_mode = "single_process_entry"\n'
+    )
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 1.1.1.1\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir",
+            str(tmp_path / "systemd"),
+            "--snapshot",
+            str(snapshot),
+            "--config",
+            str(config),
+            "--current-state",
+            str(tmp_path / "no-such-current.json"),
+            "--resolv-conf",
+            str(resolv),
+            "--now-ms",
+            "1778787000000",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1, result.stderr + result.stdout
+    payload = json.loads(result.stdout)
+    handoff = next(
+        report
+        for report in payload["reports"]
+        if report["name"] == "funding_entry_handoff"
+    )
+    assert handoff["ok"] is True
+    assert handoff["details"]["status"] == "not_required"
+    assert handoff["details"]["retired_snapshot_present"] is True
+    assert handoff["details"]["retired_manifest_present"] is True
+    assert all(
+        report["name"] not in {"sidecar_snapshot", "sidecar_audit_snapshot"}
+        for report in payload["reports"]
+    )

@@ -12,7 +12,7 @@ import threading
 import time
 from math import isfinite
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.core.domain import PerpLiquiditySnapshot, Venue
@@ -78,15 +78,30 @@ class SidecarService:
     quotes for that venue so candidates are not lost.
     """
 
-    def __init__(self, config: AppConfig, *, enable_spread_bbo: bool = True) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        enable_spread_bbo: bool = True,
+        in_process_entry: bool = False,
+    ) -> None:
         self.config = config
-        self.embedded_spread_bbo_enabled = bool(enable_spread_bbo)
+        # The live runtime can own this collection directly.  In that mode it
+        # must not restore or publish the file-based funding entry handoff.
+        self.in_process_entry = bool(in_process_entry)
+        self.embedded_spread_bbo_enabled = bool(enable_spread_bbo) and not self.in_process_entry
         self._venue_configs_by_name = _canonical_venue_configs(config.venues)
-        self.snapshot_path = config.runtime.sidecar_snapshot_path
-        self._forecast_calibrator = FundingForecastCalibrator(
-            Path(self.snapshot_path).with_name(
+        if self.in_process_entry:
+            forecast_path = Path(
+                config.runtime.funding_basis_risk_checkpoint_path
+            ).with_name("funding-forecast-in-process-calibration.json")
+        else:
+            self.snapshot_path = config.runtime.sidecar_snapshot_path
+            forecast_path = Path(self.snapshot_path).with_name(
                 f"{Path(self.snapshot_path).name}.funding-forecast-calibration.json"
-            ),
+            )
+        self._forecast_calibrator = FundingForecastCalibrator(
+            forecast_path,
             min_samples=config.strategy.funding_forecast_min_samples,
             max_quantile_drift_bps=(
                 config.strategy.funding_forecast_stability_max_quantile_drift_bps
@@ -130,6 +145,7 @@ class SidecarService:
         self._last_good_at_ms_by_key: dict[str, int] = {}
         self._last_liquidity_publish_at_ms: int = 0
         self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
+        self._in_process_top_books: dict[str, dict[str, TopBookQuote]] | None = None
 
         for venue_name in self._venue_configs_by_name:
             venue = Venue.from_str(venue_name)
@@ -188,42 +204,43 @@ class SidecarService:
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
 
-        # A restart must not erase a cadence that the exchange has already
-        # demonstrated.  This is a local snapshot read only; it adds no public
-        # REST request and leaves unknown schedules unknown.
-        try:
-            prior_snapshot = load_snapshot(self.snapshot_path)
-        except (KeyError, TypeError, ValueError):
-            # A malformed or legacy snapshot must not turn a safe restart into
-            # an outage.  It merely leaves funding cadence cold/unknown.
-            logger.warning("sidecar funding schedule restore skipped: malformed snapshot")
-            prior_snapshot = None
-        if prior_snapshot is not None:
-            self._forecast_calibrator.prime(prior_snapshot.quotes)
-            quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
-            for quote in prior_snapshot.quotes.values():
-                quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
-            for venue_name, source in self._exchange_sources.items():
-                source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
-            restored = _restorable_prior_last_good_quotes(
-                prior_snapshot,
-                configured_venues=set(self._venue_configs_by_name),
-                configured_symbols=_canonical_symbol_set(config.symbols),
-                now_ms=int(time.time() * 1000),
-                max_age_ms=max(
-                    int(runtime.live_scan_last_good_max_age_ms or 0),
-                    0,
-                ),
-            )
-            self._last_good_quotes = restored
-            self._last_good_at_ms_by_key = {
-                key: int(quote.observed_at_ms)
-                for key, quote in restored.items()
-            }
-            self._last_good_at_ms = max(
-                self._last_good_at_ms_by_key.values(),
-                default=0,
-            )
+        if not self.in_process_entry:
+            # A restart must not erase a cadence that the exchange has already
+            # demonstrated.  This is a local snapshot read only; it adds no public
+            # REST request and leaves unknown schedules unknown.
+            try:
+                prior_snapshot = load_snapshot(self.snapshot_path)
+            except (KeyError, TypeError, ValueError):
+                # A malformed or legacy snapshot must not turn a safe restart into
+                # an outage.  It merely leaves funding cadence cold/unknown.
+                logger.warning("sidecar funding schedule restore skipped: malformed snapshot")
+                prior_snapshot = None
+            if prior_snapshot is not None:
+                self._forecast_calibrator.prime(prior_snapshot.quotes)
+                quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
+                for quote in prior_snapshot.quotes.values():
+                    quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
+                for venue_name, source in self._exchange_sources.items():
+                    source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
+                restored = _restorable_prior_last_good_quotes(
+                    prior_snapshot,
+                    configured_venues=set(self._venue_configs_by_name),
+                    configured_symbols=_canonical_symbol_set(config.symbols),
+                    now_ms=int(time.time() * 1000),
+                    max_age_ms=max(
+                        int(runtime.live_scan_last_good_max_age_ms or 0),
+                        0,
+                    ),
+                )
+                self._last_good_quotes = restored
+                self._last_good_at_ms_by_key = {
+                    key: int(quote.observed_at_ms)
+                    for key, quote in restored.items()
+                }
+                self._last_good_at_ms = max(
+                    self._last_good_at_ms_by_key.values(),
+                    default=0,
+                )
 
         self._spread_bbo_data_plane = (
             SpreadBboDataPlane(
@@ -351,7 +368,37 @@ class SidecarService:
     # Main refresh
     # ------------------------------------------------------------------
 
+    async def refresh_in_process_entry(
+        self,
+        top_books: Mapping[tuple[str, str], TopBookQuote],
+    ) -> SidecarSnapshot:
+        """Build the live entry view from runtime-owned WebSocket BBOs.
+
+        This intentionally shares the candidate and fee contracts with the
+        compatibility sidecar while keeping the result in memory.  It neither
+        restores nor publishes a funding-entry snapshot generation.
+        """
+        if not self.in_process_entry:
+            raise RuntimeError("in-process entry refresh requires in_process_entry=True")
+
+        configured_venues = set(self._configured_venue_names())
+        configured_symbols = _canonical_symbol_set(self.config.symbols)
+        by_venue: dict[str, dict[str, TopBookQuote]] = {}
+        for (raw_venue, raw_symbol), top_book in top_books.items():
+            venue = str(raw_venue).strip().lower()
+            symbol = str(raw_symbol).strip().upper()
+            if venue not in configured_venues or symbol not in configured_symbols:
+                continue
+            by_venue.setdefault(venue, {})[f"{venue}:{symbol}"] = top_book
+
+        self._in_process_top_books = by_venue
+        try:
+            return await self.refresh_once()
+        finally:
+            self._in_process_top_books = None
+
     async def refresh_once(self) -> SidecarSnapshot:
+        in_process_entry = bool(getattr(self, "in_process_entry", False))
         refresh_started_at_ms = int(time.time() * 1000)
         symbols = list(
             dict.fromkeys(
@@ -376,13 +423,26 @@ class SidecarService:
         listed_symbols_by_venue: dict[str, set[str]] = {}
 
         # --- Funding + Market fetch (per venue, funding timeout) ---
-        funding_results, entry_bbo_results = await asyncio.gather(
-            self._fetch_all_venues(
+        if in_process_entry:
+            funding_results = await self._fetch_all_venues(
                 symbols,
                 timeout_s=self._funding_timeout_s,
-            ),
-            self._fetch_funding_entry_bbo_all_venues(symbols),
-        )
+                funding_metadata_only=True,
+            )
+            # The runtime's WebSocket cache owns entry BBO in this mode.  Do
+            # not start the sidecar's duplicate REST BBO collection lane.
+            entry_bbo_results = [
+                (venue_name, None, None, set())
+                for venue_name in self._configured_venue_names()
+            ]
+        else:
+            funding_results, entry_bbo_results = await asyncio.gather(
+                self._fetch_all_venues(
+                    symbols,
+                    timeout_s=self._funding_timeout_s,
+                ),
+                self._fetch_funding_entry_bbo_all_venues(symbols),
+            )
         entry_bbo_by_venue = {
             venue_name: (venue_quotes, error)
             for venue_name, venue_quotes, error, _failed_symbols in entry_bbo_results
@@ -393,6 +453,10 @@ class SidecarService:
                 venue_name,
                 (None, RuntimeError("funding entry BBO result unavailable")),
             )
+            if in_process_entry:
+                entry_bbo_quotes = (
+                    getattr(self, "_in_process_top_books", {}) or {}
+                ).get(venue_name, {})
             if error is not None:
                 degraded_venues.add(venue_name)
                 spread_market_degraded_venues.add(venue_name)
@@ -823,8 +887,10 @@ class SidecarService:
                 set(spread_degraded_symbols.get(venue, [])) | symbols
             )
         data_plane = getattr(self, "_spread_bbo_data_plane", None)
-        if bool(getattr(self, "embedded_spread_bbo_enabled", True)) and not bool(
-            getattr(data_plane, "active", False)
+        if (
+            not in_process_entry
+            and bool(getattr(self, "embedded_spread_bbo_enabled", True))
+            and not bool(getattr(data_plane, "active", False))
         ):
             try:
                 publish_spread_quote_snapshot(
@@ -941,7 +1007,7 @@ class SidecarService:
             symbols,
             observed_at_ms=candidate_build_observed_at_ms,
             diagnostics=candidate_build_diagnostics,
-            max_candidates=32,
+            max_candidates=None,
         )
         candidate_build_diagnostics["quarantined_future_quote_count"] = len(
             future_quote_keys
@@ -958,8 +1024,14 @@ class SidecarService:
             int(time.time() * 1000),
             candidate_build_observed_at_ms,
         )
-        legacy_liquidity_publish_ms = int(getattr(self, "_last_liquidity_publish_at_ms", 0) or 0)
-        liquidity_publish_by_key = getattr(self, "_last_liquidity_publish_at_ms_by_key", None)
+        legacy_liquidity_publish_ms = int(
+            getattr(self, "_last_liquidity_publish_at_ms", 0) or 0
+        )
+        liquidity_publish_by_key = getattr(
+            self,
+            "_last_liquidity_publish_at_ms_by_key",
+            None,
+        )
         if not isinstance(liquidity_publish_by_key, dict):
             liquidity_publish_by_key = {}
         use_legacy_liquidity_publish_ms = (
@@ -973,10 +1045,14 @@ class SidecarService:
             previous_publish_ms = int(liquidity_publish_by_key.get(key, 0) or 0)
             if previous_publish_ms <= 0 and use_legacy_liquidity_publish_ms:
                 previous_publish_ms = legacy_liquidity_publish_ms
-            has_usable_publish = int(getattr(row, "coverage_usable", 0) or 0) > 0
+            has_usable_publish = (
+                int(getattr(row, "coverage_usable", 0) or 0) > 0
+            )
             if has_usable_publish:
                 row.publish_interval_ms = (
-                    max(published_ms - previous_publish_ms, 0) if previous_publish_ms > 0 else 0
+                    max(published_ms - previous_publish_ms, 0)
+                    if previous_publish_ms > 0
+                    else 0
                 )
                 row.published_at_ms = published_ms
                 liquidity_publish_by_key[key] = published_ms
@@ -1000,33 +1076,34 @@ class SidecarService:
         # consumer therefore always needs the same full v3 metadata handoff;
         # omitting it in embedded mode would turn every valid BBO into
         # metadata_unavailable and create a permanent zero-sampling service.
-        try:
-            metadata_quotes = dict(self._last_good_quotes)
-            if metadata_quotes:
-                publish_spread_quote_snapshot(
-                    SpreadQuoteSnapshot(
-                        schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-                        published_at_ms=published_ms,
-                        market_observed_at_ms=_latest_valid_quote_observation_ms(
-                            metadata_quotes,
-                            decision_at_ms=published_ms,
-                            fallback_ms=refresh_started_at_ms,
+        if not in_process_entry:
+            try:
+                metadata_quotes = dict(self._last_good_quotes)
+                if metadata_quotes:
+                    publish_spread_quote_snapshot(
+                        SpreadQuoteSnapshot(
+                            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+                            published_at_ms=published_ms,
+                            market_observed_at_ms=_latest_valid_quote_observation_ms(
+                                metadata_quotes,
+                                decision_at_ms=published_ms,
+                                fallback_ms=refresh_started_at_ms,
+                            ),
+                            batch_started_at_ms=refresh_started_at_ms,
+                            configured_venues=sorted(self._configured_venue_names()),
+                            degraded_venues=sorted(degraded_venues),
+                            degraded_symbols={
+                                venue: list(symbols)
+                                for venue, symbols in degraded_symbols.items()
+                                if symbols
+                            },
+                            quotes=metadata_quotes,
                         ),
-                        batch_started_at_ms=refresh_started_at_ms,
-                        configured_venues=sorted(self._configured_venue_names()),
-                        degraded_venues=sorted(degraded_venues),
-                        degraded_symbols={
-                            venue: list(symbols)
-                            for venue, symbols in degraded_symbols.items()
-                            if symbols
-                        },
-                        quotes=metadata_quotes,
-                    ),
-                    spread_metadata_snapshot_path(self.snapshot_path),
-                    validate_contract=False,
-                )
-        except (OSError, TypeError, ValueError):
-            logger.exception("spread metadata handoff publication failed")
+                        spread_metadata_snapshot_path(self.snapshot_path),
+                        validate_contract=False,
+                    )
+            except (OSError, TypeError, ValueError):
+                logger.exception("spread metadata handoff publication failed")
 
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,
@@ -1042,12 +1119,18 @@ class SidecarService:
             degraded_venues=sorted(degraded_venues),
             degraded_domains=[],
             degraded_symbols=degraded_symbols,
-            source_mode="direct_market",
-            acquisition_mode=_resolve_acquisition_mode(
-                degraded_venues,
-                degraded_symbols,
-                fallback_used_keys,
-                has_usable_payload=bool(quotes),
+            source_mode=(
+                "single_process_entry" if in_process_entry else "direct_market"
+            ),
+            acquisition_mode=(
+                "direct_market_view"
+                if in_process_entry
+                else _resolve_acquisition_mode(
+                    degraded_venues,
+                    degraded_symbols,
+                    fallback_used_keys,
+                    has_usable_payload=bool(quotes),
+                )
             ),
             candidate_build_observed_at_ms=candidate_build_observed_at_ms,
             candidate_build_diagnostics=candidate_build_diagnostics,
@@ -1055,31 +1138,32 @@ class SidecarService:
             candidates=candidates,
         )
 
-        # Install the bounded live-entry generation first.  The full snapshot
-        # remains the audit/compatibility surface and may be tens of megabytes;
-        # it must not define when funding-live can observe this generation.
-        await asyncio.to_thread(
-            publish_funding_entry_snapshot,
-            snapshot,
-            self.snapshot_path,
-        )
-        if not snapshot.quotes and not snapshot.candidates:
-            # The fail-closed unavailable artifact is tiny and contains no
-            # full candidate work. Preserve the synchronous operational
-            # compatibility surface without reintroducing the 28MB hot path.
-            await asyncio.to_thread(publish_snapshot, snapshot, self.snapshot_path)
-        else:
-            self._schedule_audit_snapshot_publish(
+        if not in_process_entry:
+            # Install the bounded live-entry generation first.  The full snapshot
+            # remains the audit/compatibility surface and may be tens of megabytes;
+            # it must not define when funding-live can observe this generation.
+            await asyncio.to_thread(
+                publish_funding_entry_snapshot,
                 snapshot,
-                candidate_service=candidate_service,
-                quotes=quotes,
-                symbols=symbols,
-                observed_at_ms=candidate_build_observed_at_ms,
-                quote_liquidity_by_venue=quote_liquidity_by_venue,
-                skip_venues=set(degraded_venues),
-                listed_symbols_by_venue=listed_symbols_by_venue,
-                market_quality_failed_symbols=market_quality_failed_symbols,
+                self.snapshot_path,
             )
+            if not snapshot.quotes and not snapshot.candidates:
+                # The fail-closed unavailable artifact is tiny and contains no
+                # full candidate work. Preserve the synchronous operational
+                # compatibility surface without reintroducing the 28MB hot path.
+                await asyncio.to_thread(publish_snapshot, snapshot, self.snapshot_path)
+            else:
+                self._schedule_audit_snapshot_publish(
+                    snapshot,
+                    candidate_service=candidate_service,
+                    quotes=quotes,
+                    symbols=symbols,
+                    observed_at_ms=candidate_build_observed_at_ms,
+                    quote_liquidity_by_venue=quote_liquidity_by_venue,
+                    skip_venues=set(degraded_venues),
+                    listed_symbols_by_venue=listed_symbols_by_venue,
+                    market_quality_failed_symbols=market_quality_failed_symbols,
+                )
         return snapshot
 
     async def refresh_entry_from_latest_cache(self) -> SidecarSnapshot:
@@ -1412,6 +1496,8 @@ class SidecarService:
         self,
         symbols: list[str],
         timeout_s: float,
+        *,
+        funding_metadata_only: bool = False,
     ) -> list[tuple[str, Optional[dict[str, QuoteSnapshot]], Optional[Exception], set[str]]]:
         """Fetch quotes from all venues concurrently. Returns per-venue results
         with degraded symbol tracking."""
@@ -1424,7 +1510,12 @@ class SidecarService:
                 requested = _canonical_symbol_set(symbols)
                 return (venue_name, None, None, requested)
             try:
-                result = await asyncio.wait_for(source.fetch_all(symbols), timeout=timeout_s)
+                fetch = (
+                    source.fetch_funding_metadata
+                    if funding_metadata_only
+                    else source.fetch_all
+                )
+                result = await asyncio.wait_for(fetch(symbols), timeout=timeout_s)
                 requested = _canonical_symbol_set(symbols)
                 result = {
                     key: quote
@@ -1740,10 +1831,18 @@ class SidecarService:
         """Keep direct test/recovery construction compatible with the service."""
         calibrator = getattr(self, "_forecast_calibrator", None)
         if calibrator is None:
-            snapshot_path = Path(self.snapshot_path)
+            if getattr(self, "in_process_entry", False):
+                forecast_path = Path(
+                    self.config.runtime.funding_basis_risk_checkpoint_path
+                ).with_name("funding-forecast-in-process-calibration.json")
+            else:
+                snapshot_path = Path(self.snapshot_path)
+                forecast_path = snapshot_path.with_name(
+                    f"{snapshot_path.name}.funding-forecast-calibration.json"
+                )
             strategy = self.config.strategy
             calibrator = FundingForecastCalibrator(
-                snapshot_path.with_name(f"{snapshot_path.name}.funding-forecast-calibration.json"),
+                forecast_path,
                 min_samples=strategy.funding_forecast_min_samples,
                 max_quantile_drift_bps=(strategy.funding_forecast_stability_max_quantile_drift_bps),
             )

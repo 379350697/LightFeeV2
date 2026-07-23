@@ -86,6 +86,7 @@ def _merge_defaults(base: Any, raw: dict[str, Any]) -> None:
 def _load_runtime(raw: dict[str, Any]) -> RuntimeConfig:
     cfg = default_runtime()
     _merge_defaults(cfg, raw)
+    cfg._opportunity_input_mode_configured = "opportunity_input_mode" in raw
     return cfg
 
 
@@ -96,14 +97,13 @@ def _load_strategy(
 ) -> StrategyConfig:
     cfg = default_strategy()
     provider_configured = "entry_readiness_provider" in raw
+    provider_raw = raw.get("entry_readiness_provider", "")
     raw = _normalize_entry_perp_liquidity_thresholds(raw)
     _merge_defaults(cfg, raw)
-    if (
-        runtime is not None
-        and str(getattr(runtime, "mode", "") or "").lower() == "live"
-        and not provider_configured
-    ):
-        cfg.entry_readiness_provider = "ws_bbo_quote_lease"
+    # Keep loader provenance out of the TOML schema.  Runtime diagnostics use
+    # it to distinguish a defaulted composed mode from an explicit one.
+    cfg._entry_readiness_provider_configured = provider_configured
+    cfg._entry_readiness_provider_raw = provider_raw if provider_configured else ""
     return cfg
 
 

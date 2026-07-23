@@ -6,7 +6,13 @@ import math
 from pathlib import Path
 from typing import Any
 
-from lightfee.config.compatibility import REMOVED_FIELD_MESSAGES, VALID_OPPORTUNITY_INPUT_MODES
+from lightfee.config.compatibility import (
+    ENTRY_READINESS_PROVIDER_ON_DEMAND,
+    REMOVED_FIELD_MESSAGES,
+    VALID_OPPORTUNITY_INPUT_MODES,
+    entry_readiness_provider_configured,
+    resolve_entry_readiness_provider,
+)
 from lightfee.config.schema import (
     AppConfig,
     ENTRY_READINESS_PROVIDERS,
@@ -14,6 +20,9 @@ from lightfee.config.schema import (
 )
 from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
+from lightfee.marketdata.open_interest import (
+    ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+)
 from lightfee.strategy.fee_evidence import (
     LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
     TRUSTED_FEE_EVIDENCE_HMAC_ENV,
@@ -50,6 +59,25 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             f"runtime.sidecar_snapshot_max_age_ms must be > 0, "
             f"got: {config.runtime.sidecar_snapshot_max_age_ms}"
+        )
+    if not _is_positive_int(config.runtime.entry_open_interest_refresh_timeout_ms):
+        issues.append(
+            "runtime.entry_open_interest_refresh_timeout_ms must be a positive integer"
+        )
+    if not _is_positive_int(
+        config.runtime.entry_open_interest_cache_fallback_max_age_ms
+    ):
+        issues.append(
+            "runtime.entry_open_interest_cache_fallback_max_age_ms must be a "
+            "positive integer"
+        )
+    elif (
+        int(config.runtime.entry_open_interest_cache_fallback_max_age_ms)
+        > ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+    ):
+        issues.append(
+            "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= "
+            f"{ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS}"
         )
     if config.runtime.live_scan_last_good_max_age_ms <= 0:
         issues.append(
@@ -642,17 +670,20 @@ def validate_config(config: AppConfig) -> list[str]:
             "strategy.entry_window_secs must be >= "
             "strategy.min_scan_minutes_before_funding * 60"
         )
+    prewarm_window_secs = config.strategy.entry_local_l2_prewarm_window_secs
     if (
-        min_before_secs > 0
-        and config.strategy.entry_local_l2_prewarm_window_secs < min_before_secs
+        prewarm_window_secs > 0
+        and min_before_secs > 0
+        and prewarm_window_secs < min_before_secs
     ):
         issues.append(
             "strategy.entry_local_l2_prewarm_window_secs must be >= "
             "strategy.min_scan_minutes_before_funding * 60"
         )
     if (
-        max_before_secs > 0
-        and config.strategy.entry_local_l2_prewarm_window_secs > max_before_secs
+        prewarm_window_secs > 0
+        and max_before_secs > 0
+        and prewarm_window_secs > max_before_secs
     ):
         issues.append(
             "strategy.entry_local_l2_prewarm_window_secs must be <= "
@@ -677,7 +708,18 @@ def validate_config(config: AppConfig) -> list[str]:
             f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
         )
 
-    provider = config.strategy.entry_readiness_provider.strip().lower()
+    provider_resolution = resolve_entry_readiness_provider(
+        config.strategy.entry_readiness_provider,
+        configured=entry_readiness_provider_configured(
+            config.strategy.entry_readiness_provider,
+            getattr(
+                config.strategy,
+                "_entry_readiness_provider_configured",
+                None,
+            ),
+        ),
+    )
+    provider = provider_resolution.raw or ENTRY_READINESS_PROVIDER_ON_DEMAND
     if provider not in ENTRY_READINESS_PROVIDERS:
         issues.append(
             "strategy.entry_readiness_provider must be one of "
@@ -685,13 +727,36 @@ def validate_config(config: AppConfig) -> list[str]:
         )
     quote_lease_ttl_ms = config.strategy.entry_quote_lease_ttl_ms
     if (
-        provider in {"quote_lease", "ws_top_book", "ws_bbo_quote_lease"}
+        provider_resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
         and quote_lease_ttl_ms <= 0
     ):
         issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
     ws_bbo_per_venue_budget = config.strategy.entry_ws_bbo_per_venue_budget
-    if provider == "ws_bbo_quote_lease" and ws_bbo_per_venue_budget <= 0:
+    if (
+        provider_resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        and ws_bbo_per_venue_budget <= 0
+    ):
         issues.append("strategy.entry_ws_bbo_per_venue_budget must be > 0")
+
+    primary_count = config.strategy.entry_local_l2_primary_count
+    if (
+        isinstance(primary_count, bool)
+        or not isinstance(primary_count, int)
+        or primary_count < 0
+    ):
+        issues.append(
+            "strategy.entry_local_l2_primary_count must be a non-negative integer"
+        )
+
+    for field_name in (
+        "shadow_entry_opportunity_count",
+        "entry_quote_prewarm_extra_candidate_count",
+        "entry_local_l2_prewarm_window_secs",
+        "local_l2_short_prewarm_max_pairs",
+        "local_l2_short_prewarm_max_rank",
+    ):
+        if not _is_nonnegative_int(getattr(config.strategy, field_name)):
+            issues.append(f"strategy.{field_name} must be a non-negative integer")
 
     # V1 local-L2 resource budget validation
     if config.strategy.local_l2_global_max_books <= 0:

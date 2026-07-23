@@ -142,6 +142,31 @@ class ExchangeSource:
             result[key] = ft.funding_rate_bps
         return result
 
+    async def fetch_funding_metadata(
+        self,
+        symbols: list[str],
+    ) -> dict[str, QuoteSnapshot]:
+        """Fetch funding and contract evidence without acquiring a top book."""
+        tickers = await self._client.fetch_funding_tickers(
+            symbols,
+            include_open_interest=False,
+        )
+        result: dict[str, QuoteSnapshot] = {}
+        for key, ticker in tickers.items():
+            quote = self._from_funding_ticker(ticker)
+            # Single-process entry supplies executable prices from the runtime
+            # WebSocket cache.  Metadata responses must not substitute stale
+            # embedded ticker prices when a WS book is absent.
+            quote.bid = 0.0
+            quote.ask = 0.0
+            quote.bid_size = 0.0
+            quote.ask_size = 0.0
+            quote.observed_at_ms = 0
+            quote.market_event_at_ms = 0
+            quote.source = "funding_metadata"
+            result[key] = quote
+        return result
+
     async def fetch_market_quotes(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
         """Fetch bid/ask/mark for symbols as QuoteSnapshot."""
         tickers = await self._client.fetch_funding_tickers(

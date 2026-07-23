@@ -357,16 +357,19 @@ class EntryGateRuntime:
         return self.ctx._entry_l2_readiness_diagnostics_payload()
 
     def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_local_l2()
+        return self.ctx._entry_effective_readiness_provider_uses_local_l2()
 
     def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
+        return self.ctx._entry_effective_readiness_provider_uses_ws_bbo()
 
     def _local_l2_effective_enabled(self) -> bool:
-        return self.ctx._local_l2_effective_enabled()
+        return self.ctx._entry_local_l2_effective_enabled()
 
     def _entry_readiness_provider_name(self) -> str:
-        return self.ctx._entry_readiness_provider_name()
+        return self.ctx._entry_effective_readiness_provider_name()
+
+    def _entry_readiness_provider_diagnostics(self) -> dict[str, object]:
+        return self.ctx._entry_effective_readiness_provider_diagnostics()
 
     def _entry_ws_bbo_subscription_blocker(self, *args: Any, **kwargs: Any):
         return self.ctx._entry_ws_bbo_subscription_blocker(*args, **kwargs)
@@ -2495,6 +2498,7 @@ class EntryGateRuntime:
         }
 
         payload = {
+            **self._entry_readiness_provider_diagnostics(),
             "reason": reason,
             "generic_reason": (
                 "no_tradeable_candidates"
@@ -2581,7 +2585,7 @@ class EntryGateRuntime:
                 "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
             })
         elif ws_bbo_provider_active:
-            payload["entry_readiness_provider"] = "ws_bbo_quote_lease"
+            payload["entry_readiness_provider"] = self._entry_readiness_provider_name()
         fingerprint = self._payload_fingerprint({
             "reason": payload["reason"],
             "candidate_count": payload["candidate_count"],
@@ -2977,6 +2981,7 @@ class EntryGateRuntime:
                     "entry_finalization_window_expired",
                 }:
                     diagnostic_payload = {
+                        **self._entry_readiness_provider_diagnostics(),
                         "symbol": symbol,
                         "pair_id": pair_id,
                         "reason": blocker_str,
@@ -3146,7 +3151,9 @@ class EntryGateRuntime:
         if not self._local_l2_effective_enabled():
             return None
         prewarm_window_ms = self.ctx.config.strategy.entry_local_l2_prewarm_window_secs * 1000
-        if remaining_ms <= 0 or remaining_ms > prewarm_window_ms:
+        if prewarm_window_ms > 0 and (
+            remaining_ms <= 0 or remaining_ms > prewarm_window_ms
+        ):
             return "entry_local_l2_waiting_for_prewarm_window"
 
         # Primary tracking: candidate must be in primary tracked set

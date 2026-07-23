@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
+from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import (
     FundingCandidateService,
     _funding_contract_block_reasons,
@@ -111,6 +112,149 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
 
     assert first == second
     assert id(service._allocator) == allocator_id
+
+
+@pytest.mark.asyncio
+async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service.config.runtime.sidecar_snapshot_path = str(service.snapshot_path)
+    service._funding_timeout_s = 1.0
+    service._liquidity_timeout_s = 1.0
+    service._last_good_quotes = {}
+    service._last_good_at_ms = 0
+    service._last_good_at_ms_by_key = {}
+    service._last_liquidity_publish_at_ms = 0
+    service._last_liquidity_publish_at_ms_by_key = {}
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
+    service._audit_executor = None
+
+    class RecordingBuilder:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def build(self, *_args, **kwargs):
+            self.calls.append(dict(kwargs))
+            return []
+
+    builder = RecordingBuilder()
+    service._new_candidate_service = lambda *, now_ms=None: builder
+
+    async def no_funding(symbols, timeout_s, **_kwargs):
+        return []
+
+    async def no_entry_bbo(symbols):
+        return []
+
+    async def no_liquidity(
+        symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None,
+    ):
+        return []
+
+    service._fetch_all_venues = no_funding
+    service._fetch_funding_entry_bbo_all_venues = no_entry_bbo
+    service._fetch_liquidity_all_venues = no_liquidity
+    monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: 1.0)
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_funding_entry_snapshot",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_snapshot",
+        lambda *_args, **_kwargs: None,
+    )
+
+    await service.refresh_once()
+
+    assert builder.calls
+    assert builder.calls[0]["max_candidates"] is None
+
+
+@pytest.mark.asyncio
+async def test_in_process_entry_never_uses_funding_snapshot_handoff(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.in_process_entry = True
+    service.embedded_spread_bbo_enabled = False
+    service.config = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance")],
+    )
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service.config.runtime.sidecar_snapshot_path = str(service.snapshot_path)
+    service._funding_timeout_s = 1.0
+    service._liquidity_timeout_s = 1.0
+    service._last_good_quotes = {}
+    service._last_good_at_ms = 0
+    service._last_good_at_ms_by_key = {}
+    service._last_liquidity_publish_at_ms = 0
+    service._last_liquidity_publish_at_ms_by_key = {}
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
+    service._audit_executor = None
+
+    class RecordingBuilder:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def build(self, *_args, **kwargs):
+            self.calls.append(dict(kwargs))
+            return []
+
+    builder = RecordingBuilder()
+    service._new_candidate_service = lambda *, now_ms=None: builder
+
+    async def no_funding(symbols, timeout_s, **_kwargs):
+        return []
+
+    async def unexpected_entry_bbo(*_args, **_kwargs):
+        raise AssertionError("single-process path started a sidecar BBO fetch")
+
+    service._fetch_all_venues = no_funding
+    service._fetch_funding_entry_bbo_all_venues = unexpected_entry_bbo
+    monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: 1.0)
+    for name in (
+        "load_snapshot",
+        "publish_funding_entry_snapshot",
+        "publish_snapshot",
+        "publish_spread_quote_snapshot",
+    ):
+        monkeypatch.setattr(
+            f"lightfee.sidecar.service.{name}",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"single-process path called {name}")
+            ),
+        )
+
+    snapshot = await service.refresh_in_process_entry(
+        {
+            ("binance", "BTCUSDT"): TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=1_000,
+                received_at_ms=1_000,
+                source="ws_bbo",
+            )
+        }
+    )
+
+    assert snapshot.source_mode == "single_process_entry"
+    assert snapshot.acquisition_mode == "direct_market_view"
+    assert builder.calls
 
 
 def test_canary_conservative_tier_defers_symbol_specific_buffer_to_pairing(

@@ -603,6 +603,165 @@ def test_pending_first_fill_compares_fee_inclusive_hedge_and_unwind_costs(
     ]
 
 
+def test_pending_first_fill_uses_multilevel_remaining_depth(config, tmp_journal):
+    """Recovered pending entries compare the remaining base quantity, not BBO."""
+    config.venues = [
+        VenueConfig(venue="binance", taker_fee_bps=0.0),
+        VenueConfig(venue="okx", taker_fee_bps=0.0),
+    ]
+    config.strategy.local_l2_enabled = True
+    config.strategy.entry_readiness_provider = "local_l2"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    books = {
+        "binance": {
+            "bids": [(99.9, 0.05), (98.0, 0.15)],
+            "asks": [(101.0, 10.0)],
+        },
+        "okx": {
+            "bids": [(99.7, 0.05), (99.4, 0.15)],
+            "asks": [(100.5, 10.0)],
+        },
+    }
+    for venue, levels in books.items():
+        book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(price, size) for price, size in levels["bids"]]
+        book.asks = [PriceLevel(price, size) for price, size in levels["asks"]]
+        book.observed_at_ms = now_ms
+    pending = PendingEntry(
+        pending_id="pending-multilevel-depth",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.2,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.2,
+        maker_fill_price=100.0,
+    )
+
+    decision = runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    )
+
+    assert decision["action"] == "complete_hedge"
+    assert decision["hedge_price"] == pytest.approx(99.4)
+    assert decision["complete_hedge_loss_quote"] < decision[
+        "unwind_first_leg_loss_quote"
+    ]
+    assert decision["market_evidence"]["l2_depth"] == {
+        "source": "local_l2_multilevel_vwap",
+        "remaining_base_quantity": pytest.approx(0.2),
+        "hedge_vwap": pytest.approx(99.475),
+        "hedge_filled_base_quantity": pytest.approx(0.2),
+        "hedge_sweep_limit": pytest.approx(99.4),
+        "hedge_l2_complete": True,
+        "unwind_vwap": pytest.approx(98.475),
+        "unwind_filled_base_quantity": pytest.approx(0.2),
+        "unwind_sweep_limit": pytest.approx(98.0),
+        "unwind_l2_complete": True,
+    }
+
+
+def test_pending_first_fill_incomplete_depth_selects_residual_repair(
+    config, tmp_journal
+):
+    config.strategy.local_l2_enabled = True
+    config.strategy.entry_readiness_provider = "local_l2"
+    config.strategy.max_liquidity_snapshot_age_ms = 1_000
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    now_ms = 10_000
+    for venue in ("binance", "okx"):
+        book = runtime.local_l2_runtime.ensure_book(venue, "BTCUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(99.0, 0.05)]
+        book.asks = [PriceLevel(101.0, 0.05)]
+        book.observed_at_ms = now_ms
+    pending = PendingEntry(
+        pending_id="pending-incomplete-depth",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.2,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=now_ms,
+        maker_leg="long",
+        maker_leg_filled=0.2,
+        maker_fill_price=100.0,
+    )
+
+    decision = runtime._pending_entry_post_first_fill_decision(
+        pending,
+        entry_id=pending.pending_id,
+        now_ms=now_ms,
+    )
+
+    assert decision["action"] == "unwind_first_leg"
+    assert (
+        decision["reason"]
+        == "pending_post_first_fill_incomplete_l2_depth_residual_repair"
+    )
+    assert decision["market_evidence"]["l2_depth"]["hedge_l2_complete"] is False
+    assert decision["market_evidence"]["l2_depth"]["unwind_l2_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_pending_first_fill_incomplete_depth_routes_through_finalization(
+    config, tmp_journal, monkeypatch
+):
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    pending = PendingEntry(
+        pending_id="pending-residual-route",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=0.2,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=1_000,
+        maker_leg="long",
+        maker_leg_filled=0.2,
+        maker_fill_price=100.0,
+    )
+
+    monkeypatch.setattr(runtime, "get_venue_adapter", lambda _venue: object())
+    monkeypatch.setattr(
+        runtime,
+        "_pending_entry_post_first_fill_decision",
+        lambda *_args, **_kwargs: {
+            "action": "unwind_first_leg",
+            "reason": "pending_post_first_fill_incomplete_l2_depth_residual_repair",
+            "hedge_price": 99.0,
+            "market_evidence": {},
+        },
+    )
+    finalize = AsyncMock(return_value=True)
+    abort = AsyncMock(return_value=True)
+    monkeypatch.setattr(runtime, "_finalize_pending_entry", finalize)
+    monkeypatch.setattr(runtime, "_abort_pending_entry", abort)
+
+    assert (
+        await runtime._drive_missing_hedge_live(
+            pending,
+            pending.pending_id,
+            2_000,
+        )
+        is False
+    )
+    finalize.assert_awaited_once_with(pending, pending.pending_id, 2_000)
+    abort.assert_not_awaited()
+
+
 def test_pending_first_fill_rejects_future_ws_bbo_timestamp(config, tmp_journal):
     """A future-dated top book cannot steer a post-fill hedge/unwind choice."""
     config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -1158,6 +1317,7 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
     config, tmp_journal
 ):
     from lightfee.engine.entry_readiness import EntryReadinessDecision
+    from lightfee.marketdata.ws_bbo import TopBookQuote
     from lightfee.sidecar.snapshot import CandidateInput
 
     class ReadinessProvider:
@@ -1200,6 +1360,21 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
     )
 
     now_ms = 1_000_000
+    for venue, bid, ask in (
+        ("binance", 50000.0, 50010.0),
+        ("bybit", 49990.0, 50000.0),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="BTCUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
     candidate = CandidateInput(
         long_venue="binance",
         short_venue="bybit",
@@ -1240,6 +1415,7 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
 async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
     config, tmp_journal
 ):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
     from lightfee.sidecar.snapshot import CandidateInput
 
     class SlowNoSubmitExecutor:
@@ -1272,6 +1448,21 @@ async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
 
     now_ms = 1_000_000
+    for venue, bid, ask in (
+        ("binance", 1.0, 1.01),
+        ("bybit", 0.99, 1.0),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="NOSUBUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
     candidate = CandidateInput(
         long_venue="binance",
         short_venue="bybit",
@@ -1308,6 +1499,7 @@ async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
 async def test_selected_submit_deadline_does_not_wait_for_slow_cancel_cleanup(
     config, tmp_journal
 ):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
     from lightfee.sidecar.snapshot import CandidateInput
 
     class SlowCancelCleanupExecutor:
@@ -1340,6 +1532,21 @@ async def test_selected_submit_deadline_does_not_wait_for_slow_cancel_cleanup(
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
 
     now_ms = 1_000_000
+    for venue, bid, ask in (
+        ("binance", 1.0, 1.01),
+        ("bybit", 0.99, 1.0),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="SLOWCANCELUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
     candidate = CandidateInput(
         long_venue="binance",
         short_venue="bybit",
@@ -1383,6 +1590,7 @@ async def test_selected_submit_deadline_does_not_wait_for_slow_cancel_cleanup(
 async def test_dispatch_entry_keeps_order_truth_path_when_submit_evidence_exists(
     config, tmp_journal
 ):
+    from lightfee.marketdata.ws_bbo import TopBookQuote
     from lightfee.sidecar.snapshot import CandidateInput
 
     class SlowSubmittedExecutor:
@@ -1414,6 +1622,21 @@ async def test_dispatch_entry_keeps_order_truth_path_when_submit_evidence_exists
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
 
     now_ms = 1_000_000
+    for venue, bid, ask in (
+        ("binance", 1.0, 1.01),
+        ("bybit", 0.99, 1.0),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol="SUBUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source=f"{venue}_bbo_ws",
+            )
+        )
     candidate = CandidateInput(
         long_venue="binance",
         short_venue="bybit",
@@ -1922,6 +2145,7 @@ class TestPlannerDispatchIntegration:
         self, config, tmp_journal, monkeypatch
     ):
         from lightfee.engine.entry_readiness import QuoteLease
+        from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
@@ -2141,6 +2365,8 @@ class TestPlannerDispatchIntegration:
     async def test_dispatch_entry_pending_close_reconciliation_blocks_only_matching_pair(
         self, config, tmp_journal,
     ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
         runtime = LiveRuntime(
@@ -2164,6 +2390,21 @@ class TestPlannerDispatchIntegration:
 
         blocked_candidate = self._binance_bybit_candidate("BTCUSDT")
         allowed_candidate = self._binance_bybit_candidate("ETHUSDT")
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("bybit", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="ETHUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5001,
+                    received_at_ms=5001,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         blocked = await runtime._dispatch_entry(
             blocked_candidate,
@@ -2197,6 +2438,8 @@ class TestPlannerDispatchIntegration:
     async def test_dispatch_entry_pending_passive_close_blocks_only_matching_pair(
         self, config, tmp_journal,
     ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
         runtime = LiveRuntime(
@@ -2235,6 +2478,21 @@ class TestPlannerDispatchIntegration:
 
         blocked_candidate = self._binance_bybit_candidate("BTCUSDT")
         allowed_candidate = self._binance_bybit_candidate("ETHUSDT")
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("bybit", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="ETHUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5001,
+                    received_at_ms=5001,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         blocked = await runtime._dispatch_entry(
             blocked_candidate,
@@ -2623,6 +2881,8 @@ class TestPlannerDispatchIntegration:
     async def test_post_only_gtx_reject_sets_pair_cooldown_without_pending(
         self, config, tmp_journal,
     ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -2640,6 +2900,23 @@ class TestPlannerDispatchIntegration:
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=1.0,
+                    ask_size=1.0,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         candidate = self._candidate()
 
@@ -2664,6 +2941,8 @@ class TestPlannerDispatchIntegration:
 
     @pytest.mark.asyncio
     async def test_fresh_bbo_allows_post_only_maker_submit(self, config, tmp_journal):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -2675,6 +2954,23 @@ class TestPlannerDispatchIntegration:
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=1.0,
+                    ask_size=1.0,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is True
 
@@ -2736,7 +3032,7 @@ class TestPlannerDispatchIntegration:
         """The final L2-sized order must be admitted against live positions."""
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_local_l2_book_stale_after_ms = 1_000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
@@ -2784,6 +3080,23 @@ class TestPlannerDispatchIntegration:
             runtime, "okx", "BTCUSDT",
             bid=49_990.0, ask=50_000.0, observed_at_ms=5_000,
         )
+        for venue, bid, ask in (
+            ("binance", 50_000.0, 50_010.0),
+            ("okx", 49_990.0, 50_000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=1.0,
+                    ask_size=1.0,
+                    observed_at_ms=5_000,
+                    received_at_ms=5_000,
+                    source="test_ws_bbo",
+                )
+            )
         runtime.state.open_positions["open-btc"] = OpenPosition(
             position_id="open-btc",
             symbol="BTCUSDT",
@@ -2801,6 +3114,7 @@ class TestPlannerDispatchIntegration:
         candidate.entry_notional_quote = 50.0
         candidate.entry_target_quantity = 0.001
         candidate.entry_max_executable_quantity = 0.001
+        assert runtime.entry_readiness_provider.decide(candidate, 5_000).allowed
 
         dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
 
@@ -2929,10 +3243,28 @@ class TestPlannerDispatchIntegration:
             runtime, "okx", "BTCUSDT",
             bid=49_990.0, ask=50_000.0, observed_at_ms=5_000,
         )
+        for venue, bid, ask in (
+            ("binance", 50_000.0, 50_010.0),
+            ("okx", 49_990.0, 50_000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=1.0,
+                    ask_size=1.0,
+                    observed_at_ms=5_000,
+                    received_at_ms=5_000,
+                    source="test_ws_bbo",
+                )
+            )
         candidate = self._candidate()
         candidate.entry_notional_quote = 50.0
         candidate.entry_target_quantity = 0.001
         candidate.entry_max_executable_quantity = 0.001
+        assert runtime.entry_readiness_provider.decide(candidate, 5_000).allowed
 
         dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
 
@@ -3413,8 +3745,8 @@ class TestPlannerDispatchIntegration:
     ):
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3434,6 +3766,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=5000,
                     received_at_ms=5000,
                     source=f"{venue}_bbo_ws",
@@ -3470,7 +3804,7 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.runtime.maker_event_lane_enabled = True
         config.runtime.maker_event_lane_min_wake_interval_ms = 0
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
         config.strategy.local_l2_enabled = True
         config.strategy.passive_reprice_threshold_bps = 1.0
         config.strategy.passive_cancel_replace_threshold_bps = 100.0
@@ -3496,6 +3830,7 @@ class TestPlannerDispatchIntegration:
             long_quantity=0.01,
             short_quantity=0.01,
             maker_leg="long",
+            entry_maker_leg="long",
         )
         runtime.state.pending_entries[pending.pending_id] = pending
         profile = PassiveOrderManagerProfile(
@@ -3546,7 +3881,7 @@ class TestPlannerDispatchIntegration:
 
         await runtime._maybe_tick_maker_event(5000)
 
-        assert calls == [(50025.0, 50000.0, "cancel_replace", pending.pending_id)]
+        assert calls == [(50020.0, 50000.0, "cancel_replace", pending.pending_id)]
         assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
         assert runtime.state.pending_entries[pending.pending_id].maker_order_id == "amended-maker-1"
         records = tmp_journal.read_all()
@@ -3561,6 +3896,229 @@ class TestPlannerDispatchIntegration:
         )
 
     @pytest.mark.asyncio
+    async def test_ws_bbo_provider_maker_event_uses_same_side_ask_for_sell_maker(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.passive_order_manager import (
+            PassiveOrderManager,
+            PassiveOrderManagerProfile,
+        )
+
+        config.runtime.mode = "live"
+        config.runtime.maker_event_lane_enabled = True
+        config.runtime.maker_event_lane_min_wake_interval_ms = 0
+        config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
+        config.strategy.local_l2_enabled = True
+        config.strategy.passive_reprice_threshold_bps = 1.0
+        config.strategy.passive_cancel_replace_threshold_bps = 100.0
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
+                Venue.OKX: FakeVenueAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="pe-ws-bbo-short-maker",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            entry_type="passive_incremental",
+            maker_price=50000.0,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            maker_leg="short",
+            entry_maker_leg="short",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        profile = PassiveOrderManagerProfile(
+            max_consecutive_failures=3,
+            failure_cooldown_ms=0,
+            reprice_threshold_bps=1.0,
+            cancel_replace_threshold_bps=100.0,
+        )
+        runtime._maker_event_state[pending.pending_id] = (
+            PassiveOrderManager(profile),
+            50000.0,
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=50020.0,
+                ask=50040.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="okx_bbo_ws",
+            )
+        )
+
+        class RejectNewEntryExecutor:
+            async def execute(self, ctx):
+                raise AssertionError("WS BBO maker-event must not start a new entry flow")
+
+        calls: list[tuple[float, float, str, str]] = []
+
+        async def fake_reprice(pending_arg, new_price, old_price, action, now_ms, entry_id):
+            calls.append((new_price, old_price, action, entry_id))
+            return SimpleNamespace(order_id="amended-maker-short")
+
+        runtime.entry_executor = RejectNewEntryExecutor()
+        monkeypatch.setattr(runtime, "_reprice_passive_maker_l2", fake_reprice)
+
+        await runtime._maybe_tick_maker_event(5000)
+
+        assert calls == [(50040.0, 50000.0, "cancel_replace", pending.pending_id)]
+        assert runtime.state.pending_entries[pending.pending_id].maker_order_id == (
+            "amended-maker-short"
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "hedge_observed_at_ms",
+            "ttl_ms",
+            "max_skew_ms",
+            "expected_role",
+            "expected_reason",
+        ),
+        [
+            (4800, 100, 1000, "hedge", "stale_bbo"),
+            (4800, 1000, 100, "maker_hedge_pair", "quote_skew_exceeded"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_ws_bbo_provider_maker_event_blocks_stale_or_skewed_hedge_bbo(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+        hedge_observed_at_ms,
+        ttl_ms,
+        max_skew_ms,
+        expected_role,
+        expected_reason,
+    ):
+        from lightfee.engine.passive_order_manager import (
+            PassiveOrderManager,
+            PassiveOrderManagerProfile,
+        )
+
+        config.runtime.mode = "live"
+        config.runtime.maker_event_lane_enabled = True
+        config.runtime.maker_event_lane_min_wake_interval_ms = 0
+        config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_quote_lease_ttl_ms = ttl_ms
+        config.strategy.entry_final_gate_max_skew_ms = max_skew_ms
+        config.strategy.passive_reprice_threshold_bps = 1.0
+        config.strategy.passive_cancel_replace_threshold_bps = 100.0
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
+                Venue.OKX: FakeVenueAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id=f"pe-ws-bbo-{expected_reason}",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            entry_type="passive_incremental",
+            maker_price=50000.0,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            maker_leg="long",
+            entry_maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        profile = PassiveOrderManagerProfile(
+            max_consecutive_failures=3,
+            failure_cooldown_ms=0,
+            reprice_threshold_bps=1.0,
+            cancel_replace_threshold_bps=100.0,
+        )
+        runtime._maker_event_state[pending.pending_id] = (
+            PassiveOrderManager(profile),
+            50000.0,
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50020.0,
+                ask=50030.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                observed_at_ms=hedge_observed_at_ms,
+                received_at_ms=hedge_observed_at_ms,
+                source="okx_bbo_ws",
+            )
+        )
+
+        class RejectNewEntryExecutor:
+            async def execute(self, ctx):
+                raise AssertionError("WS BBO maker-event must not start a new entry flow")
+
+        calls: list[tuple[float, float, str, str]] = []
+
+        async def fake_reprice(pending_arg, new_price, old_price, action, now_ms, entry_id):
+            calls.append((new_price, old_price, action, entry_id))
+            return SimpleNamespace(order_id="must-not-submit")
+
+        runtime.entry_executor = RejectNewEntryExecutor()
+        monkeypatch.setattr(runtime, "_reprice_passive_maker_l2", fake_reprice)
+
+        await runtime._maybe_tick_maker_event(5000)
+
+        assert calls == []
+        records = tmp_journal.read_all()
+        payload = [
+            record["payload"]
+            for record in records
+            if record["kind"] == "runtime.maker_event_no_ws_bbo_quote"
+        ][-1]
+        sample = payload["samples"][0]
+        assert sample["role"] == expected_role
+        assert sample["reason"] == expected_reason
+        assert "runtime.maker_event_lane_wake" not in [
+            record["kind"] for record in records
+        ]
+
+    @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_requires_selected_quote_lease(
         self,
         config,
@@ -3570,7 +4128,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3589,6 +4147,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=5000,
                     received_at_ms=5000,
                     source=f"{venue}_bbo_ws",
@@ -3609,7 +4169,7 @@ class TestPlannerDispatchIntegration:
             if record["kind"] == "runtime.entry_blocked_quote_lease"
         ][-1]
         assert payload["reason"] == "missing_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
 
     def test_ws_bbo_provider_stale_execution_lease_records_both_leg_ages(
         self,
@@ -3662,6 +4222,262 @@ class TestPlannerDispatchIntegration:
         assert evidence["long_age_ms"] == 2001
         assert evidence["short_age_ms"] == 501
 
+    def test_ws_bbo_execution_lease_carries_sizes_and_blocks_skew(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_final_gate_max_skew_ms = 100
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=1.25,
+                ask_size=2.5,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=3.5,
+                ask_size=4.75,
+                observed_at_ms=2650,
+                received_at_ms=2650,
+                source="okx_bbo_ws",
+            )
+        )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 2650)
+        assert readiness.allowed
+        lease = runtime.entry_readiness_provider.get_lease(
+            runtime._candidate_pair_id(candidate)
+        )
+        assert lease.long_bid_size == pytest.approx(1.25)
+        assert lease.long_ask_size == pytest.approx(2.5)
+        assert lease.short_bid_size == pytest.approx(3.5)
+        assert lease.short_ask_size == pytest.approx(4.75)
+
+        reason, _lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            2700,
+        )
+
+        assert reason == "quote_lease_skew_exceeded"
+        assert evidence["quote_observation_skew_ms"] == 150
+        assert evidence["quote_observation_max_skew_ms"] == 100
+        assert evidence["long_bid_size"] == pytest.approx(1.25)
+        assert evidence["long_ask_size"] == pytest.approx(2.5)
+        assert evidence["short_bid_size"] == pytest.approx(3.5)
+        assert evidence["short_ask_size"] == pytest.approx(4.75)
+
+    def test_ws_bbo_execution_lease_blocks_insufficient_side_capacity(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_final_gate_max_skew_ms = 250
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.entry_maker_leg = "long"
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=0.001,
+                ask_size=2.5,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=3.5,
+                ask_size=4.75,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="okx_bbo_ws",
+            )
+        )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 2500)
+        assert readiness.allowed
+
+        reason, _lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            2500,
+        )
+
+        assert reason == "quote_lease_insufficient_bbo_capacity"
+        assert evidence["blocker_family"] == "insufficient_capacity"
+        assert evidence["quote_lease_required_base_quantity"] > 0.0
+        assert evidence["quote_lease_capacity_failed_legs"] == [
+            {
+                "leg": "long",
+                "role": "maker",
+                "side": "bid",
+                "size_field": "long_bid_size",
+                "available_base_quantity": 0.001,
+                "required_base_quantity": evidence[
+                    "quote_lease_required_base_quantity"
+                ],
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_dispatch_defers_capacity_to_final_l2_orientation(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.max_liquidity_snapshot_age_ms = 1500
+        config.strategy.entry_final_gate_max_skew_ms = 250
+        config.strategy.min_expected_edge_bps = 0.0
+        config.strategy.min_worst_case_edge_bps = 0.0
+        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
+        config.strategy.max_single_venue_exposure_quote = 10_000.0
+        config.strategy.max_symbol_exposure_quote = 10_000.0
+        config.strategy.funding_max_venue_pair_exposure_quote = 10_000.0
+        config.strategy.funding_max_global_gross_exposure_quote = 20_000.0
+        config.strategy.funding_max_settlement_bucket_exposure_quote = 20_000.0
+        config.strategy.funding_max_correlation_group_exposure_quote = 20_000.0
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        binance.available_margin_quote = 1_000.0
+        okx.available_margin_quote = 1_000.0
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime._entry_wall_clock_now_ms = lambda: 5000
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+        monkeypatch.setattr(
+            runtime.funding_risk_runtime,
+            "estimate_candidate",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                expected_shortfall_bps=1.0,
+                sample_count=120,
+                return_count=119,
+                history_ms=300_000,
+                confidence=1.0,
+                evidence_complete=True,
+                reason="",
+                model_version="test",
+            ),
+        )
+        candidate = self._candidate()
+        candidate.entry_maker_leg = "long"
+        candidate.entry_target_quantity = 1.0
+        candidate.entry_max_executable_quantity = 1.0
+        candidate.entry_notional_quote = 101.5
+        candidate.economics_observed_at_ms = 5000
+
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                bid_size=0.001,
+                ask_size=1.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=102.0,
+                ask=103.0,
+                bid_size=0.001,
+                ask_size=1.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="okx_bbo_ws",
+            )
+        )
+        long_book = runtime.local_l2_runtime.ensure_book("binance", "BTCUSDT")
+        long_book.status = L2BookStatus.HOT
+        long_book.bids = [PriceLevel(price=100.0, quantity=0.001)]
+        long_book.asks = [PriceLevel(price=101.0, quantity=1.0)]
+        long_book.observed_at_ms = 5000
+        short_book = runtime.local_l2_runtime.ensure_book("okx", "BTCUSDT")
+        short_book.status = L2BookStatus.HOT
+        short_book.bids = [PriceLevel(price=102.0, quantity=0.001)]
+        short_book.asks = [PriceLevel(price=103.0, quantity=1.0)]
+        short_book.observed_at_ms = 5000
+        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
+        assert readiness.allowed
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5000,
+            price_hint=101.5,
+        )
+
+        records = tmp_journal.read_all()
+        assert dispatched is True, [
+            (
+                record["kind"],
+                record["payload"].get("reason"),
+                record["payload"].get("source"),
+            )
+            for record in records
+        ]
+        assert candidate.entry_maker_leg == "short"
+        assert okx.last_request is not None
+        assert okx.last_request.side == Side.SELL
+        assert okx.last_request.price == pytest.approx(103.0)
+        assert any(
+            record["kind"] == "runtime.entry_passive_maker_orientation_selected"
+            and record["payload"]["previous_entry_maker_leg"] == "long"
+            and record["payload"]["selected_entry_maker_leg"] == "short"
+            for record in records
+        )
+        assert not any(
+            record["kind"] == "runtime.entry_blocked_quote_lease"
+            and record["payload"].get("reason")
+            == "quote_lease_insufficient_bbo_capacity"
+            for record in records
+        )
+
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_dispatch_uses_selected_quote_lease_prices(
         self,
@@ -3672,7 +4488,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3693,6 +4509,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=1.0,
+                    ask_size=1.0,
                     observed_at_ms=5000,
                     received_at_ms=5000,
                     source=f"{venue}_bbo_ws",
@@ -3712,6 +4530,121 @@ class TestPlannerDispatchIntegration:
         assert binance.last_request.post_only is True
         assert binance.last_request.price == 50000.0
 
+    def test_pending_passive_repost_gate_blocks_stale_hedge_ws_bbo(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 100
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="pending-bbo-stale",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=5_000,
+            maker_leg="long",
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=5_000,
+                received_at_ms=5_000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=4_800,
+                received_at_ms=4_800,
+                source="okx_bbo_ws",
+            )
+        )
+
+        reason, evidence = runtime._pending_entry_passive_repost_quote_gate(
+            pending,
+            now_ms=5_000,
+        )
+
+        assert reason == "passive_repost_hedge_stale_bbo"
+        assert evidence["hedge_age_ms"] == 200
+        assert evidence["hedge_stale_after_ms"] == 100
+
+    def test_pending_passive_repost_gate_blocks_skewed_ws_bbo(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1_000
+        config.strategy.entry_final_gate_max_skew_ms = 100
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        pending = PendingEntry(
+            pending_id="pending-bbo-skew",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=0.01,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=5_000,
+            maker_leg="long",
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=5_000,
+                received_at_ms=5_000,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=1.0,
+                ask_size=1.0,
+                observed_at_ms=4_850,
+                received_at_ms=4_850,
+                source="okx_bbo_ws",
+            )
+        )
+
+        reason, evidence = runtime._pending_entry_passive_repost_quote_gate(
+            pending,
+            now_ms=5_000,
+        )
+
+        assert reason == "passive_repost_quote_skew_exceeded"
+        assert evidence["quote_observation_skew_ms"] == 150
+        assert evidence["quote_observation_max_skew_ms"] == 100
+
     @pytest.mark.asyncio
     async def test_ws_bbo_post_only_guard_reprices_crossing_maker_quote_once(
         self,
@@ -3721,7 +4654,7 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3742,6 +4675,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=5000,
                     received_at_ms=5000,
                     source=f"{venue}_bbo_ws",
@@ -3756,6 +4691,8 @@ class TestPlannerDispatchIntegration:
                 symbol="BTCUSDT",
                 bid=49980.0,
                 ask=49990.0,
+                bid_size=10.0,
+                ask_size=10.0,
                 observed_at_ms=5100,
                 received_at_ms=5100,
                 source="binance_bbo_ws",
@@ -3788,7 +4725,7 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
         config.runtime.max_market_age_ms = 30_000
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3809,6 +4746,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=5000,
                     received_at_ms=5000,
                     source=f"{venue}_bbo_ws",
@@ -3827,6 +4766,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=7001,
                     received_at_ms=7001,
                     source=f"{venue}_bbo_ws",
@@ -3860,7 +4801,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -3885,6 +4826,8 @@ class TestPlannerDispatchIntegration:
                     symbol="BTCUSDT",
                     bid=bid,
                     ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
                     observed_at_ms=5_000,
                     received_at_ms=5_000,
                     source=f"{venue}_bbo_ws",
@@ -3923,6 +4866,49 @@ class TestPlannerDispatchIntegration:
             "expired_final_quote_lease",
         }
         assert blocked[-1]["source"] == "executor_submit_quote_lease"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("legacy_provider", (None, "local_l2"))
+    async def test_post_only_guard_uses_effective_composed_bbo_for_defaulted_and_legacy_provider(
+        self,
+        config,
+        tmp_journal,
+        legacy_provider,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        if legacy_provider is not None:
+            config.strategy.entry_readiness_provider = legacy_provider
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                observed_at_ms=5000,
+                received_at_ms=5000,
+                source="binance_bbo_ws",
+            )
+        )
+
+        ok, reason, payload = runtime._post_only_maker_bbo_guard(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            price=50000.0,
+            now_ms=5000,
+        )
+
+        assert ok is True
+        assert reason == ""
+        assert payload["source"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["domain"] == "ws_bbo_cache"
 
     @pytest.mark.asyncio
     async def test_ws_bbo_post_only_guard_uses_quote_lease_age_budget(
@@ -3971,7 +4957,7 @@ class TestPlannerDispatchIntegration:
     ):
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
@@ -4031,7 +5017,9 @@ class TestPlannerDispatchIntegration:
         assert "runtime.entry_blocked_post_only_bbo" in kinds
 
     @pytest.mark.asyncio
-    async def test_crossing_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
+    async def test_crossing_bbo_reprices_post_only_maker_submit(self, config, tmp_journal):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
@@ -4042,21 +5030,36 @@ class TestPlannerDispatchIntegration:
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0) is False
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0) is True
 
-        assert binance.last_request is None
-        payload = [
-            record["payload"]
-            for record in tmp_journal.read_all()
+        assert binance.last_request is not None
+        assert binance.last_request.price == 50000.0
+        assert not [
+            record for record in tmp_journal.read_all()
             if record["kind"] == "runtime.entry_blocked_post_only_bbo"
-        ][-1]
-        assert payload["reason"] == "would_cross_bbo"
-        assert payload["would_cross"] is True
+        ]
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_uses_planner_route(self, config, tmp_journal):
         """Entry route comes from planner, not hardcoded STANDARD_DUAL_TAKER."""
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
         binance = FakeVenueAdapter(Venue.BINANCE)
         okx = FakeVenueAdapter(Venue.OKX)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -4085,6 +5088,21 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         # Dispatch with valid price hint
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
@@ -4190,6 +5208,19 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+
+        for venue in ("okx", "bybit"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="HOMEUSDT",
+                    bid=0.99,
+                    ask=1.01,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
 
@@ -4540,6 +5571,23 @@ class TestPlannerDispatchIntegration:
             ask=102.0,
             observed_at_ms=5_000,
         )
+        for venue, bid, ask in (
+            ("binance", 99.0, 100.0),
+            ("bybit", 101.0, 102.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=10.0,
+                    ask_size=10.0,
+                    observed_at_ms=5_000,
+                    received_at_ms=5_000,
+                    source="test_ws_bbo",
+                )
+            )
         candidate = self._binance_bybit_candidate()
         candidate.entry_target_quantity = 1.0
         candidate.entry_max_executable_quantity = 1.0
@@ -4633,7 +5681,7 @@ class TestPlannerDispatchIntegration:
         monkeypatch.setattr(
             dispatch,
             "_entry_quote_lease_execution_check",
-            lambda *_: ("", initial_lease, {}),
+            lambda *_, **__: ("", initial_lease, {}),
         )
         monkeypatch.setattr(dispatch, "_final_quote_lease_reason", lambda *_: "")
 
@@ -4774,6 +5822,19 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+
+        for venue in ("gate", "bybit"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="TINYUSDT",
+                    bid=0.99,
+                    ask=1.01,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
 
@@ -4935,6 +5996,19 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
+        for venue in ("gate", "bybit"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="TINYUSDT",
+                    bid=0.99,
+                    ask=1.01,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
 
         assert dispatched is True
@@ -4993,6 +6067,19 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+
+        for venue in ("okx", "bybit"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="HOMEUSDT",
+                    bid=0.99,
+                    ask=1.01,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
 
@@ -5264,7 +6351,21 @@ class TestPlannerDispatchIntegration:
             advisories=["thin_book"],
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 1780163908797, price_hint=50000.0)
+        now_ms = 1780163908797
+        for venue in ("aster", "bybit"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="MAGMAUSDT",
+                    bid=49990.0,
+                    ask=50010.0,
+                    observed_at_ms=now_ms,
+                    received_at_ms=now_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0)
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -5423,7 +6524,21 @@ class TestPlannerDispatchIntegration:
             first_funding_leg="long",
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 1780167385971, price_hint=0.2068)
+        now_ms = 1780167385971
+        for venue in ("binance", "aster"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="PRLUSDT",
+                    bid=0.2067,
+                    ask=0.2069,
+                    observed_at_ms=now_ms,
+                    received_at_ms=now_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=0.2068)
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -5930,6 +7045,19 @@ class TestPlannerDispatchIntegration:
             first_funding_timestamp_ms=605_000,
             funding_timestamp_ms=605_000,
         )
+
+        for venue in ("binance", "okx"):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=49990.0,
+                    ask=50010.0,
+                    observed_at_ms=5000,
+                    received_at_ms=5000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
 

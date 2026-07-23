@@ -11,9 +11,22 @@ from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from math import isfinite
+from typing import Any
 
 
 OPEN_INTEREST_EVENT_FUTURE_SKEW_MS = 5_000
+ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS = 30 * 60 * 1_000
+
+
+def bounded_open_interest_cache_fallback_max_age_ms(value: object = None) -> int:
+    """Return the configured cache-fallback age bounded by the hard 30m cap."""
+    try:
+        parsed = int(value) if value is not None else 0
+    except (TypeError, ValueError, OverflowError):
+        parsed = 0
+    if parsed <= 0:
+        return ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+    return min(parsed, ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS)
 
 
 class OpenInterestEvidenceStatus(str, Enum):
@@ -45,6 +58,49 @@ def normalize_open_interest_status(value: object) -> str:
     raw = _LEGACY_STATUS_ALIASES.get(raw, raw)
     valid = {status.value for status in OpenInterestEvidenceStatus}
     return raw if raw in valid else OpenInterestEvidenceStatus.UNAVAILABLE.value
+
+
+def _open_interest_evidence_field(source: Any, name: str, default: Any = None) -> Any:
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def open_interest_uses_cache_fallback(source: Any) -> bool:
+    reason = str(
+        _open_interest_evidence_field(
+            source,
+            "open_interest_evidence_reason",
+            _open_interest_evidence_field(source, "reason", ""),
+        )
+        or ""
+    ).lower()
+    return bool(
+        _open_interest_evidence_field(source, "open_interest_cache_fallback", False)
+    ) or "cache_fallback" in reason
+
+
+def open_interest_max_age_ms_for_evidence(
+    source: Any,
+    *,
+    default_max_age_ms: int,
+) -> int:
+    try:
+        default_age = max(int(default_max_age_ms), 1)
+    except (TypeError, ValueError, OverflowError):
+        default_age = 1
+    if not open_interest_uses_cache_fallback(source):
+        return default_age
+    # Cached fallback evidence is a bounded exception to the normal evidence
+    # budget.  A producer-provided marker or a wider caller budget must not
+    # extend its admissible freshness window.
+    return bounded_open_interest_cache_fallback_max_age_ms(
+        _open_interest_evidence_field(
+            source,
+            "open_interest_cache_fallback_max_age_ms",
+            ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+        )
+    )
 
 
 def open_interest_sample_id(

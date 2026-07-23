@@ -55,7 +55,6 @@ AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS = 60_000
 FUNDING_ENTRY_MAX_FUTURE_SKEW_MS = 1_000
 PRODUCTION_SERVICE_NAMES = (
-    "lightfee-sidecar.service",
     "lightfee-spread-bbo.service",
     "lightfee-spread-sidecar.service",
     "lightfee-live.service",
@@ -801,7 +800,7 @@ def main() -> None:
         "--require-active-services",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Require all four production systemd services and current BBO output.",
+        help="Require all three production systemd services and current BBO output.",
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -831,15 +830,17 @@ def main() -> None:
         reports.extend(_systemd_active_report(name) for name in PRODUCTION_SERVICE_NAMES)
 
     ownership_fingerprints: list[str] = []
-    sidecar_unit = unit_texts.get("lightfee-sidecar.service", "")
+    live_unit = unit_texts.get("lightfee-live.service", "")
     spread_bbo_unit = unit_texts.get("lightfee-spread-bbo.service", "")
     spread_sidecar_unit = unit_texts.get("lightfee-spread-sidecar.service", "")
-    if "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1" not in sidecar_unit:
-        ownership_fingerprints.append("embedded_spread_bbo_not_disabled")
     if "-m lightfee.apps.spread_bbo" not in spread_bbo_unit:
         ownership_fingerprints.append("dedicated_spread_bbo_entrypoint_missing")
     if "lightfee-spread-bbo.service" not in spread_sidecar_unit:
         ownership_fingerprints.append("spread_consumer_dependency_missing")
+    if "lightfee-sidecar.service" in live_unit:
+        ownership_fingerprints.append("live_funding_sidecar_dependency_present")
+    if "lightfee-sidecar.service" in spread_bbo_unit:
+        ownership_fingerprints.append("spread_bbo_funding_sidecar_dependency_present")
     reports.append(
         HealthReport(
             name="spread_bbo_ownership",
@@ -849,60 +850,6 @@ def main() -> None:
             details={"writer_model": "dedicated_process"},
         )
     )
-
-    entry_manifest_path = funding_entry_snapshot_manifest_path(args.snapshot)
-    if entry_manifest_path.exists():
-        reports.append(
-            _funding_entry_snapshot_report(
-                args.snapshot,
-                now_ms=now_ms,
-                max_age_ms=args.snapshot_max_age_ms,
-            )
-        )
-        if Path(args.snapshot).exists():
-            reports.append(
-                _sidecar_audit_observation(
-                    analyze_sidecar_snapshot(
-                        _read_json(args.snapshot),
-                        now_ms=now_ms,
-                        max_age_ms=args.snapshot_max_age_ms,
-                    )
-                )
-            )
-        else:
-            reports.append(
-                HealthReport(
-                    name="sidecar_audit_snapshot",
-                    ok=True,
-                    severity="info",
-                    fingerprints=[],
-                    details={
-                        "data_plane": "background_full_audit",
-                        "audit_ok": False,
-                        "audit_fingerprints": ["snapshot_file_missing"],
-                        "path": args.snapshot,
-                    },
-                )
-            )
-    elif Path(args.snapshot).exists():
-        # Backward-compatible diagnostics for pre-V6 and explicit fixture paths.
-        reports.append(
-            analyze_sidecar_snapshot(
-                _read_json(args.snapshot),
-                now_ms=now_ms,
-                max_age_ms=args.snapshot_max_age_ms,
-            )
-        )
-    else:
-        reports.append(
-            HealthReport(
-                name="sidecar_snapshot",
-                ok=False,
-                severity="critical",
-                fingerprints=["snapshot_file_missing"],
-                details={"path": args.snapshot},
-            )
-        )
 
     app_config = None
     config_path = args.config
@@ -931,6 +878,87 @@ def main() -> None:
                     require_entry_enabled=args.require_entry_enabled,
                 )
             )
+
+    entry_manifest_path = funding_entry_snapshot_manifest_path(args.snapshot)
+    entry_snapshot_path = Path(args.snapshot)
+    if (
+        app_config is not None
+        and app_config.runtime.opportunity_input_mode == "single_process_entry"
+    ):
+        # Funding-entry handoff is retired in this mode.  A previous deployment
+        # can leave its V6 snapshot or manifest behind; it must not make the
+        # live-service health gate fail after the runtime has stopped reading it.
+        reports.append(
+            HealthReport(
+                name="funding_entry_handoff",
+                ok=True,
+                severity="info",
+                fingerprints=[],
+                details={
+                    "mode": "single_process_entry",
+                    "status": "not_required",
+                    "path": args.snapshot,
+                    "retired_snapshot_present": entry_snapshot_path.exists(),
+                    "retired_manifest_present": entry_manifest_path.exists(),
+                },
+            )
+        )
+    elif entry_manifest_path.exists():
+        reports.append(
+            _funding_entry_snapshot_report(
+                args.snapshot,
+                now_ms=now_ms,
+                max_age_ms=args.snapshot_max_age_ms,
+            )
+        )
+        if entry_snapshot_path.exists():
+            reports.append(
+                _sidecar_audit_observation(
+                    analyze_sidecar_snapshot(
+                        _read_json(args.snapshot),
+                        now_ms=now_ms,
+                        max_age_ms=args.snapshot_max_age_ms,
+                    )
+                )
+            )
+        else:
+            reports.append(
+                HealthReport(
+                    name="sidecar_audit_snapshot",
+                    ok=True,
+                    severity="info",
+                    fingerprints=[],
+                    details={
+                        "data_plane": "background_full_audit",
+                        "audit_ok": False,
+                        "audit_fingerprints": ["snapshot_file_missing"],
+                        "path": args.snapshot,
+                    },
+                )
+            )
+    elif entry_snapshot_path.exists():
+        # Backward-compatible diagnostics for pre-V6 and explicit fixture paths.
+        reports.append(
+            analyze_sidecar_snapshot(
+                _read_json(args.snapshot),
+                now_ms=now_ms,
+                max_age_ms=args.snapshot_max_age_ms,
+            )
+        )
+    else:
+        reports.append(
+            HealthReport(
+                name="funding_entry_handoff",
+                ok=True,
+                severity="info",
+                fingerprints=[],
+                details={
+                    "mode": "single_process_entry",
+                    "status": "not_required",
+                    "path": args.snapshot,
+                },
+            )
+        )
 
     if require_active_services:
         spread_bbo_snapshot = args.spread_bbo_snapshot or str(

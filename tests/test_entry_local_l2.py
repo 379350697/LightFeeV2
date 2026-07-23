@@ -813,6 +813,58 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         kwargs.update(overrides)
         return CandidateInput(**kwargs)
 
+    @staticmethod
+    def _with_observed_oi(
+        candidate,
+        *,
+        now_ms: int = 10_000,
+        status: str = "observed",
+        value_quote: float = 2_000_000.0,
+    ):
+        def venue_name(value) -> str:
+            return value.value if hasattr(value, "value") else str(value or "")
+
+        symbol = str(candidate.symbol).upper()
+        revision_id = str(
+            getattr(candidate, "candidate_revision_id", "")
+            or f"test-revision:{symbol}:{candidate.long_venue}:{candidate.short_venue}:{now_ms}"
+        )
+        candidate.candidate_revision_id = revision_id
+
+        def leg(venue: str) -> dict:
+            source = "test_fixture"
+            return {
+                "venue": venue,
+                "canonical_symbol": symbol,
+                "venue_symbol": symbol,
+                "status": status,
+                "observed_at_ms": now_ms,
+                "event_at_ms": 0,
+                "received_at_ms": now_ms,
+                "sample_id": open_interest_sample_id(
+                    venue=venue,
+                    canonical_symbol=symbol,
+                    venue_symbol=symbol,
+                    observed_at_ms=now_ms,
+                    source=source,
+                    raw_value=value_quote,
+                    value_quote=value_quote,
+                ),
+                "value_quote": value_quote,
+                "raw_value": value_quote,
+                "raw_unit": "quote",
+                "source": source,
+                "contract_multiplier": 1.0,
+                "conversion_mark_price": None,
+            }
+
+        candidate.entry_open_interest_evidence = {
+            "candidate_revision_id": revision_id,
+            "long": leg(venue_name(candidate.long_venue)),
+            "short": leg(venue_name(candidate.short_venue)),
+        }
+        return candidate
+
     # ------------------------------------------------------------------
     # REDLIGHT 1: real CandidateInput with all conditions met → currently blocked
     # ------------------------------------------------------------------
@@ -858,6 +910,20 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
 
         reason = rt._entry_local_l2_selection_blocker(c, now_ms=10000)
         assert reason == "entry_local_l2_waiting_for_prewarm_window"
+
+    def test_zero_prewarm_window_disables_only_the_time_window_gate(self, runtime_with_l2):
+        rt = runtime_with_l2
+        rt.config.strategy.entry_window_secs = 1200
+        rt.config.strategy.entry_local_l2_prewarm_window_secs = 0
+        c = self._make_real_candidate(first_funding_timestamp_ms=1_000_000)
+        pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
+        rt._tracked_primary_pair_ids.add(pair_id)
+        session = rt.entry_l2_sessions.get_or_create_session(pair_id)
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=9000)
+        session.refresh_state(now_ms=10000, stale_after_ms=300_000)
+
+        assert rt._entry_local_l2_selection_blocker(c, now_ms=10000) is None
 
     def test_first_funding_ts_in_past_blocked(self, runtime_with_l2):
         """Candidate with first_funding_timestamp_ms in the past is blocked."""
@@ -1073,6 +1139,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         from collections import Counter
 
         rt = runtime_with_l2
+        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
+
         c = self._make_real_candidate(
             pair_id="btcusdt:binance->bybit",
             first_funding_timestamp_ms=400_000,
@@ -1083,6 +1151,12 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "_entry_local_l2_selection_blocker",
             lambda _candidate, _now_ms: "entry_local_l2_waiting_for_dual_ready",
         )
+        monkeypatch.setattr(
+            rt,
+            "_entry_ws_bbo_subscription_blocker",
+            lambda _candidate: (None, {}),
+        )
+        rt.entry_readiness_provider = LocalL2EntryReadinessProvider(rt)
 
         rt.journal.open()
         try:
@@ -1211,10 +1285,20 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
     ):
         """V1 sorts final candidates before keeping only one per symbol."""
         from collections import Counter
+        from types import SimpleNamespace
+
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
 
         rt = runtime_with_l2
         rt.config.strategy.local_l2_enabled = False
         rt.config.strategy.max_concurrent_positions = 3
+        rt._entry_ws_bbo_subscription_blocker = lambda _candidate: (None, {})
+        rt.entry_readiness_provider = SimpleNamespace(
+            decide=lambda candidate, _now_ms, **_kwargs: EntryReadinessDecision.allow(
+                symbol=candidate.symbol,
+                pair_id=candidate.pair_id,
+            )
+        )
         candidates = [
             self._make_real_candidate(
                 pair_id="btcusdt:bybit->okx", symbol="BTCUSDT",
@@ -1257,11 +1341,20 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
     ):
         """V1 risk-adjusts ranking edge with leg depth risk before symbol dedupe."""
         from collections import Counter
+        from types import SimpleNamespace
 
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
         from lightfee.sidecar.snapshot import QuoteSnapshot
 
         rt = runtime_with_l2
         rt.config.strategy.local_l2_enabled = False
+        rt._entry_ws_bbo_subscription_blocker = lambda _candidate: (None, {})
+        rt.entry_readiness_provider = SimpleNamespace(
+            decide=lambda candidate, _now_ms, **_kwargs: EntryReadinessDecision.allow(
+                symbol=candidate.symbol,
+                pair_id=candidate.pair_id,
+            )
+        )
         candidates = [
             self._make_real_candidate(
                 pair_id="btcusdt:binance->bybit", symbol="BTCUSDT",
@@ -1313,9 +1406,19 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
     ):
         """V1 does not select a candidate whose pair has pending residual repair."""
         from collections import Counter
+        from types import SimpleNamespace
+
+        from lightfee.engine.entry_readiness import EntryReadinessDecision
 
         rt = runtime_with_l2
         rt.config.strategy.local_l2_enabled = False
+        rt._entry_ws_bbo_subscription_blocker = lambda _candidate: (None, {})
+        rt.entry_readiness_provider = SimpleNamespace(
+            decide=lambda candidate, _now_ms, **_kwargs: EntryReadinessDecision.allow(
+                symbol=candidate.symbol,
+                pair_id=candidate.pair_id,
+            )
+        )
         rt.state.pending_residual_repairs = [
             {"pair_id": "btcusdt:binance->okx"},
         ]
@@ -1826,6 +1929,19 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             ),
         )
         rt = LiveRuntime(config)
+        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
+
+        rt.entry_readiness_provider = LocalL2EntryReadinessProvider(rt)
+        monkeypatch.setattr(
+            rt,
+            "_entry_effective_readiness_provider_uses_local_l2",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            rt,
+            "_entry_effective_readiness_provider_uses_ws_bbo",
+            lambda: False,
+        )
         async def preserve_catalog(candidates, **_kwargs):
             return list(candidates)
         monkeypatch.setattr(
@@ -1833,10 +1949,16 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "_filter_candidates_supported_by_venue_catalog",
             preserve_catalog,
         )
+
+        def preserve_reprice(candidates, **_kwargs):
+            for candidate in candidates:
+                self._with_observed_oi(candidate, now_ms=now_ms)
+            return list(candidates)
+
         monkeypatch.setattr(
             rt,
             "_reprice_entry_candidates_for_selection",
-            lambda candidates, **_kwargs: list(candidates),
+            preserve_reprice,
         )
         monkeypatch.setattr(
             rt,
@@ -2045,10 +2167,16 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "_filter_candidates_supported_by_venue_catalog",
             preserve_catalog,
         )
+
+        def preserve_reprice(candidates, **_kwargs):
+            for candidate in candidates:
+                self._with_observed_oi(candidate, now_ms=now_ms)
+            return list(candidates)
+
         monkeypatch.setattr(
             rt,
             "_reprice_entry_candidates_for_selection",
-            lambda candidates, **_kwargs: list(candidates),
+            preserve_reprice,
         )
         monkeypatch.setattr(
             rt,
@@ -2172,6 +2300,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                     f"S{index}USDT",
                     bid=50_000.0,
                     ask=50_001.0,
+                    open_interest=2_000_000.0,
                     observed_at_ms=now_ms,
                     funding_rate_bps=(10.0 if venue == "binance" else -10.0),
                     funding_timestamp_ms=370_000,
@@ -2227,10 +2356,28 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         async def no_sync(now_ms, scan_promoted=False):
             return None
 
+        async def no_bbo_activation(candidates, now_ms):
+            return None
+
         monkeypatch.setattr(rt, "_ensure_l2_active_for_candidates", record_l2_activation)
+        monkeypatch.setattr(
+            rt,
+            "_ensure_entry_bbo_active_for_candidates",
+            no_bbo_activation,
+        )
         monkeypatch.setattr(rt, "_sync_local_l2_data", no_sync)
 
-        await rt.tick()
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        runtime_candidates = []
+        for candidate_fields in candidates:
+            candidate = CandidateInput(**candidate_fields)
+            self._with_observed_oi(candidate, now_ms=now_ms)
+            runtime_candidates.append(candidate)
+
+        rt._schedule_entry_data_plane_preparation(runtime_candidates)
+        if rt._entry_data_plane_preparation_task is not None:
+            await rt._entry_data_plane_preparation_task
         rt.journal.close()
 
         assert activated_symbols == ["S0USDT", "S1USDT", "S2USDT"]
@@ -2252,7 +2399,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             Venue.BINANCE: Adapter(),
             Venue.BYBIT: Adapter(),
         }
-        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        candidate = self._with_observed_oi(
+            self._make_real_candidate(first_funding_timestamp_ms=20000)
+        )
         calls = []
 
         def start_ws_streams(venue, symbols, adapter=None):
@@ -2293,6 +2442,322 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         )
 
     @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_uses_three_oi_valid_finalists_plus_pending(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        from lightfee.core.domain import Venue
+        from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("background bootstrap is stubbed in this test")
+
+        rt = runtime_with_l2
+        rt.config.strategy.local_l2_hot_exec_per_venue_budget = 8
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+        rt.state.pending_entries["pending-entry"] = SimpleNamespace(
+            symbol="PENDUSDT",
+            long_venue="binance",
+            short_venue="bybit",
+        )
+
+        async def preserve_catalog(venue, adapter, symbols, *, skip_event_kind):
+            return list(symbols)
+
+        bootstrap_calls: list[tuple[str, tuple[str, ...]]] = []
+
+        def start_background_bootstrap(**kwargs):
+            bootstrap_calls.append((kwargs["venue"], tuple(kwargs["symbols"])))
+
+        monkeypatch.setattr(rt, "_filter_symbols_supported_by_venue", preserve_catalog)
+        monkeypatch.setattr(
+            rt.l2_data_plane,
+            "start_background_bootstrap",
+            start_background_bootstrap,
+        )
+
+        def candidate(symbol: str, status: str):
+            item = self._make_real_candidate(
+                symbol=symbol,
+                first_funding_timestamp_ms=20_000,
+            )
+            return self._with_observed_oi(item, now_ms=10_000, status=status)
+
+        candidates = [
+            candidate("S0USDT", "observed"),
+            candidate("S1USDT", "observed"),
+            candidate("BADUSDT", "deferred"),
+            candidate("S2USDT", "observed"),
+            candidate("EXTRAUSDT", "observed"),
+        ]
+
+        try:
+            await rt._ensure_l2_active_for_candidates(candidates, now_ms=10_000)
+        finally:
+            rt.journal.close()
+
+        bootstrapped = {
+            (venue, symbol)
+            for venue, symbols in bootstrap_calls
+            for symbol in symbols
+        }
+        assert bootstrapped == {
+            ("binance", "PENDUSDT"),
+            ("binance", "S0USDT"),
+            ("binance", "S1USDT"),
+            ("binance", "S2USDT"),
+            ("bybit", "PENDUSDT"),
+            ("bybit", "S0USDT"),
+            ("bybit", "S1USDT"),
+            ("bybit", "S2USDT"),
+        }
+        assert LocalL2BookKey("binance", "BADUSDT") not in rt.local_l2_runtime.books
+        assert LocalL2BookKey("bybit", "BADUSDT") not in rt.local_l2_runtime.books
+        assert LocalL2BookKey("binance", "EXTRAUSDT") not in rt.local_l2_runtime.books
+        assert LocalL2BookKey("bybit", "EXTRAUSDT") not in rt.local_l2_runtime.books
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "evidence",
+        [
+            None,
+            [],
+            {},
+            {"long": {"status": "observed"}},
+            {"long": {"status": "observed"}, "short": {"status": "observed"}},
+            {"long": {"status": "observed"}, "short": {"status": "deferred"}},
+        ],
+    )
+    async def test_dynamic_l2_activation_fail_closes_without_proven_oi_evidence(
+        self, runtime_with_l2, monkeypatch, evidence,
+    ):
+        from lightfee.core.domain import Venue
+        from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("non-OI-qualified candidate must not bootstrap L2")
+
+        rt = runtime_with_l2
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+        bootstrap_calls = []
+        monkeypatch.setattr(
+            rt.l2_data_plane,
+            "start_background_bootstrap",
+            lambda **kwargs: bootstrap_calls.append(kwargs),
+        )
+        candidate = self._make_real_candidate(
+            symbol="NOOIUSDT",
+            first_funding_timestamp_ms=20_000,
+        )
+        if evidence is not None:
+            candidate.entry_open_interest_evidence = evidence
+
+        try:
+            await rt._ensure_l2_active_for_candidates([candidate], now_ms=10_000)
+        finally:
+            rt.journal.close()
+
+        assert bootstrap_calls == []
+        assert LocalL2BookKey("binance", "NOOIUSDT") not in rt.local_l2_runtime.books
+        assert LocalL2BookKey("bybit", "NOOIUSDT") not in rt.local_l2_runtime.books
+
+    @pytest.mark.asyncio
+    async def test_entry_data_plane_schedule_waits_for_oi_valid_l2_finalists(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        from types import SimpleNamespace
+
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        rt = runtime_with_l2
+        rt.config.strategy.max_concurrent_positions = 3
+        rt.config.strategy.entry_local_l2_primary_count = 3
+        rt.config.strategy.shadow_entry_opportunity_count = 0
+        rt.state.pending_entries["pending-entry"] = SimpleNamespace(
+            symbol="PENDUSDT",
+            long_venue="binance",
+            short_venue="bybit",
+        )
+        calls: list[tuple[list[str], list[str]]] = []
+        bbo_calls: list[list[str]] = []
+
+        async def record_l2_activation(candidates, now_ms, *, tracked_opportunities=None):
+            calls.append((
+                [candidate.symbol for candidate in candidates],
+                [
+                    opportunity.pair_id
+                    for opportunity in list(tracked_opportunities or [])
+                ],
+            ))
+
+        async def no_sync(now_ms, scan_promoted=False):
+            return None
+
+        async def record_bbo_activation(candidates, now_ms):
+            bbo_calls.append([candidate.symbol for candidate in candidates])
+
+        monkeypatch.setattr(rt, "_ensure_l2_active_for_candidates", record_l2_activation)
+        monkeypatch.setattr(
+            rt,
+            "_ensure_entry_bbo_active_for_candidates",
+            record_bbo_activation,
+        )
+        monkeypatch.setattr(rt, "_sync_local_l2_data", no_sync)
+        monkeypatch.setattr(rt, "_refresh_entry_l2_session_readiness", lambda _now: None)
+        monkeypatch.setattr(
+            rt,
+            "_apply_shadow_promotion_if_eligible",
+            lambda _tracked, _now: None,
+        )
+
+        def candidate(symbol: str, status: str | None):
+            item = self._make_real_candidate(
+                symbol=symbol,
+                first_funding_timestamp_ms=20_000,
+            )
+            if status is None:
+                return item
+            return self._with_observed_oi(item, now_ms=now_ms, status=status)
+
+        candidates = [
+            candidate("S0USDT", "observed"),
+            candidate("MISSUSDT", None),
+            candidate("DEFUSDT", "deferred"),
+            candidate("S1USDT", "observed"),
+            candidate("S2USDT", "observed"),
+            candidate("EXTRAUSDT", "observed"),
+        ]
+
+        rt._schedule_entry_data_plane_preparation(candidates)
+        task = rt._entry_data_plane_preparation_task
+        assert task is not None
+        await task
+
+        assert calls == [(
+            ["S0USDT", "S1USDT", "S2USDT"],
+            [
+                "s0usdt:binance->bybit",
+                "s1usdt:binance->bybit",
+                "s2usdt:binance->bybit",
+            ],
+        )]
+        assert rt._tracked_primary_pair_ids == {
+            "s0usdt:binance->bybit",
+            "s1usdt:binance->bybit",
+            "s2usdt:binance->bybit",
+        }
+        assert bbo_calls == [[
+            "S0USDT",
+            "MISSUSDT",
+            "DEFUSDT",
+            "S1USDT",
+            "S2USDT",
+            "EXTRAUSDT",
+        ]]
+
+        calls.clear()
+        rt._schedule_entry_data_plane_preparation([])
+        task = rt._entry_data_plane_preparation_task
+        assert task is not None
+        await task
+
+        assert calls == [([], [])]
+        assert rt._tracked_primary_pair_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_entry_data_plane_schedule_skips_status_only_rows_before_l2_limit(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        rt = runtime_with_l2
+        rt.config.strategy.max_concurrent_positions = 3
+        rt.config.strategy.entry_local_l2_primary_count = 3
+        rt.config.strategy.shadow_entry_opportunity_count = 0
+        calls: list[tuple[list[str], list[str]]] = []
+
+        async def record_l2_activation(candidates, now_ms, *, tracked_opportunities=None):
+            calls.append((
+                [candidate.symbol for candidate in candidates],
+                [
+                    opportunity.pair_id
+                    for opportunity in list(tracked_opportunities or [])
+                ],
+            ))
+
+        async def no_sync(now_ms, scan_promoted=False):
+            return None
+
+        async def no_bbo_activation(candidates, now_ms):
+            return None
+
+        monkeypatch.setattr(rt, "_ensure_l2_active_for_candidates", record_l2_activation)
+        monkeypatch.setattr(
+            rt,
+            "_ensure_entry_bbo_active_for_candidates",
+            no_bbo_activation,
+        )
+        monkeypatch.setattr(rt, "_sync_local_l2_data", no_sync)
+        monkeypatch.setattr(rt, "_refresh_entry_l2_session_readiness", lambda _now: None)
+        monkeypatch.setattr(
+            rt,
+            "_apply_shadow_promotion_if_eligible",
+            lambda _tracked, _now: None,
+        )
+
+        def status_only_candidate(symbol: str):
+            item = self._make_real_candidate(
+                symbol=symbol,
+                first_funding_timestamp_ms=20_000,
+            )
+            item.candidate_revision_id = f"status-only:{symbol}:{now_ms}"
+            item.entry_open_interest_evidence = {
+                "candidate_revision_id": item.candidate_revision_id,
+                "long": {"status": "observed"},
+                "short": {"status": "observed"},
+            }
+            return item
+
+        valid = self._with_observed_oi(
+            self._make_real_candidate(
+                symbol="VALIDUSDT",
+                first_funding_timestamp_ms=20_000,
+            ),
+            now_ms=now_ms,
+        )
+        candidates = [
+            status_only_candidate("BAD0USDT"),
+            status_only_candidate("BAD1USDT"),
+            status_only_candidate("BAD2USDT"),
+            valid,
+        ]
+
+        rt._schedule_entry_data_plane_preparation(candidates)
+        task = rt._entry_data_plane_preparation_task
+        assert task is not None
+        await task
+
+        assert calls == [(["VALIDUSDT"], ["validusdt:binance->bybit"])]
+        assert rt._tracked_primary_pair_ids == {"validusdt:binance->bybit"}
+
+    @pytest.mark.asyncio
     async def test_dynamic_l2_activation_registers_ws_for_hot_ws_authoritative_books(
         self, runtime_with_l2, monkeypatch,
     ):
@@ -2311,7 +2776,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             Venue.BYBIT: Adapter(),
         }
 
-        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        candidate = self._with_observed_oi(
+            self._make_real_candidate(first_funding_timestamp_ms=20000)
+        )
         for venue in ("binance", "bybit"):
             book = rt.local_l2_runtime.ensure_book(venue, candidate.symbol)
             book.transition_to_bootstrapping(now_ms=9000)
@@ -2373,7 +2840,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             Venue.BYBIT: Adapter(),
         }
 
-        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        candidate = self._with_observed_oi(
+            self._make_real_candidate(first_funding_timestamp_ms=20000)
+        )
         binance_book = rt.local_l2_runtime.ensure_book("binance", candidate.symbol)
         binance_book.transition_to_bootstrapping(now_ms=9000)
         binance_book.apply_snapshot(
@@ -2437,7 +2906,9 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             lambda **kwargs: None,
         )
 
-        candidate = self._make_real_candidate(first_funding_timestamp_ms=20000)
+        candidate = self._with_observed_oi(
+            self._make_real_candidate(first_funding_timestamp_ms=20000)
+        )
         tracked = [
             TrackedOpportunity(
                 pair_id="shadow",
@@ -2689,11 +3160,15 @@ class TestPrimaryTrackingAdmission:
     def test_select_entry_candidates_separates_admission_from_readiness(self, tmp_path):
         """Select candidates counts primary_tracking separately from readiness."""
         from collections import Counter
+        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
         from lightfee.engine.runtime import LiveRuntime
 
         journal = tmp_path / "events.jsonl"
         config = self._make_config(mode="live", journal_path=str(journal))
         rt = LiveRuntime(config)
+        rt.entry_readiness_provider = LocalL2EntryReadinessProvider(rt)
+        rt._entry_effective_readiness_provider_uses_local_l2 = lambda: True
+        rt._entry_effective_readiness_provider_uses_ws_bbo = lambda: False
         rt.journal.open()
         rt._tracked_primary_pair_ids = {"polyxusdt:bybit->hyperliquid"}
 
@@ -2766,6 +3241,7 @@ class TestEntryReadinessProviderBoundary:
         rt.journal.open()
         provider = AllowProvider()
         rt.entry_readiness_provider = provider
+        rt._entry_ws_bbo_subscription_blocker = lambda _candidate: (None, {})
 
         now_ms = 1778985600000
         candidate = TestPrimaryTrackingAdmission._make_candidate(
@@ -2891,6 +3367,7 @@ class TestEntryReadinessProviderBoundary:
         rt = LiveRuntime(config)
         rt.journal.open()
         rt.entry_readiness_provider = EmptyReasonDenyProvider()
+        rt._entry_ws_bbo_subscription_blocker = lambda _candidate: (None, {})
 
         now_ms = 1778985600000
         candidate = TestPrimaryTrackingAdmission._make_candidate(
@@ -2922,8 +3399,8 @@ class TestEntryReadinessProviderBoundary:
 class TestEntryReadinessProviderFactory:
     """Runtime config selects the readiness provider without changing entry flow."""
 
-    def test_default_provider_is_local_l2(self, tmp_path):
-        from lightfee.engine.entry_readiness import LocalL2EntryReadinessProvider
+    def test_default_provider_is_composed_ws_bbo_transport(self, tmp_path):
+        from lightfee.engine.entry_readiness import WsBboQuoteLeaseEntryReadinessProvider
         from lightfee.engine.runtime import LiveRuntime
 
         config = TestPrimaryTrackingAdmission._make_config(
@@ -2932,13 +3409,15 @@ class TestEntryReadinessProviderFactory:
         )
         rt = LiveRuntime(config)
 
-        assert config.strategy.entry_readiness_provider == "local_l2"
-        assert isinstance(rt.entry_readiness_provider, LocalL2EntryReadinessProvider)
+        assert config.strategy.entry_readiness_provider == "ws_bbo_l2_on_demand"
+        assert rt._entry_effective_readiness_provider_name() == "ws_bbo_l2_on_demand"
+        assert isinstance(rt.entry_readiness_provider, WsBboQuoteLeaseEntryReadinessProvider)
 
     def test_rest_top_book_provider_selects_candidate_from_fresh_quotes(self, tmp_path):
         from collections import Counter
-        from lightfee.engine.entry_readiness import RestTopBookEntryReadinessProvider
+        from lightfee.engine.entry_readiness import WsBboQuoteLeaseEntryReadinessProvider
         from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
         from lightfee.sidecar.snapshot import QuoteSnapshot
 
         now_ms = 1778985600000
@@ -2972,6 +3451,18 @@ class TestEntryReadinessProviderFactory:
                 observed_at_ms=now_ms - 100,
             ),
         }
+        for venue, bid, ask in (("bybit", 99.0, 100.0), ("hyperliquid", 101.0, 102.0)):
+            rt.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BANANAUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=now_ms - 100,
+                    received_at_ms=now_ms - 100,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         selected = rt._select_entry_candidates(
             [candidate],
@@ -2982,7 +3473,8 @@ class TestEntryReadinessProviderFactory:
             market_quotes=quotes,
         )
 
-        assert isinstance(rt.entry_readiness_provider, RestTopBookEntryReadinessProvider)
+        assert rt._entry_effective_readiness_provider_name() == "ws_bbo_l2_on_demand"
+        assert isinstance(rt.entry_readiness_provider, WsBboQuoteLeaseEntryReadinessProvider)
         assert selected == [candidate]
 
     def test_rest_top_book_provider_blocks_missing_quote(self, tmp_path):
@@ -3030,15 +3522,16 @@ class TestEntryReadinessProviderFactory:
             rt.journal.close()
 
         assert selected == []
-        assert selection == Counter({"entry_rest_top_book_missing_quote": 1})
+        assert selection == Counter({"entry_ws_bbo_quote_lease_waiting_for_subscription": 1})
         assert blockers == {
-            "bananausdt:bybit->hyperliquid": "entry_rest_top_book_missing_quote",
+            "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_waiting_for_subscription",
         }
 
     def test_quote_lease_provider_records_selected_quote_lease(self, tmp_path):
         from collections import Counter
-        from lightfee.engine.entry_readiness import QuoteLeaseEntryReadinessProvider
+        from lightfee.engine.entry_readiness import WsBboQuoteLeaseEntryReadinessProvider
         from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
         from lightfee.sidecar.snapshot import QuoteSnapshot
 
         now_ms = 1778985600000
@@ -3072,6 +3565,18 @@ class TestEntryReadinessProviderFactory:
                 observed_at_ms=now_ms - 100,
             ),
         }
+        for venue, bid, ask in (("bybit", 99.0, 100.0), ("hyperliquid", 101.0, 102.0)):
+            rt.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BANANAUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=now_ms - 100,
+                    received_at_ms=now_ms - 100,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         selected = rt._select_entry_candidates(
             [candidate],
@@ -3082,20 +3587,21 @@ class TestEntryReadinessProviderFactory:
             market_quotes=quotes,
         )
 
-        assert isinstance(rt.entry_readiness_provider, QuoteLeaseEntryReadinessProvider)
+        assert isinstance(rt.entry_readiness_provider, WsBboQuoteLeaseEntryReadinessProvider)
         assert selected == [candidate]
         lease = rt.entry_readiness_provider.get_lease("bananausdt:bybit->hyperliquid")
         assert lease is not None
-        assert lease.provider == "quote_lease"
+        assert lease.provider == "ws_bbo_quote_lease"
         assert lease.expires_at_ms == now_ms + 1500
         assert lease.long_ask == 100.0
         assert lease.short_bid == 101.0
 
     def test_ws_top_book_provider_uses_fresh_ws_bbo_without_entry_l2_session(self, tmp_path):
         from collections import Counter
-        from lightfee.engine.entry_readiness import WsTopBookEntryReadinessProvider
+        from lightfee.engine.entry_readiness import WsBboQuoteLeaseEntryReadinessProvider
         from lightfee.engine.runtime import LiveRuntime
         from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+        from lightfee.marketdata.ws_bbo import TopBookQuote
 
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
@@ -3128,6 +3634,17 @@ class TestEntryReadinessProviderFactory:
                 now_ms=now_ms - 100,
                 observed_at_ms=now_ms - 100,
             )
+            rt.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BANANAUSDT",
+                    bid=bid,
+                    ask=ask,
+                    observed_at_ms=now_ms - 100,
+                    received_at_ms=now_ms - 100,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
 
         try:
             selected = rt._select_entry_candidates(
@@ -3140,11 +3657,11 @@ class TestEntryReadinessProviderFactory:
         finally:
             rt.journal.close()
 
-        assert isinstance(rt.entry_readiness_provider, WsTopBookEntryReadinessProvider)
+        assert isinstance(rt.entry_readiness_provider, WsBboQuoteLeaseEntryReadinessProvider)
         assert selected == [candidate]
         lease = rt.entry_readiness_provider.get_lease("bananausdt:bybit->hyperliquid")
         assert lease is not None
-        assert lease.provider == "ws_top_book"
+        assert lease.provider == "ws_bbo_quote_lease"
         assert lease.expires_at_ms == now_ms + 1200
         assert lease.long_ask == 100.0
         assert lease.short_bid == 101.0
@@ -3193,9 +3710,9 @@ class TestEntryReadinessProviderFactory:
             rt.journal.close()
 
         assert selected == []
-        assert selection == Counter({"entry_ws_top_book_missing_ws_evidence": 1})
+        assert selection == Counter({"entry_ws_bbo_quote_lease_waiting_for_subscription": 1})
         assert blockers == {
-            "bananausdt:bybit->hyperliquid": "entry_ws_top_book_missing_ws_evidence",
+            "bananausdt:bybit->hyperliquid": "entry_ws_bbo_quote_lease_waiting_for_subscription",
         }
 
     def test_ws_bbo_quote_lease_provider_uses_independent_cache_without_local_l2_book(
@@ -3324,6 +3841,9 @@ class TestEntryReadinessProviderFactory:
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
         assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["entry_readiness_provider_raw"] == "ws_bbo_quote_lease"
+        assert payload["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
+        assert payload["entry_readiness_provider_migrated"] is True
         assert payload["domain"] == "ws_bbo_cache"
         assert evidence["blocker_family"] == "stale_quote"
         assert evidence["quote_age_ms"]["long"] == 100
@@ -3417,7 +3937,10 @@ class TestEntryReadinessProviderFactory:
         assert admission_events
         payload = admission_events[-1]["payload"]
         assert payload["reason"] == "insufficient_margin_admission_blocked"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["entry_readiness_provider_raw"] == "ws_bbo_quote_lease"
+        assert payload["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
+        assert payload["entry_readiness_provider_migrated"] is True
         assert payload["source"] == "entry_admission"
         assert payload["domain"] == "entry_admission"
         assert payload["blocker_family"] == "exchange_admission"

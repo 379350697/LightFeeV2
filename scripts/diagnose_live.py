@@ -91,7 +91,6 @@ DEFAULT_UNIT_DIR = "/etc/systemd/system"
 DEFAULT_MAX_EVENTS = 50_000
 SERVICE_NAMES = [
     "lightfee-live.service",
-    "lightfee-sidecar.service",
     "lightfee-spread-bbo.service",
     "lightfee-spread-sidecar.service",
 ]
@@ -3952,10 +3951,17 @@ def _is_ws_bbo_entry_selection_event(kind: str, payload: dict[str, Any]) -> bool
     if not isinstance(readiness, dict):
         readiness = {}
     provider = str(payload.get("provider") or readiness.get("provider") or "")
+    effective_provider = str(
+        payload.get("entry_readiness_provider_effective")
+        or readiness.get("entry_readiness_provider_effective")
+        or ""
+    )
     reason = str(payload.get("reason") or "")
     return (
         kind == "runtime.entry_blocked_ws_bbo_selection"
         or provider == "ws_bbo_quote_lease"
+        or provider == "ws_bbo_l2_on_demand"
+        or effective_provider == "ws_bbo_l2_on_demand"
         or reason.startswith("entry_ws_bbo_quote_lease_")
     )
 
@@ -8094,7 +8100,7 @@ def _build_production_acceptance_gate(
     exception_conclusions: dict[str, str] = {}
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
-    ws_bbo_effective_mode = (
+    legacy_ws_bbo_without_l2_mode = (
         str(
             runtime_market_data_config.get("entry_readiness_provider_effective", "")
             or ""
@@ -8271,7 +8277,7 @@ def _build_production_acceptance_gate(
                 exception_conclusions["local_l2_official_rebuild"] = "official_doc"
             else:
                 exception_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
-        if ws_bbo_effective_mode and (
+        if legacy_ws_bbo_without_l2_mode and (
             kind.startswith("runtime.local_l2_")
             or kind
             in {

@@ -571,6 +571,44 @@ def test_ws_bbo_scope_flags_full_universe_hot_path_regression():
     )
 
 
+def test_composed_entry_frontier_keeps_v1_quote_scope_guardrail_without_regression():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "runtime_market_data_config": {
+                "entry_readiness_provider_raw": "local_l2",
+                "entry_readiness_provider_effective": "ws_bbo_l2_on_demand",
+                "entry_readiness_provider_defaulted": False,
+                "entry_readiness_provider_migrated": True,
+                "local_l2_effective_enabled": True,
+            },
+            "last_scan": {
+                "quote_revalidate_candidate_scope": "top_k_entry_frontier",
+                "quote_revalidate_candidate_count": 50,
+                "quote_revalidate_all_target_count": 50,
+                "quote_revalidate_skipped_untracked_count": 0,
+            },
+        },
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    )
+
+    rows = [
+        row for row in table.to_dict()["rows"]
+        if row["phase"] == "ENTRY_QUOTE_LEASE"
+    ]
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["terminality"] == "composed_frontier_scope"
+    assert row["entry_policy"] == "allow_frontier_candidates"
+    assert row["diagnostic_severity"] == "info"
+    assert row["details"]["entry_readiness_provider_raw"] == "local_l2"
+    assert row["details"]["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
+    assert row["details"]["entry_readiness_provider_migrated"] is True
+
+
 def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     from lightfee.engine.v1_lifecycle_closure import (
         map_lifecycle_event,

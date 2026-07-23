@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Protocol
 
+from lightfee.config.compatibility import (
+    ENTRY_READINESS_PROVIDER_ON_DEMAND,
+    entry_readiness_provider_configured,
+    resolve_entry_readiness_provider,
+)
 from lightfee.config.schema import ENTRY_READINESS_PROVIDERS
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2BookKey
 from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
@@ -113,6 +118,10 @@ class QuoteLease:
     short_observed_at_ms: int
     created_at_ms: int
     expires_at_ms: int
+    long_bid_size: float = 0.0
+    long_ask_size: float = 0.0
+    short_bid_size: float = 0.0
+    short_ask_size: float = 0.0
     provider: str = "quote_lease"
     candidate_revision_id: str = ""
     # Filled only by the final local-L2 revalidator. BBO-only evidence must
@@ -259,6 +268,8 @@ class RestTopBookEntryReadinessProvider:
             "symbol": str(getattr(quote, "symbol", "")),
             "bid": float(getattr(quote, "bid", 0.0) or 0.0),
             "ask": float(getattr(quote, "ask", 0.0) or 0.0),
+            "bid_size": float(getattr(quote, "bid_size", 0.0) or 0.0),
+            "ask_size": float(getattr(quote, "ask_size", 0.0) or 0.0),
             "observed_at_ms": observed_at_ms,
             "age_ms": max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None,
         }
@@ -340,6 +351,10 @@ class QuoteLeaseEntryReadinessProvider(RestTopBookEntryReadinessProvider):
             short_observed_at_ms=int(getattr(short_quote, "observed_at_ms", 0) or 0),
             created_at_ms=now_ms,
             expires_at_ms=now_ms + ttl_ms,
+            long_bid_size=float(getattr(long_quote, "bid_size", 0.0) or 0.0),
+            long_ask_size=float(getattr(long_quote, "ask_size", 0.0) or 0.0),
+            short_bid_size=float(getattr(short_quote, "bid_size", 0.0) or 0.0),
+            short_ask_size=float(getattr(short_quote, "ask_size", 0.0) or 0.0),
             provider=self.provider_name,
             candidate_revision_id=str(
                 getattr(candidate, "candidate_revision_id", "") or ""
@@ -469,6 +484,16 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             symbol=str(getattr(book, "symbol", "")),
             bid=float(book.best_bid() if hasattr(book, "best_bid") else 0.0),
             ask=float(book.best_ask() if hasattr(book, "best_ask") else 0.0),
+            bid_size=(
+                float(book.bids[0].quantity)
+                if getattr(book, "bids", None)
+                else 0.0
+            ),
+            ask_size=(
+                float(book.asks[0].quantity)
+                if getattr(book, "asks", None)
+                else 0.0
+            ),
             observed_at_ms=int(getattr(book, "observed_at_ms", 0) or 0),
         )
 
@@ -727,18 +752,20 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
 
 
 def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
-    provider = runtime.config.strategy.entry_readiness_provider.strip().lower()
-    if provider == "local_l2":
-        return LocalL2EntryReadinessProvider(runtime)
-    if provider == "rest_top_book":
-        return RestTopBookEntryReadinessProvider(runtime)
-    if provider == "quote_lease":
-        return QuoteLeaseEntryReadinessProvider(runtime)
-    if provider == "ws_top_book":
-        return WsTopBookEntryReadinessProvider(runtime)
-    if provider == "ws_bbo_quote_lease":
+    resolution = resolve_entry_readiness_provider(
+        runtime.config.strategy.entry_readiness_provider,
+        configured=entry_readiness_provider_configured(
+            runtime.config.strategy.entry_readiness_provider,
+            getattr(
+                runtime.config.strategy,
+                "_entry_readiness_provider_configured",
+                None,
+            ),
+        ),
+    )
+    if resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND:
         return WsBboQuoteLeaseEntryReadinessProvider(runtime)
     raise ValueError(
         "unknown entry_readiness_provider "
-        f"{provider!r}; expected one of {list(ENTRY_READINESS_PROVIDERS)}"
+        f"{resolution.raw!r}; expected one of {list(ENTRY_READINESS_PROVIDERS)}"
     )

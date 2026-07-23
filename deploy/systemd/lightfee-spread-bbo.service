@@ -1,7 +1,7 @@
 [Unit]
 Description=LightFee V2 Dedicated Spread BBO Data Plane
-After=network-online.target lightfee-sidecar.service
-Wants=network-online.target lightfee-sidecar.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

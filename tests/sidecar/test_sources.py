@@ -192,6 +192,37 @@ class TestExchangeSource:
         assert quote.source == "sidecar_bbo_unavailable"
 
     @pytest.mark.asyncio
+    async def test_funding_metadata_does_not_fetch_or_retain_a_top_book(self):
+        class FakeClient:
+            async def fetch_funding_tickers(self, symbols, *, include_open_interest):
+                return {
+                    "binance:BTCUSDT": FundingTicker(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        funding_rate_bps=50.0,
+                    )
+                }
+
+            async def fetch_top_book_quotes(self, symbols):
+                raise AssertionError("funding metadata path fetched a top book")
+
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+        src._client = FakeClient()
+
+        quote = (await src.fetch_funding_metadata(["BTCUSDT"]))[
+            "binance:BTCUSDT"
+        ]
+
+        assert quote.funding_rate_bps == 50.0
+        assert quote.bid == 0.0
+        assert quote.ask == 0.0
+        assert quote.observed_at_ms == 0
+        assert quote.source == "funding_metadata"
+
+    @pytest.mark.asyncio
     async def test_partial_final_bbo_invalidates_only_missing_symbol(self):
         class FakeClient:
             async def fetch_funding_tickers(self, symbols, *, include_open_interest):

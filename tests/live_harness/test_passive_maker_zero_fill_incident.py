@@ -22,6 +22,7 @@ from lightfee.engine.state import (
     PendingEntryRemainderSlice,
     PendingPassiveOrder,
 )
+from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.test_live_full_closure import make_test_config
 
@@ -274,8 +275,58 @@ def _tradeable_frozen_candidate(*, entry_notional_quote: float = 50.0) -> dict:
     }
 
 
+def _seed_passive_repost_quote(
+    runtime: LiveRuntime,
+    *,
+    observed_at_ms: int = 1_779_816_045_100,
+) -> None:
+    for venue in ("okx", "bybit"):
+        book = runtime.local_l2_runtime.ensure_book(venue, "RIVERUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(price=0.0101, quantity=1_000_000.0)]
+        book.asks = [PriceLevel(price=0.0119, quantity=1_000_000.0)]
+        book.observed_at_ms = observed_at_ms
+
+
 def _install_passive_repost_quote(runtime: LiveRuntime) -> None:
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    quote_state = {"bid": 0.0101, "ask": 0.0119}
+    runtime._resolve_local_l2_quote = lambda venue, symbol: (
+        quote_state["bid"],
+        quote_state["ask"],
+    )
+    runtime.config.strategy.entry_local_l2_book_stale_after_ms = 300_000
+    _seed_passive_repost_quote(runtime)
+
+    original_start = runtime.start
+
+    async def start_with_passive_repost_quote(*args, **kwargs):
+        result = await original_start(*args, **kwargs)
+        _seed_passive_repost_quote(runtime)
+        return result
+
+    runtime.start = start_with_passive_repost_quote
+
+    original_quote_gate = runtime._pending_entry_passive_repost_quote_gate
+
+    def passive_repost_quote_gate_with_fresh_fixture(pending, *, now_ms: int):
+        _seed_passive_repost_quote(runtime, observed_at_ms=now_ms)
+        return original_quote_gate(pending, now_ms=now_ms)
+
+    runtime._pending_entry_passive_repost_quote_gate = (
+        passive_repost_quote_gate_with_fresh_fixture
+    )
+
+    original_refresh = runtime._refresh_pending_entry_passive_market_snapshot
+
+    async def refresh_with_new_passive_repost_quote(pending, adapter):
+        result = await original_refresh(pending, adapter)
+        quote_state["bid"] = 0.0100
+        quote_state["ask"] = 0.0120
+        return result
+
+    runtime._refresh_pending_entry_passive_market_snapshot = (
+        refresh_with_new_passive_repost_quote
+    )
 
     async def fake_retry_sleep(_wait_ms: int) -> None:
         return None
@@ -701,7 +752,7 @@ async def test_terminal_balanced_partial_remainder_reposts_before_finalize(tmp_p
     )
     bybit = _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.CANCELED)
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_passive_repost_quote(runtime)
 
     async def fake_retry_sleep(_wait_ms: int) -> None:
         return None
@@ -962,7 +1013,7 @@ async def test_zero_fill_repost_retries_post_only_reprice_before_backoff(tmp_pat
         post_only_error="status=429 too many requests retry_after_ms=700 post_only_would_take",
     )
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_passive_repost_quote(runtime)
     sleep_calls: list[int] = []
 
     async def fake_retry_sleep(wait_ms: int) -> None:
@@ -1039,8 +1090,8 @@ async def test_zero_fill_repost_missing_price_hint_finalizes_without_stale_submi
     assert pending.pending_id not in runtime.state.pending_entries
 
 
-def test_pending_entry_post_only_price_uses_v1_edge_and_inventory_profile(tmp_path):
-    """V1: post-only attempt price includes edge headroom and inventory bias."""
+def test_pending_entry_post_only_price_uses_same_side_bbo(tmp_path):
+    """Pending passive reposts rest at the current same-side BBO."""
 
     config = make_test_config(str(tmp_path))
     config.strategy.maker_inventory_bias_bps_per_unit = 500.0
@@ -1080,5 +1131,6 @@ def test_pending_entry_post_only_price_uses_v1_edge_and_inventory_profile(tmp_pa
         fallback_price=None,
     )
 
-    assert edge_aware > neutral
-    assert inventory_biased < neutral
+    assert neutral == pytest.approx(0.0101)
+    assert edge_aware == pytest.approx(0.0101)
+    assert inventory_biased == pytest.approx(0.0101)

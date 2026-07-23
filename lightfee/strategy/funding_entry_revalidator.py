@@ -64,6 +64,9 @@ class FundingEntryRevalidator:
         l2_vwap_complete: bool = False,
         require_l2_vwap: bool = False,
         execution_is_passive: bool | None = None,
+        passive_maker_leg_override: str | None = None,
+        long_buy_l2_capacity: float = 0.0,
+        short_sell_l2_capacity: float = 0.0,
     ) -> FundingEntryRevalidation:
         best_long_ask = float(long_ask or 0.0)
         best_short_bid = float(short_bid or 0.0)
@@ -79,12 +82,34 @@ class FundingEntryRevalidator:
         # boolean.  A string such as ``"false"`` is truthy in Python and would
         # otherwise switch the economics into the maker path; likewise a
         # truthy L2 marker could make unverified VWAP executable evidence.
+        override_maker_leg = str(passive_maker_leg_override or "").lower()
+        if override_maker_leg in {"long", "short"}:
+            planned_maker_leg = override_maker_leg
         passive_execution = (
             planned_maker_leg in {"long", "short"}
             if execution_is_passive is None
             else execution_is_passive is True
         )
+        required_quantity = max(float(required_base_quantity or 0.0), 0.0)
+        long_l2_capacity = max(float(long_buy_l2_capacity or 0.0), 0.0)
+        short_l2_capacity = max(float(short_sell_l2_capacity or 0.0), 0.0)
         l2_complete = l2_vwap_complete is True
+        long_buy_l2_complete = (
+            l2_complete
+            or (
+                required_quantity > 0.0
+                and long_l2_capacity + 1e-12 >= required_quantity
+                and float(long_buy_vwap or 0.0) > 0.0
+            )
+        )
+        short_sell_l2_complete = (
+            l2_complete
+            or (
+                required_quantity > 0.0
+                and short_l2_capacity + 1e-12 >= required_quantity
+                and float(short_sell_vwap or 0.0) > 0.0
+            )
+        )
         if (
             best_long_ask <= 0.0
             or best_short_bid <= 0.0
@@ -98,16 +123,25 @@ class FundingEntryRevalidator:
                 best_short_bid,
             )
         long_taker_price = (
-            float(long_buy_vwap or 0.0) if l2_complete else best_long_ask
+            float(long_buy_vwap or 0.0) if long_buy_l2_complete else best_long_ask
         )
         short_taker_price = (
-            float(short_sell_vwap or 0.0) if l2_complete else best_short_bid
+            float(short_sell_vwap or 0.0) if short_sell_l2_complete else best_short_bid
+        )
+        long_is_taker = not passive_execution or planned_maker_leg != "long"
+        short_is_taker = not passive_execution or planned_maker_leg != "short"
+        route_l2_complete = (
+            (long_buy_l2_complete and short_sell_l2_complete)
+            if not passive_execution
+            else short_sell_l2_complete
+            if planned_maker_leg == "long"
+            else long_buy_l2_complete
         )
         if require_l2_vwap and (
-            not l2_complete
-            or required_base_quantity <= 0.0
-            or long_taker_price <= 0.0
-            or short_taker_price <= 0.0
+            not route_l2_complete
+            or required_quantity <= 0.0
+            or (long_is_taker and long_taker_price <= 0.0)
+            or (short_is_taker and short_taker_price <= 0.0)
         ):
             return FundingEntryRevalidation(
                 False,
@@ -131,11 +165,13 @@ class FundingEntryRevalidator:
         # improvement to the strategy's edge.  Maker legs do not consume their
         # corresponding taker VWAP, so validate only the legs this route would
         # actually submit as IOC/taker orders.
-        long_is_taker = not passive_execution or planned_maker_leg != "long"
-        short_is_taker = not passive_execution or planned_maker_leg != "short"
-        if l2_complete and (
-            (long_is_taker and long_taker_price < best_long_ask)
-            or (short_is_taker and short_taker_price > best_short_bid)
+        if (
+            (long_is_taker and long_buy_l2_complete and long_taker_price < best_long_ask)
+            or (
+                short_is_taker
+                and short_sell_l2_complete
+                and short_taker_price > best_short_bid
+            )
         ):
             return FundingEntryRevalidation(
                 False,
@@ -188,7 +224,7 @@ class FundingEntryRevalidator:
         # exact book impact.  Subtracting a BBO heuristic again would double
         # charge the same entry slippage.  Without complete L2, retain the
         # conservative shortlist estimate.
-        entry_slippage_bps = 0.0 if l2_complete else float(candidate.entry_slippage_bps)
+        entry_slippage_bps = 0.0 if route_l2_complete else float(candidate.entry_slippage_bps)
         worst_funding_edge = (
             candidate.forecast_worst_funding_edge_bps
             if candidate.calculation_version == "enhanced_live"
@@ -269,6 +305,8 @@ class FundingEntryRevalidator:
         hedge_ask: float,
         hedge_fee_bps: float | None,
         unwind_fee_bps: float | None,
+        hedge_execution_price: float = 0.0,
+        unwind_execution_price: float = 0.0,
     ) -> FirstFillMarketDecision | None:
         """Price the two mandatory post-fill paths from one BBO contract.
 
@@ -287,6 +325,8 @@ class FundingEntryRevalidator:
             maker_best_ask = float(maker_ask)
             hedge_best_bid = float(hedge_bid)
             hedge_best_ask = float(hedge_ask)
+            hedge_exec = float(hedge_execution_price or 0.0)
+            unwind_exec = float(unwind_execution_price or 0.0)
         except (TypeError, ValueError):
             return None
         prices = (
@@ -301,13 +341,29 @@ class FundingEntryRevalidator:
             return None
         side = str(getattr(maker_side, "value", maker_side) or "").lower()
         if side == "buy":
-            hedge_price = hedge_best_bid
-            unwind_price = maker_best_bid
+            hedge_price = (
+                hedge_exec
+                if isfinite(hedge_exec) and hedge_exec > 0.0
+                else hedge_best_bid
+            )
+            unwind_price = (
+                unwind_exec
+                if isfinite(unwind_exec) and unwind_exec > 0.0
+                else maker_best_bid
+            )
             hedge_price_loss = max(maker_price - hedge_price, 0.0) * base_quantity
             unwind_price_loss = max(maker_price - unwind_price, 0.0) * base_quantity
         elif side == "sell":
-            hedge_price = hedge_best_ask
-            unwind_price = maker_best_ask
+            hedge_price = (
+                hedge_exec
+                if isfinite(hedge_exec) and hedge_exec > 0.0
+                else hedge_best_ask
+            )
+            unwind_price = (
+                unwind_exec
+                if isfinite(unwind_exec) and unwind_exec > 0.0
+                else maker_best_ask
+            )
             hedge_price_loss = max(hedge_price - maker_price, 0.0) * base_quantity
             unwind_price_loss = max(unwind_price - maker_price, 0.0) * base_quantity
         else:

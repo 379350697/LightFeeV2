@@ -44,7 +44,6 @@ CRITICAL_FILES = [
     "scripts/refresh_account_fee_evidence.py",
     "scripts/run_trade_optimization_report.sh",
     "deploy/systemd/lightfee-live.service",
-    "deploy/systemd/lightfee-sidecar.service",
     "deploy/systemd/lightfee-spread-bbo.service",
     "deploy/systemd/lightfee-spread-sidecar.service",
     "deploy/systemd/lightfee-trade-optimization-report.service",
@@ -317,7 +316,6 @@ verify_remote_production_health() {{
 }}
 
 install_systemd_units() {{
-  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-sidecar.service" /etc/systemd/system/lightfee-sidecar.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-bbo.service" /etc/systemd/system/lightfee-spread-bbo.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-sidecar.service" /etc/systemd/system/lightfee-spread-sidecar.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-live.service" /etc/systemd/system/lightfee-live.service
@@ -353,7 +351,7 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   install_systemd_units
 
   echo "=== Restarting production services ==="
-  systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl restart lightfee-sidecar.service && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
+  systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
   sleep 12
 
   echo "=== Verifying production health ==="
@@ -385,10 +383,10 @@ echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Installing systemd units ==="
-ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-sidecar.service /etc/systemd/system/lightfee-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-bbo.service /etc/systemd/system/lightfee-spread-bbo.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-sidecar.service /etc/systemd/system/lightfee-spread-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-live.service /etc/systemd/system/lightfee-live.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.service /etc/systemd/system/lightfee-trade-optimization-report.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.timer /etc/systemd/system/lightfee-trade-optimization-report.timer && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.service /etc/systemd/system/lightfee-fee-evidence-refresh.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.timer /etc/systemd/system/lightfee-fee-evidence-refresh.timer && chmod 0755 {remote_path}/scripts/run_trade_optimization_report.sh"
+ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-bbo.service /etc/systemd/system/lightfee-spread-bbo.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-sidecar.service /etc/systemd/system/lightfee-spread-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-live.service /etc/systemd/system/lightfee-live.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.service /etc/systemd/system/lightfee-trade-optimization-report.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.timer /etc/systemd/system/lightfee-trade-optimization-report.timer && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.service /etc/systemd/system/lightfee-fee-evidence-refresh.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.timer /etc/systemd/system/lightfee-fee-evidence-refresh.timer && chmod 0755 {remote_path}/scripts/run_trade_optimization_report.sh"
 
 echo "=== Restarting production services ==="
-ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl restart lightfee-sidecar.service && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
+ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
 sleep 12
 
 echo "=== Verifying production health ==="

@@ -262,16 +262,16 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     assert market_scope["blocked"] is False
     assert market_scope["block_reason"] == ""
     # Fallback health is non-blocking, but a real first leg still requires
-    # final executable BBO economics.  This fixture intentionally supplies no
-    # quote lease, so the new admission contract must fail closed here.
+    # revalidated quote truth.  This fixture intentionally keeps a last-good
+    # snapshot, so entry must fail closed before dispatch.
     assert len(runtime.entry_executor.contexts) == 0
     quote_blocks = [
         record for record in records
         if record["kind"] == "runtime.entry_quote_revalidate_failed"
-        and record["payload"].get("source") == "entry_quote_truth"
     ]
     assert quote_blocks
-    assert quote_blocks[0]["payload"]["reason"] == "last_good_sidecar"
+    assert quote_blocks[-1]["payload"]["reason"] == "last_good_sidecar_revalidate_required"
+    assert quote_blocks[-1]["payload"]["source"] == "sidecar_quote"
 
 
 @pytest.mark.asyncio

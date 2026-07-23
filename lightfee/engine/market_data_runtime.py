@@ -19,8 +19,11 @@ from lightfee.engine.lifecycle_sla import phase_budgets_from_strategy
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 from lightfee.marketdata.open_interest import (
+    ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+    bounded_open_interest_cache_fallback_max_age_ms,
     normalize_open_interest_status,
     observed_open_interest_proof_reason,
+    open_interest_max_age_ms_for_evidence,
     open_interest_timestamps_are_fresh,
 )
 from lightfee.sidecar.snapshot import funding_rate_evidence_reason
@@ -105,6 +108,46 @@ def _targeted_open_interest_observed_proof_valid(
     )
 
 
+def _open_interest_cache_fallback_payload(
+    *,
+    venue: str,
+    symbol: str,
+    payload: dict[str, Any] | None,
+    now_ms: int,
+    reason: str,
+    max_age_ms: int = ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    fallback_max_age_ms = bounded_open_interest_cache_fallback_max_age_ms(max_age_ms)
+    result = dict(payload)
+    if (
+        normalize_open_interest_status(
+            result.get("open_interest_evidence_status", "unavailable")
+        )
+        != "observed"
+        or not _targeted_open_interest_observed_proof_valid(
+            venue=venue,
+            symbol=symbol,
+            result=result,
+        )
+        or not open_interest_timestamps_are_fresh(
+            observed_at_ms=int(result.get("open_interest_observed_at_ms", 0) or 0),
+            received_at_ms=int(result.get("open_interest_received_at_ms", 0) or 0),
+            event_at_ms=int(result.get("open_interest_event_at_ms", 0) or 0),
+            now_ms=now_ms,
+            max_age_ms=fallback_max_age_ms,
+        )
+    ):
+        return None
+    observed_at_ms = int(result.get("open_interest_observed_at_ms", 0) or 0)
+    result["open_interest_evidence_reason"] = str(reason or "targeted_refresh_cache_fallback")
+    result["open_interest_cache_fallback"] = True
+    result["open_interest_cache_fallback_max_age_ms"] = fallback_max_age_ms
+    result["open_interest_cache_fallback_age_ms"] = max(int(now_ms) - observed_at_ms, 0)
+    return result
+
+
 def _open_interest_exception_status(exc: Exception) -> str:
     """Preserve transport/parse semantics at the entry evidence boundary."""
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
@@ -159,6 +202,16 @@ def _evidence_clock_or_zero(value: object) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _positive_runtime_ms(value: object, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = 0
+    if parsed <= 0:
+        parsed = int(default)
+    return max(parsed, 1)
 
 
 class EntryOpenInterestRefresher:
@@ -239,6 +292,27 @@ class EntryOpenInterestRefresher:
             "cancelled_count": self._cancelled_count,
         }
 
+    def cached_open_interest(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        max_age_ms: int = ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+        reason: str = "targeted_refresh_cache_fallback",
+    ) -> dict[str, Any] | None:
+        venue_key = str(venue or "").strip().lower()
+        symbol_key = str(symbol or "").strip().upper()
+        cached = self._cache.get((venue_key, symbol_key))
+        return _open_interest_cache_fallback_payload(
+            venue=venue_key,
+            symbol=symbol_key,
+            payload=cached,
+            now_ms=now_ms,
+            reason=reason,
+            max_age_ms=max_age_ms,
+        )
+
     def _client_for_venue(self, venue: str):
         venue_key = str(venue or "").strip().lower()
         client = self._clients.get(venue_key)
@@ -261,6 +335,9 @@ class EntryOpenInterestRefresher:
         now_ms: int,
         force_refresh: bool = False,
         max_age_ms: int = 30_000,
+        cache_fallback_max_age_ms: int = (
+            ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+        ),
     ) -> dict[str, Any] | None:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
@@ -299,6 +376,19 @@ class EntryOpenInterestRefresher:
             )
             if live_inflight >= self._max_inflight:
                 self._deferred_count += 1
+                fallback = self.cached_open_interest(
+                    venue_key,
+                    symbol_key,
+                    now_ms=now_ms,
+                    max_age_ms=cache_fallback_max_age_ms,
+                    reason="entry_evidence_scheduler_cache_fallback",
+                )
+                if fallback is not None:
+                    return {
+                        **fallback,
+                        "oi_scheduler_deferred_count": 1,
+                        **self.scheduler_metrics(now_ms=now_ms),
+                    }
                 return {
                     "open_interest_quote": None,
                     "open_interest_evidence_status": "deferred",
@@ -370,9 +460,61 @@ class EntryOpenInterestRefresher:
             self._reused_count += 1
         # The target deadline belongs to the caller.  It must not cancel the
         # singleflight request and leave a connection/rate-limit task orphaned.
-        result = await asyncio.shield(task)
+        try:
+            result = await asyncio.shield(task)
+        except Exception as exc:
+            status = _open_interest_exception_status(exc)
+            fallback = self.cached_open_interest(
+                venue_key,
+                symbol_key,
+                now_ms=now_ms,
+                max_age_ms=cache_fallback_max_age_ms,
+                reason=f"{status}_cache_fallback",
+            )
+            if fallback is not None:
+                return {
+                    **fallback,
+                    **_open_interest_exception_phase_timings(exc),
+                    **self.scheduler_metrics(now_ms=now_ms),
+                }
+            raise
         if result is None:
             return None
+        if (
+            normalize_open_interest_status(
+                result.get("open_interest_evidence_status", "unavailable")
+            )
+            != "observed"
+            or not _targeted_open_interest_observed_proof_valid(
+                venue=venue_key,
+                symbol=symbol_key,
+                result=result,
+            )
+            or not open_interest_timestamps_are_fresh(
+                observed_at_ms=int(result.get("open_interest_observed_at_ms", 0) or 0),
+                received_at_ms=int(result.get("open_interest_received_at_ms", 0) or 0),
+                event_at_ms=int(result.get("open_interest_event_at_ms", 0) or 0),
+                now_ms=now_ms,
+                max_age_ms=open_interest_max_age_ms_for_evidence(
+                    result,
+                    default_max_age_ms=max_age_ms,
+                ),
+            )
+        ):
+            reason = str(
+                result.get("open_interest_evidence_reason")
+                or result.get("open_interest_evidence_status")
+                or "targeted_refresh_failed"
+            )
+            fallback = self.cached_open_interest(
+                venue_key,
+                symbol_key,
+                now_ms=now_ms,
+                max_age_ms=cache_fallback_max_age_ms,
+                reason=f"{reason}_cache_fallback",
+            )
+            if fallback is not None:
+                result = {**result, **fallback}
         return {
             **result,
             **self.scheduler_metrics(now_ms=now_ms),
@@ -597,16 +739,16 @@ class MarketDataRuntime:
         return self.ctx.get_venue_adapter(venue)
 
     def _entry_readiness_provider_name(self) -> str:
-        return self.ctx._entry_readiness_provider_name()
+        return self.ctx._entry_effective_readiness_provider_name()
 
     def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_local_l2()
+        return self.ctx._entry_effective_readiness_provider_uses_local_l2()
 
     def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
+        return self.ctx._entry_effective_readiness_provider_uses_ws_bbo()
 
     def _local_l2_effective_enabled(self) -> bool:
-        return self.ctx._local_l2_effective_enabled()
+        return self.ctx._entry_local_l2_effective_enabled()
 
     def _entry_local_l2_stale_after_ms(self) -> int:
         return self.ctx._entry_local_l2_stale_after_ms()
@@ -677,15 +819,15 @@ class MarketDataRuntime:
     def _runtime_market_data_config_summary(self) -> dict[str, Any]:
         provider = self._entry_readiness_provider_name()
         return {
-            "entry_readiness_provider_effective": provider,
+            **self.ctx._entry_effective_readiness_provider_diagnostics(),
             "local_l2_configured_enabled": self.ctx.config.strategy.local_l2_enabled,
             "local_l2_ws_configured_enabled": self.ctx.config.strategy.local_l2_ws_enabled,
             "local_l2_effective_enabled": self._local_l2_effective_enabled(),
             "local_l2_effective_disabled_reason": (
-                "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
+                "ws_bbo_l2_on_demand_requires_local_l2"
                 if (
-                    provider == "ws_bbo_quote_lease"
-                    and self.ctx.config.strategy.local_l2_enabled
+                    provider == "ws_bbo_l2_on_demand"
+                    and not self.ctx.config.strategy.local_l2_enabled
                 )
                 else ""
             ),
@@ -968,6 +1110,7 @@ class MarketDataRuntime:
         candidates = list(candidates or [])
         tracked_opportunities = list(tracked_opportunities or [])
         tracked_keys: set[LocalL2BookKey] = set()
+        pending_l2_keys: set[LocalL2BookKey] = set()
         pool_by_key: dict[LocalL2BookKey, L2PoolAssignment] = {}
         pool_rank = {
             L2PoolAssignment.HOT_EXEC: 0,
@@ -977,6 +1120,102 @@ class MarketDataRuntime:
 
         def venue_name(venue) -> str:
             return venue.value if hasattr(venue, "value") else str(venue or "")
+
+        def candidate_oi_allows_l2(candidate) -> bool:
+            evidence = getattr(candidate, "entry_open_interest_evidence", None)
+            if not isinstance(evidence, dict):
+                return False
+            revision_id = str(
+                getattr(candidate, "evidence_candidate_revision_id", "")
+                or getattr(candidate, "candidate_revision_id", "")
+                or ""
+            )
+            if not revision_id:
+                return False
+            if str(evidence.get("candidate_revision_id") or "") != revision_id:
+                return False
+            symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
+            if not symbol:
+                return False
+            max_age_ms = max(
+                int(
+                    getattr(
+                        self.ctx.config.runtime,
+                        "sidecar_perp_liquidity_budget_ms",
+                        30_000,
+                    )
+                    or 0
+                ),
+                1,
+            )
+            expected_venues = {
+                "long": str(getattr(candidate, "long_venue", "") or "").strip().lower(),
+                "short": str(getattr(candidate, "short_venue", "") or "").strip().lower(),
+            }
+            for leg in ("long", "short"):
+                row = evidence.get(leg)
+                if not isinstance(row, dict):
+                    return False
+                expected_venue = expected_venues[leg]
+                if (
+                    not expected_venue
+                    or str(row.get("venue") or "").strip().lower() != expected_venue
+                    or str(row.get("canonical_symbol") or "").strip().upper() != symbol
+                    or str(row.get("status") or "").strip().lower() != "observed"
+                ):
+                    return False
+                try:
+                    observed_at_ms = int(row.get("observed_at_ms") or 0)
+                    event_at_ms = int(row.get("event_at_ms") or 0)
+                    received_at_ms = int(row.get("received_at_ms") or 0)
+                    value_quote = float(row.get("value_quote"))
+                    raw_value = float(row.get("raw_value"))
+                except (TypeError, ValueError, OverflowError):
+                    return False
+                if observed_open_interest_proof_reason(
+                    venue=expected_venue,
+                    canonical_symbol=symbol,
+                    venue_symbol=str(row.get("venue_symbol") or ""),
+                    value_quote=value_quote,
+                    raw_value=raw_value,
+                    raw_unit=str(row.get("raw_unit") or ""),
+                    contract_multiplier=row.get("contract_multiplier"),
+                    conversion_mark_price=row.get("conversion_mark_price"),
+                    observed_at_ms=observed_at_ms,
+                    event_at_ms=event_at_ms,
+                    received_at_ms=received_at_ms,
+                    source=str(row.get("source") or ""),
+                    sample_id=str(row.get("sample_id") or ""),
+                ):
+                    return False
+                open_interest_floor = float(
+                    self.ctx.config.strategy.entry_open_interest_floor_quote(
+                        expected_venue
+                    )
+                )
+                if value_quote + 1e-9 < open_interest_floor:
+                    return False
+                if not open_interest_timestamps_are_fresh(
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=received_at_ms,
+                    event_at_ms=event_at_ms,
+                    now_ms=now_ms,
+                    max_age_ms=open_interest_max_age_ms_for_evidence(
+                        row,
+                        default_max_age_ms=max_age_ms,
+                    ),
+                ):
+                    return False
+            return True
+
+        oi_valid_candidates: list[Any] = []
+        for candidate in candidates:
+            if not candidate_oi_allows_l2(candidate):
+                continue
+            oi_valid_candidates.append(candidate)
+            if len(oi_valid_candidates) >= 3:
+                break
+        candidates = oi_valid_candidates
 
         def remember_key(venue, symbol, pool: L2PoolAssignment) -> LocalL2BookKey | None:
             ven_str = venue_name(venue)
@@ -1036,6 +1275,20 @@ class MarketDataRuntime:
                 return self.get_venue_adapter(ven) if ven in self.ctx.venue_adapters else None
             except (ValueError, KeyError):
                 return None
+
+        def require_l2_key(
+            venue,
+            symbol,
+            pool: L2PoolAssignment,
+            *,
+            pending_entry: bool = False,
+        ) -> None:
+            key = remember_key(venue, symbol, pool)
+            if key is None:
+                return
+            needed.setdefault(key.venue, set()).add(key.symbol)
+            if pending_entry:
+                pending_l2_keys.add(key)
 
         def ensure_hot_ws_lifecycle(venue: str, symbol: str) -> None:
             nonlocal registered_total, connect_ws_streams_needed
@@ -1118,8 +1371,18 @@ class MarketDataRuntime:
 
         for pending in getattr(self.ctx.state, "pending_entries", {}).values():
             sym = getattr(pending, "symbol", "")
-            remember_key(getattr(pending, "long_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
-            remember_key(getattr(pending, "short_venue", ""), sym, L2PoolAssignment.HOT_EXEC)
+            require_l2_key(
+                getattr(pending, "long_venue", ""),
+                sym,
+                L2PoolAssignment.HOT_EXEC,
+                pending_entry=True,
+            )
+            require_l2_key(
+                getattr(pending, "short_venue", ""),
+                sym,
+                L2PoolAssignment.HOT_EXEC,
+                pending_entry=True,
+            )
 
         for pending_close in getattr(self.ctx.state, "pending_passive_closes", {}).values():
             position = getattr(pending_close, "position_snapshot", None)
@@ -1143,7 +1406,15 @@ class MarketDataRuntime:
 
         for ven_str, symbols in needed.items():
             # Limit per venue budget (V1: take(per_venue_budget))
-            symbols_list = sorted(symbols)[:per_venue_budget]
+            pending_symbols = [
+                symbol
+                for symbol in sorted(symbols)
+                if LocalL2BookKey(venue=ven_str, symbol=symbol) in pending_l2_keys
+            ]
+            budgeted_symbols = [
+                symbol for symbol in sorted(symbols) if symbol not in pending_symbols
+            ][:per_venue_budget]
+            symbols_list = list(dict.fromkeys([*pending_symbols, *budgeted_symbols]))
             if not symbols_list:
                 continue
 
@@ -1163,7 +1434,15 @@ class MarketDataRuntime:
                 symbols_list,
                 skip_event_kind="runtime.local_l2_symbol_skipped",
             )
-            symbols_list = filtered_symbols[:per_venue_budget]
+            filtered_pending = [
+                symbol
+                for symbol in filtered_symbols
+                if LocalL2BookKey(venue=ven_str, symbol=symbol) in pending_l2_keys
+            ]
+            filtered_budgeted = [
+                symbol for symbol in filtered_symbols if symbol not in filtered_pending
+            ][:per_venue_budget]
+            symbols_list = list(dict.fromkeys([*filtered_pending, *filtered_budgeted]))
             if not symbols_list:
                 continue
 
@@ -1242,19 +1521,31 @@ class MarketDataRuntime:
         This is separate from LocalL2Runtime: it does not create books, bootstrap
         snapshots, replay deltas, or update entry L2 sessions.
         """
+        baseline_keys = set(
+            getattr(self.ctx, "_single_process_entry_bbo_baseline_keys", set()) or set()
+        )
         if not self._entry_readiness_provider_uses_ws_bbo():
-            self._entry_bbo_subscription_budgeted_keys = set()
+            self._entry_bbo_subscription_budgeted_keys = set(baseline_keys)
             self._entry_bbo_subscription_budget_excluded_keys = set()
-            self._entry_bbo_subscription_per_venue_budget = 0
+            self._entry_bbo_subscription_per_venue_budget = (
+                max(self.ctx.config.strategy.entry_ws_bbo_per_venue_budget, 1)
+                if baseline_keys
+                else 0
+            )
             reconcile_streams = getattr(
                 self.ctx.ws_bbo_data_plane,
                 "reconcile_ws_streams",
                 None,
             )
             if callable(reconcile_streams):
-                await reconcile_streams(set(), per_client_timeout_s=0.05)
+                await reconcile_streams(baseline_keys, per_client_timeout_s=0.05)
+            self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
+                baseline_keys,
+                now_ms,
+                retained_max_age_ms=300_000,
+            )
             return
-        if self.ctx.config.runtime.mode == "paper":
+        if self.ctx.config.runtime.mode == "paper" and not baseline_keys:
             self._entry_bbo_subscription_budgeted_keys = set()
             self._entry_bbo_subscription_budget_excluded_keys = set()
             self._entry_bbo_subscription_per_venue_budget = 0
@@ -1322,18 +1613,22 @@ class MarketDataRuntime:
         setattr(self.ctx, "_entry_bbo_sticky_warm_until_ms", sticky_warm_until_ms)
 
         if not needed:
-            self._entry_bbo_subscription_budgeted_keys = set()
+            self._entry_bbo_subscription_budgeted_keys = set(baseline_keys)
             self._entry_bbo_subscription_budget_excluded_keys = set()
-            self._entry_bbo_subscription_per_venue_budget = 0
+            self._entry_bbo_subscription_per_venue_budget = (
+                max(self.ctx.config.strategy.entry_ws_bbo_per_venue_budget, 1)
+                if baseline_keys
+                else 0
+            )
             reconcile_streams = getattr(
                 self.ctx.ws_bbo_data_plane,
                 "reconcile_ws_streams",
                 None,
             )
             if callable(reconcile_streams):
-                await reconcile_streams(set(), per_client_timeout_s=0.05)
+                await reconcile_streams(baseline_keys, per_client_timeout_s=0.05)
             self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
-                tracked_keys,
+                tracked_keys | baseline_keys,
                 now_ms,
                 retained_max_age_ms=300_000,
             )
@@ -1348,12 +1643,15 @@ class MarketDataRuntime:
                 budgeted_keys.add((venue_str, symbol))
             for symbol in venue_symbols[per_venue_budget:]:
                 budget_excluded_keys.add((venue_str, symbol))
+        tracked_keys |= baseline_keys
+        budgeted_keys |= baseline_keys
+        budget_excluded_keys -= baseline_keys
         self._entry_bbo_subscription_budgeted_keys = budgeted_keys
         self._entry_bbo_subscription_budget_excluded_keys = budget_excluded_keys
         self._entry_bbo_subscription_per_venue_budget = per_venue_budget
 
-        # Reconcile before registering replacements so the number of live WS
-        # clients never grows beyond the current generation's venue budgets.
+        # Reconcile candidate replacements before registering them. The
+        # single-process source baseline remains tracked independently.
         reconcile_streams = getattr(
             self.ctx.ws_bbo_data_plane,
             "reconcile_ws_streams",
@@ -1416,6 +1714,76 @@ class MarketDataRuntime:
 
         self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
             tracked_keys,
+            now_ms,
+            retained_max_age_ms=300_000,
+        )
+
+    async def _ensure_single_process_entry_bbo_source_active(
+        self,
+        now_ms: int,
+    ) -> None:
+        """Maintain the uncapped WebSocket BBO source universe for entry input."""
+        uses_single_process_entry = getattr(
+            self.ctx,
+            "_uses_single_process_entry_input",
+            None,
+        )
+        if not callable(uses_single_process_entry) or not uses_single_process_entry():
+            return
+
+        symbols = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in self.ctx.config.symbols
+                if str(symbol or "").strip()
+            }
+        )
+        venue_symbols: dict[str, list[str]] = {}
+        for venue_config in self.ctx.config.venues:
+            venue = str(getattr(venue_config, "venue", "") or "").strip().lower()
+            if venue:
+                venue_symbols.setdefault(venue, symbols)
+        baseline_keys = {
+            (venue, symbol)
+            for venue, configured_symbols in venue_symbols.items()
+            for symbol in configured_symbols
+        }
+        setattr(self.ctx, "_single_process_entry_bbo_baseline_keys", baseline_keys)
+
+        reconcile_streams = getattr(
+            self.ctx.ws_bbo_data_plane,
+            "reconcile_ws_streams",
+            None,
+        )
+        if callable(reconcile_streams):
+            await reconcile_streams(baseline_keys, per_client_timeout_s=0.05)
+
+        registered_total = 0
+        registered_venues: set[str] = set()
+        for venue, configured_symbols in venue_symbols.items():
+            registered = self.ctx.ws_bbo_data_plane.start_ws_streams(
+                venue,
+                configured_symbols,
+            )
+            if registered > 0:
+                registered_total += registered
+                registered_venues.add(venue)
+
+        connected = await self.ctx.ws_bbo_data_plane.connect_ws_streams()
+        journal = getattr(self.ctx, "journal", None)
+        if registered_total > 0 and getattr(journal, "_file", None) is not None:
+            journal.append(
+                "runtime.single_process_entry_ws_bbo_source_started",
+                {
+                    "registered_stream_count": registered_total,
+                    "connected_stream_count": connected,
+                    "venues": sorted(registered_venues),
+                    "symbol_count": len(symbols),
+                    "ts_ms": now_ms,
+                },
+            )
+        self.ctx.ws_bbo_data_plane.prune_untracked_quotes(
+            baseline_keys,
             now_ms,
             retained_max_age_ms=300_000,
         )
@@ -3296,9 +3664,33 @@ class MarketDataRuntime:
         refresher = getattr(self, "entry_open_interest_refresher", None)
         if refresher is not None:
             return refresher
-        refresher = EntryOpenInterestRefresher()
+        refresher = EntryOpenInterestRefresher(
+            targeted_budget_s=self._entry_open_interest_refresh_timeout_s(),
+        )
         setattr(self, "entry_open_interest_refresher", refresher)
         return refresher
+
+    def _entry_open_interest_refresh_timeout_ms(self) -> int:
+        return _positive_runtime_ms(
+            getattr(
+                self.ctx.config.runtime,
+                "entry_open_interest_refresh_timeout_ms",
+                750,
+            ),
+            default=750,
+        )
+
+    def _entry_open_interest_refresh_timeout_s(self) -> float:
+        return self._entry_open_interest_refresh_timeout_ms() / 1_000.0
+
+    def _entry_open_interest_cache_fallback_max_age_ms(self) -> int:
+        return bounded_open_interest_cache_fallback_max_age_ms(
+            getattr(
+                self.ctx.config.runtime,
+                "entry_open_interest_cache_fallback_max_age_ms",
+                ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+            )
+        )
 
     async def _refresh_entry_candidate_open_interest_evidence(
         self,
@@ -3359,6 +3751,22 @@ class MarketDataRuntime:
             tuple[str, str],
             dict[str, set[str]],
         ] = {}
+        oi_max_age_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.runtime,
+                    "sidecar_perp_liquidity_budget_ms",
+                    30_000,
+                )
+                or 0
+            ),
+            1,
+        )
+        oi_refresh_timeout_ms = self._entry_open_interest_refresh_timeout_ms()
+        oi_refresh_timeout_s = oi_refresh_timeout_ms / 1_000.0
+        oi_cache_fallback_max_age_ms = (
+            self._entry_open_interest_cache_fallback_max_age_ms()
+        )
         for candidate in list(candidates or []):
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
             if not symbol:
@@ -3409,23 +3817,15 @@ class MarketDataRuntime:
                 event_at_ms = int(
                     getattr(quote, "open_interest_event_at_ms", 0) or 0
                 )
-                oi_max_age_ms = max(
-                    int(
-                        getattr(
-                            self.ctx.config.runtime,
-                            "sidecar_perp_liquidity_budget_ms",
-                            30_000,
-                        )
-                        or 0
-                    ),
-                    1,
-                )
                 evidence_is_fresh = open_interest_timestamps_are_fresh(
                     observed_at_ms=observed_at_ms,
                     received_at_ms=received_at_ms,
                     event_at_ms=event_at_ms,
                     now_ms=now_ms,
-                    max_age_ms=oi_max_age_ms,
+                    max_age_ms=open_interest_max_age_ms_for_evidence(
+                        quote,
+                        default_max_age_ms=oi_max_age_ms,
+                    ),
                 )
                 if (
                     evidence_status == "observed"
@@ -3502,6 +3902,80 @@ class MarketDataRuntime:
         if not callable(refresh) and not callable(batch_refresh):
             return stats
 
+        def _quote_open_interest_payload(quote) -> dict[str, Any]:
+            return {
+                "open_interest_quote": getattr(quote, "open_interest", None),
+                "open_interest_evidence_status": normalize_open_interest_status(
+                    getattr(quote, "open_interest_evidence_status", "unavailable")
+                ),
+                "open_interest_evidence_reason": str(
+                    getattr(quote, "open_interest_evidence_reason", "")
+                    or "quote_open_interest_cache"
+                ),
+                "open_interest_observed_at_ms": int(
+                    getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                ),
+                "open_interest_event_at_ms": int(
+                    getattr(quote, "open_interest_event_at_ms", 0) or 0
+                ),
+                "open_interest_received_at_ms": int(
+                    getattr(quote, "open_interest_received_at_ms", 0) or 0
+                ),
+                "open_interest_source": str(
+                    getattr(quote, "open_interest_source", "") or ""
+                ),
+                "open_interest_sample_id": str(
+                    getattr(quote, "open_interest_sample_id", "") or ""
+                ),
+                "open_interest_venue_symbol": str(
+                    getattr(quote, "open_interest_venue_symbol", "") or ""
+                ),
+                "raw_open_interest": getattr(quote, "raw_open_interest", None),
+                "raw_open_interest_unit": str(
+                    getattr(quote, "raw_open_interest_unit", "") or ""
+                ),
+                "open_interest_contract_multiplier": getattr(
+                    quote,
+                    "open_interest_contract_multiplier",
+                    None,
+                ),
+                "open_interest_conversion_mark_price": getattr(
+                    quote,
+                    "open_interest_conversion_mark_price",
+                    None,
+                ),
+            }
+
+        def _cached_open_interest_fallback(
+            *,
+            venue: str,
+            symbol: str,
+            quote,
+            reason: str,
+        ) -> dict[str, Any] | None:
+            cached_method = getattr(refresher, "cached_open_interest", None)
+            if callable(cached_method):
+                try:
+                    cached = cached_method(
+                        venue,
+                        symbol,
+                        now_ms=now_ms,
+                        max_age_ms=oi_cache_fallback_max_age_ms,
+                        reason=reason,
+                    )
+                except TypeError:
+                    cached = cached_method(venue, symbol, now_ms=now_ms)
+                if cached is not None:
+                    return cached
+            return _open_interest_cache_fallback_payload(
+                venue=venue,
+                symbol=symbol,
+                payload=_quote_open_interest_payload(quote),
+                now_ms=now_ms,
+                reason=reason,
+                max_age_ms=oi_cache_fallback_max_age_ms,
+            )
+
         self.ctx.journal.append(
             "runtime.entry_oi_targeted_refresh_started",
             {
@@ -3529,6 +4003,48 @@ class MarketDataRuntime:
                 )
                 or 0
             )
+            raw_status = normalize_open_interest_status(
+                (result or {}).get("open_interest_evidence_status")
+                or "unavailable"
+            )
+            raw_result_valid = (
+                raw_status == "observed"
+                and _targeted_open_interest_observed_proof_valid(
+                    venue=venue,
+                    symbol=symbol,
+                    result=result or {},
+                )
+                and open_interest_timestamps_are_fresh(
+                    observed_at_ms=int(
+                        (result or {}).get("open_interest_observed_at_ms", 0) or 0
+                    ),
+                    received_at_ms=int(
+                        (result or {}).get("open_interest_received_at_ms", 0) or 0
+                    ),
+                    event_at_ms=int(
+                        (result or {}).get("open_interest_event_at_ms", 0) or 0
+                    ),
+                    now_ms=now_ms,
+                    max_age_ms=open_interest_max_age_ms_for_evidence(
+                        result or {},
+                        default_max_age_ms=oi_max_age_ms,
+                    ),
+                )
+            )
+            if not raw_result_valid:
+                fallback_reason = str(
+                    (result or {}).get("open_interest_evidence_reason")
+                    or raw_status
+                    or "targeted_refresh_failed"
+                )
+                fallback = _cached_open_interest_fallback(
+                    venue=venue,
+                    symbol=symbol,
+                    quote=quote,
+                    reason=f"{fallback_reason}_cache_fallback",
+                )
+                if fallback is not None:
+                    result = {**(result or {}), **fallback}
             status = normalize_open_interest_status(
                 (result or {}).get("open_interest_evidence_status")
                 or "unavailable"
@@ -3607,6 +4123,19 @@ class MarketDataRuntime:
                 "oi_scheduler_cancelled_count": int(
                     (result or {}).get("cancelled_count", 0) or 0
                 ),
+                "open_interest_cache_fallback": bool(
+                    (result or {}).get("open_interest_cache_fallback", False)
+                ),
+                "open_interest_cache_fallback_max_age_ms": int(
+                    (result or {}).get(
+                        "open_interest_cache_fallback_max_age_ms",
+                        0,
+                    )
+                    or 0
+                ),
+                "open_interest_cache_fallback_age_ms": int(
+                    (result or {}).get("open_interest_cache_fallback_age_ms", 0) or 0
+                ),
                 "candidate_scope": candidate_scope,
                 "evidence_role": evidence_role,
                 "ts_ms": now_ms,
@@ -3627,6 +4156,9 @@ class MarketDataRuntime:
                     "raw_open_interest_unit",
                     "open_interest_contract_multiplier",
                     "open_interest_conversion_mark_price",
+                    "open_interest_cache_fallback",
+                    "open_interest_cache_fallback_max_age_ms",
+                    "open_interest_cache_fallback_age_ms",
                 ):
                     if field in (result or {}):
                         setattr(quote, field, (result or {}).get(field))
@@ -3707,7 +4239,10 @@ class MarketDataRuntime:
                         received_at_ms=received_at_ms,
                         event_at_ms=event_at_ms,
                         now_ms=current_now_ms,
-                        max_age_ms=oi_max_age_ms,
+                        max_age_ms=open_interest_max_age_ms_for_evidence(
+                            quote,
+                            default_max_age_ms=oi_max_age_ms,
+                        ),
                     )
                 ):
                     return False
@@ -3737,7 +4272,7 @@ class MarketDataRuntime:
                             symbols,
                             now_ms=wall_clock_now_ms(),
                         ),
-                        timeout=0.750,
+                        timeout=oi_refresh_timeout_s,
                     )
                 except asyncio.TimeoutError:
                     batch_results = {
@@ -3829,15 +4364,36 @@ class MarketDataRuntime:
                             now_ms=wall_clock_now_ms(),
                             force_refresh=force_refresh,
                             max_age_ms=oi_max_age_ms,
+                            cache_fallback_max_age_ms=oi_cache_fallback_max_age_ms,
                         )
                     except TypeError:
                         # Compatibility for injected legacy/test refreshers.
-                        refresh_coro = refresh(
-                            venue,
-                            symbol,
-                            now_ms=wall_clock_now_ms(),
-                        )
-                    result = await asyncio.wait_for(refresh_coro, timeout=0.750)
+                        try:
+                            refresh_coro = refresh(
+                                venue,
+                                symbol,
+                                now_ms=wall_clock_now_ms(),
+                                force_refresh=force_refresh,
+                                max_age_ms=oi_max_age_ms,
+                            )
+                        except TypeError:
+                            try:
+                                refresh_coro = refresh(
+                                    venue,
+                                    symbol,
+                                    now_ms=wall_clock_now_ms(),
+                                    force_refresh=force_refresh,
+                                )
+                            except TypeError:
+                                refresh_coro = refresh(
+                                    venue,
+                                    symbol,
+                                    now_ms=wall_clock_now_ms(),
+                                )
+                    result = await asyncio.wait_for(
+                        refresh_coro,
+                        timeout=oi_refresh_timeout_s,
+                    )
                 except asyncio.TimeoutError:
                     result = {
                         "open_interest_quote": None,
@@ -3933,7 +4489,7 @@ class MarketDataRuntime:
                     # failed OI evidence; continue to the next ranked row.
                 return selection_ready
 
-            deadline = asyncio.get_running_loop().time() + 0.750
+            deadline = asyncio.get_running_loop().time() + oi_refresh_timeout_s
             pending = set(target_tasks.values())
             _highest_resolved_candidate_is_ready()
             while pending:
@@ -3996,7 +4552,7 @@ class MarketDataRuntime:
                             "entry_evidence_deadline_exceeded"
                         ),
                     },
-                    default_elapsed_ms=750,
+                    default_elapsed_ms=oi_refresh_timeout_ms,
                 )
                 completed_keys.add(key)
             for key in queued_keys:

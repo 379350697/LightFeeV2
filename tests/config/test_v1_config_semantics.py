@@ -294,6 +294,11 @@ class TestOpportunityModes:
         issues = validate_config(config)
         assert len(issues) == 0
 
+    def test_single_process_entry_mode_valid(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.runtime.opportunity_input_mode = "single_process_entry"
+        assert validate_config(config) == []
+
     def test_sidecar_backed_mode_valid(self):
         config = AppConfig(symbols=["BTCUSDT"])
         config.runtime.opportunity_input_mode = "sidecar_backed"
@@ -328,7 +333,7 @@ class TestOpportunityModes:
         """Non-parity fallback mode must be explicitly set, not default."""
         config = AppConfig(symbols=["BTCUSDT"])
         assert config.runtime.opportunity_input_mode != "non_parity"
-        assert config.runtime.opportunity_input_mode in ("coarse_sidecar", "sidecar_backed")
+        assert config.runtime.opportunity_input_mode == "single_process_entry"
 
 
 # ── CONFIG-004: Config Validation Errors ───────────────────────────────────

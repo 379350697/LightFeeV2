@@ -15,6 +15,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+from lightfee.config.compatibility import (
+    ENTRY_READINESS_PROVIDER_ON_DEMAND,
+    entry_readiness_provider_configured,
+    resolve_entry_readiness_provider,
+)
 from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
@@ -322,6 +327,10 @@ class LiveRuntime:
         self._sidecar_v6_installing_since_ms: int = 0
         self._sidecar_v6_install_status: str = ""
         self._sidecar_v6_invalid_reported: bool = False
+        self._in_process_entry_source: object | None = None
+        self._in_process_entry_refresh_task: asyncio.Task | None = None
+        self._in_process_entry_snapshot = None
+        self._single_process_entry_bbo_baseline_keys: set[tuple[str, str]] = set()
         self._venue_adapters = venue_adapters or {}
         self.residual_repair_runtime = ResidualRepairRuntime(self)
         self.pending_entry_runtime = PendingEntryRuntime(self)
@@ -1200,16 +1209,102 @@ class LiveRuntime:
         return dict(self._venue_adapters)
 
     def _entry_readiness_provider_name(self) -> str:
-        return self.config.strategy.entry_readiness_provider.strip().lower()
+        return str(self.config.strategy.entry_readiness_provider or "").strip().lower()
+
+    def _entry_readiness_provider_resolution(self):
+        return resolve_entry_readiness_provider(
+            self.config.strategy.entry_readiness_provider,
+            configured=entry_readiness_provider_configured(
+                self.config.strategy.entry_readiness_provider,
+                getattr(
+                    self.config.strategy,
+                    "_entry_readiness_provider_configured",
+                    None,
+                ),
+            ),
+        )
+
+    def _entry_effective_readiness_provider_name(self) -> str:
+        return self._entry_readiness_provider_resolution().effective
+
+    def _entry_effective_readiness_provider_diagnostics(self) -> dict[str, object]:
+        resolution = self._entry_readiness_provider_resolution()
+        return {
+            "entry_readiness_provider_raw": resolution.raw,
+            "entry_readiness_provider_effective": resolution.effective,
+            "entry_readiness_provider_defaulted": resolution.defaulted,
+            "entry_readiness_provider_migrated": resolution.migrated,
+        }
+
+    def _entry_effective_readiness_provider_uses_local_l2(self) -> bool:
+        return (
+            self._entry_effective_readiness_provider_name()
+            == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        )
+
+    def _entry_effective_readiness_provider_uses_ws_bbo(self) -> bool:
+        return (
+            self._entry_effective_readiness_provider_name()
+            == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        )
+
+    def _entry_effective_readiness_provider_uses_quote_lease(self) -> bool:
+        return (
+            self._entry_effective_readiness_provider_name()
+            == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        )
+
+    def _entry_local_l2_effective_enabled(self) -> bool:
+        return (
+            self.config.strategy.local_l2_enabled
+            and self._entry_effective_readiness_provider_uses_local_l2()
+        )
+
+    def _compatibility_provider_name(self) -> str:
+        """Preserve non-entry lifecycle provider behavior across the migration."""
+        strategy = self.config.strategy
+        loader_configured = getattr(
+            strategy,
+            "_entry_readiness_provider_configured",
+            None,
+        )
+        loader_raw = getattr(strategy, "_entry_readiness_provider_raw", None)
+        provider = self._entry_readiness_provider_name()
+
+        # The schema default cannot tell a direct StrategyConfig() fixture from
+        # an explicitly composed provider.  Keep that programmatic default on
+        # the conservative Local-L2 lifecycle path.  Loader provenance does
+        # distinguish a missing TOML value, which retains V1's live WS-BBO and
+        # paper Local-L2 lifecycle behavior while entry uses the composed mode.
+        if loader_configured is None:
+            return (
+                "local_l2"
+                if provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+                else provider
+            )
+        if not loader_configured or not str(loader_raw or "").strip():
+            return (
+                "ws_bbo_quote_lease"
+                if self.config.runtime.mode == "live"
+                else "local_l2"
+            )
+        provider = str(loader_raw).strip().lower()
+        if provider == ENTRY_READINESS_PROVIDER_ON_DEMAND:
+            return (
+                "ws_bbo_quote_lease"
+                if self.config.runtime.mode == "live"
+                else "local_l2"
+            )
+        return provider
 
     def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self._entry_readiness_provider_name() in {"local_l2", "ws_top_book"}
+        return self._compatibility_provider_name() in {"local_l2", "ws_top_book"}
 
     def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self._entry_readiness_provider_name() == "ws_bbo_quote_lease"
+        return self._compatibility_provider_name() == "ws_bbo_quote_lease"
 
     def _entry_readiness_provider_uses_quote_lease(self) -> bool:
-        return self._entry_readiness_provider_name() in {
+        return self._compatibility_provider_name() in {
             "quote_lease",
             "ws_top_book",
             "ws_bbo_quote_lease",
@@ -1559,6 +1654,8 @@ class LiveRuntime:
             "invalid_quote_lease",
         }:
             return "invalid_quote"
+        if reason == "quote_lease_insufficient_bbo_capacity":
+            return "insufficient_capacity"
         return "unknown"
 
     @staticmethod
@@ -1580,7 +1677,7 @@ class LiveRuntime:
         candidate: Any,
     ) -> tuple[str | None, dict[str, Any]]:
         if (
-            not self._entry_readiness_provider_uses_ws_bbo()
+            not self._entry_effective_readiness_provider_uses_ws_bbo()
             or self.config.runtime.mode != "live"
         ):
             return None, {}
@@ -2170,7 +2267,8 @@ class LiveRuntime:
         # Parse/validate the immutable generation off the event loop.  Ticks
         # consume the last installed object and never synchronously decode the
         # full audit snapshot.
-        self._ensure_sidecar_snapshot_load()
+        if not self._uses_single_process_entry_input():
+            self._ensure_sidecar_snapshot_load()
 
         # Phase 1 – BOOTING
         set_lifecycle(self.state, EngineLifecycle.BOOTING)
@@ -4467,6 +4565,37 @@ class LiveRuntime:
                 break
         return extras
 
+    def _entry_open_interest_ready_for_l2_activation(
+        self,
+        candidate,
+        *,
+        now_ms: int,
+    ) -> bool:
+        reason, _evidence = (
+            self.entry_dispatch_runtime._entry_open_interest_submit_reason(
+                candidate,
+                now_ms=now_ms,
+            )
+        )
+        return not reason
+
+    def _entry_l2_activation_finalists(self, candidates, *, max_count: int = 3) -> list:
+        limit = max(int(max_count or 0), 0)
+        if limit <= 0:
+            return []
+        now_ms = wall_clock_now_ms()
+        finalists: list = []
+        for candidate in list(candidates or []):
+            if not self._entry_open_interest_ready_for_l2_activation(
+                candidate,
+                now_ms=now_ms,
+            ):
+                continue
+            finalists.append(candidate)
+            if len(finalists) >= limit:
+                break
+        return finalists
+
     async def _build_entry_preparation_generation(
         self,
         candidates: list,
@@ -4504,12 +4633,29 @@ class LiveRuntime:
     def _schedule_entry_data_plane_preparation(self, candidates: list) -> None:
         """Refresh L2/BBO subscriptions independently from safety eligibility."""
         prepared = list(candidates or [])
-        tracked, tracked_candidates = self._select_v1_entry_tracked_scope(prepared)
+        local_l2_enabled = self._entry_local_l2_effective_enabled()
+        ws_bbo_enabled = self._entry_effective_readiness_provider_uses_ws_bbo()
+        l2_finalists = (
+            self._entry_l2_activation_finalists(prepared)
+            if local_l2_enabled
+            else prepared
+        )
+        tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+            l2_finalists
+        )
         self._tracked_primary_pair_ids = {
             opportunity.pair_id
             for opportunity in tracked
             if opportunity.class_.value == "primary_tracked"
         }
+        if local_l2_enabled and tracked:
+            ready_now_ms = wall_clock_now_ms()
+            for opportunity in tracked:
+                self.entry_l2_sessions.track_opportunity(
+                    opportunity,
+                    ready_now_ms,
+                )
+            self._refresh_entry_l2_session_readiness(ready_now_ms)
         generation_key = tuple(sorted(
             self._candidate_pair_id(candidate) for candidate in prepared
         ))
@@ -4523,12 +4669,26 @@ class LiveRuntime:
             task = None
         if task is not None:
             return
-        if not prepared:
+        pending_entries_present = bool(getattr(self.state, "pending_entries", None))
+        if not prepared and not (local_l2_enabled and pending_entries_present):
+            self._entry_data_plane_preparation_key = generation_key
+            return
+        if (
+            local_l2_enabled
+            and not tracked_candidates
+            and not pending_entries_present
+            and not ws_bbo_enabled
+        ):
             self._entry_data_plane_preparation_key = generation_key
             return
 
         async def _prepare() -> None:
-            if self._local_l2_effective_enabled() and tracked_candidates:
+            if ws_bbo_enabled and prepared:
+                await self._ensure_entry_bbo_active_for_candidates(
+                    prepared,
+                    wall_clock_now_ms(),
+                )
+            if local_l2_enabled and (tracked_candidates or pending_entries_present):
                 await self._ensure_l2_active_for_candidates(
                     tracked_candidates,
                     wall_clock_now_ms(),
@@ -4546,11 +4706,6 @@ class LiveRuntime:
                 ready_now_ms = wall_clock_now_ms()
                 self._refresh_entry_l2_session_readiness(ready_now_ms)
                 self._apply_shadow_promotion_if_eligible(tracked, ready_now_ms)
-            elif self._entry_readiness_provider_uses_ws_bbo():
-                await self._ensure_entry_bbo_active_for_candidates(
-                    prepared,
-                    wall_clock_now_ms(),
-                )
 
         self._entry_data_plane_preparation_key = generation_key
         self._entry_data_plane_preparation_task = asyncio.create_task(
@@ -5014,7 +5169,7 @@ class LiveRuntime:
         """
         from lightfee.marketdata.l2 import PriceLevel
 
-        if not self._local_l2_effective_enabled():
+        if not self._entry_local_l2_effective_enabled():
             self._clear_local_l2_runtime_state()
             return
         if not hasattr(self.state, "local_l2_books_snapshot"):
@@ -5220,6 +5375,12 @@ class LiveRuntime:
             with suppress(asyncio.CancelledError):
                 await snapshot_load_task
         self._sidecar_snapshot_load_task = None
+        in_process_entry_task = getattr(self, "_in_process_entry_refresh_task", None)
+        if in_process_entry_task is not None and not in_process_entry_task.done():
+            in_process_entry_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await in_process_entry_task
+        self._in_process_entry_refresh_task = None
         for task_name in (
             "_entry_preparation_task",
             "_entry_account_truth_task",
@@ -5363,6 +5524,16 @@ class LiveRuntime:
             if callable(close):
                 close()
 
+        in_process_entry_source = getattr(self, "_in_process_entry_source", None)
+        close_in_process_entry_source = getattr(in_process_entry_source, "close", None)
+        if callable(close_in_process_entry_source):
+            await _await_shutdown_task(
+                "close_network",
+                "in_process_entry_source.close",
+                close_in_process_entry_source(),
+            )
+        self._in_process_entry_source = None
+
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
         await _await_shutdown_task(
             "close_network",
@@ -5501,6 +5672,85 @@ class LiveRuntime:
                 "runtime.candidate_frontier_incomplete",
             )
         return "snapshot_unavailable", "runtime.snapshot_unavailable"
+
+    def _uses_single_process_entry_input(self) -> bool:
+        mode = (
+            str(self.config.runtime.opportunity_input_mode or "").strip().lower()
+        )
+        if mode != "single_process_entry":
+            return False
+        # The production TOML must opt in explicitly.  Direct RuntimeConfig()
+        # construction remains a legacy sidecar-compatible test/integration
+        # fixture while exposing the production default for validation.
+        return bool(
+            getattr(self.config.runtime, "_opportunity_input_mode_configured", True)
+        )
+
+    def _in_process_entry_top_books(self) -> dict[tuple[str, str], object]:
+        """Read only the runtime-owned WebSocket BBO cache for entry input."""
+        cache = getattr(self, "ws_bbo_cache", None)
+        get_quote = getattr(cache, "get_quote", None)
+        if not callable(get_quote):
+            return {}
+        top_books: dict[tuple[str, str], object] = {}
+        symbols = {
+            str(symbol).strip().upper()
+            for symbol in self.config.symbols
+            if str(symbol).strip()
+        }
+        for venue_config in self.config.venues:
+            venue = str(getattr(venue_config, "venue", "") or "").strip().lower()
+            if not venue:
+                continue
+            for symbol in symbols:
+                quote = get_quote(venue, symbol)
+                if quote is not None:
+                    top_books[(venue, symbol)] = quote
+        return top_books
+
+    def _ensure_in_process_entry_source(self):
+        source = self._in_process_entry_source
+        if source is None:
+            from lightfee.sidecar.service import SidecarService
+
+            source = SidecarService(
+                self.config,
+                enable_spread_bbo=False,
+                in_process_entry=True,
+            )
+            self._in_process_entry_source = source
+        return source
+
+    async def _in_process_entry_snapshot_for_tick(self):
+        """Return the latest in-memory entry view without snapshot-file I/O."""
+        task = self._in_process_entry_refresh_task
+        if task is not None and task.done():
+            try:
+                self._in_process_entry_snapshot = task.result()
+            except Exception:
+                logger.exception("in-process funding entry refresh failed")
+            self._in_process_entry_refresh_task = None
+
+        # The metadata-only source never supplies executable prices. Keep the
+        # entire configured source universe warm before reading the cache.
+        await self.market_data_runtime._ensure_single_process_entry_bbo_source_active(
+            wall_clock_now_ms()
+        )
+
+        if self._in_process_entry_refresh_task is None:
+            source = self._ensure_in_process_entry_source()
+            self._in_process_entry_refresh_task = asyncio.create_task(
+                source.refresh_in_process_entry(self._in_process_entry_top_books()),
+                name="in-process-funding-entry-refresh",
+            )
+        return self._in_process_entry_snapshot
+
+    def _entry_consumer_frontier(self, candidates):
+        """Keep the legacy Top-32 payload cap out of the in-process path."""
+        candidates = list(candidates)
+        if self._uses_single_process_entry_input():
+            return candidates
+        return candidates[:32]
 
     def _current_sidecar_snapshot_generation(self) -> tuple[object, bool | None]:
         path = self.config.runtime.sidecar_snapshot_path
@@ -5657,8 +5907,13 @@ class LiveRuntime:
             await self._cancel_entry_evidence_task(previous_prewarm)
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
 
-        # --- Load sidecar snapshot ---
-        snapshot = await self._sidecar_snapshot_for_tick()
+        # Single-process entry ownership keeps funding/BBO/account-fee evidence
+        # in memory.  Legacy coarse_sidecar keeps the V6 file handoff intact.
+        snapshot = (
+            await self._in_process_entry_snapshot_for_tick()
+            if self._uses_single_process_entry_input()
+            else await self._sidecar_snapshot_for_tick()
+        )
         # Every awaited stage invalidates an earlier wall-clock observation.
         # This prevents a slow initial load from making newly received REST
         # evidence appear to originate in the future.
@@ -6041,10 +6296,7 @@ class LiveRuntime:
                 blocked_reason_samples=strategy_blocked_reason_samples,
             )
             strategy_tradeable_count = len(tradeable)
-            # The live entry payload contract is Top-32. Legacy V5 snapshots
-            # and tests can still contain a larger candidate array, so enforce
-            # the same hard frontier at the consumer boundary as well.
-            tradeable = list(tradeable[:32])
+            tradeable = self._entry_consumer_frontier(tradeable)
             raw_candidate_count = len(getattr(snapshot, "candidates", []) or [])
             self.state.last_scan["raw_candidate_count"] = raw_candidate_count
             self.state.last_scan["strategy_tradeable_count"] = strategy_tradeable_count
@@ -6281,8 +6533,8 @@ class LiveRuntime:
                 )
                 self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = 0
             entry_bbo_prewarm_attempted = (
-                self._entry_readiness_provider_uses_ws_bbo()
-                and bool(tracked_candidates)
+                self._entry_effective_readiness_provider_uses_ws_bbo()
+                and bool(l2_tracking_tradeable)
             )
             skipped_untracked_quote_count = 0
             prewarm_extra_quote_target_count = 0
@@ -6738,6 +6990,8 @@ class LiveRuntime:
                 tradeable,
                 now_ms=wall_clock_now_ms(),
             )
+            if self._entry_local_l2_effective_enabled() and tradeable:
+                self._schedule_entry_data_plane_preparation(tradeable)
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
             self.state.last_scan["dispatched_candidate_count"] = 0
@@ -7323,7 +7577,7 @@ class LiveRuntime:
         Delegates to the data plane which respects per-book cooldown intervals.
         """
         self._refresh_runtime_market_data_config_state()
-        if not self._local_l2_effective_enabled():
+        if not self._entry_local_l2_effective_enabled():
             return
 
         try:
@@ -8318,36 +8572,57 @@ class LiveRuntime:
                 attempt_index,
                 fallback_price=price,
             )
-            if price_hint is None:
-                raise _PendingEntryPassiveSubmitFinalized("missing_passive_price_hint")
-            rule_reason, rule_evidence = self._pending_entry_order_rule_violation(
-                pending,
-                venue=pending.maker_venue(),
-                quantity=float(quantity or 0.0),
-                price=float(price_hint or 0.0),
+            if price_hint is not None:
+                rule_reason, rule_evidence = self._pending_entry_order_rule_violation(
+                    pending,
+                    venue=pending.maker_venue(),
+                    quantity=float(quantity or 0.0),
+                    price=float(price_hint or 0.0),
+                )
+                if rule_reason:
+                    self.journal.append(
+                        "pending_entry.symbol_rule_evidence_blocked",
+                        {
+                            "entry_id": entry_id,
+                            "symbol": pending.symbol,
+                            "stage": f"{stage_prefix}_attempt_{attempt_index}",
+                            "reason": rule_reason,
+                            **rule_evidence,
+                        },
+                    )
+                    raise _PendingEntryPassiveSubmitFinalized(rule_reason)
+                canary_reason = self._funding_canary_pending_request_invariant_reason(
+                    pending,
+                    quantity=quantity,
+                    price=price_hint,
+                    stage=f"{stage_prefix}_attempt_{attempt_index}",
+                    now_ms=wall_clock_now_ms(),
+                    entry_id=entry_id,
+                )
+                if canary_reason:
+                    raise _PendingEntryPassiveSubmitFinalized(canary_reason)
+            attempt_now_ms = wall_clock_now_ms()
+            quote_gate_reason, quote_gate_evidence = (
+                self._pending_entry_passive_repost_quote_gate(
+                    pending,
+                    now_ms=attempt_now_ms,
+                )
             )
-            if rule_reason:
+            if quote_gate_reason:
                 self.journal.append(
-                    "pending_entry.symbol_rule_evidence_blocked",
+                    "execution.passive_entry_repost_failed",
                     {
                         "entry_id": entry_id,
                         "symbol": pending.symbol,
+                        "maker_venue": pending.maker_venue().value,
                         "stage": f"{stage_prefix}_attempt_{attempt_index}",
-                        "reason": rule_reason,
-                        **rule_evidence,
+                        "reason": quote_gate_reason,
+                        **quote_gate_evidence,
                     },
                 )
-                raise _PendingEntryPassiveSubmitFinalized(rule_reason)
-            canary_reason = self._funding_canary_pending_request_invariant_reason(
-                pending,
-                quantity=quantity,
-                price=price_hint,
-                stage=f"{stage_prefix}_attempt_{attempt_index}",
-                now_ms=wall_clock_now_ms(),
-                entry_id=entry_id,
-            )
-            if canary_reason:
-                raise _PendingEntryPassiveSubmitFinalized(canary_reason)
+                raise _PendingEntryPassiveSubmitFinalized(quote_gate_reason)
+            if price_hint is None:
+                raise _PendingEntryPassiveSubmitFinalized("missing_passive_price_hint")
             request = OrderRequest(
                 venue=pending.maker_venue(),
                 symbol=pending.symbol,
@@ -8400,6 +8675,176 @@ class LiveRuntime:
                 )
         raise _PendingEntryPassiveSubmitFinalized("max_passive_attempts_reached")
 
+    def _pending_entry_passive_repost_quote_gate(
+        self,
+        pending,
+        *,
+        now_ms: int,
+    ) -> tuple[str, dict[str, Any]]:
+        maker_venue = pending.maker_venue()
+        hedge_venue = pending.hedge_venue()
+        maker_venue_str = (
+            maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
+        )
+        hedge_venue_str = (
+            hedge_venue.value if hasattr(hedge_venue, "value") else str(hedge_venue)
+        )
+        symbol = str(getattr(pending, "symbol", "") or "").upper()
+        provider = self._entry_readiness_provider_name()
+        evidence: dict[str, Any] = {
+            "provider": provider,
+            "source": provider,
+            "domain": "pending_entry_passive_repost_quote_gate",
+            "symbol": symbol,
+            "maker_venue": maker_venue_str,
+            "hedge_venue": hedge_venue_str,
+            "maker_leg": str(getattr(pending, "maker_leg", "") or ""),
+            "maker_side": (
+                pending.maker_side().value
+                if hasattr(pending.maker_side(), "value")
+                else str(pending.maker_side())
+            ),
+            "hedge_side": (
+                pending.hedge_side().value
+                if hasattr(pending.hedge_side(), "value")
+                else str(pending.hedge_side())
+            ),
+            "ts_ms": now_ms,
+        }
+
+        def _valid_quote_payload(
+            *,
+            venue: str,
+            role: str,
+            bid: float,
+            ask: float,
+            observed_at_ms: int,
+            stale_after_ms: int,
+            source: str,
+        ) -> tuple[str, dict[str, Any]]:
+            age_ms = (
+                max(int(now_ms) - int(observed_at_ms), 0)
+                if int(observed_at_ms or 0) > 0
+                else None
+            )
+            payload = {
+                f"{role}_venue": venue,
+                f"{role}_bid": bid,
+                f"{role}_ask": ask,
+                f"{role}_observed_at_ms": int(observed_at_ms or 0),
+                f"{role}_age_ms": age_ms,
+                f"{role}_stale_after_ms": stale_after_ms,
+                f"{role}_source": source,
+            }
+            if bid <= 0.0 or ask <= bid:
+                return "invalid_bbo", payload
+            if (
+                observed_at_ms <= 0
+                or observed_at_ms > now_ms
+                or stale_after_ms <= 0
+                or age_ms is None
+                or age_ms > stale_after_ms
+            ):
+                return "stale_bbo", payload
+            return "", payload
+
+        if self._entry_readiness_provider_uses_ws_bbo():
+            stale_after_ms = self._entry_quote_lease_max_age_ms()
+            evidence["source"] = "ws_bbo_quote_lease"
+            evidence["domain"] = "ws_bbo_cache"
+
+            def _ws_quote(venue: str, role: str) -> tuple[str, dict[str, Any]]:
+                quote = self.ws_bbo_cache.get_quote(venue, symbol)
+                if quote is None:
+                    return "missing_bbo", {f"{role}_venue": venue}
+                return _valid_quote_payload(
+                    venue=venue,
+                    role=role,
+                    bid=float(getattr(quote, "bid", 0.0) or 0.0),
+                    ask=float(getattr(quote, "ask", 0.0) or 0.0),
+                    observed_at_ms=int(getattr(quote, "observed_at_ms", 0) or 0),
+                    stale_after_ms=stale_after_ms,
+                    source=str(getattr(quote, "source", "") or "ws_bbo"),
+                )
+
+            maker_reason, maker_payload = _ws_quote(maker_venue_str, "maker")
+            evidence.update(maker_payload)
+            if maker_reason:
+                return f"passive_repost_maker_{maker_reason}", evidence
+            hedge_reason, hedge_payload = _ws_quote(hedge_venue_str, "hedge")
+            evidence.update(hedge_payload)
+            if hedge_reason:
+                return f"passive_repost_hedge_{hedge_reason}", evidence
+        elif self._entry_readiness_provider_uses_local_l2():
+            stale_after_ms = self._entry_local_l2_stale_after_ms()
+            evidence["source"] = "local_l2"
+            evidence["domain"] = "local_l2_book"
+            from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
+
+            def _local_l2_quote(venue: str, role: str) -> tuple[str, dict[str, Any]]:
+                book = self.local_l2_runtime.get_book(venue, symbol)
+                if book is None:
+                    return "missing_bbo", {f"{role}_venue": venue}
+                snapshot = execution_liquidity_from_local_l2(
+                    book,
+                    max_depth=1,
+                    max_age_ms=stale_after_ms,
+                    now_ms=now_ms,
+                    require_ready=True,
+                )
+                observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+                if not snapshot.book_ready or not snapshot.bids or not snapshot.asks:
+                    status = getattr(
+                        getattr(book, "status", None),
+                        "value",
+                        str(getattr(book, "status", "") or ""),
+                    )
+                    return "stale_bbo", {
+                        f"{role}_venue": venue,
+                        f"{role}_observed_at_ms": observed_at_ms,
+                        f"{role}_book_status": status,
+                    }
+                return _valid_quote_payload(
+                    venue=venue,
+                    role=role,
+                    bid=float(snapshot.bids[0].price),
+                    ask=float(snapshot.asks[0].price),
+                    observed_at_ms=observed_at_ms,
+                    stale_after_ms=stale_after_ms,
+                    source="local_l2",
+                )
+
+            maker_reason, maker_payload = _local_l2_quote(maker_venue_str, "maker")
+            evidence.update(maker_payload)
+            if maker_reason:
+                return f"passive_repost_maker_{maker_reason}", evidence
+            hedge_reason, hedge_payload = _local_l2_quote(hedge_venue_str, "hedge")
+            evidence.update(hedge_payload)
+            if hedge_reason:
+                return f"passive_repost_hedge_{hedge_reason}", evidence
+        else:
+            return "", evidence
+
+        max_skew_ms = max(
+            int(
+                getattr(
+                    self.config.strategy,
+                    "entry_final_gate_max_skew_ms",
+                    0,
+                )
+                or 0
+            ),
+            0,
+        )
+        maker_observed_at_ms = int(evidence.get("maker_observed_at_ms", 0) or 0)
+        hedge_observed_at_ms = int(evidence.get("hedge_observed_at_ms", 0) or 0)
+        quote_skew_ms = abs(maker_observed_at_ms - hedge_observed_at_ms)
+        evidence["quote_observation_skew_ms"] = quote_skew_ms
+        evidence["quote_observation_max_skew_ms"] = max_skew_ms
+        if quote_skew_ms > max_skew_ms:
+            return "passive_repost_quote_skew_exceeded", evidence
+        return "", evidence
+
     @classmethod
     def _pending_entry_passive_post_only_attempt_limit(cls) -> int:
         """V1: passive_post_only_attempt_limit()."""
@@ -8423,40 +8868,13 @@ class LiveRuntime:
             return None
         best_bid, best_ask = quote
         side = pending.maker_side()
-        adaptive_ladder_enabled, queue_jump_enabled = (
-            self._pending_entry_passive_ladder_profile(pending.maker_venue())
-        )
-        attempt = self._pending_entry_passive_queue_jump_attempt_index(
-            attempt_index,
-            queue_jump_enabled=queue_jump_enabled,
-        )
         price = self._pending_entry_post_only_price_from_book_at_attempt(
             best_bid,
             best_ask,
             side,
-            attempt,
-            adaptive_ladder_enabled=adaptive_ladder_enabled,
+            attempt_index,
+            adaptive_ladder_enabled=False,
         )
-        price = self._pending_entry_apply_inventory_bias(
-            pending,
-            best_bid,
-            best_ask,
-            side,
-            price,
-        )
-        price = self._pending_entry_apply_edge_headroom(
-            pending,
-            best_bid,
-            best_ask,
-            side,
-            price,
-            attempt,
-        )
-        tick_size = self._pending_entry_infer_price_tick_size([best_bid, best_ask])
-        if tick_size > 0.0:
-            from lightfee.venues.common import align_passive_price_to_tick
-
-            price = align_passive_price_to_tick(price, tick_size, side)
         if math.isfinite(price) and price > 0.0:
             return price
         return fallback_price if fallback_price and fallback_price > 0 else None
@@ -8512,29 +8930,7 @@ class LiveRuntime:
         *,
         adaptive_ladder_enabled: bool,
     ) -> float:
-        fallback = best_bid if side == Side.BUY else best_ask
-        if (
-            not math.isfinite(best_bid)
-            or not math.isfinite(best_ask)
-            or best_bid <= 0.0
-            or best_ask <= 0.0
-        ):
-            return fallback
-        if best_ask <= best_bid:
-            return fallback
-
-        closest = cls._pending_entry_post_only_closest_price(best_bid, best_ask, side)
-        if attempt is None:
-            return closest
-        ladder = cls._pending_entry_passive_ladder_fractions_for_spread_bps(
-            cls._pending_entry_passive_spread_bps(best_bid, best_ask),
-            adaptive_ladder_enabled=adaptive_ladder_enabled,
-        )
-        stage_index = min(max(0, int(attempt or 0)), len(ladder) - 1)
-        fraction = ladder[stage_index]
-        if side == Side.BUY:
-            return best_bid + (closest - best_bid) * fraction
-        return best_ask - (best_ask - closest) * fraction
+        return best_bid if side == Side.BUY else best_ask
 
     @staticmethod
     def _pending_entry_post_only_closest_price(
@@ -12978,6 +13374,12 @@ class LiveRuntime:
                 },
             )
             if post_fill_decision["action"] == "unwind_first_leg":
+                if (
+                    post_fill_decision["reason"]
+                    == "pending_post_first_fill_incomplete_l2_depth_residual_repair"
+                ):
+                    await self._finalize_pending_entry(pending, entry_id, now_ms)
+                    return False
                 await self._abort_pending_entry(
                     pending,
                     entry_id,
@@ -14379,7 +14781,7 @@ class LiveRuntime:
             "blocker_family": "post_only_bbo",
             "repriced_attempted": False,
         }
-        if self._entry_readiness_provider_uses_ws_bbo():
+        if self._entry_effective_readiness_provider_uses_ws_bbo():
             stale_after_ms = self._entry_quote_lease_max_age_ms()
             payload["source"] = "ws_bbo_quote_lease"
             payload["provider"] = "ws_bbo_quote_lease"
@@ -14442,7 +14844,7 @@ class LiveRuntime:
                 return False, "would_cross_bbo", payload
             return True, "", payload
 
-        if not self._local_l2_effective_enabled():
+        if not self._entry_local_l2_effective_enabled():
             return True, "", payload
 
         book = self.local_l2_runtime.get_book(venue_str, symbol)
@@ -14842,7 +15244,7 @@ class LiveRuntime:
 
     def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
         """Sync entry-local-L2 session legs from local-L2 book readiness."""
-        if not self._local_l2_effective_enabled():
+        if not self._entry_local_l2_effective_enabled():
             return
         from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
 
@@ -15533,7 +15935,7 @@ class LiveRuntime:
             require_l2_vwap = bool(
                 quote_lease is not None
                 and self.config.runtime.mode == "live"
-                and self._local_l2_effective_enabled()
+                and self._entry_local_l2_effective_enabled()
             )
             if quote_lease is not None:
                 long_bid = float(getattr(quote_lease, "long_bid", 0.0) or 0.0)
@@ -15805,88 +16207,76 @@ class LiveRuntime:
                     "ranking_edge_bps": edge.ranking_edge_bps,
                 },
             )
+
+            def _open_interest_receipt_row(venue: str, quote) -> dict:
+                reason = str(
+                    getattr(quote, "open_interest_evidence_reason", "") or ""
+                )
+                cache_fallback = bool(
+                    getattr(quote, "open_interest_cache_fallback", False)
+                ) or "cache_fallback" in reason.lower()
+                return {
+                    "venue": venue,
+                    "canonical_symbol": symbol,
+                    "venue_symbol": str(
+                        getattr(quote, "open_interest_venue_symbol", "") or ""
+                    ),
+                    "status": str(
+                        getattr(quote, "open_interest_evidence_status", "") or ""
+                    ),
+                    "observed_at_ms": int(
+                        getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                    ),
+                    "event_at_ms": int(
+                        getattr(quote, "open_interest_event_at_ms", 0) or 0
+                    ),
+                    "received_at_ms": int(
+                        getattr(quote, "open_interest_received_at_ms", 0) or 0
+                    ),
+                    "sample_id": str(
+                        getattr(quote, "open_interest_sample_id", "") or ""
+                    ),
+                    "value_quote": getattr(quote, "open_interest", None),
+                    "raw_value": getattr(quote, "raw_open_interest", None),
+                    "raw_unit": str(
+                        getattr(quote, "raw_open_interest_unit", "") or ""
+                    ),
+                    "source": str(
+                        getattr(quote, "open_interest_source", "") or ""
+                    ),
+                    "contract_multiplier": getattr(
+                        quote,
+                        "open_interest_contract_multiplier",
+                        None,
+                    ),
+                    "conversion_mark_price": getattr(
+                        quote,
+                        "open_interest_conversion_mark_price",
+                        None,
+                    ),
+                    "open_interest_evidence_reason": reason,
+                    "reason": reason,
+                    "open_interest_cache_fallback": cache_fallback,
+                    "open_interest_cache_fallback_max_age_ms": _positive_int(
+                        getattr(
+                            quote,
+                            "open_interest_cache_fallback_max_age_ms",
+                            0,
+                        )
+                    ),
+                    "open_interest_cache_fallback_age_ms": _positive_int(
+                        getattr(
+                            quote,
+                            "open_interest_cache_fallback_age_ms",
+                            0,
+                        )
+                    ),
+                }
+
             candidate.entry_open_interest_evidence = {
                 "candidate_revision_id": candidate.candidate_revision_id,
-                "long": {
-                    "venue": long_venue,
-                    "canonical_symbol": symbol,
-                    "venue_symbol": str(
-                        getattr(long_quote, "open_interest_venue_symbol", "") or ""
-                    ),
-                    "status": str(
-                        getattr(long_quote, "open_interest_evidence_status", "") or ""
-                    ),
-                    "observed_at_ms": int(
-                        getattr(long_quote, "open_interest_observed_at_ms", 0) or 0
-                    ),
-                    "event_at_ms": int(
-                        getattr(long_quote, "open_interest_event_at_ms", 0) or 0
-                    ),
-                    "received_at_ms": int(
-                        getattr(long_quote, "open_interest_received_at_ms", 0) or 0
-                    ),
-                    "sample_id": str(
-                        getattr(long_quote, "open_interest_sample_id", "") or ""
-                    ),
-                    "value_quote": getattr(long_quote, "open_interest", None),
-                    "raw_value": getattr(long_quote, "raw_open_interest", None),
-                    "raw_unit": str(
-                        getattr(long_quote, "raw_open_interest_unit", "") or ""
-                    ),
-                    "source": str(
-                        getattr(long_quote, "open_interest_source", "") or ""
-                    ),
-                    "contract_multiplier": getattr(
-                        long_quote,
-                        "open_interest_contract_multiplier",
-                        None,
-                    ),
-                    "conversion_mark_price": getattr(
-                        long_quote,
-                        "open_interest_conversion_mark_price",
-                        None,
-                    ),
-                },
-                "short": {
-                    "venue": short_venue,
-                    "canonical_symbol": symbol,
-                    "venue_symbol": str(
-                        getattr(short_quote, "open_interest_venue_symbol", "") or ""
-                    ),
-                    "status": str(
-                        getattr(short_quote, "open_interest_evidence_status", "") or ""
-                    ),
-                    "observed_at_ms": int(
-                        getattr(short_quote, "open_interest_observed_at_ms", 0) or 0
-                    ),
-                    "event_at_ms": int(
-                        getattr(short_quote, "open_interest_event_at_ms", 0) or 0
-                    ),
-                    "received_at_ms": int(
-                        getattr(short_quote, "open_interest_received_at_ms", 0) or 0
-                    ),
-                    "sample_id": str(
-                        getattr(short_quote, "open_interest_sample_id", "") or ""
-                    ),
-                    "value_quote": getattr(short_quote, "open_interest", None),
-                    "raw_value": getattr(short_quote, "raw_open_interest", None),
-                    "raw_unit": str(
-                        getattr(short_quote, "raw_open_interest_unit", "") or ""
-                    ),
-                    "source": str(
-                        getattr(short_quote, "open_interest_source", "") or ""
-                    ),
-                    "contract_multiplier": getattr(
-                        short_quote,
-                        "open_interest_contract_multiplier",
-                        None,
-                    ),
-                    "conversion_mark_price": getattr(
-                        short_quote,
-                        "open_interest_conversion_mark_price",
-                        None,
-                    ),
-                },
+                "long": _open_interest_receipt_row(long_venue, long_quote),
+                "short": _open_interest_receipt_row(short_venue, short_quote),
             }
             repriced.append(candidate)
         if record_result:

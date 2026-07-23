@@ -83,6 +83,7 @@ def funding_rate_evidence_reason(
         return "funding_rate_sample_id_mismatch"
     return ""
 _V3_SOURCE_MODES = {
+    "single_process_entry",
     "coarse_sidecar",
     "direct_market",
     "direct_market_enriched",

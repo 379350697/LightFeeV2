@@ -106,7 +106,21 @@ class PassiveMakerRuntime:
         return self.ctx._local_l2_effective_enabled()
 
     def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
+        if self.ctx._entry_readiness_provider_uses_ws_bbo():
+            return True
+        local_l2_entry_enabled = getattr(
+            self.ctx,
+            "_entry_local_l2_effective_enabled",
+            self.ctx._local_l2_effective_enabled,
+        )
+        if not local_l2_entry_enabled():
+            return False
+        resolver = getattr(
+            self.ctx,
+            "_entry_effective_readiness_provider_uses_ws_bbo",
+            self.ctx._entry_readiness_provider_uses_ws_bbo,
+        )
+        return resolver()
 
     def _entry_quote_lease_max_age_ms(self) -> int:
         return self.ctx._entry_quote_lease_max_age_ms()
@@ -365,11 +379,11 @@ class PassiveMakerRuntime:
         local_l2_enabled = self._local_l2_effective_enabled()
         non_parity_mode = self.ctx.config.runtime.opportunity_input_mode == "non_parity"
 
-        if local_l2_enabled:
+        if self._entry_readiness_provider_uses_ws_bbo():
+            await self._maybe_tick_maker_event_ws_bbo(now_ms, pending_passive)
+        elif local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
             await self._maybe_tick_maker_event_local_l2(now_ms, pending_passive)
-        elif self._entry_readiness_provider_uses_ws_bbo():
-            await self._maybe_tick_maker_event_ws_bbo(now_ms, pending_passive)
         elif non_parity_mode:
             # --- Explicit non-parity fallback: sidecar mid-price ---
             await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
@@ -645,53 +659,126 @@ class PassiveMakerRuntime:
         max_quote_age_ms = 0
         min_quote_age_ms = 1_000_000_000
 
+        def venue_key(venue: object) -> str:
+            return venue.value if hasattr(venue, "value") else str(venue)
+
+        def read_fresh_quote(
+            *,
+            venue: str,
+            symbol: str,
+            role: str,
+            budget_ms: int,
+        ) -> tuple[str, dict[str, Any]]:
+            quote = None
+            try:
+                quote = self.ctx.ws_bbo_cache.get_quote(venue, symbol)
+            except Exception:
+                quote = None
+            if quote is None:
+                return "missing_bbo", {f"{role}_venue": venue}
+            try:
+                bid = float(getattr(quote, "bid", 0.0) or 0.0)
+                ask = float(getattr(quote, "ask", 0.0) or 0.0)
+                observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                bid = ask = 0.0
+                observed_at_ms = 0
+            age_ms = now_ms - observed_at_ms if observed_at_ms > 0 else None
+            payload = {
+                f"{role}_venue": venue,
+                f"{role}_bid": bid,
+                f"{role}_ask": ask,
+                f"{role}_observed_at_ms": observed_at_ms,
+                f"{role}_age_ms": age_ms,
+                f"{role}_stale_after_ms": budget_ms,
+                f"{role}_source": str(getattr(quote, "source", "") or "ws_bbo"),
+            }
+            if bid <= 0.0 or ask <= bid:
+                return "invalid_bbo", payload
+            if (
+                observed_at_ms <= 0
+                or observed_at_ms > now_ms
+                or budget_ms <= 0
+                or age_ms is None
+                or age_ms > budget_ms
+            ):
+                return "stale_bbo", payload
+            return "", payload
+
         for entry_id, pending in pending_passive:
             maker_leg = self._pending_maker_side(pending)
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
-            venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
-            quote = None
-            try:
-                quote = self.ctx.ws_bbo_cache.get_quote(venue_str, pending.symbol)
-            except Exception:
-                quote = None
+            hedge_venue = pending.short_venue if maker_leg == Side.BUY else pending.long_venue
+            venue_str = venue_key(maker_venue)
+            hedge_venue_str = venue_key(hedge_venue)
+            symbol = str(getattr(pending, "symbol", "") or "").upper()
             budget_ms = self._entry_quote_lease_max_age_ms()
-            bid = ask = 0.0
-            observed_at_ms = 0
-            if quote is not None:
-                try:
-                    bid = float(getattr(quote, "bid", 0.0) or 0.0)
-                    ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                    observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-                except Exception:
-                    bid = ask = 0.0
-                    observed_at_ms = 0
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            valid = bid > 0.0 and ask > bid
-            fresh = (
-                valid
-                and observed_at_ms > 0
-                and budget_ms > 0
-                and age_ms is not None
-                and age_ms <= budget_ms
+            maker_reason, maker_quote = read_fresh_quote(
+                venue=venue_str,
+                symbol=symbol,
+                role="maker",
+                budget_ms=budget_ms,
             )
-            if not fresh:
+            if maker_reason:
                 missing_quotes.append(
                     {
                         "entry_id": entry_id,
                         "venue": venue_str,
-                        "symbol": pending.symbol,
-                        "reason": (
-                            "stale_quote"
-                            if valid and age_ms is not None and budget_ms > 0 and age_ms > budget_ms
-                            else "missing_or_invalid_quote"
-                        ),
-                        "age_ms": age_ms,
-                        "budget_ms": budget_ms,
+                        "symbol": symbol,
+                        "role": "maker",
+                        "reason": maker_reason,
+                        **maker_quote,
+                    }
+                )
+                continue
+            hedge_reason, hedge_quote = read_fresh_quote(
+                venue=hedge_venue_str,
+                symbol=symbol,
+                role="hedge",
+                budget_ms=budget_ms,
+            )
+            if hedge_reason:
+                missing_quotes.append(
+                    {
+                        "entry_id": entry_id,
+                        "venue": hedge_venue_str,
+                        "symbol": symbol,
+                        "role": "hedge",
+                        "reason": hedge_reason,
+                        **hedge_quote,
                     }
                 )
                 continue
 
-            mid = (bid + ask) / 2.0
+            max_skew_ms = max(
+                int(getattr(strategy, "entry_final_gate_max_skew_ms", 0) or 0),
+                0,
+            )
+            quote_skew_ms = abs(
+                int(maker_quote.get("maker_observed_at_ms", 0) or 0)
+                - int(hedge_quote.get("hedge_observed_at_ms", 0) or 0)
+            )
+            if quote_skew_ms > max_skew_ms:
+                missing_quotes.append(
+                    {
+                        "entry_id": entry_id,
+                        "venue": venue_str,
+                        "hedge_venue": hedge_venue_str,
+                        "symbol": symbol,
+                        "role": "maker_hedge_pair",
+                        "reason": "quote_skew_exceeded",
+                        "quote_observation_skew_ms": quote_skew_ms,
+                        "quote_observation_max_skew_ms": max_skew_ms,
+                        **maker_quote,
+                        **hedge_quote,
+                    }
+                )
+                continue
+
+            bid = float(maker_quote["maker_bid"])
+            ask = float(maker_quote["maker_ask"])
+            reference_mid = (bid + ask) / 2.0
+            target_price = bid if maker_leg == Side.BUY else ask
             block_reason = self._maker_event_reprice_block_reason(pending)
             if block_reason:
                 self._block_maker_event_reprice(
@@ -699,7 +786,7 @@ class PassiveMakerRuntime:
                     pending,
                     now_ms=now_ms,
                     reason=block_reason,
-                    fallback_price=mid,
+                    fallback_price=target_price,
                 )
                 continue
             stored = self._maker_event_state.get(entry_id)
@@ -724,15 +811,19 @@ class PassiveMakerRuntime:
             supports_amend = _adapter_supports_amend(adapter)
             decision_input = PassiveOrderDecisionInput(
                 tick_size=0.1,
-                reference_mid_price=mid,
-                target_price=mid,
+                reference_mid_price=reference_mid,
+                target_price=target_price,
                 current_price=stored_price if stored_price > 0 else None,
-                target_quantity=getattr(pending, "long_quantity", 0) or 0,
+                target_quantity=(
+                    getattr(pending, "long_quantity", 0)
+                    if maker_leg == Side.BUY
+                    else getattr(pending, "short_quantity", 0)
+                ) or 0,
                 supports_amend=supports_amend,
             )
             decision = manager.decide(decision_input, now_ms)
             if decision.kind == PassiveOrderManagerDecisionType.PLACE:
-                self._maker_event_state[entry_id] = (manager, mid)
+                self._maker_event_state[entry_id] = (manager, target_price)
                 continue
             if decision.kind == PassiveOrderManagerDecisionType.COOLDOWN:
                 continue
@@ -762,20 +853,24 @@ class PassiveMakerRuntime:
                 if action == "cancel_replace":
                     manager.note_operation(now_ms)
                 result = await self._call_reprice_passive_maker_l2(
-                    pending, mid, stored_price, action, now_ms, entry_id,
+                    pending, target_price, stored_price, action, now_ms, entry_id,
                 )
                 manager.note_success(now_ms)
-                self._maker_event_state[entry_id] = (manager, mid)
+                self._maker_event_state[entry_id] = (manager, target_price)
                 pe = self.ctx.state.pending_entries.get(entry_id)
                 if pe is not None:
-                    pe.maker_price = mid
+                    pe.maker_price = target_price
                     if result.order_id:
                         pe.maker_order_id = result.order_id
                 woke_positions += 1
-                venues.add(venue_str)
-                if age_ms is not None:
-                    min_quote_age_ms = min(min_quote_age_ms, age_ms)
-                    max_quote_age_ms = max(max_quote_age_ms, age_ms)
+                venues.update({venue_str, hedge_venue_str})
+                for age_ms in (
+                    maker_quote.get("maker_age_ms"),
+                    hedge_quote.get("hedge_age_ms"),
+                ):
+                    if age_ms is not None:
+                        min_quote_age_ms = min(min_quote_age_ms, int(age_ms))
+                        max_quote_age_ms = max(max_quote_age_ms, int(age_ms))
             except Exception as e:
                 manager.note_failure(now_ms)
                 reject_reason = self._maker_event_reprice_reject_reason(e)

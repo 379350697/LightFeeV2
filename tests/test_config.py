@@ -4,6 +4,11 @@ import math
 
 import pytest
 
+from lightfee.config.compatibility import (
+    ENTRY_READINESS_PROVIDER_ON_DEMAND,
+    LEGACY_ENTRY_READINESS_PROVIDERS,
+    resolve_entry_readiness_provider,
+)
 from lightfee.config.validation import check_raw_toml_for_chillybot
 from lightfee.config.loader import load_config
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
@@ -21,6 +26,17 @@ def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
 def test_strategy_config_forecast_default_is_reachable_in_a_seven_day_8h_window():
     """There are only 21 independent 8-hour settlements in seven days."""
     assert StrategyConfig().funding_forecast_min_samples <= 21
+
+
+def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
+    cfg = StrategyConfig()
+
+    assert cfg.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+    assert cfg.entry_local_l2_primary_count == 3
+    assert cfg.shadow_entry_opportunity_count == 0
+    assert cfg.entry_quote_prewarm_extra_candidate_count == 0
+    assert cfg.maker_initial_slice_ratio == 0.25
+    assert cfg.maker_entry_max_reposts == 1
 
 
 def test_funding_canary_accepts_configurable_nonnegative_floors_and_requires_positive_notional():
@@ -88,6 +104,33 @@ def test_funding_and_spread_fee_evidence_are_separate_runtime_inputs():
     cfg.runtime.funding_fee_evidence_max_age_ms = 0
     assert (
         "runtime.funding_fee_evidence_max_age_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+
+
+def test_runtime_config_validates_entry_open_interest_controls():
+    cfg = AppConfig()
+
+    assert cfg.runtime.entry_open_interest_refresh_timeout_ms == 750
+    assert cfg.runtime.entry_open_interest_cache_fallback_max_age_ms == 30 * 60_000
+    assert not any("entry_open_interest" in issue for issue in validate_config(cfg))
+
+    cfg.runtime.entry_open_interest_refresh_timeout_ms = 0
+    assert (
+        "runtime.entry_open_interest_refresh_timeout_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_open_interest_refresh_timeout_ms = 750
+    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = 30 * 60_000 + 1
+    assert (
+        "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= 1800000"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = -1
+    assert (
+        "runtime.entry_open_interest_cache_fallback_max_age_ms must be a positive integer"
         in validate_config(cfg)
     )
 
@@ -445,13 +488,15 @@ class TestConfigLoading:
         assert len(config.symbols) >= 1
         assert config.runtime.mode == "paper"
         assert len(config.venues) >= 4
+        assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
 
     def test_loads_live_example_config(self):
         config = load_config("config/live.example.toml")
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
+        assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
 
-    def test_live_missing_entry_provider_defaults_to_ws_bbo_even_with_legacy_local_l2_flag(
+    def test_live_missing_entry_provider_defaults_to_composed_mode_even_with_local_l2_flag(
         self, tmp_path
     ):
         path = tmp_path / "live.toml"
@@ -472,11 +517,96 @@ local_l2_ws_enabled = true
 
         config = load_config(path)
 
-        assert config.strategy.entry_readiness_provider == "ws_bbo_quote_lease"
+        assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        resolution = resolve_entry_readiness_provider(
+            config.strategy.entry_readiness_provider,
+            configured=config.strategy._entry_readiness_provider_configured,
+        )
+        assert resolution.raw == ""
+        assert resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert resolution.defaulted is True
+        assert resolution.migrated is False
         assert config.strategy.local_l2_enabled is True
         assert config.strategy.local_l2_ws_enabled is True
 
-    def test_live_explicit_local_l2_provider_keeps_v1_local_l2_mode(self, tmp_path):
+    def test_loaded_live_defaulted_provider_preserves_ws_bbo_non_entry_helpers(
+        self, tmp_path
+    ):
+        """Loader provenance keeps V1 non-entry routing while entry is composed."""
+        from lightfee.core.domain import Venue
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        path = tmp_path / "live.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "live"
+
+[strategy]
+risk_monitor_enabled = true
+local_l2_enabled = true
+""",
+            encoding="utf-8",
+        )
+        config = load_config(path)
+        runtime = LiveRuntime(config)
+        now_ms = 1_000_000
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                observed_at_ms=now_ms,
+                received_at_ms=now_ms,
+                source="binance_bbo_ws",
+            )
+        )
+
+        assert runtime._entry_effective_readiness_provider_uses_ws_bbo() is True
+        assert runtime._entry_effective_readiness_provider_uses_local_l2() is True
+        assert runtime._entry_readiness_provider_uses_ws_bbo() is True
+        assert runtime._entry_readiness_provider_uses_local_l2() is False
+        assert runtime.close_runtime._resolve_ws_bbo_close_quote(
+            Venue.BINANCE,
+            "BTCUSDT",
+            now_ms=now_ms,
+        ) == (50000.0, 50010.0)
+        assert runtime.pending_entry_runtime._post_first_fill_executable_quote(
+            Venue.BINANCE,
+            "BTCUSDT",
+            now_ms,
+        ) == (
+            50000.0,
+            50010.0,
+            {
+                "venue": "binance",
+                "bid": 50000.0,
+                "ask": 50010.0,
+                "observed_at_ms": now_ms,
+                "max_age_ms": config.strategy.max_liquidity_snapshot_age_ms,
+                "source": "ws_bbo_quote_lease",
+            },
+        )
+        assert runtime.passive_maker_runtime._entry_readiness_provider_uses_ws_bbo()
+
+    def test_programmatic_composed_default_keeps_local_l2_non_entry_compatibility(self):
+        from lightfee.engine.runtime import LiveRuntime
+
+        config = AppConfig()
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        runtime = LiveRuntime(config)
+
+        assert runtime._entry_effective_readiness_provider_uses_ws_bbo() is True
+        assert runtime._entry_effective_readiness_provider_uses_local_l2() is True
+        assert runtime._entry_readiness_provider_uses_ws_bbo() is False
+        assert runtime._entry_readiness_provider_uses_local_l2() is True
+
+    def test_live_explicit_legacy_provider_retains_raw_value_and_migrates_entry_mode(self, tmp_path):
         path = tmp_path / "live.toml"
         path.write_text(
             """
@@ -496,8 +626,17 @@ local_l2_enabled = true
         config = load_config(path)
 
         assert config.strategy.entry_readiness_provider == "local_l2"
+        resolution = resolve_entry_readiness_provider(
+            config.strategy.entry_readiness_provider,
+            configured=config.strategy._entry_readiness_provider_configured,
+        )
+        assert resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert resolution.defaulted is False
+        assert resolution.migrated is True
 
-    def test_paper_missing_entry_provider_keeps_schema_default(self, tmp_path):
+    def test_paper_missing_entry_provider_defaults_to_composed_mode(self, tmp_path):
+        from lightfee.engine.runtime import LiveRuntime
+
         path = tmp_path / "paper.toml"
         path.write_text(
             """
@@ -514,7 +653,34 @@ local_l2_enabled = true
 
         config = load_config(path)
 
-        assert config.strategy.entry_readiness_provider == "local_l2"
+        assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        resolution = resolve_entry_readiness_provider(
+            config.strategy.entry_readiness_provider,
+            configured=config.strategy._entry_readiness_provider_configured,
+        )
+        assert resolution.raw == ""
+        assert resolution.defaulted is True
+
+        runtime = LiveRuntime(config)
+        assert runtime._entry_readiness_provider_uses_ws_bbo() is False
+        assert runtime._entry_readiness_provider_uses_local_l2() is True
+
+    @pytest.mark.parametrize("provider", sorted(LEGACY_ENTRY_READINESS_PROVIDERS))
+    def test_every_legacy_provider_resolves_to_composed_entry_mode(self, provider):
+        resolution = resolve_entry_readiness_provider(provider)
+
+        assert resolution.raw == provider
+        assert resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert resolution.defaulted is False
+        assert resolution.migrated is True
+
+    def test_explicit_composed_entry_provider_is_not_migrated(self):
+        resolution = resolve_entry_readiness_provider(ENTRY_READINESS_PROVIDER_ON_DEMAND)
+
+        assert resolution.raw == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert resolution.defaulted is False
+        assert resolution.migrated is False
 
     def test_retired_transfer_bias_keys_are_ignored_at_config_boundary(self, tmp_path):
         path = tmp_path / "paper.toml"
@@ -771,8 +937,8 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
-    def test_shadow_entry_opportunity_count_default_is_v1_explicit(self):
-        assert StrategyConfig().shadow_entry_opportunity_count == 2
+    def test_shadow_entry_opportunity_count_default_is_zero(self):
+        assert StrategyConfig().shadow_entry_opportunity_count == 0
 
     def test_accepts_sidecar_backed_opportunity_input_mode(self):
         config = AppConfig(symbols=["BTCUSDT"])
@@ -813,11 +979,67 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert any("entry_ws_bbo_per_venue_budget" in i for i in issues)
 
+    @pytest.mark.parametrize(
+        "provider",
+        sorted(LEGACY_ENTRY_READINESS_PROVIDERS | {ENTRY_READINESS_PROVIDER_ON_DEMAND}),
+    )
+    def test_all_effective_entry_modes_require_positive_quote_lease_and_ws_bbo_budget(
+        self,
+        provider,
+    ):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = provider
+        config.strategy.entry_quote_lease_ttl_ms = 0
+        config.strategy.entry_ws_bbo_per_venue_budget = 0
+
+        issues = validate_config(config)
+
+        assert any("entry_quote_lease_ttl_ms" in issue for issue in issues)
+        assert any("entry_ws_bbo_per_venue_budget" in issue for issue in issues)
+
     def test_ws_bbo_per_venue_budget_default_is_ten(self):
         assert StrategyConfig().entry_ws_bbo_per_venue_budget == 10
 
-    def test_entry_quote_prewarm_extra_candidate_count_default_is_twenty_four(self):
-        assert StrategyConfig().entry_quote_prewarm_extra_candidate_count == 24
+    def test_entry_quote_prewarm_extra_candidate_count_default_is_zero(self):
+        assert StrategyConfig().entry_quote_prewarm_extra_candidate_count == 0
+
+    def test_zero_disables_optional_entry_prewarm_and_shadow_scopes(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.shadow_entry_opportunity_count = 0
+        config.strategy.entry_quote_prewarm_extra_candidate_count = 0
+        config.strategy.entry_local_l2_prewarm_window_secs = 0
+        config.strategy.local_l2_short_prewarm_max_pairs = 0
+        config.strategy.local_l2_short_prewarm_max_rank = 0
+
+        issues = validate_config(config)
+
+        assert not any("prewarm" in issue or "shadow_entry" in issue for issue in issues)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        (
+            "shadow_entry_opportunity_count",
+            "entry_quote_prewarm_extra_candidate_count",
+            "entry_local_l2_prewarm_window_secs",
+            "local_l2_short_prewarm_max_pairs",
+            "local_l2_short_prewarm_max_rank",
+        ),
+    )
+    def test_negative_optional_entry_scope_is_invalid(self, field_name):
+        config = AppConfig(symbols=["BTCUSDT"])
+        setattr(config.strategy, field_name, -1)
+
+        assert any(field_name in issue for issue in validate_config(config))
+
+    @pytest.mark.parametrize("value", (True, "3", -1))
+    def test_entry_local_l2_primary_count_requires_nonnegative_integer(self, value):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_local_l2_primary_count = value
+
+        assert any(
+            "entry_local_l2_primary_count" in issue
+            for issue in validate_config(config)
+        )
 
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])

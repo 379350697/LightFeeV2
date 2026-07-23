@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from lightfee.core.domain import Venue
-from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+from lightfee.config.schema import (
+    AppConfig,
+    DirectedPairConfig,
+    PersistenceConfig,
+    RuntimeConfig,
+    StrategyConfig,
+    VenueConfig,
+)
 from lightfee.engine.market_data_runtime import (
     EntryOpenInterestRefresher,
     _targeted_open_interest_observed_proof_valid,
@@ -18,8 +25,13 @@ from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.recovery import recover_from_snapshot
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
+from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
-from lightfee.marketdata.open_interest import open_interest_sample_id
+from lightfee.marketdata.open_interest import (
+    ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+    open_interest_max_age_ms_for_evidence,
+    open_interest_sample_id,
+)
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -102,6 +114,157 @@ class CapturingEntryExecutor:
             route=ExecutionRoute.PASSIVE_INCREMENTAL,
             state=EntryState.COMPLETED,
         )
+
+
+@pytest.mark.asyncio
+async def test_single_process_entry_snapshot_uses_runtime_ws_bbo_without_handoff(
+    monkeypatch,
+):
+    config = AppConfig(
+        symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        runtime=RuntimeConfig(opportunity_input_mode="single_process_entry"),
+        strategy=StrategyConfig(entry_ws_bbo_per_venue_budget=1),
+        venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+    )
+    config.runtime.directed_pairs = [
+        DirectedPairConfig(
+            long="binance",
+            short="bybit",
+            symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        )
+    ]
+    runtime = LiveRuntime(config)
+    assert runtime.ws_bbo_data_plane._clients == {}
+    expected_snapshot = SimpleNamespace(source_mode="single_process_entry")
+    received_top_books = []
+
+    async def connect_source_frontier():
+        for index, (venue, symbol) in enumerate(
+            sorted(runtime.ws_bbo_data_plane._clients)
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=100.0 + index,
+                    ask=101.0 + index,
+                    observed_at_ms=1_000,
+                    received_at_ms=1_000,
+                    source="ws_bbo",
+                )
+            )
+        return len(runtime.ws_bbo_data_plane._clients)
+
+    monkeypatch.setattr(
+        runtime.ws_bbo_data_plane,
+        "connect_ws_streams",
+        connect_source_frontier,
+    )
+
+    class InProcessSource:
+        async def refresh_in_process_entry(self, top_books):
+            received_top_books.append(dict(top_books))
+            return expected_snapshot
+
+    runtime._in_process_entry_source = InProcessSource()
+    for name in (
+        "funding_entry_snapshot_identity",
+        "funding_entry_snapshot_manifest_path",
+        "funding_entry_snapshot_path",
+        "load_funding_entry_snapshot",
+        "load_snapshot",
+    ):
+        monkeypatch.setattr(
+            f"lightfee.engine.runtime.{name}",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"single-process path called {name}")
+            ),
+        )
+
+    assert await runtime._in_process_entry_snapshot_for_tick() is None
+    await runtime._in_process_entry_refresh_task
+    assert await runtime._in_process_entry_snapshot_for_tick() is expected_snapshot
+    await runtime._in_process_entry_refresh_task
+
+    expected_keys = {
+        (venue, symbol)
+        for venue in ("binance", "bybit")
+        for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+    }
+    assert set(runtime.ws_bbo_data_plane._clients) == expected_keys
+    assert set(received_top_books[0]) == expected_keys
+    assert len(received_top_books[0]) > config.strategy.entry_ws_bbo_per_venue_budget
+    await runtime.market_data_runtime._ensure_entry_bbo_active_for_candidates(
+        [],
+        now_ms=1_000,
+    )
+    assert set(runtime.ws_bbo_data_plane._clients) == expected_keys
+    assert runtime._entry_bbo_subscription_budgeted_keys == expected_keys
+    monkeypatch.setattr(
+        runtime,
+        "_entry_effective_readiness_provider_uses_ws_bbo",
+        lambda: False,
+    )
+    await runtime.market_data_runtime._ensure_entry_bbo_active_for_candidates(
+        [],
+        now_ms=1_001,
+    )
+    assert set(runtime.ws_bbo_data_plane._clients) == expected_keys
+    assert runtime._sidecar_snapshot_load_task is None
+
+
+@pytest.mark.asyncio
+async def test_single_process_entry_real_source_avoids_sidecar_snapshot_path():
+    from lightfee.sidecar.service import SidecarService
+
+    config = AppConfig(
+        symbols=["BTCUSDT"],
+        runtime=RuntimeConfig(opportunity_input_mode="single_process_entry"),
+        venues=[VenueConfig(venue="binance")],
+    )
+
+    class RuntimeWithoutSidecarSnapshotPath:
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        def __getattr__(self, name):
+            if name == "sidecar_snapshot_path":
+                raise AssertionError("in-process entry read sidecar_snapshot_path")
+            return getattr(self._wrapped, name)
+
+    config.runtime = RuntimeWithoutSidecarSnapshotPath(config.runtime)
+    direct_source = SidecarService(config, in_process_entry=True)
+    runtime = LiveRuntime(config)
+    source = runtime._ensure_in_process_entry_source()
+
+    assert direct_source.in_process_entry
+    assert direct_source._spread_bbo_data_plane is None
+    assert not hasattr(direct_source, "snapshot_path")
+    assert source.in_process_entry
+    assert not hasattr(source, "snapshot_path")
+    source._forecast_calibrator = None
+    assert source._ensure_forecast_calibrator() is not None
+    await direct_source.close()
+    await source.close()
+
+
+def test_single_process_entry_does_not_apply_legacy_top32_consumer_cap():
+    single_process = LiveRuntime(
+        AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(opportunity_input_mode="single_process_entry"),
+        )
+    )
+    legacy = LiveRuntime(
+        AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(opportunity_input_mode="coarse_sidecar"),
+        )
+    )
+
+    candidates = list(range(33))
+    assert single_process._entry_consumer_frontier(candidates) == candidates
+    assert legacy._entry_consumer_frontier(candidates) == candidates[:32]
 
 
 @pytest.mark.asyncio
@@ -3001,6 +3164,18 @@ def test_live_submit_oi_receipt_requires_fresh_revision_bound_two_leg_proof(tmp_
     assert reason == "entry_open_interest_evidence_stale"
     assert evidence["leg"] == "short"
 
+    candidate.entry_open_interest_evidence["short"] = {
+        **row("bybit", 60_000),
+        "open_interest_cache_fallback": True,
+        "open_interest_cache_fallback_max_age_ms": 30 * 60_000,
+        "open_interest_cache_fallback_age_ms": 40_001,
+    }
+    reason, _ = runtime.entry_dispatch_runtime._entry_open_interest_submit_reason(
+        candidate,
+        now_ms=100_001,
+    )
+    assert reason == ""
+
     candidate.entry_open_interest_evidence["short"] = row(
         "bybit",
         99_000,
@@ -3071,6 +3246,63 @@ def test_live_submit_oi_receipt_requires_fresh_revision_bound_two_leg_proof(tmp_
         now_ms=100_001,
     )
     assert reason == "entry_open_interest_evidence_unavailable"
+
+
+def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_perp_liquidity_budget_ms=30_000,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate("OIREPRICEUSDT")
+    candidate.long_venue = "okx"
+    candidate.short_venue = "bybit"
+
+    market_quotes = {}
+    for venue in ("okx", "bybit"):
+        quote = _quote_with_liquidity(
+            venue,
+            candidate.symbol,
+            volume_24h_quote=10_000_000.0,
+            open_interest=2_000_000.0,
+            observed_at_ms=100_000,
+            open_interest_observed_at_ms=60_000,
+        )
+        quote.open_interest_evidence_reason = "targeted_refresh_cache_fallback"
+        quote.open_interest_cache_fallback = True
+        quote.open_interest_cache_fallback_max_age_ms = 30 * 60_000
+        quote.open_interest_cache_fallback_age_ms = 40_001
+        market_quotes[f"{venue}:{candidate.symbol}"] = quote
+
+    repriced = runtime._reprice_entry_candidates_for_selection(
+        [candidate],
+        market_quotes=market_quotes,
+        now_ms=100_001,
+        record_result=False,
+    )
+
+    assert len(repriced) == 1
+    evidence = repriced[0].entry_open_interest_evidence
+    assert evidence["long"]["open_interest_cache_fallback"] is True
+    assert evidence["long"]["open_interest_cache_fallback_age_ms"] == 40_001
+    assert (
+        evidence["long"]["open_interest_cache_fallback_max_age_ms"]
+        == 30 * 60_000
+    )
+    assert evidence["short"]["open_interest_cache_fallback"] is True
+    assert "cache_fallback" in evidence["short"]["open_interest_evidence_reason"]
+
+    reason, _ = runtime.entry_dispatch_runtime._entry_open_interest_submit_reason(
+        repriced[0],
+        now_ms=100_001,
+    )
+    assert reason == ""
 
 
 def test_legacy_candidate_revision_changes_with_economic_observation(tmp_path):
@@ -6145,6 +6377,233 @@ def test_entry_open_interest_refresher_uses_targeted_public_budget():
 
 
 @pytest.mark.asyncio
+async def test_entry_oi_refresher_uses_valid_30m_cache_fallback_after_timeout():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    now_ms = 1_900_000
+    observed_at_ms = now_ms - (29 * 60_000)
+    cached = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="test_cached_oi",
+    )
+    refresher._cache[("binance", "BTCUSDT")] = cached
+
+    class TimeoutClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            raise asyncio.TimeoutError("request deadline")
+
+    refresher._clients["binance"] = TimeoutClient()
+    payload = await refresher.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=now_ms,
+        force_refresh=True,
+        max_age_ms=30_000,
+    )
+
+    assert payload["open_interest_evidence_status"] == "observed"
+    assert payload["open_interest_source"] == "test_cached_oi"
+    assert payload["open_interest_cache_fallback"] is True
+    assert payload["open_interest_cache_fallback_age_ms"] == 29 * 60_000
+    assert payload["open_interest_cache_fallback_max_age_ms"] == 30 * 60_000
+    assert "cache_fallback" in payload["open_interest_evidence_reason"]
+    assert (
+        refresher.cached_open_interest(
+            "binance",
+            "BTCUSDT",
+            now_ms=observed_at_ms + (30 * 60_000) + 1,
+        )
+        is None
+    )
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_cache_fallback_age_is_hard_capped_despite_marker_and_budget():
+    now_ms = 2_100_000
+    observed_at_ms = now_ms - ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS - 1
+    cached = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="test_cached_oi",
+    )
+    cached["open_interest_cache_fallback"] = True
+    cached["open_interest_cache_fallback_max_age_ms"] = 2 * 60 * 60_000
+    normal_budget_ms = 2 * 60 * 60_000
+
+    assert open_interest_max_age_ms_for_evidence(
+        cached,
+        default_max_age_ms=normal_budget_ms,
+    ) == ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    refresher._cache[("binance", "BTCUSDT")] = cached
+    assert refresher.cached_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=now_ms,
+        max_age_ms=normal_budget_ms,
+    ) is None
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_cache_fallback_honors_smaller_runtime_max_age():
+    now_ms = 2_100_000
+    observed_at_ms = now_ms - 60_001
+    cached = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="test_cached_oi",
+    )
+    cached["open_interest_cache_fallback"] = True
+    cached["open_interest_cache_fallback_max_age_ms"] = 60_000
+
+    assert (
+        open_interest_max_age_ms_for_evidence(
+            cached,
+            default_max_age_ms=ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+        )
+        == 60_000
+    )
+
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    refresher._cache[("binance", "BTCUSDT")] = cached
+    assert (
+        refresher.cached_open_interest(
+            "binance",
+            "BTCUSDT",
+            now_ms=now_ms,
+            max_age_ms=60_000,
+        )
+        is None
+    )
+    payload = refresher.cached_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=observed_at_ms + 59_999,
+        max_age_ms=60_000,
+    )
+    assert payload is not None
+    assert payload["open_interest_cache_fallback_max_age_ms"] == 60_000
+    await refresher.close()
+
+
+def test_runtime_entry_oi_refresher_uses_runtime_control_values():
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            entry_open_interest_refresh_timeout_ms=1_250,
+            entry_open_interest_cache_fallback_max_age_ms=60_000,
+        )
+    )
+    runtime = LiveRuntime(config)
+
+    refresher = runtime.market_data_runtime._entry_open_interest_refresher()
+
+    assert refresher._targeted_budget_s == pytest.approx(1.25)
+    assert (
+        runtime.market_data_runtime._entry_open_interest_cache_fallback_max_age_ms()
+        == 60_000
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_targeted_oi_refresh_timeout_uses_runtime_control(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            entry_open_interest_refresh_timeout_ms=25,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate()
+    candidate.long_venue = "binance"
+    candidate.short_venue = "aster"
+
+    class SlowOiRefresher:
+        async def refresh_open_interest(self, *args, **kwargs):
+            await asyncio.sleep(1.0)
+            return {
+                "open_interest_quote": 2_000_000.0,
+                "open_interest_evidence_status": "observed",
+            }
+
+    runtime.entry_open_interest_refresher = SlowOiRefresher()
+    snapshot = SidecarSnapshot(
+        published_at_ms=69000,
+        market_observed_at_ms=69000,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=69000,
+                volume_24h_quote=6_000_000.0,
+                open_interest=0.0,
+                open_interest_evidence_status="timeout",
+                open_interest_evidence_reason="timeout_waiting_for_oi",
+            ),
+            "aster:BTCUSDT": _quote_with_liquidity(
+                "aster",
+                "BTCUSDT",
+                volume_24h_quote=3_000_000.0,
+                open_interest=2_000_000.0,
+            ),
+        },
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="binance",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+            LiquidityLifecycle(
+                venue="aster",
+                observed_at_ms=69000,
+                symbol_count=1,
+                coverage_usable=1,
+            ),
+        ],
+        candidates=[candidate],
+    )
+
+    runtime.journal.open()
+    try:
+        started = time.monotonic()
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70000,
+        )
+        elapsed_s = time.monotonic() - started
+    finally:
+        runtime.journal.close()
+
+    assert elapsed_s < 0.5
+    assert stats["timeout_count"] == 1
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    failed = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_oi_targeted_refresh_failed"
+    )
+    assert failed["open_interest_evidence_reason"] == "entry_evidence_deadline_exceeded"
+    assert failed["elapsed_ms"] < 750
+
+
+@pytest.mark.asyncio
 async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -7080,7 +7539,10 @@ def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch)
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
         ),
-        strategy=StrategyConfig(max_liquidity_snapshot_age_ms=5000),
+            strategy=StrategyConfig(
+                max_liquidity_snapshot_age_ms=5000,
+                entry_readiness_provider="local_l2",
+            ),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),
             snapshot_path=str(tmp_path / "state.json"),

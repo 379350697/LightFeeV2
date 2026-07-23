@@ -505,9 +505,9 @@ class TestRuntimeLaneScheduling:
             assert runtime_progress["active_lane"] == "full_tick"
             assert runtime_progress["active_lane_overdue"] is False
             effective = exported["runtime_market_data_config"]
-            assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+            assert effective["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
             assert effective["local_l2_configured_enabled"] is True
-            assert effective["local_l2_effective_enabled"] is False
+            assert effective["local_l2_effective_enabled"] is True
             runtime._running = False
             await run_task
         finally:

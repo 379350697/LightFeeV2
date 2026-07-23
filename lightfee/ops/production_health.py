@@ -95,8 +95,10 @@ def analyze_systemd_unit(name: str, text: str) -> HealthReport:
         fingerprints.append("missing_environment_file")
     if (is_sidecar or is_live) and not _has_limit_nofile(text):
         fingerprints.append("missing_limit_nofile")
-    if is_live and _has_requires_unit(text, "lightfee-sidecar.service"):
+    if is_live and "lightfee-sidecar.service" in text:
         fingerprints.append("live_requires_sidecar_service")
+    if name.endswith("lightfee-spread-bbo.service") and "lightfee-sidecar.service" in text:
+        fingerprints.append("spread_bbo_requires_sidecar_service")
     if is_sidecar and "opportunity_input_sidecar" in command and "live.auto.toml" not in command:
         fingerprints.append("rust_sidecar_without_live_auto_config")
 

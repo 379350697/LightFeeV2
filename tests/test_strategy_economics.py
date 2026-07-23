@@ -17,6 +17,7 @@ from lightfee.engine.entry_dispatch_runtime import (
     _funding_canary_cohort_id,
 )
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
+from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
@@ -2655,6 +2656,81 @@ def test_live_final_entry_revalidation_fails_closed_without_complete_economics()
             },
         )
     ]
+
+
+def test_live_final_entry_revalidation_selects_executable_passive_orientation() -> None:
+    events: list[tuple[str, dict]] = []
+    strategy = StrategyConfig(
+        min_expected_edge_bps=0.0,
+        min_worst_case_edge_bps=0.0,
+    )
+    runtime = EntryDispatchRuntime(
+        SimpleNamespace(
+            config=SimpleNamespace(
+                runtime=SimpleNamespace(mode="live"),
+                strategy=strategy,
+            ),
+            journal=SimpleNamespace(
+                append=lambda kind, payload: events.append((kind, payload))
+            ),
+            _candidate_pair_id=lambda _candidate: "btcusdt:cheap->rich",
+            _local_l2_effective_enabled=lambda: True,
+        )
+    )
+    candidate = _candidate(
+        entry_maker_leg="long",
+        exit_maker_leg="",
+        entry_target_quantity=1.0,
+        entry_notional_quote=100.0,
+        entry_fee_bps=2.0,
+        exit_fee_bps=2.0,
+        long_taker_fee_bps=1.0,
+        short_taker_fee_bps=1.0,
+        taker_fee_evidence_complete=True,
+        economics_observed_at_ms=1_000,
+        model_epoch="v1_exact",
+    )
+    quote_lease = QuoteLease(
+        pair_id="btcusdt:cheap->rich",
+        symbol="BTCUSDT",
+        long_venue="cheap",
+        short_venue="rich",
+        long_bid=100.0,
+        long_ask=101.0,
+        short_bid=102.0,
+        short_ask=103.0,
+        long_observed_at_ms=1_000,
+        short_observed_at_ms=1_000,
+        created_at_ms=1_000,
+        expires_at_ms=2_000,
+        long_bid_size=1.0,
+        long_ask_size=1.0,
+        short_bid_size=1.0,
+        short_ask_size=1.0,
+        provider="local_l2_final_vwap",
+        long_buy_vwap=101.2,
+        short_sell_vwap=101.4,
+        long_buy_sweep_limit=101.2,
+        short_sell_sweep_limit=101.4,
+        long_l2_capacity_quantity=1.0,
+        short_l2_capacity_quantity=0.5,
+        l2_vwap_quantity=1.0,
+        l2_vwap_complete=False,
+    )
+
+    assert runtime._revalidate_final_entry_economics(
+        candidate=candidate,
+        quote_lease=quote_lease,
+        required_base_quantity=1.0,
+        now_ms=1_100,
+        source="final_entry_economics",
+        select_passive_maker_orientation=True,
+    )
+    assert candidate.entry_maker_leg == "short"
+    assert candidate.entry_notional_quote == pytest.approx((101.2 + 103.0) / 2.0)
+    assert events[-1][0] == "runtime.entry_passive_maker_orientation_selected"
+    assert events[-1][1]["previous_entry_maker_leg"] == "long"
+    assert events[-1][1]["selected_entry_maker_leg"] == "short"
 
 
 @pytest.mark.asyncio

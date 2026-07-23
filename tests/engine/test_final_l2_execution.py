@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from lightfee.config.schema import VenueConfig
 from lightfee.core.domain import Side, Venue
 from lightfee.engine.entry_dispatch_runtime import (
@@ -134,7 +136,7 @@ def test_truthy_quote_refresh_decision_cannot_bypass_the_stale_lease_gate() -> N
             )
         )
     )
-    runtime._entry_readiness_provider_name = lambda: "ws_bbo_quote_lease"
+    runtime._entry_readiness_provider_name = lambda: "ws_bbo_l2_on_demand"
     lease = _lease()
 
     reason, returned_lease, evidence = runtime._refresh_entry_quote_lease_for_execution(
@@ -291,3 +293,129 @@ def test_immediate_post_first_fill_decision_includes_taker_fees() -> None:
     assert decision["unwind_first_leg_loss_quote"] > decision[
         "complete_hedge_loss_quote"
     ]
+
+
+def test_immediate_post_first_fill_decision_uses_multilevel_remaining_depth() -> None:
+    books = {
+        "binance": LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[
+                PriceLevel(price=99.5, quantity=0.5),
+                PriceLevel(price=98.0, quantity=0.5),
+            ],
+            asks=[PriceLevel(price=101.0, quantity=1.0)],
+        ),
+        "bybit": LocalL2Book(
+            venue="bybit",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[
+                PriceLevel(price=99.9, quantity=0.5),
+                PriceLevel(price=99.0, quantity=0.5),
+            ],
+            asks=[PriceLevel(price=100.0, quantity=1.0)],
+        ),
+    }
+    runtime = object.__new__(EntryDispatchRuntime)
+    runtime.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=SimpleNamespace(max_liquidity_snapshot_age_ms=1_000),
+            venues=[
+                VenueConfig(venue="binance", taker_fee_bps=0.0),
+                VenueConfig(venue="bybit", taker_fee_bps=0.0),
+            ],
+        ),
+        local_l2_runtime=SimpleNamespace(get_book=lambda venue, _symbol: books[venue]),
+        _local_l2_effective_enabled=lambda: True,
+    )
+    entry = EntryContext(
+        entry_id="entry-depth-aware",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.0,
+        short_quantity=1.0,
+        long_price_hint=100.0,
+        short_price_hint=99.0,
+        maker_leg=Side.BUY,
+        entry_type=EntryType.PASSIVE_INCREMENTAL,
+    )
+
+    decision = asyncio.run(
+        runtime.decide_after_first_fill(
+            ctx=entry,
+            maker_fill=SimpleNamespace(quantity=1.0, price=100.0),
+            hedge_request=SimpleNamespace(price=99.9),
+            now_ms=1_000,
+        )
+    )
+
+    assert decision["action"] == "complete_hedge"
+    assert decision["hedge_price"] == pytest.approx(99.0)
+    assert decision["complete_hedge_price_loss_quote"] == pytest.approx(0.55)
+    assert decision["market_evidence"]["hedge_l2_vwap"] == pytest.approx(99.45)
+    assert decision["market_evidence"]["hedge_l2_complete"] is True
+
+
+def test_immediate_post_first_fill_incomplete_depth_routes_to_residual_unwind() -> None:
+    books = {
+        "binance": LocalL2Book(
+            venue="binance",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[PriceLevel(price=99.5, quantity=0.2)],
+            asks=[PriceLevel(price=101.0, quantity=0.2)],
+        ),
+        "bybit": LocalL2Book(
+            venue="bybit",
+            symbol="BTCUSDT",
+            status=L2BookStatus.HOT,
+            observed_at_ms=1_000,
+            bids=[PriceLevel(price=99.9, quantity=0.2)],
+            asks=[PriceLevel(price=100.0, quantity=0.2)],
+        ),
+    }
+    runtime = object.__new__(EntryDispatchRuntime)
+    runtime.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=SimpleNamespace(max_liquidity_snapshot_age_ms=1_000),
+            venues=[
+                VenueConfig(venue="binance", taker_fee_bps=0.0),
+                VenueConfig(venue="bybit", taker_fee_bps=0.0),
+            ],
+        ),
+        local_l2_runtime=SimpleNamespace(get_book=lambda venue, _symbol: books[venue]),
+        _local_l2_effective_enabled=lambda: True,
+    )
+    entry = EntryContext(
+        entry_id="entry-depth-incomplete",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.0,
+        short_quantity=1.0,
+        long_price_hint=100.0,
+        short_price_hint=99.9,
+        maker_leg=Side.BUY,
+        entry_type=EntryType.PASSIVE_INCREMENTAL,
+    )
+
+    decision = asyncio.run(
+        runtime.decide_after_first_fill(
+            ctx=entry,
+            maker_fill=SimpleNamespace(quantity=1.0, price=100.0),
+            hedge_request=SimpleNamespace(price=99.9),
+            now_ms=1_000,
+        )
+    )
+
+    assert decision["action"] == "unwind_first_leg"
+    assert decision["reason"] == "post_first_fill_incomplete_l2_depth_residual_repair"
+    assert decision["unwind_price"] == pytest.approx(99.5)
+    assert decision["market_evidence"]["hedge_l2_filled_base_quantity"] == pytest.approx(0.2)
+    assert decision["market_evidence"]["unwind_l2_complete"] is False
