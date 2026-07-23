@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from lightfee.config.schema import AppConfig, VenueConfig
-from lightfee.core.domain import PerpLiquiditySnapshot, Venue
+from lightfee.core.domain import Venue
 from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import (
+    funding_entry_snapshot_identity,
+    load_funding_entry_snapshot,
     load_snapshot,
     publish_funding_entry_snapshot,
     publish_snapshot,
@@ -48,7 +50,6 @@ from lightfee.spread.universe import (
 )
 from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
-from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.sidecar.spread_bbo import (
     SpreadBboDataPlane,
     quote_cache_contract_eligible as _quote_cache_contract_eligible,
@@ -60,7 +61,6 @@ from lightfee.venues.specs import get_spec
 DEFAULT_FUNDING_TIMEOUT_S = (
     30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
 )
-DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
 FUNDING_AUDIT_MIN_INTERVAL_S = 60.0
@@ -109,7 +109,6 @@ class SidecarService:
         )
         runtime = config.runtime
         self._funding_timeout_s = runtime.sidecar_funding_timeout_s
-        self._liquidity_timeout_s = runtime.sidecar_liquidity_timeout_s
         self._candidate_service = self._new_candidate_service()
         self._audit_publish_task: asyncio.Task | None = None
         self._audit_executor = ThreadPoolExecutor(
@@ -118,6 +117,7 @@ class SidecarService:
         )
         self._audit_pending_build: dict[str, object] | None = None
         self._last_audit_schedule_monotonic: float = 0.0
+        self._entry_frontier_oracle_tasks: set[asyncio.Task] = set()
         self._entry_venue_fetch_tasks: dict[str, asyncio.Task] = {}
         self._entry_venue_latest_results: dict[str, tuple] = {}
         self._entry_venue_late_tasks: set[asyncio.Task] = set()
@@ -130,12 +130,10 @@ class SidecarService:
         self._exchange_sources: dict[str, ExchangeSource] = {}
         self._funding_entry_bbo_sources: dict[str, ExchangeSource] = {}
         self._spread_bbo_sources: dict[str, ExchangeSource] = {}
-        self._liquidity_sources: dict[str, LiquiditySource] = {}
         from lightfee.venues.transport import EndpointRateLimiter
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
         self._funding_entry_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
-        self._liquidity_rate_limiters: dict[str, EndpointRateLimiter] = {}
         self._spread_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
         # V1 parity: last-good fallback cache.  Initialise before reading the
@@ -153,8 +151,7 @@ class SidecarService:
             rate_limiter = EndpointRateLimiter(1000, 8000, 50)
             self._public_rate_limiters[venue_name] = rate_limiter
             # Slow funding/contract metadata remains governed by the shared
-            # exchange budget.  Only its local cooldown is isolated from the
-            # diagnostic liquidity/OI client below.
+            # exchange budget.
             self._exchange_sources[venue_name] = ExchangeSource(
                 spec,
                 rate_limiter=rate_limiter,
@@ -196,13 +193,6 @@ class SidecarService:
                 ].share_contract_metadata_cache_from(
                     self._exchange_sources[venue_name]
                 )
-            liquidity_rate_limiter = EndpointRateLimiter(1000, 8000, 50)
-            self._liquidity_rate_limiters[venue_name] = liquidity_rate_limiter
-            self._liquidity_sources[venue_name] = LiquiditySource(
-                spec,
-                rate_limiter=liquidity_rate_limiter,
-                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-            )
 
         if not self.in_process_entry:
             # A restart must not erase a cadence that the exchange has already
@@ -282,6 +272,15 @@ class SidecarService:
                 audit_task.cancel()
             await asyncio.gather(audit_task, return_exceptions=True)
         self._audit_publish_task = None
+        frontier_oracle_tasks = list(
+            getattr(self, "_entry_frontier_oracle_tasks", set())
+        )
+        for task in frontier_oracle_tasks:
+            if not task.done():
+                task.cancel()
+        if frontier_oracle_tasks:
+            await asyncio.gather(*frontier_oracle_tasks, return_exceptions=True)
+        self._entry_frontier_oracle_tasks = set()
         audit_executor = getattr(self, "_audit_executor", None)
         if audit_executor is not None:
             # Full audit files are installed atomically and are not part of
@@ -297,7 +296,6 @@ class SidecarService:
                 list(getattr(self, "_funding_entry_bbo_sources", {}).values()),
             ),
             ("spread_bbo", list(getattr(self, "_spread_bbo_sources", {}).values())),
-            ("liquidity", list(getattr(self, "_liquidity_sources", {}).values())),
         ):
             for src in sources:
                 try:
@@ -418,7 +416,6 @@ class SidecarService:
         fresh_cacheable_quote_keys: set[str] = set()
         market_quality_failed_symbols: dict[str, set[str]] = {}
         spread_market_degraded_venues: set[str] = set()
-        quote_liquidity_by_venue: dict[str, dict[str, PerpLiquiditySnapshot]] = {}
         requested_symbol_count = len(_canonical_symbol_set(symbols))
         listed_symbols_by_venue: dict[str, set[str]] = {}
 
@@ -683,142 +680,17 @@ class SidecarService:
                 spread_market_degraded_venues.add(venue_name)
 
             if venue_quotes:
-                derived_liquidity: dict[str, PerpLiquiditySnapshot] = {}
                 for key, q in venue_quotes.items():
-                    funding_failed = (
-                        _snapshot_item_symbol(key, q) in funding_failures
-                    )
                     if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
                         q.observed_at_ms = refresh_started_at_ms
                     if not str(getattr(q, "source", "") or ""):
                         q.source = "sidecar_quote"
-                    # V5/V6 quote rows are executable evidence contracts.  A
-                    # malformed funding observation belongs in lifecycle and
-                    # degraded-symbol diagnostics, not in the strict quote
-                    # data plane disguised as a zero rate.  Liquidity remains
-                    # an independent domain and is still derived below.
-                    if not funding_failed:
+                    # The main quote source is the only broad-universe
+                    # liquidity evidence plane.  Missing OI is deliberately
+                    # handed to candidate-scoped runtime revalidation, never
+                    # to a second all-symbol audit client.
+                    if _snapshot_item_symbol(key, q) not in funding_failures:
                         quotes[key] = q
-                    oi_value = getattr(q, "open_interest", None)
-                    volume_value = getattr(q, "volume_24h_quote", None)
-                    oi_observed_at_ms = int(
-                        getattr(q, "open_interest_observed_at_ms", 0) or 0
-                    )
-                    oi_received_at_ms = int(
-                        getattr(q, "open_interest_received_at_ms", 0) or 0
-                    )
-                    if (
-                        isinstance(volume_value, (int, float))
-                        and not isinstance(volume_value, bool)
-                        and isfinite(float(volume_value))
-                        and float(volume_value) >= 0.0
-                        and isinstance(oi_value, (int, float))
-                        and not isinstance(oi_value, bool)
-                        and isfinite(float(oi_value))
-                        and float(oi_value) >= 0.0
-                        and str(
-                            getattr(q, "open_interest_evidence_status", "")
-                            or ""
-                        )
-                        == "observed"
-                        and oi_observed_at_ms > 0
-                        and oi_received_at_ms >= oi_observed_at_ms
-                        and bool(
-                            str(getattr(q, "open_interest_source", "") or "")
-                        )
-                        and bool(
-                            str(
-                                getattr(q, "open_interest_sample_id", "") or ""
-                            )
-                        )
-                    ):
-                        derived_liquidity[key] = PerpLiquiditySnapshot(
-                            venue=Venue.from_str(
-                                getattr(q, "venue", venue_name) or venue_name
-                            ),
-                            symbol=getattr(
-                                q, "symbol", key.split(":", 1)[-1]
-                            ),
-                            observed_at_ms=min(
-                                int(getattr(q, "observed_at_ms", 0) or 0),
-                                oi_observed_at_ms,
-                            ),
-                            volume_24h_quote=float(volume_value),
-                            open_interest_quote=float(oi_value),
-                            open_interest_evidence_status="observed",
-                            open_interest_evidence_reason=str(
-                                getattr(
-                                    q, "open_interest_evidence_reason", ""
-                                )
-                                or ""
-                            ),
-                            open_interest_observed_at_ms=oi_observed_at_ms,
-                            open_interest_event_at_ms=int(
-                                getattr(q, "open_interest_event_at_ms", 0) or 0
-                            ),
-                            open_interest_received_at_ms=oi_received_at_ms,
-                            open_interest_source=str(
-                                getattr(q, "open_interest_source", "") or ""
-                            ),
-                            open_interest_sample_id=str(
-                                getattr(q, "open_interest_sample_id", "") or ""
-                            ),
-                            open_interest_venue_symbol=str(
-                                getattr(q, "open_interest_venue_symbol", "")
-                                or ""
-                            ),
-                            raw_open_interest=getattr(
-                                q, "raw_open_interest", None
-                            ),
-                            raw_open_interest_unit=str(
-                                getattr(q, "raw_open_interest_unit", "") or ""
-                            ),
-                            open_interest_contract_multiplier=getattr(
-                                q, "open_interest_contract_multiplier", None
-                            ),
-                            open_interest_conversion_mark_price=getattr(
-                                q,
-                                "open_interest_conversion_mark_price",
-                                None,
-                            ),
-                        )
-                    elif _quote_requires_entry_targeted_oi_revalidation(q):
-                        # This quote has usable volume but intentionally omits
-                        # broad-universe OI.  Its strict OI proof belongs to
-                        # live admission for the selected candidate.  Keep it
-                        # in the audit's derived map so the background writer
-                        # does not immediately reintroduce the prohibited
-                        # all-symbol OI scan merely to rediscover this marker.
-                        derived_liquidity[key] = PerpLiquiditySnapshot(
-                            venue=Venue.from_str(
-                                getattr(q, "venue", venue_name) or venue_name
-                            ),
-                            symbol=getattr(
-                                q, "symbol", key.split(":", 1)[-1]
-                            ),
-                            observed_at_ms=int(
-                                getattr(q, "observed_at_ms", 0) or 0
-                            ),
-                            volume_24h_quote=float(volume_value),
-                            open_interest_evidence_status=str(
-                                getattr(
-                                    q,
-                                    "open_interest_evidence_status",
-                                    "unavailable",
-                                )
-                                or "unavailable"
-                            ),
-                            open_interest_evidence_reason=str(
-                                getattr(
-                                    q,
-                                    "open_interest_evidence_reason",
-                                    "",
-                                )
-                                or ""
-                            ),
-                        )
-                if derived_liquidity:
-                    quote_liquidity_by_venue[venue_name] = derived_liquidity
 
             funding_lifecycle.append(
                 FundingLifecycle(
@@ -918,7 +790,8 @@ class SidecarService:
         # The live entry generation must not await a seven-venue/full-symbol
         # liquidity pass.  Derive only strict proof already present on the
         # funding quotes; candidate-scoped OI is refreshed by the runtime.
-        # The full-source diagnostic fetch is coalesced into the audit writer.
+        # The background audit is CPU-only and cannot start a second market
+        # data collection pass.
         liquidity_lifecycle = _liquidity_lifecycle_from_quotes(
             configured_venues=self._configured_venue_names(),
             quotes=quotes,
@@ -1007,7 +880,6 @@ class SidecarService:
             symbols,
             observed_at_ms=candidate_build_observed_at_ms,
             diagnostics=candidate_build_diagnostics,
-            max_candidates=None,
         )
         candidate_build_diagnostics["quarantined_future_quote_count"] = len(
             future_quote_keys
@@ -1139,14 +1011,23 @@ class SidecarService:
         )
 
         if not in_process_entry:
-            # Install the bounded live-entry generation first.  The full snapshot
-            # remains the audit/compatibility surface and may be tens of megabytes;
-            # it must not define when funding-live can observe this generation.
-            await asyncio.to_thread(
+            # Install the complete V7 live-entry generation first. The full
+            # snapshot remains the audit/compatibility surface and may be tens
+            # of megabytes; it must not define when funding-live can observe
+            # this generation.
+            entry_manifest = await asyncio.to_thread(
                 publish_funding_entry_snapshot,
                 snapshot,
                 self.snapshot_path,
             )
+            if not isinstance(entry_manifest, dict):
+                entry_manifest = {}
+            generation_id = str(entry_manifest.get("generation_id", "") or "")
+            if (
+                generation_id
+                and entry_manifest.get("eligible_frontier_complete") is True
+            ):
+                self._schedule_entry_frontier_oracle(snapshot, generation_id)
             if not snapshot.quotes and not snapshot.candidates:
                 # The fail-closed unavailable artifact is tiny and contains no
                 # full candidate work. Preserve the synchronous operational
@@ -1159,15 +1040,168 @@ class SidecarService:
                     quotes=quotes,
                     symbols=symbols,
                     observed_at_ms=candidate_build_observed_at_ms,
-                    quote_liquidity_by_venue=quote_liquidity_by_venue,
-                    skip_venues=set(degraded_venues),
-                    listed_symbols_by_venue=listed_symbols_by_venue,
-                    market_quality_failed_symbols=market_quality_failed_symbols,
                 )
         return snapshot
 
+    def _schedule_entry_frontier_oracle(
+        self,
+        snapshot: SidecarSnapshot,
+        generation_id: str,
+    ) -> None:
+        """Verify every published eligible pair without delaying live entry.
+
+        Pair construction already examines the full directed universe.  This
+        independent, post-install read verifies the separate serialization and
+        manifest path did not omit, reorder, or duplicate one of those eligible
+        rows.  A discrepancy replaces the current generation with an empty,
+        explicitly incomplete frontier before another entry cycle can use it.
+        """
+        expected_ids = tuple(
+            str(candidate.pair_id or "").strip().lower()
+            for candidate in snapshot.candidates
+            if not candidate.blocked and candidate.economics_complete is True
+        )
+        if any(not pair_id for pair_id in expected_ids):
+            # Do not leave a syntactically publishable but unauditable row
+            # executable while waiting for the asynchronous transport oracle.
+            # Pair identity is the join key used by every later admission,
+            # recovery and omission check, so a missing value is itself a
+            # complete-frontier violation.
+            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
+            failed_diagnostics.update(
+                {
+                    "eligible_frontier_complete": False,
+                    "omitted_eligible_count": max(
+                        int(
+                            failed_diagnostics.get(
+                                "omitted_eligible_count",
+                                0,
+                            )
+                            or 0
+                        ),
+                        1,
+                    ),
+                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
+                    "entry_frontier_oracle_expected_count": len(expected_ids),
+                    "entry_frontier_oracle_observed_count": 0,
+                }
+            )
+            publish_funding_entry_snapshot(
+                replace(
+                    snapshot,
+                    candidate_build_diagnostics=failed_diagnostics,
+                ),
+                self.snapshot_path,
+            )
+            logger.critical(
+                "funding_entry_opportunity_omitted: eligible candidate missing pair_id"
+            )
+            return
+        task = asyncio.create_task(
+            self._verify_entry_frontier_oracle(
+                snapshot,
+                generation_id=generation_id,
+                expected_ids=expected_ids,
+            ),
+            name=f"funding-entry-frontier-oracle:{generation_id[:12]}",
+        )
+        tasks = getattr(self, "_entry_frontier_oracle_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._entry_frontier_oracle_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    async def _verify_entry_frontier_oracle(
+        self,
+        snapshot: SidecarSnapshot,
+        *,
+        generation_id: str,
+        expected_ids: tuple[str, ...],
+    ) -> None:
+        """Fail closed if the complete eligible frontier changes in transit."""
+        try:
+            identity = await asyncio.to_thread(
+                funding_entry_snapshot_identity,
+                self.snapshot_path,
+                verify_digest=True,
+            )
+            if identity is None or identity[0] != generation_id:
+                # A newer refresh is authoritative (or the manifest is already
+                # invalid and therefore fail-closed in the runtime); never let
+                # an old observer overwrite a later generation.
+                return
+            loaded = await asyncio.to_thread(
+                load_funding_entry_snapshot,
+                self.snapshot_path,
+            )
+            identity_after_load = await asyncio.to_thread(
+                funding_entry_snapshot_identity,
+                self.snapshot_path,
+                verify_digest=True,
+            )
+            if (
+                identity_after_load is None
+                or identity_after_load[0] != generation_id
+            ):
+                # The manifest advanced while the page set was being loaded.
+                # G2 is authoritative; an observer for G1 must not replace
+                # it with G1's fail-closed artifact based on a mixed read.
+                return
+            actual_ids = (
+                tuple(
+                    str(candidate.pair_id or "").strip().lower()
+                    for candidate in loaded.candidates
+                )
+                if loaded is not None
+                else ()
+            )
+            if loaded is not None and actual_ids == expected_ids:
+                return
+
+            omitted = len(set(expected_ids) - set(actual_ids))
+            unexpected = len(set(actual_ids) - set(expected_ids))
+            # A reorder or duplicate is an omission of the ordered frontier
+            # contract even when its two sets happen to match.
+            mismatch_count = max(omitted + unexpected, 1)
+            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
+            failed_diagnostics.update(
+                {
+                    "eligible_frontier_complete": False,
+                    "omitted_eligible_count": max(
+                        int(failed_diagnostics.get("omitted_eligible_count", 0) or 0),
+                        mismatch_count,
+                    ),
+                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
+                    "entry_frontier_oracle_expected_count": len(expected_ids),
+                    "entry_frontier_oracle_observed_count": len(actual_ids),
+                    "entry_frontier_oracle_reordered": (
+                        omitted == 0 and unexpected == 0
+                    ),
+                }
+            )
+            failed_snapshot = replace(
+                snapshot,
+                candidate_build_diagnostics=failed_diagnostics,
+            )
+            await asyncio.to_thread(
+                publish_funding_entry_snapshot,
+                failed_snapshot,
+                self.snapshot_path,
+            )
+            logger.critical(
+                "funding_entry_opportunity_omitted: generation=%s expected=%s observed=%s",
+                generation_id,
+                len(expected_ids),
+                len(actual_ids),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("funding entry complete-frontier oracle failed")
+
     async def refresh_entry_from_latest_cache(self) -> SidecarSnapshot:
-        """Republish the coalesced V6 view without starting public HTTP work."""
+        """Republish the coalesced V7 view without starting public HTTP work."""
         self._entry_cache_only_refresh = True
         try:
             return await self.refresh_once()
@@ -1182,12 +1216,14 @@ class SidecarService:
         quotes: dict[str, QuoteSnapshot],
         symbols: list[str],
         observed_at_ms: int,
-        quote_liquidity_by_venue: dict[str, dict[str, PerpLiquiditySnapshot]],
-        skip_venues: set[str],
-        listed_symbols_by_venue: dict[str, set[str]],
-        market_quality_failed_symbols: dict[str, set[str]],
     ) -> None:
-        """Schedule a bounded-rate audit without delaying live entry quotes."""
+        """Schedule a CPU-only full-frontier audit without new public IO.
+
+        The entry refresh owns broad-universe quote and liquidity collection.
+        This writer verifies pair construction and snapshot serialization from
+        that immutable generation; it must never replay a venue-wide OI/funding
+        fetch in the background.
+        """
         if bool(getattr(self, "_entry_cache_only_refresh", False)):
             return
         task = getattr(self, "_audit_publish_task", None)
@@ -1208,19 +1244,6 @@ class SidecarService:
             "quotes": dict(quotes),
             "symbols": list(symbols),
             "observed_at_ms": int(observed_at_ms),
-            "quote_liquidity_by_venue": {
-                venue: dict(rows)
-                for venue, rows in quote_liquidity_by_venue.items()
-            },
-            "skip_venues": set(skip_venues),
-            "listed_symbols_by_venue": {
-                venue: set(rows)
-                for venue, rows in listed_symbols_by_venue.items()
-            },
-            "market_quality_failed_symbols": {
-                venue: set(rows)
-                for venue, rows in market_quality_failed_symbols.items()
-            },
         }
         self._last_audit_schedule_monotonic = now_monotonic
         self._audit_publish_task = asyncio.create_task(
@@ -1241,103 +1264,12 @@ class SidecarService:
                 quotes = pending["quotes"]
                 symbols = pending["symbols"]
                 observed_at_ms = int(pending["observed_at_ms"])
-                liquidity_results = await self._fetch_liquidity_all_venues(
-                    symbols,
-                    timeout_s=self._liquidity_timeout_s,
-                    quote_liquidity_by_venue=pending[
-                        "quote_liquidity_by_venue"
-                    ],
-                    skip_venues=pending["skip_venues"],
-                )
-                liquidity_errors = {
-                    venue: error
-                    for venue, _rows, error, _failed in liquidity_results
-                    if error is not None
-                }
                 audit_quotes = {
                     key: replace(quote) for key, quote in quotes.items()
                 }
-                for venue, rows, error, _failed in liquidity_results:
-                    if error is not None:
-                        continue
-                    for raw_key, row in (rows or {}).items():
-                        symbol = _snapshot_item_symbol(raw_key, row)
-                        key = f"{str(venue).lower()}:{symbol}"
-                        quote = audit_quotes.get(key)
-                        if quote is None:
-                            continue
-                        volume = getattr(row, "volume_24h_quote", None)
-                        if (
-                            isinstance(volume, (int, float))
-                            and not isinstance(volume, bool)
-                            and isfinite(float(volume))
-                            and float(volume) >= 0.0
-                        ):
-                            quote.volume_24h_quote = float(volume)
-                        oi_value = getattr(row, "open_interest_quote", None)
-                        oi_observed_at_ms = int(
-                            getattr(row, "open_interest_observed_at_ms", 0) or 0
-                        )
-                        oi_received_at_ms = int(
-                            getattr(row, "open_interest_received_at_ms", 0) or 0
-                        )
-                        if (
-                            str(
-                                getattr(
-                                    row,
-                                    "open_interest_evidence_status",
-                                    "unavailable",
-                                )
-                                or "unavailable"
-                            )
-                            == "observed"
-                            and isinstance(oi_value, (int, float))
-                            and not isinstance(oi_value, bool)
-                            and isfinite(float(oi_value))
-                            and float(oi_value) >= 0.0
-                            and oi_observed_at_ms > 0
-                            and oi_received_at_ms >= oi_observed_at_ms
-                            and bool(
-                                str(
-                                    getattr(row, "open_interest_source", "")
-                                    or ""
-                                )
-                            )
-                            and bool(
-                                str(
-                                    getattr(row, "open_interest_sample_id", "")
-                                    or ""
-                                )
-                            )
-                        ):
-                            quote.open_interest = float(oi_value)
-                            for field in (
-                                "open_interest_evidence_status",
-                                "open_interest_evidence_reason",
-                                "open_interest_observed_at_ms",
-                                "open_interest_event_at_ms",
-                                "open_interest_received_at_ms",
-                                "open_interest_source",
-                                "open_interest_sample_id",
-                                "open_interest_venue_symbol",
-                                "raw_open_interest",
-                                "raw_open_interest_unit",
-                                "open_interest_contract_multiplier",
-                                "open_interest_conversion_mark_price",
-                            ):
-                                setattr(quote, field, getattr(row, field))
-                audit_liquidity_lifecycle = _liquidity_lifecycle_from_quotes(
-                    configured_venues=self._configured_venue_names(),
-                    quotes=audit_quotes,
-                    listed_symbols_by_venue=pending[
-                        "listed_symbols_by_venue"
-                    ],
-                    market_quality_failed_symbols=pending[
-                        "market_quality_failed_symbols"
-                    ],
-                    observed_at_ms=observed_at_ms,
-                    transport_errors=liquidity_errors,
-                )
+                audit_liquidity_lifecycle = [
+                    replace(row) for row in entry_snapshot.liquidity_lifecycle
+                ]
                 audit_diagnostics: dict[str, object] = {}
                 deferred_oi_targets = sorted(
                     {
@@ -1388,27 +1320,12 @@ class SidecarService:
                     )
                     or []
                 )
-                audit_degraded_venues = set(entry_snapshot.degraded_venues)
-                audit_degraded_domains = set(entry_snapshot.degraded_domains)
-                for lifecycle in audit_liquidity_lifecycle:
-                    if not str(lifecycle.degraded_reason or "").strip():
-                        continue
-                    audit_degraded_venues.add(str(lifecycle.venue))
-                    audit_degraded_domains.add("liquidity")
                 snapshot = replace(
                     entry_snapshot,
                     quotes=audit_quotes,
                     candidate_build_diagnostics=audit_diagnostics,
                     liquidity_lifecycle=audit_liquidity_lifecycle,
                     candidates=candidates,
-                    degraded_venues=sorted(audit_degraded_venues),
-                    degraded_domains=sorted(audit_degraded_domains),
-                    acquisition_mode=(
-                        "degraded_sidecar"
-                        if audit_degraded_domains
-                        and entry_snapshot.acquisition_mode == "fresh_sidecar"
-                        else entry_snapshot.acquisition_mode
-                    ),
                 )
                 await loop.run_in_executor(
                     executor,
@@ -1923,73 +1840,6 @@ class SidecarService:
         return candidate_service
 
     # ------------------------------------------------------------------
-    # Per-venue liquidity fetch (independent timeout, independent source)
-    # ------------------------------------------------------------------
-
-    async def _fetch_liquidity_all_venues(
-        self,
-        symbols: list[str],
-        timeout_s: float,
-        quote_liquidity_by_venue: Optional[dict[str, dict[str, PerpLiquiditySnapshot]]] = None,
-        skip_venues: Optional[set[str]] = None,
-    ) -> list[tuple[str, Optional[dict], Optional[Exception], set[str]]]:
-        """Fetch perp liquidity from all venues concurrently with independent timeout."""
-        quote_liquidity_by_venue = quote_liquidity_by_venue or {}
-        skip_venues = {str(venue).lower() for venue in (skip_venues or set())}
-
-        async def _fetch_one(
-            venue_name: str,
-        ) -> tuple[str, Optional[dict], Optional[Exception], set[str]]:
-            if venue_name.lower() in skip_venues:
-                return (
-                    venue_name,
-                    None,
-                    RuntimeError("liquidity skipped after market data degradation"),
-                    set(),
-                )
-            requested = _canonical_symbol_set(symbols)
-            derived = dict(quote_liquidity_by_venue.get(venue_name) or {})
-            derived_symbols = _snapshot_map_symbols(derived)
-            missing_symbols = sorted(requested - derived_symbols)
-            if derived and not missing_symbols:
-                return (venue_name, derived, None, set())
-            source = self._liquidity_sources.get(venue_name)
-            if source is None:
-                return (
-                    venue_name,
-                    derived or None,
-                    None,
-                    set(missing_symbols),
-                )
-            try:
-                result = await asyncio.wait_for(
-                    source.fetch_perp_liquidity(missing_symbols),
-                    timeout=timeout_s,
-                )
-                result = {
-                    key: value
-                    for key, value in (result or {}).items()
-                    if _snapshot_item_symbol(key, value) in requested
-                }
-                merged = {**derived, **result}
-                return (
-                    venue_name,
-                    merged,
-                    None,
-                    requested - _snapshot_map_symbols(merged),
-                )
-            except asyncio.TimeoutError:
-                return (venue_name, None, TimeoutError(f"liquidity timeout {timeout_s}s"), set())
-            except Exception as e:
-                return (venue_name, None, e, set())
-
-        results = await asyncio.gather(
-            *[_fetch_one(venue_name) for venue_name in self._configured_venue_names()],
-            return_exceptions=False,
-        )
-        return list(results)
-
-    # ------------------------------------------------------------------
     # Last-good fallback
     # ------------------------------------------------------------------
 
@@ -2462,6 +2312,12 @@ def _liquidity_lifecycle_from_quotes(
         listed = set(listed_symbols_by_venue.get(venue_key, set()))
         listed.update(str(q.symbol or "").upper() for q in venue_quotes)
         failed = set(market_quality_failed_symbols.get(venue_key, set()))
+        quoted_symbols = {
+            str(q.symbol or "").upper()
+            for q in venue_quotes
+            if str(q.symbol or "").strip()
+        }
+        unavailable_quote_symbols = (listed | failed) - quoted_symbols
         # An explicit deferred marker carries valid volume evidence and is
         # revalidated by the runtime for the candidate that reaches admission.
         # It must not be reported as a global strict-proof failure, while all
@@ -2473,6 +2329,14 @@ def _liquidity_lifecycle_from_quotes(
             reasons.append(f"transport:{type(error).__name__}:{error}"[:200])
         if failed:
             reasons.append(f"market_failed_symbols:{len(failed)}")
+        if unavailable_quote_symbols:
+            # The authoritative quote data plane intentionally excludes rows
+            # with invalid/stale funding or unusable market identity.  They
+            # remain in the listed-symbol denominator, so record that real
+            # source gap rather than publishing an unexplained coverage hole.
+            reasons.append(
+                f"liquidity_quote_unavailable:{len(unavailable_quote_symbols)}"
+            )
         if proof_missing:
             reasons.append(f"strict_liquidity_proof_missing:{proof_missing}")
         if not venue_quotes:

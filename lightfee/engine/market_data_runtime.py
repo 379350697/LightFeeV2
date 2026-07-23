@@ -44,6 +44,10 @@ def _mark_entry_evidence_domain_state(
     quote_states = coordinator.setdefault("quote", {})
     oi_states = coordinator.setdefault("open_interest", {})
     economics_states = coordinator.setdefault("economics", {})
+    selection_blocked_indices = coordinator.setdefault(
+        "selection_blocked_indices",
+        set(),
+    )
     candidate_count = int(coordinator.get("candidate_count", 0) or 0)
     validator = coordinator.get("candidate_ready_validator")
     # Validate every row whose two public evidence domains are complete.
@@ -54,15 +58,26 @@ def _mark_entry_evidence_domain_state(
             continue
         if quote_states.get(index) != "ready" or oi_states.get(index) != "ready":
             continue
-        if callable(validator) and not bool(validator(index)):
-            economics_states[index] = "failed"
-            continue
+        if callable(validator):
+            validation = validator(index)
+            if validation == "selection_blocked":
+                # The public economics proof is complete, but a later entry
+                # gate (for example the finalization window) rejects this row
+                # for the current tick.  Preserve it for final diagnostics
+                # while allowing a lower executable row to wake selection.
+                economics_states[index] = "ready"
+                selection_blocked_indices.add(index)
+                continue
+            if not bool(validation):
+                economics_states[index] = "failed"
+                continue
         economics_states[index] = "ready"
 
     ready_indices = [
         index
         for index in range(candidate_count)
         if economics_states.get(index) == "ready"
+        and index not in selection_blocked_indices
     ]
     if not ready_indices:
         return False
@@ -74,6 +89,7 @@ def _mark_entry_evidence_domain_state(
         quote_states.get(prior) == "failed"
         or oi_states.get(prior) == "failed"
         or economics_states.get(prior) == "failed"
+        or prior in selection_blocked_indices
         for prior in range(selected_index)
     ):
         return False
@@ -234,10 +250,9 @@ class EntryOpenInterestRefresher:
         self._inflight_started_at_ms: dict[tuple[str, str], int] = {}
         self._venue_semaphores: dict[str, asyncio.Semaphore] = {}
         self._cache_max_entries = 2_048
-        # Top-32 entry candidates can expose two distinct OI targets each.
-        # The per-venue semaphore below remains the transport concurrency
-        # bound; this registry cap must not discard the second half of that
-        # already-bounded candidate frontier before a different venue starts.
+        # This is a transport single-flight bound, not an opportunity-membership
+        # cap.  The caller keeps the complete eligible frontier queued and
+        # launches more targets as capacity is released.
         self._max_inflight = 64
         self._reused_count = 0
         self._deferred_count = 0
@@ -2053,7 +2068,7 @@ class MarketDataRuntime:
         if fallback_source == "last_good_sidecar":
             return True, "last_good_sidecar", evidence
         # A sidecar BBO is a ranking seed, never final execution evidence.
-        # Every Top-K leg must obtain a current WS/REST overlay so repricing
+        # Every eligible-frontier leg must obtain a current WS/REST overlay so repricing
         # and final ranking use the same quotes that authorize submit.
         return True, "entry_final_revalidation", evidence
 
@@ -2508,11 +2523,9 @@ class MarketDataRuntime:
                     error = f"{type(exc).__name__}: {exc}"[:240]
                 return key, target, result, refreshed, error
 
-            # Top-K is itself the hard bound (at most 64 legs).  Every target
-            # must start inside the same evidence generation; an additional
-            # global FIFO of eight lets four slow pairs starve every lower,
-            # otherwise profitable venue.  Venue clients still enforce their
-            # own connection-pool and rate-limit concurrency.
+            # Every complete-frontier target joins this evidence generation.
+            # Venue clients retain their own connection-pool and rate-limit
+            # concurrency; this layer imposes no candidate-membership cutoff.
             max_in_flight = max(len(unresolved), 1)
             queued_keys = list(unresolved)
             task_by_key: dict[tuple[str, str], asyncio.Task] = {}
@@ -3175,7 +3188,7 @@ class MarketDataRuntime:
 
     @staticmethod
     def _snapshot_publication_at_ms(snapshot) -> int:
-        """Use the verified V6 install watermark, with legacy compatibility."""
+        """Use the verified V7 install watermark, with legacy compatibility."""
         return int(
             getattr(snapshot, "ready_at_ms", 0)
             or getattr(snapshot, "published_at_ms", 0)
@@ -4430,10 +4443,14 @@ class MarketDataRuntime:
             queued_keys = list(target_rows)
             target_tasks: dict[tuple[str, str], asyncio.Task] = {}
             task_keys: dict[asyncio.Task, tuple[str, str]] = {}
-            # Top-K already bounds this fan-out.  Start every target so a slow
-            # venue/symbol cannot occupy a global FIFO and prevent unrelated
-            # evidence from even being requested before the 750ms deadline.
+            # Queue the complete frontier behind the refresher's transport
+            # single-flight capacity.  As each target settles, the next ranked
+            # target is launched, so capacity pressure delays lower routes
+            # instead of permanently classifying them as ineligible.
+            transport_limit = int(getattr(refresher, "_max_inflight", 0) or 0)
             max_in_flight = max(len(target_rows), 1)
+            if transport_limit > 0:
+                max_in_flight = min(max_in_flight, transport_limit)
 
             def _launch_more_targets() -> None:
                 while queued_keys and len(task_keys) < max_in_flight:
@@ -5408,16 +5425,22 @@ class MarketDataRuntime:
             "source_mode": str(getattr(snapshot, "source_mode", "") or ""),
             "acquisition_mode": str(getattr(snapshot, "acquisition_mode", "") or ""),
             "source_data_ready": candidate_diagnostics.get("source_data_ready") is True,
-            "seed_frontier_complete": (
-                candidate_diagnostics.get("seed_frontier_complete") is True
+            "eligible_frontier_complete": (
+                candidate_diagnostics.get("eligible_frontier_complete") is True
             ),
             "entry_frontier_ready": (
                 candidate_diagnostics.get("entry_frontier_ready") is True
             ),
-            "seed_frontier_count": _diagnostic_int("seed_frontier_count"),
-            "seed_pair_count": _diagnostic_int("seed_pair_count"),
-            "seed_frontier_stop_reason": str(
-                candidate_diagnostics.get("seed_frontier_stop_reason", "") or ""
+            "frontier_input_pair_count": _diagnostic_int("seed_pair_count"),
+            "pair_decision_count": _diagnostic_int("pair_decision_count"),
+            "eligible_candidate_count": _diagnostic_int(
+                "eligible_candidate_count"
+            ),
+            "omitted_eligible_count": _diagnostic_int(
+                "omitted_eligible_count"
+            ),
+            "frontier_stop_reason": str(
+                candidate_diagnostics.get("frontier_stop_reason", "") or ""
             ),
             "snapshot_path": snapshot_path,
             "config_hash": config_hash,

@@ -16,6 +16,15 @@ from lightfee.sidecar.service import SidecarService
 logger = logging.getLogger("lightfee.sidecar")
 
 
+def _next_full_refresh_deadline_s(
+    *,
+    refresh_started_at_s: float,
+    refresh_interval_s: float,
+) -> float:
+    """Schedule from refresh start, so work time does not consume freshness."""
+    return refresh_started_at_s + max(float(refresh_interval_s), 0.0)
+
+
 def _install_shutdown_handlers(
     stop_event: asyncio.Event,
     *,
@@ -56,6 +65,8 @@ async def _run(
     stop_event = asyncio.Event()
     cleanup_shutdown_handlers = install_shutdown_handlers(stop_event)
     bbo_task: asyncio.Task[None] | None = None
+    loop = asyncio.get_running_loop()
+    refresh_interval_s = max(float(refresh_interval_s), 0.0)
 
     async def refresh_once_until_stop(*, cache_only: bool = False) -> bool:
         refresh_call = (
@@ -118,16 +129,33 @@ async def _run(
             # Establish compact-snapshot ownership before the slower metadata
             # loop can publish its one-shot compatibility view.
             await asyncio.sleep(0)
+        # A full refresh's deadline is measured from its start.  The old loop
+        # slept for a full interval after refresh work completed, so a 2s
+        # refresh plus a 3s interval published at ~5s and regularly exceeded
+        # the 4s live-market freshness budget. Cache-only republish work must
+        # never postpone this periodic full-refresh deadline.
+        next_full_refresh_deadline_s = loop.time()
         cache_only_next = False
         while not stop_event.is_set():
+            cache_only_refresh = cache_only_next
+            refresh_started_at_s = loop.time()
             completed_refresh = await refresh_once_until_stop(
-                cache_only=cache_only_next
+                cache_only=cache_only_refresh
             )
             cache_only_next = False
             if stop_event.is_set():
                 break
             if not completed_refresh:
                 break
+            if not cache_only_refresh:
+                next_full_refresh_deadline_s = _next_full_refresh_deadline_s(
+                    refresh_started_at_s=refresh_started_at_s,
+                    refresh_interval_s=refresh_interval_s,
+                )
+            wait_timeout_s = max(
+                next_full_refresh_deadline_s - loop.time(),
+                0.0,
+            )
             republish_event = getattr(
                 service,
                 "entry_venue_republish_event",
@@ -146,7 +174,7 @@ async def _run(
                         waiters.add(republish_task)
                     done, _pending = await asyncio.wait(
                         waiters,
-                        timeout=refresh_interval_s,
+                        timeout=wait_timeout_s,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if republish_task is not None and republish_task in done:
@@ -168,7 +196,7 @@ async def _run(
                     waiters.add(republish_task)
                 done, _pending = await asyncio.wait(
                     waiters,
-                    timeout=refresh_interval_s,
+                    timeout=wait_timeout_s,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if republish_task is not None and republish_task in done:

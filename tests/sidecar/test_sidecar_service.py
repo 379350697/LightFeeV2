@@ -20,11 +20,17 @@ from lightfee.sidecar.service import (
     SidecarService,
     _canonical_venue_configs,
     _canonicalize_venue_quotes,
+    _liquidity_lifecycle_from_quotes,
     _market_failure_reasons,
     _quote_cache_contract_eligible,
     _restorable_prior_last_good_quotes,
 )
-from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
+from lightfee.sidecar.snapshot import (
+    CandidateInput,
+    LiquidityLifecycle,
+    QuoteSnapshot,
+    SidecarSnapshot,
+)
 
 
 def _schedule_audit_build(
@@ -38,10 +44,6 @@ def _schedule_audit_build(
         quotes={},
         symbols=[],
         observed_at_ms=snapshot.published_at_ms,
-        quote_liquidity_by_venue={},
-        skip_venues=set(),
-        listed_symbols_by_venue={},
-        market_quality_failed_symbols={},
     )
 
 
@@ -176,7 +178,7 @@ async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
     await service.refresh_once()
 
     assert builder.calls
-    assert builder.calls[0]["max_candidates"] is None
+    assert "max_candidates" not in builder.calls[0]
 
 
 @pytest.mark.asyncio
@@ -255,6 +257,37 @@ async def test_in_process_entry_never_uses_funding_snapshot_handoff(
     assert snapshot.source_mode == "single_process_entry"
     assert snapshot.acquisition_mode == "direct_market_view"
     assert builder.calls
+
+
+def test_liquidity_lifecycle_explains_source_quote_excluded_from_data_plane() -> None:
+    """Listed symbols without an executable quote must not publish a blank gap."""
+    quote = QuoteSnapshot(
+        venue="okx",
+        symbol="BTCUSDT",
+        bid=100.0,
+        ask=101.0,
+        volume_24h_quote=10_000_000.0,
+        open_interest=2_000_000.0,
+        open_interest_evidence_status="observed",
+        open_interest_observed_at_ms=10_000,
+        open_interest_event_at_ms=10_000,
+        open_interest_received_at_ms=10_000,
+        open_interest_source="okx_open_interest",
+        open_interest_sample_id="okx:BTCUSDT:10000",
+        open_interest_venue_symbol="BTC-USDT-SWAP",
+    )
+
+    lifecycle = _liquidity_lifecycle_from_quotes(
+        configured_venues=["okx"],
+        quotes={"okx:BTCUSDT": quote},
+        listed_symbols_by_venue={"okx": {"BTCUSDT", "ETHUSDT"}},
+        market_quality_failed_symbols={},
+        observed_at_ms=10_000,
+    )
+
+    assert lifecycle[0].symbol_count == 2
+    assert lifecycle[0].coverage_usable == 1
+    assert lifecycle[0].degraded_reason == "liquidity_quote_unavailable:1"
 
 
 def test_canary_conservative_tier_defers_symbol_specific_buffer_to_pairing(
@@ -602,16 +635,11 @@ async def test_audit_writer_is_nonblocking_and_drops_overlapping_generations(
     service = object.__new__(SidecarService)
     service.config = AppConfig(venues=[])
     service.snapshot_path = tmp_path / "sidecar.json"
-    service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
     service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
-    async def no_liquidity(*_args, **_kwargs):
-        return []
-
-    service._fetch_liquidity_all_venues = no_liquidity
     service._configured_venue_names = lambda: []
     started = threading.Event()
     release = threading.Event()
@@ -712,16 +740,11 @@ async def test_audit_failure_does_not_poison_next_generation(
     service = object.__new__(SidecarService)
     service.config = AppConfig(venues=[])
     service.snapshot_path = tmp_path / "sidecar.json"
-    service._liquidity_timeout_s = 0.01
     service._audit_pending_build = None
     service._audit_publish_task = None
     service._last_audit_schedule_monotonic = 0.0
     service._audit_executor = ThreadPoolExecutor(max_workers=1)
 
-    async def no_liquidity(*_args, **_kwargs):
-        return []
-
-    service._fetch_liquidity_all_venues = no_liquidity
     service._configured_venue_names = lambda: []
 
     class FailingBuilder:
@@ -768,6 +791,62 @@ async def test_audit_failure_does_not_poison_next_generation(
 
 
 @pytest.mark.asyncio
+async def test_audit_preserves_symbol_scoped_liquidity_degradation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(venues=[])
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service._audit_pending_build = None
+    service._audit_publish_task = None
+    service._last_audit_schedule_monotonic = 0.0
+    service._audit_executor = ThreadPoolExecutor(max_workers=1)
+
+    class EmptyBuilder:
+        def build(self, *_args, **_kwargs):
+            return []
+
+    published: list[SidecarSnapshot] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_snapshot",
+        lambda snapshot, _path: published.append(snapshot),
+    )
+    entry_snapshot = SidecarSnapshot(
+        published_at_ms=1,
+        liquidity_lifecycle=[
+            LiquidityLifecycle(
+                venue="okx",
+                observed_at_ms=1,
+                symbol_count=5,
+                coverage_usable=4,
+                degraded_reason="liquidity_quote_unavailable:1",
+            )
+        ],
+        degraded_venues=[],
+        degraded_domains=[],
+        degraded_symbols={"okx": ["MISSINGUSDT"]},
+    )
+
+    try:
+        _schedule_audit_build(service, entry_snapshot, EmptyBuilder())
+        task = service._audit_publish_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        service._audit_executor.shutdown(wait=True, cancel_futures=True)
+
+    assert len(published) == 1
+    audited = published[0]
+    assert audited.degraded_venues == []
+    assert audited.degraded_domains == []
+    assert audited.degraded_symbols == {"okx": ["MISSINGUSDT"]}
+    assert audited.liquidity_lifecycle[0].degraded_reason == (
+        "liquidity_quote_unavailable:1"
+    )
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_blocked_audit_without_hanging() -> None:
     service = object.__new__(SidecarService)
     service._entry_venue_fetch_tasks = {}
@@ -776,7 +855,6 @@ async def test_close_cancels_blocked_audit_without_hanging() -> None:
     service._audit_pending_build = {"snapshot": object()}
     service._exchange_sources = {}
     service._spread_bbo_sources = {}
-    service._liquidity_sources = {}
     cancelled = asyncio.Event()
 
     async def blocked_audit() -> None:
@@ -803,6 +881,113 @@ async def test_close_cancels_blocked_audit_without_hanging() -> None:
     assert service._audit_publish_task is None
     assert service._audit_pending_build is None
     assert executor.calls == [(False, True)]
+
+
+@pytest.mark.asyncio
+async def test_entry_frontier_oracle_replaces_a_transport_omission_with_fail_closed_generation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The post-install oracle must never leave an omitted route executable."""
+    service = object.__new__(SidecarService)
+    service.snapshot_path = tmp_path / "sidecar.json"
+    snapshot = SidecarSnapshot(
+        candidates=[
+            CandidateInput(
+                long_venue="binance",
+                short_venue="bybit",
+                symbol="BTCUSDT",
+                funding_diff_bps=1.0,
+                funding_edge_bps=1.0,
+                expected_edge_bps=1.0,
+                worst_case_edge_bps=1.0,
+                ranking_edge_bps=1.0,
+                pair_id="btcusdt:binance->bybit",
+                economics_complete=True,
+            )
+        ],
+        candidate_build_diagnostics={
+            "seed_pair_count": 1,
+            "pair_decision_count": 1,
+            "eligible_candidate_count": 1,
+            "omitted_eligible_count": 0,
+            "eligible_frontier_complete": True,
+            "frontier_stop_reason": "all_pairs_decided",
+        },
+    )
+    published: list[SidecarSnapshot] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.funding_entry_snapshot_identity",
+        lambda _path, *, verify_digest: ("generation-1", 1, 1),
+    )
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.load_funding_entry_snapshot",
+        lambda _path: SidecarSnapshot(candidates=[]),
+    )
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_funding_entry_snapshot",
+        lambda failed_snapshot, _path: published.append(failed_snapshot),
+    )
+
+    await service._verify_entry_frontier_oracle(
+        snapshot,
+        generation_id="generation-1",
+        expected_ids=("btcusdt:binance->bybit",),
+    )
+
+    assert len(published) == 1
+    failed = published[0].candidate_build_diagnostics
+    assert failed["eligible_frontier_complete"] is False
+    assert failed["omitted_eligible_count"] == 1
+    assert failed["frontier_stop_reason"] == "funding_entry_opportunity_omitted"
+
+
+@pytest.mark.asyncio
+async def test_entry_frontier_oracle_missing_pair_id_fails_closed_before_task_start(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """An eligible row without its identity cannot wait for async auditing."""
+    service = object.__new__(SidecarService)
+    service.snapshot_path = tmp_path / "sidecar.json"
+    service._entry_frontier_oracle_tasks = set()
+    snapshot = SidecarSnapshot(
+        candidates=[
+            CandidateInput(
+                long_venue="binance",
+                short_venue="bybit",
+                symbol="BTCUSDT",
+                funding_diff_bps=1.0,
+                funding_edge_bps=1.0,
+                expected_edge_bps=1.0,
+                worst_case_edge_bps=1.0,
+                ranking_edge_bps=1.0,
+                economics_complete=True,
+            )
+        ],
+        candidate_build_diagnostics={
+            "seed_pair_count": 1,
+            "pair_decision_count": 1,
+            "eligible_candidate_count": 1,
+            "omitted_eligible_count": 0,
+            "eligible_frontier_complete": True,
+            "frontier_stop_reason": "all_pairs_decided",
+        },
+    )
+    published: list[SidecarSnapshot] = []
+    monkeypatch.setattr(
+        "lightfee.sidecar.service.publish_funding_entry_snapshot",
+        lambda failed_snapshot, _path: published.append(failed_snapshot),
+    )
+
+    service._schedule_entry_frontier_oracle(snapshot, "generation-1")
+
+    assert service._entry_frontier_oracle_tasks == set()
+    assert len(published) == 1
+    failed = published[0].candidate_build_diagnostics
+    assert failed["eligible_frontier_complete"] is False
+    assert failed["omitted_eligible_count"] == 1
+    assert failed["frontier_stop_reason"] == "funding_entry_opportunity_omitted"
 
 
 @pytest.mark.asyncio
@@ -869,16 +1054,7 @@ async def test_future_quote_is_quarantined_before_candidate_build_and_publish(
             ),
         ]
 
-    async def liquidity_results(
-        symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None,
-    ):
-        return [
-            ("binance", {"binance:BTCUSDT": object()}, None, set()),
-            ("okx", {"okx:BTCUSDT": object()}, None, set()),
-        ]
-
     service._fetch_all_venues = funding_results
-    service._fetch_liquidity_all_venues = liquidity_results
     clock = iter([1.0, 1.5, 2.0, 3.0])
     monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
 
@@ -905,7 +1081,7 @@ def test_pairing_rejects_zero_funding_schedule_proof() -> None:
             funding_timestamp_ms=0,
             funding_interval_ms=28_800_000,
         )
-        for venue, rate in (("binance", 1.0), ("okx", 2.0))
+        for venue, rate in (("binance", 1.0), ("okx", 8.0))
     }
 
     assert build_same_symbol_pairs(
@@ -942,7 +1118,7 @@ def test_pairing_canonicalizes_duplicate_requested_symbols_once() -> None:
             funding_timestamp_ms=2_000,
             funding_interval_ms=28_800_000,
         )
-        for venue, rate in (("binance", 1.0), ("okx", 2.0))
+        for venue, rate in (("binance", 1.0), ("okx", 8.0))
     }
     diagnostics: dict[str, object] = {}
 
@@ -955,6 +1131,9 @@ def test_pairing_canonicalizes_duplicate_requested_symbols_once() -> None:
     assert len(candidates) == 1
     assert diagnostics["requested_symbol_count"] == 1
     assert diagnostics["output_candidate_count"] == 1
+    assert diagnostics["seed_pair_count"] == 2
+    assert diagnostics["pair_decision_count"] == 2
+    assert diagnostics["eligible_frontier_complete"] is True
 
 
 class TestSidecarPairingV2:
@@ -1041,7 +1220,7 @@ class TestSidecarPairingV2:
         q = {
             "binance:btcusdt": QuoteSnapshot(
                 venue="binance", symbol="BTCUSDT",
-                bid=50000, ask=50001, funding_rate_bps=5.0,
+                bid=50000, ask=50001, funding_rate_bps=-10.0,
                 funding_timestamp_ms=1700000000000,
                 funding_interval_ms=28_800_000,
             ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import combinations
 import hashlib
 import math
 import json
@@ -379,7 +380,7 @@ def test_opportunity_lease_tags_settlement_time_by_leg() -> None:
     assert opportunity_lease_id(**kwargs) != baseline
 
 
-def test_bounded_candidate_build_cannot_prune_cross_driven_global_best() -> None:
+def test_full_pairing_reaches_real_opportunity_after_high_surface_blockers() -> None:
     quotes: dict[str, QuoteSnapshot] = {}
     symbols = [f"BAD{index}USDT" for index in range(300)] + ["SPECIALUSDT"]
 
@@ -427,43 +428,61 @@ def test_bounded_candidate_build_cannot_prune_cross_driven_global_best() -> None
 
     for symbol in symbols[:-1]:
         quotes[f"cheap:{symbol}"] = quote(
-            "cheap", symbol, bid=99.99, ask=100.0, funding_rate_bps=0.0
+            "cheap", symbol, bid=129.99, ask=130.0, funding_rate_bps=0.0
         )
         quotes[f"rich:{symbol}"] = quote(
-            "rich", symbol, bid=100.01, ask=100.02, funding_rate_bps=100.0
+            "rich", symbol, bid=100.0, ask=100.01, funding_rate_bps=100.0
         )
     quotes["cheap:SPECIALUSDT"] = quote(
         "cheap", "SPECIALUSDT", bid=99.99, ask=100.0, funding_rate_bps=0.0
     )
     quotes["rich:SPECIALUSDT"] = quote(
-        "rich", "SPECIALUSDT", bid=130.0, ask=130.01, funding_rate_bps=1.0
+        "rich", "SPECIALUSDT", bid=100.2, ask=100.21, funding_rate_bps=20.0
     )
     kwargs = {
+        "strategy": StrategyConfig(
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
+        ),
         "venue_fee_bps": {"cheap": 1.0, "rich": 1.0},
         "venue_maker_fee_bps": {"cheap": 1.0, "rich": 1.0},
         "observed_at_ms": 1_000,
     }
 
-    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
     diagnostics: dict[str, object] = {}
-    bounded = build_same_symbol_pairs(
+    candidates = build_same_symbol_pairs(
         quotes,
         symbols,
-        max_candidates=32,
         diagnostics=diagnostics,
         **kwargs,
     )
+    eligible = [
+        row for row in candidates if not row.blocked and row.economics_complete
+    ]
 
-    assert full[0].symbol == "SPECIALUSDT"
-    assert bounded[0].symbol == full[0].symbol
-    assert bounded[0].ranking_edge_bps == pytest.approx(full[0].ranking_edge_bps)
-    assert len(bounded) == 32
-    assert diagnostics["seed_pair_count"] > 256
-    assert diagnostics["seed_frontier_count"] <= 64
-    assert diagnostics["seed_bound_violation"] is False
+    assert [row.symbol for row in eligible] == ["SPECIALUSDT"]
+    assert diagnostics["seed_pair_count"] == len(symbols) * 2
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == 1
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
+    assert len(diagnostics["pair_decisions"]) == diagnostics["seed_pair_count"]
+    decisions = {
+        row["pair_id"]: row for row in diagnostics["pair_decisions"]
+    }
+    assert decisions["specialusdt:cheap->rich"]["decision"] == "eligible"
+    assert decisions["bad0usdt:cheap->rich"] == {
+        "pair_id": "bad0usdt:cheap->rich",
+        "decision": "blocked",
+        "blocked_reasons": ["expected_edge_below_floor", "worst_case_edge_below_floor"],
+    }
 
 
-def test_bounded_candidate_build_keeps_seven_venue_frontier_under_500ms() -> None:
+def test_full_pairing_decides_seven_venue_universe_under_500ms() -> None:
     quotes: dict[str, QuoteSnapshot] = {}
     venues = [f"venue{index}" for index in range(7)]
     symbols = [f"S{index}USDT" for index in range(216)]
@@ -508,28 +527,38 @@ def test_bounded_candidate_build_keeps_seven_venue_frontier_under_500ms() -> Non
     candidates = build_same_symbol_pairs(
         quotes,
         symbols,
+        strategy=StrategyConfig(
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
+        ),
         venue_fee_bps={venue: 1.0 for venue in venues},
         venue_maker_fee_bps={venue: 1.0 for venue in venues},
         observed_at_ms=1_000,
-        max_candidates=32,
         diagnostics=diagnostics,
     )
     elapsed_s = time.perf_counter() - started
 
-    assert len(candidates) == 32
-    assert diagnostics["seed_pair_count"] == 216 * 21
-    assert diagnostics["seed_frontier_count"] <= 64
-    assert diagnostics["seed_bound_violation"] is False
+    assert len(candidates) == len(symbols)
+    assert all(not row.blocked and row.economics_complete for row in candidates)
+    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == len(symbols)
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
     assert elapsed_s <= 0.5
 
 
-def test_bounded_canary_frontier_treats_uncovered_symbols_as_conservative() -> None:
+def test_full_canary_frontier_treats_uncovered_symbols_as_conservative() -> None:
     quotes: dict[str, QuoteSnapshot] = {}
     venues = [f"venue{index}" for index in range(7)]
     symbols = [f"C{index}USDT" for index in range(96)]
     for symbol_index, symbol in enumerate(symbols):
         reference = 100.0 + symbol_index / 100.0
         for venue_index, venue in enumerate(venues):
+            rate_bps = 0.0 if venue_index == 0 else float(24 + venue_index)
             quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
                 venue=venue,
                 symbol=symbol,
@@ -537,13 +566,13 @@ def test_bounded_canary_frontier_treats_uncovered_symbols_as_conservative() -> N
                 ask=reference + 0.01,
                 bid_size=10.0,
                 ask_size=10.0,
-                funding_rate_bps=float(venue_index),
+                funding_rate_bps=rate_bps,
                 funding_rate_observed_at_ms=1_000,
                 funding_rate_event_at_ms=1_000,
                 funding_rate_received_at_ms=1_000,
                 funding_rate_source="test_fixture",
                 funding_rate_sample_id=(
-                    f"funding:{venue}:{symbol}:1000:{float(venue_index):.17g}:100000"
+                    f"funding:{venue}:{symbol}:1000:{rate_bps:.17g}:100000"
                 ),
                 funding_timestamp_ms=100_000,
                 funding_interval_ms=28_800_000,
@@ -583,9 +612,18 @@ def test_bounded_canary_frontier_treats_uncovered_symbols_as_conservative() -> N
     kwargs = {
         "strategy": StrategyConfig(
             funding_canary_enabled=True,
+            funding_canary_allowed_venues=venues,
             funding_canary_require_account_fee_evidence=False,
             funding_canary_conservative_fee_buffer_bps=2.0,
             funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+            funding_canary_min_expected_net_edge_bps=-100.0,
+            funding_canary_min_worst_case_edge_bps=-100.0,
+            min_funding_edge_bps=30.0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
         ),
         "venue_fee_bps": {venue: 1.0 for venue in venues},
         "venue_maker_fee_bps": {venue: 0.5 for venue in venues},
@@ -595,36 +633,31 @@ def test_bounded_canary_frontier_treats_uncovered_symbols_as_conservative() -> N
         "observed_at_ms": 1_000,
     }
 
-    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
     diagnostics: dict[str, object] = {}
     started = time.perf_counter()
-    bounded = build_same_symbol_pairs(
+    candidates = build_same_symbol_pairs(
         quotes,
         symbols,
-        max_candidates=32,
         diagnostics=diagnostics,
         **kwargs,
     )
     elapsed_s = time.perf_counter() - started
-    full_top32 = [row for row in full if not row.blocked and row.economics_complete][
-        :32
-    ]
 
-    assert len(bounded) == len(full_top32) == 32
-    assert all(not row.blocked and row.economics_complete for row in bounded)
-    assert [row.pair_id for row in bounded] == [row.pair_id for row in full_top32]
-    assert [row.ranking_edge_bps for row in bounded] == pytest.approx(
-        [row.ranking_edge_bps for row in full_top32]
-    )
+    assert len(candidates) == len(symbols)
+    assert all(not row.blocked and row.economics_complete for row in candidates)
     assert all(
-        row.funding_canary_fee_assurance_tier == "conservative" for row in bounded
+        row.funding_canary_fee_assurance_tier == "conservative"
+        for row in candidates
     )
-    assert diagnostics["seed_frontier_complete"] is True
-    assert diagnostics["seed_frontier_count"] <= 64
+    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == len(symbols)
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
     assert elapsed_s <= 0.5
 
 
-def test_bounded_canary_frontier_excludes_final_quantity_below_pair_minimum() -> None:
+def test_full_canary_frontier_excludes_final_quantity_below_pair_minimum() -> None:
     def quote(
         *,
         venue: str,
@@ -705,9 +738,17 @@ def test_bounded_canary_frontier_excludes_final_quantity_below_pair_minimum() ->
     kwargs = {
         "strategy": StrategyConfig(
             funding_canary_enabled=True,
+            funding_canary_allowed_venues=["long", "short"],
             funding_canary_require_account_fee_evidence=False,
             funding_canary_conservative_fee_buffer_bps=2.0,
             funding_canary_conservative_fee_max_entry_notional_quote=15.0,
+            funding_canary_min_expected_net_edge_bps=-100.0,
+            funding_canary_min_worst_case_edge_bps=-100.0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
         ),
         "venue_fee_bps": {"long": 1.0, "short": 1.0},
         "observed_at_ms": 1_000,
@@ -719,32 +760,29 @@ def test_bounded_canary_frontier_excludes_final_quantity_below_pair_minimum() ->
         **kwargs,
     )
     thin = next(row for row in full if row.symbol == "THINUSDT")
-    full_top1 = [row for row in full if not row.blocked and row.economics_complete][
-        :1
-    ]
     diagnostics: dict[str, object] = {}
-    bounded = build_same_symbol_pairs(
+    complete = build_same_symbol_pairs(
         quotes,
         ["THINUSDT", "GOODUSDT"],
-        max_candidates=1,
         diagnostics=diagnostics,
         **kwargs,
     )
-    bounded_viable = [
-        row for row in bounded if not row.blocked and row.economics_complete
+    complete_viable = [
+        row for row in complete if not row.blocked and row.economics_complete
     ]
 
     assert thin.blocked is True
     assert thin.economics_complete is False
     assert "entry_pair_minimum_not_met" in thin.blocked_reasons
-    assert [row.pair_id for row in bounded_viable] == [
-        row.pair_id for row in full_top1
-    ]
-    assert [row.symbol for row in bounded_viable] == ["GOODUSDT"]
-    assert diagnostics["seed_frontier_complete"] is True
+    assert [row.symbol for row in complete_viable] == ["GOODUSDT"]
+    assert diagnostics["seed_pair_count"] == 4
+    assert diagnostics["pair_decision_count"] == 4
+    assert diagnostics["eligible_candidate_count"] == 1
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
 
 
-def test_bounded_candidate_build_fails_closed_at_exact_work_budget() -> None:
+def test_full_pairing_never_stops_at_an_exact_work_budget() -> None:
     venues = [f"venue{index}" for index in range(7)]
     symbols = [f"B{index}USDT" for index in range(8)]
     quotes = {
@@ -790,26 +828,29 @@ def test_bounded_candidate_build_fails_closed_at_exact_work_budget() -> None:
         quotes,
         symbols,
         strategy=StrategyConfig(
-            entry_notional_cap_quote=0.0,
-            live_entry_notional_cap_quote=0.0,
-            funding_missing_margin_fallback_notional_quote=0.0,
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
         ),
         venue_fee_bps={venue: 1.0 for venue in venues},
         venue_maker_fee_bps={venue: 1.0 for venue in venues},
         observed_at_ms=1_000,
-        max_candidates=8,
         diagnostics=diagnostics,
     )
 
-    assert candidates == []
-    assert diagnostics["seed_pair_count"] == len(symbols) * 21
-    assert diagnostics["seed_frontier_limit"] == 16
-    assert diagnostics["seed_frontier_count"] == 16
-    assert diagnostics["seed_frontier_complete"] is False
-    assert diagnostics["seed_frontier_stop_reason"] == "exact_frontier_limit_reached"
+    assert len(candidates) == len(symbols)
+    assert all(not row.blocked and row.economics_complete for row in candidates)
+    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == len(symbols)
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
 
 
-def test_enhanced_live_signed_bound_keeps_large_frontier_bounded() -> None:
+def test_enhanced_live_decides_every_direction_without_candidate_cap() -> None:
     venues = [f"venue{index}" for index in range(7)]
     symbols = [f"E{index}USDT" for index in range(80)]
     quotes: dict[str, QuoteSnapshot] = {}
@@ -871,17 +912,17 @@ def test_enhanced_live_signed_bound_keeps_large_frontier_bounded() -> None:
         venue_fee_bps={venue: 1.0 for venue in venues},
         venue_maker_fee_bps={venue: 1.0 for venue in venues},
         observed_at_ms=10_000,
-        max_candidates=32,
         diagnostics=diagnostics,
     )
 
-    assert len(candidates) == 32
-    assert all(not row.blocked and row.economics_complete for row in candidates)
+    assert len(candidates) == len(symbols) * 7 * 6
+    assert all(row.blocked for row in candidates)
     assert diagnostics["seed_pair_count"] == len(symbols) * 42
-    assert diagnostics["seed_frontier_count"] <= 64
-    assert diagnostics["seed_bound_violation"] is False
-    assert diagnostics["seed_frontier_complete"] is True
-    assert diagnostics["seed_frontier_stop_reason"] == "remaining_upper_bounds_dominated"
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == 0
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
 
 
 @pytest.mark.parametrize(
@@ -893,7 +934,7 @@ def test_enhanced_live_signed_bound_keeps_large_frontier_bounded() -> None:
         (53, "enhanced_live", False),
     ],
 )
-def test_bounded_candidate_build_matches_randomized_full_top32(
+def test_full_pairing_matches_randomized_pairwise_oracle(
     seed: int,
     economics_mode: str,
     passive_execution_enabled: bool,
@@ -969,30 +1010,50 @@ def test_bounded_candidate_build_matches_randomized_full_top32(
         "observed_at_ms": 10_000,
     }
 
-    full = build_same_symbol_pairs(quotes, symbols, **kwargs)
     diagnostics: dict[str, object] = {}
-    bounded = build_same_symbol_pairs(
+    full = build_same_symbol_pairs(
         quotes,
         symbols,
         diagnostics=diagnostics,
-        max_candidates=32,
         **kwargs,
     )
-    full_top32 = [
+    full_eligible = [
         row for row in full if not row.blocked and row.economics_complete
-    ][:32]
-    bounded_top32 = [
-        row for row in bounded if not row.blocked and row.economics_complete
-    ][:32]
-
-    assert [row.pair_id for row in bounded_top32] == [
-        row.pair_id for row in full_top32
     ]
-    assert [row.ranking_edge_bps for row in bounded_top32] == pytest.approx(
-        [row.ranking_edge_bps for row in full_top32]
+    oracle_rows: list[CandidateInput] = []
+    for symbol in symbols:
+        symbol_quotes = [quotes[f"{venue}:{symbol}"] for venue in venues]
+        for left, right in combinations(symbol_quotes, 2):
+            oracle_rows.extend(
+                build_same_symbol_pairs(
+                    {
+                        f"{left.venue}:{symbol}": left,
+                        f"{right.venue}:{symbol}": right,
+                    },
+                    [symbol],
+                    **kwargs,
+                )
+            )
+    oracle_eligible = sorted(
+        (
+            row
+            for row in oracle_rows
+            if not row.blocked and row.economics_complete
+        ),
+        key=lambda row: (-row.ranking_edge_bps, row.pair_id),
     )
-    assert diagnostics["seed_bound_violation"] is False
-    assert diagnostics["seed_frontier_complete"] is True
+
+    assert [row.pair_id for row in full_eligible] == [
+        row.pair_id for row in oracle_eligible
+    ]
+    assert [row.ranking_edge_bps for row in full_eligible] == pytest.approx(
+        [row.ranking_edge_bps for row in oracle_eligible]
+    )
+    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
+    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
+    assert diagnostics["eligible_candidate_count"] == len(full_eligible)
+    assert diagnostics["omitted_eligible_count"] == 0
+    assert diagnostics["eligible_frontier_complete"] is True
 
 
 def test_edge_breakdown_has_one_expected_and_worst_formula() -> None:
@@ -1343,7 +1404,7 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
             symbol="BTCUSDT",
             bid=100.0,
             ask=101.0,
-            funding_rate_bps=5.0,
+            funding_rate_bps=8.0,
             funding_timestamp_ms=2_000,
             funding_interval_ms=28_800_000,
             observed_at_ms=1_000,
@@ -1361,7 +1422,13 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
         == []
     )
     assert diagnostics["future_input_quote_count"] == 1
-    assert diagnostics["rejection_counts"] == {"quote_after_candidate_watermark": 1}
+    assert diagnostics["rejection_counts"] == {
+        "funding_edge_below_floor": 1,
+        "quote_after_candidate_watermark": 1,
+    }
+    assert diagnostics["seed_pair_count"] == 2
+    assert diagnostics["pair_decision_count"] == 2
+    assert diagnostics["eligible_frontier_complete"] is True
 
 
 def test_funding_forecast_worst_case_uses_short_lower_and_long_upper_bounds() -> None:
@@ -2527,8 +2594,13 @@ def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
         ["SOLUSDT"],
         strategy=StrategyConfig(
             funding_canary_enabled=True,
+            funding_canary_allowed_venues=["cheap", "rich"],
             funding_canary_require_account_fee_evidence=False,
             funding_canary_conservative_fee_buffer_bps=2.0,
+            min_expected_edge_bps=-10_000.0,
+            min_worst_case_edge_bps=-10_000.0,
+            funding_canary_min_expected_net_edge_bps=-10_000.0,
+            funding_canary_min_worst_case_edge_bps=-10_000.0,
         ),
         venue_fee_bps={"cheap": 1.0, "rich": 1.0},
         venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},

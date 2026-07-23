@@ -1521,8 +1521,8 @@ class EngineState:
     runtime_progress: dict[str, Any] = field(default_factory=dict)
     runtime_market_data_config: dict[str, Any] = field(default_factory=dict)
     v1_lifecycle_closure: dict[str, Any] = field(default_factory=dict)
-    # Bounded durable lease tombstones prevent a stable funding opportunity
-    # from receiving a fresh hard-expiry budget after every process restart.
+    # Legacy pre-evidence candidate-lease tombstones. Recovery reads this only
+    # to clear old snapshots; live admission never restores it as a gate.
     entry_opportunity_lease_ledger: dict[str, dict[str, int]] = field(
         default_factory=dict
     )

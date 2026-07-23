@@ -405,7 +405,10 @@ class EntryLocalL2SessionRuntime:
         session = self.get_or_create_session(opp.pair_id)
         session.ensure_leg(opp.long_venue, opp.symbol)
         session.ensure_leg(opp.short_venue, opp.symbol)
-        if opp.class_ == TrackedOpportunityClass.PRIMARY:
+        if (
+            opp.class_ == TrackedOpportunityClass.PRIMARY
+            and session.primary_assigned_at_ms <= 0
+        ):
             session.primary_assigned_at_ms = now_ms
         return session
 
@@ -435,34 +438,73 @@ def make_candidate_pair_id(symbol: str, long_venue: str, short_venue: str) -> st
 
 
 def select_tracked_opportunities(
-    candidates: list, primary_count: int, shadow_count: int
+    candidates: list,
+    primary_count: int,
+    shadow_count: int,
+    *,
+    primary_excluded_pair_ids: set[str] | None = None,
 ) -> list[TrackedOpportunity]:
-    """Select primary and shadow tracked opportunities from candidates.
+    """Allocate a bounded L2 resource window from the complete frontier.
 
-    Top primary_count become PRIMARY, next shadow_count become SHADOW.
-    Uses stable pair_id from make_candidate_pair_id() when candidate lacks one.
+    Primary slots are symbol-unique so duplicate routes cannot monopolize the
+    scarce HOT_EXEC pool.  Remaining ranked routes, including alternatives for
+    an already-primary symbol, stay eligible for the shadow window.  A caller
+    may temporarily exclude faulted or lease-expired routes from primary
+    ownership without removing them from the complete opportunity frontier.
     """
-    tracked_count = primary_count + shadow_count
-    result: list[TrackedOpportunity] = []
-    for i, c in enumerate(candidates[:tracked_count]):
-        class_ = (
-            TrackedOpportunityClass.PRIMARY if i < primary_count
-            else TrackedOpportunityClass.SHADOW
-        )
-        symbol = getattr(c, "symbol", "")
-        long_venue = str(getattr(c, "long_venue", ""))
-        short_venue = str(getattr(c, "short_venue", ""))
-        pair_id = getattr(c, "pair_id", None)
+    source_candidates = list(candidates or [])
+    excluded = set(primary_excluded_pair_ids or set())
+    normalized: list[tuple[object, str, str, str, str]] = []
+    seen_pair_ids: set[str] = set()
+    for candidate in source_candidates:
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        long_venue = str(getattr(candidate, "long_venue", "") or "")
+        short_venue = str(getattr(candidate, "short_venue", "") or "")
+        pair_id = str(getattr(candidate, "pair_id", "") or "")
         if not pair_id:
             pair_id = make_candidate_pair_id(symbol, long_venue, short_venue)
-        result.append(TrackedOpportunity(
-            pair_id=pair_id,
-            symbol=symbol,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            ranking_edge_bps=getattr(c, "ranking_edge_bps", 0.0),
-            class_=class_,
-        ))
+        if not pair_id or pair_id in seen_pair_ids:
+            continue
+        seen_pair_ids.add(pair_id)
+        normalized.append((candidate, pair_id, symbol, long_venue, short_venue))
+
+    selected_primary_ids: set[str] = set()
+    primary_symbols: set[str] = set()
+    primary_rows: list[tuple[object, str, str, str, str]] = []
+    for row in normalized:
+        _candidate, pair_id, symbol, _long_venue, _short_venue = row
+        symbol_key = symbol.upper()
+        if pair_id in excluded or not symbol_key or symbol_key in primary_symbols:
+            continue
+        primary_rows.append(row)
+        selected_primary_ids.add(pair_id)
+        primary_symbols.add(symbol_key)
+        if len(primary_rows) >= max(int(primary_count), 0):
+            break
+
+    shadow_rows: list[tuple[object, str, str, str, str]] = []
+    for row in normalized:
+        _candidate, pair_id, _symbol, _long_venue, _short_venue = row
+        if pair_id in selected_primary_ids:
+            continue
+        shadow_rows.append(row)
+        if len(shadow_rows) >= max(int(shadow_count), 0):
+            break
+
+    result: list[TrackedOpportunity] = []
+    for class_, rows in (
+        (TrackedOpportunityClass.PRIMARY, primary_rows),
+        (TrackedOpportunityClass.SHADOW, shadow_rows),
+    ):
+        for candidate, pair_id, symbol, long_venue, short_venue in rows:
+            result.append(TrackedOpportunity(
+                pair_id=pair_id,
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                ranking_edge_bps=getattr(candidate, "ranking_edge_bps", 0.0),
+                class_=class_,
+            ))
     return result
 
 

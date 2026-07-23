@@ -115,13 +115,8 @@ def _stub_auxiliary_market_sources(service) -> None:
     async def empty_bbo(_symbols):
         return {}
 
-    async def empty_liquidity(_symbols):
-        return {}
-
     for source in service._funding_entry_bbo_sources.values():
         source.fetch_spread_bbo = empty_bbo
-    for source in service._liquidity_sources.values():
-        source.fetch_perp_liquidity = empty_liquidity
 
 
 class TestLifecycleCoverageDegradation:
@@ -411,12 +406,9 @@ class TestSidecarResourceLifecycle:
             "bad": Source("exchange_bad", fail=True),
             "good": Source("exchange_good"),
         }
-        svc._liquidity_sources = {"liq": Source("liquidity")}
         await svc.close()
 
-        # Inventory evidence belongs to the live admission path, so lifecycle
-        # cleanup has no synthetic pairwise clients to close.
-        assert closed == ["exchange_bad", "exchange_good", "liquidity"]
+        assert closed == ["exchange_bad", "exchange_good"]
 
     @pytest.mark.asyncio
     async def test_service_close_uses_source_snapshot_when_close_mutates_registry(self):
@@ -438,7 +430,6 @@ class TestSidecarResourceLifecycle:
             "mutating": MutatingSource(),
             "good": Source(),
         }
-        svc._liquidity_sources = {}
 
         await svc.close()
 
@@ -609,40 +600,14 @@ class TestAcquisitionModeReflectsDegradation:
         )
 
 
-class TestLiquiditySourceWiredIntoRefresh:
-    """LiquiditySource and sidecar_liquidity_timeout_s must be in the refresh path."""
+class TestLiquidityEvidenceWiredIntoRefresh:
+    """The refresh owns broad liquidity evidence; audit never adds a source lane."""
 
-    def test_fetch_liquidity_all_venues_method_exists(self):
+    def test_no_background_liquidity_fetch_method_exists(self):
         from lightfee.sidecar.service import SidecarService
 
         svc = object.__new__(SidecarService)
-        assert hasattr(svc, "_fetch_liquidity_all_venues")
-
-    def test_liquidity_timeout_s_read_from_runtime(self):
-        from lightfee.sidecar.service import SidecarService
-
-        svc = object.__new__(SidecarService)
-        svc.config = type(
-            "c",
-            (),
-            {
-                "runtime": RuntimeConfig(sidecar_snapshot_path="/tmp"),
-                "strategy": StrategyConfig(),
-                "venues": [VenueConfig(venue="binance")],
-                "symbols": [],
-            },
-        )()
-        svc._liquidity_sources = {}
-        svc._exchange_sources = {}
-        svc._last_good_quotes = {}
-        svc._funding_timeout_s = 10
-        svc._liquidity_timeout_s = 7.0
-        assert svc._liquidity_timeout_s == 7.0
-
-    def test_liquidity_timeout_default(self):
-        from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
-
-        assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
+        assert not hasattr(svc, "_fetch_liquidity_all_venues")
 
     @pytest.mark.asyncio
     async def test_funding_fetch_treats_bulk_endpoint_omission_as_unlisted(self):
@@ -858,7 +823,10 @@ class TestLiquiditySourceWiredIntoRefresh:
         from lightfee.sidecar.service import SidecarService
 
         class FakeExchangeSource:
+            calls = 0
+
             async def fetch_all(self, symbols):
+                type(self).calls += 1
                 return {
                     "binance:BTCUSDT": _strict_liquidity_quote(
                         observed_at_ms=123,
@@ -866,15 +834,6 @@ class TestLiquiditySourceWiredIntoRefresh:
                         open_interest_received_at_ms=123,
                     )
                 }
-
-            async def close(self):
-                return None
-
-        class DuplicateLiquidityFetch:
-            async def fetch_perp_liquidity(self, symbols):
-                raise AssertionError(
-                    "quote-derived liquidity lifecycle must not duplicate public IO"
-                )
 
             async def close(self):
                 return None
@@ -887,10 +846,10 @@ class TestLiquiditySourceWiredIntoRefresh:
         service = SidecarService(config)
         _stub_auxiliary_market_sources(service)
         service._exchange_sources["binance"] = FakeExchangeSource()
-        service._liquidity_sources["binance"] = DuplicateLiquidityFetch()
 
         try:
             snapshot = await service.refresh_once()
+            await _wait_for_full_audit_publish(service)
         finally:
             await service.close()
 
@@ -898,6 +857,7 @@ class TestLiquiditySourceWiredIntoRefresh:
         assert len(snapshot.liquidity_lifecycle) == 1
         assert snapshot.liquidity_lifecycle[0].coverage_usable == 1
         assert snapshot.liquidity_lifecycle[0].symbol_count == 1
+        assert FakeExchangeSource.calls == 1
 
 
 class TestRefreshPublicationSemantics:
@@ -960,13 +920,7 @@ class TestRefreshPublicationSemantics:
                 )
             ]
 
-        async def fake_fetch_liquidity_all_venues(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [("binance", {"binance:BTCUSDT": object()}, None, set())]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
         times = iter([1.0, 5.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -1111,18 +1065,7 @@ class TestRefreshPublicationSemantics:
                 )
             ]
 
-        async def failed_liquidity(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [("binance", None, TimeoutError("liquidity timeout 10.0s"), set())]
-
-        async def successful_liquidity(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [("binance", {"binance:BTCUSDT": object()}, None, set())]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = failed_liquidity
         times = iter([2.0, 5.0, 6.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -1133,7 +1076,6 @@ class TestRefreshPublicationSemantics:
         assert svc._last_liquidity_publish_at_ms == 1000
 
         quote_has_liquidity_proof = True
-        svc._fetch_liquidity_all_venues = successful_liquidity
         times = iter([8.0, 9.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -1210,16 +1152,7 @@ class TestRefreshPublicationSemantics:
                 ),
             ]
 
-        async def mixed_liquidity(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [
-                ("okx", {"okx:BTCUSDT": object()}, None, set()),
-                ("bybit", None, TimeoutError("liquidity timeout 10.0s"), set()),
-            ]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = mixed_liquidity
         times = iter([8.0, 9.0, 10.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -1384,21 +1317,7 @@ class TestRefreshPublicationSemantics:
                 ),
             ]
 
-        async def fake_fetch_liquidity_all_venues(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [
-                (
-                    "binance",
-                    None,
-                    RuntimeError("liquidity skipped after market data degradation"),
-                    set(),
-                ),
-                ("okx", {"okx:BTCUSDT": object()}, None, set()),
-            ]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
 
         snapshot = await svc.refresh_once()
 
@@ -1435,16 +1354,7 @@ class TestRefreshPublicationSemantics:
                 for venue in ("binance", "okx")
             ]
 
-        async def skipped_liquidity(
-            symbols, timeout_s, quote_liquidity_by_venue=None, skip_venues=None
-        ):
-            return [
-                (venue, None, RuntimeError("market unavailable"), set())
-                for venue in ("binance", "okx")
-            ]
-
         svc._fetch_all_venues = failed_market
-        svc._fetch_liquidity_all_venues = skipped_liquidity
 
         snapshot = await svc.refresh_once()
 

@@ -13150,6 +13150,97 @@ def test_business_progression_quality_summary_reports_phase_takeover_gaps():
     }
 
 
+def test_phase_duration_summary_skips_retired_candidate_discovery_lease():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "startup.strategy_entry_policy",
+            "payload": {"candidate_discovery_lease_enforced": False},
+        },
+        {
+            "ts_ms": 2_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "candidate_pair_id": "revalidated-candidate",
+                "symbol": "REVALIDATEUSDT",
+                "venue": "aster",
+            },
+        },
+        {
+            "ts_ms": 100_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {"reason": "diagnostic_horizon"},
+        },
+    ]
+
+    summary = dl._build_phase_duration_summary(events)
+
+    assert summary["phase_handoff_quality"]["severity"] == "ok"
+    assert summary["phase_handoff_quality"]["phase_counts"]["candidate_lease"] == {
+        "over_budget_count": 0,
+        "takeover_count": 0,
+        "missing_takeover_count": 0,
+    }
+    assert not any(
+        record["phase"] == "candidate_lease"
+        for record in summary["samples"]
+    )
+
+
+def test_phase_duration_summary_keeps_legacy_pair_lease_across_new_run():
+    import scripts.diagnose_live as dl
+
+    events = [
+        {
+            "ts_ms": 1_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                # Fallback-only historic records do not have an entry id.
+                "candidate_pair_id": "same-pair",
+                "symbol": "LEGACYUSDT",
+            },
+        },
+        {
+            "ts_ms": 80_000,
+            "kind": "startup.strategy_entry_policy",
+            "payload": {
+                "run_id": "full-frontier-runtime",
+                "candidate_discovery_lease_enforced": False,
+            },
+        },
+        {
+            "ts_ms": 81_000,
+            "kind": "review.candidate_shortlisted",
+            "payload": {
+                "candidate_pair_id": "same-pair",
+                "symbol": "CURRENTUSDT",
+            },
+        },
+        {
+            "ts_ms": 150_000,
+            "kind": "runtime.lifecycle_tick",
+            "payload": {},
+        },
+    ]
+
+    summary = dl._build_phase_duration_summary(events)
+    candidate_records = [
+        record for record in summary["samples"]
+        if record["phase"] == "candidate_lease"
+    ]
+
+    # The new run must not erase the old lease diagnosis merely because it
+    # observed the same fallback pair id.  Its retired lease remains absent.
+    assert len(candidate_records) == 1
+    assert candidate_records[0]["artifact_id"] == "same-pair"
+    assert candidate_records[0]["symbol"] == "LEGACYUSDT"
+    assert summary["phase_handoff_quality"]["phase_counts"][
+        "candidate_lease"
+    ]["over_budget_count"] == 1
+
+
 def test_business_progression_quality_summary_counts_candidate_quote_takeovers():
     import scripts.diagnose_live as dl
 

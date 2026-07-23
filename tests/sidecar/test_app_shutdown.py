@@ -77,6 +77,111 @@ async def test_run_closes_service_after_shutdown_request():
 
 
 @pytest.mark.asyncio
+async def test_run_schedules_full_refresh_from_its_start_time():
+    captured = {}
+
+    class FakeService:
+        embedded_spread_bbo_enabled = False
+
+        def __init__(self):
+            self.full_refresh_started_at_s = []
+            self.closed = False
+
+        async def refresh_once(self):
+            self.full_refresh_started_at_s.append(asyncio.get_running_loop().time())
+            await asyncio.sleep(0.08)
+            if len(self.full_refresh_started_at_s) == 2:
+                captured["stop_event"].set()
+
+        async def close(self):
+            self.closed = True
+
+    def install_handlers(stop_event):
+        captured["stop_event"] = stop_event
+        return lambda: None
+
+    service = FakeService()
+    await asyncio.wait_for(
+        sidecar_app._run(
+            service,
+            once=False,
+            refresh_interval_s=0.20,
+            install_shutdown_handlers=install_handlers,
+        ),
+        timeout=1.0,
+    )
+
+    cadence_s = (
+        service.full_refresh_started_at_s[1]
+        - service.full_refresh_started_at_s[0]
+    )
+    # The former completion-plus-interval loop took about 0.28s here. The
+    # periodic full refresh now starts on its 0.20s deadline.
+    assert cadence_s < 0.25
+    assert service.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cache_only_republish_does_not_postpone_full_refresh_deadline():
+    captured = {}
+
+    class FakeService:
+        embedded_spread_bbo_enabled = False
+
+        def __init__(self):
+            self.entry_venue_republish_event = asyncio.Event()
+            self.full_refresh_started_at_s = []
+            self.cache_refresh_started_at_s = []
+            self.closed = False
+
+        async def refresh_once(self):
+            self.full_refresh_started_at_s.append(asyncio.get_running_loop().time())
+            await asyncio.sleep(0.04)
+            if len(self.full_refresh_started_at_s) == 2:
+                captured["stop_event"].set()
+
+        async def refresh_entry_from_latest_cache(self):
+            self.cache_refresh_started_at_s.append(asyncio.get_running_loop().time())
+            await asyncio.sleep(0.04)
+
+        async def close(self):
+            self.closed = True
+
+    def install_handlers(stop_event):
+        captured["stop_event"] = stop_event
+
+        async def request_republish_after_first_refresh():
+            await asyncio.sleep(0.07)
+            service.entry_venue_republish_event.set()
+
+        captured["republish_task"] = asyncio.create_task(
+            request_republish_after_first_refresh()
+        )
+        return lambda: None
+
+    service = FakeService()
+    await asyncio.wait_for(
+        sidecar_app._run(
+            service,
+            once=False,
+            refresh_interval_s=0.20,
+            install_shutdown_handlers=install_handlers,
+        ),
+        timeout=1.0,
+    )
+
+    assert len(service.cache_refresh_started_at_s) == 1
+    cadence_s = (
+        service.full_refresh_started_at_s[1]
+        - service.full_refresh_started_at_s[0]
+    )
+    # A cache-only publish completed before the full deadline. It must not
+    # reset that deadline and extend the market-data cadence to ~0.31s.
+    assert cadence_s < 0.25
+    assert service.closed is True
+
+
+@pytest.mark.asyncio
 async def test_run_once_cancels_inflight_refresh_after_shutdown_request():
     captured = {}
     refresh_started = asyncio.Event()

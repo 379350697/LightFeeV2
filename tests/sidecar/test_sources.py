@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from lightfee.core.domain import PerpLiquiditySnapshot, Venue
+from lightfee.core.domain import Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot, funding_rate_sample_id
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
@@ -371,7 +371,7 @@ class TestLiquiditySource:
 
 
 class TestSidecarServiceRateLimitWiring:
-    def test_service_isolates_funding_bbo_from_slow_and_audit_lanes(self):
+    def test_service_has_no_background_liquidity_collection_lane(self):
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
         from lightfee.sidecar.service import SidecarService
 
@@ -384,38 +384,26 @@ class TestSidecarServiceRateLimitWiring:
 
         binance_limiter = service._exchange_sources["binance"]._client._rate_limiter
         aster_limiter = service._exchange_sources["aster"]._client._rate_limiter
-        binance_audit_limiter = service._liquidity_sources["binance"]._client._rate_limiter
-        aster_audit_limiter = service._liquidity_sources["aster"]._client._rate_limiter
         binance_bbo_limiter = service._funding_entry_bbo_sources["binance"]._client._rate_limiter
         aster_bbo_limiter = service._funding_entry_bbo_sources["aster"]._client._rate_limiter
 
-        assert binance_limiter is not binance_audit_limiter
-        assert aster_limiter is not aster_audit_limiter
         assert binance_limiter is not binance_bbo_limiter
         assert aster_limiter is not aster_bbo_limiter
-        assert binance_audit_limiter is not binance_bbo_limiter
-        assert aster_audit_limiter is not aster_bbo_limiter
         assert binance_limiter is not aster_limiter
-        assert binance_audit_limiter is not aster_audit_limiter
         assert binance_bbo_limiter is not aster_bbo_limiter
         assert binance_limiter is not None
         assert aster_limiter is not None
+        assert not hasattr(service, "_liquidity_sources")
         assert (
             service._exchange_sources["binance"]._client._consume_global_rate_limit_budget is True
-        )
-        assert (
-            service._liquidity_sources["binance"]._client._consume_global_rate_limit_budget is True
         )
         assert (
             service._funding_entry_bbo_sources["binance"]._client._consume_global_rate_limit_budget
             is False
         )
 
-        binance_audit_limiter.record_rate_limit_for_scopes(["venue:binance"], retry_after_ms=1_000)
-        assert (
-            binance_audit_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is not None
-        )
-        assert binance_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is None
+        binance_limiter.record_rate_limit_for_scopes(["venue:binance"], retry_after_ms=1_000)
+        assert binance_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is not None
         assert binance_bbo_limiter._cooldown_remaining_ms_for_scopes(["venue:binance"]) is None
 
     @pytest.mark.asyncio
@@ -692,15 +680,11 @@ class TestSidecarServiceRateLimitWiring:
         assert elapsed_s < 0.8
         assert len(snapshot.candidates) == 1
         assert compact is not None
-        assert len(compact.candidates) == 1
-        assert set(compact.quotes) == {
-            "binance:BTCUSDT",
-            "bybit:BTCUSDT",
-        }
-        for quote in compact.quotes.values():
-            assert quote.observed_at_ms == now_ms
-            assert quote.source == "funding_entry_bbo_test"
-            assert compact.published_at_ms - quote.observed_at_ms < 1_000
+        # The funding event is eight hours away, so complete static admission
+        # decides this pair as outside the scan window.  V7 publishes every
+        # eligible candidate, which correctly means an empty entry page here.
+        assert compact.candidates == []
+        assert compact.quotes == {}
 
     @pytest.mark.asyncio
     async def test_refresh_once_keeps_binance_quotes_when_open_interest_is_slow(self, tmp_path):
@@ -728,13 +712,6 @@ class TestSidecarServiceRateLimitWiring:
                     return {"symbol": params["symbol"], "openInterest": "2500"}
                 return {}
 
-        class FakeLiquiditySource:
-            async def fetch_perp_liquidity(self, symbols):
-                return {}
-
-            async def close(self):
-                return None
-
         config = AppConfig(
             symbols=["BTCUSDT"],
             runtime=RuntimeConfig(
@@ -750,8 +727,6 @@ class TestSidecarServiceRateLimitWiring:
             "test_fixture",
             int(time.time() * 1_000),
         )
-        service._liquidity_sources["binance"] = FakeLiquiditySource()
-
         async def fake_bbo(*_args, **_kwargs):
             return [("binance", {}, None, set())]
 
@@ -860,12 +835,6 @@ class TestSidecarServiceRateLimitWiring:
                 ("bybit", {"bybit:BTCUSDT": quotes["bybit:BTCUSDT"]}, None, set()),
             ]
 
-        async def fake_liquidity(*_args, **_kwargs):
-            return [
-                ("binance", {}, None, set()),
-                ("bybit", {}, None, set()),
-            ]
-
         async def fake_bbo(*_args, **_kwargs):
             return [
                 ("binance", {}, None, set()),
@@ -876,7 +845,6 @@ class TestSidecarServiceRateLimitWiring:
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
         service._fetch_all_venues = fake_funding
         service._fetch_funding_entry_bbo_all_venues = fake_bbo
-        service._fetch_liquidity_all_venues = fake_liquidity
 
         try:
             snapshot = await service.refresh_once()
@@ -886,128 +854,26 @@ class TestSidecarServiceRateLimitWiring:
         assert len(snapshot.candidates) == 1
         assert snapshot.market_observed_at_ms == 10_200
         assert snapshot.candidate_build_observed_at_ms >= 10_200
-        assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 1
+        assert snapshot.candidate_build_diagnostics["directional_pair_count"] == 2
+        assert snapshot.candidate_build_diagnostics["seed_pair_count"] == 2
+        assert snapshot.candidate_build_diagnostics["pair_decision_count"] == 2
+        assert snapshot.candidate_build_diagnostics["eligible_frontier_complete"] is True
         assert snapshot.candidate_build_diagnostics["output_candidate_count"] == 1
-        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {}
-
-    @pytest.mark.asyncio
-    async def test_refresh_publishes_compact_spread_quotes_before_liquidity_work(
-        self, tmp_path, monkeypatch
-    ):
-        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
-        from lightfee.sidecar.service import SidecarService
-        from lightfee.spread.quote_snapshot import (
-            load_spread_quote_snapshot,
-            spread_quote_snapshot_path,
-        )
-
-        sidecar_path = tmp_path / "sidecar.json"
-        service = SidecarService(
-            AppConfig(
-                symbols=["BTCUSDT"],
-                runtime=RuntimeConfig(sidecar_snapshot_path=str(sidecar_path)),
-                venues=[VenueConfig(venue="binance")],
-            )
-        )
-        quote = QuoteSnapshot(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=100.0,
-            ask=100.1,
-            bid_size=1.0,
-            ask_size=1.0,
-            observed_at_ms=1_100,
-            underlying="BTC",
-            quote_currency="USDT",
-            contract_normalization_complete=True,
-        )
-
-        async def fake_funding(*_args, **_kwargs):
-            return [("binance", {"binance:BTCUSDT": quote}, None, set())]
-
-        async def fake_liquidity(*_args, **_kwargs):
-            compact = load_spread_quote_snapshot(spread_quote_snapshot_path(sidecar_path))
-            assert compact is not None
-            assert compact.quotes["binance:BTCUSDT"].observed_at_ms == 1_100
-            return [("binance", {}, None, set())]
-
-        async def fake_bbo(*_args, **_kwargs):
-            return [("binance", {}, None, set())]
-
-        clock = iter((1.0, 1.2, 1.3, 1.4))
-        monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(clock))
-        service._fetch_all_venues = fake_funding
-        service._fetch_funding_entry_bbo_all_venues = fake_bbo
-        service._fetch_liquidity_all_venues = fake_liquidity
-
-        try:
-            await service.refresh_once()
-        finally:
-            await service.close()
-
-    @pytest.mark.asyncio
-    async def test_liquidity_fetch_skips_venue_already_degraded_by_market_data(self, tmp_path):
-        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
-        from lightfee.sidecar.service import SidecarService
-
-        calls: list[str] = []
-
-        class FakeLiquiditySource:
-            def __init__(self, venue: str):
-                self.venue = venue
-
-            async def fetch_perp_liquidity(self, symbols):
-                calls.append(self.venue)
-                return {}
-
-            async def close(self):
-                return None
-
-        service = SidecarService(
-            AppConfig(
-                symbols=["BTCUSDT"],
-                runtime=RuntimeConfig(
-                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-                ),
-                venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
-            )
-        )
-        service._liquidity_sources = {
-            "binance": FakeLiquiditySource("binance"),
-            "bybit": FakeLiquiditySource("bybit"),
+        assert snapshot.candidate_build_diagnostics["rejection_counts"] == {
+            "funding_edge_below_floor": 1,
+        }
+        assert snapshot.candidate_build_diagnostics["blocked_reason_counts"] == {
+            "funding_edge_below_floor": 1,
+            "outside_scan_window": 1,
         }
 
-        try:
-            results = await service._fetch_liquidity_all_venues(
-                ["BTCUSDT"],
-                timeout_s=0.1,
-                skip_venues={"bybit"},
-            )
-        finally:
-            await service.close()
-
-        assert calls == ["binance"]
-        bybit = next(row for row in results if row[0] == "bybit")
-        assert isinstance(bybit[2], RuntimeError)
-        assert "market data degradation" in str(bybit[2])
-
     @pytest.mark.asyncio
-    async def test_liquidity_fetch_does_not_refetch_explicit_deferred_oi_symbols(
+    async def test_background_audit_never_starts_a_second_venue_fetch(
         self, tmp_path
     ):
-        """Only genuine evidence gaps may reach the slow liquidity source."""
+        """A missing configured symbol must not trigger an audit-wide refetch."""
         from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
         from lightfee.sidecar.service import SidecarService
-
-        calls: list[list[str]] = []
-
-        class FakeLiquiditySource:
-            async def fetch_perp_liquidity(self, symbols):
-                calls.append(list(symbols))
-                return {}
-
-            async def close(self):
-                return None
 
         service = SidecarService(
             AppConfig(
@@ -1018,57 +884,6 @@ class TestSidecarServiceRateLimitWiring:
                 venues=[VenueConfig(venue="binance")],
             )
         )
-        service._liquidity_sources = {"binance": FakeLiquiditySource()}
-        deferred_btc = PerpLiquiditySnapshot(
-            venue=Venue.BINANCE,
-            symbol="BTCUSDT",
-            observed_at_ms=1_000,
-            volume_24h_quote=10_000_000.0,
-            open_interest_evidence_status="unavailable",
-            open_interest_evidence_reason="entry_targeted_revalidation_required",
-        )
-
-        try:
-            await service._fetch_liquidity_all_venues(
-                ["BTCUSDT", "ETHUSDT"],
-                timeout_s=0.1,
-                quote_liquidity_by_venue={
-                    "binance": {"binance:BTCUSDT": deferred_btc}
-                },
-            )
-        finally:
-            await service.close()
-
-        assert calls == [["ETHUSDT"]]
-
-    @pytest.mark.asyncio
-    async def test_background_audit_does_not_refetch_fully_deferred_oi_venue(
-        self, tmp_path
-    ):
-        """The producer must put its own deferred marker into the audit map."""
-        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
-        from lightfee.sidecar.service import SidecarService
-
-        calls: list[list[str]] = []
-
-        class FakeLiquiditySource:
-            async def fetch_perp_liquidity(self, symbols):
-                calls.append(list(symbols))
-                return {}
-
-            async def close(self):
-                return None
-
-        service = SidecarService(
-            AppConfig(
-                symbols=["BTCUSDT"],
-                runtime=RuntimeConfig(
-                    sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-                ),
-                venues=[VenueConfig(venue="binance")],
-            )
-        )
-        service._liquidity_sources = {"binance": FakeLiquiditySource()}
         now_ms = int(time.time() * 1_000)
         funding_timestamp_ms = now_ms + 28_800_000
         quote = QuoteSnapshot(
@@ -1096,7 +911,11 @@ class TestSidecarServiceRateLimitWiring:
             open_interest_evidence_reason="entry_targeted_revalidation_required",
         )
 
+        fetch_calls = 0
+
         async def fake_funding(_symbols, timeout_s):
+            nonlocal fetch_calls
+            fetch_calls += 1
             assert timeout_s > 0.0
             return [("binance", {"binance:BTCUSDT": quote}, None, set())]
 
@@ -1113,4 +932,4 @@ class TestSidecarServiceRateLimitWiring:
         finally:
             await service.close()
 
-        assert calls == []
+        assert fetch_calls == 1

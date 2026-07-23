@@ -89,10 +89,10 @@ def _isolate_non_canary_snapshot_stages(monkeypatch):
     )
 
 
-def _install_v6_snapshot_fixture(monkeypatch, snapshot) -> None:
+def _install_v7_snapshot_fixture(monkeypatch, snapshot) -> None:
     monkeypatch.setattr(
         "lightfee.engine.runtime.funding_entry_snapshot_identity",
-        lambda _path: ("test-v6-generation", 1, 1),
+        lambda _path: ("test-v7-generation", 1, 1),
     )
     monkeypatch.setattr(
         "lightfee.engine.runtime.load_funding_entry_snapshot",
@@ -248,7 +248,7 @@ async def test_single_process_entry_real_source_avoids_sidecar_snapshot_path():
     await source.close()
 
 
-def test_single_process_entry_does_not_apply_legacy_top32_consumer_cap():
+def test_entry_consumer_frontier_preserves_v7_and_in_process_frontiers():
     single_process = LiveRuntime(
         AppConfig(
             symbols=["BTCUSDT"],
@@ -264,7 +264,7 @@ def test_single_process_entry_does_not_apply_legacy_top32_consumer_cap():
 
     candidates = list(range(33))
     assert single_process._entry_consumer_frontier(candidates) == candidates
-    assert legacy._entry_consumer_frontier(candidates) == candidates[:32]
+    assert legacy._entry_consumer_frontier(candidates) == candidates
 
 
 @pytest.mark.asyncio
@@ -472,7 +472,7 @@ async def test_entry_oi_scheduler_is_bounded_reuses_and_reaps_on_close():
 
 
 @pytest.mark.asyncio
-async def test_entry_oi_top32_allows_64_targets_without_slow_venue_starvation():
+async def test_entry_oi_queue_allows_64_targets_without_slow_venue_starvation():
     refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
     release_slow = asyncio.Event()
 
@@ -590,7 +590,7 @@ async def test_runtime_snapshot_generation_is_parsed_once_off_event_loop(
 
 
 @pytest.mark.asyncio
-async def test_runtime_keeps_verified_v6_cache_during_two_file_install_window(
+async def test_runtime_keeps_verified_v7_cache_during_two_file_install_window(
     tmp_path,
     monkeypatch,
 ):
@@ -607,7 +607,7 @@ async def test_runtime_keeps_verified_v6_cache_during_two_file_install_window(
     runtime = LiveRuntime(config)
     cached = SidecarSnapshot(published_at_ms=1)
     runtime._sidecar_snapshot_cache = cached
-    runtime._sidecar_snapshot_identity = ("funding-entry-v6", "old", 1, 1)
+    runtime._sidecar_snapshot_identity = ("funding-entry-v7", "old", 1, 1)
     legacy_loads = 0
 
     def legacy_load(_path):
@@ -746,7 +746,7 @@ async def test_entry_pipeline_shared_deadline_cancels_quote_and_oi_waiters(
             oi_cancelled.set()
             raise
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(
         runtime,
@@ -841,7 +841,7 @@ async def test_runtime_unavailable_snapshot_resets_streak_and_preserves_last_goo
 
 
 @pytest.mark.asyncio
-async def test_runtime_names_incomplete_candidate_frontier_explicitly(
+async def test_runtime_v6_compat_names_incomplete_seed_frontier_explicitly(
     tmp_path, monkeypatch
 ):
     config = AppConfig(
@@ -886,11 +886,89 @@ async def test_runtime_names_incomplete_candidate_frontier_explicitly(
         for record in records
         if record["kind"] == "runtime.candidate_frontier_incomplete"
     )
-    assert event["payload"]["seed_frontier_complete"] is False
-    assert event["payload"]["seed_frontier_count"] == 64
-    assert event["payload"]["seed_pair_count"] == 4_811
-    assert event["payload"]["seed_frontier_stop_reason"] == (
-        "exact_frontier_limit_reached"
+    assert event["payload"]["frontier_contract"] == "seed_frontier_v6"
+    assert event["payload"]["frontier_contract_reason"] == (
+        "seed_frontier_incomplete"
+    )
+    assert "seed_frontier_complete" not in event["payload"]
+    assert "seed_frontier_count" not in event["payload"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_v7_incomplete_eligible_frontier_fails_closed_even_with_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="paper"),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        candidate_build_observed_at_ms=1_000,
+        acquisition_mode="fresh_sidecar",
+        candidates=[_freshness_candidate()],
+        candidate_build_diagnostics={
+            "source_data_ready": True,
+            "eligible_frontier_complete": False,
+            "entry_frontier_ready": False,
+            "seed_pair_count": 2,
+            "pair_decision_count": 1,
+            "eligible_candidate_count": 1,
+            "omitted_eligible_count": 1,
+            "frontier_stop_reason": "pair_decision_incomplete",
+        },
+    )
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 1_050)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime.state.last_scan["no_entry_reason"] == (
+        "candidate_frontier_incomplete"
+    )
+    event = next(
+        record
+        for record in _read_journal_records(tmp_path / "events.jsonl")
+        if record["kind"] == "runtime.candidate_frontier_incomplete"
+    )
+    assert event["payload"]["frontier_contract"] == "eligible_frontier_v7"
+    assert event["payload"]["frontier_contract_reason"] == (
+        "eligible_frontier_incomplete"
+    )
+    assert event["payload"]["eligible_frontier_complete"] is False
+    assert event["payload"]["frontier_input_pair_count"] == 2
+    assert event["payload"]["pair_decision_count"] == 1
+    assert event["payload"]["eligible_candidate_count"] == 1
+    assert event["payload"]["omitted_eligible_count"] == 1
+    assert event["payload"]["frontier_stop_reason"] == (
+        "pair_decision_incomplete"
+    )
+
+
+def test_runtime_v7_frontier_contract_rejects_manual_candidate_count_mismatch():
+    snapshot = SidecarSnapshot(
+        candidates=[_freshness_candidate()],
+        candidate_build_diagnostics={
+            "eligible_frontier_complete": True,
+            "seed_pair_count": 1,
+            "pair_decision_count": 1,
+            "eligible_candidate_count": 0,
+            "omitted_eligible_count": 0,
+        },
+    )
+
+    assert LiveRuntime._candidate_frontier_incomplete_reason(snapshot) == (
+        "eligible_candidate_count_mismatch"
     )
 
 
@@ -1600,7 +1678,7 @@ async def test_runtime_entry_quote_revalidate_prewarm_resolves_stale_top_candida
                 )
             )
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_and_fill_cache)
 
@@ -2044,7 +2122,7 @@ async def test_quote_revalidation_overlay_keeps_ws_that_superseded_delayed_rest(
 
 
 @pytest.mark.asyncio
-async def test_runtime_ws_bbo_quote_revalidate_uses_complete_bounded_entry_frontier(
+async def test_runtime_ws_bbo_quote_revalidate_uses_active_execution_queue(
     tmp_path,
     monkeypatch,
 ):
@@ -2177,7 +2255,7 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_complete_bounded_entry_front
             evidence_coordinator=evidence_coordinator,
         )
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
     monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", record_revalidate)
@@ -2199,26 +2277,31 @@ async def test_runtime_ws_bbo_quote_revalidate_uses_complete_bounded_entry_front
         if record["kind"] == "runtime.entry_quote_revalidate_probe"
     ][-1]
 
-    # The independent preparation generation activates the complete bounded
-    # frontier once; the 750ms evidence phase must not repeat activation.
-    assert prewarm_candidate_counts == [32]
-    assert quote_revalidate_calls == [
-        {
-            "candidate_count": 32,
-            "candidate_scope": "top_k_entry_frontier",
-            "evidence_role": "entry_execution",
-            "skipped_untracked_count": 0,
-        },
+    # Full-pair discovery remains intact, but each live proof batch is
+    # limited to the 2 primary + 1 shadow execution queue.  When a batch is
+    # terminal it may backfill from the full queue, never revalidate all 50
+    # routes at once.
+    assert prewarm_candidate_counts[0] == 3
+    assert all(count <= 27 for count in prewarm_candidate_counts)
+    execution_calls = [
+        call
+        for call in quote_revalidate_calls
+        if call["evidence_role"] == "entry_execution"
     ]
-    assert len(refresher.calls) == 64
-    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "top_k_entry_frontier"
-    assert runtime.state.last_scan["quote_revalidate_candidate_count"] == 32
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 64
-    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 0
-    assert runtime.state.last_scan["quote_prewarm_extra_candidate_count"] == 0
-    assert probe["candidate_scope"] == "top_k_entry_frontier"
-    assert probe["candidate_count"] == 32
-    assert probe["skipped_untracked_count"] == 0
+    assert execution_calls
+    assert all(
+        call["candidate_count"] <= 3
+        and call["candidate_scope"] == "active_execution_queue"
+        for call in execution_calls
+    )
+    assert not any(call["candidate_count"] == 50 for call in quote_revalidate_calls)
+    assert len(refresher.calls) <= 100
+    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "active_execution_queue"
+    assert runtime.state.last_scan["quote_revalidate_candidate_count"] <= 3
+    assert runtime.state.last_scan["quote_revalidate_target_count"] <= 6
+    assert any(call["skipped_untracked_count"] > 0 for call in execution_calls)
+    assert probe["candidate_scope"] == "active_execution_queue"
+    assert probe["candidate_count"] <= 3
 
 
 @pytest.mark.asyncio
@@ -2438,7 +2521,7 @@ async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_ex
 
     runtime.ws_bbo_rest_refresher = NoRestCapability()
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(
         runtime,
@@ -2889,10 +2972,14 @@ def test_runtime_entry_quote_rewarm_cooldown_suppresses_revalidate_target(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
+async def test_runtime_revalidates_candidate_despite_legacy_epoch_lease(
     tmp_path,
     monkeypatch,
 ):
+    from types import SimpleNamespace
+
+    from lightfee.engine.entry_readiness import EntryReadinessDecision
+
     config = AppConfig(
         runtime=RuntimeConfig(mode="live"),
         strategy=StrategyConfig(
@@ -2910,7 +2997,8 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     )
     candidate = _freshness_candidate("LEASEUSDT")
     candidate.pair_id = "leaseusdt:okx->bybit"
-    candidate.candidate_revision_id = "lease-revision-1"
+    candidate.candidate_revision_id = "lease-revision-after-initial-proof-failure"
+    candidate.opportunity_lease_id = "leaseusdt:okx->bybit:funding-epoch"
     runtime = LiveRuntime(
         config,
         venue_adapters={
@@ -2922,12 +3010,86 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime._live_scan_success_streak = 3
     runtime.entry_executor = CapturingEntryExecutor()
-    runtime._entry_candidate_lease_started_at_ms[candidate.candidate_revision_id] = 1_000
+    runtime.state.entry_opportunity_lease_ledger = {
+        candidate.opportunity_lease_id: {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_000,
+        }
+    }
 
     now_ms = 2_500
+    funding_timestamp_ms = now_ms + 60_000
+    candidate.first_funding_timestamp_ms = funding_timestamp_ms
+    candidate.funding_timestamp_ms = funding_timestamp_ms
+    candidate.long_funding_timestamp_ms = funding_timestamp_ms
+    candidate.short_funding_timestamp_ms = funding_timestamp_ms
     snapshot = _candidate_lease_snapshot(candidate, now_ms)
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+
+    async def complete_preparation(rows, **_kwargs):
+        return {
+            "allowed_pair_ids": {
+                runtime._candidate_pair_id(row) for row in rows
+            }
+        }
+
+    async def complete_oi(rows, *, evidence_coordinator=None, **_kwargs):
+        assert evidence_coordinator is not None
+        for index, _row in enumerate(rows):
+            evidence_coordinator["open_interest"][index] = "ready"
+        return {}
+
+    async def complete_quotes(rows, *, evidence_coordinator=None, **_kwargs):
+        assert evidence_coordinator is not None
+        for index, _row in enumerate(rows):
+            evidence_coordinator["quote"][index] = "ready"
+            evidence_coordinator["economics"][index] = "ready"
+        evidence_coordinator["selection_ready_event"].set()
+        return {}, runtime._entry_quote_truth_empty_stats()
+
+    dispatched_pair_ids = []
+
+    async def dispatch_after_fresh_revalidation(row, *_args, **_kwargs):
+        dispatched_pair_ids.append(runtime._candidate_pair_id(row))
+        return True
+
+    monkeypatch.setattr(runtime, "_entry_preparation_for_tick", complete_preparation)
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_entry_candidate_open_interest_evidence",
+        complete_oi,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_entry_quote_revalidate_for_candidates",
+        complete_quotes,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_filter_candidates_by_snapshot_freshness",
+        lambda rows, **_kwargs: list(rows),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_reprice_entry_candidates_for_selection",
+        lambda rows, **_kwargs: list(rows),
+    )
+    # This regression exercises legacy lease retirement after fresh evidence
+    # arrives.  WS-BBO transport is covered independently, so do not make the
+    # assertion depend on a live transport cache fixture.
+    monkeypatch.setattr(
+        runtime,
+        "_entry_ws_bbo_subscription_blocker",
+        lambda _candidate: (None, {}),
+    )
+    runtime.entry_readiness_provider = SimpleNamespace(
+        decide=lambda row, _now_ms, **_kwargs: EntryReadinessDecision.allow(
+            symbol=row.symbol,
+            pair_id=row.pair_id,
+        )
+    )
+    monkeypatch.setattr(runtime, "_dispatch_entry", dispatch_after_fresh_revalidation)
 
     runtime.journal.open()
     try:
@@ -2937,22 +3099,12 @@ async def test_runtime_expires_overdue_candidate_lease_before_dispatch(
 
     records = _read_journal_records(tmp_path / "events.jsonl")
     kinds = [record["kind"] for record in records]
-    assert runtime.entry_executor.contexts == []
-    assert runtime.state.last_scan["tradeable_count"] == 0
-    assert runtime.state.last_scan["candidate_lease_expired_count"] == 1
-    assert "runtime.candidate_lease_expired" in kinds
-    assert "review.candidate_rejected" in kinds
-    assert "execution.entry_selected" not in kinds
-    expired = next(
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.candidate_lease_expired"
-    )
-    assert expired["action_taken"] == "expire_candidate_and_rescan"
-    assert expired["reason"] == "candidate_lease_hard_expired"
+    assert dispatched_pair_ids == [candidate.pair_id]
+    assert runtime.state.last_scan["tradeable_count"] == 1
+    assert "runtime.candidate_lease_expired" not in kinds
 
 
-def test_expired_opportunity_lease_remains_expired_across_ticks(tmp_path):
+def test_legacy_opportunity_lease_ledger_is_discarded_during_recovery(tmp_path):
     config = AppConfig(
         strategy=StrategyConfig(candidate_lease_ms=1_000),
         persistence=PersistenceConfig(
@@ -2961,32 +3113,17 @@ def test_expired_opportunity_lease_remains_expired_across_ticks(tmp_path):
         ),
     )
     runtime = LiveRuntime(config)
-    candidate = _freshness_candidate("LEASESTABLEUSDT")
-    candidate.pair_id = "leasestableusdt:okx->bybit"
-    candidate.candidate_revision_id = "revision-stable"
-    candidate.opportunity_lease_id = "opportunity-stable"
-    runtime.state.last_scan = {}
-    runtime.journal.open()
-    try:
-        runtime._entry_candidate_active_lease_ids = {"opportunity-stable"}
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=1_000
-        ) == [candidate]
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=2_000
-        ) == []
-        assert runtime._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=2_100
-        ) == []
-    finally:
-        runtime.journal.close()
-
-    assert runtime._entry_candidate_lease_started_at_ms == {
-        "opportunity-stable": 1_000
+    runtime.state.entry_opportunity_lease_ledger = {
+        "opportunity-stable": {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_500,
+        }
     }
+    assert runtime._retire_legacy_entry_opportunity_lease_ledger() == 1
+    assert runtime.state.entry_opportunity_lease_ledger == {}
 
 
-def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
+def test_legacy_opportunity_lease_ledger_is_not_restored_after_snapshot_restart(tmp_path):
     config = AppConfig(
         strategy=StrategyConfig(candidate_lease_ms=60_000),
         persistence=PersistenceConfig(
@@ -2995,14 +3132,12 @@ def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
         ),
     )
     first = LiveRuntime(config)
-    candidate = _freshness_candidate("LEASEPERSISTUSDT")
-    candidate.opportunity_lease_id = "lease-persist"
-    first.state.last_scan = {}
-    first._entry_candidate_active_lease_ids = {"lease-persist"}
-    assert first._filter_expired_entry_candidate_leases(
-        [candidate], now_ms=1_000
-    ) == [candidate]
-    first._persist_entry_opportunity_lease_ledger()
+    first.state.entry_opportunity_lease_ledger = {
+        "lease-persist": {
+            "started_at_ms": 1_000,
+            "last_seen_at_ms": 1_000,
+        }
+    }
 
     store = SnapshotStore(tmp_path / "lease-state.json")
     store.write(first.state.to_dict())
@@ -3012,16 +3147,8 @@ def test_opportunity_lease_age_survives_snapshot_restart(tmp_path):
 
     second = LiveRuntime(config)
     second.state = restored
-    second.state.last_scan = {}
-    second._restore_entry_opportunity_lease_ledger()
-    second._entry_candidate_active_lease_ids = {"lease-persist"}
-    second.journal.open()
-    try:
-        assert second._filter_expired_entry_candidate_leases(
-            [candidate], now_ms=61_999
-        ) == []
-    finally:
-        second.journal.close()
+    assert second._retire_legacy_entry_opportunity_lease_ledger() == 1
+    assert second.state.entry_opportunity_lease_ledger == {}
 
 
 def test_corrupt_opportunity_lease_row_does_not_block_snapshot_recovery(tmp_path):
@@ -3330,7 +3457,7 @@ def test_legacy_candidate_revision_changes_with_economic_observation(tmp_path):
     assert newer.candidate_revision_id == newer_revision
 
 
-def test_top_k_reprice_is_stable_immutable_and_canary_sized(tmp_path):
+def test_frontier_reprice_is_stable_immutable_and_canary_sized(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),
         strategy=StrategyConfig(local_l2_enabled=False),
@@ -3386,7 +3513,7 @@ def test_top_k_reprice_is_stable_immutable_and_canary_sized(tmp_path):
     assert first[0].expected_profit_quote > 0.0
 
 
-def test_top_k_reprice_uses_common_grid_before_v1_priority_ranking(tmp_path):
+def test_frontier_reprice_uses_common_grid_before_v1_priority_ranking(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),
         strategy=StrategyConfig(local_l2_enabled=False),
@@ -3450,7 +3577,7 @@ def test_top_k_reprice_uses_common_grid_before_v1_priority_ranking(tmp_path):
         ) == pytest.approx(candidate.ranking_edge_bps / (1.0 + risk))
 
 
-def test_top_k_reprice_rejects_cap_below_common_pair_minimum(tmp_path):
+def test_frontier_reprice_rejects_cap_below_common_pair_minimum(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),
         strategy=StrategyConfig(local_l2_enabled=False),
@@ -3491,7 +3618,7 @@ def test_top_k_reprice_rejects_cap_below_common_pair_minimum(tmp_path):
     ] == "funding_canary_cap_below_pair_minimum"
 
 
-def test_top_k_reprice_does_not_mislabel_original_minimum_failure_as_canary(
+def test_frontier_reprice_does_not_mislabel_original_minimum_failure_as_canary(
     tmp_path,
 ):
     config = AppConfig(
@@ -3529,7 +3656,7 @@ def test_top_k_reprice_does_not_mislabel_original_minimum_failure_as_canary(
     }
 
 
-def test_top_k_reprice_canary_ignores_non_executable_short_ask(tmp_path):
+def test_frontier_reprice_canary_ignores_non_executable_short_ask(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),
         strategy=StrategyConfig(local_l2_enabled=False),
@@ -3813,7 +3940,7 @@ async def test_runtime_entry_quote_probe_diagnostics_can_be_enabled(
             )
 
     runtime.ws_bbo_rest_refresher = RestOnlyRefresher()
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
 
@@ -4149,7 +4276,7 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
         observed_candidate_counts.append(len(candidates))
         return {}, {}, {}, {}, {}
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
     monkeypatch.setattr(runtime, "_snapshot_freshness_observability", observe_scope)
 
@@ -4198,7 +4325,7 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
 
 
 @pytest.mark.asyncio
-async def test_runtime_snapshot_freshness_filter_uses_complete_top32_entry_frontier(
+async def test_runtime_snapshot_freshness_filter_uses_active_execution_queue(
     tmp_path,
     monkeypatch,
 ):
@@ -4271,7 +4398,7 @@ async def test_runtime_snapshot_freshness_filter_uses_complete_top32_entry_front
             incremental_filter_counts.append(len(candidates))
         return list(candidates)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
     monkeypatch.setattr(
         runtime,
@@ -4285,14 +4412,18 @@ async def test_runtime_snapshot_freshness_filter_uses_complete_top32_entry_front
     finally:
         runtime.journal.close()
 
-    assert authoritative_filter_counts == [32, 32]
-    assert incremental_filter_counts == [1] * 32
+    assert authoritative_filter_counts[:2] == [8, 8]
+    assert all(count <= 8 for count in authoritative_filter_counts)
+    assert all(count == 1 for count in incremental_filter_counts)
     assert runtime.state.last_scan["snapshot_freshness_filter_candidate_scope"] == (
-        "top_k_entry_frontier"
+        "active_execution_queue"
     )
-    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] == 32
-    assert runtime.state.last_scan["snapshot_freshness_filter_all_candidate_count"] == 32
-    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] == 0
+    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] <= 8
+    assert runtime.state.last_scan["snapshot_freshness_filter_all_candidate_count"] == 64
+    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] >= 56
+    assert runtime.state.last_scan["complete_eligible_frontier_count"] == 64
+    assert runtime.state.last_scan["active_execution_queue_candidate_count"] <= 8
+    assert runtime.state.last_scan["deferred_execution_queue_candidate_count"] >= 56
 
 
 def test_runtime_snapshot_fallback_health_scope_uses_v1_primary_shadow_candidates(
@@ -4565,7 +4696,7 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
         ],
     )
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -4785,7 +4916,7 @@ async def test_runtime_ignores_admission_blocked_candidate_stale_quotes_for_entr
         candidates=[blocked_candidate],
     )
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -4904,7 +5035,7 @@ async def test_runtime_aster_max_notional_cooldown_prunes_before_entry_prewarm(
     async def fail_if_prewarmed(candidates, *, snapshot, now_ms, **kwargs):
         raise AssertionError("active admission cooldown must prune before quote prewarm")
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
     monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", fail_if_prewarmed)
 
@@ -4972,7 +5103,7 @@ async def test_runtime_invalid_quote_decision_carries_sanitized_quote_evidence(t
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -5082,7 +5213,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
 
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -5780,7 +5911,7 @@ async def test_runtime_targeted_oi_refresh_covers_public_market_data_venues(
 
 
 @pytest.mark.asyncio
-async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject(
+async def test_tick_backfills_complete_queue_beyond_128_after_front_evidence_failures(
     tmp_path,
     monkeypatch,
 ):
@@ -5808,7 +5939,10 @@ async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject
     runtime.state.lifecycle = EngineLifecycle.RUNNING
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime.entry_executor = object()
-    candidates = [_freshness_candidate(f"RANK{index}USDT") for index in range(5)]
+    # A complete frontier can be much larger than the 6 primary + 2 shadow
+    # execution window.  Every front route below is conclusively rejected;
+    # the only dispatchable route sits past the old Top-128 boundary.
+    candidates = [_freshness_candidate(f"RANK{index}USDT") for index in range(129)]
     snapshot = SidecarSnapshot(
         published_at_ms=69_000,
         market_observed_at_ms=69_000,
@@ -5826,7 +5960,7 @@ async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject
         candidates=candidates,
     )
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
     monkeypatch.setattr(
         "lightfee.engine.runtime.discover_tradeable_candidates",
@@ -5842,17 +5976,23 @@ async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject
 
     async def complete_oi(rows, *, evidence_coordinator=None, **_kwargs):
         assert evidence_coordinator is not None
-        for index, _candidate in enumerate(rows):
-            evidence_coordinator["open_interest"][index] = "ready"
-            evidence_coordinator["economics"][index] = "ready"
-        evidence_coordinator["selection_ready_event"].set()
+        for index, candidate in enumerate(rows):
+            rank = int(str(candidate.symbol)[4:-4])
+            evidence_coordinator["open_interest"][index] = (
+                "failed" if rank < 64 else "ready"
+            )
         return {}
 
     async def complete_quotes(rows, *, evidence_coordinator=None, **_kwargs):
         assert evidence_coordinator is not None
-        for index, _candidate in enumerate(rows):
-            evidence_coordinator["quote"][index] = "ready"
-            evidence_coordinator["economics"][index] = "ready"
+        for index, candidate in enumerate(rows):
+            rank = int(str(candidate.symbol)[4:-4])
+            evidence_coordinator["quote"][index] = (
+                "failed" if 64 <= rank < 128 else "ready"
+            )
+            evidence_coordinator["economics"][index] = (
+                "failed" if rank < 128 else "ready"
+            )
         evidence_coordinator["selection_ready_event"].set()
         return {}, runtime._entry_quote_truth_empty_stats()
 
@@ -5882,17 +6022,6 @@ async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject
         "_reprice_entry_candidates_for_selection",
         lambda rows, **_kwargs: list(rows),
     )
-    monkeypatch.setattr(
-        runtime,
-        "_filter_expired_entry_candidate_leases",
-        lambda rows, **_kwargs: list(rows),
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_entry_candidate_lease_is_live",
-        lambda _candidate, **_kwargs: True,
-    )
-
     selection_inputs: list[list[str]] = []
 
     def select_four(rows, **_kwargs):
@@ -5901,29 +6030,31 @@ async def test_tick_reselects_rank_five_when_completed_evidence_finalists_reject
 
     dispatch_attempts: list[str] = []
 
-    async def reject_first_four(candidate, *_args, **_kwargs):
+    async def reject_until_rank_128(candidate, *_args, **_kwargs):
         dispatch_attempts.append(candidate.symbol)
-        return candidate.symbol == "RANK4USDT"
+        return candidate.symbol == "RANK128USDT"
 
     monkeypatch.setattr(runtime, "_select_entry_candidates", select_four)
-    monkeypatch.setattr(runtime, "_dispatch_entry", reject_first_four)
+    monkeypatch.setattr(runtime, "_dispatch_entry", reject_until_rank_128)
 
     runtime.journal.open()
     try:
-        await runtime.tick()
+        # Each terminal active page is handed back to the ordinary runtime
+        # loop.  This deliberately proves queue promotion without recursive
+        # tick() re-entry, so every page gets a fresh snapshot/account-truth
+        # generation before it can dispatch.
+        for _ in range(129):
+            await runtime.tick()
+            if dispatch_attempts:
+                break
     finally:
         runtime.journal.close()
 
     assert dispatch_attempts == [
-        "RANK0USDT",
-        "RANK1USDT",
-        "RANK2USDT",
-        "RANK3USDT",
-        "RANK4USDT",
+        candidate.symbol for candidate in candidates[128:]
     ]
-    assert selection_inputs == [
-        [candidate.symbol for candidate in candidates],
-        ["RANK4USDT"],
+    assert [rows[0] for rows in selection_inputs if rows] == [
+        candidate.symbol for candidate in candidates[128:]
     ]
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
 
@@ -6995,7 +7126,7 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -7091,7 +7222,7 @@ async def test_runtime_blocks_required_sidecar_liquidity_when_current_row_has_no
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -7185,7 +7316,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -7277,7 +7408,7 @@ async def test_runtime_does_not_skip_fresh_quote_and_l2_for_20s_perp_liquidity_a
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -7413,7 +7544,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -7483,7 +7614,7 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     )
     _install_ws_quotes_from_snapshot(runtime, snapshot, now_ms=70_000)
 
-    _install_v6_snapshot_fixture(monkeypatch, snapshot)
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
