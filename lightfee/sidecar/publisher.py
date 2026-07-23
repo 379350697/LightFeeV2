@@ -975,6 +975,38 @@ def publish_funding_entry_snapshot(
         original_diagnostics.get("requested_venues", [])
     )
     source_data_ready = bool(snapshot.quotes)
+    requested_venue_set = {
+        str(venue).strip().lower()
+        for venue in requested_venues
+        if str(venue).strip()
+    }
+    source_quote_venues = {
+        str(quote.venue or "").strip().lower()
+        for quote in snapshot.quotes.values()
+        if str(quote.venue or "").strip()
+    }
+    source_lifecycle_rows = (
+        snapshot.funding_lifecycle
+        + snapshot.market_lifecycle
+        + snapshot.liquidity_lifecycle
+    )
+    complete_empty_frontier_ready = bool(
+        not candidates
+        and eligible_frontier_complete
+        and source_data_ready
+        and snapshot.acquisition_mode != "unavailable"
+        and not snapshot.degraded_venues
+        and not snapshot.degraded_domains
+        and not any(snapshot.degraded_symbols.values())
+        and requested_venue_set
+        and requested_venue_set <= source_quote_venues
+        and all(not str(row.degraded_reason or "").strip() for row in source_lifecycle_rows)
+        and all(
+            requested_venue_set
+            <= {str(row.venue or "").strip().lower() for row in rows}
+            for rows in (snapshot.funding_lifecycle, snapshot.market_lifecycle)
+        )
+    )
     source_rejection_counts = {
         str(reason): int(count)
         for reason, count in sorted(
@@ -1021,6 +1053,7 @@ def publish_funding_entry_snapshot(
         "omitted_eligible_count": max(omitted_eligible_count, 0),
         "eligible_frontier_complete": eligible_frontier_complete,
         "entry_frontier_ready": source_data_ready and eligible_frontier_complete,
+        "complete_empty_frontier_ready": complete_empty_frontier_ready,
         "entry_policy_fingerprint": policy_fingerprint,
         "entry_policy_fingerprint_source": policy_fingerprint_source,
         "frontier_stop_reason": frontier_stop_reason,

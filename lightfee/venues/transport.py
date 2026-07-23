@@ -71,6 +71,30 @@ OKX_PUBLIC_INSTRUMENTS_PATH = "/api/v5/public/instruments"
 OKX_ACCOUNT_INSTRUMENTS_PATH = "/api/v5/account/instruments"
 
 
+def _net_bybit_positions(
+    positions: list[PositionSnapshot],
+) -> list[PositionSnapshot]:
+    """Match Rust V1: collapse Bybit hedge-mode rows to net symbol exposure."""
+    by_symbol: dict[str, list[PositionSnapshot]] = defaultdict(list)
+    for position in positions:
+        by_symbol[position.symbol].append(position)
+
+    net_positions: list[PositionSnapshot] = []
+    for rows in by_symbol.values():
+        net_quantity = sum(
+            row.quantity if row.side == Side.BUY else -row.quantity
+            for row in rows
+        )
+        if abs(net_quantity) <= 1e-9:
+            continue
+        side = Side.BUY if net_quantity > 0 else Side.SELL
+        source = next((row for row in rows if row.side == side), rows[0])
+        net_positions.append(
+            replace(source, side=side, quantity=abs(net_quantity))
+        )
+    return net_positions
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------
@@ -3308,9 +3332,61 @@ class VenueTransport(MarketDataClient):
                 if spec.venue_id == Venue.BYBIT:
                     params["category"] = "linear"
                     params["settleCoin"] = "USDT"
+                    # Bybit defaults to 20 rows and supplies a cursor for the
+                    # remaining account positions.  A first-page-only view is
+                    # not valid exchange truth.
+                    params["limit"] = 200
                 elif spec.venue_id == Venue.BITGET:
                     params["productType"] = "USDT-FUTURES"
                     params["marginCoin"] = "USDT"
+                if spec.venue_id == Venue.BYBIT:
+                    raws: list[Any] = []
+                    seen_cursors: set[str] = set()
+                    for _page in range(100):
+                        raw = await self._request(
+                            "GET", spec.position_path, params=params, private=True
+                        )
+                        if not isinstance(raw, dict) or int(raw.get("retCode", 0) or 0) != 0:
+                            detail = (
+                                raw
+                                if isinstance(raw, dict)
+                                else {"response_type": type(raw).__name__}
+                            )
+                            raise TransportError(
+                                TransportErrorCategory.TRANSPORT_FAILURE,
+                                "bybit all-position pagination response invalid: "
+                                f"retCode={detail.get('retCode')} "
+                                f"retMsg={detail.get('retMsg', '')}",
+                            )
+                        raws.append(raw)
+                        result = raw.get("result") if isinstance(raw, dict) else None
+                        cursor = (
+                            str(result.get("nextPageCursor") or "")
+                            if isinstance(result, dict)
+                            else ""
+                        )
+                        if not cursor:
+                            break
+                        if cursor in seen_cursors:
+                            raise TransportError(
+                                TransportErrorCategory.TRANSPORT_FAILURE,
+                                "bybit all-position pagination cursor loop",
+                            )
+                        seen_cursors.add(cursor)
+                        params["cursor"] = cursor
+                    else:
+                        raise TransportError(
+                            TransportErrorCategory.TRANSPORT_FAILURE,
+                            "bybit all-position pagination page cap reached",
+                        )
+                    positions: list[PositionSnapshot] = []
+                    for page_raw in raws:
+                        positions.extend(self._parse_all_positions(page_raw, now_ms))
+                    positions = _net_bybit_positions(positions)
+                    for pos in positions:
+                        self._position_cache[pos.symbol] = (pos, now_ms)
+                    self._all_positions_cache = (positions, now_ms)
+                    return positions
                 raw = await self._request("GET", spec.position_path, params=params, private=True)
             if spec.venue_id == Venue.OKX:
                 positions = await self._parse_all_positions_okx(raw, now_ms)
@@ -3415,6 +3491,25 @@ class VenueTransport(MarketDataClient):
                     now_ms,
                     contract_size_override=contract_size,
                 )
+            elif spec.venue_id == Venue.BYBIT:
+                matching = _net_bybit_positions(
+                    [
+                        pos
+                        for pos in self._parse_all_positions(raw, now_ms)
+                        if pos.symbol in {symbol, venue_sym}
+                    ]
+                )
+                if matching:
+                    snapshot = replace(matching[0], symbol=symbol)
+                else:
+                    snapshot = PositionSnapshot(
+                        venue=spec.venue_id,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=now_ms,
+                    )
             else:
                 snapshot = self._parse_position(raw, venue_sym, now_ms)
             self._position_cache[symbol] = (snapshot, now_ms)

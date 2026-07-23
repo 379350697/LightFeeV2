@@ -88,29 +88,28 @@ class VenueBboCache:
                 normalized.received_at_ms or normalized.observed_at_ms or 0
             )
             incoming_is_rest = "rest" in str(normalized.source or "").lower()
+            current_is_rest = "rest" in str(current.source or "").lower()
             if (
-                current_event_ms > 0
-                and incoming_event_ms <= 0
-                and incoming_is_rest
+                incoming_is_rest
+                and not current_is_rest
+                and now_ms > 0
+                and current_max_age_ms > 0
             ):
-                # A REST receipt timestamp cannot prove that its market event
-                # is newer than a WS event timestamp.  Keep the comparable WS
-                # observation while its local lease is still valid.  Callers
-                # that know the lease TTL may explicitly allow REST to replace
-                # an expired observation; callers without that context remain
-                # conservative.
-                current_is_fresh = True
-                if now_ms > 0 and current_max_age_ms > 0:
-                    current_observed_ms = int(
-                        current.observed_at_ms or current.received_at_ms or 0
-                    )
-                    current_is_fresh = bool(
-                        current_observed_ms > 0
-                        and current_observed_ms <= now_ms
-                        and now_ms - current_observed_ms <= current_max_age_ms
-                    )
-                if current_is_fresh:
-                    return False
+                current_observed_ms = int(
+                    current.observed_at_ms or current.received_at_ms or 0
+                )
+                current_is_fresh = bool(
+                    current_observed_ms > 0
+                    and current_observed_ms <= now_ms
+                    and now_ms - current_observed_ms <= current_max_age_ms
+                )
+                if not current_is_fresh:
+                    # Once the WS lease has expired, its event timestamp must
+                    # not permanently block a separately validated REST quote.
+                    self._quotes[(venue, symbol)] = normalized
+                    return True
+            if current_event_ms > 0 and incoming_event_ms <= 0 and incoming_is_rest:
+                return False
             if current_event_ms > 0 and incoming_event_ms > 0:
                 if incoming_event_ms < current_event_ms:
                     return False

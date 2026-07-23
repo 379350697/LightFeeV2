@@ -136,6 +136,8 @@ def _handle_bybit_position_message(
     private_state,
 ) -> None:
     loop = asyncio.get_running_loop()
+    net_positions: dict[str, float] = {}
+    updated_at_ms: dict[str, int] = {}
     for row in data:
         venue_symbol = row.get("symbol", "")
         symbol = symbol_map.get(venue_symbol)
@@ -145,8 +147,15 @@ def _handle_bybit_position_message(
         side = row.get("side", "")
         contracts = float(size_str or 0)
         signed = contracts if side == "Buy" else -contracts
-        ts = int(row.get("updatedTime", _now_ms()))
-        loop.create_task(private_state.update_position(symbol, signed, ts))
+        net_positions[symbol] = net_positions.get(symbol, 0.0) + signed
+        updated_at_ms[symbol] = max(
+            updated_at_ms.get(symbol, 0),
+            int(row.get("updatedTime", _now_ms())),
+        )
+    for symbol, signed in net_positions.items():
+        loop.create_task(
+            private_state.update_position(symbol, signed, updated_at_ms[symbol])
+        )
 
 
 def handle_bybit_private_message(

@@ -357,6 +357,44 @@ class TestBybitPrivateParserExtended:
         assert pos is not None
         assert pos.size > 0  # long
 
+    @pytest.mark.asyncio
+    async def test_position_event_hedge_mode_nets_same_symbol_rows(self):
+        from lightfee.venues.bybit_private_ws import handle_bybit_private_message
+
+        state = PrivateWsState()
+        raw = json.dumps({
+            "topic": "position",
+            "data": [
+                {
+                    "symbol": "ETHUSDT",
+                    "size": "1.0",
+                    "side": "Buy",
+                    "positionIdx": "1",
+                    "updatedTime": "1700000000000",
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "size": "0.25",
+                    "side": "Sell",
+                    "positionIdx": "2",
+                    "updatedTime": "1700000000001",
+                },
+            ],
+        })
+
+        handle_bybit_private_message(
+            state,
+            {"ETHUSDT": "ETHUSDT"},
+            raw,
+            subscribed=True,
+        )
+        await _sleep_short()
+
+        pos = state.position("ETHUSDT")
+        assert pos is not None
+        assert pos.size == 0.75
+        assert pos.updated_at_ms == 1700000000001
+
 
 class TestBitgetPrivateParserExtended:
     """Bitget: orders and positions channel events."""

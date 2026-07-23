@@ -841,6 +841,59 @@ async def test_runtime_unavailable_snapshot_resets_streak_and_preserves_last_goo
 
 
 @pytest.mark.asyncio
+async def test_runtime_accepts_producer_proven_complete_empty_frontier(
+    tmp_path, monkeypatch
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="paper"),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = SidecarSnapshot(
+        published_at_ms=1_000,
+        market_observed_at_ms=1_000,
+        candidate_build_observed_at_ms=1_000,
+        acquisition_mode="unavailable",
+        candidate_build_diagnostics={
+            "complete_empty_frontier_ready": True,
+            "diagnostics_only": True,
+            "source_data_ready": True,
+            "entry_frontier_ready": True,
+            "eligible_frontier_complete": True,
+            "seed_pair_count": 12,
+            "pair_decision_count": 12,
+            "eligible_candidate_count": 0,
+            "omitted_eligible_count": 0,
+        },
+    )
+    runtime._live_scan_success_streak = 3
+    monkeypatch.setattr(
+        "lightfee.engine.runtime.load_snapshot", lambda _path: snapshot
+    )
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 1_050)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime._live_scan_success_streak == 4
+    assert runtime._last_good_snapshot is snapshot
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert not any(
+        record["kind"] == "runtime.snapshot_unavailable" for record in records
+    )
+
+
+@pytest.mark.asyncio
 async def test_runtime_v6_compat_names_incomplete_seed_frontier_explicitly(
     tmp_path, monkeypatch
 ):

@@ -862,6 +862,21 @@ class SidecarService:
                 decision_at_ms=candidate_build_observed_at_ms,
             )
 
+        # The V5 contract requires every lifecycle degradation to be owned by
+        # a venue, symbol, or domain.  Lifecycle rows are already venue-scoped;
+        # carry that source fact into the snapshot instead of letting the audit
+        # writer reject an otherwise valid refresh.
+        for lifecycle_rows in (
+            funding_lifecycle,
+            market_lifecycle,
+            liquidity_lifecycle,
+        ):
+            degraded_venues.update(
+                row.venue
+                for row in lifecycle_rows
+                if str(row.degraded_reason or "").strip()
+            )
+
         self._ensure_forecast_calibrator().apply(
             quotes,
             now_ms=candidate_build_observed_at_ms,

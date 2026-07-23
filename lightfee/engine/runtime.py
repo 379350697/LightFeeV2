@@ -5830,6 +5830,26 @@ class LiveRuntime:
         return None
 
     @staticmethod
+    def _complete_empty_frontier_ready(snapshot) -> bool:
+        """Accept only a producer-proven, fully decided zero-candidate frontier."""
+        if snapshot is None or list(getattr(snapshot, "candidates", []) or []):
+            return False
+        diagnostics = dict(
+            getattr(snapshot, "candidate_build_diagnostics", {}) or {}
+        )
+        return bool(
+            diagnostics.get("complete_empty_frontier_ready") is True
+            and diagnostics.get("diagnostics_only") is True
+            and diagnostics.get("source_data_ready") is True
+            and diagnostics.get("entry_frontier_ready") is True
+            and diagnostics.get("eligible_candidate_count") == 0
+            and diagnostics.get("omitted_eligible_count") == 0
+            and diagnostics.get("pair_decision_count")
+            == diagnostics.get("seed_pair_count")
+            and LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is None
+        )
+
+    @staticmethod
     def _unusable_snapshot_reason(snapshot) -> tuple[str, str]:
         if LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is not None:
             return (
@@ -6088,6 +6108,11 @@ class LiveRuntime:
         last_good_max_age = self.config.runtime.live_scan_last_good_max_age_ms
 
         # V1: evaluate_snapshot_freshness — multi-state freshness evaluation
+        def usable_entry_snapshot(candidate) -> bool:
+            return bool(
+                has_usable_funding_payload(candidate)
+                or self._complete_empty_frontier_ready(candidate)
+            )
         freshness_decision = decide_snapshot_freshness(
             snapshot=snapshot,
             max_age_ms=max_age,
@@ -6095,7 +6120,7 @@ class LiveRuntime:
             last_good=self._last_good_snapshot,
             last_good_max_age_ms=last_good_max_age,
             market_max_age_ms=self.config.runtime.max_market_age_ms,
-            usable_payload=has_usable_funding_payload,
+            usable_payload=usable_entry_snapshot,
         )
         freshness = freshness_decision.freshness
         snapshot = freshness_decision.snapshot
@@ -6196,7 +6221,7 @@ class LiveRuntime:
             return
         if freshness == SnapshotFreshness.DEGRADED:
             # Some venues degraded but can still trade on healthy ones
-            if not has_usable_funding_payload(snapshot):
+            if not usable_entry_snapshot(snapshot):
                 self._live_scan_success_streak = 0
                 no_entry_reason, event_kind = self._unusable_snapshot_reason(snapshot)
                 self._finalize_unusable_snapshot_scan(
@@ -6238,7 +6263,7 @@ class LiveRuntime:
                 )
                 self.journal.append("runtime.snapshot_missing", {"ts_ms": now_ms})
                 return
-            if not has_usable_funding_payload(snapshot):
+            if not usable_entry_snapshot(snapshot):
                 self._live_scan_success_streak = 0
                 no_entry_reason, event_kind = self._unusable_snapshot_reason(snapshot)
                 self._finalize_unusable_snapshot_scan(

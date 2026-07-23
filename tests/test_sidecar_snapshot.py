@@ -1982,6 +1982,34 @@ def test_v7_funding_entry_snapshot_pages_preserve_every_candidate(
     assert len(set(candidate.pair_id for candidate in loaded.candidates)) == 40
 
 
+def test_v7_marks_only_healthy_complete_empty_frontier_as_ready(tmp_path) -> None:
+    snapshot = _complete_funding_entry_snapshot(candidate_count=0)
+    path = tmp_path / "audit.json"
+
+    publish_funding_entry_snapshot(snapshot, path)
+    loaded = load_funding_entry_snapshot(path)
+
+    assert loaded is not None
+    assert loaded.candidates == []
+    assert loaded.acquisition_mode == "unavailable"
+    assert loaded.candidate_build_diagnostics[
+        "complete_empty_frontier_ready"
+    ] is True
+
+    degraded = _complete_funding_entry_snapshot(candidate_count=0)
+    degraded.acquisition_mode = "degraded_sidecar"
+    degraded.degraded_venues = ["long"]
+    degraded.funding_lifecycle[0].degraded_reason = "funding evidence degraded"
+    degraded_path = tmp_path / "degraded-audit.json"
+    publish_funding_entry_snapshot(degraded, degraded_path)
+    degraded_loaded = load_funding_entry_snapshot(degraded_path)
+
+    assert degraded_loaded is not None
+    assert degraded_loaded.candidate_build_diagnostics[
+        "complete_empty_frontier_ready"
+    ] is False
+
+
 def test_v7_funding_entry_snapshot_missing_or_corrupt_page_fails_closed(
     tmp_path,
     monkeypatch,

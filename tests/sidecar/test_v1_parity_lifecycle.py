@@ -1066,14 +1066,20 @@ class TestRefreshPublicationSemantics:
             ]
 
         svc._fetch_all_venues = fake_fetch_all_venues
-        times = iter([2.0, 5.0, 6.0, 7.0])
+        # The expected invalid compact spread publication logs once; logging
+        # reads the process clock before the V5 snapshot publication time.
+        times = iter([2.0, 5.0, 6.0, 7.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         failed = await svc.refresh_once()
 
         assert failed.liquidity_lifecycle[0].coverage_usable == 0
         assert failed.liquidity_lifecycle[0].publish_interval_ms == 0
+        assert failed.degraded_venues == ["binance"]
         assert svc._last_liquidity_publish_at_ms == 1000
+        audit_path = tmp_path / "liquidity-degraded-audit.json"
+        publish_snapshot(failed, audit_path)
+        assert load_snapshot(audit_path) is not None
 
         quote_has_liquidity_proof = True
         times = iter([8.0, 9.0, 10.0, 11.0])

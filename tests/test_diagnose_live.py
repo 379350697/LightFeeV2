@@ -7170,6 +7170,47 @@ def test_exchange_truth_empty_symbols_uses_unfiltered_open_orders_probe():
     ]
 
 
+def test_bybit_unfiltered_open_orders_reads_every_cursor_page():
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeTransport:
+        _credential = None
+
+        def __init__(self):
+            self.cursors = []
+
+        async def _request(self, method, path, **kwargs):
+            assert method == "GET"
+            assert path == "/v5/order/realtime"
+            assert kwargs["params"]["limit"] == 50
+            cursor = kwargs["params"].get("cursor", "")
+            self.cursors.append(cursor)
+            suffix = "1" if not cursor else "2"
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {
+                            "orderId": f"order-{suffix}",
+                            "symbol": "BTCUSDT",
+                            "side": "Buy",
+                            "qty": suffix,
+                        }
+                    ],
+                    "nextPageCursor": "page-2" if not cursor else "",
+                },
+            }
+
+    transport = FakeTransport()
+    orders = asyncio.run(
+        dl._fetch_unfiltered_open_orders(object(), transport, "bybit")
+    )
+
+    assert transport.cursors == ["", "page-2"]
+    assert [order["order_id"] for order in orders] == ["order-1", "order-2"]
+
+
 def test_exchange_truth_creates_readonly_adapters_for_all_live_perp_venues():
     from scripts import diagnose_live as dl
     from lightfee.venues.transport import LiveCredential
@@ -7560,13 +7601,21 @@ def test_exchange_truth_default_venues_cover_all_live_perp_venues(monkeypatch):
     from scripts import diagnose_live as dl
 
     class FakeTransport:
+        def __init__(self, venue):
+            self.venue = venue
+
         async def _request(self, method, path, **kwargs):
+            if self.venue == "bybit":
+                return {
+                    "retCode": 0,
+                    "result": {"list": [], "nextPageCursor": ""},
+                }
             return []
 
     class FakeAdapter:
         def __init__(self, venue):
             self.venue = venue
-            self._transport = FakeTransport()
+            self._transport = FakeTransport(venue)
             if venue == "bitget":
                 from lightfee.venues.specs import BitgetContractFamily
 

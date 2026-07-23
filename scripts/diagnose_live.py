@@ -33,6 +33,7 @@ from lightfee.marketdata.local_l2_incident_classification import (
 from lightfee.core.domain import Venue
 from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.exchange_truth import (
+    build_venue_operation_request,
     normalize_exchange_truth_payload,
     request_venue_operation,
 )
@@ -1550,6 +1551,44 @@ async def _fetch_unfiltered_open_orders(
         credential = getattr(transport, "_credential", None)
         account = str(getattr(credential, "account_address", "") or "")
         agent_wallet = str(getattr(credential, "agent_wallet_address", "") or "")
+        if contract_venue == Venue.BYBIT:
+            request = build_venue_operation_request(
+                contract_venue,
+                VenueOperation.OPEN_ORDERS,
+                account_address=account,
+                agent_wallet_address=agent_wallet,
+            )
+            params = dict(request.params)
+            params["limit"] = 50
+            rows: list[Any] = []
+            seen_cursors: set[str] = set()
+            for _page in range(100):
+                raw = await transport._request(
+                    request.method,
+                    request.path,
+                    params=params,
+                    private=request.private,
+                )
+                if not isinstance(raw, dict) or int(raw.get("retCode", 0) or 0) != 0:
+                    raise RuntimeError("Bybit open-order pagination response invalid")
+                rows.extend(_extract_order_rows(raw))
+                result = raw.get("result")
+                cursor = (
+                    str(result.get("nextPageCursor") or "")
+                    if isinstance(result, dict)
+                    else ""
+                )
+                if not cursor:
+                    return [
+                        _summarize_open_order(row)
+                        for row in rows
+                        if isinstance(row, dict)
+                    ]
+                if cursor in seen_cursors:
+                    raise RuntimeError("Bybit open-order pagination cursor loop")
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+            raise RuntimeError("Bybit open-order pagination page cap reached")
         raw, _ = await request_venue_operation(
             transport,
             contract_venue,

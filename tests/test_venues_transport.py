@@ -7148,6 +7148,146 @@ class TestFetchAllPositions:
             ("ETHUSDT", Side.SELL, 0.5),
         ]
 
+    @pytest.mark.asyncio
+    async def test_bybit_fetch_all_positions_reads_second_page_and_nets_hedge_legs(self):
+        cursors: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v5/position/list":
+                cursor = request.url.params.get("cursor", "")
+                cursors.append(cursor)
+                if not cursor:
+                    return httpx.Response(200, json={
+                        "retCode": 0,
+                        "result": {"list": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionIdx": 1,
+                                "side": "Buy",
+                                "size": "1",
+                                "avgPrice": "65000",
+                            },
+                        ], "nextPageCursor": "next-1"},
+                    })
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "result": {"list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionIdx": 2,
+                            "side": "Sell",
+                            "size": "0.25",
+                            "avgPrice": "65100",
+                        },
+                    ], "nextPageCursor": ""},
+                })
+            if request.url.path == "/v5/market/time":
+                return httpx.Response(200, json={"timeSecond": "1770000000"})
+            raise AssertionError(request.url.path)
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        positions = await transport.fetch_all_positions()
+
+        assert cursors == ["", "next-1"]
+        assert [(item.symbol, item.side, item.quantity) for item in positions] == [
+            ("BTCUSDT", Side.BUY, 0.75),
+        ]
+        assert transport.cached_position("BTCUSDT").quantity == 0.75
+
+    @pytest.mark.asyncio
+    async def test_bybit_fetch_position_nets_same_symbol_hedge_legs(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v5/position/list":
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "result": {"list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionIdx": 1,
+                            "side": "Buy",
+                            "size": "1",
+                            "avgPrice": "65000",
+                        },
+                        {
+                            "symbol": "BTCUSDT",
+                            "positionIdx": 2,
+                            "side": "Sell",
+                            "size": "0.25",
+                            "avgPrice": "65100",
+                        },
+                    ], "nextPageCursor": ""},
+                })
+            if request.url.path == "/v5/market/time":
+                return httpx.Response(200, json={"timeSecond": "1770000000"})
+            raise AssertionError(request.url.path)
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+        position = await transport.fetch_position("BTCUSDT")
+
+        assert position.symbol == "BTCUSDT"
+        assert position.side == Side.BUY
+        assert position.quantity == 0.75
+
+    @pytest.mark.asyncio
+    async def test_bybit_fetch_all_positions_cursor_loop_fails_closed(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v5/position/list":
+                return httpx.Response(200, json={
+                    "retCode": 0,
+                    "result": {"list": [], "nextPageCursor": "loop"},
+                })
+            if request.url.path == "/v5/market/time":
+                return httpx.Response(200, json={"timeSecond": "1770000000"})
+            raise AssertionError(request.url.path)
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+
+        with pytest.raises(TransportError, match="cursor loop") as exc:
+            await transport.fetch_all_positions()
+        assert exc.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_bybit_fetch_all_positions_later_page_failure_is_not_flat_truth(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v5/position/list":
+                if not request.url.params.get("cursor"):
+                    return httpx.Response(200, json={
+                        "retCode": 0,
+                        "result": {"list": [], "nextPageCursor": "page-2"},
+                    })
+                return httpx.Response(503, json={"retCode": 10016, "retMsg": "server error"})
+            if request.url.path == "/v5/market/time":
+                return httpx.Response(200, json={"timeSecond": "1770000000"})
+            raise AssertionError(request.url.path)
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+
+        with pytest.raises(TransportError) as exc:
+            await transport.fetch_all_positions()
+        assert exc.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_bybit_fetch_all_positions_later_ret_code_failure_is_not_flat_truth(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v5/position/list":
+                if not request.url.params.get("cursor"):
+                    return httpx.Response(200, json={
+                        "retCode": 0,
+                        "result": {"list": [], "nextPageCursor": "page-2"},
+                    })
+                return httpx.Response(200, json={
+                    "retCode": 10016, "retMsg": "server error",
+                })
+            if request.url.path == "/v5/market/time":
+                return httpx.Response(200, json={"timeSecond": "1770000000"})
+            raise AssertionError(request.url.path)
+
+        transport = _make_live_transport(Venue.BYBIT, handler)
+
+        with pytest.raises(TransportError, match="retCode=10016") as exc:
+            await transport.fetch_all_positions()
+        assert exc.value.category == TransportErrorCategory.TRANSPORT_FAILURE
+
     def test_parse_all_positions_okx_canonicalizes_symbols(self):
         transport = VenueTransport(spec=okx_spec(), mode="paper")
         raw = {

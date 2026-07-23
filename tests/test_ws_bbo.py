@@ -160,6 +160,42 @@ def test_ws_bbo_cache_allows_timestamp_less_rest_after_ws_lease_expires():
     assert cache.get_quote("binance", "BTCUSDT").bid == 101.0
 
 
+def test_ws_bbo_cache_allows_older_rest_event_after_ws_lease_expires():
+    from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
+
+    cache = VenueBboCache()
+    cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            observed_at_ms=1_000,
+            received_at_ms=1_000,
+            exchange_event_at_ms=900,
+            source="binance_book_ticker",
+        )
+    )
+
+    accepted = cache.update_quote(
+        TopBookQuote(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=101.0,
+            ask=101.1,
+            observed_at_ms=2_100,
+            received_at_ms=2_100,
+            exchange_event_at_ms=800,
+            source="binance_rest_top_book",
+        ),
+        now_ms=2_100,
+        current_max_age_ms=500,
+    )
+
+    assert accepted is True
+    assert cache.get_quote("binance", "BTCUSDT").bid == 101.0
+
+
 def test_binance_book_ticker_parser_uses_best_bid_and_ask():
     from lightfee.marketdata.ws_bbo import BinanceBboWsClient, VenueBboCache
 
