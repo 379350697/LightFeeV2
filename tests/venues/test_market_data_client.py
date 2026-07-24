@@ -361,6 +361,29 @@ class TestEntryOpenInterestOnlyEndpoints:
         assert all(t.open_interest_quote == 2_500_000.0 for t in result.values())
 
     @pytest.mark.asyncio
+    async def test_okx_entry_oi_keeps_prefixed_alias_separate_from_live_contract(self):
+        class Client(MarketDataClient):
+            def __init__(self):
+                super().__init__(okx_spec())
+                self.calls = []
+
+            async def _public_get(self, path, params=None):
+                self.calls.append((path, dict(params or {})))
+                symbol = params["instId"]
+                if symbol == "1000BONK-USDT-SWAP":
+                    return {"code": "51001", "data": []}
+                return {"data": [{"instId": symbol, "oiUsd": "2500000"}]}
+
+        result = await Client().fetch_entry_open_interest_evidence(
+            ["1000BONKUSDT", "BONKUSDT"]
+        )
+
+        assert result["okx:BONKUSDT"].open_interest_evidence_status == "observed"
+        assert result["okx:1000BONKUSDT"].open_interest_evidence_status == (
+            "symbol_not_listed"
+        )
+
+    @pytest.mark.asyncio
     async def test_bybit_entry_oi_scopes_each_request_by_symbol(self):
         class Client(MarketDataClient):
             def __init__(self):
@@ -3152,6 +3175,64 @@ class TestProductionSidecarParserRegressions:
         assert ticker.min_notional_quote == 0.0
         assert ticker.min_notional_evidence_complete is True
         assert ticker.contract_normalization_complete is True
+
+    @pytest.mark.asyncio
+    async def test_okx_prefixed_alias_cannot_claim_the_unprefixed_contract(self):
+        """A 1000-unit alias must not reuse a one-unit OKX ticker or funding row."""
+
+        class FakeOkxClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v5/market/tickers":
+                    return {"data": [{
+                        "instId": "BONK-USDT-SWAP",
+                        "bidPx": "0.000002888",
+                        "askPx": "0.000002889",
+                        "bidSz": "2",
+                        "askSz": "3",
+                        "last": "0.0000028885",
+                    }]}
+                if path == "/api/v5/public/instruments":
+                    return {"data": [{
+                        "instId": "BONK-USDT-SWAP",
+                        "ctVal": "100000",
+                        "ctValCcy": "BONK",
+                        "settleCcy": "USDT",
+                        "ctType": "linear",
+                        "state": "live",
+                        "tickSz": "0.000000001",
+                        "lotSz": "1",
+                        "minSz": "1",
+                    }]}
+                if path == "/api/v5/public/mark-price":
+                    return {"data": [{
+                        "instId": "BONK-USDT-SWAP",
+                        "markPx": "0.0000028885",
+                    }]}
+                if path == "/api/v5/market/index-tickers":
+                    return {"data": [{
+                        "instId": "BONK-USDT",
+                        "idxPx": "0.0000028884",
+                    }]}
+                if path == "/api/v5/public/funding-rate":
+                    return {"data": [{
+                        "instId": "BONK-USDT-SWAP",
+                        "fundingRate": "0.0001",
+                        "fundingTime": "4099978400000",
+                        "nextFundingTime": "4100007200000",
+                    }]}
+                if path == "/api/v5/public/open-interest":
+                    return {"data": [{"instId": "BONK-USDT-SWAP", "oiUsd": "1000"}]}
+                return {}
+
+        result = await FakeOkxClient(okx_spec())._fetch_okx_style(
+            ["1000BONKUSDT", "BONKUSDT"]
+        )
+
+        assert list(result) == ["okx:BONKUSDT"]
+        ticker = result["okx:BONKUSDT"]
+        assert ticker.bid == pytest.approx(0.000002888)
+        assert ticker.funding_rate_bps == pytest.approx(1.0)
+        assert ticker.quantity_step_base == pytest.approx(100000.0)
 
     @pytest.mark.asyncio
     async def test_okx_funding_cache_keeps_independent_mark_and_index_proof(self):

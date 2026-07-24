@@ -39,12 +39,6 @@ def _symbol_map(
     for canonical in requested:
         venue_symbol = client._to_venue_symbol(canonical)
         venue_symbols[venue_symbol] = canonical
-        if client.venue == Venue.OKX:
-            for prefix in ("1000000", "1000"):
-                if canonical.startswith(prefix):
-                    stripped = client._to_venue_symbol(canonical[len(prefix):])
-                    venue_symbols.setdefault(stripped, canonical)
-                    break
     return venue_symbols
 
 

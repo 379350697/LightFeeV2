@@ -453,7 +453,13 @@ def _entry_oi_application_error(
             )
         )
     )
-    status = "rate_limited" if rate_limited else "http_error"
+    # OKX returns HTTP 200 with code 51001 when an instId does not exist.
+    # Treat that as a catalog absence so an unlisted alias cannot masquerade
+    # as a transport fault or poison otherwise healthy venue coverage.
+    if venue == Venue.OKX and code_s == "51001":
+        status = "symbol_not_listed"
+    else:
+        status = "rate_limited" if rate_limited else "http_error"
     reason = f"{venue.value}_application_error:{code_s}:{message_s}"[:200]
     return status, reason
 
@@ -1513,15 +1519,15 @@ class MarketDataClient:
         canonical_candidates: dict[str, tuple[str, ...]] = {}
         canonical_by_venue_symbol: dict[str, set[str]] = {}
         for raw_symbol in symbols:
-            canonical = str(raw_symbol or "").upper()
-            venue_candidates = [self._to_venue_symbol(canonical)]
-            for prefix in ("1000000", "1000"):
-                if canonical.startswith(prefix):
-                    stripped = self._to_venue_symbol(canonical[len(prefix):])
-                    if stripped not in venue_candidates:
-                        venue_candidates.append(stripped)
-                    break
-            canonical_candidates[canonical] = tuple(venue_candidates)
+            canonical = str(raw_symbol or "").strip().upper()
+            if not canonical:
+                continue
+            # Targeted OI must use the same exact-unit identity rule as the
+            # bulk funding and BBO paths.  Falling back from 1000BONK to BONK
+            # would attach a one-unit contract's evidence to a different
+            # canonical price unit.
+            venue_candidates = (self._to_venue_symbol(canonical),)
+            canonical_candidates[canonical] = venue_candidates
             for venue_symbol in venue_candidates:
                 canonical_by_venue_symbol.setdefault(venue_symbol, set()).add(canonical)
 
@@ -3066,20 +3072,17 @@ class MarketDataClient:
         spec = self._spec
         venue_str = spec.venue_id.value
         canonical_by_venue_symbol: dict[str, set[str]] = {}
-        for s in symbols:
-            venue_sym = self._to_venue_symbol(s)
-            canonical_by_venue_symbol.setdefault(venue_sym, set()).add(s.upper())
-            # V1 parity: OKX drops 1000/1000000 prefix from some contracts
-            # e.g. 1000BONKUSDT → BONK-USDT-SWAP (not 1000BONK-USDT-SWAP)
-            for prefix in ("1000000", "1000"):
-                if s.upper().startswith(prefix):
-                    stripped_sym = s.upper()[len(prefix):]
-                    stripped_venue = self._to_venue_symbol(stripped_sym)
-                    if stripped_venue != venue_sym:
-                        canonical_by_venue_symbol.setdefault(
-                            stripped_venue, set()
-                        ).add(s.upper())
-                    break  # only strip the longest matching prefix
+        for raw_symbol in symbols:
+            canonical = str(raw_symbol or "").strip().upper()
+            if not canonical:
+                continue
+            # A canonical symbol defines the ticker price unit.  In
+            # particular, OKX BONK-USDT-SWAP is quoted per BONK and cannot be
+            # reused as 1000BONKUSDT merely because the underlying token is
+            # the same.  Keep only exact wire mappings; a missing prefixed
+            # wire contract is an unlisted alias, not a fallback candidate.
+            venue_sym = self._to_venue_symbol(canonical)
+            canonical_by_venue_symbol.setdefault(venue_sym, set()).add(canonical)
         ambiguous_mappings = {
             venue_symbol: canonical_symbols
             for venue_symbol, canonical_symbols in canonical_by_venue_symbol.items()

@@ -126,6 +126,47 @@ async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata():
 
 
 @pytest.mark.asyncio
+async def test_okx_bulk_bbo_does_not_relabel_one_unit_contract_as_1000_alias():
+    class FakeOkxClient(MarketDataClient):
+        async def _public_get_with_received_at(self, path, params=None):
+            return ({"data": [{
+                "instId": "BONK-USDT-SWAP",
+                "bidPx": "0.000002888",
+                "askPx": "0.000002889",
+                "bidSz": "2",
+                "askSz": "3",
+                "ts": "1999",
+            }]}, 2_000)
+
+    client = FakeOkxClient(okx_spec())
+
+    quotes = await client.fetch_top_book_quotes(["1000BONKUSDT"])
+
+    assert quotes == {}
+
+
+@pytest.mark.asyncio
+async def test_okx_bulk_bbo_keeps_an_exact_prefixed_contract_when_listed():
+    class FakeOkxClient(MarketDataClient):
+        async def _public_get_with_received_at(self, path, params=None):
+            return ({"data": [{
+                "instId": "1000BONK-USDT-SWAP",
+                "bidPx": "0.002888",
+                "askPx": "0.002889",
+                "bidSz": "2",
+                "askSz": "3",
+                "ts": "1999",
+            }]}, 2_000)
+
+    quotes = await FakeOkxClient(okx_spec()).fetch_top_book_quotes(
+        ["1000BONKUSDT"]
+    )
+
+    assert list(quotes) == ["okx:1000BONKUSDT"]
+    assert quotes["okx:1000BONKUSDT"].bid == pytest.approx(0.002888)
+
+
+@pytest.mark.asyncio
 async def test_bitget_and_hyperliquid_bulk_quote_parsing():
     class FakeBitgetClient(MarketDataClient):
         async def _public_get_with_received_at(self, path, params=None):
