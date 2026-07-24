@@ -415,7 +415,16 @@ def main() -> None:
         help="SSH port for remote deploy/check commands (default: 2222)",
     )
     parser.add_argument("--check", type=str, help="Verify manifest at given path (local)")
-    parser.add_argument("--generate-deploy", action="store_true", help="Generate deploy script")
+    parser.add_argument(
+        "--generate-deploy",
+        action="store_true",
+        help="Generate an executable deploy script",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output path for --generate-deploy (default: scripts/.deploy.generated.sh)",
+    )
     args = parser.parse_args()
 
     root = repo_root()
@@ -427,9 +436,9 @@ def main() -> None:
             args.path,
             ssh_port=args.ssh_port,
         )
-        script_path = root / "scripts" / "deploy.sh"
-        with open(script_path, "w") as f:
-            f.write(script)
+        script_path = args.output or root / "scripts" / ".deploy.generated.sh"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script, encoding="utf-8")
         os.chmod(script_path, 0o755)
         print(f"Deploy script written: {script_path}")
         print("Review before running!")

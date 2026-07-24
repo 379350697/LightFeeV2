@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from lightfee.core.domain import OrderFillReconciliation, Side, Venue
 from lightfee.lifecycle.exchange_truth_ledger import (
@@ -14,8 +18,30 @@ from lightfee.lifecycle.exchange_truth_ledger import (
 )
 
 
+CORRECTION_AUDIT_TEST_KEY = b"lifecycle-audit-test-key-for-signing-32-bytes"
+
+
 def _event(ts_ms: int, kind: str, payload: dict) -> dict:
     return {"ts_ms": ts_ms, "kind": kind, "payload": payload}
+
+
+def _correction_snapshot_event(position_id: str, *, truth_position_id: str | None = None) -> dict:
+    truth = {
+        "position_id": truth_position_id or position_id,
+        "classification": "evidence_incomplete",
+        "project_record_status": "evidence_incomplete",
+    }
+    return _event(
+        1_500,
+        "accounting.lifecycle_truth_rebuilt",
+        {
+            "position_id": position_id,
+            "source": "rebuild_lifecycle_truth",
+            "classification": truth["classification"],
+            "project_record_status": truth["project_record_status"],
+            "truth": truth,
+        },
+    )
 
 
 def _truth(events: list[dict], position_id: str) -> dict:
@@ -1387,6 +1413,552 @@ def test_rebuild_lifecycle_truth_cli_dry_run(tmp_path: Path):
     assert payload["positions"][position_id]["classification"] == (
         LifecycleClassification.EXCHANGE_LIFECYCLE_COMPLETE.value
     )
+
+
+def test_rebuild_lifecycle_truth_cli_replays_correction_audit_after_journal_rotation(
+    tmp_path: Path,
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-replay-LABUSDT"
+    events_path = tmp_path / "historical-events.jsonl"
+    base_events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 2,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        )
+    ]
+    complete_events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 1,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(
+            1_100,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "venue": "bybit",
+                "leg": "long",
+                "order_id": "open-long",
+                "quantity": 1,
+                "price": 1,
+            },
+        ),
+        _event(
+            1_200,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "open",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "open-short",
+                "quantity": 1,
+                "price": 1,
+            },
+        ),
+        _event(
+            1_300,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "close",
+                "venue": "bybit",
+                "leg": "long",
+                "order_id": "close-long",
+                "quantity": 1,
+                "price": 1,
+            },
+        ),
+        _event(
+            1_400,
+            "order.filled",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "phase": "close",
+                "venue": "bitget",
+                "leg": "short",
+                "order_id": "close-short",
+                "quantity": 1,
+                "price": 1,
+            },
+        ),
+    ]
+    events_path.write_text("\n".join(json.dumps(event) for event in base_events), encoding="utf-8")
+    truth = build_exchange_truth_lifecycle(complete_events)["positions"][position_id]
+    corrections_path = tmp_path / "lifecycle-corrections.json"
+    corrections_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [
+                    _event(
+                        1_500,
+                        "accounting.lifecycle_truth_rebuilt",
+                        {
+                            "position_id": position_id,
+                            "source": "rebuild_lifecycle_truth",
+                            "classification": truth["classification"],
+                            "project_record_status": truth["project_record_status"],
+                            "truth": truth,
+                        },
+                    )
+                ],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    signing_key_path = (
+        corrections_path.parent / rebuild_lifecycle_truth.CORRECTION_AUDIT_HMAC_KEY_FILENAME
+    )
+    signing_key_path.write_bytes(CORRECTION_AUDIT_TEST_KEY)
+    signing_key_path.chmod(0o600)
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "scripts/rebuild_lifecycle_truth.py",
+            "--events",
+            str(events_path),
+            "--correction-events",
+            str(corrections_path),
+            "--positions-file",
+            str(positions_path),
+            "--no-query-exchange",
+            "--dry-run",
+            "--expected-complete",
+            "1",
+            "--expected-phantom-zero",
+            "0",
+            "--expected-exchange-bad",
+            "0",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    payload = json.loads(proc.stdout)
+    assert payload["summary"]["exchange_lifecycle_complete"] == 1
+    assert payload["inputs"]["correction_event_files"] == [str(corrections_path)]
+    assert payload["correction_replay_applied_count"] == 1
+    assert payload["correction_audits"] == [
+        {
+            "path": str(corrections_path),
+            "integrity": "verified_hmac_sha256",
+            "event_count": 1,
+            "selected_event_count": 1,
+            "selected_snapshot_count": 1,
+        }
+    ]
+
+
+def test_rebuild_lifecycle_truth_apply_writes_replayable_evidence(
+    monkeypatch, tmp_path: Path, capsys
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-replay-artifact-LABUSDT"
+    runtime_dir = tmp_path / "runtime"
+    events_path = tmp_path / "events.jsonl"
+    events = [
+        _event(
+            1_000,
+            "entry.opened",
+            {
+                "position_id": position_id,
+                "symbol": "LABUSDT",
+                "quantity": 1,
+                "long_venue": "bybit",
+                "short_venue": "bitget",
+            },
+        ),
+        _event(1_100, "order.filled", {"position_id": position_id, "phase": "open", "venue": "bybit", "leg": "long", "quantity": 1, "price": 1}),
+        _event(1_200, "order.filled", {"position_id": position_id, "phase": "open", "venue": "bitget", "leg": "short", "quantity": 1, "price": 1}),
+        _event(1_300, "order.filled", {"position_id": position_id, "phase": "close", "venue": "bybit", "leg": "long", "quantity": 1, "price": 1}),
+        _event(1_400, "order.filled", {"position_id": position_id, "phase": "close", "venue": "bitget", "leg": "short", "quantity": 1, "price": 1}),
+    ]
+    events_path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+    monkeypatch.setattr(rebuild_lifecycle_truth, "ROOT", tmp_path)
+    monkeypatch.setattr(rebuild_lifecycle_truth, "assert_apply_gates", lambda: None)
+    monkeypatch.setattr(
+        rebuild_lifecycle_truth,
+        "apply_report_blockers",
+        lambda *args, **kwargs: [],
+    )
+
+    assert rebuild_lifecycle_truth.main(
+        [
+            "--runtime-dir",
+            str(runtime_dir),
+            "--events",
+            str(events_path),
+            "--positions-file",
+            str(positions_path),
+            "--no-query-exchange",
+            "--apply",
+        ]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    correction_path = Path(payload["apply"]["correction_path"])
+    correction_audit = json.loads(correction_path.read_text(encoding="utf-8"))
+    assert correction_audit["schema_version"] == rebuild_lifecycle_truth.CORRECTION_AUDIT_SCHEMA_VERSION
+    assert correction_audit["events_sha256"]
+    assert correction_audit["signature_algorithm"] == "hmac-sha256"
+    assert correction_audit["events_hmac_sha256"]
+    signing_key_path = correction_path.parent / rebuild_lifecycle_truth.CORRECTION_AUDIT_HMAC_KEY_FILENAME
+    assert signing_key_path.is_file()
+    assert signing_key_path.stat().st_mode & 0o777 == 0o600
+    replay_path = Path(payload["apply"]["replay_path"])
+    assert replay_path.exists()
+    replay_events = rebuild_lifecycle_truth.read_jsonl_events(
+        [replay_path], position_ids={position_id}
+    )
+    replayed = build_exchange_truth_lifecycle(replay_events, position_ids={position_id})
+    assert replayed["summary"]["exchange_lifecycle_complete"] == 1
+
+
+def test_rebuild_lifecycle_truth_rejects_correction_replay_apply(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    corrections_path = tmp_path / "corrections.json"
+    corrections_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="read-only"):
+        rebuild_lifecycle_truth.main(["--correction-events", str(corrections_path), "--apply"])
+
+    with pytest.raises(SystemExit, match="no-query"):
+        rebuild_lifecycle_truth.main(["--correction-events", str(corrections_path), "--dry-run"])
+
+
+def test_rebuild_lifecycle_truth_rejects_missing_or_corrupt_correction_audit(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-correction-integrity-LABUSDT"
+    missing_path = tmp_path / "missing.json"
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="does not exist"):
+        rebuild_lifecycle_truth.read_correction_events([missing_path], position_ids={position_id})
+
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="does not exist"):
+        rebuild_lifecycle_truth.main(
+            [
+                "--events",
+                str(tmp_path / "events.jsonl"),
+                "--correction-events",
+                str(missing_path),
+                "--positions-file",
+                str(positions_path),
+                "--no-query-exchange",
+                "--expected-complete",
+                "0",
+                "--expected-phantom-zero",
+                "0",
+                "--expected-exchange-bad",
+                "0",
+            ]
+        )
+
+    corrupt_path = tmp_path / "corrupt.json"
+    audit = rebuild_lifecycle_truth.correction_audit_payload(
+        [_correction_snapshot_event(position_id)],
+        hmac_key=CORRECTION_AUDIT_TEST_KEY,
+    )
+    audit["events"][0]["payload"]["truth"]["position_id"] = "entry-tampered-LABUSDT"
+    corrupt_path.write_text(json.dumps(audit), encoding="utf-8")
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="checksum mismatch"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [corrupt_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+
+def test_rebuild_lifecycle_truth_requires_expected_counts_for_correction_replay(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    correction_path = tmp_path / "correction.json"
+    correction_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [_correction_snapshot_event("entry-requires-counts-LABUSDT")],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text("entry-requires-counts-LABUSDT\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="requires exact expected counts"):
+        rebuild_lifecycle_truth.main(
+            [
+                "--correction-events",
+                str(correction_path),
+                "--positions-file",
+                str(positions_path),
+                "--no-query-exchange",
+            ]
+        )
+
+
+def test_rebuild_lifecycle_truth_rejects_inconsistent_duplicate_or_out_of_scope_snapshots(
+    tmp_path: Path,
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-correction-consistency-LABUSDT"
+    mismatch_path = tmp_path / "mismatch.json"
+    mismatch_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [_correction_snapshot_event(position_id, truth_position_id="entry-other-LABUSDT")],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="position_id mismatch"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [mismatch_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+    duplicate_path = tmp_path / "duplicate.json"
+    snapshot = _correction_snapshot_event(position_id)
+    duplicate_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [snapshot, snapshot],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="duplicate canonical snapshot"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [duplicate_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+    other_path = tmp_path / "other.json"
+    other_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [_correction_snapshot_event("entry-other-LABUSDT")],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="scope mismatch"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [other_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+
+def test_rebuild_lifecycle_truth_marks_legacy_unsigned_correction_replay_non_passing(
+    tmp_path: Path,
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-legacy-correction-LABUSDT"
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text("", encoding="utf-8")
+    corrections_path = tmp_path / "legacy-corrections.json"
+    corrections_path.write_text(
+        json.dumps([_correction_snapshot_event(position_id)]), encoding="utf-8"
+    )
+    positions_path = tmp_path / "positions.txt"
+    positions_path.write_text(position_id + "\n", encoding="utf-8")
+
+    common_args = [
+        "--events",
+        str(events_path),
+        "--correction-events",
+        str(corrections_path),
+        "--positions-file",
+        str(positions_path),
+        "--no-query-exchange",
+        "--dry-run",
+        "--expected-complete",
+        "0",
+        "--expected-phantom-zero",
+        "0",
+        "--expected-exchange-bad",
+        "1",
+    ]
+    with pytest.raises(SystemExit, match="legacy unsigned"):
+        rebuild_lifecycle_truth.main(common_args)
+
+    assert rebuild_lifecycle_truth.main(
+        [*common_args, "--allow-legacy-unsigned-correction"]
+    ) == 2
+
+
+def test_rebuild_lifecycle_truth_atomic_writer_preserves_previous_audit_on_replace_failure(
+    monkeypatch, tmp_path: Path
+):
+    from scripts import rebuild_lifecycle_truth
+
+    path = tmp_path / "audit.json"
+    path.write_text('{"previous": true}\n', encoding="utf-8")
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(rebuild_lifecycle_truth.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected rename failure"):
+        rebuild_lifecycle_truth.write_json(path, {"next": True})
+
+    assert path.read_text(encoding="utf-8") == '{"previous": true}\n'
+    assert not list(tmp_path.glob(".audit.json.*.tmp"))
+
+
+def test_rebuild_lifecycle_truth_atomic_writer_fsyncs_parent_directory(
+    monkeypatch, tmp_path: Path
+):
+    from scripts import rebuild_lifecycle_truth
+
+    original_fsync = os.fsync
+    fsync_target_types: list[bool] = []
+
+    def record_fsync(fd: int) -> None:
+        fsync_target_types.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+        original_fsync(fd)
+
+    monkeypatch.setattr(rebuild_lifecycle_truth.os, "fsync", record_fsync)
+    rebuild_lifecycle_truth.write_json(tmp_path / "audit.json", {"next": True})
+
+    assert fsync_target_types == [False, True]
+
+
+def test_rebuild_lifecycle_truth_rejects_independently_tampered_or_unknown_snapshots(
+    tmp_path: Path,
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-signed-integrity-LABUSDT"
+    tampered_path = tmp_path / "tampered.json"
+    tampered = rebuild_lifecycle_truth.correction_audit_payload(
+        [_correction_snapshot_event(position_id)],
+        hmac_key=CORRECTION_AUDIT_TEST_KEY,
+    )
+    tampered["events"][0]["payload"]["classification"] = "not_a_lifecycle_class"
+    tampered["events"][0]["payload"]["truth"]["classification"] = "not_a_lifecycle_class"
+    tampered["events_sha256"] = hashlib.sha256(
+        rebuild_lifecycle_truth._canonical_json_bytes(tampered["events"])
+    ).hexdigest()
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="signature mismatch"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [tampered_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+    unknown_path = tmp_path / "unknown-classification.json"
+    unknown_event = _correction_snapshot_event(position_id)
+    unknown_event["payload"]["classification"] = "not_a_lifecycle_class"
+    unknown_event["payload"]["truth"]["classification"] = "not_a_lifecycle_class"
+    unknown_path.write_text(
+        json.dumps(
+            rebuild_lifecycle_truth.correction_audit_payload(
+                [unknown_event],
+                hmac_key=CORRECTION_AUDIT_TEST_KEY,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="unsupported classification"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [unknown_path],
+            position_ids={position_id},
+            hmac_key=CORRECTION_AUDIT_TEST_KEY,
+        )
+
+
+def test_rebuild_lifecycle_truth_treats_schema_v1_checksum_as_legacy_unsigned(
+    tmp_path: Path,
+):
+    from scripts import rebuild_lifecycle_truth
+
+    position_id = "entry-schema-v1-LABUSDT"
+    rows = [_correction_snapshot_event(position_id)]
+    legacy_path = tmp_path / "schema-v1.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": rebuild_lifecycle_truth.CORRECTION_AUDIT_KIND,
+                "producer": rebuild_lifecycle_truth.CORRECTION_AUDIT_PRODUCER,
+                "events": rows,
+                "events_sha256": hashlib.sha256(
+                    rebuild_lifecycle_truth._canonical_json_bytes(rows)
+                ).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(rebuild_lifecycle_truth.CorrectionAuditError, match="legacy unsigned"):
+        rebuild_lifecycle_truth.read_correction_events(
+            [legacy_path],
+            position_ids={position_id},
+        )
+
+    audit = rebuild_lifecycle_truth.read_correction_events(
+        [legacy_path],
+        position_ids={position_id},
+        allow_legacy_unsigned=True,
+    )
+    assert audit.audits[0]["integrity"] == "legacy_unsigned"
+
+
+def test_rebuild_lifecycle_truth_creates_private_local_audit_hmac_key(tmp_path: Path):
+    from scripts import rebuild_lifecycle_truth
+
+    assert rebuild_lifecycle_truth._correction_audit_hmac_key(tmp_path, create=False) is None
+
+    created_key = rebuild_lifecycle_truth._correction_audit_hmac_key(tmp_path, create=True)
+    assert created_key is not None
+    assert len(created_key) == rebuild_lifecycle_truth.CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES
+
+    signing_key_path = tmp_path / rebuild_lifecycle_truth.CORRECTION_AUDIT_HMAC_KEY_FILENAME
+    assert signing_key_path.stat().st_mode & 0o777 == 0o600
+    assert rebuild_lifecycle_truth._correction_audit_hmac_key(tmp_path, create=False) == created_key
+
 
 
 def test_rebuild_lifecycle_truth_reads_only_selected_position_events(tmp_path: Path):

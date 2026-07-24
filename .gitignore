@@ -7,7 +7,7 @@ runtime/
 .env
 .env.*
 !.env.example
-scripts/deploy.sh
+scripts/.deploy.generated.sh
 .deploy_manifest.json
 .deploy_version
 .venv/

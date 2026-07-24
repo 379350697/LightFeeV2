@@ -36,6 +36,41 @@ Record the current deploy identity (`git rev-parse --short HEAD` and
 the first failing health field. Do not include secrets, raw account identifiers,
 or long journal excerpts in the bug ledger.
 
+## Replay a Retained Lifecycle Correction
+
+Journal rotation can remove the original JSONL rows after a gated lifecycle
+correction has been applied. Replay the retained evidence read-only; never use
+this command with `--apply` or exchange querying. The correction audit must be
+the HMAC-signed schema-v2 envelope written by a current `--apply`; the selected
+position scope and all three expected counts are mandatory so a missing or
+wrong audit cannot report a false green. No environment variable is required:
+the first gated `--apply` creates the random, owner-private `0600` sidecar
+`runtime/audits/lifecycle-truth-corrections/.audit-hmac-key` automatically.
+Retain that hidden file with the correction artifacts; losing it makes older
+signed audits deliberately unverifiable:
+
+```bash
+cd /opt/lightfee-v2
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 \
+  scripts/rebuild_lifecycle_truth.py \
+  --events runtime/audits/lifecycle-truth-corrections/<source>.jsonl \
+  --correction-events runtime/audits/lifecycle-truth-corrections/<correction>.json \
+  --positions-file runtime/audits/lifecycle-truth-corrections/<positions>.txt \
+  --no-query-exchange --dry-run \
+  --expected-complete <exact-count> \
+  --expected-phantom-zero <exact-count> \
+  --expected-exchange-bad <exact-count>
+```
+
+The correction audit is a gated canonical snapshot and therefore overrides
+stale partial journal rows only for this explicit replay. New `--apply` runs
+write an HMAC-SHA256 envelope plus a self-contained `.replay.jsonl` artifact;
+the writer fsyncs both file content and its parent directory before reporting
+success. Use the replay file directly with `--events` for future replays. A
+pre-schema JSON-array or schema-v1 checksum-only audit is deliberately refused.
+The `--allow-legacy-unsigned-correction` escape hatch is for forensic inspection
+only and always leaves an integrity blocker, so it cannot pass the replay gate.
+
 ## Remediate Sidecar Config Drift
 
 The sidecar runs as a Python V2 service (not Rust V1 bridge). Install the versioned template:
@@ -59,17 +94,19 @@ Must show `ok: true`, no open orders, no pending entries, no recovery work.
 
 ## Deploy
 
-Run the auto-generated deploy script or manual equivalent:
+Run the version-controlled deployment entrypoint:
 
 ```bash
-python3 scripts/verify_deploy_manifest.py --generate-deploy --remote root@38.60.253.248 --path /opt/lightfee-v2 --ssh-port 2222
 bash scripts/deploy.sh
 ```
 
-The script syncs code, uploads `.deploy_manifest.json`, writes `.deploy_version`,
-runs remote verification with `/opt/lightfee-v2/.venv/bin/python3`, restarts the
-live services, and collects `diagnose_live.py --since-deploy` evidence. Any step
-failure exits non-zero.
+The entrypoint generates a temporary deploy script from the current versioned
+generator on every run, so an ignored or stale generated file cannot be
+executed after a pull. It syncs code, uploads `.deploy_manifest.json`, writes
+`.deploy_version`, runs remote verification with
+`/opt/lightfee-v2/.venv/bin/python3`, restarts the live services, and requires
+the post-deploy `diagnose_live.py --since-deploy` acceptance gate to pass. Any
+step failure exits non-zero.
 
 ## Post-Deploy Verification
 
@@ -101,7 +138,7 @@ ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
 
 # 7. Since-deploy diagnostic evidence (same interpreter as production)
 ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/diagnose_live.py --json --since-deploy"
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/diagnose_live.py --json --since-deploy --require-gate-pass"
 ```
 
 All checks must pass before marking a deploy complete. If any check fails, do NOT resume trading — diagnose and re-deploy.

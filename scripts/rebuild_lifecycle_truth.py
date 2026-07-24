@@ -5,11 +5,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import hmac
 import inspect
 import json
+import os
+import secrets
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
@@ -17,16 +24,132 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lightfee.lifecycle.exchange_truth_ledger import build_exchange_truth_lifecycle  # noqa: E402
+from lightfee.lifecycle.exchange_truth_ledger import (  # noqa: E402
+    LifecycleClassification,
+    build_exchange_truth_lifecycle,
+)
 
 
 DEFAULT_RUNTIME_DIR = Path("runtime")
 CORRECTION_DIR = Path("runtime/audits/lifecycle-truth-corrections")
+CORRECTION_AUDIT_SCHEMA_VERSION = 2
+CORRECTION_AUDIT_KIND = "lightfee.lifecycle_truth_correction_audit"
+CORRECTION_EVENT_KIND = "accounting.lifecycle_truth_rebuilt"
+CORRECTION_AUDIT_PRODUCER = "rebuild_lifecycle_truth"
+CORRECTION_AUDIT_SIGNATURE_ALGORITHM = "hmac-sha256"
+CORRECTION_AUDIT_HMAC_KEY_FILENAME = ".audit-hmac-key"
+CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES = 32
 HISTORICAL_ORDER_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 ACCOUNT_HISTORY_QUERY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000
 ACCOUNT_HISTORY_IDENTITY_FALLBACK_WINDOW_MS = 30 * 60 * 1000
 ACCOUNT_HISTORY_NEXT_ENTRY_BOUNDARY_GRACE_MS = 250
 QTY_TOLERANCE = 0.999
+
+
+class CorrectionAuditError(ValueError):
+    """A correction audit is absent, corrupt, or outside the requested scope."""
+
+
+@dataclass(frozen=True)
+class CorrectionAuditInput:
+    events: list[dict[str, Any]]
+    audits: list[dict[str, Any]]
+
+
+def _canonical_json_bytes(payload: Any) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _fsync_directory(directory: Path) -> None:
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _correction_audit_hmac_key(directory: Path, *, create: bool) -> bytes | None:
+    """Read, or on the write path create, the private sidecar signing key."""
+    key_path = directory / CORRECTION_AUDIT_HMAC_KEY_FILENAME
+    try:
+        key = key_path.read_bytes()
+    except FileNotFoundError:
+        if not create:
+            return None
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return _correction_audit_hmac_key(directory, create=False)
+        except OSError as exc:
+            raise CorrectionAuditError(
+                f"cannot create correction audit signing key: {key_path}"
+            ) from exc
+        key = secrets.token_bytes(CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(key)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_directory(directory)
+        except OSError as exc:
+            key_path.unlink(missing_ok=True)
+            raise CorrectionAuditError(
+                f"cannot persist correction audit signing key: {key_path}"
+            ) from exc
+    except OSError as exc:
+        raise CorrectionAuditError(f"cannot read correction audit signing key: {key_path}") from exc
+
+    if len(key) < CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES:
+        raise CorrectionAuditError(f"invalid correction audit signing key: {key_path}")
+    try:
+        key_mode = key_path.stat().st_mode & 0o777
+    except OSError as exc:
+        raise CorrectionAuditError(f"cannot stat correction audit signing key: {key_path}") from exc
+    if key_mode & 0o077:
+        raise CorrectionAuditError(
+            f"correction audit signing key is not private (expected 0600): {key_path}"
+        )
+    return key
+
+
+def _correction_audit_signed_payload(events: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": CORRECTION_AUDIT_SCHEMA_VERSION,
+        "kind": CORRECTION_AUDIT_KIND,
+        "producer": CORRECTION_AUDIT_PRODUCER,
+        "events": events,
+        "events_sha256": hashlib.sha256(_canonical_json_bytes(events)).hexdigest(),
+    }
+
+
+def correction_audit_payload(
+    events: list[dict[str, Any]],
+    *,
+    hmac_key: bytes,
+) -> dict[str, Any]:
+    """Envelope a correction audit with an independently verifiable signature."""
+    if len(hmac_key) < CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES:
+        raise CorrectionAuditError(
+            "correction audit HMAC key is shorter than "
+            f"{CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES} bytes"
+        )
+    signed_payload = _correction_audit_signed_payload(events)
+    signature = hmac.new(
+        hmac_key,
+        _canonical_json_bytes(signed_payload),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        **signed_payload,
+        "signature_algorithm": CORRECTION_AUDIT_SIGNATURE_ALGORITHM,
+        "events_hmac_sha256": signature,
+    }
 
 
 def _event_position_id(event: dict[str, Any]) -> str:
@@ -59,6 +182,228 @@ def read_jsonl_events(
                         continue
                     events.append(event)
     return events
+
+
+def read_correction_events(
+    paths: list[Path],
+    *,
+    position_ids: set[str] | None = None,
+    hmac_key: bytes | None = None,
+    allow_legacy_unsigned: bool = False,
+) -> CorrectionAuditInput:
+    """Read append-only correction audit files produced by ``--apply``.
+
+    A retained audit is a stricter input than the best-effort runtime journal:
+    a missing, truncated, malformed, out-of-scope, or internally inconsistent
+    audit must fail the replay rather than create a false-green zero result.
+    """
+    selected_ids = {str(item) for item in position_ids or set() if str(item)}
+    if hmac_key is not None and len(hmac_key) < CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES:
+        raise CorrectionAuditError(
+            "correction audit HMAC key is shorter than "
+            f"{CORRECTION_AUDIT_MIN_HMAC_KEY_BYTES} bytes"
+        )
+    events: list[dict[str, Any]] = []
+    audits: list[dict[str, Any]] = []
+    seen_snapshot_positions: dict[str, Path] = {}
+    for path in paths:
+        if not path.is_file():
+            raise CorrectionAuditError(f"correction audit does not exist or is not a file: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CorrectionAuditError(f"invalid correction audit JSON: {path}") from exc
+
+        integrity = "verified_hmac_sha256"
+        if isinstance(payload, list):
+            if not allow_legacy_unsigned:
+                raise CorrectionAuditError(
+                    "legacy unsigned correction audit is refused: "
+                    f"{path}; use --allow-legacy-unsigned-correction only for forensic inspection"
+                )
+            rows = payload
+            integrity = "legacy_unsigned"
+        elif isinstance(payload, dict):
+            schema_version = payload.get("schema_version")
+            if schema_version == 1:
+                if not allow_legacy_unsigned:
+                    raise CorrectionAuditError(
+                        "legacy unsigned correction audit is refused: "
+                        f"{path}; use --allow-legacy-unsigned-correction only for forensic inspection"
+                    )
+                integrity = "legacy_unsigned"
+            elif schema_version != CORRECTION_AUDIT_SCHEMA_VERSION:
+                raise CorrectionAuditError(f"unsupported correction audit schema: {path}")
+            if payload.get("kind") != CORRECTION_AUDIT_KIND:
+                raise CorrectionAuditError(f"unexpected correction audit kind: {path}")
+            if payload.get("producer") != CORRECTION_AUDIT_PRODUCER:
+                raise CorrectionAuditError(f"unexpected correction audit producer: {path}")
+            rows = payload.get("events")
+            expected_digest = payload.get("events_sha256")
+            if not isinstance(rows, list) or not isinstance(expected_digest, str):
+                raise CorrectionAuditError(f"invalid correction audit envelope: {path}")
+            actual_digest = hashlib.sha256(_canonical_json_bytes(rows)).hexdigest()
+            if actual_digest != expected_digest:
+                raise CorrectionAuditError(f"correction audit checksum mismatch: {path}")
+            if schema_version == CORRECTION_AUDIT_SCHEMA_VERSION:
+                if payload.get("signature_algorithm") != CORRECTION_AUDIT_SIGNATURE_ALGORITHM:
+                    raise CorrectionAuditError(f"unexpected correction audit signature algorithm: {path}")
+                supplied_signature = payload.get("events_hmac_sha256")
+                if not isinstance(supplied_signature, str):
+                    raise CorrectionAuditError(f"invalid correction audit signature: {path}")
+                key = hmac_key or _correction_audit_hmac_key(path.parent, create=False)
+                if key is None:
+                    raise CorrectionAuditError(
+                        "correction audit signing key is missing: "
+                        f"{path.parent / CORRECTION_AUDIT_HMAC_KEY_FILENAME}"
+                    )
+                expected_signature = hmac.new(
+                    key,
+                    _canonical_json_bytes(_correction_audit_signed_payload(rows)),
+                    hashlib.sha256,
+                ).hexdigest()
+                if not hmac.compare_digest(supplied_signature, expected_signature):
+                    raise CorrectionAuditError(f"correction audit signature mismatch: {path}")
+        else:
+            raise CorrectionAuditError(f"invalid correction audit root value: {path}")
+
+        if not isinstance(rows, list):
+            raise CorrectionAuditError(f"invalid correction audit events: {path}")
+        selected_event_count = 0
+        selected_snapshot_count = 0
+        for event in rows:
+            if not isinstance(event, dict):
+                raise CorrectionAuditError(f"non-object correction audit event: {path}")
+            snapshot_position_id = _validate_correction_snapshot(event, path=path)
+            if snapshot_position_id:
+                prior_path = seen_snapshot_positions.get(snapshot_position_id)
+                if prior_path is not None:
+                    raise CorrectionAuditError(
+                        "duplicate canonical snapshot for "
+                        f"{snapshot_position_id}: {prior_path} and {path}"
+                    )
+                seen_snapshot_positions[snapshot_position_id] = path
+            if selected_ids and _event_position_id(event) not in selected_ids:
+                continue
+            events.append(event)
+            selected_event_count += 1
+            if snapshot_position_id:
+                selected_snapshot_count += 1
+        audits.append(
+            {
+                "path": str(path),
+                "integrity": integrity,
+                "event_count": len(rows),
+                "selected_event_count": selected_event_count,
+                "selected_snapshot_count": selected_snapshot_count,
+            }
+        )
+
+    snapshot_ids = {
+        _event_position_id(event)
+        for event in events
+        if str(event.get("kind") or "") == CORRECTION_EVENT_KIND
+    }
+    if selected_ids:
+        missing = sorted(selected_ids - snapshot_ids)
+        extra = sorted(snapshot_ids - selected_ids)
+        if missing or extra:
+            raise CorrectionAuditError(
+                "correction audit scope mismatch: "
+                f"missing_snapshots={missing}, unexpected_snapshots={extra}"
+            )
+    if not snapshot_ids:
+        raise CorrectionAuditError("correction audit contains no canonical lifecycle snapshots")
+    return CorrectionAuditInput(events=events, audits=audits)
+
+
+def _validate_correction_snapshot(event: dict[str, Any], *, path: Path) -> str | None:
+    """Validate one canonical snapshot and return its position id, if any."""
+    if str(event.get("kind") or "") != CORRECTION_EVENT_KIND:
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        raise CorrectionAuditError(f"canonical snapshot has non-object payload: {path}")
+    position_id = _event_position_id(event)
+    truth = payload.get("truth")
+    if not position_id or not isinstance(truth, dict):
+        raise CorrectionAuditError(f"canonical snapshot missing position_id or truth: {path}")
+    if payload.get("source") != CORRECTION_AUDIT_PRODUCER:
+        raise CorrectionAuditError(f"canonical snapshot has unexpected source: {path}")
+    truth_position_id = str(truth.get("position_id") or "").strip()
+    if truth_position_id != position_id:
+        raise CorrectionAuditError(
+            "canonical snapshot position_id mismatch: "
+            f"event={position_id}, truth={truth_position_id}, audit={path}"
+        )
+    classification = str(truth.get("classification") or "")
+    if classification not in {item.value for item in LifecycleClassification}:
+        raise CorrectionAuditError(
+            f"canonical snapshot has unsupported classification for {position_id}: {path}"
+        )
+    for field in ("classification", "project_record_status"):
+        payload_value = str(payload.get(field) or "")
+        truth_value = str(truth.get(field) or "")
+        if not payload_value or payload_value != truth_value:
+            raise CorrectionAuditError(
+                f"canonical snapshot {field} mismatch for {position_id}: {path}"
+            )
+    return position_id
+
+
+def apply_correction_replay_snapshots(
+    report: dict[str, Any],
+    correction_events: Iterable[dict[str, Any]],
+) -> int:
+    """Overlay canonical truth snapshots from an append-only correction audit.
+
+    A lifecycle correction is the gated result of a previous exchange-truth
+    rebuild.  It must retain its canonical classification after the original
+    journal has been rotated away; merging its individual fills with stale
+    partial rows can otherwise recreate the very gap the correction closed.
+    This is deliberately used only by the explicit, no-query replay mode.
+    """
+    positions = report.get("positions")
+    if not isinstance(positions, dict):
+        return 0
+    applied = 0
+    for event in correction_events:
+        if str(event.get("kind") or "") != CORRECTION_EVENT_KIND:
+            continue
+        position_id = _validate_correction_snapshot(event, path=Path("<replay>"))
+        assert position_id is not None
+        payload = event["payload"]
+        truth = payload.get("truth")
+        assert isinstance(truth, dict)
+        positions[position_id] = dict(truth)
+        applied += 1
+    if not applied:
+        return 0
+
+    classifications = Counter(
+        str(truth.get("classification") or "")
+        for truth in positions.values()
+        if isinstance(truth, dict)
+    )
+    project_statuses = Counter(
+        str(truth.get("project_record_status") or "")
+        for truth in positions.values()
+        if isinstance(truth, dict) and str(truth.get("project_record_status") or "")
+    )
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        report["summary"] = summary
+    summary["position_count"] = len(positions)
+    for classification in (
+        "exchange_lifecycle_complete",
+        "exchange_lifecycle_incomplete",
+        "evidence_incomplete",
+        "phantom_zero_qty_opened",
+    ):
+        summary[classification] = classifications[classification]
+    summary["project_record_status_counts"] = dict(sorted(project_statuses.items()))
+    return applied
 
 
 def discover_event_files(runtime_dir: Path, history: str) -> list[Path]:
@@ -1485,11 +1830,44 @@ def correction_event(position_id: str, truth: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    _atomic_write_text(
+        path,
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
     )
+
+
+def write_jsonl(path: Path, events: Iterable[dict[str, Any]]) -> None:
+    def write_events(handle: Any) -> None:
+        for event in events:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+
+    _atomic_write(path, write_events)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Replace an audit artifact only after its complete content is durable."""
+    _atomic_write(path, lambda handle: handle.write(text))
+
+
+def _atomic_write(path: Path, write: Callable[[Any], None]) -> None:
+    """Replace an audit artifact only after its complete content is durable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def append_events(runtime_dir: Path, events: list[dict[str, Any]]) -> Path:
@@ -1613,6 +1991,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, default=DEFAULT_RUNTIME_DIR)
     parser.add_argument("--events", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--correction-events",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "append-only correction audit JSON from an earlier --apply; "
+            "requires a valid HMAC signature; read-only replay input and incompatible with --apply"
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-unsigned-correction",
+        action="store_true",
+        help=(
+            "allow forensic reading of a pre-HMAC JSON-array or schema-v1 correction audit; "
+            "the replay remains deliberately non-passing because its integrity is unverified"
+        ),
+    )
     parser.add_argument("--positions-file", type=Path)
     parser.add_argument("--history", choices=["current", "all"], default="all")
     parser.add_argument("--output-json", type=Path)
@@ -1640,17 +2036,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.apply and args.correction_events:
+        raise SystemExit("--correction-events is read-only and cannot be combined with --apply")
+    if args.correction_events and args.query_exchange:
+        raise SystemExit("--correction-events requires --no-query-exchange for canonical audit replay")
+    if args.correction_events and args.positions_file is None:
+        raise SystemExit("--correction-events requires a non-empty --positions-file")
+    if args.correction_events:
+        missing_expected = [
+            option
+            for option, value in (
+                ("--expected-complete", args.expected_complete),
+                ("--expected-phantom-zero", args.expected_phantom_zero),
+                ("--expected-exchange-bad", args.expected_exchange_bad),
+            )
+            if value is None
+        ]
+        if missing_expected:
+            raise SystemExit(
+                "--correction-events requires exact expected counts: " + ", ".join(missing_expected)
+            )
     event_files = list(args.events)
     if not event_files:
         event_files = discover_event_files(args.runtime_dir, args.history)
     position_ids = read_position_ids(args.positions_file)
+    if args.correction_events and not position_ids:
+        raise SystemExit("--correction-events requires a non-empty --positions-file")
     event_position_filter = set(position_ids or []) if position_ids is not None else None
+    exchange_truth_env_files_loaded: list[str] = []
     events = read_jsonl_events(event_files, position_ids=event_position_filter)
+    correction_audit = CorrectionAuditInput(events=[], audits=[])
+    if args.correction_events:
+        try:
+            correction_audit = read_correction_events(
+                list(args.correction_events),
+                position_ids=event_position_filter,
+                allow_legacy_unsigned=bool(args.allow_legacy_unsigned_correction),
+            )
+        except CorrectionAuditError as exc:
+            raise SystemExit(str(exc)) from exc
+    correction_events = correction_audit.events
+    events.extend(correction_events)
     context_windows: dict[str, dict[str, Any]] | None = None
     if event_position_filter:
         context_windows = read_position_event_windows(event_files)
     queried_fill_events: list[dict[str, Any]] = []
-    exchange_truth_env_files_loaded: list[str] = []
     report = build_exchange_truth_lifecycle(
         events,
         position_ids=set(position_ids or []),
@@ -1667,14 +2097,21 @@ def main(argv: list[str] | None = None) -> int:
         report["exchange_query"] = exchange_query_summary
     else:
         report["exchange_query"] = {"enabled": False}
+        report["correction_replay_applied_count"] = apply_correction_replay_snapshots(
+            report,
+            correction_events,
+        )
     report["inputs"] = {
         "runtime_dir": str(args.runtime_dir),
         "event_files": [str(path) for path in event_files],
+        "correction_event_files": [str(path) for path in args.correction_events],
         "positions_file": str(args.positions_file) if args.positions_file else "",
         "position_ids": position_ids or [],
         "dry_run": not args.apply,
         "query_exchange": bool(args.query_exchange),
     }
+    if correction_audit.audits:
+        report["correction_audits"] = correction_audit.audits
     report["exchange_truth_env_files_loaded"] = exchange_truth_env_files_loaded
     report["apply_blockers"] = apply_report_blockers(
         report,
@@ -1683,6 +2120,18 @@ def main(argv: list[str] | None = None) -> int:
         expected_phantom_zero=args.expected_phantom_zero,
         expected_exchange_bad=args.expected_exchange_bad,
     )
+    legacy_audits = [
+        str(audit["path"])
+        for audit in correction_audit.audits
+        if audit.get("integrity") == "legacy_unsigned"
+    ]
+    if legacy_audits:
+        report["correction_replay_integrity_blockers"] = [
+            f"legacy_unsigned_correction_audit:{path}" for path in legacy_audits
+        ]
+        report["apply_blockers"] = sorted(
+            set(report["apply_blockers"] + report["correction_replay_integrity_blockers"])
+        )
 
     if args.apply:
         if report["apply_blockers"]:
@@ -1705,10 +2154,18 @@ def main(argv: list[str] | None = None) -> int:
         ]
         append_items = [*queried_fill_events, *correction_events]
         correction_path = ROOT / CORRECTION_DIR / "{}.json".format(int(time.time() * 1000))
-        write_json(correction_path, append_items)
+        try:
+            hmac_key = _correction_audit_hmac_key(correction_path.parent, create=True)
+            assert hmac_key is not None
+            write_json(correction_path, correction_audit_payload(append_items, hmac_key=hmac_key))
+        except CorrectionAuditError as exc:
+            raise SystemExit(str(exc)) from exc
+        replay_path = correction_path.with_suffix(".replay.jsonl")
+        write_jsonl(replay_path, [*events, *append_items])
         journal_path = append_events(args.runtime_dir, append_items)
         report["apply"] = {
             "correction_path": str(correction_path),
+            "replay_path": str(replay_path),
             "runtime_journal_path": str(journal_path),
             "event_count": len(append_items),
             "queried_fill_event_count": len(queried_fill_events),

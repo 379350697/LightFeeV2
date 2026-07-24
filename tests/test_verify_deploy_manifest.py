@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from scripts import verify_deploy_manifest as manifest
@@ -64,6 +65,45 @@ def test_generate_deploy_script_uses_ssh_port_2222(tmp_path, monkeypatch):
     assert "rsync -avz --delete" in script
     assert '-e "ssh $SSH_OPTS"' in script
     assert "scp $SCP_OPTS" in script
+
+
+def test_generate_deploy_main_preserves_versioned_entrypoint(tmp_path, monkeypatch):
+    _stub_manifest_generation(monkeypatch)
+    entrypoint = tmp_path / "scripts" / "deploy.sh"
+    generated_path = tmp_path / "temporary" / "deploy.sh"
+    entrypoint.parent.mkdir()
+    entrypoint.write_text("versioned entrypoint\n", encoding="utf-8")
+    monkeypatch.setattr(manifest, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        manifest.sys,
+        "argv",
+        [
+            "verify_deploy_manifest.py",
+            "--generate-deploy",
+            "--remote",
+            "root@38.60.253.248",
+            "--output",
+            str(generated_path),
+        ],
+    )
+
+    manifest.main()
+
+    assert entrypoint.read_text(encoding="utf-8") == "versioned entrypoint\n"
+    assert generated_path.is_file()
+    assert not (tmp_path / "scripts" / ".deploy.generated.sh").exists()
+
+
+def test_versioned_deploy_entrypoint_generates_ephemeral_script():
+    entrypoint = Path(__file__).resolve().parents[1] / "scripts" / "deploy.sh"
+    script = entrypoint.read_text(encoding="utf-8")
+
+    assert 'GENERATED_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/lightfee-deploy.XXXXXX")"' in script
+    assert 'trap cleanup EXIT' in script
+    assert '"$SCRIPT_DIR/verify_deploy_manifest.py" --generate-deploy' in script
+    assert '--output "$GENERATED_SCRIPT"' in script
+    assert 'PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"' in script
+    assert 'LIGHTFEE_DEPLOY_LOCAL="${LIGHTFEE_DEPLOY_LOCAL:-$PROJECT_ROOT}" bash "$GENERATED_SCRIPT"' in script
 
 
 def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path, monkeypatch):
