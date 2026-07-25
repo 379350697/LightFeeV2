@@ -1415,7 +1415,7 @@ def test_strategy_entry_policy_reports_disabled_live_entries_without_hiding_stat
     assert "funding_live_entry_disabled" in required.fingerprints
 
 
-def test_verifier_spread_ttl_uses_strictest_runtime_and_signal_policy():
+def test_verifier_spread_health_uses_runtime_liveness_budget_not_signal_ttl():
     class Runtime:
         sidecar_snapshot_max_age_ms = 10_000
 
@@ -1423,7 +1423,7 @@ def test_verifier_spread_ttl_uses_strictest_runtime_and_signal_policy():
         runtime = Runtime()
         strategy = SimpleNamespace(spread_signal_ttl_ms=1_000)
 
-    assert vps._resolve_spread_snapshot_max_age_ms(None, Config()) == 1_000
+    assert vps._resolve_spread_snapshot_max_age_ms(None, Config()) == 10_000
     assert vps._resolve_spread_snapshot_max_age_ms(3_000, Config()) == 3_000
     assert vps._resolve_spread_snapshot_max_age_ms(None, None) == 60_000
 
@@ -1564,7 +1564,9 @@ def test_spread_runtime_samples_clock_after_snapshot_load(monkeypatch):
     assert report.details["publish_age_ms"] == 50
 
 
-def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
+def test_spread_bbo_runtime_keeps_live_market_degradation_observable_not_global_gate(
+    monkeypatch,
+):
     now_ms = 2_000
     snapshot = SimpleNamespace(
         schema_version=5,
@@ -1606,11 +1608,148 @@ def test_spread_bbo_runtime_rejects_producer_declared_degradation(monkeypatch):
         now_ms=now_ms,
     )
 
-    assert not report.ok
-    assert "spread_bbo_venue_degraded" in report.fingerprints
-    assert "spread_bbo_symbol_degraded" in report.fingerprints
+    assert report.ok
+    assert report.fingerprints == []
+    assert report.details["nonblocking_market_observations"] == [
+        "spread_bbo_symbol_degraded",
+        "spread_bbo_venue_degraded",
+    ]
+    assert report.details["execution_admission_contract"] == (
+        "selected_pair_two_leg_freshness_fail_closed"
+    )
     assert report.details["degraded_venues"] == ["okx"]
     assert report.details["degraded_symbols"] == {"binance": ["ETHUSDT"]}
+
+
+def test_spread_bbo_runtime_keeps_global_quote_gap_observable_not_global_gate(
+    monkeypatch,
+):
+    now_ms = 2_000
+    snapshot = SimpleNamespace(
+        schema_version=5,
+        published_at_ms=now_ms - 1_100,
+        batch_started_at_ms=now_ms - 1_200,
+        producer_generation_id="boot:42",
+        configured_venues=["binance", "okx"],
+        sampling_symbols=["BTCUSDT"],
+        degraded_venues=[],
+        degraded_symbols={},
+        quotes={
+            "binance:BTCUSDT": SimpleNamespace(
+                venue="binance",
+                symbol="BTCUSDT",
+                observed_at_ms=now_ms - 1_100,
+            ),
+        },
+    )
+    config = SimpleNamespace(
+        venues=[SimpleNamespace(venue="binance"), SimpleNamespace(venue="okx")],
+        strategy=SimpleNamespace(
+            spread_signal_ttl_ms=1_000,
+            spread_live_enabled=True,
+        ),
+    )
+    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
+    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
+    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
+    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
+
+    report = vps._spread_bbo_runtime_report(
+        "/tmp/spread-bbo.json",
+        app_config=config,
+        now_ms=now_ms,
+    )
+
+    assert report.ok
+    assert report.details["nonblocking_market_observations"] == [
+        "spread_bbo_publication_stale",
+        "spread_bbo_quote_stale",
+        "spread_bbo_venue_coverage_incomplete",
+    ]
+    assert report.details["observed_venues"] == []
+
+
+def test_spread_snapshot_runtime_keeps_market_staleness_observable_not_global_gate(
+    monkeypatch,
+):
+    now_ms = 10_000
+    snapshot = {
+        "schema_version": 4,
+        "decision_at_ms": now_ms - 2_000,
+        "published_at_ms": now_ms - 1_900,
+        "market_observed_at_ms": now_ms - 2_000,
+        "source_mode": "sidecar_snapshot_stale",
+        "degraded_venues": ["okx"],
+        "degraded_symbols": {},
+        "input_quote_count": 2,
+        "valid_quote_count": 0,
+        "evaluated_pair_count": 0,
+        "accepted_pair_count": 0,
+        "paper_configured_enabled": False,
+        "paper_admission_enabled": False,
+        "paper_tracked_count": 0,
+        "paper_refresh_status": "disabled",
+        "paper_event_count": 0,
+        "paper_last_success_at_ms": 0,
+        "rejection_counts": {},
+        "paper_admission_rejection_counts": {},
+        "candidates": [],
+    }
+    monkeypatch.setattr(vps, "_read_json", lambda path: snapshot)
+
+    report = vps._spread_snapshot_runtime_report(
+        "/tmp/spread.json",
+        max_age_ms=1_000,
+        now_ms=now_ms,
+    )
+
+    assert report.ok
+    assert report.fingerprints == []
+    assert report.details["nonblocking_market_observations"] == [
+        "spread_degraded_inputs",
+        "spread_input_pipeline_stalled",
+        "spread_snapshot_stale",
+        "spread_source_sidecar_snapshot_stale",
+    ]
+
+
+def test_spread_snapshot_runtime_keeps_contract_failures_blocking(monkeypatch):
+    now_ms = 10_000
+    snapshot = {
+        "schema_version": 4,
+        "decision_at_ms": now_ms - 2_000,
+        "published_at_ms": now_ms - 1_900,
+        "market_observed_at_ms": now_ms - 2_000,
+        "source_mode": "unknown",
+        "degraded_venues": [],
+        "degraded_symbols": {},
+        "input_quote_count": 0,
+        "valid_quote_count": 0,
+        "evaluated_pair_count": 0,
+        "accepted_pair_count": 0,
+        "paper_configured_enabled": False,
+        "paper_admission_enabled": False,
+        "paper_tracked_count": 0,
+        "paper_refresh_status": "disabled",
+        "paper_event_count": 0,
+        "paper_last_success_at_ms": 0,
+        "rejection_counts": {},
+        "paper_admission_rejection_counts": {},
+        "candidates": [],
+    }
+    monkeypatch.setattr(vps, "_read_json", lambda path: snapshot)
+
+    report = vps._spread_snapshot_runtime_report(
+        "/tmp/spread.json",
+        max_age_ms=1_000,
+        now_ms=now_ms,
+    )
+
+    assert not report.ok
+    assert "spread_source_mode_unknown" in report.fingerprints
+    assert report.details["nonblocking_market_observations"] == [
+        "spread_snapshot_stale"
+    ]
 
 
 def test_spread_bbo_runtime_keeps_paper_only_symbol_gaps_observable_not_blocking(

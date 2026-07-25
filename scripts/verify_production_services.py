@@ -59,6 +59,32 @@ PRODUCTION_SERVICE_NAMES = (
     "lightfee-live.service",
 )
 
+# These conditions describe current market-data availability, not whether the
+# process is safe to run.  Spread execution proves freshness independently for
+# the two selected legs immediately before dispatch; requiring every configured
+# venue to be fresh in one global verifier sample would make an unrelated slow
+# venue a new admission gate.
+_SPREAD_BBO_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
+    {
+        "spread_bbo_venue_coverage_incomplete",
+        "spread_bbo_venue_degraded",
+        "spread_bbo_symbol_degraded",
+        "spread_bbo_publication_stale",
+        "spread_bbo_quote_stale",
+    }
+)
+_SPREAD_SNAPSHOT_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
+    {
+        "spread_snapshot_stale",
+        "spread_source_sidecar_snapshot_stale",
+        "spread_source_sidecar_snapshot_quotes_stale",
+        "spread_source_sidecar_snapshot_degraded",
+        "spread_source_sidecar_snapshot_partial",
+        "spread_degraded_inputs",
+        "spread_input_pipeline_stalled",
+    }
+)
+
 
 def _read_json(path: str) -> dict:
     with open(path) as f:
@@ -295,20 +321,59 @@ def _resolve_spread_snapshot_max_age_ms(
 ) -> int:
     if explicit_max_age_ms is not None:
         return max(int(explicit_max_age_ms), 0)
-    candidates: list[int] = []
-    for owner, name in (
-        (getattr(app_config, "runtime", None), "sidecar_snapshot_max_age_ms"),
-        (getattr(app_config, "strategy", None), "spread_signal_ttl_ms"),
-    ):
-        configured = getattr(owner, name, None)
-        try:
-            if configured is not None and int(configured) > 0:
-                candidates.append(int(configured))
-        except (TypeError, ValueError):
-            continue
-    if candidates:
-        return min(candidates)
+    # This is a service-liveness budget.  ``spread_signal_ttl_ms`` remains the
+    # strict per-candidate execution gate and must not be repurposed as a
+    # whole-data-plane availability requirement.
+    configured = getattr(
+        getattr(app_config, "runtime", None),
+        "sidecar_snapshot_max_age_ms",
+        None,
+    )
+    try:
+        if configured is not None and int(configured) > 0:
+            return int(configured)
+    except (TypeError, ValueError):
+        pass
     return DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS
+
+
+def _keep_pair_scoped_market_observations_nonblocking(
+    report: HealthReport,
+    *,
+    market_observation_fingerprints: frozenset[str],
+) -> HealthReport:
+    """Keep degraded market evidence visible without making it a global gate.
+
+    The runtime's order path owns pair-scoped admission and rejects stale or
+    incomplete evidence for either selected leg.  This verifier must still
+    fail on a broken producer, schema, generation, or sampling contract, but a
+    temporary absence of quotes on unrelated venues is an operational
+    observation rather than a process-wide readiness failure.
+    """
+
+    observations = sorted(
+        set(report.fingerprints) & market_observation_fingerprints
+    )
+    if not observations:
+        return report
+    blocking = [
+        fingerprint
+        for fingerprint in report.fingerprints
+        if fingerprint not in market_observation_fingerprints
+    ]
+    details = dict(report.details)
+    details["nonblocking_market_observations"] = observations
+    details["execution_admission_contract"] = (
+        "selected_pair_two_leg_freshness_fail_closed"
+    )
+    details["data_plane_status"] = "degraded"
+    return HealthReport(
+        name=report.name,
+        ok=not blocking,
+        severity="critical" if blocking else "info",
+        fingerprints=blocking,
+        details=details,
+    )
 
 
 def _systemd_active_report(name: str) -> HealthReport:
@@ -518,12 +583,16 @@ def _spread_bbo_runtime_report(
         ):
             fingerprints.append("spread_bbo_snapshot_generation_mismatch")
 
-    return HealthReport(
+    report = HealthReport(
         name="spread_bbo_runtime",
         ok=not fingerprints,
         severity="critical" if fingerprints else "info",
         fingerprints=fingerprints,
         details=details,
+    )
+    return _keep_pair_scoped_market_observations_nonblocking(
+        report,
+        market_observation_fingerprints=_SPREAD_BBO_MARKET_OBSERVATION_FINGERPRINTS,
     )
 
 
@@ -537,10 +606,16 @@ def _spread_snapshot_runtime_report(
 
     snapshot = _read_json(path)
     checked_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-    return analyze_spread_snapshot(
+    report = analyze_spread_snapshot(
         snapshot,
         now_ms=checked_at_ms,
         max_age_ms=max_age_ms,
+    )
+    return _keep_pair_scoped_market_observations_nonblocking(
+        report,
+        market_observation_fingerprints=(
+            _SPREAD_SNAPSHOT_MARKET_OBSERVATION_FINGERPRINTS
+        ),
     )
 
 
@@ -1087,8 +1162,14 @@ def main() -> None:
     else:
         print(f"ok={summary.ok} critical={summary.critical_count} warning={summary.warning_count}")
         for report in summary.reports:
-            status = "PASS" if report.ok else report.severity.upper()
-            print(f"{status} {report.name}: {','.join(report.fingerprints) or 'ok'}")
+            observations = report.details.get("nonblocking_market_observations", [])
+            if observations:
+                status = "OBSERVE"
+                labels = ",".join(str(item) for item in observations)
+            else:
+                status = "PASS" if report.ok else report.severity.upper()
+                labels = ",".join(report.fingerprints) or "ok"
+            print(f"{status} {report.name}: {labels}")
     sys.exit(0 if summary.ok else 1)
 
 
