@@ -866,6 +866,24 @@ class TestSidecarServiceRateLimitWiring:
             "funding_edge_below_floor": 1,
             "outside_scan_window": 1,
         }
+        timing = snapshot.candidate_build_diagnostics
+        assert timing["refresh_started_at_ms"] == 10_000
+        assert timing["venue_quote_observed_at_ms"] == {
+            "binance": 10_100,
+            "bybit": 10_200,
+        }
+        assert timing["candidate_build_started_at_ms"] == (
+            snapshot.candidate_build_observed_at_ms
+        )
+        assert timing["candidate_build_completed_at_ms"] == snapshot.published_at_ms
+        assert timing["entry_publish_started_at_ms"] == snapshot.published_at_ms
+        assert timing["refresh_latency_quantiles_ms"] == {
+            "sample_count": 1,
+            "window_size": 128,
+            "p50": 350,
+            "p95": 350,
+            "p99": 350,
+        }
 
     @pytest.mark.asyncio
     async def test_background_audit_never_starts_a_second_venue_fetch(

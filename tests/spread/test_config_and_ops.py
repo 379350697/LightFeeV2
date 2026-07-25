@@ -106,6 +106,28 @@ venue = "okx"
 """,
         encoding="utf-8",
     )
+    manifest = tmp_path / "config" / "research" / "spread_v2_signed_reversion.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        """
+{
+  "version": "spread_research_manifest_v2",
+  "model_epoch": "v2_signed_reversion",
+  "hypothesis": "signed-basis mean reversion after executable costs",
+  "cohorts": [
+    {
+      "bot_id": "tt_conservative",
+      "cohort": "taker_taker_baseline",
+      "hypothesis": "executable taker/taker baseline",
+      "enabled": true,
+      "control_group": false,
+      "acceptance_eligible": true
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
 
     config = load_config(path)
 

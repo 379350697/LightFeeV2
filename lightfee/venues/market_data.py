@@ -30,6 +30,10 @@ from lightfee.marketdata.open_interest import (
     validated_open_interest_evidence,
 )
 from lightfee.sidecar.snapshot import funding_rate_sample_id
+from lightfee.venues.hyperliquid_info_coordinator import (
+    hyperliquid_info_coordinator,
+    should_coordinate_hyperliquid_info_request,
+)
 from lightfee.venues.specs import VenueSpec
 
 if TYPE_CHECKING:
@@ -954,6 +958,17 @@ class MarketDataClient:
         scopes = self._public_rate_limit_scopes(method, path)
         phase_collector = _PUBLIC_REQUEST_PHASE_COLLECTOR.get()
         rate_limit_started = time.perf_counter()
+        info_coordinator = None
+        if should_coordinate_hyperliquid_info_request(
+            self._spec.venue_id,
+            method,
+            path,
+            body,
+        ):
+            info_coordinator = hyperliquid_info_coordinator()
+            cached_info = info_coordinator.lookup_metadata_response(body)
+            if cached_info is not None:
+                return cached_info.payload, cached_info.received_at_ms
 
         if self._rate_limiter is not None:
             await self._rate_limiter.wait_until_ready_for_scopes(scopes)
@@ -963,6 +978,8 @@ class MarketDataClient:
         global_rt = _get_global_rt()
         if self._consume_global_rate_limit_budget and global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
+        if info_coordinator is not None:
+            await info_coordinator.async_wait_until_ready(body)
         rate_limit_elapsed_ms = max(
             int((time.perf_counter() - rate_limit_started) * 1_000),
             0,
@@ -1034,6 +1051,12 @@ class MarketDataClient:
             else:
                 raise ValueError(f"unsupported method: {method}")
             received_at_ms = _now_ms()
+            if info_coordinator is not None:
+                info_coordinator.record_http_response(
+                    resp.status_code,
+                    dict(resp.headers),
+                    body=body,
+                )
 
             if resp.status_code >= 400:
                 if resp.status_code in (429, 418):
@@ -1082,6 +1105,12 @@ class MarketDataClient:
                     0,
                 )
                 _record_phase(parse_ms=parse_ms)
+            if info_coordinator is not None:
+                info_coordinator.store_metadata_response(
+                    body,
+                    payload,
+                    received_at_ms=received_at_ms,
+                )
             return payload, received_at_ms
         except httpx.TimeoutException:
             phase = _record_phase()
@@ -2013,11 +2042,10 @@ class MarketDataClient:
         self,
         symbols: list[str],
     ) -> dict[str, FundingTicker]:
-        raw = await self._public_post(
+        raw, received_at_ms = await self._public_post_with_received_at(
             self._spec.market_snapshot_path,
             body={"type": "metaAndAssetCtxs"},
         )
-        received_at_ms = _now_ms()
         application_error = _entry_oi_application_error(Venue.HYPERLIQUID, raw)
         if application_error is not None:
             status, reason = application_error

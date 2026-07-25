@@ -2580,7 +2580,7 @@ class TestPlannerDispatchIntegration:
         assert runtime._entry_account_truth_generation_is_ready(22_002) is False
 
     @pytest.mark.asyncio
-    async def test_entry_account_truth_timeout_never_marks_generation_ready(
+    async def test_entry_account_truth_global_refresh_is_not_cut_short_by_aggregate_budget(
         self, config, tmp_journal,
     ):
         class SlowAccountTruthAdapter(FakeVenueAdapter):
@@ -2592,6 +2592,9 @@ class TestPlannerDispatchIntegration:
                 return []
 
         config.runtime.mode = "live"
+        # Recovery retains its own budget for recovery paths, but ordinary
+        # background all-venue truth must complete rather than being silently
+        # truncated by that aggregate number.
         config.runtime.live_recovery_rest_probe_timeout_ms = 1
         runtime = LiveRuntime(
             config,
@@ -2601,13 +2604,10 @@ class TestPlannerDispatchIntegration:
         )
         runtime.journal = tmp_journal
 
-        assert await runtime._ensure_entry_account_truth_for_preparation() is False
-        assert runtime._entry_account_truth_ready_at_ms == 0
-        assert runtime._entry_account_truth_generation_is_ready() is False
-        assert any(
-            "entry_account_truth_refresh_timeout" in error
-            for error in runtime._entry_account_truth_generation["errors"]
-        )
+        assert await runtime._ensure_entry_account_truth_for_preparation() is True
+        assert runtime._entry_account_truth_ready_at_ms > 0
+        assert runtime._entry_account_truth_generation_is_ready() is True
+        assert runtime._entry_account_truth_generation["errors"] == []
 
     @pytest.mark.asyncio
     async def test_entry_account_truth_refresh_is_singleflight(
@@ -2650,25 +2650,16 @@ class TestPlannerDispatchIntegration:
         assert adapter.open_order_calls == 1
 
     @pytest.mark.asyncio
-    async def test_entry_account_truth_submit_recheck_rejects_expired_generation(
+    async def test_entry_account_truth_submit_recheck_rejects_missing_target_receipts(
         self, config, tmp_journal, monkeypatch,
     ):
         config.runtime.mode = "live"
         config.runtime.private_position_max_age_ms = 15_000
         runtime = LiveRuntime(config, venue_adapters={})
         runtime.journal = tmp_journal
-        runtime._entry_account_truth_generation = {
-            "truth_supported": True,
-            "truth_available": True,
-            "venue_count": 1,
-            "complete_venue_count": 1,
-            "errors": [],
-            "finished_at_ms": 7_001,
-        }
-        runtime._entry_account_truth_ready_at_ms = 7_001
         monkeypatch.setattr(
             "lightfee.engine.runtime.wall_clock_now_ms",
-            lambda: 22_002,
+            lambda: 7_001,
         )
 
         assert (
@@ -2677,11 +2668,426 @@ class TestPlannerDispatchIntegration:
             )
             is False
         )
+        events = runtime.journal.read_all()
+        assert any(event["kind"] == "runtime.entry_account_truth_incomplete" for event in events)
+        assert runtime.state.last_scan["blocking_reason"] == (
+            "entry_account_truth_incomplete_before_dispatch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_before_dispatch_uses_target_venues_only(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            position_calls = 0
+            open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                self.position_calls += 1
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                self.open_order_calls += 1
+                return []
+
+        class BrokenNonTargetAdapter(FakeVenueAdapter):
+            position_calls = 0
+
+            async def fetch_all_positions(self):
+                self.position_calls += 1
+                raise RuntimeError("non-target venue must not be probed")
+
+        config.runtime.mode = "live"
+        adapters = {
+            Venue.BINANCE: CompleteAccountTruthAdapter(Venue.BINANCE),
+            Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
+            Venue.ASTER: BrokenNonTargetAdapter(Venue.ASTER),
+        }
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: 7_001,
+        )
+
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is True
+        )
+        assert adapters[Venue.BINANCE].position_calls == 1
+        assert adapters[Venue.OKX].open_order_calls == 1
+        assert adapters[Venue.ASTER].position_calls == 0
+        assert runtime.journal.read_all() == []
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_pending_global_sweep_does_not_hold_target_pair(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        global_sweep_started = asyncio.Event()
+        release_global_sweep = asyncio.Event()
+
+        async def slow_global_sweep(*_args, **_kwargs):
+            global_sweep_started.set()
+            await release_global_sweep.wait()
+            return {}, {
+                "truth_supported": True,
+                "truth_available": True,
+                "venue_count": 3,
+                "complete_venue_count": 3,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+                "errors": [],
+            }
+
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: CompleteAccountTruthAdapter(Venue.BINANCE),
+                Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
+                Venue.ASTER: CompleteAccountTruthAdapter(Venue.ASTER),
+            },
+        )
+        runtime.journal = tmp_journal
+        monkeypatch.setattr(
+            runtime.recovery_startup_runtime,
+            "_refresh_recovery_ledger_from_account_truth_with_evidence",
+            slow_global_sweep,
+        )
+
+        assert await runtime._entry_account_truth_ready_for_tick() is False
+        await global_sweep_started.wait()
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is True
+        )
+
+        release_global_sweep.set()
         assert runtime._entry_account_truth_gate_task is not None
-        await runtime._entry_account_truth_gate_task
-        assert any(
-            event["kind"] == "runtime.entry_account_truth_not_ready_before_dispatch"
+        assert await runtime._entry_account_truth_gate_task is True
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_target_venue_probes_are_singleflight(
+        self, config, tmp_journal,
+    ):
+        release = asyncio.Event()
+
+        class BlockingAccountTruthAdapter(FakeVenueAdapter):
+            position_calls = 0
+            open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                self.position_calls += 1
+                await release.wait()
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                self.open_order_calls += 1
+                return []
+
+        config.runtime.mode = "live"
+        adapters = {
+            Venue.BINANCE: BlockingAccountTruthAdapter(Venue.BINANCE),
+            Venue.OKX: BlockingAccountTruthAdapter(Venue.OKX),
+        }
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        first = asyncio.create_task(
+            runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+        )
+        second = asyncio.create_task(
+            runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert adapters[Venue.BINANCE].position_calls == 1
+        assert adapters[Venue.OKX].position_calls == 1
+
+        release.set()
+        assert await asyncio.gather(first, second) == [True, True]
+        assert adapters[Venue.BINANCE].open_order_calls == 1
+        assert adapters[Venue.OKX].open_order_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_before_dispatch_times_out_target_venue(
+        self, config, tmp_journal,
+    ):
+        class SlowAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                await asyncio.sleep(0.05)
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        config.runtime.mode = "live"
+        config.runtime.live_recovery_rest_probe_timeout_ms = 60_000
+        config.runtime.entry_account_truth_probe_timeout_ms = 1
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: SlowAccountTruthAdapter(Venue.BINANCE),
+                Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is False
+        )
+        timeout_events = [
+            event
             for event in runtime.journal.read_all()
+            if event["kind"] == "runtime.entry_account_truth_timeout"
+        ]
+        assert len(timeout_events) == 1
+        assert timeout_events[0]["payload"]["reason"] == (
+            "entry_account_truth_timeout_before_dispatch"
+        )
+        assert "account_truth_timeout:1ms" in timeout_events[0]["payload"]["errors"][0]
+        summaries = {
+            row["venue"]: row
+            for row in timeout_events[0]["payload"]["receipt_summaries"]
+        }
+        assert summaries[Venue.BINANCE.value]["complete"] is False
+        assert summaries[Venue.BINANCE.value]["duration_ms"] >= 0
+        assert summaries[Venue.BINANCE.value]["position_count"] == 0
+        assert summaries[Venue.BINANCE.value]["open_order_count"] == 0
+        assert summaries[Venue.OKX.value]["complete"] is True
+        assert "positions" not in summaries[Venue.OKX.value]
+        assert "open_orders" not in summaries[Venue.OKX.value]
+
+    @pytest.mark.asyncio
+    async def test_tick_continues_to_clean_rank_two_after_rank_one_truth_timeout(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+        from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
+
+        class SlowAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                await asyncio.sleep(0.05)
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        def quote(venue: str, symbol: str) -> QuoteSnapshot:
+            return QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=50_000.0,
+                ask=50_010.0,
+                observed_at_ms=7_000,
+                funding_rate_observed_at_ms=7_000,
+                funding_rate_received_at_ms=7_000,
+                funding_rate_source="test_fixture",
+                funding_rate_sample_id=f"funding:{venue}:{symbol}:7000:0:0",
+                open_interest=5_000_000.0,
+                open_interest_evidence_status="observed",
+                open_interest_evidence_reason="test_fixture",
+                open_interest_observed_at_ms=7_000,
+                open_interest_received_at_ms=7_000,
+                open_interest_source="test_fixture",
+                open_interest_sample_id=f"{venue}:{symbol}:7000:test_fixture",
+                open_interest_venue_symbol=symbol,
+            )
+
+        config.runtime.live_scan_recovery_success_count = 1
+        config.runtime.mode = "live"
+        config.runtime.sidecar_snapshot_max_age_ms = 10_000
+        config.runtime.max_market_age_ms = 10_000
+        config.runtime.entry_account_truth_probe_timeout_ms = 1
+        rank_one = self._candidate("BTCUSDT")
+        rank_two = self._candidate("ETHUSDT")
+        rank_two.long_venue = "aster"
+        rank_two.short_venue = "bybit"
+        _attach_live_oi_evidence(rank_two, now_ms=5_000)
+        for candidate in (rank_one, rank_two):
+            candidate.first_funding_timestamp_ms = 7_001 + 10 * 60_000
+        adapters = {
+            Venue.BINANCE: SlowAccountTruthAdapter(Venue.BINANCE),
+            Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
+            Venue.ASTER: CompleteAccountTruthAdapter(Venue.ASTER),
+            Venue.BYBIT: CompleteAccountTruthAdapter(Venue.BYBIT),
+        }
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = object()
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        snapshot = SidecarSnapshot(
+            published_at_ms=7_000,
+            market_observed_at_ms=7_000,
+            candidates=[rank_one, rank_two],
+            quotes={
+                f"{venue}:{symbol}": quote(venue, symbol)
+                for venue, symbol in (
+                    ("binance", "BTCUSDT"),
+                    ("okx", "BTCUSDT"),
+                    ("aster", "ETHUSDT"),
+                    ("bybit", "ETHUSDT"),
+                )
+            },
+        )
+        for venue, symbol in (
+            ("binance", "BTCUSDT"),
+            ("okx", "BTCUSDT"),
+            ("aster", "ETHUSDT"),
+            ("bybit", "ETHUSDT"),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=50_000.0,
+                    ask=50_010.0,
+                    observed_at_ms=7_000,
+                    received_at_ms=7_000,
+                    source="test_ws_bbo",
+                ),
+                now_ms=7_001,
+            )
+
+        async def refresh():
+            return False
+
+        dispatched_symbols: list[str] = []
+
+        async def dispatch(candidate, now_ms, price_hint=0.0, **_kwargs):
+            dispatched_symbols.append(candidate.symbol)
+            return True
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
+        _install_v6_snapshot_fixture(monkeypatch, snapshot)
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.discover_tradeable_candidates",
+            lambda candidates, _strategy, _now_ms, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_ensure_entry_account_truth_for_preparation",
+            refresh,
+        )
+
+        async def preserve_catalog_scope(candidates, **_kwargs):
+            return list(candidates)
+
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_supported_by_venue_catalog",
+            preserve_catalog_scope,
+        )
+        monkeypatch.setattr(runtime, "_dispatch_entry", dispatch)
+        monkeypatch.setattr(
+            runtime,
+            "_select_entry_candidates",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+
+        await runtime.tick()
+
+        assert dispatched_symbols == ["ETHUSDT"]
+        assert runtime.recovery_ledger is None
+        timeout_events = [
+            event
+            for event in runtime.journal.read_all()
+            if event["kind"] == "runtime.entry_account_truth_timeout"
+        ]
+        assert len(timeout_events) == 1
+        assert timeout_events[0]["payload"]["reason"] == (
+            "entry_account_truth_timeout_before_dispatch"
+        )
+        assert runtime.state.last_scan["dispatched_candidate_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_live_artifact_refreshes_global_recovery(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        class LivePositionAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return [
+                    PositionSnapshot(
+                        venue=Venue.BINANCE,
+                        symbol="BTCUSDT",
+                        side=Side.BUY,
+                        quantity=0.5,
+                        entry_price=50_000.0,
+                        observed_at_ms=7_001,
+                    )
+                ]
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: LivePositionAccountTruthAdapter(Venue.BINANCE),
+                Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: 7_001,
+        )
+
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is False
+        )
+        assert runtime.recovery_ledger is not None
+        assert runtime.recovery_decision is not None
+        assert runtime.recovery_decision.entry_allowed is False
+        assert runtime.state.recovery_blocked_reason == "unpaired_live_position"
+        assert any(
+            item.kind == "unpaired_live_position"
+            for item in runtime.recovery_ledger.work_items
         )
 
     @pytest.mark.asyncio
@@ -2691,6 +3097,13 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
         from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
 
+        class CompleteAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
         config.runtime.live_scan_recovery_success_count = 1
         config.runtime.mode = "live"
         config.runtime.sidecar_snapshot_max_age_ms = 10_000
@@ -2698,8 +3111,8 @@ class TestPlannerDispatchIntegration:
         runtime = LiveRuntime(
             config,
             venue_adapters={
-                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
-                Venue.OKX: FakeVenueAdapter(Venue.OKX),
+                Venue.BINANCE: CompleteAccountTruthAdapter(Venue.BINANCE),
+                Venue.OKX: CompleteAccountTruthAdapter(Venue.OKX),
             },
         )
         runtime.journal = tmp_journal
@@ -2769,16 +3182,7 @@ class TestPlannerDispatchIntegration:
         order: list[str] = []
         async def refresh():
             order.append("refresh")
-            runtime._entry_account_truth_generation = {
-                "truth_supported": True,
-                "truth_available": True,
-                "venue_count": 2,
-                "complete_venue_count": 2,
-                "errors": [],
-                "finished_at_ms": 7_001,
-            }
-            runtime._entry_account_truth_ready_at_ms = 7_001
-            return True
+            return False
 
         async def dispatch(candidate, now_ms, price_hint=0.0, **_kwargs):
             order.append("dispatch")
@@ -2810,14 +3214,11 @@ class TestPlannerDispatchIntegration:
         monkeypatch.setattr(runtime, "_select_entry_candidates", select_candidates)
 
         await runtime.tick()
-        # Safety/account preparation is a background generation; the next tick
-        # consumes it without putting that work back on the evidence deadline.
-        await asyncio.sleep(0)
-        await runtime.tick()
 
         assert order[:2] == ["refresh", "dispatch"]
         assert runtime._entry_account_truth_generation is None
         assert runtime._entry_account_truth_ready_at_ms == 0
+        assert runtime._entry_account_truth_venue_receipts == {}
 
     @pytest.mark.asyncio
     async def test_recovery_ledger_refresh_skips_metadata_only_adapter(

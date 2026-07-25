@@ -13,6 +13,7 @@ from lightfee.config.compatibility import (
     entry_readiness_provider_configured,
     resolve_entry_readiness_provider,
 )
+from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.config.schema import (
     AppConfig,
     ENTRY_READINESS_PROVIDERS,
@@ -104,14 +105,34 @@ def validate_config(config: AppConfig) -> list[str]:
             f"runtime.max_order_quote_age_ms must be > 0, "
             f"got: {config.runtime.max_order_quote_age_ms}"
         )
+    if not _is_positive_int(
+        config.runtime.entry_account_truth_per_venue_timeout_ms
+    ):
+        issues.append(
+            "runtime.entry_account_truth_per_venue_timeout_ms must be a positive integer"
+        )
+    legacy_entry_truth_timeout = config.runtime.entry_account_truth_probe_timeout_ms
+    if legacy_entry_truth_timeout is not None and not _is_positive_int(
+        legacy_entry_truth_timeout
+    ):
+        issues.append(
+            "runtime.entry_account_truth_probe_timeout_ms must be a positive integer "
+            "when set"
+        )
+    if not str(config.runtime.hyperliquid_info_coordinator_dir or "").strip():
+        issues.append("runtime.hyperliquid_info_coordinator_dir must be non-empty")
     if not str(config.runtime.funding_basis_risk_checkpoint_path or "").strip():
         issues.append("runtime.funding_basis_risk_checkpoint_path must be non-empty")
     if not str(config.runtime.fee_evidence_path or "").strip():
         issues.append("runtime.fee_evidence_path must be non-empty")
     if not str(config.runtime.funding_fee_evidence_path or "").strip():
         issues.append("runtime.funding_fee_evidence_path must be non-empty")
-    elif _canonical_path(config.runtime.funding_fee_evidence_path) == _canonical_path(
-        config.runtime.fee_evidence_path
+    elif _canonical_path(
+        config.runtime.funding_fee_evidence_path,
+        config=config,
+    ) == _canonical_path(
+        config.runtime.fee_evidence_path,
+        config=config,
     ):
         issues.append(
             "runtime.funding_fee_evidence_path must differ from "
@@ -647,7 +668,7 @@ def validate_config(config: AppConfig) -> list[str]:
         ).strip()
         if not manifest_path:
             issues.append("strategy.spread_paper_research_manifest_path must be set")
-        elif not Path(manifest_path).is_file():
+        elif not _canonical_path(manifest_path, config=config).is_file():
             issues.append(
                 "strategy.spread_paper_research_manifest_path must reference a file"
             )
@@ -823,9 +844,13 @@ def _is_finite_nonnegative(value: object) -> bool:
     return math.isfinite(numeric) and numeric >= 0.0
 
 
-def _canonical_path(value: object) -> Path:
+def _canonical_path(
+    value: object,
+    *,
+    config: AppConfig | None = None,
+) -> Path:
     """Normalize aliases so two strategy inputs cannot resolve to one file."""
-    return Path(str(value or "").strip()).expanduser().resolve(strict=False)
+    return resolve_config_artifact_path(config, value)
 
 
 def _is_finite_ratio(value: object) -> bool:

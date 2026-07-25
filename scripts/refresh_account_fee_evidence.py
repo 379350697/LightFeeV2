@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable
 
 from lightfee.config.loader import load_config
+from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.core.domain import Venue
 from lightfee.strategy.fee_evidence import (
     LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
@@ -744,7 +745,10 @@ def main() -> int:
     parser.add_argument("--output", default="")
     args = parser.parse_args()
     config = load_config(args.config)
-    output = Path(args.output or config.runtime.funding_fee_evidence_path)
+    output = resolve_config_artifact_path(
+        config,
+        args.output or config.runtime.funding_fee_evidence_path,
+    )
     now_ms = int(time.time() * 1000)
     fresh, failures, requested = asyncio.run(
         collect_evidence(args.config, now_ms=now_ms)

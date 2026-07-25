@@ -26,6 +26,7 @@ from lightfee.core.domain import (
     Venue,
 )
 from lightfee.core.errors import OrderSubmitError
+from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
 from lightfee.engine.business_contract import classify_entry_quantity_contract
 from lightfee.engine.entry_readiness import QuoteLease
@@ -3346,12 +3347,16 @@ class EntryDispatchRuntime:
             ):
                 return "funding_canary_conservative_fee_config_invalid"
 
-            evidence = load_fee_evidence(
+            evidence_path = resolve_config_artifact_path(
+                runtime,
                 getattr(
                     runtime,
                     "funding_fee_evidence_path",
                     getattr(runtime, "fee_evidence_path", ""),
                 ),
+            )
+            evidence = load_fee_evidence(
+                evidence_path,
                 now_ms=now_ms,
                 max_age_ms=int(
                     getattr(
@@ -3461,8 +3466,12 @@ class EntryDispatchRuntime:
                 return "funding_canary_fee_cost_understated"
             return ""
 
-        evidence = load_fee_evidence(
+        evidence_path = resolve_config_artifact_path(
+            runtime,
             getattr(runtime, "funding_fee_evidence_path", runtime.fee_evidence_path),
+        )
+        evidence = load_fee_evidence(
+            evidence_path,
             now_ms=now_ms,
             max_age_ms=int(
                 getattr(

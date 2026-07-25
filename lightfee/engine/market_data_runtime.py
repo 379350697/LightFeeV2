@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections import Counter
+import math
+from collections import Counter, deque
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -665,10 +666,13 @@ class EntryOpenInterestRefresher:
 
 
 class MarketDataRuntime:
+    SNAPSHOT_LATENCY_QUANTILE_WINDOW = 128
+
     def __init__(self, ctx: MarketDataRuntimeContext) -> None:
         self.ctx = ctx
         self._last_local_l2_depth_bridge_publish_ms = 0
         self._last_local_l2_depth_bridge_error_ms = 0
+        self._snapshot_latency_samples_ms: dict[str, deque[int]] = {}
 
     def _current_wall_clock_ms(self) -> int:
         """Read the owner runtime clock so tests and production share one clock.
@@ -681,6 +685,46 @@ class MarketDataRuntime:
         if callable(provider):
             return int(provider())
         return int(wall_clock_now_ms())
+
+    @classmethod
+    def _snapshot_latency_quantiles_ms(cls, samples: list[int]) -> dict[str, int]:
+        if not samples:
+            return {
+                "sample_count": 0,
+                "window_size": cls.SNAPSHOT_LATENCY_QUANTILE_WINDOW,
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+            }
+        ordered = sorted(int(sample) for sample in samples)
+
+        def percentile(value: float) -> int:
+            index = min(
+                max(math.ceil(len(ordered) * value) - 1, 0),
+                len(ordered) - 1,
+            )
+            return ordered[index]
+
+        return {
+            "sample_count": len(ordered),
+            "window_size": cls.SNAPSHOT_LATENCY_QUANTILE_WINDOW,
+            "p50": percentile(0.50),
+            "p95": percentile(0.95),
+            "p99": percentile(0.99),
+        }
+
+    def _snapshot_latency_quantile_summary_ms(
+        self,
+        key: str,
+        latency_ms: int,
+    ) -> dict[str, int]:
+        samples = self._snapshot_latency_samples_ms.setdefault(
+            key,
+            deque(maxlen=self.SNAPSHOT_LATENCY_QUANTILE_WINDOW),
+        )
+        if latency_ms > 0:
+            samples.append(int(latency_ms))
+        return self._snapshot_latency_quantiles_ms(list(samples))
 
     @property
     def ws_bbo_rest_refresher(self):
@@ -5322,6 +5366,10 @@ class MarketDataRuntime:
                     per_venue_candidate_count[venue] += 1
 
         published_at_ms = self._snapshot_publication_at_ms(snapshot)
+        ready_at_ms = int(getattr(snapshot, "ready_at_ms", 0) or 0)
+        candidate_build_at_ms = int(
+            getattr(snapshot, "candidate_build_observed_at_ms", 0) or 0
+        )
         market_observed_at_ms = int(getattr(snapshot, "market_observed_at_ms", 0) or 0)
         snapshot_publish_age_ms = now_ms - published_at_ms if published_at_ms > 0 else 0
         market_observed_age_ms = (
@@ -5389,6 +5437,40 @@ class MarketDataRuntime:
                 if age_ms <= self._snapshot_domain_budget_ms("quote"):
                     fresh_source_ages.append(age_ms)
         fresh_source_age_ms = min(fresh_source_ages) if fresh_source_ages else 0
+        acquisition_to_publish_latency_ms = (
+            max(published_at_ms - market_observed_at_ms, 0)
+            if published_at_ms > 0 and market_observed_at_ms > 0
+            else 0
+        )
+        stage_latency_ms = {
+            "market_observed_to_candidate_build": (
+                max(candidate_build_at_ms - market_observed_at_ms, 0)
+                if candidate_build_at_ms > 0 and market_observed_at_ms > 0
+                else 0
+            ),
+            "candidate_build_to_ready": (
+                max(ready_at_ms - candidate_build_at_ms, 0)
+                if ready_at_ms > 0 and candidate_build_at_ms > 0
+                else 0
+            ),
+            "ready_to_publish": (
+                max(published_at_ms - ready_at_ms, 0)
+                if published_at_ms > 0 and ready_at_ms > 0
+                else 0
+            ),
+            "market_observed_to_publish": acquisition_to_publish_latency_ms,
+        }
+        stage_latency_quantiles_ms = {
+            stage: self._snapshot_latency_quantile_summary_ms(
+                f"stage:{stage}",
+                latency_ms,
+            )
+            for stage, latency_ms in stage_latency_ms.items()
+        }
+        acquisition_latency_summary_ms = self._snapshot_latency_quantile_summary_ms(
+            "acquisition_to_publish",
+            acquisition_to_publish_latency_ms,
+        )
         (
             candidate_scope_candidates,
             candidate_scope_mode,
@@ -5405,6 +5487,20 @@ class MarketDataRuntime:
             "top_degraded_symbols": top_degraded_symbols,
             "snapshot_publish_age_ms": max(snapshot_publish_age_ms, 0),
             "market_observed_age_ms": max(market_observed_age_ms, 0),
+            "snapshot_stage_timestamps_ms": {
+                "market_observed_at_ms": market_observed_at_ms,
+                "candidate_build_observed_at_ms": candidate_build_at_ms,
+                "ready_at_ms": ready_at_ms,
+                "published_at_ms": published_at_ms,
+            },
+            "snapshot_stage_latency_ms": stage_latency_ms,
+            "snapshot_stage_latency_quantiles_ms": stage_latency_quantiles_ms,
+            "snapshot_acquisition_to_publish_latency_ms": (
+                acquisition_to_publish_latency_ms
+            ),
+            "snapshot_acquisition_to_publish_latency_quantiles_ms": (
+                acquisition_latency_summary_ms
+            ),
             "fallback_duration_ms": fallback_duration_ms,
             "last_good_age_ms": max(snapshot_publish_age_ms, 0),
             "fresh_source_age_ms": fresh_source_age_ms,

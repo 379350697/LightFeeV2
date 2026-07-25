@@ -10,10 +10,11 @@ from functools import partial
 import logging
 import threading
 import time
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
 from typing import Mapping, Optional
 
+from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.core.domain import Venue
 from lightfee.marketdata.ws_bbo import TopBookQuote
@@ -887,7 +888,37 @@ class SidecarService:
         # a new immutable candidate service for this snapshot so a verified
         # account tier is never silently retained past its evidence TTL.
         self._candidate_service = self._new_candidate_service(now_ms=candidate_build_observed_at_ms)
-        candidate_build_diagnostics: dict[str, object] = {}
+        # The existing decision watermark is captured immediately before the
+        # candidate pass.  Reuse it as the start marker so diagnostics do not
+        # introduce another wall-clock read or re-date source evidence.
+        candidate_build_started_at_ms = candidate_build_observed_at_ms
+        candidate_timing_diagnostics: dict[str, object] = {
+            # Keep global refresh health separate from candidate-level final
+            # admission.  These are evidence timestamps only; they never
+            # relax quote/OI freshness or the live revalidator's hard gates.
+            "refresh_started_at_ms": refresh_started_at_ms,
+            "quote_collection_completed_at_ms": candidate_build_observed_at_ms,
+            # Quotes have no independent transport-receipt field.  Their
+            # per-venue observation time is the original sidecar arrival
+            # evidence; do not replace it with this refresh clock.
+            "venue_quote_observed_at_ms": _venue_quote_receipt_timestamps(
+                quotes,
+                field_name="observed_at_ms",
+            ),
+            "open_interest_collection_completed_at_ms": (
+                _latest_quote_evidence_timestamp(
+                    quotes,
+                    field_name="open_interest_received_at_ms",
+                    fallback_ms=candidate_build_observed_at_ms,
+                )
+            ),
+            "venue_open_interest_received_at_ms": _venue_quote_receipt_timestamps(
+                quotes,
+                field_name="open_interest_received_at_ms",
+            ),
+            "candidate_build_started_at_ms": candidate_build_started_at_ms,
+        }
+        candidate_build_diagnostics = dict(candidate_timing_diagnostics)
         candidate_service = self._ensure_candidate_service()
         candidates = await asyncio.to_thread(
             candidate_service.build,
@@ -896,6 +927,10 @@ class SidecarService:
             observed_at_ms=candidate_build_observed_at_ms,
             diagnostics=candidate_build_diagnostics,
         )
+        # ``build`` replaces its diagnostic mapping to enforce pair-count
+        # conservation. Re-attach collection timing afterwards; it describes
+        # the same build and is never an eligibility input.
+        candidate_build_diagnostics.update(candidate_timing_diagnostics)
         candidate_build_diagnostics["quarantined_future_quote_count"] = len(
             future_quote_keys
         )
@@ -910,6 +945,19 @@ class SidecarService:
         published_ms = max(
             int(time.time() * 1000),
             candidate_build_observed_at_ms,
+        )
+        # Publication begins only after the synchronous candidate build has
+        # returned, so this is a conservative completion bound without a
+        # second, independently sampled process clock.
+        candidate_build_diagnostics["candidate_build_completed_at_ms"] = published_ms
+        candidate_build_diagnostics["entry_publish_started_at_ms"] = published_ms
+        candidate_build_diagnostics["entry_snapshot_install_started_at_ms"] = (
+            published_ms
+        )
+        candidate_build_diagnostics["refresh_latency_quantiles_ms"] = (
+            self._record_refresh_latency_quantiles(
+                max(published_ms - refresh_started_at_ms, 0)
+            )
         )
         legacy_liquidity_publish_ms = int(
             getattr(self, "_last_liquidity_publish_at_ms", 0) or 0
@@ -1037,6 +1085,11 @@ class SidecarService:
             )
             if not isinstance(entry_manifest, dict):
                 entry_manifest = {}
+            # The publisher obtains this from the installed manifest inode,
+            # the same cross-process readiness clock used by consumers.
+            candidate_build_diagnostics["entry_snapshot_install_completed_at_ms"] = (
+                int(entry_manifest.get("ready_at_ms", 0) or 0)
+            )
             generation_id = str(entry_manifest.get("generation_id", "") or "")
             if (
                 generation_id
@@ -1759,6 +1812,39 @@ class SidecarService:
             self._venue_configs_by_name = configured
         return list(configured)
 
+    def _record_refresh_latency_quantiles(self, latency_ms: int) -> dict[str, int]:
+        samples = getattr(self, "_refresh_latency_samples_ms", None)
+        if not isinstance(samples, list):
+            samples = []
+            self._refresh_latency_samples_ms = samples
+        if latency_ms >= 0:
+            samples.append(int(latency_ms))
+        del samples[:-128]
+        if not samples:
+            return {
+                "sample_count": 0,
+                "window_size": 128,
+                "p50": 0,
+                "p95": 0,
+                "p99": 0,
+            }
+        ordered = sorted(samples)
+
+        def _percentile(percentile: float) -> int:
+            index = min(
+                max(int(ceil(len(ordered) * percentile)) - 1, 0),
+                len(ordered) - 1,
+            )
+            return int(ordered[index])
+
+        return {
+            "sample_count": len(ordered),
+            "window_size": 128,
+            "p50": _percentile(0.50),
+            "p95": _percentile(0.95),
+            "p99": _percentile(0.99),
+        }
+
     def _ensure_forecast_calibrator(self) -> FundingForecastCalibrator:
         """Keep direct test/recovery construction compatible with the service."""
         calibrator = getattr(self, "_forecast_calibrator", None)
@@ -1792,12 +1878,16 @@ class SidecarService:
         if not isinstance(venue_configs, dict):
             venue_configs = _canonical_venue_configs(config.venues)
             self._venue_configs_by_name = venue_configs
-        evidence = load_fee_evidence(
+        evidence_path = resolve_config_artifact_path(
+            config,
             getattr(
                 config.runtime,
                 "funding_fee_evidence_path",
                 config.runtime.fee_evidence_path,
             ),
+        )
+        evidence = load_fee_evidence(
+            evidence_path,
             now_ms=int(now_ms if now_ms is not None else time.time() * 1000),
             max_age_ms=int(
                 getattr(
@@ -2284,6 +2374,34 @@ def _quote_has_strict_liquidity_evidence(quote: QuoteSnapshot) -> bool:
         and str(quote.open_interest_sample_id or "").strip()
         and str(quote.open_interest_venue_symbol or "").strip()
     )
+
+
+def _venue_quote_receipt_timestamps(
+    quotes: Mapping[str, QuoteSnapshot],
+    *,
+    field_name: str,
+) -> dict[str, int]:
+    """Return original per-venue receipt timestamps without re-dating quotes."""
+    timestamps: dict[str, int] = {}
+    for quote in quotes.values():
+        venue = str(getattr(quote, "venue", "") or "").strip().lower()
+        try:
+            received_at_ms = int(getattr(quote, field_name, 0) or 0)
+        except (TypeError, ValueError):
+            received_at_ms = 0
+        if venue and received_at_ms > 0:
+            timestamps[venue] = max(timestamps.get(venue, 0), received_at_ms)
+    return dict(sorted(timestamps.items()))
+
+
+def _latest_quote_evidence_timestamp(
+    quotes: Mapping[str, QuoteSnapshot],
+    *,
+    field_name: str,
+    fallback_ms: int,
+) -> int:
+    timestamps = _venue_quote_receipt_timestamps(quotes, field_name=field_name)
+    return max(timestamps.values(), default=int(fallback_ms))
 
 
 def _quote_requires_entry_targeted_oi_revalidation(quote: QuoteSnapshot) -> bool:

@@ -6,6 +6,12 @@ and slow enrichment that must not block publication.
 ## Stable Fingerprints
 
 - `snapshot_stale_or_missing_timestamp`
+- `runtime.snapshot_degraded`, `runtime.snapshot_fallback_last_good`, or
+  `runtime.snapshot_unavailable` during an otherwise healthy BBO plane
+- `runtime.entry_oi_targeted_refresh_failed` or
+  `runtime.entry_quote_revalidate_failed` with
+  `entry_evidence_deadline_exceeded`
+- Hyperliquid Info endpoint HTTP `429`
 - `quote_venue_count_lt_7`
 - `sidecar_snapshot` degraded or stale while `current_state` remains healthy
 - Long sidecar log sequences of per-symbol enrichment calls before snapshot
@@ -142,6 +148,30 @@ refresh/backoff action. They must not be hidden, but they also must not be
 reported as abnormal positions, open-order failures, or a reason to loosen
 quote TTL, OI floor, liquidity floor, or post-only execution quality.
 
+Snapshot freshness must distinguish a broad snapshot's publication timestamp
+from a selected candidate's two-leg BBO evidence. A stale or last-good broad
+snapshot is never dispatch truth, but a healthy candidate must not be rejected
+solely because unrelated enrichment delayed that broad snapshot. Final
+revalidation needs fresh candidate-leg timestamps from the BBO data plane,
+with acquire-to-publish and cache-age evidence per venue. This preserves the
+fail-closed rule for either candidate leg while avoiding an over-broad timing
+gate.
+
+The sidecar records optional stage evidence in
+`candidate_build_diagnostics`: refresh start, per-venue quote observation,
+OI completion/receipt, candidate-build start/completion, entry publication /
+installation, and a rolling 128-sample p50/p95/p99 refresh latency window.
+Pre-install fields are carried into the compact entry projection; the atomic
+manifest's ready clock supplies the install-completion proof. These fields are
+observational only and do not relax TTL, OI, liquidity, or final BBO
+requirements.
+
+Public rate-limit evidence is source health, not an invitation to reuse stale
+prices. Hyperliquid or another venue that returns `429` must be cached,
+backed-off with jitter, and candidate-scoped; shared host/IP processes must
+cooperate on the public request budget. Current recovery of quotes does not
+erase the historical rate-limit event.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |
@@ -169,6 +199,7 @@ quote TTL, OI floor, liquidity floor, or post-only execution quality.
 | 2026-06-27 | Private truth pre-HTTP symbol filter and spread source-state classification | code fix `a839074` deployed/cloud verified | CL-124 adds shared `venue_symbol_eligibility(...)` for Aster private position/open-order probes, reports `symbol_not_listed_before_private_truth_http` before V3 private HTTP, keeps account-level unfiltered truth untouched, and splits spread stale source evidence into current degraded vs `transient_stale_recovered`. Cloud diagnose passed with flat/no-open-orders, `private_truth_pre_http_filtered_count=0`, and recovered spread stale source not counted as current degraded. No quote/OI threshold, entry sizing, order, close, or recovery behavior is changed. |
 | 2026-07-01 | Deploy readiness bucket for quote/OI candidate noise | `a9269db` deployed/cloud verified | CL-143 adds `market_data_readiness_summary` for quote stale, OI below floor, OI unavailable, structural OI suppression, and prewarm pending samples. The fix explains candidate-readiness volume without lowering OI/quote/liquidity gates and without misclassifying readiness as order-path failure. |
 | 2026-07-08 | Sidecar FD exhaustion and live restart cascade | local green, deploy pending | CL-156 caps sidecar and spread-sidecar direct public HTTP total connections without constraining credentialed `VenueTransport`, reuses same-cycle quote snapshots for liquidity lifecycle, closes sidecar/spread-sidecar services on SIGTERM/every app exit path including in-flight refresh cancellation, makes source close best-effort, requires `LimitNOFILE=65536`, verifies sidecar/spread-sidecar/live units, and removes live's hard `Requires=lightfee-sidecar.service` dependency. This is operational IO lifecycle hardening; it does not change quote TTL, OI/liquidity floors, entry admission, close truth, or owner recovery semantics. |
+| 2026-07-25 | Post-deploy snapshot/OI/quote deadline recurrence and Hyperliquid `429` | local verified; deploy pending | CL-159 now records per-venue collection-to-publication timing and rolling latency quantiles while retaining candidate-leg final revalidation. Hyperliquid `POST /info` callers share config-rooted pacing, public-metadata cache, and 429 exponential cooldown; strict read-only is unchanged. No TTL, OI, liquidity, or quote threshold changed. See [daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates](../daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates). |
 
 ## Regression Harness
 

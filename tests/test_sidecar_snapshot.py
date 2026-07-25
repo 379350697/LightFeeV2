@@ -1917,6 +1917,26 @@ def test_funding_entry_snapshot_manifest_is_installed_after_all_pages(
     tmp_path,
 ) -> None:
     proof = _v3_snapshot_proof(1_000, input_quote_count=1)
+    proof["candidate_build_diagnostics"].update(
+        {
+            "refresh_started_at_ms": 900,
+            "quote_collection_completed_at_ms": 950,
+            "venue_quote_observed_at_ms": {"binance": 950},
+            "open_interest_collection_completed_at_ms": 960,
+            "venue_open_interest_received_at_ms": {"binance": 960},
+            "candidate_build_started_at_ms": 970,
+            "candidate_build_completed_at_ms": 980,
+            "entry_publish_started_at_ms": 990,
+            "entry_snapshot_install_started_at_ms": 990,
+            "refresh_latency_quantiles_ms": {
+                "sample_count": 4,
+                "window_size": 128,
+                "p50": 80,
+                "p95": 100,
+                "p99": 100,
+            },
+        }
+    )
     proof["acquisition_mode"] = "degraded_sidecar"
     snapshot = SidecarSnapshot(
         **proof,
@@ -1952,6 +1972,11 @@ def test_funding_entry_snapshot_manifest_is_installed_after_all_pages(
     assert loaded.candidate_build_diagnostics["source_data_ready"] is True
     assert loaded.candidate_build_diagnostics["eligible_frontier_complete"] is True
     assert loaded.candidate_build_diagnostics["entry_frontier_ready"] is True
+    assert loaded.candidate_build_diagnostics["venue_quote_observed_at_ms"] == {
+        "binance": 950
+    }
+    assert loaded.candidate_build_diagnostics["candidate_build_completed_at_ms"] == 980
+    assert loaded.candidate_build_diagnostics["refresh_latency_quantiles_ms"]["p99"] == 100
 
 
 def test_v7_funding_entry_snapshot_pages_preserve_every_candidate(

@@ -12,6 +12,7 @@ from pathlib import Path
 import tempfile
 import time
 
+from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
@@ -1091,7 +1092,10 @@ class SpreadSidecarService:
 
     def _load_fee_evidence(self, now_ms: int) -> FeeEvidenceBook:
         return load_fee_evidence(
-            self.config.runtime.fee_evidence_path,
+            resolve_config_artifact_path(
+                self.config,
+                self.config.runtime.fee_evidence_path,
+            ),
             now_ms=now_ms,
             max_age_ms=int(self.config.runtime.fee_evidence_max_age_ms),
         )
@@ -1120,7 +1124,12 @@ class SpreadSidecarService:
         strategy = config.strategy
         manifest = DEFAULT_SPREAD_RESEARCH_MANIFEST
         if strategy.spread_paper_enabled:
-            manifest = load_spread_research_manifest(strategy.spread_paper_research_manifest_path)
+            manifest = load_spread_research_manifest(
+                resolve_config_artifact_path(
+                    config,
+                    strategy.spread_paper_research_manifest_path,
+                )
+            )
             if manifest.model_epoch != strategy.spread_paper_model_epoch:
                 raise ValueError(
                     "spread research manifest model_epoch must match "

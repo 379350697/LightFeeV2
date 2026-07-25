@@ -1,6 +1,8 @@
 """Tests for config loading, validation, and Chillybot removal."""
 
+import json
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,10 +11,15 @@ from lightfee.config.compatibility import (
     LEGACY_ENTRY_READINESS_PROVIDERS,
     resolve_entry_readiness_provider,
 )
+from lightfee.config.paths import (
+    DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR,
+    resolve_config_artifact_path,
+)
 from lightfee.config.validation import check_raw_toml_for_chillybot
 from lightfee.config.loader import load_config
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
 from lightfee.config.validation import validate_config
+from lightfee.core.errors import ConfigError
 
 
 def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
@@ -131,6 +138,46 @@ def test_runtime_config_validates_entry_open_interest_controls():
     cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = -1
     assert (
         "runtime.entry_open_interest_cache_fallback_max_age_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+
+
+def test_runtime_config_validates_entry_account_truth_per_venue_timeout():
+    cfg = AppConfig()
+
+    assert cfg.runtime.entry_account_truth_per_venue_timeout_ms == 2000
+    assert cfg.runtime.entry_account_truth_probe_timeout_ms is None
+    assert cfg.runtime.live_recovery_rest_probe_timeout_ms == 2000
+    assert (
+        cfg.runtime.hyperliquid_info_coordinator_dir
+        == DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR
+    )
+    assert not any(
+        "entry_account_truth_per_venue_timeout_ms" in issue
+        for issue in validate_config(cfg)
+    )
+    assert not any(
+        "hyperliquid_info_coordinator_dir" in issue
+        for issue in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_account_truth_per_venue_timeout_ms = 0
+    assert (
+        "runtime.entry_account_truth_per_venue_timeout_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+    cfg.runtime.entry_account_truth_per_venue_timeout_ms = 2000
+
+    cfg.runtime.entry_account_truth_probe_timeout_ms = 0
+    assert (
+        "runtime.entry_account_truth_probe_timeout_ms must be a positive integer when set"
+        in validate_config(cfg)
+    )
+    cfg.runtime.entry_account_truth_probe_timeout_ms = None
+
+    cfg.runtime.hyperliquid_info_coordinator_dir = ""
+    assert (
+        "runtime.hyperliquid_info_coordinator_dir must be non-empty"
         in validate_config(cfg)
     )
 
@@ -495,6 +542,228 @@ class TestConfigLoading:
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
         assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+
+    def test_config_relative_artifacts_resolve_from_project_root_without_mutating_literals(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        project = tmp_path / "project"
+        config_dir = project / "config"
+        manifest = config_dir / "research" / "spread_v2_signed_reversion.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}", encoding="utf-8")
+        runtime_dir = project / "runtime"
+        runtime_dir.mkdir()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        path = config_dir / "live.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+fee_evidence_path = "runtime/account-fee-evidence.json"
+funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+
+[strategy]
+spread_paper_enabled = true
+spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversion.json"
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(other_cwd)
+
+        config = load_config(path)
+
+        assert config.runtime.fee_evidence_path == "runtime/account-fee-evidence.json"
+        assert (
+            config.runtime.funding_fee_evidence_path
+            == "runtime/funding-account-fee-evidence.json"
+        )
+        assert (
+            config.strategy.spread_paper_research_manifest_path
+            == "config/research/spread_v2_signed_reversion.json"
+        )
+        assert resolve_config_artifact_path(
+            config,
+            config.strategy.spread_paper_research_manifest_path,
+        ) == manifest.resolve()
+        assert resolve_config_artifact_path(
+            config,
+            config.runtime.fee_evidence_path,
+        ) == (runtime_dir / "account-fee-evidence.json").resolve()
+
+    def test_config_artifact_duplicate_check_uses_loaded_project_root(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        project = tmp_path / "project"
+        config_dir = project / "config"
+        config_dir.mkdir(parents=True)
+        account_evidence = project / "runtime" / "account-fee-evidence.json"
+        account_evidence.parent.mkdir()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        path = config_dir / "live.toml"
+        path.write_text(
+            f"""
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+fee_evidence_path = "runtime/account-fee-evidence.json"
+funding_fee_evidence_path = "{account_evidence}"
+""",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(other_cwd)
+
+        with pytest.raises(ConfigError, match="funding_fee_evidence_path"):
+            load_config(path)
+
+    def test_loaded_config_root_feeds_runtime_artifact_consumers_after_cwd_change(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        project = tmp_path / "project"
+        config_dir = project / "config"
+        manifest = config_dir / "research" / "spread_v2_signed_reversion.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": "spread_research_manifest_v2",
+                    "model_epoch": "v2_signed_reversion",
+                    "hypothesis": "test manifest",
+                    "cohorts": [
+                        {
+                            "bot_id": "tt_conservative",
+                            "cohort": "baseline",
+                            "hypothesis": "test cohort",
+                            "enabled": True,
+                            "control_group": False,
+                            "acceptance_eligible": True,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        runtime_dir = project / "runtime"
+        runtime_dir.mkdir(parents=True)
+        path = config_dir / "live.toml"
+        path.write_text(
+            """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+fee_evidence_path = "runtime/account-fee-evidence.json"
+funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+
+[strategy]
+spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversion.json"
+""",
+            encoding="utf-8",
+        )
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        monkeypatch.chdir(other_cwd)
+
+        config = load_config(path)
+        config.venues = [
+            VenueConfig(venue="binance", taker_fee_bps=5.0, maker_fee_bps=2.0),
+            VenueConfig(venue="okx", taker_fee_bps=5.0, maker_fee_bps=2.0),
+        ]
+        config.strategy.funding_canary_enabled = True
+        config.strategy.funding_canary_max_entry_notional_quote = 100.0
+        config.strategy.funding_canary_conservative_fee_max_entry_notional_quote = 100.0
+        config.strategy.funding_canary_min_expected_net_edge_bps = 0.0
+        config.strategy.funding_canary_min_worst_case_edge_bps = 0.0
+        config.strategy.funding_canary_conservative_fee_buffer_bps = 1.0
+        config.strategy.spread_paper_enabled = True
+
+        from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+        import lightfee.engine.entry_dispatch_runtime as entry_module
+        import lightfee.sidecar.service as sidecar_module
+        import lightfee.spread.service as spread_module
+        from lightfee.spread.service import SpreadSidecarService
+        from lightfee.strategy.fee_evidence import FeeEvidenceBook
+
+        captured: dict[str, str] = {}
+
+        def entry_load(path, **_kwargs):
+            captured["entry"] = str(path)
+            return FeeEvidenceBook()
+
+        def sidecar_load(path, **_kwargs):
+            captured["sidecar"] = str(path)
+            return FeeEvidenceBook()
+
+        def spread_load(path, **_kwargs):
+            captured["spread"] = str(path)
+            return FeeEvidenceBook()
+
+        class CandidateServiceCapture:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr(entry_module, "load_fee_evidence", entry_load)
+        monkeypatch.setattr(sidecar_module, "load_fee_evidence", sidecar_load)
+        monkeypatch.setattr(
+            sidecar_module,
+            "FundingCandidateService",
+            CandidateServiceCapture,
+        )
+        monkeypatch.setattr(spread_module, "load_fee_evidence", spread_load)
+
+        entry_runtime = EntryDispatchRuntime.__new__(EntryDispatchRuntime)
+        entry_runtime.ctx = SimpleNamespace(
+            config=config,
+            state=SimpleNamespace(open_positions=[], pending_entries=[]),
+        )
+        candidate = SimpleNamespace(
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            taker_fee_evidence_complete=True,
+            account_fee_evidence_complete=False,
+            entry_max_leg_notional_quote=10.0,
+            expected_net_edge_bps=10.0,
+            worst_case_edge_bps=10.0,
+            long_taker_fee_bps=8.0,
+            short_taker_fee_bps=8.0,
+            entry_fee_bps=16.0,
+            exit_fee_bps=16.0,
+            entry_maker_leg="",
+            exit_maker_leg="",
+        )
+
+        assert (
+            entry_runtime._funding_canary_admission_reason(
+                candidate,
+                1_800_000_000_000,
+                check_concurrency=False,
+            )
+            == ""
+        )
+        sidecar = sidecar_module.SidecarService.__new__(sidecar_module.SidecarService)
+        sidecar.config = config
+        sidecar._new_candidate_service(now_ms=1_800_000_000_000)
+        spread = SpreadSidecarService.__new__(SpreadSidecarService)
+        spread.config = config
+        spread._load_fee_evidence(1_800_000_000_000)
+        spread._paper_config(config, fee_evidence=FeeEvidenceBook())
+
+        assert captured == {
+            "entry": str((runtime_dir / "funding-account-fee-evidence.json").resolve()),
+            "sidecar": str((runtime_dir / "funding-account-fee-evidence.json").resolve()),
+            "spread": str((runtime_dir / "account-fee-evidence.json").resolve()),
+        }
 
     def test_live_missing_entry_provider_defaults_to_composed_mode_even_with_local_l2_flag(
         self, tmp_path

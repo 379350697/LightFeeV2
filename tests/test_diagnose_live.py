@@ -44,6 +44,28 @@ def test_diagnose_service_status_includes_spread_sidecar():
     assert "lightfee-spread-sidecar.service" in diagnose_live.SERVICE_NAMES
 
 
+def test_diagnose_binds_hyperliquid_coordination_to_runtime_dir(
+    tmp_path, monkeypatch,
+):
+    import lightfee.config.paths as config_paths
+    import scripts.diagnose_live as diagnose_live
+
+    monkeypatch.setattr(diagnose_live, "_build_exchange_truth", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(diagnose_live, "_build_deploy_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(diagnose_live, "_build_service_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(diagnose_live, "_load_systemd_environment_files", lambda *_args, **_kwargs: [])
+
+    diagnose_live.run_diagnose(
+        runtime_dir=str(tmp_path),
+        unit_dir=str(tmp_path / "units"),
+        now_ms=1,
+    )
+
+    assert config_paths.configured_hyperliquid_info_coordinator_dir() == (
+        tmp_path / "hyperliquid-info-coordinator"
+    ).resolve()
+
+
 def _write_jsonl(path, records):
     with open(path, "w") as f:
         for r in records:
@@ -808,6 +830,64 @@ def _flat_exchange_truth(runtime_dir, symbols, venues=None):
         "errors": [],
         "missing_evidence": [],
     }
+
+
+def test_run_diagnose_uses_unfiltered_account_truth_for_unrelated_event_symbol(
+    monkeypatch,
+):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1700000001000,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-1700000001000-YFIUSDT",
+                    "symbol": "YFIUSDT",
+                    "venue": "bybit",
+                },
+            },
+        ])
+        calls = []
+
+        def fake_exchange_truth(runtime_dir, symbols, venues=None):
+            calls.append((list(symbols), list(venues or [])))
+            truth = _flat_exchange_truth(runtime_dir, symbols, venues)
+            truth["private_truth_pre_http_filtered_count"] = 0
+            return truth
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", fake_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            venues=["bitget", "bybit"],
+            now_ms=1700000005000,
+        )
+
+        assert calls == [([], ["bitget", "bybit"])]
+        assert result["exchange_truth"]["confidence"] == "high"
+        assert result["exchange_truth"]["private_truth_pre_http_filtered_count"] == 0
+        assert result["production_acceptance_gate"]["gate_passed"] is True
+        assert (
+            "exchange_truth_missing_required_evidence"
+            not in result["production_acceptance_gate"]["blocking_reasons"]
+        )
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_run_diagnose_reports_hyperliquid_strict_readonly_authorization_summary(monkeypatch):
@@ -7988,7 +8068,7 @@ def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkey
 
         run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
 
-        assert seen["symbols"] == ["XCNUSDT"]
+        assert seen["symbols"] == []
         assert seen["venues"] == ["bybit", "aster"]
     finally:
         import shutil
@@ -8045,7 +8125,7 @@ def test_run_diagnose_probes_recent_traded_scope_when_current_state_is_flat(monk
 
         run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
 
-        assert seen["symbols"] == ["LABUSDT"]
+        assert seen["symbols"] == []
         assert seen["venues"] == ["aster", "bybit", "hyperliquid"]
     finally:
         import shutil
@@ -8105,7 +8185,7 @@ def test_run_diagnose_allows_explicit_exchange_truth_venues(monkeypatch):
             now_ms=1700000005000,
         )
 
-        assert seen["symbols"] == ["OPGUSDT"]
+        assert seen["symbols"] == []
         assert seen["venues"] == ["binance", "okx"]
     finally:
         import shutil
@@ -14355,8 +14435,7 @@ def test_since_deploy_preserves_early_materialized_trade_scope_before_noise(monk
             max_events=50,
         )
 
-        assert "LABUSDT" in captured["symbols"]
-        assert "GUAUSDT" in captured["symbols"]
+        assert captured["symbols"] == []
         assert {"bitget", "okx", "aster", "hyperliquid"}.issubset(
             set(captured["venues"])
         )

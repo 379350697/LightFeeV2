@@ -10,6 +10,7 @@ from lightfee.config.compatibility import (
     ENTRY_READINESS_PROVIDER_ON_DEMAND,
     ENTRY_READINESS_PROVIDERS as _ENTRY_READINESS_PROVIDERS,
 )
+from lightfee.config.paths import DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR
 
 # V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
 _GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
@@ -128,6 +129,15 @@ class RuntimeConfig:
     max_market_age_ms: int = 3000
     private_position_max_age_ms: int = 15000
     live_recovery_rest_probe_timeout_ms: int = 2000
+    # Candidate entry probes are per venue.  This is deliberately separate
+    # from recovery's aggregate/probe budget: ordinary entry must never be
+    # held behind an unrelated venue's account request.
+    entry_account_truth_per_venue_timeout_ms: int = 2000
+    # Compatibility-only spelling used by the first CL-159 rollout.  Keep it
+    # nullable so the canonical setting above remains authoritative whenever
+    # an operator has not explicitly supplied the legacy key.
+    entry_account_truth_probe_timeout_ms: int | None = None
+    hyperliquid_info_coordinator_dir: str = DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR
     max_order_quote_age_ms: int = 6000
     # One-way, bounded IPC from the live Local-L2 runtime to the public
     # sidecar.  It reuses already-held books and never creates a second public

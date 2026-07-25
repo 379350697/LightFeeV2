@@ -445,6 +445,11 @@ class LiveRuntime:
         self._entry_account_truth_gate_task: asyncio.Task | None = None
         self._entry_account_truth_generation: dict[str, Any] | None = None
         self._entry_account_truth_ready_at_ms: int = 0
+        self._entry_account_truth_venue_receipts: dict[str, dict[str, Any]] = {}
+        self._entry_account_truth_last_good_venue_receipts: dict[
+            str, dict[str, Any]
+        ] = {}
+        self._entry_account_truth_venue_tasks: dict[str, asyncio.Task] = {}
         self._entry_data_plane_preparation_task: asyncio.Task | None = None
         self._entry_data_plane_preparation_key: tuple[str, ...] | None = None
         # A newer active queue can arrive while the previous data-plane
@@ -4854,6 +4859,478 @@ class LiveRuntime:
     def _invalidate_entry_account_truth_generation(self) -> None:
         self._entry_account_truth_generation = None
         self._entry_account_truth_ready_at_ms = 0
+        self._entry_account_truth_venue_receipts.clear()
+        self._entry_account_truth_last_good_venue_receipts.clear()
+
+    def _entry_account_truth_per_venue_timeout_ms(self) -> int:
+        """Return the canonical target-leg budget with one release of alias support."""
+        legacy = getattr(
+            self.config.runtime,
+            "entry_account_truth_probe_timeout_ms",
+            None,
+        )
+        configured = (
+            legacy
+            if legacy is not None
+            else getattr(
+                self.config.runtime,
+                "entry_account_truth_per_venue_timeout_ms",
+                2_000,
+            )
+        )
+        try:
+            return max(int(configured or 0), 1)
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _entry_account_truth_receipt_is_recent_attempt(
+        receipt: Mapping[str, Any] | None,
+        *,
+        now_ms: int,
+        retry_after_ms: int,
+    ) -> bool:
+        """Reuse a recent failed receipt so one slow venue cannot be hammered.
+
+        It never authorizes entry: callers still require a complete fresh
+        receipt.  The short negative cache only makes the failure fan out to
+        every candidate safely while the next refresh opportunity is pending.
+        """
+        if not isinstance(receipt, Mapping):
+            return False
+        try:
+            finished_at_ms = int(receipt.get("finished_at_ms", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        age_ms = int(now_ms) - finished_at_ms
+        return finished_at_ms > 0 and 0 <= age_ms <= max(int(retry_after_ms), 1)
+
+    def _entry_account_truth_candidate_venues(self, candidate) -> tuple[Venue, ...]:
+        venues: list[Venue] = []
+        for attr in ("long_venue", "short_venue"):
+            raw = getattr(candidate, attr, "")
+            if isinstance(raw, Venue):
+                venue = raw
+            else:
+                try:
+                    venue = Venue.from_str(str(raw or ""))
+                except ValueError:
+                    return tuple()
+            if venue not in venues:
+                venues.append(venue)
+        return tuple(venues)
+
+    def _entry_account_truth_receipt_is_fresh_complete(
+        self,
+        receipt: Mapping[str, Any] | None,
+        *,
+        now_ms: int,
+    ) -> bool:
+        if not isinstance(receipt, Mapping):
+            return False
+        if receipt.get("complete") is not True:
+            return False
+        errors = receipt.get("errors")
+        if not isinstance(errors, list) or errors:
+            return False
+        try:
+            finished_at_ms = int(receipt.get("finished_at_ms", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if finished_at_ms <= 0:
+            return False
+        age_ms = int(now_ms) - finished_at_ms
+        max_age_ms = max(
+            int(self.config.runtime.private_position_max_age_ms or 0),
+            0,
+        )
+        return 0 <= age_ms <= max_age_ms
+
+    @staticmethod
+    def _entry_account_truth_live_artifact_counts(
+        receipts: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[int, int]:
+        position_count = 0
+        open_order_count = 0
+        for receipt in receipts.values():
+            positions = receipt.get("positions")
+            if isinstance(positions, list):
+                for position in positions:
+                    quantity = 0.0
+                    if isinstance(position, Mapping):
+                        try:
+                            quantity = float(position.get("quantity", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            quantity = 0.0
+                    if abs(quantity) > 1e-12:
+                        position_count += 1
+            open_orders = receipt.get("open_orders")
+            if isinstance(open_orders, list):
+                open_order_count += len(open_orders)
+        return position_count, open_order_count
+
+    def _entry_account_truth_receipt_audit_summary(
+        self,
+        receipt: Mapping[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        def _int_or_zero(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        venue = str(receipt.get("venue") or "")
+        started_at_ms = _int_or_zero(receipt.get("started_at_ms"))
+        finished_at_ms = _int_or_zero(receipt.get("finished_at_ms"))
+        duration_ms = (
+            max(finished_at_ms - started_at_ms, 0)
+            if started_at_ms > 0 and finished_at_ms > 0
+            else 0
+        )
+        age_ms = max(int(now_ms) - finished_at_ms, 0) if finished_at_ms > 0 else None
+        positions = receipt.get("positions")
+        open_orders = receipt.get("open_orders")
+        probe_evidence = receipt.get("probe_evidence")
+        errors = receipt.get("errors")
+        return {
+            "venue": venue,
+            "complete": receipt.get("complete") is True,
+            "truth_supported": receipt.get("truth_supported") is True,
+            "truth_available": receipt.get("truth_available") is True,
+            "started_at_ms": started_at_ms,
+            "finished_at_ms": finished_at_ms,
+            "duration_ms": duration_ms,
+            "age_ms": age_ms,
+            "last_good_finished_at_ms": _int_or_zero(
+                receipt.get("last_good_finished_at_ms")
+            ),
+            "position_count": len(positions) if isinstance(positions, list) else 0,
+            "open_order_count": len(open_orders) if isinstance(open_orders, list) else 0,
+            "probe_evidence_count": (
+                len(probe_evidence) if isinstance(probe_evidence, list) else 0
+            ),
+            "errors": list(errors or [])[:8] if isinstance(errors, list) else [],
+        }
+
+    async def _collect_entry_account_truth_for_venue(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+    ) -> dict[str, Any]:
+        venue_name = venue.value
+        started_at_ms = wall_clock_now_ms()
+        positions: list[dict[str, Any]] = []
+        open_orders: list[dict[str, Any]] = []
+        probe_evidence: list[dict[str, Any]] = []
+        errors: list[str] = []
+        truth_probe_count = 0
+
+        fetch_all_positions = getattr(adapter, "fetch_all_positions", None)
+        if not callable(fetch_all_positions):
+            transport = getattr(adapter, "_transport", None)
+            fetch_all_positions = getattr(transport, "fetch_all_positions", None)
+        if not callable(fetch_all_positions):
+            errors.append(f"{venue_name}:*:positions:fetch_all_positions_unavailable")
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": "*",
+                    "endpoint": "fetch_all_positions",
+                    "method": "fetch_all_positions",
+                    "finished_at_ms": wall_clock_now_ms(),
+                    "classification": "position_probe_unfiltered_failed",
+                    "error": "fetch_all_positions_unavailable",
+                }
+            )
+        else:
+            try:
+                rows = await fetch_all_positions()
+                if rows is None:
+                    raise RuntimeError("fetch_all_positions_returned_none")
+                truth_probe_count += 1
+                if isinstance(rows, (list, tuple, set)):
+                    for position in rows:
+                        positions.append(
+                            self._recovery_ledger_position_payload(
+                                position,
+                                venue_name=venue_name,
+                                symbol="*",
+                            )
+                        )
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": "*",
+                        "endpoint": "fetch_all_positions",
+                        "method": "fetch_all_positions",
+                        "finished_at_ms": wall_clock_now_ms(),
+                        "classification": "position_probe_unfiltered_succeeded",
+                        "position_count": len(rows)
+                        if isinstance(rows, (list, tuple, set))
+                        else 0,
+                    }
+                )
+            except Exception as exc:
+                truth_probe_count += 1
+                errors.append(f"{venue_name}:*:positions:{exc}")
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": "*",
+                        "endpoint": "fetch_all_positions",
+                        "method": "fetch_all_positions",
+                        "finished_at_ms": wall_clock_now_ms(),
+                        "classification": "position_probe_unfiltered_failed",
+                        "error": str(exc),
+                    }
+                )
+
+        try:
+            rows, endpoint = await self._fetch_recovery_ledger_account_open_orders(
+                venue,
+                adapter,
+            )
+            truth_probe_count += 1
+            open_orders.extend(
+                self._recovery_ledger_open_order_payloads(
+                    rows,
+                    venue_name=venue_name,
+                    symbol="*",
+                )
+            )
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": "*",
+                    "endpoint": endpoint,
+                    "method": "fetch_open_orders",
+                    "finished_at_ms": wall_clock_now_ms(),
+                    "classification": "open_order_probe_unfiltered_succeeded",
+                    "open_order_count": len(rows)
+                    if isinstance(rows, (list, tuple, set))
+                    else 0,
+                }
+            )
+        except Exception as exc:
+            truth_probe_count += 1
+            errors.append(f"{venue_name}:*:open_orders:{exc}")
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": "*",
+                    "endpoint": "fetch_open_orders",
+                    "method": "fetch_open_orders",
+                    "finished_at_ms": wall_clock_now_ms(),
+                    "classification": "open_order_probe_unfiltered_failed",
+                    "error": str(exc),
+                }
+            )
+
+        finished_at_ms = wall_clock_now_ms()
+        complete = not errors and truth_probe_count >= 2
+        return {
+            "venue": venue_name,
+            "truth_supported": truth_probe_count > 0,
+            "truth_available": not errors,
+            "complete": complete,
+            "positions": positions,
+            "open_orders": open_orders,
+            "probe_evidence": probe_evidence,
+            "errors": errors,
+            "truth_probe_count": truth_probe_count,
+            "started_at_ms": started_at_ms,
+            "finished_at_ms": finished_at_ms,
+        }
+
+    async def _entry_account_truth_target_receipts(
+        self,
+        candidate,
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        now_ms = wall_clock_now_ms()
+        receipts: dict[str, dict[str, Any]] = {}
+        required_venues = self._entry_account_truth_candidate_venues(candidate)
+        timeout_count = 0
+        timeout_ms = self._entry_account_truth_per_venue_timeout_ms()
+        pending: list[tuple[Venue, asyncio.Task]] = []
+        for venue in required_venues:
+            venue_name = venue.value
+            cached = self._entry_account_truth_venue_receipts.get(venue_name)
+            if self._entry_account_truth_receipt_is_fresh_complete(
+                cached,
+                now_ms=now_ms,
+            ):
+                receipts[venue_name] = dict(cached or {})
+                continue
+            if self._entry_account_truth_receipt_is_recent_attempt(
+                cached,
+                now_ms=now_ms,
+                retry_after_ms=timeout_ms,
+            ):
+                receipts[venue_name] = dict(cached or {})
+                continue
+            adapter = self._venue_adapters.get(venue)
+            if adapter is None:
+                receipts[venue_name] = {
+                    "venue": venue_name,
+                    "truth_supported": False,
+                    "truth_available": False,
+                    "complete": False,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [],
+                    "errors": [f"{venue_name}:*:adapter_unavailable"],
+                    "truth_probe_count": 0,
+                    "started_at_ms": now_ms,
+                    "finished_at_ms": wall_clock_now_ms(),
+                }
+                continue
+            task = self._entry_account_truth_venue_tasks.get(venue_name)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    asyncio.wait_for(
+                        self._collect_entry_account_truth_for_venue(venue, adapter),
+                        timeout=timeout_ms / 1_000.0,
+                    ),
+                    name=f"funding-entry-account-truth:{venue_name}",
+                )
+                self._entry_account_truth_venue_tasks[venue_name] = task
+            pending.append((venue, task))
+
+        if pending:
+            results = await asyncio.gather(
+                *(task for _venue, task in pending),
+                return_exceptions=True,
+            )
+            for (venue, _task), result in zip(pending, results):
+                venue_name = venue.value
+                if (
+                    _task.done()
+                    and self._entry_account_truth_venue_tasks.get(venue_name)
+                    is _task
+                ):
+                    self._entry_account_truth_venue_tasks.pop(venue_name, None)
+                if isinstance(result, asyncio.TimeoutError):
+                    timeout_count += 1
+                    receipt = {
+                        "venue": venue_name,
+                        "truth_supported": False,
+                        "truth_available": False,
+                        "complete": False,
+                        "positions": [],
+                        "open_orders": [],
+                        "probe_evidence": [],
+                        "errors": [
+                            f"{venue_name}:*:account_truth_timeout:{timeout_ms}ms"
+                        ],
+                        "truth_probe_count": 0,
+                        "started_at_ms": now_ms,
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                elif isinstance(result, BaseException):
+                    receipt = {
+                        "venue": venue_name,
+                        "truth_supported": False,
+                        "truth_available": False,
+                        "complete": False,
+                        "positions": [],
+                        "open_orders": [],
+                        "probe_evidence": [],
+                        "errors": [f"{venue_name}:*:account_truth:{result}"],
+                        "truth_probe_count": 0,
+                        "started_at_ms": now_ms,
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                else:
+                    receipt = dict(result)
+                if self._entry_account_truth_receipt_is_fresh_complete(
+                    receipt,
+                    now_ms=wall_clock_now_ms(),
+                ):
+                    receipt["last_good_finished_at_ms"] = int(
+                        receipt.get("finished_at_ms", 0) or 0
+                    )
+                    self._entry_account_truth_last_good_venue_receipts[
+                        venue_name
+                    ] = dict(receipt)
+                else:
+                    last_good = (
+                        self._entry_account_truth_last_good_venue_receipts.get(
+                            venue_name
+                        )
+                    )
+                    if isinstance(last_good, Mapping):
+                        receipt["last_good_finished_at_ms"] = int(
+                            last_good.get("finished_at_ms", 0) or 0
+                        )
+                self._entry_account_truth_venue_receipts[venue_name] = dict(receipt)
+                receipts[venue_name] = receipt
+        return receipts, timeout_count
+
+    def _record_entry_account_truth_target_block(
+        self,
+        candidate,
+        *,
+        reason: str,
+        event_kind: str,
+        receipts: Mapping[str, Mapping[str, Any]],
+        now_ms: int,
+    ) -> None:
+        pair_id = self._candidate_pair_id(candidate)
+        if not isinstance(self.state.last_scan, dict):
+            self.state.last_scan = {}
+        self.state.last_scan["no_entry_reason"] = reason
+        self.state.last_scan["blocking_stage"] = "selected_submit"
+        self.state.last_scan["blocking_domain"] = "exchange_account_truth"
+        self.state.last_scan["blocking_status"] = "blocked"
+        self.state.last_scan["blocking_reason"] = reason
+        target_venues = sorted(receipts.keys())
+        max_age_ms = max(
+            int(self.config.runtime.private_position_max_age_ms or 0),
+            0,
+        )
+        position_count, open_order_count = (
+            self._entry_account_truth_live_artifact_counts(receipts)
+        )
+        payload = {
+            "pair_id": pair_id,
+            "candidate_revision_id": str(
+                getattr(candidate, "candidate_revision_id", "") or ""
+            ),
+            "reason": reason,
+            "target_venues": target_venues,
+            "complete_venue_count": sum(
+                1
+                for receipt in receipts.values()
+                if self._entry_account_truth_receipt_is_fresh_complete(
+                    receipt,
+                    now_ms=now_ms,
+                )
+            ),
+            "venue_count": len(target_venues),
+            "max_age_ms": max_age_ms,
+            "target_position_count": position_count,
+            "target_open_order_count": open_order_count,
+            "receipt_summaries": [
+                self._entry_account_truth_receipt_audit_summary(
+                    receipt,
+                    now_ms=now_ms,
+                )
+                for receipt in receipts.values()
+            ],
+            "errors": [
+                error
+                for receipt in receipts.values()
+                for error in list(receipt.get("errors") or [])[:8]
+            ][:8],
+            "ts_ms": now_ms,
+        }
+        self.journal.append(event_kind, payload)
+        self.journal.append(
+            "runtime.entry_account_truth_not_ready_before_dispatch",
+            dict(payload),
+        )
 
     async def _ensure_entry_account_truth_for_preparation(self) -> bool:
         """Singleflight a complete account-truth generation off the entry path."""
@@ -4865,24 +5342,14 @@ class LiveRuntime:
 
             async def _refresh() -> dict[str, Any]:
                 started_at_ms = wall_clock_now_ms()
-                timeout_ms = max(
-                    int(
-                        self.config.runtime.live_recovery_rest_probe_timeout_ms
-                        or 0
-                    ),
-                    1,
-                )
                 try:
-                    _ledger, exchange_truth = await asyncio.wait_for(
+                    _ledger, exchange_truth = await (
                         self.recovery_startup_runtime._refresh_recovery_ledger_from_account_truth_with_evidence(
                             started_at_ms,
-                            lifecycle_clear_reason=(
-                                "entry_preparation_account_truth_clean"
-                            ),
-                        ),
-                        timeout=timeout_ms / 1_000.0,
+                            lifecycle_clear_reason="entry_preparation_account_truth_clean",
+                        )
                     )
-                except asyncio.TimeoutError:
+                except Exception as exc:
                     exchange_truth = {
                         "truth_supported": False,
                         "truth_available": False,
@@ -4892,8 +5359,8 @@ class LiveRuntime:
                         "open_orders": [],
                         "probe_evidence": [],
                         "errors": [
-                            "entry_account_truth_refresh_timeout:"
-                            f"{timeout_ms}ms"
+                            "entry_account_truth_refresh_failed:"
+                            f"{type(exc).__name__}:{exc}"
                         ],
                     }
                 generation = dict(exchange_truth or {})
@@ -4952,51 +5419,126 @@ class LiveRuntime:
             self._entry_account_truth_gate_task = gate_task
         return False
 
-    async def _entry_account_truth_ready_before_dispatch(self, candidate) -> bool:
-        """Recheck cached account truth without adding private I/O to submit."""
+    def _entry_account_truth_exchange_truth_from_receipts(
+        self,
+        receipts: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        positions: list[Any] = []
+        open_orders: list[Any] = []
+        probe_evidence: list[Any] = []
+        errors: list[str] = []
+        complete_venue_count = 0
+        for receipt in receipts.values():
+            if receipt.get("complete") is True:
+                complete_venue_count += 1
+            receipt_positions = receipt.get("positions")
+            if isinstance(receipt_positions, list):
+                positions.extend(receipt_positions)
+            receipt_orders = receipt.get("open_orders")
+            if isinstance(receipt_orders, list):
+                open_orders.extend(receipt_orders)
+            receipt_evidence = receipt.get("probe_evidence")
+            if isinstance(receipt_evidence, list):
+                probe_evidence.extend(receipt_evidence)
+            receipt_errors = receipt.get("errors")
+            if isinstance(receipt_errors, list):
+                errors.extend(str(error) for error in receipt_errors)
+        venue_count = len(receipts)
+        return {
+            "truth_supported": venue_count > 0,
+            "truth_available": complete_venue_count == venue_count and not errors,
+            "venue_count": venue_count,
+            "complete_venue_count": complete_venue_count,
+            "positions": positions,
+            "open_orders": open_orders,
+            "probe_evidence": probe_evidence,
+            "errors": errors,
+        }
+
+    async def _entry_account_truth_dispatch_readiness(
+        self,
+        candidate,
+    ) -> tuple[bool, bool, str]:
+        """Return entry truth readiness and whether the block is global recovery."""
         if self.config.runtime.mode != "live":
-            return True
-        if await self._entry_account_truth_ready_for_tick():
-            return True
-        generation = self._entry_account_truth_generation or {}
-        finished_at_ms = int(generation.get("finished_at_ms", 0) or 0)
+            return True, False, ""
         now_ms = wall_clock_now_ms()
-        max_age_ms = max(
-            int(self.config.runtime.private_position_max_age_ms or 0),
-            0,
+        target_venues = self._entry_account_truth_candidate_venues(candidate)
+        if not target_venues:
+            reason = "entry_account_truth_target_venues_missing_before_dispatch"
+            self._record_entry_account_truth_target_block(
+                candidate,
+                reason=reason,
+                event_kind="runtime.entry_account_truth_incomplete",
+                receipts={},
+                now_ms=now_ms,
+            )
+            return False, False, reason
+        receipts, timeout_count = await self._entry_account_truth_target_receipts(
+            candidate
         )
-        age_ms = now_ms - finished_at_ms if finished_at_ms > 0 else None
-        reason = (
-            "entry_account_truth_expired_before_dispatch"
-            if age_ms is not None and age_ms > max_age_ms
-            else "entry_account_truth_incomplete_before_dispatch"
+        now_ms = wall_clock_now_ms()
+        incomplete = [
+            venue
+            for venue, receipt in receipts.items()
+            if not self._entry_account_truth_receipt_is_fresh_complete(
+                receipt,
+                now_ms=now_ms,
+            )
+        ]
+        position_count, open_order_count = (
+            self._entry_account_truth_live_artifact_counts(receipts)
         )
-        pair_id = self._candidate_pair_id(candidate)
-        if not isinstance(self.state.last_scan, dict):
-            self.state.last_scan = {}
-        self.state.last_scan["no_entry_reason"] = reason
-        self.state.last_scan["blocking_stage"] = "selected_submit"
-        self.state.last_scan["blocking_domain"] = "exchange_account_truth"
-        self.state.last_scan["blocking_status"] = "blocked"
-        self.state.last_scan["blocking_reason"] = reason
-        self.journal.append(
-            "runtime.entry_account_truth_not_ready_before_dispatch",
-            {
-                "pair_id": pair_id,
-                "candidate_revision_id": str(
-                    getattr(candidate, "candidate_revision_id", "") or ""
-                ),
-                "reason": reason,
-                "finished_at_ms": finished_at_ms,
-                "age_ms": age_ms,
-                "max_age_ms": max_age_ms,
-                "truth_supported": generation.get("truth_supported") is True,
-                "truth_available": generation.get("truth_available") is True,
-                "errors": list(generation.get("errors") or [])[:8],
-                "ts_ms": now_ms,
-            },
+        if not incomplete and position_count == 0 and open_order_count == 0:
+            return True, False, ""
+        global_recovery_block = bool(position_count or open_order_count)
+        if global_recovery_block:
+            reason = "entry_account_truth_live_artifact_before_dispatch"
+            event_kind = "runtime.entry_account_truth_incomplete"
+            # The two target receipts prove concrete risk and must stop all
+            # new exposure immediately.  Preserve the receipt scope so the
+            # V1 recovery core cannot mistake this interim view for a complete
+            # seven-venue account scan; the already-singleflight background
+            # scan will replace it with full truth when every venue returns.
+            target_truth = self._entry_account_truth_exchange_truth_from_receipts(
+                receipts
+            )
+            expected_venues = {
+                venue.value for venue in self._venue_adapters
+            }
+            observed_venues = set(receipts)
+            target_truth["truth_available"] = False
+            target_truth["missing_evidence"] = sorted(
+                expected_venues - observed_venues
+            )
+            target_truth["account_truth_scope"] = "target_venues_incident_trigger"
+            self._refresh_recovery_ledger_from_exchange_truth(
+                target_truth,
+                now_ms=now_ms,
+                lifecycle_clear_reason="entry_account_truth_target_live_artifact",
+            )
+            await self._entry_account_truth_ready_for_tick()
+        elif timeout_count:
+            reason = "entry_account_truth_timeout_before_dispatch"
+            event_kind = "runtime.entry_account_truth_timeout"
+        else:
+            reason = "entry_account_truth_incomplete_before_dispatch"
+            event_kind = "runtime.entry_account_truth_incomplete"
+        self._record_entry_account_truth_target_block(
+            candidate,
+            reason=reason,
+            event_kind=event_kind,
+            receipts=receipts,
+            now_ms=now_ms,
         )
-        return False
+        return False, global_recovery_block, reason
+
+    async def _entry_account_truth_ready_before_dispatch(self, candidate) -> bool:
+        """Require fresh private truth for only the selected candidate venues."""
+        ready, _global_recovery_block, _reason = (
+            await self._entry_account_truth_dispatch_readiness(candidate)
+        )
+        return ready
 
     async def _entry_preparation_for_tick(
         self,
@@ -5491,6 +6033,12 @@ class LiveRuntime:
                 with suppress(asyncio.CancelledError):
                     await task
             setattr(self, task_name, None)
+        for task in list(self._entry_account_truth_venue_tasks.values()):
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        self._entry_account_truth_venue_tasks.clear()
         self._entry_data_plane_preparation_pending = None
         shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
@@ -5833,6 +6381,48 @@ class LiveRuntime:
             and LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is None
         )
 
+    def _snapshot_target_only_retention_reason(
+        self,
+        *,
+        snapshot,
+        now_ms: int,
+        max_age_ms: int,
+    ) -> str:
+        """Allow only publish-fresh snapshots stale from broad market evidence."""
+        if snapshot is None:
+            return ""
+        acquisition_mode = str(getattr(snapshot, "acquisition_mode", "") or "")
+        if acquisition_mode in {"last_good_sidecar", "unavailable"}:
+            return ""
+        try:
+            publication_at_ms = int(
+                getattr(snapshot, "ready_at_ms", 0)
+                or getattr(snapshot, "published_at_ms", 0)
+                or 0
+            )
+            market_observed_at_ms = int(
+                getattr(snapshot, "market_observed_at_ms", 0) or 0
+            )
+            candidate_build_at_ms = int(
+                getattr(snapshot, "candidate_build_observed_at_ms", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return ""
+        if publication_at_ms <= 0 or market_observed_at_ms <= 0:
+            return ""
+        publish_age_ms = int(now_ms) - publication_at_ms
+        if publish_age_ms < 0 or publish_age_ms > int(max_age_ms):
+            return ""
+        if candidate_build_at_ms <= 0 or candidate_build_at_ms > int(now_ms):
+            return ""
+        market_age_ms = int(now_ms) - market_observed_at_ms
+        market_max_age_ms = int(
+            self.config.runtime.max_market_age_ms or max_age_ms
+        )
+        if market_age_ms <= market_max_age_ms:
+            return ""
+        return "market_observed_stale_candidate_target_revalidation_required"
+
     @staticmethod
     def _unusable_snapshot_reason(snapshot) -> tuple[str, str]:
         if LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is not None:
@@ -6043,6 +6633,7 @@ class LiveRuntime:
         )
         freshness = freshness_decision.freshness
         snapshot = freshness_decision.snapshot
+        targeted_retention_reason = ""
         if freshness == SnapshotFreshness.MISSING:
             self._live_scan_success_streak = 0
             install_status = self._sidecar_entry_install_status
@@ -6078,23 +6669,35 @@ class LiveRuntime:
                 )
             return
         if freshness == SnapshotFreshness.STALE:
-            self._live_scan_success_streak = 0
-            self._finalize_unusable_snapshot_scan(
-                snapshot=snapshot,
-                now_ms=now_ms,
-                freshness="stale",
-                no_entry_reason="snapshot_stale",
-            )
-            self.journal.append(
-                "runtime.snapshot_stale",
-                self._snapshot_health_payload(
+            targeted_retention_reason = (
+                self._snapshot_target_only_retention_reason(
                     snapshot=snapshot,
                     now_ms=now_ms,
                     max_age_ms=max_age,
-                    freshness="stale",
-                ),
+                )
+                if usable_entry_snapshot(snapshot)
+                else ""
             )
-            return
+            if targeted_retention_reason:
+                freshness = SnapshotFreshness.DEGRADED
+            else:
+                self._live_scan_success_streak = 0
+                self._finalize_unusable_snapshot_scan(
+                    snapshot=snapshot,
+                    now_ms=now_ms,
+                    freshness="stale",
+                    no_entry_reason="snapshot_stale",
+                )
+                self.journal.append(
+                    "runtime.snapshot_stale",
+                    self._snapshot_health_payload(
+                        snapshot=snapshot,
+                        now_ms=now_ms,
+                        max_age_ms=max_age,
+                        freshness="stale",
+                    ),
+                )
+                return
         frontier_incomplete_reason = self._candidate_frontier_incomplete_reason(
             snapshot
         )
@@ -6161,14 +6764,25 @@ class LiveRuntime:
                 return
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
+            payload = self._snapshot_health_payload(
+                snapshot=snapshot,
+                now_ms=now_ms,
+                max_age_ms=max_age,
+                freshness="degraded",
+            )
+            if targeted_retention_reason:
+                payload.update(
+                    {
+                        "targeted_retention_reason": targeted_retention_reason,
+                        "targeted_revalidation_required": True,
+                        "targeted_retention_scope": (
+                            "candidate_long_short_venues"
+                        ),
+                    }
+                )
             self.journal.append(
                 "runtime.snapshot_degraded",
-                self._snapshot_health_payload(
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                    max_age_ms=max_age,
-                    freshness="degraded",
-                ),
+                payload,
             )
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             # Current snapshot is stale/missing; fall back to last good
@@ -6577,30 +7191,8 @@ class LiveRuntime:
             self.state.last_scan["catalog_admission_balance_passed_count"] = len(
                 tradeable
             )
-            if (
-                self.config.runtime.mode == "live"
-                and tradeable
-                and not await self._entry_account_truth_ready_for_tick()
-            ):
-                self.state.last_scan["no_entry_reason"] = "entry_account_truth_pending"
-                self.state.last_scan["blocking_stage"] = "account_truth"
-                self.state.last_scan["blocking_domain"] = "exchange_account_truth"
-                self.state.last_scan["blocking_status"] = "pending"
-                self.state.last_scan["blocking_reason"] = (
-                    "entry_account_truth_pending"
-                )
-                self.journal.append(
-                    "runtime.entry_account_truth_pending",
-                    {
-                        "candidate_count": len(tradeable),
-                        "blocking_stage": "account_truth",
-                        "blocking_domain": "exchange_account_truth",
-                        "blocking_status": "pending",
-                        "blocking_reason": "entry_account_truth_pending",
-                        "ts_ms": wall_clock_now_ms(),
-                    },
-                )
-                return
+            if self.config.runtime.mode == "live" and tradeable:
+                await self._entry_account_truth_ready_for_tick()
             # The whole published frontier remains available to the execution
             # queue.  V1-compatible failed-route suppression is persisted in
             # the selector, so the next ordinary tick promotes the next page
@@ -7489,6 +8081,7 @@ class LiveRuntime:
                 dispatched = 0
                 dispatch_failure_state_changed = False
                 account_truth_blocked_before_dispatch = False
+                account_truth_block_reason = ""
                 attempted_pair_ids: set[str] = set()
                 selected_deadline_ms = max(
                     int(self.config.strategy.selected_submit_deadline_ms or 0),
@@ -7497,16 +8090,26 @@ class LiveRuntime:
                 for candidate in finalists:
                     if len(self.state.open_positions) >= max_slots:
                         break
-                    if not await self._entry_account_truth_ready_before_dispatch(
+                    pair_id = self._candidate_pair_id(candidate)
+                    (
+                        account_truth_ready,
+                        account_truth_global_block,
+                        account_truth_reason,
+                    ) = await self._entry_account_truth_dispatch_readiness(
                         candidate
-                    ):
-                        account_truth_blocked_before_dispatch = True
-                        break
+                    )
+                    if not account_truth_ready:
+                        attempted_pair_ids.add(pair_id)
+                        account_truth_block_reason = account_truth_reason
+                        if account_truth_global_block:
+                            account_truth_blocked_before_dispatch = True
+                            break
+                        continue
                     # Each finalist becomes selected only when its own final
                     # revalidation begins. A slow or rejected rank-1 row must
                     # not consume rank-2's quote-to-submit safety budget.
                     selected_at_ms = wall_clock_now_ms()
-                    attempted_pair_ids.add(self._candidate_pair_id(candidate))
+                    attempted_pair_ids.add(pair_id)
                     selected_deadline_monotonic = (
                         entry_pipeline_loop.time()
                         + selected_deadline_ms / 1_000.0
@@ -7527,6 +8130,20 @@ class LiveRuntime:
                         selected_at_ms=selected_at_ms,
                     )
                     if dispatch_succeeded:
+                        if (
+                            account_truth_block_reason
+                            and self.state.last_scan.get("blocking_domain")
+                            == "exchange_account_truth"
+                        ):
+                            for key in (
+                                "no_entry_reason",
+                                "blocking_stage",
+                                "blocking_domain",
+                                "blocking_status",
+                                "blocking_reason",
+                            ):
+                                self.state.last_scan.pop(key, None)
+                            account_truth_block_reason = ""
                         dispatch_failure_state_changed = (
                             self._clear_entry_primary_backfill_failure(candidate)
                             or dispatch_failure_state_changed
@@ -7631,15 +8248,24 @@ class LiveRuntime:
                     for candidate in fallback_finalists:
                         if len(self.state.open_positions) >= max_slots:
                             break
-                        if not await self._entry_account_truth_ready_before_dispatch(
+                        pair_id = self._candidate_pair_id(candidate)
+                        (
+                            account_truth_ready,
+                            account_truth_global_block,
+                            account_truth_reason,
+                        ) = await self._entry_account_truth_dispatch_readiness(
                             candidate
-                        ):
-                            account_truth_blocked_before_dispatch = True
-                            break
-                        attempted_fallback = True
-                        attempted_pair_ids.add(
-                            self._candidate_pair_id(candidate)
                         )
+                        if not account_truth_ready:
+                            attempted_fallback = True
+                            attempted_pair_ids.add(pair_id)
+                            account_truth_block_reason = account_truth_reason
+                            if account_truth_global_block:
+                                account_truth_blocked_before_dispatch = True
+                                break
+                            continue
+                        attempted_fallback = True
+                        attempted_pair_ids.add(pair_id)
                         selected_at_ms = wall_clock_now_ms()
                         selected_deadline_monotonic = (
                             entry_pipeline_loop.time()
@@ -7662,6 +8288,20 @@ class LiveRuntime:
                             selected_at_ms=selected_at_ms,
                         )
                         if dispatch_succeeded:
+                            if (
+                                account_truth_block_reason
+                                and self.state.last_scan.get("blocking_domain")
+                                == "exchange_account_truth"
+                            ):
+                                for key in (
+                                    "no_entry_reason",
+                                    "blocking_stage",
+                                    "blocking_domain",
+                                    "blocking_status",
+                                    "blocking_reason",
+                                ):
+                                    self.state.last_scan.pop(key, None)
+                                account_truth_block_reason = ""
                             dispatch_failure_state_changed = (
                                 self._clear_entry_primary_backfill_failure(
                                     candidate
@@ -7745,7 +8385,7 @@ class LiveRuntime:
                 if dispatched == 0:
                     reason = (
                         self.state.last_scan.get("blocking_reason")
-                        if account_truth_blocked_before_dispatch
+                        if account_truth_block_reason
                         else self._v1_tradeable_no_entry_reason(
                             selection_blocker_counts,
                             admission_blocker_counts,

@@ -24,6 +24,10 @@ from lightfee.config.schema import (
     VenueLiveConfig,
     VenuePassiveMakerConfig,
 )
+from lightfee.config.paths import (
+    remember_config_artifact_root,
+    remember_hyperliquid_info_coordinator_dir,
+)
 from lightfee.config.validation import check_raw_toml_for_chillybot, validate_config
 from lightfee.core.errors import ConfigError
 
@@ -38,7 +42,8 @@ _RETIRED_TRANSFER_BIAS_FIELDS = frozenset(
 
 def load_config(path: str | Path) -> AppConfig:
     """Load and validate a TOML config file. Raises ConfigError on failure."""
-    raw = _read_toml(path)
+    config_path = Path(path).expanduser()
+    raw = _read_toml(config_path)
 
     # Check for removed Chillybot fields first
     chillybot_errors = check_raw_toml_for_chillybot(raw)
@@ -52,6 +57,7 @@ def load_config(path: str | Path) -> AppConfig:
         symbols = []
 
     runtime = _load_runtime(raw.get("runtime", {}))
+    remember_config_artifact_root(runtime, config_path)
     strategy = _load_strategy(raw.get("strategy", {}), runtime=runtime)
     persistence = _load_persistence(raw.get("persistence", {}))
     venues = _load_venues(raw.get("venues", []))
@@ -68,6 +74,7 @@ def load_config(path: str | Path) -> AppConfig:
     if issues:
         raise ConfigError("config validation failed:\n" + "\n".join(f"  - {i}" for i in issues))
 
+    remember_hyperliquid_info_coordinator_dir(config)
     return config
 
 

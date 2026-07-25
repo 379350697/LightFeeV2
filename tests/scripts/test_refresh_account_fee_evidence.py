@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -462,6 +465,75 @@ def test_collect_evidence_uses_seven_private_read_paths_and_binds_symbol_coverag
     ]
     assert {call["params"]["groupId"] for call in okx_fee_calls} == {"2", "4"}
     assert all("instId" not in call["params"] for call in okx_fee_calls)
+
+
+def test_refresh_main_resolves_default_output_from_loaded_config_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    config_dir = project / "config"
+    runtime_dir = project / "runtime"
+    config_dir.mkdir(parents=True)
+    runtime_dir.mkdir()
+    path = config_dir / "live.toml"
+    path.write_text(
+        """
+symbols = ["BTCUSDT"]
+
+[runtime]
+mode = "paper"
+funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
+""",
+        encoding="utf-8",
+    )
+    output = runtime_dir / "funding-account-fee-evidence.json"
+    output.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "generated_at_ms": NOW_MS - 10,
+                "venues": {
+                    "binance": {
+                        "taker_fee_bps": 5.0,
+                        "maker_fee_bps": 2.0,
+                        "observed_at_ms": NOW_MS - 10,
+                        "source": "account_fee_api",
+                        "evidence_ref": "last-good",
+                        "covered_symbols": ["BTCUSDT"],
+                        "symbol_schedules": {
+                            "BTCUSDT": {
+                                "taker_fee_bps": 5.0,
+                                "maker_fee_bps": 2.0,
+                                "observed_at_ms": NOW_MS - 10,
+                                "evidence_ref": "last-good",
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    output.chmod(0o600)
+    other_cwd = tmp_path / "other"
+    other_cwd.mkdir()
+
+    async def no_fresh_collect(_config_path: str, *, now_ms: int, **_kwargs):
+        assert now_ms == NOW_MS
+        return {}, {}, {"binance"}
+
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setattr(sys, "argv", ["refresh", "--config", str(path)])
+    monkeypatch.setattr(refresh_module.time, "time", lambda: NOW_MS / 1000)
+    monkeypatch.setattr(refresh_module, "collect_evidence", no_fresh_collect)
+
+    assert refresh_module.main() == 0
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["venues"]["binance"]["observed_at_ms"] == NOW_MS - 10
+    assert payload["venues"]["binance"]["covered_symbols"] == ["BTCUSDT"]
+    assert not (other_cwd / "runtime" / "funding-account-fee-evidence.json").exists()
 
 
 def test_okx_fee_parser_requires_the_instrument_mapped_fee_group() -> None:

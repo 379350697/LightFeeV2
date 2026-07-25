@@ -31,6 +31,7 @@ from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
 from lightfee.core.domain import Venue
+from lightfee.config.paths import remember_hyperliquid_info_coordinator_directory
 from lightfee.core.order_identity import normalize_order_identity
 from lightfee.engine.exchange_truth import (
     build_venue_operation_request,
@@ -9919,8 +9920,18 @@ def run_diagnose(
     code_side_blockers: bool = False,
     exclude_strategy: bool = False,
     exclude_liquidity: bool = False,
+    hyperliquid_info_coordinator_dir: str = "",
 ) -> dict[str, Any]:
     generated_at_ms = now_ms or _now_ms()
+
+    # This diagnostic constructs read-only Hyper adapters directly.  Bind them
+    # to the service runtime's coordinator before any adapter can issue
+    # ``POST /info``; never let a standalone invocation create a CWD-scoped
+    # pacing namespace.
+    remember_hyperliquid_info_coordinator_directory(
+        hyperliquid_info_coordinator_dir
+        or (Path(runtime_dir) / "hyperliquid-info-coordinator")
+    )
 
     resolved_state_path, state_source = _resolve_state_path(
         runtime_dir, current_state_path,
@@ -10002,10 +10013,7 @@ def run_diagnose(
             venue = str(pos.get(venue_key, "") or "").lower()
             if venue and venue not in pos_venues:
                 pos_venues.append(venue)
-    event_symbols, event_venues = _exchange_truth_scope_from_events(all_events)
-    for sym in event_symbols:
-        if sym not in pos_symbols:
-            pos_symbols.append(sym)
+    _event_symbols, event_venues = _exchange_truth_scope_from_events(all_events)
     for venue in event_venues:
         if venue not in pos_venues:
             pos_venues.append(venue)
@@ -10020,7 +10028,7 @@ def run_diagnose(
     required_truth_venues = list(venues) if venues is not None else list(event_venues)
     exchange_truth = _build_exchange_truth(
         runtime_dir,
-        pos_symbols if pos_symbols else [],
+        [],
         exchange_truth_venues,
     )
     exchange_truth = _annotate_exchange_truth_required_venues(
@@ -10766,6 +10774,8 @@ def main() -> None:
                        help="Exit nonzero when the production acceptance gate does not pass")
     parser.add_argument("--runtime-dir", type=str, default=DEFAULT_RUNTIME_DIR,
                        help="Runtime directory (default: {})".format(DEFAULT_RUNTIME_DIR))
+    parser.add_argument("--hyperliquid-info-coordinator-dir", type=str, default="",
+                       help="Shared Hyperliquid /info coordination directory (defaults under --runtime-dir)")
     parser.add_argument("--current-state", type=str, default="",
                        help="Path to live-state-current.json (overrides default)")
     parser.add_argument("--events", type=str, nargs="*", default=None,
@@ -10805,6 +10815,7 @@ def main() -> None:
         code_side_blockers=args.code_side_blockers,
         exclude_strategy=args.exclude_strategy,
         exclude_liquidity=args.exclude_liquidity,
+        hyperliquid_info_coordinator_dir=args.hyperliquid_info_coordinator_dir,
     )
 
     profile = "agent" if args.compact_json else args.profile

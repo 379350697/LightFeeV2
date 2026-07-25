@@ -51,6 +51,10 @@ from lightfee.marketdata.private_ws import (
 )
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.venues.common import normalize_venue_quantity
+from lightfee.venues.hyperliquid_info_coordinator import (
+    hyperliquid_info_coordinator,
+    should_coordinate_hyperliquid_info_request,
+)
 from lightfee.venues.market_data import MarketDataClient
 from lightfee.venues.specs import (
     AuthScheme,
@@ -2745,6 +2749,17 @@ class VenueTransport(MarketDataClient):
         )
         qs, headers, req_body = await self._build_signed_request_async(method, path, params, body, private=private)
         url = base_url + path + qs
+        info_coordinator = None
+        if should_coordinate_hyperliquid_info_request(
+            self._spec.venue_id,
+            method,
+            path,
+            body,
+        ):
+            info_coordinator = hyperliquid_info_coordinator()
+            cached_info = info_coordinator.lookup_metadata_response(body)
+            if cached_info is not None:
+                return cached_info.payload
 
         # V1-aligned scoped rate limiting
         scopes = self._rest_rate_limit_scopes(method, path, base_url, private=private)
@@ -2758,6 +2773,8 @@ class VenueTransport(MarketDataClient):
         global_rt = _get_global_rt()
         if global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
+        if info_coordinator is not None:
+            await info_coordinator.async_wait_until_ready(body)
 
         try:
             if method.upper() == "GET":
@@ -2770,6 +2787,12 @@ class VenueTransport(MarketDataClient):
                 resp = await client.delete(url, headers=headers)
             else:
                 raise ValueError(f"unsupported HTTP method: {method}")
+            if info_coordinator is not None:
+                info_coordinator.record_http_response(
+                    resp.status_code,
+                    dict(resp.headers),
+                    body=body,
+                )
 
             if resp.status_code >= 400:
                 # V1: record rate-limit for 429/418 to trigger cooldown on all scopes
@@ -2819,6 +2842,7 @@ class VenueTransport(MarketDataClient):
                     self._rate_limiter.record_success_for_scopes(scopes)
                 return {}
             raw = resp.json()
+            received_at_ms = int(time.time() * 1000)
             if private and self._is_time_offset_retryable(resp.status_code, resp.text):
                 if _retry_ts_error:
                     self._clear_server_time_offset()
@@ -2839,6 +2863,12 @@ class VenueTransport(MarketDataClient):
             # V1: record success for all scopes
             if self._rate_limiter is not None:
                 self._rate_limiter.record_success_for_scopes(scopes)
+            if info_coordinator is not None:
+                info_coordinator.store_metadata_response(
+                    body,
+                    raw,
+                    received_at_ms=received_at_ms,
+                )
             return raw
         except httpx.TimeoutException:
             raise TransportError(

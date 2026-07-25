@@ -815,6 +815,29 @@ def publish_funding_entry_snapshot(
     original_diagnostics = dict(snapshot.candidate_build_diagnostics)
     candidates = _funding_entry_candidates(snapshot)
 
+    # The entry projection intentionally rebuilds its diagnostics rather than
+    # copying arbitrary audit-only data.  Preserve the bounded timing evidence
+    # needed to explain a candidate generation, though: it neither changes the
+    # V5 schema nor participates in entry eligibility.
+    timing_diagnostic_keys = {
+        "refresh_started_at_ms",
+        "quote_collection_completed_at_ms",
+        "venue_quote_observed_at_ms",
+        "open_interest_collection_completed_at_ms",
+        "venue_open_interest_received_at_ms",
+        "candidate_build_started_at_ms",
+        "candidate_build_completed_at_ms",
+        "entry_publish_started_at_ms",
+        "entry_snapshot_install_started_at_ms",
+        "entry_snapshot_install_completed_at_ms",
+        "refresh_latency_quantiles_ms",
+    }
+    timing_diagnostics = {
+        key: original_diagnostics[key]
+        for key in timing_diagnostic_keys
+        if key in original_diagnostics
+    }
+
     def _frontier_count(name: str) -> int:
         value = original_diagnostics.get(name, -1)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1065,6 +1088,7 @@ def publish_funding_entry_snapshot(
         "entry_targeted_oi_revalidation_required_venues": sorted(
             {venue for venue, _symbol in targeted_oi_revalidation_targets}
         ),
+        **timing_diagnostics,
     }
     funding_lifecycle = _lifecycle(snapshot.funding_lifecycle, "funding")
     market_lifecycle = _lifecycle(snapshot.market_lifecycle, "market")

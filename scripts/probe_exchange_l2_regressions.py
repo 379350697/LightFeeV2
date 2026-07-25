@@ -13,12 +13,19 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from lightfee.marketdata.l2 import LocalL2UpdateKind
 from lightfee.marketdata.local_l2_venues import parse_l2_update
+from lightfee.venues.hyperliquid_info_coordinator import (
+    hyperliquid_info_coordinator,
+    should_coordinate_hyperliquid_info_url,
+)
+from lightfee.config.paths import remember_hyperliquid_info_coordinator_directory
 from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.binance import BinanceAdapter
 from lightfee.venues.bitget import BitgetAdapter
@@ -80,6 +87,18 @@ def _get_json(url: str, params: dict[str, Any], timeout_s: float) -> dict[str, A
 
 
 def _post_json(url: str, body: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    info_coordinator = None
+    cached_info = None
+    if should_coordinate_hyperliquid_info_url("POST", url, body):
+        info_coordinator = hyperliquid_info_coordinator()
+        cached_info = info_coordinator.lookup_metadata_response(body)
+    if cached_info is not None:
+        raw = cached_info.payload
+        if not isinstance(raw, dict):
+            raise AssertionError(f"expected JSON object from {url}, got {type(raw).__name__}")
+        return raw
+    if info_coordinator is not None:
+        info_coordinator.wait_until_ready(body)
     request = Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -88,10 +107,27 @@ def _post_json(url: str, body: dict[str, Any], timeout_s: float) -> dict[str, An
             "User-Agent": "LightFeeV2-regression-probe/1.0",
         },
     )
-    with urlopen(request, timeout=timeout_s) as response:
-        raw = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            if info_coordinator is not None:
+                info_coordinator.record_http_response(
+                    int(getattr(response, "status", 200) or 200),
+                    dict(response.headers),
+                    body=body,
+                )
+            raw = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if info_coordinator is not None:
+            info_coordinator.record_http_response(
+                int(getattr(exc, "code", 0) or 0),
+                dict(getattr(exc, "headers", {}) or {}),
+                body=body,
+            )
+        raise
     if not isinstance(raw, dict):
         raise AssertionError(f"expected JSON object from {url}, got {type(raw).__name__}")
+    if info_coordinator is not None:
+        info_coordinator.store_metadata_response(body, raw)
     return raw
 
 
@@ -346,7 +382,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout-s", type=float, default=12.0)
     parser.add_argument("--json", action="store_true", help="emit JSON only")
+    parser.add_argument(
+        "--hyperliquid-info-coordinator-dir",
+        type=str,
+        default="",
+        help="shared Hyperliquid /info coordination directory",
+    )
     args = parser.parse_args()
+
+    default_coordinator_dir = (
+        Path(__file__).resolve().parents[1]
+        / "runtime"
+        / "hyperliquid-info-coordinator"
+    )
+    remember_hyperliquid_info_coordinator_directory(
+        args.hyperliquid_info_coordinator_dir or default_coordinator_dir
+    )
 
     results = run(args.timeout_s)
     payload = {

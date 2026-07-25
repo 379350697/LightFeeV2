@@ -1156,6 +1156,447 @@ class CloseRuntime:
                 },
             )
 
+    @staticmethod
+    def _close_reconciliation_venue_name(venue: Any) -> str:
+        value = getattr(venue, "value", venue)
+        return str(value or "").strip().lower()
+
+    def _configured_close_reconciliation_venues(self) -> set[str]:
+        adapters = getattr(self.ctx, "venue_adapters", None)
+        if not isinstance(adapters, dict):
+            adapters = getattr(self.ctx, "_venue_adapters", None)
+        if not isinstance(adapters, dict):
+            return set()
+        return {
+            name
+            for name in (
+                self._close_reconciliation_venue_name(venue)
+                for venue in adapters.keys()
+            )
+            if name
+        }
+
+    @staticmethod
+    def _close_reconciliation_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _close_reconciliation_zero_quantity(row: dict[str, Any]) -> bool:
+        for key in ("quantity", "position_qty", "size", "contracts", "qty"):
+            if key not in row:
+                continue
+            value = row.get(key)
+            if isinstance(value, bool):
+                return False
+            try:
+                quantity = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(quantity) and abs(quantity) <= 1e-9
+        return False
+
+    @classmethod
+    def _close_reconciliation_position_value_flat(cls, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, dict):
+            if any(
+                key in value
+                for key in ("quantity", "position_qty", "size", "contracts", "qty")
+            ):
+                return cls._close_reconciliation_zero_quantity(value)
+            return all(
+                cls._close_reconciliation_position_value_flat(item)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple, set)):
+            return all(
+                cls._close_reconciliation_position_value_flat(item)
+                for item in value
+            )
+        if isinstance(value, bool):
+            return False
+        try:
+            quantity = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(quantity) and abs(quantity) <= 1e-9
+
+    @classmethod
+    def _close_reconciliation_positions_flat(
+        cls,
+        positions: Any,
+        *,
+        configured_venues: set[str],
+    ) -> bool:
+        if isinstance(positions, list):
+            return all(
+                isinstance(row, dict)
+                and cls._close_reconciliation_zero_quantity(row)
+                for row in positions
+            )
+        if isinstance(positions, dict):
+            venue_keys = {
+                cls._close_reconciliation_venue_name(venue)
+                for venue in positions.keys()
+            }
+            if not configured_venues.issubset(venue_keys):
+                return False
+            return all(
+                cls._close_reconciliation_position_value_flat(
+                    positions.get(venue)
+                )
+                for venue in configured_venues
+            )
+        return False
+
+    @classmethod
+    def _close_reconciliation_order_value_flat(cls, value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, list):
+            return not value
+        if isinstance(value, tuple):
+            return not value
+        if isinstance(value, set):
+            return not value
+        if isinstance(value, dict):
+            if value.get("open_orders_empty") is True:
+                return True
+            if value.get("order_count") == 0 or value.get("open_order_count") == 0:
+                return True
+            if not value:
+                return True
+            return all(
+                cls._close_reconciliation_order_value_flat(item)
+                for item in value.values()
+            )
+        return False
+
+    @classmethod
+    def _close_reconciliation_open_orders_flat(
+        cls,
+        open_orders: Any,
+        *,
+        configured_venues: set[str],
+    ) -> bool:
+        if isinstance(open_orders, list):
+            return not open_orders
+        if isinstance(open_orders, dict):
+            venue_keys = {
+                cls._close_reconciliation_venue_name(venue)
+                for venue in open_orders.keys()
+            }
+            if not configured_venues.issubset(venue_keys):
+                return False
+            return all(
+                cls._close_reconciliation_order_value_flat(open_orders.get(venue))
+                for venue in configured_venues
+            )
+        return False
+
+    @classmethod
+    def _close_reconciliation_has_unfiltered_probe_evidence(
+        cls,
+        exchange_truth: dict[str, Any],
+        *,
+        configured_venues: set[str],
+    ) -> bool:
+        position_venues: set[str] = set()
+        open_order_venues: set[str] = set()
+        probe_evidence = exchange_truth.get("probe_evidence")
+        if isinstance(probe_evidence, list):
+            for row in probe_evidence:
+                if not isinstance(row, dict):
+                    continue
+                venue = cls._close_reconciliation_venue_name(row.get("venue"))
+                if venue not in configured_venues:
+                    continue
+                if str(row.get("symbol") or "") != "*":
+                    continue
+                classification = str(row.get("classification") or "")
+                if classification == "position_probe_unfiltered_succeeded":
+                    position_venues.add(venue)
+                if classification == "open_order_probe_unfiltered_succeeded":
+                    open_order_venues.add(venue)
+
+        position_probe_evidence = exchange_truth.get("position_probe_evidence")
+        if isinstance(position_probe_evidence, dict):
+            for raw_venue, raw_symbols in position_probe_evidence.items():
+                venue = cls._close_reconciliation_venue_name(raw_venue)
+                if venue not in configured_venues or not isinstance(raw_symbols, dict):
+                    continue
+                probe = raw_symbols.get("*")
+                if (
+                    isinstance(probe, dict)
+                    and str(probe.get("classification") or "")
+                    == "position_probe_unfiltered_succeeded"
+                ):
+                    position_venues.add(venue)
+
+        open_order_probe_evidence = exchange_truth.get("open_order_probe_evidence")
+        if isinstance(open_order_probe_evidence, dict):
+            for raw_venue, raw_symbols in open_order_probe_evidence.items():
+                venue = cls._close_reconciliation_venue_name(raw_venue)
+                if venue not in configured_venues or not isinstance(raw_symbols, dict):
+                    continue
+                probe = raw_symbols.get("*")
+                if (
+                    isinstance(probe, dict)
+                    and str(probe.get("classification") or "")
+                    == "open_order_probe_unfiltered_succeeded"
+                ):
+                    open_order_venues.add(venue)
+
+        return (
+            configured_venues.issubset(position_venues)
+            and configured_venues.issubset(open_order_venues)
+        )
+
+    def _close_reconciliation_archive_exchange_truth(
+        self,
+        *,
+        now_ms: int,
+    ) -> tuple[dict[str, Any] | None, str]:
+        exchange_truth = self._close_reconciliation_exchange_truth
+        if not isinstance(exchange_truth, dict):
+            return None, ""
+        configured_venues = self._configured_close_reconciliation_venues()
+        if not configured_venues:
+            return None, ""
+        captured_at_ms = self._close_reconciliation_int(
+            exchange_truth.get("close_reconciliation_captured_at_ms")
+        )
+        if captured_at_ms != int(now_ms):
+            return None, ""
+        if exchange_truth.get("truth_supported") is False:
+            return None, ""
+        if exchange_truth.get("truth_available") is not True:
+            return None, ""
+        errors = exchange_truth.get("errors")
+        if errors:
+            return None, ""
+
+        configured_truth = exchange_truth.get("configured_venues")
+        if not isinstance(configured_truth, list):
+            return None, ""
+        truth_venues = {
+            self._close_reconciliation_venue_name(venue)
+            for venue in configured_truth
+        }
+        if truth_venues != configured_venues:
+            return None, ""
+
+        venue_count = self._close_reconciliation_int(exchange_truth.get("venue_count"))
+        complete_venue_count = self._close_reconciliation_int(
+            exchange_truth.get("complete_venue_count")
+        )
+        if venue_count != len(configured_venues):
+            return None, ""
+        if complete_venue_count != len(configured_venues):
+            return None, ""
+        if not self._close_reconciliation_has_unfiltered_probe_evidence(
+            exchange_truth,
+            configured_venues=configured_venues,
+        ):
+            return None, ""
+        if not self._close_reconciliation_positions_flat(
+            exchange_truth.get("positions"),
+            configured_venues=configured_venues,
+        ):
+            return None, ""
+        if not self._close_reconciliation_open_orders_flat(
+            exchange_truth.get("open_orders"),
+            configured_venues=configured_venues,
+        ):
+            return None, ""
+
+        archived_truth = dict(exchange_truth)
+        truth_hash = self._close_reconciliation_truth_hash(archived_truth)
+        if not truth_hash:
+            return None, ""
+        return archived_truth, truth_hash
+
+    def _append_pending_close_archive_event(
+        self,
+        payload: dict[str, Any],
+        *,
+        exchange_truth: dict[str, Any],
+        truth_hash: str,
+    ) -> tuple[bool, str]:
+        if not isinstance(exchange_truth, dict) or not truth_hash:
+            return False, ""
+        archive_payload = dict(payload)
+        archive_payload["exchange_truth_hash"] = truth_hash
+        archive_payload["truth_hash"] = truth_hash
+        archive_payload["exchange_truth"] = deepcopy(exchange_truth)
+        archive_payload["configured_venues"] = sorted(
+            self._configured_close_reconciliation_venues()
+        )
+        archive_key = self._close_reconciliation_archive_key(
+            archive_payload,
+            truth_hash=truth_hash,
+        )
+        archive_payload["archive_key"] = archive_key
+        if archive_key in self._close_reconciliation_archive_emitted_keys:
+            return True, archive_key
+        journal = getattr(self.ctx, "journal", None)
+        append = getattr(journal, "append", None)
+        if not callable(append):
+            return False, archive_key
+        append("reconciliation.pending_close_backfill_archived", archive_payload)
+        self._close_reconciliation_archive_emitted_keys.add(archive_key)
+        return True, archive_key
+
+    def _archive_pending_close_reconciliation_with_payload(
+        self,
+        reconciliation: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        now_ms: int,
+        state: str = "terminal_flat_accounting_gap",
+    ) -> bool:
+        exchange_truth, truth_hash = self._close_reconciliation_archive_exchange_truth(
+            now_ms=now_ms
+        )
+        if not isinstance(exchange_truth, dict) or not truth_hash:
+            return False
+
+        archive_payload = dict(payload)
+        archive_payload["close_reconciliation_state"] = state
+        archive_payload["archive_reconciliation"] = True
+        archive_payload["exchange_truth_hash"] = truth_hash
+        archive_payload.setdefault(
+            "position_id",
+            reconciliation.get("position_id", ""),
+        )
+        archive_payload.setdefault("symbol", reconciliation.get("symbol", ""))
+        archive_payload.setdefault(
+            "candidate_owner_id",
+            reconciliation.get(
+                "candidate_owner_id",
+                reconciliation.get("position_id", ""),
+            ),
+        )
+        archive_payload.setdefault(
+            "source",
+            reconciliation.get("source", "pending_close_reconciliation"),
+        )
+        appended, archive_key = self._append_pending_close_archive_event(
+            archive_payload,
+            exchange_truth=exchange_truth,
+            truth_hash=truth_hash,
+        )
+        if not appended:
+            return False
+
+        reconciliation["pending_backfill"] = True
+        reconciliation["close_reconciliation_state"] = state
+        reconciliation["archived"] = True
+        reconciliation["archive_reason"] = state
+        reconciliation["business_contract_action"] = state
+        reconciliation["archive_reconciliation"] = True
+        reconciliation["exchange_truth"] = dict(exchange_truth)
+        reconciliation["exchange_truth_hash"] = truth_hash
+        reconciliation["last_partial_reconciled_at_ms"] = now_ms
+        if archive_key:
+            reconciliation["archive_key"] = archive_key
+        missing_leg = str(archive_payload.get("missing_leg") or "")
+        if missing_leg:
+            reconciliation["missing_leg"] = missing_leg
+        evidence_gap_reason = str(archive_payload.get("evidence_gap_reason") or "")
+        if evidence_gap_reason:
+            reconciliation["last_evidence_gap_reason"] = evidence_gap_reason
+        candidate_owner_id = str(archive_payload.get("candidate_owner_id") or "")
+        if candidate_owner_id:
+            reconciliation["candidate_owner_id"] = candidate_owner_id
+        original_payload = reconciliation.get("original_payload")
+        if not isinstance(original_payload, dict):
+            original_payload = {}
+        original_payload["exchange_truth"] = dict(exchange_truth)
+        reconciliation["original_payload"] = original_payload
+        return True
+
+    def _archive_malformed_pending_close_reconciliation(
+        self,
+        reconciliation: dict[str, Any],
+        *,
+        now_ms: int,
+        reason: str,
+        symbol: str = "",
+    ) -> bool:
+        snapshot = reconciliation.get("position_snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        payload = {
+            "position_id": reconciliation.get("position_id", ""),
+            "symbol": str(
+                symbol
+                or reconciliation.get("symbol")
+                or snapshot.get("symbol")
+                or ""
+            ).upper(),
+            "candidate_owner_id": reconciliation.get(
+                "candidate_owner_id",
+                reconciliation.get("position_id", ""),
+            ),
+            "missing_leg": self._missing_leg_from_reconciliation(reconciliation)
+            or "both",
+            "evidence_gap_reason": reason,
+            "next_attempt_ms": reconciliation.get("next_attempt_ms", 0),
+            "source": reconciliation.get(
+                "source",
+                "pending_close_reconciliation",
+            ),
+            "close_reconciliation_state": "terminal_flat_accounting_gap",
+            "archive_reconciliation": True,
+        }
+        return self._archive_pending_close_reconciliation_with_payload(
+            reconciliation,
+            payload,
+            now_ms=now_ms,
+        )
+
+    def _append_pending_close_invalid_once(
+        self,
+        reconciliation: dict[str, Any],
+        *,
+        symbol: str,
+        reason: str,
+    ) -> None:
+        key = "|".join(
+            [
+                str(reconciliation.get("position_id") or ""),
+                str(symbol or reconciliation.get("symbol") or "").upper(),
+                reason,
+            ]
+        )
+        raw_keys = reconciliation.get("invalid_reconciliation_warning_keys")
+        if not isinstance(raw_keys, list):
+            raw_keys = []
+        emitted_keys = {
+            str(item)
+            for item in raw_keys
+            if isinstance(item, (str, int, float))
+        }
+        if key in emitted_keys:
+            return
+        self.ctx.journal.append(
+            "reconciliation.pending_close_reconciliation_invalid",
+            {
+                "position_id": reconciliation.get("position_id", ""),
+                "symbol": symbol or reconciliation.get("symbol", ""),
+                "reason": reason,
+            },
+        )
+        raw_keys.append(key)
+        reconciliation["invalid_reconciliation_warning_keys"] = raw_keys
+
     def _archive_terminal_flat_pending_close_reconciliation(
         self,
         reconciliation: dict[str, Any],
@@ -1190,7 +1631,7 @@ class CloseRuntime:
             or "terminal_flat_accounting_gap"
         )
         missing_leg = self._missing_leg_from_reconciliation(reconciliation)
-        truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
+        retained_truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
         candidates = self._statement_probe_candidates_from_reconciliation(
             reconciliation,
             missing_leg=missing_leg,
@@ -1204,13 +1645,18 @@ class CloseRuntime:
                 symbol=symbol,
                 missing_leg=missing_leg,
                 evidence_gap_reason=evidence_gap_reason,
-                truth_hash=truth_hash,
+                truth_hash=retained_truth_hash,
                 source=str(
                     reconciliation.get("source")
                     or "pending_close_reconciliation"
                 ),
                 emit_event=reconciliation.get("accounting_only_backfill") is not True,
             )
+            return False
+        archive_exchange_truth, truth_hash = (
+            self._close_reconciliation_archive_exchange_truth(now_ms=now_ms)
+        )
+        if not isinstance(archive_exchange_truth, dict) or not truth_hash:
             return False
         payload = {
             "position_id": reconciliation.get("position_id", ""),
@@ -1230,24 +1676,19 @@ class CloseRuntime:
             "archive_reconciliation": True,
             "exchange_truth_hash": truth_hash,
         }
-        archive_key = (
-            self._close_reconciliation_archive_key(
-                payload,
-                truth_hash=truth_hash,
-            )
-            if truth_hash
-            else ""
+        archive_appended, archive_key = self._append_pending_close_archive_event(
+            payload,
+            exchange_truth=archive_exchange_truth,
+            truth_hash=truth_hash,
         )
-        archive_already_emitted = bool(
-            archive_key
-            and archive_key in self._close_reconciliation_archive_emitted_keys
-        )
+        if not archive_appended:
+            return False
 
         reconciliation["close_reconciliation_state"] = state
         reconciliation["archived"] = True
         reconciliation["archive_reason"] = state
         reconciliation["business_contract_action"] = state
-        reconciliation["exchange_truth"] = dict(exchange_truth)
+        reconciliation["exchange_truth"] = dict(archive_exchange_truth)
         reconciliation["last_partial_reconciled_at_ms"] = now_ms
         if missing_leg:
             reconciliation["missing_leg"] = missing_leg
@@ -1260,16 +1701,9 @@ class CloseRuntime:
         original_payload = reconciliation.get("original_payload")
         if not isinstance(original_payload, dict):
             original_payload = {}
-        original_payload["exchange_truth"] = dict(exchange_truth)
+        original_payload["exchange_truth"] = dict(archive_exchange_truth)
         reconciliation["original_payload"] = original_payload
 
-        if not archive_already_emitted:
-            self.ctx.journal.append(
-                "reconciliation.pending_close_backfill_archived",
-                payload,
-            )
-            if archive_key:
-                self._close_reconciliation_archive_emitted_keys.add(archive_key)
         return True
 
     def _current_exchange_truth_for_close_reconciliation(
@@ -1296,12 +1730,6 @@ class CloseRuntime:
         now_ms: int,
     ) -> None:
         if not reconciliations:
-            return
-        if all(
-            self._current_exchange_truth_for_close_reconciliation(reconciliation)
-            is not None
-            for reconciliation in reconciliations
-        ):
             return
         if self._close_reconciliation_truth_refresh_next_ms > now_ms:
             return
@@ -1332,12 +1760,19 @@ class CloseRuntime:
             "source",
             "pending_close_reconciliation_account_truth_refresh",
         )
+        configured_venues = sorted(self._configured_close_reconciliation_venues())
+        exchange_truth["configured_venues"] = configured_venues
+        exchange_truth["configured_venue_count"] = len(configured_venues)
+        exchange_truth["close_reconciliation_captured_at_ms"] = int(now_ms)
         self._close_reconciliation_exchange_truth = exchange_truth
         self.ctx.journal.append(
             "reconciliation.pending_close_exchange_truth_refreshed",
             {
                 "truth_supported": exchange_truth.get("truth_supported"),
                 "truth_available": exchange_truth.get("truth_available"),
+                "configured_venues": configured_venues,
+                "configured_venue_count": len(configured_venues),
+                "captured_at_ms": int(now_ms),
                 "position_row_count": len(exchange_truth.get("positions") or []),
                 "open_order_count": len(exchange_truth.get("open_orders") or []),
                 "probe_evidence_count": len(exchange_truth.get("probe_evidence") or []),
@@ -1829,13 +2264,26 @@ class CloseRuntime:
                 or (long_has_identity and long_venue is None)
                 or (short_has_identity and short_venue is None)
             ):
-                self.ctx.journal.append(
-                    "reconciliation.pending_close_reconciliation_invalid",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": reconciliation.get("symbol", ""),
-                        "reason": "missing_position_snapshot_venues",
-                    },
+                if self._archive_malformed_pending_close_reconciliation(
+                    reconciliation,
+                    now_ms=now_ms,
+                    reason="missing_position_snapshot_venues",
+                    symbol=str(
+                        reconciliation.get("symbol")
+                        or snapshot.get("symbol")
+                        or ""
+                    ),
+                ):
+                    changed = True
+                    continue
+                self._append_pending_close_invalid_once(
+                    reconciliation,
+                    symbol=str(
+                        reconciliation.get("symbol")
+                        or snapshot.get("symbol")
+                        or ""
+                    ),
+                    reason="missing_position_snapshot_venues",
                 )
                 self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                 retained.append(reconciliation)
@@ -1843,13 +2291,26 @@ class CloseRuntime:
                 continue
 
             if not (long_has_identity or short_has_identity):
-                self.ctx.journal.append(
-                    "reconciliation.pending_close_reconciliation_invalid",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": reconciliation.get("symbol", ""),
-                        "reason": "missing_order_identity",
-                    },
+                if self._archive_malformed_pending_close_reconciliation(
+                    reconciliation,
+                    now_ms=now_ms,
+                    reason="missing_order_identity",
+                    symbol=str(
+                        reconciliation.get("symbol")
+                        or snapshot.get("symbol")
+                        or ""
+                    ),
+                ):
+                    changed = True
+                    continue
+                self._append_pending_close_invalid_once(
+                    reconciliation,
+                    symbol=str(
+                        reconciliation.get("symbol")
+                        or snapshot.get("symbol")
+                        or ""
+                    ),
+                    reason="missing_order_identity",
                 )
                 self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                 retained.append(reconciliation)
@@ -1907,6 +2368,27 @@ class CloseRuntime:
                         payload["accounting_only_backfill"] = True
                         payload["blocking_trading"] = False
                         payload["archive_reconciliation"] = False
+                    if archive_reconciliation:
+                        archive_exchange_truth, archive_truth_hash = (
+                            self._close_reconciliation_archive_exchange_truth(
+                                now_ms=now_ms
+                            )
+                        )
+                        if (
+                            isinstance(archive_exchange_truth, dict)
+                            and archive_truth_hash
+                        ):
+                            exchange_truth = archive_exchange_truth
+                            truth_hash = archive_truth_hash
+                            self._annotate_terminal_flat_accounting_gap_payload(
+                                payload,
+                                contract=contract,
+                                exchange_truth=exchange_truth,
+                                truth_hash=truth_hash,
+                            )
+                        else:
+                            archive_reconciliation = False
+                            payload["archive_reconciliation"] = False
                     if archive_reconciliation and truth_hash:
                         archive_key = self._close_reconciliation_archive_key(
                             payload,
@@ -1972,6 +2454,16 @@ class CloseRuntime:
                         retained_keys
                     )
                 if bool(payload.get("pending_backfill")):
+                    if archive_reconciliation:
+                        archived = self._archive_pending_close_reconciliation_with_payload(
+                            reconciliation,
+                            payload,
+                            now_ms=now_ms,
+                            state=str(contract.get("state") or ""),
+                        )
+                        if not archived:
+                            archive_reconciliation = False
+                            payload["archive_reconciliation"] = False
                     reconciliation["pending_backfill"] = True
                     reconciliation["missing_leg"] = payload.get("missing_leg", "")
                     reconciliation["candidate_owner_id"] = payload.get("candidate_owner_id", "")
@@ -2042,7 +2534,7 @@ class CloseRuntime:
                         if archive_reconciliation
                         else "reconciliation.pending_close_backfill_retained"
                     )
-                    if emit_reconciled:
+                    if emit_reconciled and not archive_reconciliation:
                         self.ctx.journal.append(
                             event_kind,
                             {
@@ -2156,84 +2648,35 @@ class CloseRuntime:
                     ):
                         archive_reconciliation = False
                     if archive_reconciliation:
-                        archive_key = self._close_reconciliation_archive_key(
-                            payload,
-                            truth_hash=truth_hash,
-                        )
-                        archive_already_emitted = (
-                            archive_key
-                            in self._close_reconciliation_archive_emitted_keys
-                        )
-                        reconciliation["pending_backfill"] = True
-                        reconciliation["missing_leg"] = "both"
-                        reconciliation["candidate_owner_id"] = payload.get(
-                            "candidate_owner_id",
-                            "",
-                        )
-                        reconciliation["last_evidence_gap_reason"] = payload.get(
-                            "evidence_gap_reason",
-                            "",
-                        )
-                        reconciliation["last_partial_reconciled_at_ms"] = now_ms
-                        reconciliation["close_reconciliation_state"] = str(
-                            contract.get("state") or ""
-                        )
-                        reconciliation["archived"] = True
-                        reconciliation["archive_reason"] = str(
-                            contract.get("state") or ""
-                        )
-                        reconciliation["business_contract_action"] = str(
-                            contract.get("state") or ""
-                        )
-                        reconciliation["exchange_truth"] = dict(exchange_truth)
-                        if truth_hash:
-                            reconciliation["exchange_truth_hash"] = truth_hash
-                        if archive_key:
-                            reconciliation["archive_key"] = archive_key
-                        original_payload = reconciliation.get("original_payload")
-                        if not isinstance(original_payload, dict):
-                            original_payload = {}
-                        original_payload["exchange_truth"] = dict(exchange_truth)
-                        reconciliation["original_payload"] = original_payload
-                        if not archive_already_emitted:
-                            self.ctx.journal.append(
-                                "reconciliation.pending_close_backfill_archived",
-                                {
-                                    "position_id": reconciliation.get(
-                                        "position_id",
-                                        "",
-                                    ),
-                                    "symbol": symbol,
-                                    "candidate_owner_id": payload.get(
-                                        "candidate_owner_id",
-                                        "",
-                                    ),
-                                    "missing_leg": payload.get("missing_leg", ""),
-                                    "evidence_gap_reason": payload.get(
-                                        "evidence_gap_reason",
-                                        "",
-                                    ),
-                                    "next_attempt_ms": reconciliation.get(
-                                        "next_attempt_ms",
-                                        0,
-                                    ),
-                                    "source": payload.get(
-                                        "source",
-                                        "pending_close_reconciliation",
-                                    ),
-                                    "close_reconciliation_state": str(
-                                        contract.get("state") or ""
-                                    ),
-                                    "archive_reconciliation": True,
-                                    "exchange_truth_hash": truth_hash,
-                                },
+                        archive_exchange_truth, archive_truth_hash = (
+                            self._close_reconciliation_archive_exchange_truth(
+                                now_ms=now_ms
                             )
-                            if archive_key:
-                                self._close_reconciliation_archive_emitted_keys.add(
-                                    archive_key
-                                )
-                        changed = True
-                        continue
+                        )
+                        if (
+                            isinstance(archive_exchange_truth, dict)
+                            and archive_truth_hash
+                        ):
+                            exchange_truth = archive_exchange_truth
+                            truth_hash = archive_truth_hash
+                            self._annotate_terminal_flat_accounting_gap_payload(
+                                payload,
+                                contract=contract,
+                                exchange_truth=exchange_truth,
+                                truth_hash=truth_hash,
+                            )
+                        else:
+                            archive_reconciliation = False
+                            payload["archive_reconciliation"] = False
+                    if archive_reconciliation:
+                        if self._archive_pending_close_reconciliation_with_payload(
+                            reconciliation,
+                            payload,
+                            now_ms=now_ms,
+                            state=str(contract.get("state") or ""),
+                        ):
+                            changed = True
+                            continue
                     if self._has_statement_probe_candidates(reconciliation):
                         self._retain_terminal_flat_accounting_backfill(
                             reconciliation,
@@ -2260,13 +2703,10 @@ class CloseRuntime:
                         retained.append(reconciliation)
                         changed = True
                         continue
-                self.ctx.journal.append(
-                    "reconciliation.pending_close_reconciliation_invalid",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": symbol,
-                        "reason": "confirmed_no_close_fill",
-                    },
+                self._append_pending_close_invalid_once(
+                    reconciliation,
+                    symbol=symbol,
+                    reason="confirmed_no_close_fill",
                 )
                 self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                 retained.append(reconciliation)

@@ -16,6 +16,11 @@ from typing import Any, Optional
 import httpx
 import websockets
 
+from lightfee.venues.hyperliquid_info_coordinator import (
+    hyperliquid_info_coordinator,
+    should_coordinate_hyperliquid_info_url,
+)
+
 
 @dataclass(frozen=True)
 class TopBookQuote:
@@ -341,16 +346,40 @@ class RestTopBookQuoteRefresher:
                 client = httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_s))
                 self._async_client = client
             venue_semaphore = self._venue_async_semaphores[venue_key]
-            async with self._global_async_semaphore, venue_semaphore:
-                response = await client.request(
-                    method,
-                    url,
-                    timeout=self._timeout_s,
-                    **request_kwargs,
-                )
-            response.raise_for_status()
-            raw = response.json()
-            received_at_ms = int(time.time() * 1000)
+            json_body = request_kwargs.get("json") if method == "POST" else None
+            info_coordinator = None
+            cached_info = None
+            if should_coordinate_hyperliquid_info_url(method, url, json_body):
+                info_coordinator = hyperliquid_info_coordinator()
+                cached_info = info_coordinator.lookup_metadata_response(json_body)
+            if cached_info is not None:
+                raw = cached_info.payload
+                received_at_ms = cached_info.received_at_ms
+            else:
+                async with self._global_async_semaphore, venue_semaphore:
+                    if info_coordinator is not None:
+                        await info_coordinator.async_wait_until_ready(json_body)
+                    response = await client.request(
+                        method,
+                        url,
+                        timeout=self._timeout_s,
+                        **request_kwargs,
+                    )
+                if info_coordinator is not None:
+                    info_coordinator.record_http_response(
+                        response.status_code,
+                        dict(response.headers),
+                        body=json_body,
+                    )
+                response.raise_for_status()
+                raw = response.json()
+                received_at_ms = int(time.time() * 1000)
+                if info_coordinator is not None:
+                    info_coordinator.store_metadata_response(
+                        json_body,
+                        raw,
+                        received_at_ms=received_at_ms,
+                    )
             quote = self._quote_from_raw(
                 venue_key,
                 symbol_key,
@@ -699,9 +728,27 @@ class RestTopBookQuoteRefresher:
     def _post_json(self, url: str, *, json: dict[str, Any]) -> Any:
         if self._client is None:
             self._client = httpx.Client(timeout=httpx.Timeout(self._timeout_s))
+        info_coordinator = None
+        cached_info = None
+        if should_coordinate_hyperliquid_info_url("POST", url, json):
+            info_coordinator = hyperliquid_info_coordinator()
+            cached_info = info_coordinator.lookup_metadata_response(json)
+        if cached_info is not None:
+            return cached_info.payload
+        if info_coordinator is not None:
+            info_coordinator.wait_until_ready(json)
         response = self._client.post(url, json=json, timeout=self._timeout_s)
+        if info_coordinator is not None:
+            info_coordinator.record_http_response(
+                response.status_code,
+                dict(response.headers),
+                body=json,
+            )
         response.raise_for_status()
-        return response.json()
+        raw = response.json()
+        if info_coordinator is not None:
+            info_coordinator.store_metadata_response(json, raw)
+        return raw
 
     @staticmethod
     def _select_row(raw: Any, venue_symbol: str) -> dict[str, Any]:

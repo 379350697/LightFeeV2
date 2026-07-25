@@ -12,6 +12,8 @@ Rust references:
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 import tempfile
@@ -774,6 +776,208 @@ def test_terminal_flat_accounting_gap_is_retained_as_accounting_only_backfill():
     assert reconciliation["accounting_only_backfill"] is True
     assert reconciliation["blocking_trading"] is False
     assert reconciliation["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+
+
+class _PendingCloseArchiveJournal:
+    def __init__(self):
+        self.records = []
+
+    def append(self, kind, payload):
+        self.records.append({"kind": kind, "payload": deepcopy(payload)})
+
+    def append_critical(self, now_ms, kind, payload):
+        self.records.append({
+            "ts_ms": now_ms,
+            "kind": kind,
+            "payload": deepcopy(payload),
+        })
+
+    def read_all(self):
+        return list(self.records)
+
+
+class _PendingCloseArchiveCtx:
+    def __init__(self, exchange_truth):
+        self.state = EngineState()
+        self.config = SimpleNamespace(runtime=SimpleNamespace(mode="live"))
+        self.journal = _PendingCloseArchiveJournal()
+        self.venue_adapters = {
+            Venue.BINANCE: object(),
+            Venue.OKX: object(),
+        }
+        self._last_recovery_exchange_truth = None
+        self.exchange_truth = exchange_truth
+        self.collector_calls = []
+
+    async def _collect_recovery_ledger_account_truth(self, now_ms):
+        self.collector_calls.append(now_ms)
+        return deepcopy(self.exchange_truth)
+
+
+def _pending_close_archive_account_truth(
+    *,
+    complete: bool = True,
+    nonflat: bool = False,
+):
+    venues = [Venue.BINANCE.value, Venue.OKX.value]
+    evidence_venues = venues if complete else venues[:1]
+    return {
+        "truth_supported": True,
+        "truth_available": True,
+        "venue_count": len(venues),
+        "complete_venue_count": len(venues) if complete else len(evidence_venues),
+        "positions": [
+            {
+                "venue": Venue.BINANCE.value,
+                "symbol": "*",
+                "quantity": 1.0,
+            }
+        ]
+        if nonflat
+        else [],
+        "open_orders": [],
+        "probe_evidence": [
+            {
+                "venue": venue,
+                "symbol": "*",
+                "classification": "position_probe_unfiltered_succeeded",
+                "finished_at_ms": 3000,
+            }
+            for venue in evidence_venues
+        ]
+        + [
+            {
+                "venue": venue,
+                "symbol": "*",
+                "classification": "open_order_probe_unfiltered_succeeded",
+                "finished_at_ms": 3000,
+            }
+            for venue in evidence_venues
+        ],
+        "errors": [],
+    }
+
+
+def _pending_close_missing_order_identity_record():
+    return {
+        "position_id": "entry-archive",
+        "symbol": "ARCHIVEUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "closed_at_ms": 1000,
+        "created_cycle": 1,
+        "next_attempt_ms": 0,
+        "attempt_count": 0,
+        "position_snapshot": {
+            "position_id": "entry-archive",
+            "symbol": "ARCHIVEUSDT",
+            "long_venue": Venue.BINANCE.value,
+            "short_venue": Venue.OKX.value,
+        },
+        "long_legs": [],
+        "short_legs": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_pending_close_archives_malformed_record_after_complete_fresh_account_flat_proof():
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth())
+    ctx.state.tick_count = 2
+    ctx.state.pending_close_reconciliations.append(
+        _pending_close_missing_order_identity_record()
+    )
+    runtime = CloseRuntime(ctx=ctx)
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    records = ctx.journal.read_all()
+    archived = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    invalid = [
+        record
+        for record in records
+        if record["kind"] == "reconciliation.pending_close_reconciliation_invalid"
+    ]
+    assert ctx.collector_calls == [3000]
+    assert ctx.state.pending_close_reconciliations == []
+    assert len(archived) == 1
+    assert invalid == []
+    truth_hash = runtime._close_reconciliation_truth_hash(
+        runtime._close_reconciliation_exchange_truth
+    )
+    assert archived[0]["exchange_truth_hash"] == truth_hash
+    assert archived[0]["truth_hash"] == truth_hash
+    assert archived[0]["configured_venues"] == [
+        Venue.BINANCE.value,
+        Venue.OKX.value,
+    ]
+    assert archived[0]["evidence_gap_reason"] == "missing_order_identity"
+    assert archived[0]["close_reconciliation_state"] == (
+        "terminal_flat_accounting_gap"
+    )
+    assert archived[0]["archive_reconciliation"] is True
+    assert archived[0]["archive_key"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proof_case", ["stale", "incomplete", "nonflat"])
+async def test_pending_close_retains_malformed_record_without_complete_fresh_flat_proof_once(
+    proof_case,
+):
+    ctx = _PendingCloseArchiveCtx(
+        _pending_close_archive_account_truth(
+            complete=proof_case != "incomplete",
+            nonflat=proof_case == "nonflat",
+        )
+    )
+    ctx.state.tick_count = 2
+    ctx.state.pending_close_reconciliations.append(
+        _pending_close_missing_order_identity_record()
+    )
+    runtime = CloseRuntime(ctx=ctx)
+    if proof_case == "stale":
+        stale_truth = _pending_close_archive_account_truth()
+        stale_truth["configured_venues"] = [
+            Venue.BINANCE.value,
+            Venue.OKX.value,
+        ]
+        stale_truth["configured_venue_count"] = 2
+        stale_truth["close_reconciliation_captured_at_ms"] = 2500
+        runtime._close_reconciliation_exchange_truth = stale_truth
+        runtime._close_reconciliation_truth_refresh_next_ms = 60_000
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    assert len(ctx.state.pending_close_reconciliations) == 1
+    retained = ctx.state.pending_close_reconciliations[0]
+    assert retained["attempt_count"] == 1
+    assert retained["next_attempt_ms"] > 3000
+    records = ctx.journal.read_all()
+    assert [
+        record["kind"]
+        for record in records
+    ].count("reconciliation.pending_close_backfill_archived") == 0
+    assert [
+        record["kind"]
+        for record in records
+    ].count("reconciliation.pending_close_reconciliation_invalid") == 1
+
+    retained["next_attempt_ms"] = 0
+    ctx.state.tick_count = 3
+    await runtime._process_pending_close_reconciliations(now_ms=4000)
+
+    assert len(ctx.state.pending_close_reconciliations) == 1
+    assert [
+        record["kind"]
+        for record in ctx.journal.read_all()
+    ].count("reconciliation.pending_close_reconciliation_invalid") == 1
+    assert [
+        record["kind"]
+        for record in ctx.journal.read_all()
+    ].count("reconciliation.pending_close_backfill_archived") == 0
 
 
 def test_accounting_only_backfill_does_not_block_entry_gate():
