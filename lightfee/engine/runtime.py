@@ -7229,6 +7229,7 @@ class LiveRuntime:
                 l2_tracking_tradeable,
                 tracked_candidates,
             )
+            oi_prewarm_candidates = list(l2_tracking_tradeable)
             self.state.last_scan["complete_eligible_frontier_count"] = len(
                 l2_tracking_tradeable
             )
@@ -7248,6 +7249,9 @@ class LiveRuntime:
             self.state.last_scan["quote_prewarm_extra_target_count"] = 0
             self.state.last_scan["quote_prewarm_extra_resolved_count"] = 0
             self.state.last_scan["quote_prewarm_extra_failed_count"] = 0
+            self.state.last_scan["oi_prewarm_frontier_candidate_count"] = len(
+                oi_prewarm_candidates
+            )
             entry_quote_keys: set[tuple[str, str]] = set()
             for candidate in tracked_candidates:
                 symbol = str(getattr(candidate, "symbol", "") or "").upper()
@@ -7721,12 +7725,12 @@ class LiveRuntime:
                 if symbol and bid > 0.0 and ask > bid:
                     price_hints[symbol] = (bid + ask) / 2.0
             now_ms = wall_clock_now_ms()
-            if prewarm_extra_candidates and self._running:
+            if self._running:
                 async def _prewarm_latest_generation() -> None:
                     try:
                         if entry_evidence_generation != self._entry_evidence_generation:
                             return
-                        if entry_bbo_prewarm_attempted:
+                        if entry_bbo_prewarm_attempted and prewarm_extra_candidates:
                             await self._entry_quote_revalidate_for_candidates(
                                 prewarm_extra_candidates,
                                 snapshot=snapshot,
@@ -7742,11 +7746,11 @@ class LiveRuntime:
                         if entry_evidence_generation != self._entry_evidence_generation:
                             return
                         await self._refresh_entry_candidate_open_interest_evidence(
-                            prewarm_extra_candidates,
+                            oi_prewarm_candidates,
                             snapshot=snapshot,
                             now_ms=wall_clock_now_ms(),
                             evidence_role="prewarm_only",
-                            candidate_scope="prewarm_extra",
+                            candidate_scope="l2_tracking_tradeable",
                         )
                     except asyncio.CancelledError:
                         raise
@@ -7756,7 +7760,7 @@ class LiveRuntime:
                                 "runtime.entry_evidence_prewarm_failed",
                                 {
                                     "error": f"{type(exc).__name__}: {exc}"[:240],
-                                    "candidate_count": len(prewarm_extra_candidates),
+                                    "candidate_count": len(oi_prewarm_candidates),
                                     "ts_ms": wall_clock_now_ms(),
                                 },
                             )

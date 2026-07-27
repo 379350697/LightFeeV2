@@ -140,6 +140,31 @@ promotion time. Those events must carry `evidence_role=prewarm_only` and
 `candidate_scope=prewarm_extra`. Prewarm failures are diagnostic refresh
 evidence, not current entry blockers; only `entry_execution` evidence from the
 V1 primary+shadow scope can increment current unresolved entry blockers.
+Targeted entry OI may persist last-good observations, but only as proof-valid
+direct `observed` evidence. Durable fallback must lazy-load the exact
+venue/symbol key, revalidate source/sample/raw-value proof and timestamps, keep
+the existing 30 minute hard cap, and preserve the original observation fields.
+Foreground targeted OI lookup order is hot proof-valid memory, exact proof-valid
+durable evidence, then exchange refresh; missing, stale, or invalid durable rows
+fall through to the real exchange attempt.
+The hot runtime cache remains LRU-bounded at 256 entries; the full durable store
+must not be hydrated into memory. Prewarm OI work is lower priority than entry
+execution, bounded independently, cancellable by foreground refresh, and paced
+by a 15 minute cadence. That cadence is fed by the complete current
+`l2_tracking_tradeable` frontier, not by optional quote prewarm extras; its
+four-target setting is concurrency only. Due cycles force real refresh for every
+required resolved-frontier target, including targets whose quote snapshot already
+has fresh OI; hot or durable evidence cannot satisfy due prewarm. Due cycles must
+run durable expiry cleanup exactly once, including empty frontiers, before marking the cycle
+started. Not-due cycles must perform no cleanup or refresh, and cleanup
+failures must be logged without blocking OI refresh.
+Prewarm OI may use global low-priority capacity across different venues, but a
+single venue must have at most one active or gate-waiting transport request at a
+time; distinct same-venue direct prewarm attempts are deferred before occupying
+a global prewarm slot. SQLite durable replacement is strictly ordered by
+observed timestamp;
+equal observed timestamps must not overwrite a row even with newer receipt time
+or a different sample.
 
 Deploy diagnostics must keep readiness separate from execution failure. Quote
 stale, confirmed OI below floor, OI unavailable, structural OI suppression, and
@@ -200,6 +225,7 @@ erase the historical rate-limit event.
 | 2026-07-01 | Deploy readiness bucket for quote/OI candidate noise | `a9269db` deployed/cloud verified | CL-143 adds `market_data_readiness_summary` for quote stale, OI below floor, OI unavailable, structural OI suppression, and prewarm pending samples. The fix explains candidate-readiness volume without lowering OI/quote/liquidity gates and without misclassifying readiness as order-path failure. |
 | 2026-07-08 | Sidecar FD exhaustion and live restart cascade | local green, deploy pending | CL-156 caps sidecar and spread-sidecar direct public HTTP total connections without constraining credentialed `VenueTransport`, reuses same-cycle quote snapshots for liquidity lifecycle, closes sidecar/spread-sidecar services on SIGTERM/every app exit path including in-flight refresh cancellation, makes source close best-effort, requires `LimitNOFILE=65536`, verifies sidecar/spread-sidecar/live units, and removes live's hard `Requires=lightfee-sidecar.service` dependency. This is operational IO lifecycle hardening; it does not change quote TTL, OI/liquidity floors, entry admission, close truth, or owner recovery semantics. |
 | 2026-07-25 | Post-deploy snapshot/OI/quote deadline recurrence and Hyperliquid `429` | local verified; deploy pending | CL-159 now records per-venue collection-to-publication timing and rolling latency quantiles while retaining candidate-leg final revalidation. Hyperliquid `POST /info` callers share config-rooted pacing, public-metadata cache, and 429 exponential cooldown; strict read-only is unchanged. No TTL, OI, liquidity, or quote threshold changed. See [daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates](../daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates). |
+| 2026-07-26 | Durable targeted entry OI evidence and prewarm bounds | local green; deploy pending | CL-160 adds a proof-valid SQLite last-good store for targeted entry OI, foreground hot-proof -> exact durable <=30m -> exchange lookup order, a 256-entry LRU hot cache, low-priority cancellable 15 minute prewarm that force-refreshes the full required frontier, same-venue prewarm serialization, and strict observed-time durable replacement. No OI floor, TTL, liquidity, ranking, sizing, order, close, recovery, or deployment behavior changed. See [daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds](../daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds). |
 
 ## Regression Harness
 

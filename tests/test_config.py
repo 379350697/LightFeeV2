@@ -21,6 +21,13 @@ from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
 from lightfee.config.validation import validate_config
 from lightfee.core.errors import ConfigError
 
+EXPECTED_PUBLIC_ENTRY_OPEN_INTEREST_RUNTIME_FIELDS = {
+    "entry_open_interest_refresh_timeout_ms",
+    "entry_open_interest_cache_fallback_max_age_ms",
+    "entry_open_interest_store_path",
+    "entry_open_interest_background_refresh_ms",
+}
+
 
 def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
     from lightfee.config.schema import StrategyConfig
@@ -115,11 +122,22 @@ def test_funding_and_spread_fee_evidence_are_separate_runtime_inputs():
     )
 
 
-def test_runtime_config_validates_entry_open_interest_controls():
+def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
     cfg = AppConfig()
 
     assert cfg.runtime.entry_open_interest_refresh_timeout_ms == 750
     assert cfg.runtime.entry_open_interest_cache_fallback_max_age_ms == 30 * 60_000
+    assert (
+        cfg.runtime.entry_open_interest_store_path
+        == "runtime/entry-open-interest-evidence-v1.sqlite3"
+    )
+    assert cfg.runtime.entry_open_interest_background_refresh_ms == 15 * 60_000
+    assert {
+        name
+        for name in cfg.runtime.__dataclass_fields__
+        if name.startswith("entry_open_interest_")
+    } == EXPECTED_PUBLIC_ENTRY_OPEN_INTEREST_RUNTIME_FIELDS
+    assert not any("hot_cache" in name for name in cfg.runtime.__dataclass_fields__)
     assert not any("entry_open_interest" in issue for issue in validate_config(cfg))
 
     cfg.runtime.entry_open_interest_refresh_timeout_ms = 0
@@ -138,6 +156,50 @@ def test_runtime_config_validates_entry_open_interest_controls():
     cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = -1
     assert (
         "runtime.entry_open_interest_cache_fallback_max_age_ms must be a positive integer"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = 30 * 60_000
+    cfg.runtime.entry_open_interest_store_path = " "
+    assert (
+        "runtime.entry_open_interest_store_path must not be empty"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_open_interest_store_path = (
+        "runtime/entry-open-interest-evidence-v1.sqlite3"
+    )
+    existing_directory = tmp_path / "entry-oi-directory"
+    existing_directory.mkdir()
+    cfg.runtime.entry_open_interest_store_path = str(existing_directory)
+    assert (
+        "runtime.entry_open_interest_store_path must not be "
+        "an existing directory"
+        in validate_config(cfg)
+    )
+
+    parent_file = tmp_path / "entry-oi-parent-file"
+    parent_file.write_text("not a directory")
+    cfg.runtime.entry_open_interest_store_path = str(
+        parent_file / "entry-oi.sqlite3"
+    )
+    assert (
+        "runtime.entry_open_interest_store_path parent must be a usable "
+        "directory or creatable"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.entry_open_interest_store_path = str(
+        tmp_path / "missing-parent" / "entry-oi.sqlite3"
+    )
+    assert not any("entry_open_interest" in issue for issue in validate_config(cfg))
+
+    cfg.runtime.entry_open_interest_store_path = (
+        "runtime/entry-open-interest-evidence-v1.sqlite3"
+    )
+    cfg.runtime.entry_open_interest_background_refresh_ms = 0
+    assert (
+        "runtime.entry_open_interest_background_refresh_ms must be a positive integer"
         in validate_config(cfg)
     )
 

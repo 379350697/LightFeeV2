@@ -1,14 +1,20 @@
 """Tests for persistence: journal, snapshot, SQLite."""
 
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from lightfee.marketdata.open_interest import (
+    ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+    open_interest_sample_id,
+)
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.journal_index import JournalIndex
 from lightfee.persistence.metrics import PersistenceMetrics
+from lightfee.persistence.open_interest_store import OpenInterestEvidenceStore
 from lightfee.persistence.projection_backfill import ProjectionBackfill
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.persistence.projection_contracts import (
@@ -27,6 +33,318 @@ from lightfee.persistence.projection_contracts import (
     is_projected_kind,
 )
 from lightfee.persistence.sqlite_store import SqliteStore
+
+
+def _targeted_oi_payload(
+    venue: str,
+    symbol: str,
+    observed_at_ms: int,
+    *,
+    source: str = "test_durable_oi",
+    value_quote: float = 2_500_000.0,
+) -> dict:
+    return {
+        "open_interest_quote": value_quote,
+        "open_interest_evidence_status": "observed",
+        "open_interest_evidence_reason": "targeted_refresh",
+        "open_interest_observed_at_ms": observed_at_ms,
+        "open_interest_event_at_ms": 0,
+        "open_interest_received_at_ms": observed_at_ms,
+        "open_interest_source": source,
+        "open_interest_sample_id": open_interest_sample_id(
+            venue=venue,
+            canonical_symbol=symbol,
+            venue_symbol=symbol,
+            observed_at_ms=observed_at_ms,
+            source=source,
+            raw_value=value_quote,
+            value_quote=value_quote,
+        ),
+        "open_interest_venue_symbol": symbol,
+        "raw_open_interest": value_quote,
+        "raw_open_interest_unit": "quote",
+        "open_interest_contract_multiplier": 1.0,
+        "open_interest_conversion_mark_price": None,
+    }
+
+
+class TestOpenInterestEvidenceStore:
+    def test_stores_and_loads_only_the_requested_proof_valid_row(self, tmp_path):
+        store = OpenInterestEvidenceStore(tmp_path / "entry-oi.sqlite3")
+        payload = _targeted_oi_payload("binance", "BTCUSDT", 1_000)
+
+        assert store.store_observed(
+            venue="BINANCE",
+            symbol="btcusdt",
+            payload=payload,
+            now_ms=1_001,
+        )
+
+        loaded = store.load_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            now_ms=1_010,
+        )
+        assert loaded == payload
+        assert (
+            store.load_observed(
+                venue="binance",
+                symbol="ETHUSDT",
+                now_ms=1_010,
+            )
+            is None
+        )
+
+    def test_rejects_fallback_failures_and_expired_observations(self, tmp_path):
+        store = OpenInterestEvidenceStore(tmp_path / "entry-oi.sqlite3")
+        now_ms = ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS + 2_000
+
+        fallback = _targeted_oi_payload("binance", "BTCUSDT", now_ms)
+        fallback["open_interest_cache_fallback"] = True
+        assert not store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=fallback,
+            now_ms=now_ms,
+        )
+
+        failure = _targeted_oi_payload("binance", "ETHUSDT", now_ms)
+        failure["open_interest_evidence_status"] = "timeout"
+        assert not store.store_observed(
+            venue="binance",
+            symbol="ETHUSDT",
+            payload=failure,
+            now_ms=now_ms,
+        )
+
+        expired = _targeted_oi_payload("binance", "SOLUSDT", 1_000)
+        assert not store.store_observed(
+            venue="binance",
+            symbol="SOLUSDT",
+            payload=expired,
+            now_ms=now_ms,
+        )
+
+    def test_upsert_is_monotonic_and_expiry_cleanup_preserves_cap_boundary(
+        self,
+        tmp_path,
+    ):
+        store = OpenInterestEvidenceStore(tmp_path / "entry-oi.sqlite3")
+        older = _targeted_oi_payload(
+            "binance",
+            "BTCUSDT",
+            1_000,
+            source="older",
+        )
+        newer = _targeted_oi_payload(
+            "binance",
+            "BTCUSDT",
+            2_000,
+            source="newer",
+        )
+
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=newer,
+            now_ms=2_001,
+        )
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=older,
+            now_ms=2_002,
+        )
+        loaded = store.load_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            now_ms=2_010,
+        )
+        assert loaded["open_interest_source"] == "newer"
+
+        boundary = _targeted_oi_payload(
+            "binance",
+            "ETHUSDT",
+            10_000,
+            source="boundary",
+        )
+        stale = _targeted_oi_payload("binance", "SOLUSDT", 9_999, source="stale")
+        assert store.store_observed(
+            venue="binance",
+            symbol="ETHUSDT",
+            payload=boundary,
+            now_ms=10_000,
+        )
+        assert store.store_observed(
+            venue="binance",
+            symbol="SOLUSDT",
+            payload=stale,
+            now_ms=10_000,
+        )
+
+        assert (
+            store.delete_expired(
+                now_ms=10_000 + ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+            )
+            == 2
+        )
+        assert (
+            store.load_observed(
+                venue="binance",
+                symbol="ETHUSDT",
+                now_ms=10_000 + ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+            )
+            is not None
+        )
+        assert (
+            store.load_observed(
+                venue="binance",
+                symbol="SOLUSDT",
+                now_ms=10_000 + ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+            )
+            is None
+        )
+
+    def test_upsert_rejects_equal_observed_timestamp_replacements(self, tmp_path):
+        store = OpenInterestEvidenceStore(tmp_path / "entry-oi.sqlite3")
+        original = _targeted_oi_payload(
+            "binance",
+            "BTCUSDT",
+            1_000,
+            source="original",
+            value_quote=2_500_000.0,
+        )
+        equal_observed = _targeted_oi_payload(
+            "binance",
+            "BTCUSDT",
+            1_000,
+            source="same_observed_new_sample",
+            value_quote=3_000_000.0,
+        )
+        equal_observed["open_interest_received_at_ms"] = 1_500
+        later = _targeted_oi_payload(
+            "binance",
+            "BTCUSDT",
+            1_001,
+            source="later_observed",
+            value_quote=3_500_000.0,
+        )
+
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=original,
+            now_ms=1_001,
+        )
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=equal_observed,
+            now_ms=1_501,
+        )
+        loaded = store.load_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            now_ms=1_501,
+        )
+        assert loaded["open_interest_source"] == "original"
+        assert loaded["open_interest_quote"] == 2_500_000.0
+
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=later,
+            now_ms=1_002,
+        )
+        loaded = store.load_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            now_ms=1_002,
+        )
+        assert loaded["open_interest_source"] == "later_observed"
+        assert loaded["open_interest_quote"] == 3_500_000.0
+
+    def test_persists_only_explicit_open_interest_proof_fields(self, tmp_path):
+        store = OpenInterestEvidenceStore(tmp_path / "entry-oi.sqlite3")
+        payload = _targeted_oi_payload("binance", "BTCUSDT", 1_000)
+        payload.update(
+            {
+                "unexpected_payload": {"must": "not persist"},
+                "oi_cache_hit_count": 99,
+                "transport_debug": "private diagnostic",
+            }
+        )
+
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=payload,
+            now_ms=1_001,
+        )
+
+        loaded = store.load_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            now_ms=1_010,
+        )
+
+        assert loaded is not None
+        assert "unexpected_payload" not in loaded
+        assert "oi_cache_hit_count" not in loaded
+        assert "transport_debug" not in loaded
+        assert loaded["open_interest_sample_id"] == payload["open_interest_sample_id"]
+        assert loaded["raw_open_interest"] == payload["raw_open_interest"]
+
+    def test_delete_expired_reports_operational_cleanup_failure(self, tmp_path):
+        store_path = tmp_path / "entry-oi.sqlite3"
+        store_path.mkdir()
+        store = OpenInterestEvidenceStore(store_path)
+
+        with pytest.raises(sqlite3.Error):
+            store.delete_expired(now_ms=2_000, max_age_ms=1_000)
+
+    def test_load_fails_closed_for_corrupt_or_locked_store(self, tmp_path):
+        path = tmp_path / "entry-oi.sqlite3"
+        store = OpenInterestEvidenceStore(path)
+        payload = _targeted_oi_payload("binance", "BTCUSDT", 1_000)
+        assert store.store_observed(
+            venue="binance",
+            symbol="BTCUSDT",
+            payload=payload,
+            now_ms=1_001,
+        )
+
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                UPDATE entry_open_interest_evidence
+                SET payload_json = ?
+                WHERE venue = ? AND canonical_symbol = ?
+                """,
+                ("{", "binance", "BTCUSDT"),
+            )
+        assert (
+            store.load_observed(
+                venue="binance",
+                symbol="BTCUSDT",
+                now_ms=1_010,
+            )
+            is None
+        )
+
+        locker = sqlite3.connect(path, timeout=0.0, isolation_level=None)
+        try:
+            locker.execute("BEGIN EXCLUSIVE")
+            newer = _targeted_oi_payload("binance", "BTCUSDT", 2_000)
+            assert not store.store_observed(
+                venue="binance",
+                symbol="BTCUSDT",
+                payload=newer,
+                now_ms=2_001,
+            )
+        finally:
+            locker.rollback()
+            locker.close()
 
 
 class TestJournal:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from collections import Counter
 from types import SimpleNamespace
@@ -49,6 +50,7 @@ from lightfee.sidecar.publisher import (
     funding_entry_snapshot_path,
 )
 from lightfee.persistence.journal import Journal
+from lightfee.persistence.open_interest_store import OpenInterestEvidenceStore
 from lightfee.persistence.snapshot_store import SnapshotStore
 
 
@@ -284,7 +286,12 @@ def test_entry_consumer_frontier_preserves_v7_and_in_process_frontiers():
 
 
 @pytest.mark.asyncio
-async def test_entry_oi_singleflight_survives_caller_deadline_and_reuses_result():
+async def test_entry_oi_singleflight_survives_caller_deadline_and_reuses_result(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms", lambda: 1_010
+    )
     refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
 
     class SlowClient:
@@ -340,6 +347,191 @@ async def test_entry_oi_singleflight_survives_caller_deadline_and_reuses_result(
     assert payload["open_interest_evidence_status"] == "observed"
     assert payload["open_interest_quote"] == 2_000_000.0
     await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_prewarm_owner_cancellation_cancels_inner_request():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    release = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self):
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls += 1
+            self.started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {}
+
+    client = BlockingClient()
+    refresher._clients["binance"] = client
+    prewarm = asyncio.create_task(
+        refresher.refresh_open_interest(
+            "binance",
+            "BTCUSDT",
+            now_ms=10_000,
+            priority="prewarm_only",
+        )
+    )
+
+    await asyncio.wait_for(client.started.wait(), timeout=0.1)
+    assert list(refresher._inflight) == [("binance", "BTCUSDT")]
+    assert refresher._inflight_started_at_ms == {("binance", "BTCUSDT"): 10_000}
+    assert refresher._prewarm_inflight_keys == {("binance", "BTCUSDT")}
+
+    prewarm.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await prewarm
+    await asyncio.wait_for(client.cancelled.wait(), timeout=0.1)
+
+    assert release.is_set() is False
+    assert client.calls == 1
+    assert refresher._inflight == {}
+    assert refresher._inflight_started_at_ms == {}
+    assert refresher._prewarm_inflight_keys == set()
+    assert refresher.scheduler_metrics(now_ms=10_001)["cancelled_count"] >= 1
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_prewarm_waiter_cancellation_does_not_cancel_shared_request():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    release = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self):
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls += 1
+            self.started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            symbol = symbols[0]
+            return {
+                f"binance:{symbol}": SimpleNamespace(
+                    **_targeted_observed_oi_result(
+                        "binance",
+                        symbol,
+                        10_000,
+                        source="shared_prewarm",
+                    )
+                )
+            }
+
+    client = BlockingClient()
+    refresher._clients["binance"] = client
+    owner = asyncio.create_task(
+        refresher.refresh_open_interest(
+            "binance",
+            "ETHUSDT",
+            now_ms=10_000,
+            priority="prewarm_only",
+        )
+    )
+    await asyncio.wait_for(client.started.wait(), timeout=0.1)
+    waiter = asyncio.create_task(
+        refresher.refresh_open_interest(
+            "binance",
+            "ETHUSDT",
+            now_ms=10_001,
+            priority="prewarm_only",
+        )
+    )
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert client.cancelled.is_set() is False
+    assert refresher._inflight.get(("binance", "ETHUSDT")) is not None
+    assert refresher._prewarm_inflight_keys == {("binance", "ETHUSDT")}
+
+    release.set()
+    result = await owner
+    await asyncio.sleep(0)
+
+    assert client.calls == 1
+    assert result["open_interest_evidence_status"] == "observed"
+    assert result["open_interest_source"] == "shared_prewarm"
+    assert refresher._inflight == {}
+    assert refresher._inflight_started_at_ms == {}
+    assert refresher._prewarm_inflight_keys == set()
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_write_through_uses_completion_clock_for_post_start_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "entry-oi.sqlite3"
+    request_started_ms = 100_000
+    completion_ms = request_started_ms + 250
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms", lambda: completion_ms
+    )
+    payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        completion_ms,
+        source="test_completion_clock",
+    )
+
+    class ObservedClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {f"binance:{symbols[0]}": SimpleNamespace(**payload)}
+
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    refresher._clients["binance"] = ObservedClient()
+
+    result = await refresher.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=request_started_ms,
+        force_refresh=True,
+    )
+    await asyncio.sleep(0)
+    hot_cached = refresher.cached_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=completion_ms,
+    )
+    await refresher.close()
+
+    restarted = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    durable_cached = restarted.cached_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=completion_ms + 1,
+    )
+
+    assert result["open_interest_evidence_status"] == "observed"
+    assert hot_cached is not None
+    assert hot_cached["open_interest_observed_at_ms"] == completion_ms
+    assert durable_cached is not None
+    assert durable_cached["open_interest_observed_at_ms"] == completion_ms
+    await restarted.close()
 
 
 @pytest.mark.asyncio
@@ -6862,11 +7054,1943 @@ async def test_entry_oi_cache_fallback_honors_smaller_runtime_max_age():
     await refresher.close()
 
 
+@pytest.mark.asyncio
+async def test_entry_oi_durable_restart_fallback_after_timeout(tmp_path, monkeypatch):
+    path = tmp_path / "entry-oi.sqlite3"
+    observed_at_ms = 1_000
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms", lambda: 1_010
+    )
+    payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="test_durable_oi",
+    )
+
+    class ObservedClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {f"binance:{symbols[0]}": SimpleNamespace(**payload)}
+
+    first = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    first._clients["binance"] = ObservedClient()
+    assert (
+        await first.refresh_open_interest(
+            "binance",
+            "BTCUSDT",
+            now_ms=1_010,
+            force_refresh=True,
+        )
+    )["open_interest_evidence_status"] == "observed"
+    await asyncio.sleep(0)
+    await first.close()
+
+    class TimeoutClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {
+                f"binance:{symbols[0]}": SimpleNamespace(
+                    open_interest_quote=None,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="request_deadline",
+                )
+            }
+
+    restarted = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    restarted._clients["binance"] = TimeoutClient()
+    recovered = await restarted.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=observed_at_ms + 29 * 60_000,
+        force_refresh=True,
+        max_age_ms=30_000,
+    )
+
+    assert recovered["open_interest_evidence_status"] == "observed"
+    assert recovered["open_interest_source"] == "test_durable_oi"
+    assert recovered["open_interest_observed_at_ms"] == observed_at_ms
+    assert recovered["open_interest_cache_fallback"] is True
+    assert recovered["open_interest_cache_fallback_age_ms"] == 29 * 60_000
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_foreground_restart_uses_valid_disk_before_exchange(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "entry-oi.sqlite3"
+    observed_at_ms = 50_000
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms",
+        lambda: observed_at_ms + 10,
+    )
+    payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="restart_disk_exact",
+    )
+
+    class ObservedClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {f"binance:{symbols[0]}": SimpleNamespace(**payload)}
+
+    first = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    first._clients["binance"] = ObservedClient()
+    await first.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=observed_at_ms + 10,
+        force_refresh=True,
+    )
+    await asyncio.sleep(0)
+    await first.close()
+
+    class ExchangeShouldNotRun:
+        calls = 0
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls += 1
+            raise AssertionError("valid durable OI should satisfy foreground lookup")
+
+    client = ExchangeShouldNotRun()
+    restarted = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    restarted._clients["binance"] = client
+    recovered = await restarted.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=observed_at_ms + 29 * 60_000,
+        max_age_ms=30_000,
+    )
+
+    assert client.calls == 0
+    assert recovered["open_interest_evidence_status"] == "observed"
+    assert recovered["open_interest_source"] == "restart_disk_exact"
+    assert recovered["open_interest_cache_fallback"] is True
+    assert recovered["open_interest_cache_fallback_age_ms"] == 29 * 60_000
+    assert recovered["open_interest_evidence_reason"] == (
+        "entry_oi_durable_cache_fallback"
+    )
+    await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_foreground_force_uses_valid_disk_before_exchange(
+    tmp_path,
+):
+    path = tmp_path / "entry-oi.sqlite3"
+    observed_at_ms = 90_000
+    payload = _targeted_observed_oi_result(
+        "binance",
+        "FORCEDISKUSDT",
+        observed_at_ms,
+        source="force_valid_disk",
+    )
+    store = OpenInterestEvidenceStore(path)
+    assert store.store_observed(
+        venue="binance",
+        symbol="FORCEDISKUSDT",
+        payload=payload,
+        now_ms=observed_at_ms + 1,
+    )
+
+    class ExchangeShouldNotRun:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls.append((symbols[0], bool(force_refresh)))
+            raise AssertionError("force must not bypass valid durable OI")
+
+    client = ExchangeShouldNotRun()
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    refresher._clients["binance"] = client
+    recovered = await refresher.refresh_open_interest(
+        "binance",
+        "FORCEDISKUSDT",
+        now_ms=observed_at_ms + 29 * 60_000,
+        force_refresh=True,
+        max_age_ms=30_000,
+    )
+
+    assert client.calls == []
+    assert recovered["open_interest_evidence_status"] == "observed"
+    assert recovered["open_interest_source"] == "force_valid_disk"
+    assert recovered["open_interest_cache_fallback"] is True
+    assert recovered["open_interest_cache_fallback_age_ms"] == 29 * 60_000
+    assert recovered["open_interest_evidence_reason"] == (
+        "entry_oi_durable_cache_fallback"
+    )
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_invalid_or_stale_disk_falls_through_to_exchange_fail_closed(
+    tmp_path,
+):
+    invalid_path = tmp_path / "entry-oi-invalid.sqlite3"
+    invalid_payload = _targeted_observed_oi_result(
+        "binance",
+        "BADUSDT",
+        20_000,
+        source="invalid_disk",
+    )
+    store = OpenInterestEvidenceStore(invalid_path)
+    assert store.store_observed(
+        venue="binance",
+        symbol="BADUSDT",
+        payload=invalid_payload,
+        now_ms=20_001,
+    )
+    invalid_payload["open_interest_sample_id"] = "forged-sample"
+    with sqlite3.connect(invalid_path) as conn:
+        conn.execute(
+            """
+            UPDATE entry_open_interest_evidence
+            SET payload_json = ?
+            WHERE venue = ? AND canonical_symbol = ?
+            """,
+            (
+                json.dumps(invalid_payload, sort_keys=True, separators=(",", ":")),
+                "binance",
+                "BADUSDT",
+            ),
+        )
+
+    stale_path = tmp_path / "entry-oi-stale.sqlite3"
+    stale_payload = _targeted_observed_oi_result(
+        "binance",
+        "OLDUSDT",
+        30_000,
+        source="stale_disk",
+    )
+    stale_store = OpenInterestEvidenceStore(stale_path)
+    assert stale_store.store_observed(
+        venue="binance",
+        symbol="OLDUSDT",
+        payload=stale_payload,
+        now_ms=30_001,
+    )
+
+    class TimeoutClient:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            symbol = symbols[0]
+            self.calls.append((symbol, bool(force_refresh)))
+            return {
+                f"binance:{symbol}": SimpleNamespace(
+                    open_interest_quote=None,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="exchange_timeout",
+                )
+            }
+
+    invalid_client = TimeoutClient()
+    invalid_refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(invalid_path),
+    )
+    invalid_refresher._clients["binance"] = invalid_client
+    invalid_result = await invalid_refresher.refresh_open_interest(
+        "binance",
+        "BADUSDT",
+        now_ms=20_010,
+    )
+    await invalid_refresher.close()
+
+    stale_client = TimeoutClient()
+    stale_refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(stale_path),
+    )
+    stale_refresher._clients["binance"] = stale_client
+    stale_result = await stale_refresher.refresh_open_interest(
+        "binance",
+        "OLDUSDT",
+        now_ms=30_000 + ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS + 1,
+    )
+    await stale_refresher.close()
+
+    assert invalid_client.calls == [("BADUSDT", False)]
+    assert invalid_result["open_interest_evidence_status"] == "timeout"
+    assert invalid_result["open_interest_evidence_reason"] == "exchange_timeout"
+    assert invalid_result.get("open_interest_cache_fallback") is not True
+    assert stale_client.calls == [("OLDUSDT", False)]
+    assert stale_result["open_interest_evidence_status"] == "timeout"
+    assert stale_result["open_interest_evidence_reason"] == "exchange_timeout"
+    assert stale_result.get("open_interest_cache_fallback") is not True
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_durable_fallback_rejects_beyond_30m(tmp_path, monkeypatch):
+    path = tmp_path / "entry-oi.sqlite3"
+    observed_at_ms = 1_000
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms", lambda: 1_010
+    )
+    payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        observed_at_ms,
+        source="test_durable_oi",
+    )
+
+    class ObservedClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {f"binance:{symbols[0]}": SimpleNamespace(**payload)}
+
+    first = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    first._clients["binance"] = ObservedClient()
+    await first.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=1_010,
+        force_refresh=True,
+    )
+    await asyncio.sleep(0)
+    await first.close()
+
+    class TimeoutClient:
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            return {
+                f"binance:{symbols[0]}": SimpleNamespace(
+                    open_interest_quote=None,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="request_deadline",
+                )
+            }
+
+    restarted = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    restarted._clients["binance"] = TimeoutClient()
+    result = await restarted.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=observed_at_ms + ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS + 1,
+        force_refresh=True,
+        max_age_ms=30_000,
+    )
+
+    assert result["open_interest_evidence_status"] == "timeout"
+    assert result.get("open_interest_cache_fallback") is not True
+    await restarted.close()
+
+
+def test_entry_oi_hot_cache_is_lru_capped_at_256():
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+    )
+    for index in range(257):
+        symbol = f"SYM{index:03d}USDT"
+        assert refresher._remember_observed_open_interest(
+            venue="binance",
+            symbol=symbol,
+            payload=_targeted_observed_oi_result(
+                "binance",
+                symbol,
+                10_000 + index,
+                source=f"lru_{index}",
+            ),
+            now_ms=20_000 + index,
+            persist=False,
+        )
+
+    assert len(refresher._cache) == 256
+    assert ("binance", "SYM000USDT") not in refresher._cache
+
+    assert (
+        refresher.cached_open_interest(
+            "binance",
+            "SYM001USDT",
+            now_ms=20_300,
+        )
+        is not None
+    )
+    assert refresher._remember_observed_open_interest(
+        venue="binance",
+        symbol="SYM999USDT",
+        payload=_targeted_observed_oi_result(
+            "binance",
+            "SYM999USDT",
+            20_999,
+            source="lru_new",
+        ),
+        now_ms=21_000,
+        persist=False,
+    )
+
+    assert len(refresher._cache) == 256
+    assert ("binance", "SYM001USDT") in refresher._cache
+    assert ("binance", "SYM002USDT") not in refresher._cache
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_prewarm_does_not_consume_foreground_capacity():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    refresher._max_inflight = 1
+    refresher._max_prewarm_inflight = 1
+    release = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            symbol = symbols[0]
+            self.calls.append(symbol)
+            if symbol == "PREUSDT":
+                await release.wait()
+            return {
+                f"binance:{symbol}": SimpleNamespace(
+                    **_targeted_observed_oi_result(
+                        "binance",
+                        symbol,
+                        10_000,
+                        source=f"client_{symbol}",
+                    )
+                )
+            }
+
+    client = BlockingClient()
+    refresher._clients["binance"] = client
+    prewarm_task = asyncio.create_task(
+        refresher.refresh_open_interest(
+            "binance",
+            "PREUSDT",
+            now_ms=10_000,
+            priority="prewarm_only",
+        )
+    )
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if refresher._prewarm_inflight_keys:
+            break
+    assert refresher._prewarm_inflight_keys == {("binance", "PREUSDT")}
+
+    foreground = await refresher.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=10_001,
+    )
+
+    assert foreground["open_interest_evidence_status"] == "observed"
+    assert foreground["open_interest_evidence_reason"] == "targeted_refresh"
+    assert foreground["cancelled_count"] >= 1
+    prewarm_result = await prewarm_task
+    assert (
+        prewarm_result["open_interest_evidence_reason"]
+        == "entry_oi_prewarm_cancelled"
+    )
+    release.set()
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_due_prewarm_force_refresh_ignores_hot_and_durable_cache(
+    tmp_path,
+):
+    path = tmp_path / "entry-oi.sqlite3"
+    durable_payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        10_000,
+        source="durable_cache",
+    )
+    store = OpenInterestEvidenceStore(path)
+    assert store.store_observed(
+        venue="binance",
+        symbol="BTCUSDT",
+        payload=durable_payload,
+        now_ms=10_001,
+    )
+    hot_payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        10_100,
+        source="hot_cache",
+    )
+    network_payload = _targeted_observed_oi_result(
+        "binance",
+        "BTCUSDT",
+        10_200,
+        source="prewarm_network",
+    )
+
+    class ObservedClient:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            symbol = symbols[0]
+            self.calls.append((symbol, bool(force_refresh)))
+            return {f"binance:{symbol}": SimpleNamespace(**network_payload)}
+
+    client = ObservedClient()
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(path),
+    )
+    refresher._cache[("binance", "BTCUSDT")] = hot_payload
+    refresher._clients["binance"] = client
+
+    result = await refresher.refresh_open_interest(
+        "binance",
+        "BTCUSDT",
+        now_ms=10_200,
+        priority="prewarm_only",
+        force_refresh=True,
+    )
+
+    assert client.calls == [("BTCUSDT", True)]
+    assert result["open_interest_evidence_status"] == "observed"
+    assert result["open_interest_source"] == "prewarm_network"
+    assert result.get("open_interest_cache_fallback") is not True
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_forced_prewarm_failure_does_not_use_valid_cache(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    symbol = "PREFAILCACHEUSDT"
+    candidate = _freshness_candidate(symbol)
+    snapshot = SidecarSnapshot(
+        published_at_ms=160_000,
+        market_observed_at_ms=160_000,
+        quotes={
+            f"{venue}:{symbol}": _quote_with_liquidity(
+                venue,
+                symbol,
+                volume_24h_quote=10_000_000.0,
+                open_interest=3_000_000.0,
+                observed_at_ms=160_000,
+            )
+            for venue in ("okx", "bybit")
+        },
+        candidates=[candidate],
+    )
+    store_path = tmp_path / "entry-oi.sqlite3"
+    store = OpenInterestEvidenceStore(store_path)
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=str(store_path),
+    )
+
+    class TimeoutClient:
+        def __init__(self, venue: str):
+            self.venue = venue
+            self.calls: list[tuple[str, bool]] = []
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            symbol_key = symbols[0]
+            self.calls.append((symbol_key, bool(force_refresh)))
+            return {
+                f"{self.venue}:{symbol_key}": SimpleNamespace(
+                    open_interest_quote=None,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="forced_prewarm_timeout",
+                )
+            }
+
+    clients = {venue: TimeoutClient(venue) for venue in ("okx", "bybit")}
+    for venue, client in clients.items():
+        payload = _targeted_observed_oi_result(
+            venue,
+            symbol,
+            159_000,
+            source=f"{venue}_valid_cache",
+        )
+        assert store.store_observed(
+            venue=venue,
+            symbol=symbol,
+            payload=payload,
+            now_ms=159_001,
+        )
+        refresher._cache[(venue, symbol)] = dict(payload)
+        refresher._clients[venue] = client
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=160_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+        await refresher.close()
+
+    assert stats["target_count"] == 2
+    assert stats["attempt_count"] == 2
+    assert stats["resolved_count"] == 0
+    assert stats["failed_count"] == 2
+    assert sorted(
+        (venue, call[0], call[1])
+        for venue, client in clients.items()
+        for call in client.calls
+    ) == [
+        ("bybit", symbol, True),
+        ("okx", symbol, True),
+    ]
+    for quote in snapshot.quotes.values():
+        assert quote.open_interest is None
+        assert quote.open_interest_evidence_status == "timeout"
+        assert quote.open_interest_evidence_reason == "forced_prewarm_timeout"
+        assert getattr(quote, "open_interest_cache_fallback", False) is not True
+
+
+@pytest.mark.asyncio
+async def test_entry_oi_prewarm_defers_distinct_same_venue_before_global_slot_use():
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    refresher._max_prewarm_inflight = 2
+    release = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self, venue: str):
+            self.venue = venue
+            self.calls: list[str] = []
+            self.active = 0
+            self.max_active = 0
+            self.started: dict[str, asyncio.Event] = {}
+
+        def event_for(self, symbol: str) -> asyncio.Event:
+            event = self.started.get(symbol)
+            if event is None:
+                event = asyncio.Event()
+                self.started[symbol] = event
+            return event
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            symbol = symbols[0]
+            self.calls.append(symbol)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.event_for(symbol).set()
+            try:
+                if symbol == "BTCUSDT":
+                    await release.wait()
+                return {
+                    f"{self.venue}:{symbol}": SimpleNamespace(
+                        **_targeted_observed_oi_result(
+                            self.venue,
+                            symbol,
+                            10_000,
+                            source=f"prewarm_gate_{symbol}",
+                        )
+                    )
+                }
+            finally:
+                self.active -= 1
+
+    binance = BlockingClient("binance")
+    bybit = BlockingClient("bybit")
+    refresher._clients["binance"] = binance
+    refresher._clients["bybit"] = bybit
+
+    first = asyncio.create_task(
+        refresher.refresh_open_interest(
+            "binance",
+            "BTCUSDT",
+            now_ms=10_000,
+            priority="prewarm_only",
+        )
+    )
+    await asyncio.wait_for(binance.event_for("BTCUSDT").wait(), timeout=0.1)
+    second_same_venue = await asyncio.wait_for(
+        refresher.refresh_open_interest(
+            "binance",
+            "ETHUSDT",
+            now_ms=10_001,
+            priority="prewarm_only",
+        ),
+        timeout=0.1,
+    )
+
+    assert second_same_venue["open_interest_evidence_status"] == "deferred"
+    assert (
+        second_same_venue["open_interest_evidence_reason"]
+        == "entry_oi_prewarm_venue_capacity_reserved"
+    )
+    assert binance.calls == ["BTCUSDT"]
+    assert refresher._prewarm_inflight_keys == {("binance", "BTCUSDT")}
+    assert binance.max_active == 1
+
+    cross_result = await asyncio.wait_for(
+        refresher.refresh_open_interest(
+            "bybit",
+            "SOLUSDT",
+            now_ms=10_002,
+            priority="prewarm_only",
+        ),
+        timeout=0.1,
+    )
+
+    assert cross_result["open_interest_evidence_status"] == "observed"
+    assert bybit.calls == ["SOLUSDT"]
+    assert bybit.max_active == 1
+    assert ("binance", "ETHUSDT") not in refresher._prewarm_inflight_keys
+    assert ("bybit", "SOLUSDT") not in refresher._prewarm_inflight_keys
+
+    foreground_result = await asyncio.wait_for(
+        refresher.refresh_open_interest(
+            "binance",
+            "XRPUSDT",
+            now_ms=10_003,
+        ),
+        timeout=0.1,
+    )
+    first_result = await asyncio.wait_for(first, timeout=0.1)
+
+    assert foreground_result["open_interest_evidence_status"] == "observed"
+    assert foreground_result["cancelled_count"] >= 1
+    assert (
+        first_result["open_interest_evidence_reason"]
+        == "entry_oi_prewarm_cancelled"
+    )
+    assert binance.calls == ["BTCUSDT", "XRPUSDT"]
+    assert binance.max_active == 1
+    release.set()
+    await refresher.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_uses_15m_cadence(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            entry_open_interest_background_refresh_ms=15 * 60_000,
+            entry_open_interest_store_path=str(
+                tmp_path / "entry-oi.sqlite3"
+            ),
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate("CADENCEUSDT")
+    candidate.long_venue = "binance"
+    candidate.short_venue = "binance"
+    snapshot = SidecarSnapshot(
+        published_at_ms=70_000,
+        market_observed_at_ms=70_000,
+        quotes={
+            "binance:CADENCEUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="CADENCEUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=70_000,
+                volume_24h_quote=10_000_000.0,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+                open_interest_evidence_reason="prior_timeout",
+            )
+        },
+        candidates=[candidate],
+    )
+
+    class ObservedClient:
+        def __init__(self):
+            self.calls = 0
+            self.observed_at_ms = 70_000
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls += 1
+            symbol = symbols[0]
+            return {
+                f"binance:{symbol}": SimpleNamespace(
+                    **_targeted_observed_oi_result(
+                        "binance",
+                        symbol,
+                        self.observed_at_ms,
+                        source="prewarm_cadence",
+                    )
+                )
+            }
+
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        prewarm_interval_ms=15 * 60_000,
+    )
+    client = ObservedClient()
+    refresher._clients["binance"] = client
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        first = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70_000,
+            evidence_role="prewarm_only",
+            candidate_scope="prewarm_extra",
+        )
+        snapshot.quotes["binance:CADENCEUSDT"].open_interest = None
+        snapshot.quotes[
+            "binance:CADENCEUSDT"
+        ].open_interest_evidence_status = "timeout"
+        second = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=70_100,
+            evidence_role="prewarm_only",
+            candidate_scope="prewarm_extra",
+        )
+        client.observed_at_ms = 970_001
+        third = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=970_001,
+            evidence_role="prewarm_only",
+            candidate_scope="prewarm_extra",
+        )
+    finally:
+        runtime.journal.close()
+        await refresher.close()
+
+    assert first["resolved_count"] == 1
+    assert second["prewarm_skipped_reason"] == "entry_oi_prewarm_cadence_not_due"
+    assert second["deferred_count"] == 1
+    assert third["resolved_count"] == 1
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_due_prewarm_refreshes_fresh_quote_oi_frontier(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidates = [
+        _freshness_candidate("FORCEFRESHUSDT"),
+        _freshness_candidate("FORCEFRESHUSDT"),
+        _freshness_candidate("FLOORSKIPUSDT"),
+        _freshness_candidate("MISSINGQUOTEUSDT"),
+    ]
+    candidates[2].long_venue = "gate"
+    candidates[2].short_venue = "gate"
+    snapshot = SidecarSnapshot(
+        published_at_ms=150_000,
+        market_observed_at_ms=150_000,
+        quotes={
+            f"{venue}:FORCEFRESHUSDT": _quote_with_liquidity(
+                venue,
+                "FORCEFRESHUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=150_000,
+            )
+            for venue in ("okx", "bybit")
+        }
+        | {
+            "gate:FLOORSKIPUSDT": _quote_with_liquidity(
+                "gate",
+                "FLOORSKIPUSDT",
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=150_000,
+            )
+        },
+        candidates=candidates,
+    )
+
+    class RecordingRefresher:
+        _max_inflight = 64
+        _max_prewarm_inflight = 4
+
+        def __init__(self):
+            self.calls: list[tuple[str, str, bool, str]] = []
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return True
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            return 0
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            return None
+
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+            force_refresh: bool,
+            priority: str,
+            **_kwargs,
+        ):
+            self.calls.append((venue, symbol, force_refresh, priority))
+            return _targeted_observed_oi_result(
+                venue,
+                symbol,
+                now_ms,
+                source="due_prewarm_network",
+            )
+
+    refresher = RecordingRefresher()
+    runtime.entry_open_interest_refresher = refresher
+    runtime._entry_liquidity_open_interest_floor_quote = (
+        lambda venue: 0.0 if venue == "gate" else 1.0
+    )
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            candidates,
+            snapshot=snapshot,
+            now_ms=150_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+
+    assert stats["target_count"] == 2
+    assert stats["attempt_count"] == 2
+    assert stats["resolved_count"] == 2
+    assert sorted(refresher.calls) == [
+        ("bybit", "FORCEFRESHUSDT", True, "prewarm_only"),
+        ("okx", "FORCEFRESHUSDT", True, "prewarm_only"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_uses_full_frontier_when_quote_extras_zero(
+    tmp_path,
+    monkeypatch,
+):
+    now_ms = 70_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=600000,
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            live_scan_recovery_success_count=1,
+            entry_open_interest_store_path=str(tmp_path / "entry-oi.sqlite3"),
+        ),
+        strategy=_entry_flow_strategy_config(
+            local_l2_enabled=False,
+            entry_readiness_provider="ws_bbo_quote_lease",
+            entry_window_secs=600,
+            min_scan_minutes_before_funding=0,
+            min_funding_edge_bps=0,
+            entry_local_l2_primary_count=2,
+            shadow_entry_opportunity_count=1,
+            entry_quote_prewarm_extra_candidate_count=0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: OkxMetadataAdapter(),
+            Venue.BYBIT: BybitMetadataAdapter(),
+        },
+    )
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    runtime.entry_executor = CapturingEntryExecutor()
+    candidates = [_freshness_candidate(f"FULL{i:02d}USDT") for i in range(6)]
+    for index, candidate in enumerate(candidates):
+        candidate.ranking_edge_bps = 100.0 - index
+        candidate.funding_edge_bps = 100.0 - index
+        candidate.funding_diff_bps = 100.0 - index
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            f"{venue}:{candidate.symbol}": _quote_with_liquidity(
+                venue,
+                candidate.symbol,
+                volume_24h_quote=10_000_000.0,
+                open_interest=2_000_000.0,
+                observed_at_ms=now_ms,
+            )
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        },
+        candidates=candidates,
+    )
+    quote_calls: list[dict[str, int | str]] = []
+    oi_calls: list[dict[str, int | str]] = []
+
+    def mark_domain_ready(
+        coordinator: dict | None,
+        *,
+        domain: str,
+        count: int,
+    ) -> None:
+        if coordinator is None:
+            return
+        states = coordinator.setdefault(domain, {})
+        quote_states = coordinator.setdefault("quote", {})
+        oi_states = coordinator.setdefault("open_interest", {})
+        economics_states = coordinator.setdefault("economics", {})
+        for index in range(count):
+            states[index] = "ready"
+            if (
+                quote_states.get(index) == "ready"
+                and oi_states.get(index) == "ready"
+            ):
+                economics_states[index] = "ready"
+                coordinator["selected_index"] = min(
+                    int(coordinator.get("selected_index") or index),
+                    index,
+                )
+                ready_event = coordinator.get("selection_ready_event")
+                if isinstance(ready_event, asyncio.Event):
+                    ready_event.set()
+
+    async def record_quote_revalidate(
+        candidates,
+        *,
+        snapshot,
+        now_ms,
+        candidate_scope="",
+        skipped_untracked_count=0,
+        evidence_role="entry_execution",
+        activation_candidates=None,
+        evidence_coordinator=None,
+    ):
+        quote_calls.append(
+            {
+                "candidate_count": len(candidates),
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
+            }
+        )
+        mark_domain_ready(
+            evidence_coordinator,
+            domain="quote",
+            count=len(candidates),
+        )
+        return {}, runtime.market_data_runtime._entry_quote_truth_empty_stats()
+
+    async def record_oi_revalidate(
+        candidates,
+        *,
+        snapshot,
+        now_ms,
+        evidence_role="entry_execution",
+        candidate_scope="",
+        evidence_coordinator=None,
+    ):
+        oi_calls.append(
+            {
+                "candidate_count": len(candidates),
+                "candidate_scope": candidate_scope,
+                "evidence_role": evidence_role,
+            }
+        )
+        mark_domain_ready(
+            evidence_coordinator,
+            domain="open_interest",
+            count=len(candidates),
+        )
+        return {
+            "candidate_count": len(candidates),
+            "target_count": 0,
+            "resolved_count": len(candidates),
+            "failed_count": 0,
+        }
+
+    _install_v7_snapshot_fixture(monkeypatch, snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(
+        runtime,
+        "_entry_quote_revalidate_for_candidates",
+        record_quote_revalidate,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_refresh_entry_candidate_open_interest_evidence",
+        record_oi_revalidate,
+    )
+
+    runtime.journal.open()
+    try:
+        runtime._running = True
+        await runtime.tick()
+        if runtime._entry_evidence_prewarm_task is not None:
+            await runtime._entry_evidence_prewarm_task
+    finally:
+        runtime._running = False
+        runtime.journal.close()
+
+    quote_prewarm_calls = [
+        call for call in quote_calls if call["evidence_role"] == "prewarm_only"
+    ]
+    oi_prewarm_calls = [
+        call for call in oi_calls if call["evidence_role"] == "prewarm_only"
+    ]
+    assert quote_prewarm_calls == []
+    assert oi_prewarm_calls[-1] == {
+        "candidate_count": 6,
+        "candidate_scope": "l2_tracking_tradeable",
+        "evidence_role": "prewarm_only",
+    }
+    assert runtime.state.last_scan["quote_prewarm_extra_candidate_count"] == 0
+    assert runtime.state.last_scan["oi_prewarm_frontier_candidate_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_cleanup_due_empty_and_not_due_noop(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    snapshot = SidecarSnapshot(
+        published_at_ms=100_000,
+        market_observed_at_ms=100_000,
+        quotes={},
+        candidates=[],
+    )
+
+    class CleanupOnlyRefresher:
+        def __init__(self, *, due: bool):
+            self.due = due
+            self.cleanup_calls: list[tuple[int, int]] = []
+            self.mark_calls: list[int] = []
+            self.refresh_calls: list[tuple[str, str]] = []
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return self.due
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            self.cleanup_calls.append((now_ms, max_age_ms))
+            return 2
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            self.mark_calls.append(now_ms)
+
+        async def refresh_open_interest(self, venue: str, symbol: str, **_kwargs):
+            self.refresh_calls.append((venue, symbol))
+            return None
+
+    due_refresher = CleanupOnlyRefresher(due=True)
+    runtime.entry_open_interest_refresher = due_refresher
+    due_stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+        [],
+        snapshot=snapshot,
+        now_ms=100_000,
+        evidence_role="prewarm_only",
+        candidate_scope="l2_tracking_tradeable",
+    )
+
+    candidate = _freshness_candidate("NOTDUEUSDT")
+    not_due_snapshot = SidecarSnapshot(
+        published_at_ms=100_100,
+        market_observed_at_ms=100_100,
+        quotes={
+            "okx:NOTDUEUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="NOTDUEUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=100_100,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+            "bybit:NOTDUEUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="NOTDUEUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=100_100,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+        },
+        candidates=[candidate],
+    )
+    not_due_refresher = CleanupOnlyRefresher(due=False)
+    runtime.entry_open_interest_refresher = not_due_refresher
+    not_due_stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+        [candidate],
+        snapshot=not_due_snapshot,
+        now_ms=100_100,
+        evidence_role="prewarm_only",
+        candidate_scope="l2_tracking_tradeable",
+    )
+
+    assert due_refresher.cleanup_calls == [
+        (100_000, ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS)
+    ]
+    assert due_refresher.mark_calls == [100_000]
+    assert due_refresher.refresh_calls == []
+    assert due_stats["cleanup_deleted_count"] == 2
+    assert due_stats["target_count"] == 0
+    assert not_due_refresher.cleanup_calls == []
+    assert not_due_refresher.mark_calls == []
+    assert not_due_refresher.refresh_calls == []
+    assert not_due_stats["prewarm_skipped_reason"] == (
+        "entry_oi_prewarm_cadence_not_due"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_cleanup_failure_is_nonblocking(tmp_path):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidate = _freshness_candidate("CLEANFAILUSDT")
+    snapshot = SidecarSnapshot(
+        published_at_ms=120_000,
+        market_observed_at_ms=120_000,
+        quotes={
+            "okx:CLEANFAILUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="CLEANFAILUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=120_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+            "bybit:CLEANFAILUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="CLEANFAILUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=120_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    class FailingCleanupRefresher:
+        _max_inflight = 64
+        _max_prewarm_inflight = 4
+
+        def __init__(self):
+            self.mark_calls: list[int] = []
+            self.refresh_calls: list[tuple[str, str]] = []
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return True
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            raise RuntimeError("cleanup locked")
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            self.mark_calls.append(now_ms)
+
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+            **_kwargs,
+        ):
+            self.refresh_calls.append((venue, symbol))
+            return _targeted_observed_oi_result(
+                venue,
+                symbol,
+                now_ms,
+                source="cleanup_failure_continued",
+            )
+
+    refresher = FailingCleanupRefresher()
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=120_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert stats["cleanup_failed_count"] == 1
+    assert stats["resolved_count"] == 2
+    assert sorted(refresher.refresh_calls) == [
+        ("bybit", "CLEANFAILUSDT"),
+        ("okx", "CLEANFAILUSDT"),
+    ]
+    assert refresher.mark_calls == [120_000]
+    assert "runtime.entry_oi_durable_cleanup_failed" in [
+        record["kind"] for record in records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_real_store_cleanup_failure_reports_and_continues(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidate = _freshness_candidate("REALCLEANFAILUSDT")
+    snapshot = SidecarSnapshot(
+        published_at_ms=125_000,
+        market_observed_at_ms=125_000,
+        quotes={
+            "okx:REALCLEANFAILUSDT": QuoteSnapshot(
+                venue="okx",
+                symbol="REALCLEANFAILUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=125_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+            "bybit:REALCLEANFAILUSDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="REALCLEANFAILUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=125_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+        },
+        candidates=[candidate],
+    )
+
+    class ObservedClient:
+        def __init__(self, venue: str):
+            self.venue = venue
+            self.calls: list[str] = []
+
+        async def fetch_entry_open_interest_evidence(
+            self,
+            symbols,
+            *,
+            force_refresh,
+        ):
+            self.calls.extend(symbols)
+            return {
+                f"{self.venue}:{symbol}": SimpleNamespace(
+                    **_targeted_observed_oi_result(
+                        self.venue,
+                        symbol,
+                        125_000,
+                        source="real_cleanup_failure_continued",
+                    )
+                )
+                for symbol in symbols
+            }
+
+    broken_store_path = tmp_path / "entry-oi-broken.sqlite3"
+    broken_store_path.mkdir()
+    refresher = EntryOpenInterestRefresher(
+        targeted_budget_s=1.0,
+        durable_store_path=broken_store_path,
+    )
+    okx_client = ObservedClient("okx")
+    bybit_client = ObservedClient("bybit")
+    refresher._clients["okx"] = okx_client
+    refresher._clients["bybit"] = bybit_client
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            [candidate],
+            snapshot=snapshot,
+            now_ms=125_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+        await refresher.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    assert stats["cleanup_failed_count"] == 1
+    assert stats["resolved_count"] == 2
+    assert okx_client.calls == ["REALCLEANFAILUSDT"]
+    assert bybit_client.calls == ["REALCLEANFAILUSDT"]
+    cleanup_records = [
+        record
+        for record in records
+        if record["kind"] == "runtime.entry_oi_durable_cleanup_failed"
+    ]
+    assert len(cleanup_records) == 1
+    assert "OperationalError" in cleanup_records[0]["payload"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_drains_slow_frontier_past_cycle_deadline(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+                entry_open_interest_refresh_timeout_ms=80,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidates = [_freshness_candidate(f"SLOWDRAIN{i}USDT") for i in range(3)]
+    snapshot = SidecarSnapshot(
+        published_at_ms=128_000,
+        market_observed_at_ms=128_000,
+        quotes={
+            f"{venue}:{candidate.symbol}": QuoteSnapshot(
+                venue=venue,
+                symbol=candidate.symbol,
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=128_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            )
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        },
+        candidates=candidates,
+    )
+
+    class SlowQueueingRefresher:
+        _max_inflight = 64
+        _max_prewarm_inflight = 1
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+            self.cleanup_calls = 0
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return True
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            self.cleanup_calls += 1
+            return 0
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            return None
+
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+            **_kwargs,
+        ):
+            self.calls.append((venue, symbol))
+            await asyncio.sleep(0.02)
+            return _targeted_observed_oi_result(
+                venue,
+                symbol,
+                now_ms,
+                source="slow_frontier_drain",
+            )
+
+    refresher = SlowQueueingRefresher()
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            candidates,
+            snapshot=snapshot,
+            now_ms=128_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+
+    assert stats["target_count"] == 6
+    assert stats["attempt_count"] == 6
+    assert stats["resolved_count"] == 6
+    assert stats["deferred_count"] == 0
+    assert sorted(refresher.calls) == [
+        ("bybit", "SLOWDRAIN0USDT"),
+        ("bybit", "SLOWDRAIN1USDT"),
+        ("bybit", "SLOWDRAIN2USDT"),
+        ("okx", "SLOWDRAIN0USDT"),
+        ("okx", "SLOWDRAIN1USDT"),
+        ("okx", "SLOWDRAIN2USDT"),
+    ]
+    assert refresher.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_concurrency_limit_does_not_drop_frontier(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidates = [_freshness_candidate(f"QUEUE{i}USDT") for i in range(3)]
+    snapshot = SidecarSnapshot(
+        published_at_ms=130_000,
+        market_observed_at_ms=130_000,
+        quotes={
+            f"{venue}:{candidate.symbol}": QuoteSnapshot(
+                venue=venue,
+                symbol=candidate.symbol,
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=130_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            )
+            for candidate in candidates
+            for venue in ("okx", "bybit")
+        },
+        candidates=candidates,
+    )
+
+    class QueueingRefresher:
+        _max_inflight = 64
+        _max_prewarm_inflight = 2
+
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.calls: list[tuple[str, str]] = []
+            self.cleanup_calls = 0
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return True
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            self.cleanup_calls += 1
+            return 0
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            return None
+
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+            **_kwargs,
+        ):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.calls.append((venue, symbol))
+            await asyncio.sleep(0)
+            self.active -= 1
+            return _targeted_observed_oi_result(
+                venue,
+                symbol,
+                now_ms,
+                source="queued_prewarm",
+            )
+
+    refresher = QueueingRefresher()
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        stats = await runtime._refresh_entry_candidate_open_interest_evidence(
+            candidates,
+            snapshot=snapshot,
+            now_ms=130_000,
+            evidence_role="prewarm_only",
+            candidate_scope="l2_tracking_tradeable",
+        )
+    finally:
+        runtime.journal.close()
+
+    assert stats["target_count"] == 6
+    assert stats["attempt_count"] == 6
+    assert stats["resolved_count"] == 6
+    assert len(refresher.calls) == 6
+    assert refresher.max_active <= 2
+    assert refresher.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_uses_cross_venue_capacity_before_same_venue_waiter(
+    tmp_path,
+):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                max_market_age_ms=600000,
+                max_order_quote_age_ms=600000,
+            ),
+            strategy=StrategyConfig(local_l2_enabled=False),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    candidates = [
+        _freshness_candidate("VENUEGATE0USDT"),
+        _freshness_candidate("VENUEGATE1USDT"),
+        _freshness_candidate("VENUEGATE2USDT"),
+    ]
+    candidates[0].long_venue = "binance"
+    candidates[0].short_venue = "binance"
+    candidates[1].long_venue = "binance"
+    candidates[1].short_venue = "binance"
+    candidates[2].long_venue = "bybit"
+    candidates[2].short_venue = "bybit"
+    snapshot = SidecarSnapshot(
+        published_at_ms=132_000,
+        market_observed_at_ms=132_000,
+        quotes={
+            "binance:VENUEGATE0USDT": QuoteSnapshot(
+                venue="binance",
+                symbol="VENUEGATE0USDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=132_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+            "binance:VENUEGATE1USDT": QuoteSnapshot(
+                venue="binance",
+                symbol="VENUEGATE1USDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=132_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+            "bybit:VENUEGATE2USDT": QuoteSnapshot(
+                venue="bybit",
+                symbol="VENUEGATE2USDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=132_000,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+            ),
+        },
+        candidates=candidates,
+    )
+    release = asyncio.Event()
+
+    class VenueGateRefresher:
+        _max_inflight = 64
+        _max_prewarm_inflight = 2
+
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+            self.active_by_venue: Counter[str] = Counter()
+            self.max_total_active = 0
+            self.max_active_by_venue: Counter[str] = Counter()
+            self.cleanup_calls = 0
+
+        def prewarm_due(self, *, now_ms: int) -> bool:
+            return True
+
+        def delete_expired(self, *, now_ms: int, max_age_ms: int) -> int:
+            self.cleanup_calls += 1
+            return 0
+
+        def mark_prewarm_started(self, *, now_ms: int) -> None:
+            return None
+
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            now_ms: int,
+            **_kwargs,
+        ):
+            self.calls.append((venue, symbol))
+            self.active_by_venue[venue] += 1
+            self.max_active_by_venue[venue] = max(
+                self.max_active_by_venue[venue],
+                self.active_by_venue[venue],
+            )
+            self.max_total_active = max(
+                self.max_total_active,
+                sum(self.active_by_venue.values()),
+            )
+            try:
+                await release.wait()
+                return _targeted_observed_oi_result(
+                    venue,
+                    symbol,
+                    now_ms,
+                    source="cross_venue_prewarm_capacity",
+                )
+            finally:
+                self.active_by_venue[venue] -= 1
+
+    refresher = VenueGateRefresher()
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        refresh_task = asyncio.create_task(
+            runtime._refresh_entry_candidate_open_interest_evidence(
+                candidates,
+                snapshot=snapshot,
+                now_ms=132_000,
+                evidence_role="prewarm_only",
+                candidate_scope="l2_tracking_tradeable",
+            )
+        )
+        for _ in range(50):
+            if (
+                ("binance", "VENUEGATE0USDT") in refresher.calls
+                and ("bybit", "VENUEGATE2USDT") in refresher.calls
+            ):
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert ("binance", "VENUEGATE0USDT") in refresher.calls
+        assert ("bybit", "VENUEGATE2USDT") in refresher.calls
+        assert ("binance", "VENUEGATE1USDT") not in refresher.calls
+        assert refresher.max_total_active == 2
+        assert refresher.max_active_by_venue["binance"] == 1
+        assert refresher.max_active_by_venue["bybit"] == 1
+
+        release.set()
+        stats = await refresh_task
+    finally:
+        runtime.journal.close()
+
+    assert stats["target_count"] == 3
+    assert stats["attempt_count"] == 3
+    assert stats["resolved_count"] == 3
+    assert stats["deferred_count"] == 0
+    assert sorted(refresher.calls) == [
+        ("binance", "VENUEGATE0USDT"),
+        ("binance", "VENUEGATE1USDT"),
+        ("bybit", "VENUEGATE2USDT"),
+    ]
+    assert refresher.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_entry_oi_prewarm_cancellation_drains_target_tasks(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "lightfee.engine.market_data_runtime.wall_clock_now_ms", lambda: 80_000
+    )
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            max_market_age_ms=600000,
+            max_order_quote_age_ms=600000,
+            entry_open_interest_refresh_timeout_ms=1_000,
+            entry_open_interest_store_path=str(
+                tmp_path / "entry-oi.sqlite3"
+            ),
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    candidate = _freshness_candidate("BLOCKUSDT")
+    candidate.long_venue = "binance"
+    candidate.short_venue = "binance"
+    snapshot = SidecarSnapshot(
+        published_at_ms=80_000,
+        market_observed_at_ms=80_000,
+        quotes={
+            "binance:BLOCKUSDT": QuoteSnapshot(
+                venue="binance",
+                symbol="BLOCKUSDT",
+                bid=100.0,
+                ask=101.0,
+                observed_at_ms=80_000,
+                volume_24h_quote=10_000_000.0,
+                open_interest=None,
+                open_interest_evidence_status="timeout",
+                open_interest_evidence_reason="prior_timeout",
+            )
+        },
+        candidates=[candidate],
+    )
+    release = asyncio.Event()
+
+    class BlockingClient:
+        def __init__(self):
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def fetch_entry_open_interest_evidence(self, symbols, *, force_refresh):
+            self.calls += 1
+            self.started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                raise
+            return {}
+
+    refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
+    client = BlockingClient()
+    refresher._clients["binance"] = client
+    runtime.entry_open_interest_refresher = refresher
+
+    runtime.journal.open()
+    try:
+        prewarm_refresh = asyncio.create_task(
+            runtime._refresh_entry_candidate_open_interest_evidence(
+                [candidate],
+                snapshot=snapshot,
+                now_ms=80_000,
+                evidence_role="prewarm_only",
+                candidate_scope="prewarm_extra",
+            )
+        )
+        await asyncio.wait_for(client.started.wait(), timeout=0.1)
+        assert list(refresher._inflight) == [("binance", "BLOCKUSDT")]
+        assert refresher._inflight_started_at_ms == {
+            ("binance", "BLOCKUSDT"): 80_000
+        }
+        assert refresher._prewarm_inflight_keys == {("binance", "BLOCKUSDT")}
+
+        prewarm_refresh.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await prewarm_refresh
+        await asyncio.wait_for(client.cancelled.wait(), timeout=0.1)
+
+        assert release.is_set() is False
+        assert client.calls == 1
+        assert refresher._inflight == {}
+        assert refresher._inflight_started_at_ms == {}
+        assert refresher._prewarm_inflight_keys == set()
+    finally:
+        runtime.journal.close()
+        await refresher.close()
+
+
 def test_runtime_entry_oi_refresher_uses_runtime_control_values():
     config = AppConfig(
         runtime=RuntimeConfig(
             entry_open_interest_refresh_timeout_ms=1_250,
             entry_open_interest_cache_fallback_max_age_ms=60_000,
+            entry_open_interest_store_path="runtime/custom-entry-oi.sqlite3",
+            entry_open_interest_background_refresh_ms=60_000,
         )
     )
     runtime = LiveRuntime(config)
@@ -6874,6 +8998,11 @@ def test_runtime_entry_oi_refresher_uses_runtime_control_values():
     refresher = runtime.market_data_runtime._entry_open_interest_refresher()
 
     assert refresher._targeted_budget_s == pytest.approx(1.25)
+    assert str(refresher._durable_store.path).endswith(
+        "runtime/custom-entry-oi.sqlite3"
+    )
+    assert refresher._cache_max_entries == 256
+    assert refresher._prewarm_interval_ms == 60_000
     assert (
         runtime.market_data_runtime._entry_open_interest_cache_fallback_max_age_ms()
         == 60_000

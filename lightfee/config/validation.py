@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,51 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= "
             f"{ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS}"
+        )
+    entry_oi_store_path = str(
+        getattr(config.runtime, "entry_open_interest_store_path", "")
+        or ""
+    ).strip()
+    if not entry_oi_store_path:
+        issues.append(
+            "runtime.entry_open_interest_store_path must not be empty"
+        )
+    else:
+        try:
+            resolved_entry_oi_store_path = resolve_config_artifact_path(
+                config, entry_oi_store_path
+            )
+        except (TypeError, ValueError, OSError):
+            issues.append(
+                "runtime.entry_open_interest_store_path must resolve to a "
+                "valid artifact path"
+            )
+        else:
+            if (
+                resolved_entry_oi_store_path.exists()
+                and resolved_entry_oi_store_path.is_dir()
+            ):
+                issues.append(
+                    "runtime.entry_open_interest_store_path must not be "
+                    "an existing directory"
+                )
+            elif not _artifact_parent_is_usable_or_creatable(
+                resolved_entry_oi_store_path
+            ):
+                issues.append(
+                    "runtime.entry_open_interest_store_path parent must "
+                    "be a usable directory or creatable"
+                )
+    if not _is_positive_int(
+        getattr(
+            config.runtime,
+            "entry_open_interest_background_refresh_ms",
+            15 * 60_000,
+        )
+    ):
+        issues.append(
+            "runtime.entry_open_interest_background_refresh_ms must be a "
+            "positive integer"
         )
     if config.runtime.live_scan_last_good_max_age_ms <= 0:
         issues.append(
@@ -851,6 +897,19 @@ def _canonical_path(
 ) -> Path:
     """Normalize aliases so two strategy inputs cannot resolve to one file."""
     return resolve_config_artifact_path(config, value)
+
+
+def _artifact_parent_is_usable_or_creatable(path: Path) -> bool:
+    parent = path.parent
+    if parent.exists():
+        return parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+
+    probe = parent
+    while not probe.exists():
+        if probe == probe.parent:
+            return False
+        probe = probe.parent
+    return probe.is_dir() and os.access(probe, os.W_OK | os.X_OK)
 
 
 def _is_finite_ratio(value: object) -> bool:

@@ -86,6 +86,10 @@ class RuntimeConfig:
     sidecar_perp_liquidity_budget_ms: int = 30000
     entry_open_interest_refresh_timeout_ms: int = 750
     entry_open_interest_cache_fallback_max_age_ms: int = 30 * 60 * 1000
+    entry_open_interest_store_path: str = (
+        "runtime/entry-open-interest-evidence-v1.sqlite3"
+    )
+    entry_open_interest_background_refresh_ms: int = 15 * 60 * 1000
     sidecar_funding_timeout_s: float = 30.0
     sidecar_liquidity_timeout_s: float = 10.0
     sidecar_hint_budget_ms: int = 500
