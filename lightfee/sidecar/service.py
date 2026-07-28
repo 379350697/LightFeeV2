@@ -864,13 +864,12 @@ class SidecarService:
             except Exception as e:
                 return (venue_name, None, e, set())
 
-        # The live-entry publication is a bounded completion frontier, not an
-        # all-venue barrier. Slow venue tasks stay alive as singleflight work.
-        # Their completion updates a per-venue cache and wakes the service loop
-        # so a fresh V6 generation is published immediately rather than at the
-        # next multi-second polling interval.
-        # Full/audit publication has its own background path and may use the
-        # much larger configured transport timeout.
+        # Discovery uses the configured per-venue transport timeout.  It must
+        # not impose a second, sub-second all-venue deadline: funding, contract
+        # and ranking inputs are allowed to arrive later than the final entry
+        # quote.  A venue that exhausts its own timeout is represented as local
+        # degradation; the live runtime revalidates only a selected candidate's
+        # two legs immediately before it can submit an order.
         venue_names = self._configured_venue_names()
         inflight = getattr(self, "_entry_venue_fetch_tasks", None)
         if not isinstance(inflight, dict):
@@ -937,7 +936,7 @@ class SidecarService:
                     late_tasks.add(task)
             task_to_venue[task] = venue_name
 
-        entry_deadline_s = min(max(float(timeout_s), 0.0), 0.45)
+        collection_timeout_s = max(float(timeout_s), 0.0)
         missing_tasks = {
             task
             for task, venue_name in task_to_venue.items()
@@ -946,7 +945,7 @@ class SidecarService:
         if missing_tasks:
             done, pending = await asyncio.wait(
                 missing_tasks,
-                timeout=entry_deadline_s,
+                timeout=collection_timeout_s,
                 return_when=asyncio.ALL_COMPLETED,
             )
         else:
@@ -971,7 +970,7 @@ class SidecarService:
                     venue_name,
                     None,
                     TimeoutError(
-                        f"entry venue evidence deadline {entry_deadline_s:.3f}s; "
+                        f"venue collection deadline {collection_timeout_s:.3f}s; "
                         "background fetch inflight"
                     ),
                     set(),

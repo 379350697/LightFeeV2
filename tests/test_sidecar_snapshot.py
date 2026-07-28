@@ -1538,7 +1538,7 @@ class TestPublisher:
         assert "sidecar_diagnostics_contract_invalid" in health.fingerprints
         assert expected_error in health.details["contract_errors"]
 
-    def test_crossed_quote_is_readable_only_with_bound_market_degradation(self):
+    def test_crossed_quote_is_readable_only_with_local_market_degradation(self):
         raw = {
             "schema_version": 4,
             **_v3_snapshot_proof(1_000, input_quote_count=1),
@@ -1580,7 +1580,8 @@ class TestPublisher:
 
         health = analyze_sidecar_snapshot(raw, now_ms=1_000, max_age_ms=10_000)
         assert "sidecar_diagnostics_contract_invalid" not in health.fingerprints
-        assert "sidecar_snapshot_degraded" in health.fingerprints
+        assert "sidecar_snapshot_degraded" not in health.fingerprints
+        assert "quote_venue_count_lt_7" in health.fingerprints
         assert not health.ok
 
 

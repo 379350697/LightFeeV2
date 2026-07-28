@@ -931,11 +931,10 @@ class TestRefreshPublicationSemantics:
         assert snapshot.liquidity_lifecycle[0].source == "sidecar_perp_liquidity"
 
     @pytest.mark.asyncio
-    async def test_slow_venue_does_not_block_live_entry_generation(self, tmp_path):
+    async def test_slow_venue_uses_configured_scan_timeout_not_subsecond_deadline(self, tmp_path):
         from lightfee.config.schema import AppConfig
         from lightfee.sidecar.service import SidecarService
 
-        release_slow = asyncio.Event()
         fetch_counts: dict[str, int] = {}
 
         class Source:
@@ -946,7 +945,7 @@ class TestRefreshPublicationSemantics:
             async def fetch_all(self, symbols):
                 fetch_counts[self.venue] = fetch_counts.get(self.venue, 0) + 1
                 if self.wait:
-                    await release_slow.wait()
+                    await asyncio.sleep(0.55)
                 now_ms = int(time.time() * 1_000)
                 return {
                     f"{self.venue}:BTCUSDT": _strict_liquidity_quote(
@@ -966,7 +965,7 @@ class TestRefreshPublicationSemantics:
                 symbols=["BTCUSDT"],
                 runtime=RuntimeConfig(
                     sidecar_snapshot_path=str(snapshot_path),
-                    sidecar_funding_timeout_s=5.0,
+                    sidecar_funding_timeout_s=0.8,
                 ),
                 venues=[
                     VenueConfig(venue="binance"),
@@ -986,22 +985,11 @@ class TestRefreshPublicationSemantics:
         first = await service.refresh_once()
         elapsed = time.monotonic() - started
 
-        assert elapsed < 0.55
-        assert {"binance:BTCUSDT", "okx:BTCUSDT"} <= set(first.quotes)
-        assert "bybit" in first.degraded_venues
+        assert elapsed >= 0.5
+        assert elapsed < 0.8
+        assert {"binance:BTCUSDT", "okx:BTCUSDT", "bybit:BTCUSDT"} <= set(first.quotes)
+        assert "bybit" not in first.degraded_venues
         assert snapshot_path.exists()
-
-        release_slow.set()
-        await asyncio.wait_for(
-            service.entry_venue_republish_event.wait(),
-            timeout=0.5,
-        )
-        republish_started = time.monotonic()
-        second = await service.refresh_entry_from_latest_cache()
-        republish_elapsed = time.monotonic() - republish_started
-        assert republish_elapsed < 0.5
-        assert "bybit:BTCUSDT" in second.quotes
-        assert "bybit" not in second.degraded_venues
         assert fetch_counts == {"binance": 1, "okx": 1, "bybit": 1}
         await service.close()
 

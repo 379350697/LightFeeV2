@@ -416,7 +416,7 @@ def test_snapshot_unavailable_mode_is_never_production_green():
     assert "sidecar_snapshot_unavailable" in report.fingerprints
 
 
-def test_snapshot_declared_degradation_cannot_be_production_green():
+def test_snapshot_declared_venue_degradation_is_candidate_local():
     snapshot = _fresh_seven_venue_snapshot()
     snapshot["quotes"]["aster:BTCUSDT"]["bid"] = 65_002.0
     snapshot["degraded_venues"] = ["aster"]
@@ -438,8 +438,43 @@ def test_snapshot_declared_degradation_cannot_be_production_green():
     )
 
     assert report.details["contract_errors"] == []
-    assert not report.ok
-    assert "sidecar_snapshot_degraded" in report.fingerprints
+    assert report.ok
+    assert "sidecar_snapshot_degraded" not in report.fingerprints
+
+
+def test_snapshot_missing_declared_degraded_venue_is_not_global_failure():
+    snapshot = _fresh_seven_venue_snapshot()
+    snapshot["quotes"].pop("aster:BTCUSDT")
+    snapshot["candidate_build_diagnostics"]["input_quote_count"] = 6
+    snapshot["degraded_venues"] = ["aster"]
+    snapshot["degraded_symbols"] = {"aster": ["BTCUSDT"]}
+    snapshot["acquisition_mode"] = "last_good_sidecar"
+    snapshot["candidate_build_diagnostics"].update(
+        {
+            "directional_pair_count": 2,
+            "output_candidate_count": 1,
+            "rejection_counts": {"invalid_trade_quote": 1},
+        }
+    )
+    _add_complete_contract_proof(snapshot["quotes"]["binance:BTCUSDT"])
+    _add_complete_contract_proof(snapshot["quotes"]["okx:BTCUSDT"])
+    snapshot["candidates"] = [_complete_unblocked_candidate()]
+    for lifecycle_name in ("funding_lifecycle", "market_lifecycle", "liquidity_lifecycle"):
+        lifecycle = next(row for row in snapshot[lifecycle_name] if row["venue"] == "aster")
+        lifecycle["coverage_usable"] = 0
+        lifecycle["degraded_reason"] = "BTCUSDT: GET /ticker/bookTicker timeout"
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.ok
+    assert report.details["missing_venues"] == ["aster"]
+    assert report.details["unattributed_missing_venues"] == []
+    assert report.details["unblocked_candidate_count"] == 1
+    assert "quote_venue_count_lt_7" not in report.fingerprints
 
 
 def test_snapshot_scoped_symbol_degradation_keeps_healthy_candidates_green():

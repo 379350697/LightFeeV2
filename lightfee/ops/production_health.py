@@ -340,7 +340,14 @@ def analyze_sidecar_snapshot(
         or published_at_ms > now_ms
     ):
         fingerprints.append("sidecar_snapshot_watermark_invalid")
-    if missing:
+    raw_degraded_venues = snapshot.get("degraded_venues", [])
+    degraded_venue_set = {
+        str(venue).strip().lower()
+        for venue in (raw_degraded_venues if isinstance(raw_degraded_venues, list) else [])
+        if isinstance(venue, str) and venue.strip()
+    }
+    unattributed_missing_venues = sorted(set(missing) - degraded_venue_set)
+    if unattributed_missing_venues:
         fingerprints.append("quote_venue_count_lt_7")
     if unexpected:
         fingerprints.append("quote_venue_set_unexpected")
@@ -381,21 +388,24 @@ def analyze_sidecar_snapshot(
         # zero-candidate symptom.
         fingerprints.append("funding_interval_evidence_incomplete")
     acquisition_mode = str(snapshot.get("acquisition_mode", "") or "")
-    has_degraded_venues = isinstance(degraded_venues, list) and bool(
-        degraded_venues
-    )
     has_degraded_domains = isinstance(degraded_domains, list) and bool(
         degraded_domains
     )
-    symbol_degradation_has_no_usable_candidate = bool(
-        degraded_symbol_keys and unblocked_candidate_count <= 0
-    )
+    # Venue/symbol degradation and last-good data are discovery-time facts.
+    # They are intentionally not a global entry gate: affected candidates are
+    # skipped, while every selected pair must still pass its own fresh two-leg
+    # quote/OI/private-truth revalidation before an order can exist.  A missing
+    # venue remains critical only when the snapshot did not attribute it to a
+    # local venue failure.  Domains remain global because they have no
+    # candidate/venue ownership in this snapshot contract.
     has_global_degradation = bool(
-        has_degraded_venues
-        or has_degraded_domains
-        or acquisition_mode in {"last_good_sidecar", "unavailable"}
-        or (acquisition_mode == "degraded_sidecar" and not degraded_symbol_keys)
-        or symbol_degradation_has_no_usable_candidate
+        has_degraded_domains
+        or acquisition_mode == "unavailable"
+        or (
+            acquisition_mode == "degraded_sidecar"
+            and not degraded_venue_set
+            and not degraded_symbol_keys
+        )
     )
     if has_global_degradation:
         fingerprints.append("sidecar_snapshot_degraded")
@@ -427,6 +437,7 @@ def analyze_sidecar_snapshot(
             "age_ms": age_ms,
             "quote_venues": sorted(venues),
             "missing_venues": missing,
+            "unattributed_missing_venues": unattributed_missing_venues,
             "unexpected_venues": unexpected,
             "requested_venues": sorted(requested_venue_set),
             "fixture_quote_count": fixture_quotes,
