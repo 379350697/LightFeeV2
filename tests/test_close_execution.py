@@ -778,6 +778,54 @@ def test_terminal_flat_accounting_gap_is_retained_as_accounting_only_backfill():
     assert reconciliation["close_reconciliation_state"] == "terminal_flat_accounting_gap"
 
 
+@pytest.mark.asyncio
+async def test_terminal_flat_accounting_gap_archives_expired_candidates_after_fresh_full_truth():
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth())
+    ctx.state.tick_count = 2
+    reconciliation = _pending_close_missing_order_identity_record()
+    reconciliation.update({
+        "pending_backfill": True,
+        "evidence_gap": True,
+        "closed_at_ms": 1_000,
+        "missing_leg": "long",
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+        "long_legs": [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "late-statement-order",
+            "client_order_id": "late-statement-client",
+            "statement_probe_candidate": True,
+        }],
+    })
+    ctx.state.pending_close_reconciliations.append(reconciliation)
+    runtime = CloseRuntime(ctx=ctx)
+    now_ms = 1_000 + runtime._TERMINAL_FLAT_ACCOUNTING_BACKFILL_RETENTION_MS
+
+    await runtime._process_pending_close_reconciliations(now_ms=now_ms)
+
+    assert ctx.state.pending_close_reconciliations == []
+    archived = [
+        record["payload"]
+        for record in ctx.journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["archive_reason"] == (
+        "terminal_flat_accounting_retention_elapsed"
+    )
+    assert archived[0]["retention_until_ms"] == now_ms
+    assert archived[0]["unresolved_statement_probe_candidates"] == [
+        {
+            "leg": "long",
+            "venue": Venue.BINANCE.value,
+            "order_id": "late-statement-order",
+            "client_order_id": "late-statement-client",
+            "source": "",
+            "quantity_hint": 0.0,
+            "submitted_at_ms": 0,
+        }
+    ]
+
+
 class _PendingCloseArchiveJournal:
     def __init__(self):
         self.records = []
@@ -840,6 +888,7 @@ def _pending_close_archive_account_truth(
             {
                 "venue": venue,
                 "symbol": "*",
+                "endpoint": "fetch_all_positions",
                 "classification": "position_probe_unfiltered_succeeded",
                 "finished_at_ms": 3000,
             }
@@ -849,6 +898,7 @@ def _pending_close_archive_account_truth(
             {
                 "venue": venue,
                 "symbol": "*",
+                "endpoint": "fetch_open_orders",
                 "classification": "open_order_probe_unfiltered_succeeded",
                 "finished_at_ms": 3000,
             }

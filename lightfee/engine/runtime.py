@@ -472,6 +472,7 @@ class LiveRuntime:
     _ENTRY_BALANCE_SNAPSHOT_TTL_MS_DEFAULT = 10_000
     _RISK_SNAPSHOT_TTL_MS_ASTER = 30_000  # Aster lacks WS, avoid REST polling
     _UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS = 60_000
+    _UNSUPPORTED_SYMBOL_DIAGNOSTIC_SAMPLE_LIMIT = 20
     _SYMBOL_ADMISSION_BLOCK_TTL_MS = 6 * 60 * 60 * 1000
     _SNAPSHOT_FRESHNESS_DECISION_LOG_INTERVAL_MS = 60_000
     _ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS = 60_000
@@ -2859,7 +2860,15 @@ class LiveRuntime:
             return
         self._unsupported_symbol_diagnostic_seen_keys.add(diagnostic_key)
         self._unsupported_symbol_diagnostic_last_ms[diagnostic_key] = now_ms
+        sample_limit = self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_SAMPLE_LIMIT
         sample_mappings = mapping_samples[:10]
+        requested_symbol_sample = requested_symbols[:sample_limit]
+        unsupported_symbol_sample = unsupported_symbols[:sample_limit]
+        unsupported_by_venue_sample = {
+            venue: symbols[:sample_limit]
+            for venue, symbols in unsupported_by_venue.items()
+        }
+        diagnostic_key_sample = list(diagnostic_key[: sample_limit + 1])
         self.journal.append(
             "recovery.live_position_probe_unsupported_symbols",
             {
@@ -2874,10 +2883,18 @@ class LiveRuntime:
                     first.get("sample_supported_symbols") or []
                 ),
                 "symbol_count": len(requested_symbols),
-                "requested_symbols": requested_symbols,
-                "skipped_by_catalog": unsupported_symbols,
+                "requested_symbols": requested_symbol_sample,
+                "requested_symbols_truncated": len(requested_symbols) > sample_limit,
+                "skipped_by_catalog": unsupported_symbol_sample,
                 "unsupported_count": len(unsupported_symbols),
-                "unsupported_by_venue": unsupported_by_venue,
+                "skipped_by_catalog_truncated": (
+                    len(unsupported_symbols) > sample_limit
+                ),
+                "unsupported_by_venue": unsupported_by_venue_sample,
+                "unsupported_by_venue_counts": {
+                    venue: len(symbols)
+                    for venue, symbols in unsupported_by_venue.items()
+                },
                 "sample_symbols": [
                     item["symbol"] for item in sample_mappings
                 ],
@@ -2896,7 +2913,10 @@ class LiveRuntime:
                     for item in sample_mappings
                 ],
                 "symbol_mapping_samples_by_venue": sample_mappings,
-                "diagnostic_key": list(diagnostic_key),
+                "diagnostic_key": diagnostic_key_sample,
+                "diagnostic_key_truncated": len(diagnostic_key) > len(
+                    diagnostic_key_sample
+                ),
                 "diagnostic_rate_limit_ms": self._UNSUPPORTED_SYMBOL_DIAGNOSTIC_RATE_LIMIT_MS,
                 "reason": "unsupported_symbol",
             },

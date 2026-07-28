@@ -1538,6 +1538,70 @@ class TestRuntimePreflight:
             assert unsupported[0]["payload"]["unsupported_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_live_position_fallback_probe_bounds_large_catalog_diagnostics(self):
+        """Large historical scopes stay observable without inflating the journal."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class SupportedOnlyAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BITGET)
+
+                def supported_symbols(self) -> list[str]:
+                    return ["BTCUSDT"]
+
+                async def fetch_all_positions(self):
+                    return None
+
+                async def fetch_position(self, symbol: str) -> PositionSnapshot:
+                    return PositionSnapshot(
+                        venue=Venue.BITGET,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.0,
+                        entry_price=0.0,
+                        observed_at_ms=1700000010000,
+                    )
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BITGET: SupportedOnlyAdapter()},
+            )
+            unsupported_symbols = [f"OLD{index}USDT" for index in range(25)]
+            runtime.journal.open()
+            try:
+                await runtime._fetch_startup_live_position_snapshots(
+                    ["BTCUSDT", *unsupported_symbols]
+                )
+            finally:
+                runtime.journal.close()
+
+            records = [
+                json.loads(line)
+                for line in Path(config.persistence.event_log_path).read_text().splitlines()
+                if line.strip()
+            ]
+            payload = next(
+                record["payload"]
+                for record in records
+                if record["kind"]
+                == "recovery.live_position_probe_unsupported_symbols"
+            )
+            assert payload["unsupported_count"] == len(unsupported_symbols)
+            assert payload["symbol_count"] == len(unsupported_symbols) + 1
+            assert len(payload["skipped_by_catalog"]) == (
+                runtime._UNSUPPORTED_SYMBOL_DIAGNOSTIC_SAMPLE_LIMIT
+            )
+            assert payload["skipped_by_catalog_truncated"] is True
+            assert len(payload["requested_symbols"]) == (
+                runtime._UNSUPPORTED_SYMBOL_DIAGNOSTIC_SAMPLE_LIMIT
+            )
+            assert payload["requested_symbols_truncated"] is True
+            assert payload["unsupported_by_venue_counts"] == {
+                Venue.BITGET.value: len(unsupported_symbols)
+            }
+
+    @pytest.mark.asyncio
     async def test_live_position_fallback_probe_dedupes_unsupported_symbols_across_venues(self):
         """Catalog diagnostics are symbol-scope, not one blocker per venue fanout."""
         with tempfile.TemporaryDirectory() as td:

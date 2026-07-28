@@ -277,6 +277,10 @@ class CloseRuntime:
     _RECONCILE_RETRY_BASE_MS = 30_000
     _RECONCILE_RETRY_MAX_MS = 300_000
     _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
+    # Terminal-flat statement gaps are non-blocking accounting work. Keep the
+    # original retry window for late exchange statements, then retain durable
+    # evidence in the journal and remove it from the hot reconciliation loop.
+    _TERMINAL_FLAT_ACCOUNTING_BACKFILL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
     _FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S = 15.0
     # Limit one private-statement I/O pass, never the durable accounting task
     # ledger. Unselected due tasks remain queued for the next tick.
@@ -1652,7 +1656,39 @@ class CloseRuntime:
                 ),
                 emit_event=reconciliation.get("accounting_only_backfill") is not True,
             )
-            return False
+            closed_at_ms = (
+                self._close_reconciliation_int(reconciliation.get("closed_at_ms"))
+                or 0
+            )
+            retention_until_ms = (
+                closed_at_ms + self._TERMINAL_FLAT_ACCOUNTING_BACKFILL_RETENTION_MS
+            )
+            if closed_at_ms <= 0 or now_ms < retention_until_ms:
+                return False
+            return self._archive_pending_close_reconciliation_with_payload(
+                reconciliation,
+                {
+                    "position_id": reconciliation.get("position_id", ""),
+                    "symbol": symbol,
+                    "candidate_owner_id": reconciliation.get(
+                        "candidate_owner_id",
+                        reconciliation.get("position_id", ""),
+                    ),
+                    "missing_leg": missing_leg,
+                    "evidence_gap_reason": evidence_gap_reason,
+                    "next_attempt_ms": reconciliation.get("next_attempt_ms", 0),
+                    "source": reconciliation.get(
+                        "source", "pending_close_reconciliation"
+                    ),
+                    "accounting_only_backfill": True,
+                    "blocking_trading": False,
+                    "archive_reason": "terminal_flat_accounting_retention_elapsed",
+                    "retention_until_ms": retention_until_ms,
+                    "unresolved_statement_probe_candidates": candidates,
+                },
+                now_ms=now_ms,
+                state=state,
+            )
         archive_exchange_truth, truth_hash = (
             self._close_reconciliation_archive_exchange_truth(now_ms=now_ms)
         )

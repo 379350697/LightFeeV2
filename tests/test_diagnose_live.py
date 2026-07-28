@@ -943,6 +943,43 @@ def test_run_diagnose_uses_unfiltered_account_truth_for_unrelated_event_symbol(
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_defaults_to_full_configured_account_truth(monkeypatch):
+    import shutil
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_positions": [],
+            "pending_entries": [],
+            "pending_closes": [],
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+        calls = []
+
+        def exchange_truth(runtime_dir, symbols, venues=None):
+            calls.append((list(symbols), list(venues or [])))
+            return _flat_exchange_truth(runtime_dir, symbols, venues)
+
+        monkeypatch.setattr(dl, "_build_exchange_truth", exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        assert calls == [([], dl.DEFAULT_EXCHANGE_TRUTH_VENUES)]
+        assert result["exchange_truth"]["required_venues"] == (
+            dl.DEFAULT_EXCHANGE_TRUTH_VENUES
+        )
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_reports_hyperliquid_strict_readonly_authorization_summary(monkeypatch):
     import shutil
     import scripts.diagnose_live as dl
@@ -1038,7 +1075,7 @@ def test_run_diagnose_keeps_hyperliquid_identity_with_other_active_positions(mon
 
         def exchange_truth(runtime_dir, symbols, venues=None):
             captured["venues"] = venues
-            assert venues == ["binance", "okx", "hyperliquid"]
+            assert venues == dl.DEFAULT_EXCHANGE_TRUTH_VENUES
             return {
                 "available": True,
                 "available_venues": ["binance", "okx", "hyperliquid"],
@@ -1092,7 +1129,7 @@ def test_run_diagnose_keeps_hyperliquid_identity_with_other_active_positions(mon
             now_ms=1782628000000,
         )
 
-        assert captured["venues"] == ["binance", "okx", "hyperliquid"]
+        assert captured["venues"] == dl.DEFAULT_EXCHANGE_TRUTH_VENUES
         summary = result["hyperliquid_trading_authorization"]
         assert summary["wallet_mode"] == "api_wallet"
         assert summary["account_state_readable"] is True
@@ -8071,7 +8108,7 @@ def test_exchange_truth_classifies_okx_instrument_missing_metadata_as_flat():
     assert evidence["PRLUSDT"]["venue_symbol"] == "PRL-USDT-SWAP"
 
 
-def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):
+def test_run_diagnose_uses_full_configured_account_truth_for_xcnusdt_position(monkeypatch):
     from scripts import diagnose_live as dl
 
     d = _make_tmpdir()
@@ -8122,13 +8159,13 @@ def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkey
         run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
 
         assert seen["symbols"] == []
-        assert seen["venues"] == ["bybit", "aster"]
+        assert seen["venues"] == dl.DEFAULT_EXCHANGE_TRUTH_VENUES
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_run_diagnose_probes_recent_traded_scope_when_current_state_is_flat(monkeypatch):
+def test_run_diagnose_uses_full_configured_account_truth_when_current_state_is_flat(monkeypatch):
     from scripts import diagnose_live as dl
 
     d = _make_tmpdir()
@@ -8179,7 +8216,7 @@ def test_run_diagnose_probes_recent_traded_scope_when_current_state_is_flat(monk
         run_diagnose(runtime_dir=d, unit_dir="/nonexistent", now_ms=1700000005000)
 
         assert seen["symbols"] == []
-        assert seen["venues"] == ["aster", "bybit", "hyperliquid"]
+        assert seen["venues"] == dl.DEFAULT_EXCHANGE_TRUTH_VENUES
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
@@ -8374,16 +8411,7 @@ def test_run_diagnose_reports_passive_close_terminal_summary(monkeypatch):
             },
         ])
 
-        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
-            "available": True,
-            "confidence": "high",
-            "positions": {},
-            "open_orders": {},
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "errors": [],
-            "missing_evidence": [],
-        })
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
 
         result = dl.run_diagnose(
             runtime_dir=d,
@@ -8774,16 +8802,7 @@ def test_run_diagnose_reports_passive_zero_fill_recovered_short_window(monkeypat
             },
         ])
 
-        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
-            "available": True,
-            "confidence": "high",
-            "positions": {},
-            "open_orders": {},
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "errors": [],
-            "missing_evidence": [],
-        })
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
 
         result = dl.run_diagnose(
             runtime_dir=d,
@@ -8874,16 +8893,7 @@ def test_run_diagnose_reports_zero_fill_lifecycle_guard_entry_outcome(monkeypatc
             },
         ])
 
-        monkeypatch.setattr(dl, "_build_exchange_truth", lambda *args, **kwargs: {
-            "available": True,
-            "confidence": "high",
-            "positions": {},
-            "open_orders": {},
-            "has_nonzero_position": False,
-            "has_open_order": False,
-            "errors": [],
-            "missing_evidence": [],
-        })
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
 
         result = dl.run_diagnose(
             runtime_dir=d,
@@ -14559,8 +14569,15 @@ def test_since_deploy_required_venues_missing_blocks_gate(monkeypatch):
         )
 
         exchange_truth = result["exchange_truth"]
-        assert exchange_truth["required_venues"] == ["binance", "bitget"]
-        assert exchange_truth["missing_required_venues"] == ["bitget"]
+        assert exchange_truth["required_venues"] == dl.DEFAULT_EXCHANGE_TRUTH_VENUES
+        assert exchange_truth["missing_required_venues"] == [
+            "bybit",
+            "aster",
+            "okx",
+            "bitget",
+            "gate",
+            "hyperliquid",
+        ]
         assert "exchange_truth_required_venue_missing_bitget" in (
             exchange_truth["missing_evidence"]
         )

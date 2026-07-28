@@ -971,13 +971,12 @@ def _exchange_truth_venues_for_diagnose(
 ) -> list[str] | None:
     if explicit_venues is not None:
         return explicit_venues
-    selected = list(position_venues)
-    if (
-        local_state.get("hyperliquid_trading_disabled_reason")
-        and Venue.HYPERLIQUID.value not in selected
-    ):
-        selected.append(Venue.HYPERLIQUID.value)
-    return selected if selected else None
+    # Production diagnosis is an account-level safety assertion, not an
+    # optimisation of the current local/event scope. An empty local state (or
+    # a quiet deployment window) must still prove every configured account is
+    # flat and free of orders. V1's recovery truth is likewise unfiltered.
+    del position_venues, local_state
+    return list(DEFAULT_EXCHANGE_TRUTH_VENUES)
 
 
 _EXCHANGE_TRUTH_SCOPE_EVENT_KINDS = frozenset({
@@ -4474,6 +4473,9 @@ def _payload_symbol_set(payload: dict[str, Any]) -> set[str]:
 
 
 def _okx_instrument_missing_skipped_count(payload: dict[str, Any]) -> int:
+    explicit_count = payload.get("unsupported_count")
+    if isinstance(explicit_count, (int, float)) and int(explicit_count) > 0:
+        return int(explicit_count)
     skipped = payload.get("skipped_by_catalog", []) or []
     if isinstance(skipped, list) and skipped:
         return len(skipped)
@@ -10029,7 +10031,9 @@ def run_diagnose(
         position_venues=pos_venues,
         local_state=local_state,
     )
-    required_truth_venues = list(venues) if venues is not None else list(event_venues)
+    required_truth_venues = list(
+        exchange_truth_venues or DEFAULT_EXCHANGE_TRUTH_VENUES
+    )
     exchange_truth = _build_exchange_truth(
         runtime_dir,
         [],

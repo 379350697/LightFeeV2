@@ -743,6 +743,9 @@ def _okx_catalog_symbols(payload: dict[str, Any]) -> set[str]:
 
 
 def _okx_instrument_missing_skipped_count(payload: dict[str, Any]) -> int:
+    explicit_count = payload.get("unsupported_count")
+    if isinstance(explicit_count, (int, float)) and int(explicit_count) > 0:
+        return int(explicit_count)
     skipped = payload.get("skipped_by_catalog", []) or []
     if isinstance(skipped, list) and skipped:
         return len(skipped)
