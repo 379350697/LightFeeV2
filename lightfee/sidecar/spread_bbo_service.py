@@ -12,7 +12,6 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.domain import Venue
 from lightfee.marketdata.ws_bbo import (
     HyperliquidMultiplexBboWsClient,
-    RestTopBookQuoteRefresher,
     TopBookQuote,
     VenueBboCache,
 )
@@ -37,7 +36,7 @@ class HyperliquidSpreadBboSource:
         self,
         *,
         max_age_ms: int,
-        rest_fallback: RestTopBookQuoteRefresher | None = None,
+        rest_fallback: ExchangeSource | None = None,
     ) -> None:
         self.max_age_ms = max(int(max_age_ms or 0), 1)
         self.refresh_age_ms = max(self.max_age_ms // 2, 1)
@@ -45,10 +44,15 @@ class HyperliquidSpreadBboSource:
         self._clients: dict[str, HyperliquidMultiplexBboWsClient] = {}
         self._multiplex_client: HyperliquidMultiplexBboWsClient | None = None
         self._spec = get_spec(Venue.HYPERLIQUID)
-        self._rest_fallback = rest_fallback or RestTopBookQuoteRefresher(
-            timeout_ms=min(self.max_age_ms, 750),
-            venue_async_concurrency=RestTopBookQuoteRefresher.GLOBAL_ASYNC_CONCURRENCY,
-            min_attempt_interval_ms=max(min(self.max_age_ms // 4, 250), 50),
+        # A WS gap must not fan out into one /info request per symbol.  The
+        # venue-wide ``metaAndAssetCtxs`` request covers the complete frozen
+        # research universe in one response; pace it independently of the
+        # funding sidecar and retain WS as the primary source.
+        self._rest_fallback = rest_fallback or ExchangeSource(
+            get_spec(Venue.HYPERLIQUID),
+            rate_limiter=EndpointRateLimiter(1000, 8000, 1000),
+            http_max_connections=8,
+            consume_global_rate_limit_budget=False,
         )
 
     async def start(self, symbols: list[str]) -> None:
@@ -98,15 +102,12 @@ class HyperliquidSpreadBboSource:
             if now_ms - received_at_ms >= self.refresh_age_ms and symbol in self._clients:
                 fallback_symbols.append(symbol)
         if fallback_symbols:
-            results = await asyncio.gather(
-                *(
-                    self._rest_fallback.arefresh_quote_result(self.venue, symbol, now_ms=now_ms)
-                    for symbol in fallback_symbols
-                )
+            raw_fallback = await self._rest_fallback.fetch_spread_bbo(
+                fallback_symbols
             )
             received_now_ms = int(time.time() * 1000)
-            for symbol, result in zip(fallback_symbols, results, strict=True):
-                quote = result.quote
+            for symbol in fallback_symbols:
+                quote = raw_fallback.get(f"{self.venue}:{symbol}")
                 received_at_ms = int(getattr(quote, "received_at_ms", 0) or 0)
                 if (
                     quote is None
@@ -129,7 +130,7 @@ class HyperliquidSpreadBboSource:
     async def close(self) -> None:
         clients = list({id(client): client for client in self._clients.values()}.values())
         results = await asyncio.gather(
-            self._rest_fallback.aclose(),
+            self._rest_fallback.close(),
             *(client.stop() for client in clients),
             return_exceptions=True,
         )

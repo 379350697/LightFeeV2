@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -177,6 +178,48 @@ def test_dedicated_bbo_plane_rejects_zero_size_as_non_executable(tmp_path) -> No
     )
     assert plane._build_snapshot() is None
     assert plane._degraded_symbols == {"okx": {"BTCUSDT"}}
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_ws_gap_uses_one_bulk_rest_fallback_for_all_symbols() -> None:
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+    from lightfee.sidecar.spread_bbo_service import HyperliquidSpreadBboSource
+
+    class FakeBulkFallback:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        async def fetch_spread_bbo(
+            self, symbols: list[str]
+        ) -> dict[str, TopBookQuote]:
+            self.calls.append(symbols)
+            now_ms = int(time.time() * 1_000)
+            return {
+                f"hyperliquid:{symbol}": TopBookQuote(
+                    venue="hyperliquid",
+                    symbol=symbol,
+                    bid=100.0,
+                    ask=100.1,
+                    bid_size=1.0,
+                    ask_size=1.0,
+                    observed_at_ms=now_ms,
+                    received_at_ms=now_ms,
+                    source="sidecar_bulk_impact_quote_rest",
+                )
+                for symbol in symbols
+            }
+
+        async def close(self) -> None:
+            return None
+
+    fallback = FakeBulkFallback()
+    source = HyperliquidSpreadBboSource(max_age_ms=1_000, rest_fallback=fallback)
+    source._clients = {"BTCUSDT": object(), "ETHUSDT": object()}
+
+    quotes = await source.fetch_spread_bbo(["BTCUSDT", "ETHUSDT"])
+
+    assert fallback.calls == [["BTCUSDT", "ETHUSDT"]]
+    assert set(quotes) == {"hyperliquid:BTCUSDT", "hyperliquid:ETHUSDT"}
 
 
 def test_standalone_spread_bbo_modules_are_available() -> None:
