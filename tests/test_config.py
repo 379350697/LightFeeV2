@@ -1,8 +1,6 @@
 """Tests for config loading, validation, and Chillybot removal."""
 
-import json
 import math
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +11,6 @@ from lightfee.config.compatibility import (
 )
 from lightfee.config.paths import (
     DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR,
-    resolve_config_artifact_path,
 )
 from lightfee.config.validation import check_raw_toml_for_chillybot
 from lightfee.config.loader import load_config
@@ -24,8 +21,6 @@ from lightfee.core.errors import ConfigError
 EXPECTED_PUBLIC_ENTRY_OPEN_INTEREST_RUNTIME_FIELDS = {
     "entry_open_interest_refresh_timeout_ms",
     "entry_open_interest_cache_fallback_max_age_ms",
-    "entry_open_interest_store_path",
-    "entry_open_interest_background_refresh_ms",
 }
 
 
@@ -53,73 +48,27 @@ def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
     assert cfg.maker_entry_max_reposts == 1
 
 
-def test_funding_canary_accepts_configurable_nonnegative_floors_and_requires_positive_notional():
-    cfg = AppConfig()
-    cfg.strategy.funding_canary_enabled = True
-    cfg.strategy.funding_canary_min_expected_net_edge_bps = 0.0
-    cfg.strategy.funding_canary_min_worst_case_edge_bps = 0.0
-
-    assert not any("funding_canary_min_" in issue for issue in validate_config(cfg))
-
-    cfg.strategy.funding_canary_max_entry_notional_quote = 0.0
-    assert (
-        "strategy.funding_canary_max_entry_notional_quote must be finite and > 0"
-        in validate_config(cfg)
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("runtime", "fee_evidence_path"),
+        ("runtime", "funding_fee_evidence_path"),
+        ("strategy", "funding_canary_enabled"),
+        ("strategy", "funding_canary_max_entry_notional_quote"),
+    ],
+)
+def test_removed_live_evidence_and_canary_fields_fail_config_loading(
+    tmp_path, section, field
+):
+    path = tmp_path / "removed.toml"
+    value = "true" if field.endswith("enabled") else '"retired"'
+    path.write_text(
+        f'symbols = ["BTCUSDT"]\n\n[{section}]\n{field} = {value}\n',
+        encoding="utf-8",
     )
 
-
-def test_funding_canary_caps_are_configurable_but_conservative_tier_stays_smaller():
-    cfg = AppConfig()
-    cfg.strategy.funding_canary_enabled = True
-    cfg.strategy.funding_canary_max_concurrent_positions = 2
-    cfg.strategy.funding_canary_max_entry_notional_quote = 31.0
-
-    assert not any("funding_canary_max_concurrent_positions" in issue for issue in validate_config(cfg))
-    assert not any("funding_canary_max_entry_notional_quote" in issue for issue in validate_config(cfg))
-
-    cfg.strategy.funding_canary_conservative_fee_max_entry_notional_quote = 31.01
-    assert (
-        "strategy.funding_canary_conservative_fee_max_entry_notional_quote "
-        "must not exceed funding_canary_max_entry_notional_quote"
-        in validate_config(cfg)
-    )
-
-
-def test_funding_canary_allows_bounded_conservative_fee_assurance():
-    cfg = AppConfig()
-    cfg.strategy.funding_canary_enabled = True
-    cfg.strategy.funding_canary_require_account_fee_evidence = False
-
-    assert not any("require_account_fee_evidence" in issue for issue in validate_config(cfg))
-
-
-def test_funding_and_spread_fee_evidence_are_separate_runtime_inputs():
-    cfg = AppConfig()
-
-    assert cfg.runtime.funding_fee_evidence_path != cfg.runtime.fee_evidence_path
-    assert cfg.runtime.funding_fee_evidence_max_age_ms == 5 * 24 * 60 * 60 * 1000
-    assert cfg.runtime.fee_evidence_max_age_ms == 24 * 60 * 60 * 1000
-    cfg.runtime.funding_fee_evidence_path = ""
-    assert "runtime.funding_fee_evidence_path must be non-empty" in validate_config(cfg)
-    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
-    cfg.runtime.funding_fee_evidence_path = cfg.runtime.fee_evidence_path
-    assert (
-        "runtime.funding_fee_evidence_path must differ from runtime.fee_evidence_path"
-        in validate_config(cfg)
-    )
-    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
-    cfg.runtime.fee_evidence_path = "runtime/account-fee-evidence.json"
-    cfg.runtime.funding_fee_evidence_path = "runtime/../runtime/account-fee-evidence.json"
-    assert (
-        "runtime.funding_fee_evidence_path must differ from runtime.fee_evidence_path"
-        in validate_config(cfg)
-    )
-    cfg.runtime.funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
-    cfg.runtime.funding_fee_evidence_max_age_ms = 0
-    assert (
-        "runtime.funding_fee_evidence_max_age_ms must be a positive integer"
-        in validate_config(cfg)
-    )
+    with pytest.raises(ConfigError, match=rf"removed production field: {section}\.{field}"):
+        load_config(path)
 
 
 def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
@@ -127,11 +76,6 @@ def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
 
     assert cfg.runtime.entry_open_interest_refresh_timeout_ms == 750
     assert cfg.runtime.entry_open_interest_cache_fallback_max_age_ms == 30 * 60_000
-    assert (
-        cfg.runtime.entry_open_interest_store_path
-        == "runtime/entry-open-interest-evidence-v1.sqlite3"
-    )
-    assert cfg.runtime.entry_open_interest_background_refresh_ms == 15 * 60_000
     assert {
         name
         for name in cfg.runtime.__dataclass_fields__
@@ -159,56 +103,15 @@ def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
         in validate_config(cfg)
     )
 
-    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = 30 * 60_000
-    cfg.runtime.entry_open_interest_store_path = " "
-    assert (
-        "runtime.entry_open_interest_store_path must not be empty"
-        in validate_config(cfg)
-    )
-
-    cfg.runtime.entry_open_interest_store_path = (
-        "runtime/entry-open-interest-evidence-v1.sqlite3"
-    )
-    existing_directory = tmp_path / "entry-oi-directory"
-    existing_directory.mkdir()
-    cfg.runtime.entry_open_interest_store_path = str(existing_directory)
-    assert (
-        "runtime.entry_open_interest_store_path must not be "
-        "an existing directory"
-        in validate_config(cfg)
-    )
-
-    parent_file = tmp_path / "entry-oi-parent-file"
-    parent_file.write_text("not a directory")
-    cfg.runtime.entry_open_interest_store_path = str(
-        parent_file / "entry-oi.sqlite3"
-    )
-    assert (
-        "runtime.entry_open_interest_store_path parent must be a usable "
-        "directory or creatable"
-        in validate_config(cfg)
-    )
-
-    cfg.runtime.entry_open_interest_store_path = str(
-        tmp_path / "missing-parent" / "entry-oi.sqlite3"
-    )
-    assert not any("entry_open_interest" in issue for issue in validate_config(cfg))
-
-    cfg.runtime.entry_open_interest_store_path = (
-        "runtime/entry-open-interest-evidence-v1.sqlite3"
-    )
-    cfg.runtime.entry_open_interest_background_refresh_ms = 0
-    assert (
-        "runtime.entry_open_interest_background_refresh_ms must be a positive integer"
-        in validate_config(cfg)
-    )
+    assert not hasattr(cfg.runtime, "entry_open_interest_store_path")
+    assert not hasattr(cfg.runtime, "entry_open_interest_background_refresh_ms")
 
 
 def test_runtime_config_validates_entry_account_truth_per_venue_timeout():
     cfg = AppConfig()
 
     assert cfg.runtime.entry_account_truth_per_venue_timeout_ms == 2000
-    assert cfg.runtime.entry_account_truth_probe_timeout_ms is None
+    assert not hasattr(cfg.runtime, "entry_account_truth_probe_timeout_ms")
     assert cfg.runtime.live_recovery_rest_probe_timeout_ms == 2000
     assert (
         cfg.runtime.hyperliquid_info_coordinator_dir
@@ -230,35 +133,9 @@ def test_runtime_config_validates_entry_account_truth_per_venue_timeout():
     )
     cfg.runtime.entry_account_truth_per_venue_timeout_ms = 2000
 
-    cfg.runtime.entry_account_truth_probe_timeout_ms = 0
-    assert (
-        "runtime.entry_account_truth_probe_timeout_ms must be a positive integer when set"
-        in validate_config(cfg)
-    )
-    cfg.runtime.entry_account_truth_probe_timeout_ms = None
-
     cfg.runtime.hyperliquid_info_coordinator_dir = ""
     assert (
         "runtime.hyperliquid_info_coordinator_dir must be non-empty"
-        in validate_config(cfg)
-    )
-
-
-def test_live_funding_fee_evidence_accepts_five_days_but_not_longer():
-    cfg = AppConfig()
-    cfg.runtime.mode = "live"
-    cfg.strategy.funding_new_entries_enabled = True
-    cfg.strategy.funding_canary_enabled = True
-    cfg.runtime.funding_fee_evidence_max_age_ms = 5 * 24 * 60 * 60 * 1000
-
-    assert not any(
-        "funding_fee_evidence_max_age_ms" in issue for issue in validate_config(cfg)
-    )
-
-    cfg.runtime.funding_fee_evidence_max_age_ms += 1
-    assert (
-        "runtime.funding_fee_evidence_max_age_ms must be <= 432000000 "
-        "for a live funding canary"
         in validate_config(cfg)
     )
 
@@ -286,42 +163,15 @@ def test_venue_cost_and_cap_configuration_fails_closed(
     assert any(expected in issue for issue in validate_config(cfg))
 
 
-def test_funding_canary_supports_all_seven_live_venues_and_rejects_unknown_names():
-    cfg = AppConfig()
-    cfg.strategy.funding_canary_enabled = True
-    cfg.strategy.funding_canary_allowed_venues = [
-        "aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"
-    ]
-    assert not any("funding_canary_allowed_venues" in issue for issue in validate_config(cfg))
-
-    cfg.strategy.funding_canary_allowed_venues.append("unknown")
-    assert (
-        "strategy.funding_canary_allowed_venues contains unsupported live perp venues: unknown"
-        in validate_config(cfg)
+def test_spread_paper_uses_configured_venue_fees_without_account_identity():
+    cfg = AppConfig(
+        symbols=["BTCUSDT"],
+        venues=[VenueConfig(venue="binance", taker_fee_bps=5.0)],
     )
-
-
-def test_v3_spread_paper_requires_fee_account_identity_for_each_venue():
-    cfg = AppConfig(symbols=["BTCUSDT"], venues=[VenueConfig(venue="binance")])
     cfg.strategy.spread_paper_enabled = True
-    cfg.strategy.spread_dynamic_net_edge_enabled = True
-    cfg.strategy.spread_model_epoch = "v3_cost_normalized_reversion"
-    cfg.strategy.spread_paper_model_epoch = "v3_cost_normalized_reversion"
-    cfg.strategy.spread_paper_research_manifest_path = (
-        "config/research/spread_v3_cost_normalized_reversion.json"
-    )
 
-    assert (
-        "runtime.fee_evidence_account_identity_hashes must contain a SHA256 "
-        "identity hash for v3 spread paper venue binance"
-        in validate_config(cfg)
-    )
-
-    cfg.runtime.fee_evidence_account_identity_hashes = {"binance": "a" * 64}
-    assert not any(
-        "identity hash for v3 spread paper venue binance" in issue
-        for issue in validate_config(cfg)
-    )
+    assert validate_config(cfg) == []
+    assert not hasattr(cfg.runtime, "fee_evidence_account_identity_hashes")
 
 
 def test_live_funding_entries_do_not_require_the_canary_profile():
@@ -336,47 +186,15 @@ def test_live_funding_entries_do_not_require_the_canary_profile():
     )
 
 
-def test_live_funding_entries_require_positive_bounded_es_cold_start_controls():
+def test_live_funding_entries_do_not_require_retired_expected_shortfall_configuration():
     cfg = AppConfig()
     cfg.runtime.mode = "live"
     cfg.strategy.risk_monitor_enabled = True
     cfg.strategy.funding_new_entries_enabled = True
-    cfg.strategy.funding_es_cold_start_max_entry_notional_quote = 0.0
-    cfg.strategy.funding_es_cold_start_bps = 0.0
 
     issues = validate_config(cfg)
 
-    assert (
-        "strategy.funding_es_cold_start_max_entry_notional_quote must be > 0 "
-        "when live funding entries are enabled"
-        in issues
-    )
-    assert (
-        "strategy.funding_es_cold_start_bps must be > 0 when live funding entries are enabled"
-        in issues
-    )
-
-
-def test_live_funding_canary_does_not_require_promotion_receipt_key_at_startup(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    cfg = AppConfig()
-    cfg.runtime.mode = "live"
-    cfg.strategy.risk_monitor_enabled = True
-    cfg.strategy.funding_new_entries_enabled = True
-    cfg.strategy.funding_canary_enabled = True
-    monkeypatch.delenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", raising=False)
-
-    assert not any(
-        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY" in issue
-        for issue in validate_config(cfg)
-    )
-
-    monkeypatch.setenv("LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY", "canary-test-key")
-    assert not any(
-        "LIGHTFEE_EXECUTION_BENCHMARK_HMAC_KEY" in issue
-        for issue in validate_config(cfg)
-    )
+    assert not any("expected_shortfall" in issue for issue in issues)
 
 
 def test_dynamic_spread_cost_gate_and_model_epoch_are_indivisible():
@@ -453,8 +271,6 @@ def test_strategy_config_rejects_invalid_cost_and_haircut_values(
         "funding_max_global_gross_exposure_quote",
         "funding_max_settlement_bucket_exposure_quote",
         "funding_max_correlation_group_exposure_quote",
-        "funding_expected_shortfall_bps",
-        "funding_expected_shortfall_budget_quote",
     ],
 )
 def test_strategy_config_rejects_nonfinite_funding_risk_limits(field_name: str):
@@ -491,7 +307,6 @@ def test_strategy_config_rejects_nonfinite_or_invalid_funding_risk_contracts():
     "field_name",
     [
         "funding_new_entries_enabled",
-        "funding_dynamic_expected_shortfall_enabled",
         "risk_monitor_enabled",
         "spread_live_enabled",
         "spread_paper_enabled",
@@ -514,15 +329,6 @@ def test_live_config_does_not_accept_truthy_risk_monitor_value():
     issues = validate_config(cfg)
 
     assert "strategy.risk_monitor_enabled must be true in live mode" in issues
-
-
-def test_runtime_basis_risk_checkpoint_path_must_be_non_empty():
-    cfg = AppConfig()
-    cfg.runtime.funding_basis_risk_checkpoint_path = " "
-
-    issues = validate_config(cfg)
-
-    assert "runtime.funding_basis_risk_checkpoint_path must be non-empty" in issues
 
 
 def test_strategy_config_rejects_negative_first_funding_horizon():
@@ -612,11 +418,7 @@ class TestConfigLoading:
     ):
         project = tmp_path / "project"
         config_dir = project / "config"
-        manifest = config_dir / "research" / "spread_v2_signed_reversion.json"
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text("{}", encoding="utf-8")
-        runtime_dir = project / "runtime"
-        runtime_dir.mkdir()
+        config_dir.mkdir(parents=True)
         other_cwd = tmp_path / "other"
         other_cwd.mkdir()
         path = config_dir / "live.toml"
@@ -637,25 +439,8 @@ spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversio
         )
         monkeypatch.chdir(other_cwd)
 
-        config = load_config(path)
-
-        assert config.runtime.fee_evidence_path == "runtime/account-fee-evidence.json"
-        assert (
-            config.runtime.funding_fee_evidence_path
-            == "runtime/funding-account-fee-evidence.json"
-        )
-        assert (
-            config.strategy.spread_paper_research_manifest_path
-            == "config/research/spread_v2_signed_reversion.json"
-        )
-        assert resolve_config_artifact_path(
-            config,
-            config.strategy.spread_paper_research_manifest_path,
-        ) == manifest.resolve()
-        assert resolve_config_artifact_path(
-            config,
-            config.runtime.fee_evidence_path,
-        ) == (runtime_dir / "account-fee-evidence.json").resolve()
+        with pytest.raises(ConfigError, match="removed production field"):
+            load_config(path)
 
     def test_config_artifact_duplicate_check_uses_loaded_project_root(
         self,
@@ -693,30 +478,7 @@ funding_fee_evidence_path = "{account_evidence}"
     ):
         project = tmp_path / "project"
         config_dir = project / "config"
-        manifest = config_dir / "research" / "spread_v2_signed_reversion.json"
-        manifest.parent.mkdir(parents=True)
-        manifest.write_text(
-            json.dumps(
-                {
-                    "version": "spread_research_manifest_v2",
-                    "model_epoch": "v2_signed_reversion",
-                    "hypothesis": "test manifest",
-                    "cohorts": [
-                        {
-                            "bot_id": "tt_conservative",
-                            "cohort": "baseline",
-                            "hypothesis": "test cohort",
-                            "enabled": True,
-                            "control_group": False,
-                            "acceptance_eligible": True,
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        runtime_dir = project / "runtime"
-        runtime_dir.mkdir(parents=True)
+        config_dir.mkdir(parents=True)
         path = config_dir / "live.toml"
         path.write_text(
             """
@@ -724,11 +486,16 @@ symbols = ["BTCUSDT"]
 
 [runtime]
 mode = "paper"
-fee_evidence_path = "runtime/account-fee-evidence.json"
-funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
 
-[strategy]
-spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversion.json"
+[[venues]]
+venue = "binance"
+taker_fee_bps = 5.0
+maker_fee_bps = 2.0
+
+[[venues]]
+venue = "okx"
+taker_fee_bps = 6.0
+maker_fee_bps = 3.0
 """,
             encoding="utf-8",
         )
@@ -737,95 +504,12 @@ spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversio
         monkeypatch.chdir(other_cwd)
 
         config = load_config(path)
-        config.venues = [
-            VenueConfig(venue="binance", taker_fee_bps=5.0, maker_fee_bps=2.0),
-            VenueConfig(venue="okx", taker_fee_bps=5.0, maker_fee_bps=2.0),
+        assert [(row.venue, row.taker_fee_bps, row.maker_fee_bps) for row in config.venues] == [
+            ("binance", 5.0, 2.0),
+            ("okx", 6.0, 3.0),
         ]
-        config.strategy.funding_canary_enabled = True
-        config.strategy.funding_canary_max_entry_notional_quote = 100.0
-        config.strategy.funding_canary_conservative_fee_max_entry_notional_quote = 100.0
-        config.strategy.funding_canary_min_expected_net_edge_bps = 0.0
-        config.strategy.funding_canary_min_worst_case_edge_bps = 0.0
-        config.strategy.funding_canary_conservative_fee_buffer_bps = 1.0
-        config.strategy.spread_paper_enabled = True
-
-        from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
-        import lightfee.engine.entry_dispatch_runtime as entry_module
-        import lightfee.sidecar.service as sidecar_module
-        import lightfee.spread.service as spread_module
-        from lightfee.spread.service import SpreadSidecarService
-        from lightfee.strategy.fee_evidence import FeeEvidenceBook
-
-        captured: dict[str, str] = {}
-
-        def entry_load(path, **_kwargs):
-            captured["entry"] = str(path)
-            return FeeEvidenceBook()
-
-        def sidecar_load(path, **_kwargs):
-            captured["sidecar"] = str(path)
-            return FeeEvidenceBook()
-
-        def spread_load(path, **_kwargs):
-            captured["spread"] = str(path)
-            return FeeEvidenceBook()
-
-        class CandidateServiceCapture:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-        monkeypatch.setattr(entry_module, "load_fee_evidence", entry_load)
-        monkeypatch.setattr(sidecar_module, "load_fee_evidence", sidecar_load)
-        monkeypatch.setattr(
-            sidecar_module,
-            "FundingCandidateService",
-            CandidateServiceCapture,
-        )
-        monkeypatch.setattr(spread_module, "load_fee_evidence", spread_load)
-
-        entry_runtime = EntryDispatchRuntime.__new__(EntryDispatchRuntime)
-        entry_runtime.ctx = SimpleNamespace(
-            config=config,
-            state=SimpleNamespace(open_positions=[], pending_entries=[]),
-        )
-        candidate = SimpleNamespace(
-            symbol="BTCUSDT",
-            long_venue="binance",
-            short_venue="okx",
-            taker_fee_evidence_complete=True,
-            account_fee_evidence_complete=False,
-            entry_max_leg_notional_quote=10.0,
-            expected_net_edge_bps=10.0,
-            worst_case_edge_bps=10.0,
-            long_taker_fee_bps=8.0,
-            short_taker_fee_bps=8.0,
-            entry_fee_bps=16.0,
-            exit_fee_bps=16.0,
-            entry_maker_leg="",
-            exit_maker_leg="",
-        )
-
-        assert (
-            entry_runtime._funding_canary_admission_reason(
-                candidate,
-                1_800_000_000_000,
-                check_concurrency=False,
-            )
-            == ""
-        )
-        sidecar = sidecar_module.SidecarService.__new__(sidecar_module.SidecarService)
-        sidecar.config = config
-        sidecar._new_candidate_service(now_ms=1_800_000_000_000)
-        spread = SpreadSidecarService.__new__(SpreadSidecarService)
-        spread.config = config
-        spread._load_fee_evidence(1_800_000_000_000)
-        spread._paper_config(config, fee_evidence=FeeEvidenceBook())
-
-        assert captured == {
-            "entry": str((runtime_dir / "funding-account-fee-evidence.json").resolve()),
-            "sidecar": str((runtime_dir / "funding-account-fee-evidence.json").resolve()),
-            "spread": str((runtime_dir / "account-fee-evidence.json").resolve()),
-        }
+        assert not hasattr(config.runtime, "fee_evidence_path")
+        assert not hasattr(config.runtime, "funding_fee_evidence_path")
 
     def test_live_missing_entry_provider_defaults_to_composed_mode_even_with_local_l2_flag(
         self, tmp_path

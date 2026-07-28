@@ -94,7 +94,7 @@ class TestRuntimeLaneScheduling:
     """V1 parity: run_loop schedules all eight lanes in V1 order."""
 
     @pytest.mark.asyncio
-    async def test_tick_marks_funding_basis_risk_unhealthy_after_observation_error(
+    async def test_tick_does_not_run_retired_funding_basis_risk_admission(
         self, tmp_path, monkeypatch
     ):
         from lightfee.config.schema import RuntimeConfig, PersistenceConfig
@@ -202,11 +202,11 @@ class TestRuntimeLaneScheduling:
         finally:
             runtime.journal.close()
 
-        assert fake_risk_runtime.marked_reasons == ["RuntimeError"]
-        assert runtime.state.last_scan["funding_basis_risk"]["checkpoint_healthy"] is False
+        assert fake_risk_runtime.marked_reasons == []
+        assert "funding_basis_risk" not in runtime.state.last_scan
 
     @pytest.mark.asyncio
-    async def test_tick_marks_funding_basis_risk_unhealthy_when_snapshot_not_fresh(
+    async def test_degraded_tick_does_not_publish_retired_funding_basis_risk_state(
         self, tmp_path, monkeypatch
     ):
         from lightfee.config.schema import RuntimeConfig, PersistenceConfig
@@ -309,8 +309,8 @@ class TestRuntimeLaneScheduling:
             runtime.journal.close()
 
         assert fake_risk_runtime.observe_calls == 0
-        assert fake_risk_runtime.marked_reasons == ["fresh_snapshot_required"]
-        assert runtime.state.last_scan["funding_basis_risk"]["checkpoint_healthy"] is False
+        assert fake_risk_runtime.marked_reasons == []
+        assert "funding_basis_risk" not in runtime.state.last_scan
 
     @pytest.mark.asyncio
     async def test_run_loop_schedules_all_lanes(self, monkeypatch):
@@ -772,11 +772,7 @@ class TestRuntimeLaneScheduling:
         from lightfee.sidecar.publisher import load_snapshot
 
         monkeypatch.setattr(
-            "lightfee.engine.runtime.funding_entry_snapshot_identity",
-            lambda _path: ("test-v6-file", 1, 1),
-        )
-        monkeypatch.setattr(
-            "lightfee.engine.runtime.load_funding_entry_snapshot",
+            "lightfee.engine.runtime.load_snapshot",
             lambda _path: load_snapshot(sidecar_path),
         )
         config = AppConfig(

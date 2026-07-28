@@ -106,8 +106,6 @@ def candidate_revision_id(
     settlement_timestamps_ms: tuple[int, int, int, int],
     entry_route: str,
     exit_route: str,
-    fee_evidence_fingerprint: str,
-    fee_assurance_tier: str,
     model_epoch: str,
     economics: Mapping[str, object],
 ) -> str:
@@ -115,7 +113,7 @@ def candidate_revision_id(
     try:
         return _digest(
             {
-                "identity_version": "funding_candidate_revision_v5",
+                "identity_version": "funding_candidate_revision_v6",
                 "pair_id": _text(pair_id).lower(),
                 "long_contract": _quote_contract(long_quote),
                 "short_contract": _quote_contract(short_quote),
@@ -126,8 +124,6 @@ def candidate_revision_id(
                     "entry": _text(entry_route).lower() or "taker_both",
                     "exit": _text(exit_route).lower() or "taker_both",
                 },
-                "fee_evidence_fingerprint": _text(fee_evidence_fingerprint),
-                "fee_assurance_tier": _text(fee_assurance_tier).lower(),
                 "model_epoch": _text(model_epoch),
                 "economics": {
                     str(key): _number(value)

@@ -1,0 +1,118 @@
+{
+  "v1_source": {
+    "commit": "ca4b166",
+    "entry": "src/execution_core/entry_sync.rs; src/engine/entry.rs",
+    "close": "src/engine/exit.rs:standard_close_reason; close order uses opposite side and reduce-only",
+    "recovery": "src/engine/recovery.rs: live artifact recovery blocks or flattens an unpaired live position"
+  },
+  "entry": {
+    "context": {
+      "entry_id": "v1-fixture-btc-aligned-001",
+      "symbol": "BTCUSDT",
+      "long_venue": "binance",
+      "short_venue": "okx",
+      "long_quantity": 0.01,
+      "short_quantity": 0.01,
+      "long_price_hint": 50000.0,
+      "short_price_hint": 50010.0,
+      "maker_leg": "buy",
+      "entry_type": "passive_incremental"
+    },
+    "final_order_payloads": [
+      {
+        "role": "maker",
+        "venue": "binance",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "quantity": 0.01,
+        "price": 50000.0,
+        "reduce_only": false,
+        "post_only": true,
+        "time_in_force": "gtc",
+        "client_order_id": "199654a8f7c3e4c3dfd232f18101f039affd"
+      },
+      {
+        "role": "hedge",
+        "venue": "okx",
+        "symbol": "BTCUSDT",
+        "side": "sell",
+        "quantity": 0.01,
+        "price": 50010.0,
+        "reduce_only": false,
+        "post_only": false,
+        "time_in_force": "ioc",
+        "client_order_id": "74123c7a028af6563e40031a390e2957"
+      }
+    ]
+  },
+  "close": {
+    "position": {
+      "position_id": "v1-fixture-btc-aligned-001",
+      "symbol": "BTCUSDT",
+      "long_venue": "binance",
+      "short_venue": "okx",
+      "long_quantity": 0.01,
+      "short_quantity": 0.01,
+      "long_entry_price": 50000.0,
+      "short_entry_price": 50010.0,
+      "opened_at_ms": 1700000000000,
+      "matched_quantity": 0.01,
+      "funding_timestamp_ms": 1700000300000,
+      "funding_captured": true,
+      "current_net_quote": 0.25
+    },
+    "config": {
+      "settlement_remainder_close_delay_secs": 300,
+      "settlement_force_close_delay_secs": 1200
+    },
+    "now_ms": 1700000600000,
+    "expected_reason": "funding_capture",
+    "final_order_payloads": [
+      {
+        "role": "long_close",
+        "venue": "binance",
+        "symbol": "BTCUSDT",
+        "side": "sell",
+        "quantity": 0.01,
+        "price": null,
+        "reduce_only": true,
+        "post_only": false,
+        "time_in_force": null,
+        "client_order_id": null
+      },
+      {
+        "role": "short_close",
+        "venue": "okx",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "quantity": 0.01,
+        "price": null,
+        "reduce_only": true,
+        "post_only": false,
+        "time_in_force": null,
+        "client_order_id": null
+      }
+    ]
+  },
+  "recovery": {
+    "exchange_truth": {
+      "available": true,
+      "confidence": "high",
+      "positions": [
+        {
+          "venue": "bybit",
+          "symbol": "ETHUSDT",
+          "side": "buy",
+          "quantity": 0.5,
+          "entry_price": 3000.0
+        }
+      ]
+    },
+    "expected_decision": {
+      "kind": "BLOCK_OR_FLATTEN_LIVE_ARTIFACT",
+      "entry_allowed": false,
+      "block_reason": "unpaired_live_position",
+      "management_action": "flatten_or_block_live_artifact"
+    }
+  }
+}

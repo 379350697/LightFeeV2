@@ -56,25 +56,11 @@ def make_test_config(temp_dir: str) -> AppConfig:
     )
 
 
-def _install_v6_file_snapshot_fixture(monkeypatch) -> None:
-    """Route orchestration fixtures through the live V6 loader contract."""
+def _install_file_snapshot_fixture(monkeypatch) -> None:
+    """Route orchestration fixtures through the single sidecar snapshot."""
     from lightfee.sidecar.publisher import load_snapshot
 
-    def identity(path):
-        try:
-            stat = Path(path).stat()
-        except OSError:
-            return None
-        return ("test-v6-file", stat.st_mtime_ns, stat.st_size)
-
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.funding_entry_snapshot_identity",
-        identity,
-    )
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.load_funding_entry_snapshot",
-        load_snapshot,
-    )
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", load_snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +115,7 @@ class TestLiveFullClosure:
                 "candidates": [],
                 "quotes": {},
             }))
-            _install_v6_file_snapshot_fixture(monkeypatch)
+            _install_file_snapshot_fixture(monkeypatch)
 
             runtime = LiveRuntime(config)
             await runtime.start()
@@ -156,7 +142,7 @@ class TestLiveFullClosure:
                 "candidates": [],
                 "quotes": {},
             }))
-            _install_v6_file_snapshot_fixture(monkeypatch)
+            _install_file_snapshot_fixture(monkeypatch)
 
             runtime = LiveRuntime(config)
             await runtime.start()
@@ -224,14 +210,16 @@ class TestLiveFullClosure:
             # No sidecar file → tick logs snapshot_missing and returns gracefully
             runtime = LiveRuntime(config)
             await runtime.start()
-
-            # Tick without sidecar → snapshot_missing logged, no error raised
-            await runtime.tick()
-            # Backoff is NOT applied for missing snapshot (not an error)
-            # The runtime just skips the tick
-            records = runtime.journal.read_all()
-            kinds = [r["kind"] for r in records]
-            assert "runtime.snapshot_missing" in kinds
+            try:
+                # Tick without sidecar → snapshot_missing logged, no error raised
+                await runtime.tick()
+                # Backoff is NOT applied for missing snapshot (not an error)
+                # The runtime just skips the tick
+                records = runtime.journal.read_all()
+                kinds = [r["kind"] for r in records]
+                assert "runtime.snapshot_missing" in kinds
+            finally:
+                await runtime.stop()
 
     def test_startup_recovered_position_hydrates_funding_metadata_from_entry_journal(self):
         with tempfile.TemporaryDirectory() as td:

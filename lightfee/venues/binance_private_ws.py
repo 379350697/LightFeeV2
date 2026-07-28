@@ -558,10 +558,12 @@ def start_binance_private_ws(transport, symbols: list[str]) -> None:
 
     from lightfee.venues.transport import LiveCredential
 
-    # V1: venue_symbol mapping
-    symbol_map = {
-        transport._venue_symbol(s): s for s in symbols
-    }
+    # The transport owns a mutable map for the worker lifetime.  Binance user
+    # data is account-wide, so candidate changes update parsing state without
+    # recreating the listenKey/WebSocket session.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
 
     # V1: reconnect parameters from runtime config
     reconnect_initial_ms = 1_000

@@ -2,27 +2,14 @@ symbols = ["BTCUSDT", "ETHUSDT"]
 
 [runtime]
 mode = "live"
-opportunity_input_mode = "single_process_entry"
 sidecar_snapshot_path = "runtime/opportunity-input-snapshot.json"
 sidecar_snapshot_max_age_ms = 10000
 sidecar_refresh_ms = 3000
 sidecar_perp_liquidity_budget_ms = 30000
 entry_open_interest_refresh_timeout_ms = 750
 entry_open_interest_cache_fallback_max_age_ms = 1800000
-entry_open_interest_store_path = "runtime/entry-open-interest-evidence-v1.sqlite3"
-entry_open_interest_background_refresh_ms = 900000
 spread_sidecar_snapshot_path = "runtime/spread-opportunities-current.json"
 spread_stats_checkpoint_path = "runtime/spread-stats-v2-checkpoint.json"
-# Funding account fees are refreshed from seven private read-only APIs into an
-# atomic 0600 local file. Failed symbols reuse their own still-fresh last-good
-# rows; uncovered symbols cannot claim account-authoritative economics.
-funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
-funding_fee_evidence_max_age_ms = 432000000
-# Strict spread-paper fee evidence remains a separate schema-v3 input.
-fee_evidence_path = "runtime/account-fee-evidence.json"
-fee_evidence_max_age_ms = 86400000
-fee_evidence_integrity_key_env = ""
-fee_evidence_account_identity_hashes = {}
 spread_sidecar_refresh_ms = 1000
 spread_sidecar_fetch_timeout_s = 10.0
 # One-way Local-L2 -> sidecar evidence bridge; no new public REST traffic.
@@ -78,17 +65,6 @@ min_funding_edge_bps = 6.0
 min_expected_edge_bps = 1.0
 min_worst_case_edge_bps = 0.0
 funding_new_entries_enabled = false
-funding_canary_enabled = false
-funding_canary_allowed_venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
-funding_canary_max_concurrent_positions = 8
-funding_canary_max_entry_notional_quote = 50.0
-funding_canary_min_expected_net_edge_bps = 3.0
-funding_canary_min_worst_case_edge_bps = 0.0
-funding_canary_min_expected_net_edge_bps_by_venue_pair = {}
-funding_canary_min_worst_case_edge_bps_by_venue_pair = {}
-funding_canary_require_account_fee_evidence = false
-funding_canary_conservative_fee_max_entry_notional_quote = 15.0
-funding_canary_conservative_fee_buffer_bps = 2.0
 funding_economics_mode = "v1_exact"
 funding_forecast_mode = "shadow"
 funding_forecast_uncertainty_haircut_bps = 2.0
@@ -103,10 +79,6 @@ funding_max_settlement_bucket_exposure_quote = 0.0
 funding_settlement_crowding_bucket_ms = 300000
 funding_max_correlation_group_exposure_quote = 0.0
 funding_correlation_group_by_symbol = {}
-funding_expected_shortfall_bps = 0.0
-funding_es_cold_start_max_entry_notional_quote = 15.0
-funding_es_cold_start_bps = 100.0
-funding_expected_shortfall_budget_quote = 0.0
 spread_reversion_enabled = false
 spread_live_enabled = false
 spread_model_epoch = "v2_signed_reversion"
@@ -166,17 +138,11 @@ spread_paper_excluded_symbols = []
 spread_paper_allowed_opportunity_labels = ["spread_reversion"]
 spread_paper_episode_cooldown_ms = 1800000
 spread_paper_bot_ids = ["tt_conservative"]
-spread_paper_research_manifest_path = "config/research/spread_v2_signed_reversion.json"
 spread_paper_markout_secs = [60, 300, 900, 1800]
 spread_paper_terminal_secs = 1800
 spread_paper_slippage_buffer_bps = 0.0
 spread_paper_latency_buffer_bps = 0.5
 spread_paper_require_l2_vwap = true
-spread_paper_require_account_fee_evidence = true
-# Keep rebate credit disabled until signed account-fee exports are observed.
-spread_allow_verified_maker_rebates = false
-spread_paper_oos_start_ms = 0
-spread_paper_require_out_of_sample = false
 risk_monitor_enabled = true
 execution_liquidity_enabled = true
 max_entry_slippage_bps = 25.0
@@ -189,17 +155,13 @@ entry_ws_bbo_per_venue_budget = 10
 [persistence]
 event_log_path = "runtime/events.jsonl"
 spread_paper_event_log_path = "runtime/spread-paper-events.jsonl"
-# Put this on an independently retained/mounted state volume.  It must be an
-# absolute path outside the paper journal directory or admission fails closed.
-spread_paper_rollback_anchor_path = "/var/lib/lightfee-v2-rollback-anchor/spread-paper.epoch"
 snapshot_path = "runtime/state.json"
 tuning_diagnostics_enabled = true
 tuning_diagnostics_max_records = 10000
 
 [[venues]]
 venue = "binance"
-# Conservative non-VIP fallback floors. Funding live uses its local schema-v4
-# snapshot; strict spread paper uses its separate signed schema-v3 evidence.
+# Conservative non-VIP account fee floors used by live and paper economics.
 taker_fee_bps = 5.0
 maker_fee_bps = 2.0
 max_notional = 1000.0

@@ -25,7 +25,6 @@ from lightfee.spread.modules import (
     ZScoreSignalModel,
 )
 from lightfee.strategy.economics import build_edge_breakdown
-from lightfee.strategy.fee_evidence import FeeEvidenceBook, effective_fee_maps
 
 
 @dataclass(frozen=True)
@@ -56,8 +55,6 @@ class SpreadReversionConfig:
     min_profit_buffer_bps: float = 0.0
     rank_by_capital_efficiency: bool = False
     volatility_high_std_bps: float = 10.0
-    account_fee_evidence: FeeEvidenceBook | None = None
-    fee_evidence_account_identity_hashes: dict[str, str] | None = None
     mean_reversion_min_std_bps: float = 0.05
     mean_reversion_max_half_life_ms: int = 30 * 60 * 1000
     ranker_max_candidates: int = 10
@@ -81,15 +78,16 @@ class SpreadReversionConfig:
     def from_app_config(
         cls,
         config: AppConfig,
-        *,
-        fee_evidence: FeeEvidenceBook | None = None,
     ) -> "SpreadReversionConfig":
         s = config.strategy
-        taker_fees, _ = effective_fee_maps(
-            _fee_map(config.venues),
-            _maker_fee_map(config.venues),
-            fee_evidence,
-        )
+        # Spread paper uses the configured account schedule as a conservative
+        # floor.  Account-fee documents are an offline diagnostic input and
+        # must never block, discount, or otherwise steer the production
+        # signal process.
+        taker_fees = {
+            venue: max(float(fee_bps), 0.0)
+            for venue, fee_bps in _fee_map(config.venues).items()
+        }
         return cls(
             min_samples=s.spread_min_samples,
             entry_z=s.spread_entry_z,
@@ -117,10 +115,6 @@ class SpreadReversionConfig:
             min_profit_buffer_bps=s.spread_min_profit_buffer_bps,
             rank_by_capital_efficiency=s.spread_rank_by_capital_efficiency,
             volatility_high_std_bps=s.spread_volatility_high_std_bps,
-            account_fee_evidence=fee_evidence,
-            fee_evidence_account_identity_hashes=dict(
-                config.runtime.fee_evidence_account_identity_hashes
-            ),
             mean_reversion_min_std_bps=s.spread_mean_reversion_min_std_bps,
             mean_reversion_max_half_life_ms=s.spread_mean_reversion_max_half_life_ms,
             ranker_max_candidates=s.spread_ranker_max_candidates,
@@ -1319,31 +1313,6 @@ def _candidate_for_pair(
         if config.rank_by_capital_efficiency
         else statistical_score
     )
-    account_fee_evidence_base_complete = bool(
-        config.account_fee_evidence is not None
-        and config.account_fee_evidence.complete_for(long_q.venue, short_q.venue)
-        and config.account_fee_evidence.integrity_verified is True
-    )
-    account_fee_identity_matches = bool(
-        account_fee_evidence_base_complete
-        and (
-            config.fee_evidence_account_identity_hashes is None
-            or config.account_fee_evidence.identity_matches(
-                config.fee_evidence_account_identity_hashes,
-                long_q.venue,
-                short_q.venue,
-            )
-        )
-    )
-    account_fee_evidence_complete = (
-        account_fee_evidence_base_complete and account_fee_identity_matches
-    )
-    if (
-        account_fee_evidence_base_complete
-        and config.fee_evidence_account_identity_hashes is not None
-        and not account_fee_identity_matches
-    ):
-        screening_reasons.append("account_fee_account_identity_mismatch")
     calculation_version = edge.calculation_version
 
     return SpreadReversionCandidate(
@@ -1426,27 +1395,6 @@ def _candidate_for_pair(
         model_epoch=config.model_epoch,
         economics_complete=edge.economics_complete,
         fee_evidence_complete=fee_evidence_complete,
-        account_fee_evidence_complete=account_fee_evidence_complete,
-        account_fee_evidence_observed_at_ms=(
-            config.account_fee_evidence.observed_at_ms_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and config.account_fee_evidence is not None
-            else 0
-        ),
-        account_fee_evidence_source=(
-            config.account_fee_evidence.source_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and config.account_fee_evidence is not None
-            else ""
-        ),
-        account_fee_evidence_fingerprint=(
-            config.account_fee_evidence.fingerprint_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and config.account_fee_evidence is not None
-            else ""
-        ),
-        account_fee_evidence_provenance=(
-            config.account_fee_evidence.provenance_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and config.account_fee_evidence is not None
-            else []
-        ),
         volatility_regime=(
             "high" if stats.std_bps >= float(config.volatility_high_std_bps) else "low"
         ),

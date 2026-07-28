@@ -111,36 +111,8 @@ def _attach_live_oi_evidence(candidate, *, now_ms: int, value_quote: float = 2_0
     return candidate
 
 
-def _install_v6_snapshot_fixture(monkeypatch, snapshot) -> None:
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.funding_entry_snapshot_identity",
-        lambda _path: ("test-v6-generation", 1, 1),
-    )
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.load_funding_entry_snapshot",
-        lambda _path: snapshot,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _isolate_non_canary_entry_stages(monkeypatch):
-    """Keep these legacy stage tests focused on their named admission stage.
-
-    Live production now rejects every new funding entry until the signed canary
-    contract is configured.  This module intentionally tests L2, leverage and
-    planner stages, while canary policy itself is covered by strategy-economics
-    tests; bypassing only the canary predicate here preserves that separation.
-    """
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_admission_reason",
-        lambda *_args, **_kwargs: "",
-    )
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_submission_reason",
-        lambda *_args, **_kwargs: "",
-    )
+def _install_single_snapshot_fixture(monkeypatch, snapshot) -> None:
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
 
 
 @dataclass
@@ -302,71 +274,6 @@ def config(tmp_path):
             funding_new_entries_enabled=True,
         ),
     )
-
-
-@pytest.mark.asyncio
-async def test_entry_preparation_survives_candidate_revision_churn(
-    config,
-    tmp_journal,
-    monkeypatch,
-):
-    """Raw private/catalog evidence must not be keyed by volatile economics."""
-    from lightfee.sidecar.snapshot import CandidateInput
-
-    runtime = LiveRuntime(config, venue_adapters={})
-    runtime.journal = tmp_journal
-    candidate = CandidateInput(
-        long_venue="binance",
-        short_venue="okx",
-        symbol="BTCUSDT",
-        funding_diff_bps=10.0,
-        funding_edge_bps=8.0,
-        expected_edge_bps=5.0,
-        worst_case_edge_bps=2.0,
-        ranking_edge_bps=8.0,
-        entry_notional_quote=15.0,
-        candidate_revision_id="revision-0",
-    )
-    catalog_calls = 0
-
-    async def slow_catalog(candidates):
-        nonlocal catalog_calls
-        catalog_calls += 1
-        await asyncio.sleep(0.10)
-        return list(candidates)
-
-    async def cached_balance(candidates, **_kwargs):
-        return list(candidates)
-
-    monkeypatch.setattr(
-        runtime,
-        "_filter_candidates_supported_by_venue_catalog",
-        slow_catalog,
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_filter_candidates_by_entry_balance_admission",
-        cached_balance,
-    )
-    monkeypatch.setattr(
-        runtime,
-        "_filter_candidates_by_entry_admission",
-        lambda candidates, **_kwargs: list(candidates),
-    )
-
-    assert await runtime._entry_preparation_for_tick([candidate], snapshot=None) is None
-    for revision in range(1, 5):
-        await asyncio.sleep(0.025)
-        candidate.candidate_revision_id = f"revision-{revision}"
-        candidate.entry_notional_quote = 15.0 + revision
-        result = await runtime._entry_preparation_for_tick(
-            [candidate],
-            snapshot=None,
-        )
-
-    assert result is not None
-    assert result["allowed_pair_ids"] == {runtime._candidate_pair_id(candidate)}
-    assert catalog_calls == 1
 
 
 @pytest.fixture
@@ -2134,10 +2041,6 @@ class TestPlannerDispatchIntegration:
             short_funding_timestamp_ms=605_000,
             economics_complete=True,
             economics_observed_at_ms=1_000,
-            # This helper represents a complete v3 sidecar candidate.  An
-            # explicit zero is a valid configured fee tier; an omitted field
-            # is intentionally covered by the dedicated rejection test.
-            taker_fee_evidence_complete=True,
             ), now_ms=5_000)
 
     @pytest.mark.asyncio
@@ -2236,7 +2139,7 @@ class TestPlannerDispatchIntegration:
         assert policy_events[-1]["reason"] == "funding_calculation_version_mismatch"
 
     @pytest.mark.asyncio
-    async def test_live_dispatch_rejects_candidate_without_taker_fee_evidence(
+    async def test_live_dispatch_does_not_require_legacy_taker_fee_evidence(
         self,
         config,
         tmp_journal,
@@ -2246,7 +2149,6 @@ class TestPlannerDispatchIntegration:
         runtime = LiveRuntime(config, venue_adapters={})
         runtime.journal = tmp_journal
         candidate = self._candidate()
-        candidate.taker_fee_evidence_complete = False
 
         dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
 
@@ -2256,7 +2158,10 @@ class TestPlannerDispatchIntegration:
             for record in tmp_journal.read_all()
             if record["kind"] == "runtime.entry_blocked_entry_policy"
         ]
-        assert policy_events[-1]["reason"] == "missing_taker_fee_evidence"
+        assert all(
+            event.get("reason") != "missing_taker_fee_evidence"
+            for event in policy_events
+        )
 
     @pytest.mark.asyncio
     async def test_live_dispatch_rebuilds_enhanced_forecast_readiness_from_evidence(
@@ -2274,7 +2179,6 @@ class TestPlannerDispatchIntegration:
         candidate = self._candidate()
         candidate.calculation_version = "enhanced_live"
         candidate.model_epoch = "enhanced_live"
-        candidate.taker_fee_evidence_complete = True
         candidate.forecast_ready = True
         candidate.forecast_confidence = 1.0
         candidate.forecast_sample_count = 0
@@ -2307,7 +2211,6 @@ class TestPlannerDispatchIntegration:
         candidate = self._candidate()
         candidate.calculation_version = "enhanced_live"
         candidate.model_epoch = "enhanced_live"
-        candidate.taker_fee_evidence_complete = True
         candidate.forecast_ready = True
         candidate.forecast_confidence = 1.0
         candidate.forecast_sample_count = 1
@@ -2679,12 +2582,7 @@ class TestPlannerDispatchIntegration:
         self, config, tmp_journal, monkeypatch,
     ):
         class CompleteAccountTruthAdapter(FakeVenueAdapter):
-            position_calls = 0
             open_order_calls = 0
-
-            async def fetch_all_positions(self):
-                self.position_calls += 1
-                return []
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 self.open_order_calls += 1
@@ -2693,7 +2591,7 @@ class TestPlannerDispatchIntegration:
         class BrokenNonTargetAdapter(FakeVenueAdapter):
             position_calls = 0
 
-            async def fetch_all_positions(self):
+            async def fetch_position(self, symbol: str):
                 self.position_calls += 1
                 raise RuntimeError("non-target venue must not be probed")
 
@@ -2716,7 +2614,7 @@ class TestPlannerDispatchIntegration:
             )
             is True
         )
-        assert adapters[Venue.BINANCE].position_calls == 1
+        assert adapters[Venue.BINANCE].fetch_position_call_count == 1
         assert adapters[Venue.OKX].open_order_calls == 1
         assert adapters[Venue.ASTER].position_calls == 0
         assert runtime.journal.read_all() == []
@@ -2788,10 +2686,17 @@ class TestPlannerDispatchIntegration:
             position_calls = 0
             open_order_calls = 0
 
-            async def fetch_all_positions(self):
+            async def fetch_position(self, symbol: str):
                 self.position_calls += 1
                 await release.wait()
-                return []
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1_000,
+                )
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 self.open_order_calls += 1
@@ -2830,9 +2735,9 @@ class TestPlannerDispatchIntegration:
         self, config, tmp_journal,
     ):
         class SlowAccountTruthAdapter(FakeVenueAdapter):
-            async def fetch_all_positions(self):
+            async def fetch_position(self, symbol: str):
                 await asyncio.sleep(0.05)
-                return []
+                return await super().fetch_position(symbol)
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 return []
@@ -2846,7 +2751,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.runtime.live_recovery_rest_probe_timeout_ms = 60_000
-        config.runtime.entry_account_truth_probe_timeout_ms = 1
+        config.runtime.entry_account_truth_per_venue_timeout_ms = 1
         runtime = LiveRuntime(
             config,
             venue_adapters={
@@ -2885,16 +2790,16 @@ class TestPlannerDispatchIntegration:
         assert "open_orders" not in summaries[Venue.OKX.value]
 
     @pytest.mark.asyncio
-    async def test_tick_continues_to_clean_rank_two_after_rank_one_truth_timeout(
+    async def test_tick_continues_to_clean_rank_two_after_rank_one_truth_timeout_and_incomplete_broad_frontier(
         self, config, tmp_journal, monkeypatch,
     ):
         from lightfee.marketdata.ws_bbo import TopBookQuote
         from lightfee.sidecar.snapshot import QuoteSnapshot, SidecarSnapshot
 
         class SlowAccountTruthAdapter(FakeVenueAdapter):
-            async def fetch_all_positions(self):
+            async def fetch_position(self, symbol: str):
                 await asyncio.sleep(0.05)
-                return []
+                return await super().fetch_position(symbol)
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 return []
@@ -2931,7 +2836,7 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.runtime.sidecar_snapshot_max_age_ms = 10_000
         config.runtime.max_market_age_ms = 10_000
-        config.runtime.entry_account_truth_probe_timeout_ms = 1
+        config.runtime.entry_account_truth_per_venue_timeout_ms = 1
         rank_one = self._candidate("BTCUSDT")
         rank_two = self._candidate("ETHUSDT")
         rank_two.long_venue = "aster"
@@ -2953,6 +2858,9 @@ class TestPlannerDispatchIntegration:
         snapshot = SidecarSnapshot(
             published_at_ms=7_000,
             market_observed_at_ms=7_000,
+            candidate_build_diagnostics={
+                "source_data_ready": True,
+            },
             candidates=[rank_one, rank_two],
             quotes={
                 f"{venue}:{symbol}": quote(venue, symbol)
@@ -2993,7 +2901,7 @@ class TestPlannerDispatchIntegration:
             return True
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
-        _install_v6_snapshot_fixture(monkeypatch, snapshot)
+        _install_single_snapshot_fixture(monkeypatch, snapshot)
         monkeypatch.setattr(
             "lightfee.engine.runtime.discover_tradeable_candidates",
             lambda candidates, _strategy, _now_ms, **_kwargs: list(candidates),
@@ -3035,21 +2943,152 @@ class TestPlannerDispatchIntegration:
         assert runtime.state.last_scan["dispatched_candidate_count"] == 1
 
     @pytest.mark.asyncio
+    async def test_restart_first_oi_failure_skips_only_rank_one_candidate(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
+
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.last_scan = {}
+        rank_one = self._candidate("BTCUSDT")
+        rank_two = self._candidate("ETHUSDT")
+
+        restarted = EntryOpenInterestRefresher(targeted_budget_s=0.01)
+        runtime.entry_open_interest_refresher = restarted
+        assert restarted.cached_open_interest(
+            "binance", "BTCUSDT", now_ms=7_001
+        ) is None
+
+        async def passthrough(candidates, **_kwargs):
+            return list(candidates)
+
+        async def quote_truth(candidates, **_kwargs):
+            return {}, {"resolved_count": len(candidates)}
+
+        oi_symbols: list[str] = []
+
+        async def refresh_oi(candidates, **_kwargs):
+            symbol = candidates[0].symbol
+            oi_symbols.append(symbol)
+            if symbol == "BTCUSDT":
+                raise asyncio.TimeoutError("restart on-demand OI unavailable")
+            return {"resolved_count": 1, "timeout_count": 0}
+
+        async def account_ready(_candidate):
+            return True, False, ""
+
+        dispatched_symbols: list[str] = []
+
+        async def dispatch(candidate, *_args, **_kwargs):
+            dispatched_symbols.append(candidate.symbol)
+            return True
+
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_supported_by_venue_catalog",
+            passthrough,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_admission",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_balance_admission",
+            passthrough,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_effective_readiness_provider_uses_ws_bbo",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_local_l2_effective_enabled",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_quote_revalidate_for_candidates",
+            quote_truth,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_refresh_entry_candidate_open_interest_evidence",
+            refresh_oi,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_snapshot_freshness",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_quote_truth_market_quotes",
+            lambda *_args, **_kwargs: {},
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_reprice_entry_candidates_for_selection",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_select_entry_candidates",
+            lambda candidates, **_kwargs: list(candidates[:1]),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_account_truth_dispatch_readiness",
+            account_ready,
+        )
+        monkeypatch.setattr(runtime, "_dispatch_entry", dispatch)
+
+        try:
+            await runtime._run_ranked_candidate_entry_flow(
+                [rank_one, rank_two],
+                snapshot=SimpleNamespace(quotes={}),
+                price_hints={},
+            )
+        finally:
+            await restarted.close()
+
+        assert oi_symbols == ["BTCUSDT", "ETHUSDT"]
+        assert dispatched_symbols == ["ETHUSDT"]
+        assert runtime.state.last_scan["ranked_candidate_checked_count"] == 2
+        failures = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_candidate_revalidation_failed"
+        ]
+        assert failures == [
+            {
+                "pair_id": runtime._candidate_pair_id(rank_one),
+                "domain": "open_interest",
+                "error": "TimeoutError: restart on-demand OI unavailable",
+                "ts_ms": failures[0]["ts_ms"],
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_entry_account_truth_live_artifact_refreshes_global_recovery(
         self, config, tmp_journal, monkeypatch,
     ):
         class LivePositionAccountTruthAdapter(FakeVenueAdapter):
-            async def fetch_all_positions(self):
-                return [
-                    PositionSnapshot(
-                        venue=Venue.BINANCE,
-                        symbol="BTCUSDT",
-                        side=Side.BUY,
-                        quantity=0.5,
-                        entry_price=50_000.0,
-                        observed_at_ms=7_001,
-                    )
-                ]
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.5,
+                    entry_price=50_000.0,
+                    observed_at_ms=7_001,
+                )
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 return []
@@ -3091,7 +3130,7 @@ class TestPlannerDispatchIntegration:
         )
 
     @pytest.mark.asyncio
-    async def test_tick_refreshes_account_truth_before_dispatch(
+    async def test_tick_uses_target_truth_without_waiting_for_global_refresh(
         self, config, tmp_journal, monkeypatch,
     ):
         from lightfee.marketdata.ws_bbo import TopBookQuote
@@ -3192,7 +3231,7 @@ class TestPlannerDispatchIntegration:
             return list(candidates)
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
-        _install_v6_snapshot_fixture(monkeypatch, snapshot)
+        _install_single_snapshot_fixture(monkeypatch, snapshot)
         monkeypatch.setattr(
             "lightfee.engine.runtime.discover_tradeable_candidates",
             lambda candidates, _strategy, _now_ms, **_kwargs: list(candidates),
@@ -3215,7 +3254,7 @@ class TestPlannerDispatchIntegration:
 
         await runtime.tick()
 
-        assert order[:2] == ["refresh", "dispatch"]
+        assert order == ["dispatch"]
         assert runtime._entry_account_truth_generation is None
         assert runtime._entry_account_truth_ready_at_ms == 0
         assert runtime._entry_account_truth_venue_receipts == {}
@@ -3457,19 +3496,6 @@ class TestPlannerDispatchIntegration:
             config,
             venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
         )
-        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
-            lambda *_args, **_kwargs: SimpleNamespace(
-                expected_shortfall_bps=10.0,
-                sample_count=120,
-                return_count=119,
-                history_ms=300_000,
-                confidence=0.95,
-                evidence_complete=True,
-                reason="",
-                model_version="test",
-            )
-        )
-        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
         config.strategy.max_concurrent_positions_per_symbol = 0
         runtime.journal = tmp_journal
         runtime.entry_executor = self._capturing_executor()
@@ -3551,7 +3577,6 @@ class TestPlannerDispatchIntegration:
         config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_local_l2_book_stale_after_ms = 1_000
-        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
         quantity_metadata = {
             "min_notional": 10.0,
             "min_quantity": 0.0001,
@@ -3624,18 +3649,6 @@ class TestPlannerDispatchIntegration:
         monkeypatch.setattr(runtime, "_entry_wall_clock_now_ms", lambda: 5_000)
         runtime.journal = tmp_journal
         runtime.entry_executor = self._capturing_executor()
-        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
-            lambda *_args, **_kwargs: SimpleNamespace(
-                expected_shortfall_bps=10.0,
-                sample_count=120,
-                return_count=119,
-                history_ms=300_000,
-                confidence=0.95,
-                evidence_complete=True,
-                reason="",
-                model_version="test",
-            )
-        )
         self._install_hot_book(
             runtime, "binance", "BTCUSDT",
             bid=50_000.0, ask=50_010.0, observed_at_ms=5_000,
@@ -4688,6 +4701,138 @@ class TestPlannerDispatchIntegration:
         assert evidence["short_bid_size"] == pytest.approx(3.5)
         assert evidence["short_ask_size"] == pytest.approx(4.75)
 
+    def test_ws_bbo_execution_and_final_lease_block_candidate_revision_mismatch(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from dataclasses import replace
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_final_gate_max_skew_ms = 250
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        oi_revision_id = candidate.entry_open_interest_evidence["candidate_revision_id"]
+        candidate.candidate_revision_id = ""
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="okx_bbo_ws",
+            )
+        )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 2500)
+        assert readiness.allowed
+        pair_id = runtime._candidate_pair_id(candidate)
+        lease = runtime.entry_readiness_provider.get_lease(pair_id)
+        assert lease.candidate_revision_id == ""
+        stale_lease = replace(
+            lease,
+            candidate_revision_id="stale-quote-lease-revision",
+        )
+        runtime.entry_readiness_provider._leases[pair_id] = stale_lease
+
+        reason, checked_lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            2500,
+        )
+
+        assert reason == "quote_lease_candidate_revision_mismatch"
+        assert checked_lease is stale_lease
+        assert evidence["candidate_revision_id"]
+        assert evidence["candidate_revision_id"] != oi_revision_id
+        assert evidence["lease_candidate_revision_id"] == "stale-quote-lease-revision"
+        assert (
+            runtime._final_quote_lease_reason(candidate, stale_lease, 2500)
+            == "final_quote_lease_candidate_revision_mismatch"
+        )
+
+    def test_ws_bbo_execution_and_final_lease_allow_legacy_empty_revision(
+        self,
+        config,
+        tmp_journal,
+    ):
+        from lightfee.marketdata.ws_bbo import TopBookQuote
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_final_gate_max_skew_ms = 250
+        runtime = LiveRuntime(config)
+        runtime.journal = tmp_journal
+        candidate = self._candidate()
+        candidate.candidate_revision_id = ""
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=50000.0,
+                ask=50010.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="binance_bbo_ws",
+            )
+        )
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue="okx",
+                symbol="BTCUSDT",
+                bid=49990.0,
+                ask=50000.0,
+                bid_size=10.0,
+                ask_size=10.0,
+                observed_at_ms=2500,
+                received_at_ms=2500,
+                source="okx_bbo_ws",
+            )
+        )
+        readiness = runtime.entry_readiness_provider.decide(candidate, 2500)
+        assert readiness.allowed
+        lease = runtime.entry_readiness_provider.get_lease(
+            runtime._candidate_pair_id(candidate)
+        )
+        assert lease.candidate_revision_id == ""
+
+        reason, checked_lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            2500,
+        )
+
+        assert reason == ""
+        assert checked_lease is lease
+        assert evidence["candidate_revision_id"]
+        assert evidence["lease_candidate_revision_id"] == ""
+        assert runtime._final_quote_lease_reason(candidate, lease, 2500) == ""
+
     def test_ws_bbo_execution_lease_blocks_insufficient_side_capacity(
         self,
         config,
@@ -4771,7 +4916,6 @@ class TestPlannerDispatchIntegration:
         config.strategy.entry_final_gate_max_skew_ms = 250
         config.strategy.min_expected_edge_bps = 0.0
         config.strategy.min_worst_case_edge_bps = 0.0
-        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
         config.strategy.max_single_venue_exposure_quote = 10_000.0
         config.strategy.max_symbol_exposure_quote = 10_000.0
         config.strategy.funding_max_venue_pair_exposure_quote = 10_000.0
@@ -4787,20 +4931,6 @@ class TestPlannerDispatchIntegration:
         runtime._entry_wall_clock_now_ms = lambda: 5000
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        monkeypatch.setattr(
-            runtime.funding_risk_runtime,
-            "estimate_candidate",
-            lambda *_args, **_kwargs: SimpleNamespace(
-                expected_shortfall_bps=1.0,
-                sample_count=120,
-                return_count=119,
-                history_ms=300_000,
-                confidence=1.0,
-                evidence_complete=True,
-                reason="",
-                model_version="test",
-            ),
-        )
         candidate = self._candidate()
         candidate.entry_maker_leg = "long"
         candidate.entry_target_quantity = 1.0
@@ -5916,7 +6046,7 @@ class TestPlannerDispatchIntegration:
         assert short_failure["min_notional_quote"] == pytest.approx(100.0)
 
     @pytest.mark.asyncio
-    async def test_passive_canary_resize_rebuilds_l2_for_new_quantity_before_revalidation(
+    async def test_passive_entry_keeps_planned_quantity_without_canary_resize(
         self,
         config,
         tmp_journal,
@@ -5931,7 +6061,6 @@ class TestPlannerDispatchIntegration:
         config.strategy.max_liquidity_snapshot_age_ms = 1_000
         config.strategy.min_entry_leg_notional_quote = 1.0
         config.strategy.maker_initial_slice_ratio = 0.2
-        config.strategy.funding_expected_shortfall_budget_quote = 1_000.0
         config.strategy.max_single_venue_exposure_quote = 10_000.0
         config.strategy.max_symbol_exposure_quote = 10_000.0
         config.strategy.funding_max_venue_pair_exposure_quote = 10_000.0
@@ -6038,18 +6167,6 @@ class TestPlannerDispatchIntegration:
             "_resolve_entry_quantity_steps",
             fixed_quantity_resolution,
         )
-        runtime.funding_risk_runtime.estimate_candidate = (  # type: ignore[method-assign]
-            lambda *_args, **_kwargs: SimpleNamespace(
-                expected_shortfall_bps=1.0,
-                sample_count=100,
-                return_count=99,
-                history_ms=300_000,
-                confidence=1.0,
-                evidence_complete=True,
-                reason="",
-                model_version="test",
-            )
-        )
 
         async def leverage_inspection(**_kwargs):
             return True, {}
@@ -6086,26 +6203,6 @@ class TestPlannerDispatchIntegration:
         )
         monkeypatch.setattr(dispatch, "_final_quote_lease_reason", lambda *_: "")
 
-        clamp_calls = 0
-
-        def clamp(_candidate, _now_ms, *, quantity, **_kwargs):
-            nonlocal clamp_calls
-            clamp_calls += 1
-            return (quantity, "") if clamp_calls == 1 else (0.5, "")
-
-        monkeypatch.setattr(dispatch, "_funding_canary_clamp_quantity", clamp)
-        original_l2_builder = dispatch._local_l2_final_quote_lease
-        rebuilt_quantities: list[float] = []
-
-        def rebuilding_l2(candidate_arg, now_ms_arg, *, target_quantity=None):
-            rebuilt_quantities.append(float(target_quantity or 0.0))
-            return original_l2_builder(
-                candidate_arg,
-                now_ms_arg,
-                target_quantity=target_quantity,
-            )
-
-        monkeypatch.setattr(dispatch, "_local_l2_final_quote_lease", rebuilding_l2)
         revalidations: list[tuple[str, float, float]] = []
 
         def revalidate(*, quote_lease, required_base_quantity, source, **_kwargs):
@@ -6143,16 +6240,11 @@ class TestPlannerDispatchIntegration:
             )
             for record in tmp_journal.read_all()
         ]
-        assert rebuilt_quantities == [pytest.approx(0.5)]
-        assert (
-            "final_passive_reprice_canary",
-            pytest.approx(0.5),
-            pytest.approx(0.5),
-        ) in revalidations
+        assert all("canary" not in source for source, _, _ in revalidations)
         assert executor.ctx is not None
-        assert candidate.entry_target_quantity == pytest.approx(0.5)
-        assert candidate.entry_notional_quote == pytest.approx(50.0)
-        assert candidate.entry_max_leg_notional_quote == pytest.approx(50.5)
+        assert candidate.entry_target_quantity == pytest.approx(1.0)
+        assert candidate.entry_notional_quote == pytest.approx(100.0)
+        assert candidate.entry_max_leg_notional_quote == pytest.approx(101.0)
         assert candidate.expected_profit_quote == pytest.approx(
             candidate.entry_notional_quote * candidate.expected_edge_bps / 10_000.0
         )
@@ -6823,8 +6915,8 @@ class TestPlannerDispatchIntegration:
         assert selected["payload"]["funding_timestamp_ms"] == first_funding_ms
         assert selected["payload"]["second_funding_timestamp_ms"] == second_funding_ms
 
-    def test_entry_context_records_only_dispatch_provided_es_for_live_sized_candidate(self, config, tmp_journal):
-        """Entry context persists the dispatch model evidence, never a config guess."""
+    def test_entry_context_keeps_retired_es_field_neutral_for_new_entries(self, config, tmp_journal):
+        """New entries must not carry a retired ES admission value into recovery state."""
         from lightfee.engine.entry import EntryType
         from lightfee.sidecar.snapshot import CandidateInput
 
@@ -6874,7 +6966,7 @@ class TestPlannerDispatchIntegration:
                 now_ms=1_000,
                 expected_shortfall_bps_entry=12.5,
             ).expected_shortfall_bps_entry
-            == pytest.approx(12.5)
+            == 0.0
         )
 
     @pytest.mark.asyncio

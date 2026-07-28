@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import os
 import signal
 import sys
 from collections.abc import Callable
@@ -64,7 +63,6 @@ async def _run(
 ) -> None:
     stop_event = asyncio.Event()
     cleanup_shutdown_handlers = install_shutdown_handlers(stop_event)
-    bbo_task: asyncio.Task[None] | None = None
     loop = asyncio.get_running_loop()
     refresh_interval_s = max(float(refresh_interval_s), 0.0)
 
@@ -78,8 +76,6 @@ async def _run(
         stop_task = asyncio.create_task(stop_event.wait())
         try:
             waiters: set[asyncio.Task] = {refresh_task, stop_task}
-            if bbo_task is not None:
-                waiters.add(bbo_task)
             done, _pending = await asyncio.wait(
                 waiters,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -92,14 +88,6 @@ async def _run(
                     except asyncio.CancelledError:
                         pass
                 return False
-            if bbo_task is not None and bbo_task in done:
-                if not refresh_task.done():
-                    refresh_task.cancel()
-                    try:
-                        await refresh_task
-                    except asyncio.CancelledError:
-                        pass
-                await bbo_task
             await refresh_task
             return True
         except asyncio.CancelledError:
@@ -122,13 +110,6 @@ async def _run(
         if once:
             await refresh_once_until_stop()
             return
-        bbo_runner = getattr(service, "run_spread_bbo_data_plane", None)
-        embedded_bbo_enabled = bool(getattr(service, "embedded_spread_bbo_enabled", True))
-        if embedded_bbo_enabled and callable(bbo_runner):
-            bbo_task = asyncio.create_task(bbo_runner(stop_event))
-            # Establish compact-snapshot ownership before the slower metadata
-            # loop can publish its one-shot compatibility view.
-            await asyncio.sleep(0)
         # A full refresh's deadline is measured from its start.  The old loop
         # slept for a full interval after refresh work completed, so a 2s
         # refresh plus a 3s interval published at ~5s and regularly exceeded
@@ -166,32 +147,9 @@ async def _run(
                 if isinstance(republish_event, asyncio.Event)
                 else None
             )
-            if bbo_task is None:
-                try:
-                    stop_task = asyncio.create_task(stop_event.wait())
-                    waiters = {stop_task}
-                    if republish_task is not None:
-                        waiters.add(republish_task)
-                    done, _pending = await asyncio.wait(
-                        waiters,
-                        timeout=wait_timeout_s,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if republish_task is not None and republish_task in done:
-                        republish_event.clear()
-                        cache_only_next = True
-                        continue
-                    if stop_task not in done:
-                        continue
-                    break
-                finally:
-                    for task in (stop_task, republish_task):
-                        if task is not None and not task.done():
-                            task.cancel()
-                            await asyncio.gather(task, return_exceptions=True)
             try:
                 stop_task = asyncio.create_task(stop_event.wait())
-                waiters = {stop_task, bbo_task}
+                waiters = {stop_task}
                 if republish_task is not None:
                     waiters.add(republish_task)
                 done, _pending = await asyncio.wait(
@@ -203,8 +161,6 @@ async def _run(
                     republish_event.clear()
                     cache_only_next = True
                     continue
-                if bbo_task in done:
-                    await bbo_task
                 if stop_task in done:
                     break
             finally:
@@ -214,11 +170,6 @@ async def _run(
                         await asyncio.gather(task, return_exceptions=True)
     finally:
         stop_event.set()
-        if bbo_task is not None:
-            if not bbo_task.done():
-                await bbo_task
-            else:
-                bbo_task.exception()
         cleanup_shutdown_handlers()
         await service.close()
 
@@ -237,12 +188,7 @@ def main() -> None:
 
     logger.info("loading config from %s", args.config)
     config = load_config(args.config)
-    external_spread_bbo = os.environ.get("LIGHTFEE_EXTERNAL_SPREAD_BBO", "") == "1"
-    service = (
-        SidecarService(config, enable_spread_bbo=False)
-        if external_spread_bbo
-        else SidecarService(config)
-    )
+    service = SidecarService(config)
 
     asyncio.run(
         _run(

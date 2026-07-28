@@ -318,7 +318,11 @@ def start_hyperliquid_private_ws(transport, symbols: list[str]) -> None:
     base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _hyperliquid_ws_url_from_base_url(base_url)
     private_state = transport._private_ws_state
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    # Hyperliquid userEvents/orderUpdates are account-wide.  The shared map
+    # lets the existing worker decode a newly tracked coin without reconnect.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
 
     task = asyncio.create_task(
         _hyperliquid_private_ws_loop(

@@ -414,9 +414,6 @@ def test_collect_evidence_uses_seven_private_read_paths_and_binds_symbol_coverag
     }
     config = SimpleNamespace(
         symbols=["BTCUSDT", "ETHUSDT"],
-        strategy=SimpleNamespace(
-            funding_canary_allowed_venues=[venue.value for venue in adapters]
-        ),
     )
     monkeypatch.setattr(refresh_module, "load_config", lambda _: config)
     monkeypatch.setattr(refresh_module, "build_adapter_map", lambda _: adapters)
@@ -426,6 +423,7 @@ def test_collect_evidence_uses_seven_private_read_paths_and_binds_symbol_coverag
             "ignored.toml",
             now_ms=NOW_MS,
             clock_ms=lambda: NOW_MS + 6_000,
+            requested_venues=set(adapters),
         )
     )
 
@@ -467,7 +465,36 @@ def test_collect_evidence_uses_seven_private_read_paths_and_binds_symbol_coverag
     assert all("instId" not in call["params"] for call in okx_fee_calls)
 
 
-def test_refresh_main_resolves_default_output_from_loaded_config_root(
+def test_collect_evidence_loads_current_example_config_without_canary_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline venue selection is explicit and independent of RuntimeConfig."""
+    calls: list[dict[str, object]] = []
+    shutdowns: list[str] = []
+    adapter = _FakeAdapter(Venue.BINANCE, calls, shutdowns)
+    example = Path(__file__).parents[2] / "config" / "live.example.toml"
+
+    monkeypatch.setattr(
+        refresh_module,
+        "build_adapter_map",
+        lambda _config: {Venue.BINANCE: adapter},
+    )
+
+    rows, failures, requested = asyncio.run(
+        collect_evidence(
+            str(example),
+            now_ms=NOW_MS,
+            requested_venues={Venue.BINANCE},
+        )
+    )
+
+    assert failures == {}
+    assert requested == {"binance"}
+    assert rows["binance"]["covered_symbols"]
+    assert shutdowns == ["binance"]
+
+
+def test_refresh_main_accepts_explicit_offline_output_without_production_config_field(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -483,7 +510,6 @@ symbols = ["BTCUSDT"]
 
 [runtime]
 mode = "paper"
-funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
 """,
         encoding="utf-8",
     )
@@ -524,7 +550,11 @@ funding_fee_evidence_path = "runtime/funding-account-fee-evidence.json"
         return {}, {}, {"binance"}
 
     monkeypatch.chdir(other_cwd)
-    monkeypatch.setattr(sys, "argv", ["refresh", "--config", str(path)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["refresh", "--config", str(path), "--output", str(output)],
+    )
     monkeypatch.setattr(refresh_module.time, "time", lambda: NOW_MS / 1000)
     monkeypatch.setattr(refresh_module, "collect_evidence", no_fresh_collect)
 

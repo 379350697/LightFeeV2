@@ -52,9 +52,6 @@ class MarketDataRuntimeContext(RuntimeCommonContext, Protocol):
     def local_l2_runtime(self) -> Any: ...
 
     @property
-    def funding_risk_runtime(self) -> Any: ...
-
-    @property
     def ws_bbo_cache(self) -> Any: ...
 
     @property

@@ -215,6 +215,30 @@ def _build_gate_contract_multiplier_map(transport, symbol_map: dict[str, str]) -
     return result
 
 
+def _build_gate_private_subscribe_messages(
+    api_key: str,
+    api_secret: str,
+    contract_list: list[str],
+) -> list[str]:
+    """Build the signed order and position subscriptions for given contracts."""
+    now_s = int(_now_ms() / 1000)
+    messages: list[str] = []
+    for channel in ("futures.orders", "futures.positions"):
+        auth = _gate_ws_auth(api_key, api_secret, channel, "subscribe", now_s)
+        messages.append(
+            json.dumps(
+                {
+                    "time": now_s,
+                    "channel": channel,
+                    "event": "subscribe",
+                    "payload": contract_list,
+                    "auth": auth,
+                }
+            )
+        )
+    return messages
+
+
 async def _gate_private_ws_loop(
     transport,
     api_key: str,
@@ -244,32 +268,15 @@ async def _gate_private_ws_loop(
 
         transport.record_private_ws_success(_now_ms())
 
-        # Build signed subscriptions
-        now_s = int(_now_ms() / 1000)
-        orders_auth = _gate_ws_auth(api_key, api_secret, "futures.orders", "subscribe", now_s)
-        positions_auth = _gate_ws_auth(api_key, api_secret, "futures.positions", "subscribe", now_s)
-        contract_list = list(symbol_map.keys())
-
-        orders_sub = json.dumps({
-            "time": now_s,
-            "channel": "futures.orders",
-            "event": "subscribe",
-            "payload": contract_list,
-            "auth": orders_auth,
-        })
-        positions_sub = json.dumps({
-            "time": now_s,
-            "channel": "futures.positions",
-            "event": "subscribe",
-            "payload": contract_list,
-            "auth": positions_auth,
-        })
-
         # Send subscriptions
         send_ok = False
         try:
-            await ws.send(orders_sub)
-            await ws.send(positions_sub)
+            for message in _build_gate_private_subscribe_messages(
+                api_key,
+                api_secret,
+                sorted(symbol_map),
+            ):
+                await ws.send(message)
             send_ok = True
         except Exception as e:
             transport.record_private_ws_failure(
@@ -297,6 +304,22 @@ async def _gate_private_ws_loop(
 
         try:
             while True:
+                consume_updates = getattr(
+                    transport,
+                    "consume_private_ws_symbol_updates",
+                    None,
+                )
+                updates = consume_updates() if callable(consume_updates) else {}
+                if updates:
+                    contract_multiplier_map.update(
+                        _build_gate_contract_multiplier_map(transport, updates)
+                    )
+                    for update_message in _build_gate_private_subscribe_messages(
+                        api_key,
+                        api_secret,
+                        sorted(updates),
+                    ):
+                        await ws.send(update_message)
                 try:
                     message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -348,7 +371,11 @@ def start_gate_private_ws(transport, symbols: list[str]) -> None:
     base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _gate_ws_url(base_url)
     private_state = transport._private_ws_state
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    # Gate subscriptions are instrument-scoped.  The worker retains this map
+    # and receives additions through in-band signed subscribe messages.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
     contract_multiplier_map = _build_gate_contract_multiplier_map(transport, symbol_map)
 
     task = asyncio.create_task(

@@ -31,6 +31,10 @@ from lightfee.strategy.fee_evidence import (
 from lightfee.venues.registry import build_adapter_map
 
 
+_DEFAULT_OUTPUT_PATH = "runtime/funding-account-fee-evidence.json"
+_DEFAULT_MAX_AGE_MS = 5 * 24 * 60 * 60 * 1000
+
+
 ACCOUNT_FEE_API_VENUES = frozenset(
     {
         Venue.ASTER,
@@ -42,6 +46,24 @@ ACCOUNT_FEE_API_VENUES = frozenset(
         Venue.OKX,
     }
 )
+
+
+def _parse_requested_venues(value: str) -> set[Venue]:
+    """Parse the offline collector scope without consulting live strategy config."""
+    names = [item.strip() for item in str(value or "").split(",") if item.strip()]
+    if not names:
+        raise ValueError("at least one offline fee venue is required")
+    try:
+        requested = {Venue.from_str(name) for name in names}
+    except ValueError as exc:
+        raise ValueError(f"invalid offline fee venue: {exc}") from exc
+    unsupported = requested - ACCOUNT_FEE_API_VENUES
+    if unsupported:
+        raise ValueError(
+            "offline fee venue has no account-fee collector: "
+            + ",".join(sorted(venue.value for venue in unsupported))
+        )
+    return requested
 
 
 def _rate(value: object, *, field: str) -> float:
@@ -411,19 +433,15 @@ async def collect_evidence(
     config_path: str,
     *,
     now_ms: int,
+    requested_venues: set[Venue],
     clock_ms: Callable[[], int] | None = None,
 ) -> tuple[dict[str, dict[str, object]], dict[str, str], set[str]]:
     receipt_clock_ms = clock_ms or (lambda: int(time.time() * 1000))
     config = load_config(config_path)
-    requested = {
-        Venue.from_str(str(venue))
-        for venue in config.strategy.funding_canary_allowed_venues
-        if str(venue).strip()
-    }
-    exact_venues = requested & ACCOUNT_FEE_API_VENUES
+    exact_venues = set(requested_venues) & ACCOUNT_FEE_API_VENUES
     if not exact_venues:
         raise ValueError(
-            "no configured canary venue has an account-fee API collector"
+            "no requested offline venue has an account-fee API collector"
         )
     adapters = build_adapter_map(config)
     symbols = sorted(
@@ -743,27 +761,40 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/live.toml")
     parser.add_argument("--output", default="")
+    parser.add_argument(
+        "--venues",
+        default=",".join(sorted(venue.value for venue in ACCOUNT_FEE_API_VENUES)),
+        help="comma-separated offline account-fee venues (default: all supported venues)",
+    )
     args = parser.parse_args()
+    try:
+        requested_venues = _parse_requested_venues(args.venues)
+    except ValueError as exc:
+        parser.error(str(exc))
     config = load_config(args.config)
     output = resolve_config_artifact_path(
         config,
-        args.output or config.runtime.funding_fee_evidence_path,
+        args.output or _DEFAULT_OUTPUT_PATH,
     )
     now_ms = int(time.time() * 1000)
     fresh, failures, requested = asyncio.run(
-        collect_evidence(args.config, now_ms=now_ms)
+        collect_evidence(
+            args.config,
+            now_ms=now_ms,
+            requested_venues=requested_venues,
+        )
     )
     previous = _previous_rows(
         output,
         now_ms=now_ms,
-        max_age_ms=int(config.runtime.funding_fee_evidence_max_age_ms),
+        max_age_ms=_DEFAULT_MAX_AGE_MS,
     )
     venues, reused = merge_evidence_rows(
         fresh,
         previous,
         requested=requested,
         now_ms=now_ms,
-        max_age_ms=int(config.runtime.funding_fee_evidence_max_age_ms),
+        max_age_ms=_DEFAULT_MAX_AGE_MS,
         requested_symbols={
             str(symbol or "").strip().upper()
             for symbol in config.symbols

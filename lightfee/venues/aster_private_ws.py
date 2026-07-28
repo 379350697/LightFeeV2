@@ -634,7 +634,10 @@ def start_aster_private_ws(transport, symbols: list[str]) -> None:
     base_url = transport._spec.private_base_url.rstrip("/")
     ws_base_url = _aster_ws_base_url(base_url)
     private_state = transport._private_ws_state
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
+        setattr(transport, "_private_ws_symbol_map", symbol_map)
 
     task = asyncio.create_task(
         _aster_private_ws_loop(

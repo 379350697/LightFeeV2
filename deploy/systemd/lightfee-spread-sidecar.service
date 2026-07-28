@@ -1,7 +1,7 @@
 [Unit]
 Description=LightFee V2 Spread Reversion Sidecar
-After=network-online.target lightfee-spread-bbo.service
-Wants=network-online.target lightfee-spread-bbo.service
+After=network-online.target lightfee-sidecar.service
+Wants=network-online.target lightfee-sidecar.service
 
 [Service]
 Type=simple

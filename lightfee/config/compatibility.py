@@ -91,7 +91,7 @@ REMOVED_FIELD_MESSAGES: dict[str, str] = {
     "opportunity_source": (
         "removed Chillybot config field: runtime.opportunity_source. "
         "Python LightFee uses exchange-native sources only. "
-        "Remove this field or set opportunity_input_mode = 'sidecar_backed'."
+        "Remove this field; production input is the exchange-native sidecar."
     ),
     "chillybot_api_base": (
         "removed Chillybot config field: runtime.chillybot_api_base. "
@@ -133,20 +133,6 @@ LEGACY_FIELD_ALIASES: dict[str, str] = {
     "stop_loss_quote": "net_stop_loss_quote",
     "profit_target_quote": "profit_take_quote",
 }
-
-# Acceptable opportunity_input_mode values for the Python runtime (CONFIG-003)
-# V1 parity retains coarse_sidecar; single_process_entry is the production default.
-VALID_OPPORTUNITY_INPUT_MODES = frozenset({
-    "single_process_entry",
-    "direct_market",
-    "coarse_sidecar",
-    "sidecar_backed",  # alias for coarse_sidecar (V1 compat)
-    "sidecar_scan",
-    "direct_market_enriched",  # V1: enriched provider with hints and transfer resolution
-    "disabled",
-    "non_parity",
-})
-
 
 def apply_legacy_aliases(raw: dict) -> dict:
     """Transparently rewrite old field names to canonical names in a parsed TOML dict.

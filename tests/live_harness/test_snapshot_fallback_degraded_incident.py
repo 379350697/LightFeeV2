@@ -7,7 +7,6 @@ import pytest
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import Venue
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
@@ -21,17 +20,7 @@ from lightfee.sidecar.snapshot import (
 
 @pytest.fixture(autouse=True)
 def _isolate_non_canary_snapshot_incident(monkeypatch):
-    """This incident suite verifies snapshot semantics, not canary admission."""
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_admission_reason",
-        lambda *_args, **_kwargs: "",
-    )
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_submission_reason",
-        lambda *_args, **_kwargs: "",
-    )
+    """Isolate snapshot semantics from account-truth integration."""
 
     async def complete_account_truth(_runtime):
         return True
@@ -104,7 +93,6 @@ def _candidate(
         economics_observed_at_ms=69_000,
         calculation_version="v1_exact",
         model_epoch="v1_exact",
-        taker_fee_evidence_complete=True,
     )
 
 
@@ -201,14 +189,7 @@ def _runtime(tmp_path) -> LiveRuntime:
 
 async def _run_tick(tmp_path, monkeypatch, snapshot: SidecarSnapshot) -> tuple[LiveRuntime, list[dict]]:
     runtime = _runtime(tmp_path)
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.funding_entry_snapshot_identity",
-        lambda _path: ("test-v6-generation", 1, 1),
-    )
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.load_funding_entry_snapshot",
-        lambda _path: snapshot,
-    )
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
 
     runtime.journal.open()
@@ -277,8 +258,8 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
         if record["kind"] == "runtime.entry_quote_revalidate_failed"
     ]
     assert quote_blocks
-    assert quote_blocks[-1]["payload"]["reason"] == "last_good_sidecar_revalidate_required"
-    assert quote_blocks[-1]["payload"]["source"] == "sidecar_quote"
+    assert quote_blocks[-1]["payload"]["reason"] == "last_good_sidecar"
+    assert quote_blocks[-1]["payload"]["source"] == "entry_quote_truth"
 
 
 @pytest.mark.asyncio
@@ -335,8 +316,13 @@ async def test_degraded_other_symbol_does_not_reject_selected_candidate(
         and record["payload"].get("reason") == "entry_final_revalidation"
         for record in records
     )
-    diagnostics = [record for record in records if record["kind"] == "scan.no_entry_diagnostics"]
-    assert diagnostics and diagnostics[0]["payload"]["reason"] == "no_tradeable_candidates"
+    diagnostics = [
+        record
+        for record in records
+        if record["kind"] == "scan.no_entry_ranked_candidates"
+    ]
+    assert diagnostics
+    assert diagnostics[0]["payload"]["reason"] == "candidate_final_selection_blocked"
 
 
 @pytest.mark.asyncio
@@ -390,25 +376,7 @@ async def test_degraded_selected_required_liquidity_rejects_candidate_and_enters
     assert mon_scope["blocked"] is True
     assert mon_scope["block_reason"] == "perp_liquidity_stale_blocking"
 
-    decision = next(
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.snapshot_freshness_decision"
-    )
-    assert decision["candidate_symbol"] == "MONUSDT"
-    assert decision["candidate_pair_id"] == "monusdt:okx->bybit"
-    assert decision["source_age_ms"] == 69000
-    assert decision["blocked"] is True
-    assert decision["block_reason"] == "perp_liquidity_stale_blocking"
-
-    no_entry = _payload(records, "scan.no_entry_diagnostics")
-    assert no_entry["reason"] == "candidate_snapshot_domain_stale"
-    sample = no_entry["snapshot_freshness_blocked_samples"][0]
-    assert sample["candidate_symbol"] == "MONUSDT"
-    assert sample["candidate_pair_id"] == "monusdt:okx->bybit"
-    assert sample["domain"] == "liquidity"
-    assert sample["venue"] == "okx"
-    assert sample["source_age_ms"] == 69000
-    assert sample["blocked"] is True
-    assert sample["block_reason"] == "perp_liquidity_stale_blocking"
+    no_entry = _payload(records, "scan.no_entry_ranked_candidates")
+    assert no_entry["reason"] == "candidate_market_evidence_unavailable"
+    assert no_entry["checked_candidate_count"] == 1
     assert runtime.entry_executor.contexts == []

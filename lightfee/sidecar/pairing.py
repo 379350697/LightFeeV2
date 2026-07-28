@@ -16,12 +16,7 @@ from lightfee.strategy.candidate_identity import (
     candidate_revision_id as build_candidate_revision_id,
     opportunity_lease_id as build_opportunity_lease_id,
 )
-from lightfee.strategy.fee_evidence import FeeEvidenceBook
-from lightfee.strategy.funding_canary_policy import canary_notional_cap_for_tier
-from lightfee.strategy.discovery import (
-    funding_entry_policy_fingerprint,
-    funding_entry_static_block_reasons,
-)
+from lightfee.strategy.discovery import funding_entry_static_block_reasons
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -38,7 +33,7 @@ class FundingCandidateService:
 
     The public ``build_same_symbol_pairs`` function remains a compatibility
     boundary for tests and tooling.  A running sidecar instead keeps the
-    typed strategy, venue-fee evidence and risk allocator together, so a
+    typed strategy, configured fee floors and risk allocator together, so a
     refresh does not rebuild configuration-derived maps.
     """
 
@@ -50,19 +45,10 @@ class FundingCandidateService:
         venue_maker_fee_bps: dict[str, float],
         venue_notional_caps: dict[str, float],
         passive_execution_enabled: bool,
-        fee_evidence: FeeEvidenceBook | None = None,
-        expected_fee_identity_hashes: dict[str, str] | None = None,
     ) -> None:
         self._strategy = strategy
         self._fee_by_venue = _normalise_venue_bps(venue_fee_bps)
-        self._fee_evidence = fee_evidence
-        self._expected_fee_identity_hashes = expected_fee_identity_hashes
-        self._maker_fee_by_venue = _normalise_venue_bps(
-            venue_maker_fee_bps,
-            allow_negative=bool(
-                fee_evidence is not None and fee_evidence.integrity_verified is True
-            ),
-        )
+        self._maker_fee_by_venue = _normalise_venue_bps(venue_maker_fee_bps)
         self._caps_by_venue = _normalise_venue_bps(venue_notional_caps)
         self._passive_execution_enabled = passive_execution_enabled is True
         self._allocator = StrategyRiskAllocator()
@@ -84,8 +70,6 @@ class FundingCandidateService:
             caps_by_venue=self._caps_by_venue,
             allocator=self._allocator,
             passive_execution_enabled=self._passive_execution_enabled,
-            fee_evidence=self._fee_evidence,
-            expected_fee_identity_hashes=self._expected_fee_identity_hashes,
             observed_at_ms=observed_at_ms,
             diagnostics=diagnostics,
         )
@@ -100,8 +84,6 @@ def build_same_symbol_pairs(
     venue_maker_fee_bps: dict[str, float] | None = None,
     venue_notional_caps: dict[str, float] | None = None,
     passive_execution_enabled: bool = False,
-    fee_evidence: FeeEvidenceBook | None = None,
-    expected_fee_identity_hashes: dict[str, str] | None = None,
     observed_at_ms: int = 0,
     diagnostics: dict[str, object] | None = None,
 ) -> list[CandidateInput]:
@@ -118,102 +100,12 @@ def build_same_symbol_pairs(
         symbols,
         config=strategy if strategy is not None else StrategyConfig(),
         fee_by_venue=_normalise_venue_bps(venue_fee_bps or {}),
-        maker_fee_by_venue=_normalise_venue_bps(
-            venue_maker_fee_bps or {},
-            allow_negative=bool(
-                fee_evidence is not None and fee_evidence.integrity_verified is True
-            ),
-        ),
+        maker_fee_by_venue=_normalise_venue_bps(venue_maker_fee_bps or {}),
         caps_by_venue=_normalise_venue_bps(venue_notional_caps or {}),
         allocator=StrategyRiskAllocator(),
         passive_execution_enabled=passive_execution_enabled is True,
-        fee_evidence=fee_evidence,
-        expected_fee_identity_hashes=expected_fee_identity_hashes,
         observed_at_ms=observed_at_ms,
         diagnostics=diagnostics,
-    )
-
-
-def _pair_fee_assurance(
-    long_q: QuoteSnapshot,
-    short_q: QuoteSnapshot,
-    *,
-    config: StrategyConfig,
-    fee_by_venue: dict[str, float],
-    fee_evidence: FeeEvidenceBook | None,
-    expected_fee_identity_hashes: dict[str, str] | None,
-) -> tuple[str, bool, bool, bool, str]:
-    """Resolve one fee contract shared by frontier and exact evaluation.
-
-    The conservative canary tier deliberately accepts a symbol that was not
-    covered by the latest private-account schedule, provided both configured
-    taker fees are explicit.  It remains conservative because the caller adds
-    the per-unverified-leg buffer, removes that leg's maker discount and
-    applies the smaller notional cap.
-    """
-
-    taker_complete = _taker_fee_evidence_complete(
-        fee_by_venue,
-        long_q.venue,
-        short_q.venue,
-    )
-    long_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            long_q.venue,
-            symbol=long_q.symbol,
-        )
-    )
-    short_authoritative = bool(
-        fee_evidence is not None
-        and fee_evidence.account_authoritative_for(
-            expected_fee_identity_hashes or {},
-            short_q.venue,
-            symbol=short_q.symbol,
-        )
-    )
-    if long_authoritative and short_authoritative:
-        return "account", taker_complete, True, True, ""
-
-    unavailable_reason = "account_fee_evidence_unavailable"
-    if (
-        fee_evidence is not None
-        and fee_evidence.complete_for(long_q.venue, short_q.venue)
-        and expected_fee_identity_hashes is not None
-    ):
-        schedules = (
-            fee_evidence.schedule_for(long_q.venue),
-            fee_evidence.schedule_for(short_q.venue),
-        )
-        symbol = str(long_q.symbol).strip().upper()
-        if any(
-            schedule is not None
-            and schedule.covered_symbols
-            and symbol not in schedule.covered_symbols
-            for schedule in schedules
-        ):
-            unavailable_reason = "account_fee_symbol_coverage_missing"
-        else:
-            unavailable_reason = "account_fee_account_identity_mismatch"
-
-    if (
-        config.funding_canary_require_account_fee_evidence is not True
-        and taker_complete
-    ):
-        return (
-            "conservative",
-            taker_complete,
-            long_authoritative,
-            short_authoritative,
-            unavailable_reason,
-        )
-    return (
-        "unavailable",
-        taker_complete,
-        long_authoritative,
-        short_authoritative,
-        unavailable_reason,
     )
 
 
@@ -227,13 +119,10 @@ def _build_same_symbol_pairs(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
-    fee_evidence: FeeEvidenceBook | None,
-    expected_fee_identity_hashes: dict[str, str] | None,
     observed_at_ms: int,
     diagnostics: dict[str, object] | None,
 ) -> list[CandidateInput]:
     candidates: list[CandidateInput] = []
-    pair_decisions: list[dict[str, object]] = []
     # ``rejection_counts`` is deliberately a cardinality-conserving terminal
     # ledger for the V5 audit contract: a count is recorded only when no
     # CandidateInput exists for that pair.  ``blocked_reason_counts`` is the
@@ -241,8 +130,7 @@ def _build_same_symbol_pairs(
     # audit rows (a row can legitimately have more than one such reason).
     rejection_counts: dict[str, int] = {}
     blocked_reason_counts: dict[str, int] = {}
-    seed_pair_count = 0
-    eligible_candidate_count = 0
+    directional_pair_count = 0
     future_input_quote_count = sum(
         1
         for quote in quotes.values()
@@ -297,7 +185,7 @@ def _build_same_symbol_pairs(
                 # decision universe, including the direction whose quoted
                 # funding looks unattractive.  Ranking is never allowed to
                 # decide whether a pair receives an admission decision.
-                seed_pair_count += 1
+                directional_pair_count += 1
                 pair_id = make_candidate_pair_id(
                     long_q.symbol,
                     long_q.venue,
@@ -309,13 +197,6 @@ def _build_same_symbol_pairs(
                 if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
                     _record_rejection(rejection_counts, "invalid_trade_quote")
                     _record_rejection(blocked_reason_counts, "invalid_trade_quote")
-                    pair_decisions.append(
-                        {
-                            "pair_id": pair_id,
-                            "decision": "blocked",
-                            "blocked_reasons": ["invalid_trade_quote"],
-                        }
-                    )
                     continue
                 economics_mode = str(
                     config.funding_economics_mode or "v1_exact"
@@ -351,13 +232,6 @@ def _build_same_symbol_pairs(
                             blocked_reason_counts,
                             "funding_edge_below_floor",
                         )
-                        pair_decisions.append(
-                            {
-                                "pair_id": pair_id,
-                                "decision": "blocked",
-                                "blocked_reasons": ["funding_edge_below_floor"],
-                            }
-                        )
                         continue
                 rejection_counts_before = dict(rejection_counts)
                 candidate = _candidate_for_pair(
@@ -369,8 +243,6 @@ def _build_same_symbol_pairs(
                     caps_by_venue=caps_by_venue,
                     allocator=allocator,
                     passive_execution_enabled=passive_execution_enabled,
-                    fee_evidence=fee_evidence,
-                    expected_fee_identity_hashes=expected_fee_identity_hashes,
                     observed_at_ms=observed_at_ms,
                     rejection_counts=rejection_counts,
                 )
@@ -388,13 +260,6 @@ def _build_same_symbol_pairs(
                         )
                     for reason in construction_reasons:
                         _record_rejection(blocked_reason_counts, reason)
-                    pair_decisions.append(
-                        {
-                            "pair_id": pair_id,
-                            "decision": "blocked",
-                            "blocked_reasons": construction_reasons,
-                        }
-                    )
                     continue
                 admission_reasons = funding_entry_static_block_reasons(
                     candidate,
@@ -408,22 +273,6 @@ def _build_same_symbol_pairs(
                     candidate.blocked_reasons = list(admission_reasons)
                     for reason in admission_reasons:
                         _record_rejection(blocked_reason_counts, reason)
-                    pair_decisions.append(
-                        {
-                            "pair_id": candidate.pair_id or pair_id,
-                            "decision": "blocked",
-                            "blocked_reasons": list(admission_reasons),
-                        }
-                    )
-                else:
-                    eligible_candidate_count += 1
-                    pair_decisions.append(
-                        {
-                            "pair_id": candidate.pair_id or pair_id,
-                            "decision": "eligible",
-                            "blocked_reasons": [],
-                        }
-                    )
                 candidates.append(candidate)
 
     eligible = sorted(
@@ -443,11 +292,6 @@ def _build_same_symbol_pairs(
         key=lambda candidate: (-candidate.ranking_edge_bps, candidate.pair_id),
     )
     ordered = eligible + blocked
-    # Derive the published count from the auditable ledger itself.  If a new
-    # branch ever forgets to append its per-pair result, completeness turns
-    # false instead of the generation reporting a false green.
-    pair_decision_count = len(pair_decisions)
-    frontier_complete = pair_decision_count == seed_pair_count
     if diagnostics is not None:
         requested_symbols = sorted(canonical_symbols)
         diagnostics.clear()
@@ -456,16 +300,8 @@ def _build_same_symbol_pairs(
                 "input_quote_count": len(quotes),
                 "requested_symbol_count": len(requested_symbols),
                 "requested_symbols": requested_symbols,
-                "directional_pair_count": seed_pair_count,
                 "output_candidate_count": len(ordered),
-                "seed_pair_count": seed_pair_count,
-                "pair_decision_count": pair_decision_count,
-                "pair_decisions": pair_decisions,
-                "eligible_candidate_count": eligible_candidate_count,
-                "omitted_eligible_count": 0,
-                "eligible_frontier_complete": frontier_complete,
-                "entry_policy_fingerprint": funding_entry_policy_fingerprint(config),
-                "frontier_stop_reason": "all_pairs_decided",
+                "directional_pair_count": directional_pair_count,
                 "future_input_quote_count": future_input_quote_count,
                 "duplicate_input_quote_count": len(duplicate_quote_identities),
                 "rejection_counts": dict(sorted(rejection_counts.items())),
@@ -485,8 +321,6 @@ def _candidate_for_pair(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
-    fee_evidence: FeeEvidenceBook | None,
-    expected_fee_identity_hashes: dict[str, str] | None,
     observed_at_ms: int,
     rejection_counts: dict[str, int] | None = None,
 ) -> CandidateInput | None:
@@ -623,51 +457,45 @@ def _candidate_for_pair(
     gate_funding = gate_long_component + gate_short_component
     gate_worst_funding = gate_worst_long_component + gate_worst_short_component
     calculation_version = economics_mode
-    long_fee = fee_by_venue.get(str(long_q.venue).lower(), 0.0)
-    short_fee = fee_by_venue.get(str(short_q.venue).lower(), 0.0)
-    (
-        canary_assurance_tier,
-        taker_fee_evidence_complete,
-        long_account_fee_authoritative,
-        short_account_fee_authoritative,
-        account_fee_unavailable_reason,
-    ) = _pair_fee_assurance(
-        long_q,
-        short_q,
-        config=config,
-        fee_by_venue=fee_by_venue,
-        fee_evidence=fee_evidence,
-        expected_fee_identity_hashes=expected_fee_identity_hashes,
-    )
-    account_fee_evidence_base_complete = bool(
-        fee_evidence is not None
-        and fee_evidence.complete_for(long_q.venue, short_q.venue)
-    )
-    account_fee_identity_matches = (
-        long_account_fee_authoritative and short_account_fee_authoritative
-    )
-    account_fee_evidence_complete = account_fee_identity_matches
-    long_maker_fee = maker_fee_by_venue.get(str(long_q.venue).lower(), long_fee)
-    short_maker_fee = maker_fee_by_venue.get(str(short_q.venue).lower(), short_fee)
-    if (
-        config.funding_canary_enabled is True
-        and canary_assurance_tier == "conservative"
+    long_fee_key = str(long_q.venue).lower()
+    short_fee_key = str(short_q.venue).lower()
+    long_fee = fee_by_venue.get(long_fee_key)
+    short_fee = fee_by_venue.get(short_fee_key)
+    if not (
+        isinstance(long_fee, (int, float))
+        and not isinstance(long_fee, bool)
+        and isinstance(short_fee, (int, float))
+        and not isinstance(short_fee, bool)
+        and isfinite(float(long_fee))
+        and isfinite(float(short_fee))
+        and float(long_fee) >= 0.0
+        and float(short_fee) >= 0.0
     ):
-        # The fallback tier is a property of this symbol/venue leg, not of the
-        # venue as a whole.  A daily-universe symbol that was not covered by
-        # the latest private fee response must not inherit another symbol's
-        # authority or maker discount.  Keep an authoritative sibling leg at
-        # its measured fee and price only the unverified leg conservatively.
-        conservative_buffer_bps = max(
-            float(config.funding_canary_conservative_fee_buffer_bps or 0.0),
-            0.0,
-        )
-        if not long_account_fee_authoritative:
-            long_fee += conservative_buffer_bps
-            long_maker_fee = long_fee
-        if not short_account_fee_authoritative:
-            short_fee += conservative_buffer_bps
-            short_maker_fee = short_fee
+        # Fees are configured, conservative inputs.  A malformed local config
+        # is a sidecar construction failure, not a private-account evidence
+        # gate attached to every live candidate.
+        _record_rejection(rejection_counts, "configured_taker_fee_unavailable")
+        return None
+    long_fee = float(long_fee)
+    short_fee = float(short_fee)
+    long_maker_fee = maker_fee_by_venue.get(long_fee_key, long_fee)
+    short_maker_fee = maker_fee_by_venue.get(short_fee_key, short_fee)
+    if not (
+        isinstance(long_maker_fee, (int, float))
+        and not isinstance(long_maker_fee, bool)
+        and isfinite(float(long_maker_fee))
+        and float(long_maker_fee) >= 0.0
+    ):
+        long_maker_fee = long_fee
+    if not (
+        isinstance(short_maker_fee, (int, float))
+        and not isinstance(short_maker_fee, bool)
+        and isfinite(float(short_maker_fee))
+        and float(short_maker_fee) >= 0.0
+    ):
+        short_maker_fee = short_fee
+    long_maker_fee = float(long_maker_fee)
+    short_maker_fee = float(short_maker_fee)
     venue_haircut = float(
         config.funding_venue_risk_haircut_bps_by_venue.get(str(long_q.venue).lower(), 0.0) or 0.0
     ) + float(
@@ -705,21 +533,7 @@ def _candidate_for_pair(
         max(float(config.entry_notional_cap_quote or 0.0), 0.0),
         max(float(config.live_entry_notional_cap_quote or 0.0), 0.0),
     )
-    canary_hard_cap = (
-        canary_notional_cap_for_tier(canary_assurance_tier, config)
-        if config.funding_canary_enabled is True
-        and canary_assurance_tier != "unavailable"
-        else 0.0
-    )
-    pre_canary_configured_cap = configured_cap
-    if canary_hard_cap > 0.0:
-        configured_cap = min(configured_cap, canary_hard_cap)
     conservative_depth_quantity = configured_cap / reference_mid if configured_cap > 0.0 else 0.0
-    pre_canary_conservative_depth_quantity = (
-        pre_canary_configured_cap / reference_mid
-        if pre_canary_configured_cap > 0.0
-        else 0.0
-    )
     long_depth = float(long_q.ask_size or 0.0) * max(
         float(config.max_top_book_usage_ratio or 0.0), 0.0
     )
@@ -728,19 +542,6 @@ def _candidate_for_pair(
     )
     long_allocation_quantity = long_depth if long_depth > 0.0 else conservative_depth_quantity
     short_allocation_quantity = short_depth if short_depth > 0.0 else conservative_depth_quantity
-    pre_canary_long_allocation_quantity = (
-        long_depth if long_depth > 0.0 else pre_canary_conservative_depth_quantity
-    )
-    pre_canary_short_allocation_quantity = (
-        short_depth if short_depth > 0.0 else pre_canary_conservative_depth_quantity
-    )
-    if canary_hard_cap > 0.0:
-        canary_quantity = canary_hard_cap / max(
-            float(long_q.ask),
-            float(short_q.bid),
-        )
-        long_allocation_quantity = min(long_allocation_quantity, canary_quantity)
-        short_allocation_quantity = min(short_allocation_quantity, canary_quantity)
     venue_cap = _minimum_positive(
         caps_by_venue.get(str(long_q.venue).lower(), 0.0),
         caps_by_venue.get(str(short_q.venue).lower(), 0.0),
@@ -753,30 +554,6 @@ def _candidate_for_pair(
             else 0.0
         ),
         config.funding_max_correlation_group_exposure_quote,
-        (
-            float(config.funding_expected_shortfall_budget_quote or 0.0)
-            * 10_000.0
-            / float(config.funding_expected_shortfall_bps or 0.0)
-            if float(config.funding_expected_shortfall_bps or 0.0) > 0.0
-            else 0.0
-        ),
-    )
-    pre_canary_allocation = allocator.allocate(
-        long_entry_price=long_q.ask,
-        short_entry_price=short_q.bid,
-        long_max_quantity=pre_canary_long_allocation_quantity,
-        short_max_quantity=pre_canary_short_allocation_quantity,
-        configured_notional_cap_quote=pre_canary_configured_cap,
-        venue_notional_cap_quote=venue_cap,
-        symbol_risk_budget_quote=float(config.max_symbol_exposure_quote or 0.0),
-        venue_pair_risk_budget_quote=float(
-            config.funding_max_venue_pair_exposure_quote or 0.0
-        ),
-        global_risk_budget_quote=global_reference_cap,
-        fallback_notional_quote=float(
-            config.funding_missing_margin_fallback_notional_quote or 0.0
-        ),
-        health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
     )
     allocation = allocator.allocate(
         long_entry_price=long_q.ask,
@@ -792,29 +569,6 @@ def _candidate_for_pair(
         health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
     )
     candidate_block_reasons = list(contract_block_reasons)
-    if not account_fee_identity_matches:
-        conservative_canary = bool(
-            config.funding_canary_enabled is True
-            and canary_assurance_tier == "conservative"
-        )
-        legacy_account_mismatch = bool(
-            config.funding_canary_enabled is not True
-            and account_fee_evidence_base_complete
-            and expected_fee_identity_hashes is not None
-        )
-        unavailable_canary = bool(
-            config.funding_canary_enabled is True
-            and canary_assurance_tier == "unavailable"
-            and taker_fee_evidence_complete
-        )
-        if not conservative_canary and (legacy_account_mismatch or unavailable_canary):
-            candidate_block_reasons.append(account_fee_unavailable_reason)
-    if not taker_fee_evidence_complete:
-        # A zero fee can be a valid explicitly configured VIP tier, but an
-        # omitted, non-finite, or negative taker fee is not evidence.  The
-        # shortlist may remain observable for diagnostics, never complete
-        # enough for a live first-leg decision.
-        candidate_block_reasons.append("missing_taker_fee_evidence")
     if economics_mode == "enhanced_live" and not forecast_ready:
         candidate_block_reasons.append("funding_forecast_not_ready")
     if economics_mode == "enhanced_live" and not forecast_distribution_stable:
@@ -854,13 +608,7 @@ def _candidate_for_pair(
     # taker-impact estimate.  This cannot be reconstructed from aggregate
     # four-leg fee fields after the fact.
     quantity = float(allocation.base_quantity or 0.0)
-    canary_size_constrained = bool(
-        config.funding_canary_enabled is True
-        and canary_hard_cap > 0.0
-        and quantity + 1e-12
-        < float(pre_canary_allocation.base_quantity or 0.0)
-    )
-    if config.funding_canary_enabled is True and not contract_block_reasons:
+    if not contract_block_reasons:
         def _below_pair_minimum(target_quantity: float) -> bool:
             return any(
                 target_quantity + 1e-12
@@ -874,15 +622,7 @@ def _candidate_for_pair(
             )
 
         if _below_pair_minimum(quantity):
-            pre_canary_below_pair_minimum = _below_pair_minimum(
-                float(pre_canary_allocation.base_quantity or 0.0)
-            )
-            candidate_block_reasons.append(
-                "funding_canary_cap_below_pair_minimum"
-                if canary_size_constrained
-                and not pre_canary_below_pair_minimum
-                else "entry_pair_minimum_not_met"
-            )
+            candidate_block_reasons.append("entry_pair_minimum_not_met")
             candidate_blocked = True
     long_entry_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=True)
     short_entry_slippage_bps = _heuristic_slippage_bps(short_q, quantity, taking_ask=False)
@@ -952,15 +692,6 @@ def _candidate_for_pair(
     # may remain visible in the sidecar, but no mode may label the candidate
     # complete or send it to live admission.
     pair_id = make_candidate_pair_id(long_q.symbol, long_q.venue, short_q.venue)
-    fee_fingerprint = (
-        fee_evidence.fingerprint_for(
-            long_q.venue,
-            short_q.venue,
-            symbol=long_q.symbol,
-        )
-        if account_fee_evidence_complete and fee_evidence is not None
-        else canary_assurance_tier
-    )
     candidate_revision_id = build_candidate_revision_id(
         pair_id=pair_id,
         long_quote=long_q,
@@ -968,8 +699,6 @@ def _candidate_for_pair(
         settlement_timestamps_ms=(first_ts, long_ts, short_ts, second_ts),
         entry_route=(entry_maker_leg if passive_execution_enabled else "taker_both"),
         exit_route=(exit_maker_leg if passive_execution_enabled else "taker_both"),
-        fee_evidence_fingerprint=fee_fingerprint,
-        fee_assurance_tier=canary_assurance_tier,
         model_epoch=calculation_version,
         economics={
             "long_funding_rate_bps": long_q.funding_rate_bps,
@@ -1026,32 +755,6 @@ def _candidate_for_pair(
         short_exit_slippage_bps=short_exit_slippage_bps,
         long_taker_fee_bps=long_fee,
         short_taker_fee_bps=short_fee,
-        taker_fee_evidence_complete=taker_fee_evidence_complete,
-        account_fee_evidence_complete=account_fee_evidence_complete,
-        account_fee_evidence_observed_at_ms=(
-            fee_evidence.observed_at_ms_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and fee_evidence is not None
-            else 0
-        ),
-        account_fee_evidence_source=(
-            fee_evidence.source_for(long_q.venue, short_q.venue)
-            if account_fee_evidence_complete and fee_evidence is not None
-            else ""
-        ),
-        account_fee_evidence_fingerprint=(
-            fee_evidence.fingerprint_for(
-                long_q.venue, short_q.venue, symbol=long_q.symbol
-            )
-            if account_fee_evidence_complete and fee_evidence is not None
-            else ""
-        ),
-        account_fee_evidence_provenance=(
-            fee_evidence.provenance_for(
-                long_q.venue, short_q.venue, symbol=long_q.symbol
-            )
-            if account_fee_evidence_complete and fee_evidence is not None
-            else []
-        ),
         pair_id=pair_id,
         funding_timestamp_ms=first_ts,
         first_funding_timestamp_ms=first_ts,
@@ -1068,16 +771,6 @@ def _candidate_for_pair(
         entry_max_leg_notional_quote=max(
             allocation.long_leg_notional_quote,
             allocation.short_leg_notional_quote,
-        ),
-        funding_canary_fee_assurance_tier=canary_assurance_tier,
-        funding_canary_hard_max_entry_notional_quote=canary_hard_cap,
-        funding_canary_size_constrained=canary_size_constrained,
-        funding_canary_requested_quantity=float(
-            pre_canary_allocation.base_quantity or 0.0
-        ),
-        funding_canary_requested_max_leg_notional_quote=(
-            float(pre_canary_allocation.base_quantity or 0.0)
-            * max(float(long_q.ask), float(short_q.bid))
         ),
         contract_price_consistency_ratio=(
             max(float(long_q.ask), float(short_q.bid))
@@ -1327,30 +1020,9 @@ def _effective_fee_bps(
         asserted = float(long_maker_fee_bps) + float(short_taker_fee_bps)
     else:
         asserted = float(long_taker_fee_bps) + float(short_maker_fee_bps)
-    # Maker schedules are useful operational evidence, but their serialized
-    # provenance cannot authenticate itself.  Never let a discount/rebate
-    # create shortlist alpha; the local live boundary may only improve this
-    # after reloading the signed account evidence.
+    # Configured taker fees are the conservative floor.  A maker discount may
+    # improve realised PnL, but it must not manufacture shortlist alpha.
     return max(asserted, taker_floor)
-
-
-def _taker_fee_evidence_complete(
-    fee_by_venue: dict[str, float],
-    long_venue: object,
-    short_venue: object,
-) -> bool:
-    """Require explicit, finite, non-negative taker fees for both legs."""
-    for venue in (long_venue, short_venue):
-        key = str(venue or "").lower()
-        if key not in fee_by_venue:
-            return False
-        try:
-            fee_bps = float(fee_by_venue[key])
-        except (TypeError, ValueError):
-            return False
-        if not isfinite(fee_bps) or fee_bps < 0.0:
-            return False
-    return True
 
 
 def _effective_slippage_bps(

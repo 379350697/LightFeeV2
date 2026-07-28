@@ -97,8 +97,6 @@ def analyze_systemd_unit(name: str, text: str) -> HealthReport:
         fingerprints.append("missing_limit_nofile")
     if is_live and "lightfee-sidecar.service" in text:
         fingerprints.append("live_requires_sidecar_service")
-    if name.endswith("lightfee-spread-bbo.service") and "lightfee-sidecar.service" in text:
-        fingerprints.append("spread_bbo_requires_sidecar_service")
     if is_sidecar and "opportunity_input_sidecar" in command and "live.auto.toml" not in command:
         fingerprints.append("rust_sidecar_without_live_auto_config")
 
@@ -753,14 +751,12 @@ def analyze_strategy_entry_policy(
     require_entry_enabled: bool = False,
 ) -> HealthReport:
     funding_entries_enabled = getattr(strategy, "funding_new_entries_enabled", None) is True
-    funding_canary_enabled = getattr(strategy, "funding_canary_enabled", None) is True
     spread_reversion_enabled = getattr(strategy, "spread_reversion_enabled", None) is True
     spread_paper_enabled = getattr(strategy, "spread_paper_enabled", None) is True
     spread_live_enabled = getattr(strategy, "spread_live_enabled", None) is True
     funding_live_entry_ready = (
         str(runtime_mode or "").lower() == "live"
         and funding_entries_enabled
-        and funding_canary_enabled
     )
     fingerprints: list[str] = []
     if spread_live_enabled:
@@ -776,7 +772,6 @@ def analyze_strategy_entry_policy(
         details={
             "runtime_mode": str(runtime_mode or ""),
             "funding_new_entries_enabled": funding_entries_enabled,
-            "funding_canary_enabled": funding_canary_enabled,
             "funding_live_entry_ready": funding_live_entry_ready,
             "spread_reversion_enabled": spread_reversion_enabled,
             "spread_paper_enabled": spread_paper_enabled,

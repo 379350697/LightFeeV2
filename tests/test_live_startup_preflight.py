@@ -49,18 +49,8 @@ from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain
 
 
 @pytest.fixture(autouse=True)
-def _isolate_non_canary_preflight_stages(monkeypatch):
+def _isolate_preflight_stages(monkeypatch):
     """This suite isolates non-economic live preflight stages."""
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_admission_reason",
-        lambda *_args, **_kwargs: "",
-    )
-    monkeypatch.setattr(
-        EntryDispatchRuntime,
-        "_funding_canary_submission_reason",
-        lambda *_args, **_kwargs: "",
-    )
     monkeypatch.setattr(
         EntryDispatchRuntime,
         "_revalidate_final_entry_economics",
@@ -196,7 +186,6 @@ def _admissible_dispatch_candidate(
         forecast_worst_funding_edge_bps=0.0,
         # This helper represents a complete V3 all-taker candidate used to
         # exercise venue-admission failures after economics has been admitted.
-        taker_fee_evidence_complete=True,
         economics_complete=True,
         economics_observed_at_ms=1778786999000,
         blocked=False,

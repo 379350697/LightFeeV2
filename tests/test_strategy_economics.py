@@ -2,21 +2,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import combinations
-import hashlib
 import math
-import json
 import random
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from lightfee.config.schema import StrategyConfig, VenueConfig
+from lightfee.config.schema import StrategyConfig
 from lightfee.core.domain import EntryLeverageEvidence, Venue
-from lightfee.engine.entry_dispatch_runtime import (
-    EntryDispatchRuntime,
-    _funding_canary_cohort_id,
-)
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.sidecar.pairing import build_same_symbol_pairs
@@ -34,20 +29,8 @@ from lightfee.strategy.economics import (
     build_edge_breakdown,
     conservative_funding_edge_bps,
 )
-from lightfee.strategy.candidate_identity import (
-    candidate_revision_id,
-    final_candidate_revision_id,
-    opportunity_lease_id,
-)
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
-from lightfee.strategy.fee_evidence import (
-    FeeEvidenceBook,
-    FeeScheduleEvidence,
-    LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
-    load_fee_evidence,
-    sign_fee_evidence_payload,
-)
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -75,309 +58,6 @@ def _candidate(**overrides: object) -> CandidateInput:
     }
     values.update(overrides)
     return CandidateInput(**values)
-
-
-def _verified_fee_provenance_candidate_fields(
-    *, observed_at_ms: int,
-) -> dict[str, object]:
-    document_sha256 = "a" * 64
-    account_hashes = {"cheap": "b" * 64, "rich": "c" * 64}
-    rows = [
-        {
-            "venue": venue,
-            "taker_fee_bps": 1.0,
-            "maker_fee_bps": 1.0,
-            "observed_at_ms": observed_at_ms,
-            "source": "account_fee_api",
-            "evidence_ref": f"test:{venue}",
-            "account_identity_hash": account_hashes[venue],
-            "document_sha256": document_sha256,
-            "integrity_key_id": "lightfee-fee-evidence-v3",
-            "integrity_verified": True,
-        }
-        for venue in ("cheap", "rich")
-    ]
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            rows,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    return {
-        "long_taker_fee_bps": 1.0,
-        "short_taker_fee_bps": 1.0,
-        "taker_fee_evidence_complete": True,
-        "account_fee_evidence_complete": True,
-        "account_fee_evidence_observed_at_ms": observed_at_ms,
-        "account_fee_evidence_source": "account_fee_api",
-        "account_fee_evidence_fingerprint": fingerprint,
-        "account_fee_evidence_provenance": rows,
-        "economics_observed_at_ms": observed_at_ms,
-    }
-
-
-def _identity_quote(venue: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        venue=venue,
-        symbol="BTCUSDT",
-        observed_at_ms=1_000,
-        funding_timestamp_ms=100_000,
-        funding_interval_ms=28_800_000,
-        bid=99.9,
-        ask=100.0,
-        underlying="BTC",
-        quote_currency="USDT",
-        contract_type="linear",
-        contract_multiplier=1.0,
-        mark_index_source="venue_index",
-        price_tick=0.01,
-        quantity_step_base=0.001,
-        min_quantity_base=0.001,
-        min_notional_quote=5.0,
-        min_notional_evidence_complete=True,
-        venue_status="active",
-        contract_normalization_complete=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("field", "changed"),
-    [
-        ("funding_interval_ms", 14_400_000),
-        ("price_tick", 0.1),
-        ("quantity_step_base", 0.01),
-        ("min_quantity_base", 0.01),
-        ("min_notional_quote", 10.0),
-        ("contract_multiplier", 1_000.0),
-        ("venue_status", "reduce_only"),
-        ("contract_normalization_complete", False),
-    ],
-)
-def test_candidate_revision_changes_with_every_execution_contract_rule(
-    field: str,
-    changed: object,
-) -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-
-    def revision() -> str:
-        return candidate_revision_id(
-            pair_id="btcusdt:cheap->rich",
-            long_quote=long_quote,
-            short_quote=short_quote,
-            settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
-            entry_route="taker_both",
-            exit_route="taker_both",
-            fee_evidence_fingerprint="fee-v1",
-            fee_assurance_tier="account",
-            model_epoch="model-v1",
-            economics={"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
-        )
-
-    baseline = revision()
-    setattr(short_quote, field, changed)
-    assert revision() != baseline
-
-
-def test_candidate_revision_and_lease_split_build_clock_from_route_cycle() -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-    revision_kwargs = {
-        "pair_id": "btcusdt:cheap->rich",
-        "long_quote": long_quote,
-        "short_quote": short_quote,
-        "settlement_timestamps_ms": (100_000, 100_000, 100_000, 100_000),
-        "entry_route": "taker_both",
-        "exit_route": "taker_both",
-        "fee_evidence_fingerprint": "fee-v1",
-        "fee_assurance_tier": "account",
-        "model_epoch": "model-v1",
-        "economics": {"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
-    }
-    lease_kwargs = {
-        "pair_id": "btcusdt:cheap->rich",
-        "long_quote": long_quote,
-        "short_quote": short_quote,
-        "first_funding_timestamp_ms": 100_000,
-        "second_funding_timestamp_ms": 100_000,
-        "entry_route": "taker_both",
-        "exit_route": "taker_both",
-        "model_epoch": "model-v1",
-    }
-
-    assert candidate_revision_id(**revision_kwargs) == candidate_revision_id(
-        **revision_kwargs
-    )
-    baseline_lease = opportunity_lease_id(**lease_kwargs)
-    long_quote.observed_at_ms = 2_000
-    long_quote.bid = 99.8
-    assert opportunity_lease_id(**lease_kwargs) == baseline_lease
-    assert opportunity_lease_id(
-        **{**lease_kwargs, "entry_route": "maker_long"}
-    ) != baseline_lease
-    long_quote.funding_interval_ms = 14_400_000
-    assert opportunity_lease_id(**lease_kwargs) != baseline_lease
-
-
-def test_candidate_revision_ignores_observation_and_receipt_wall_clocks() -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-    for quote, prefix in ((long_quote, "cheap"), (short_quote, "rich")):
-        quote.funding_rate_observed_at_ms = 1_000
-        quote.funding_rate_event_at_ms = 900
-        quote.funding_rate_received_at_ms = 1_001
-        quote.funding_rate_source = "venue_api"
-        quote.funding_rate_sample_id = f"funding:{prefix}:BTCUSDT:1000:1:100000"
-
-    kwargs = {
-        "pair_id": "btcusdt:cheap->rich",
-        "long_quote": long_quote,
-        "short_quote": short_quote,
-        "settlement_timestamps_ms": (100_000, 100_000, 100_000, 100_000),
-        "entry_route": "taker_both",
-        "exit_route": "taker_both",
-        "fee_evidence_fingerprint": "fee-v1",
-        "fee_assurance_tier": "account",
-        "model_epoch": "model-v1",
-        "economics": {"entry_target_quantity": 0.1, "ranking_edge_bps": 3.0},
-    }
-    baseline = candidate_revision_id(**kwargs)
-
-    long_quote.observed_at_ms = 2_000
-    long_quote.funding_rate_observed_at_ms = 2_000
-    long_quote.funding_rate_event_at_ms = 1_900
-    long_quote.funding_rate_received_at_ms = 2_001
-    long_quote.funding_rate_sample_id = (
-        "funding:cheap:BTCUSDT:2000:1:100000"
-    )
-    assert candidate_revision_id(**kwargs) == baseline
-
-    long_quote.bid = 99.8
-    assert candidate_revision_id(**kwargs) != baseline
-
-
-@pytest.mark.parametrize(
-    "invalid",
-    [True, False, None, "1.0", "invalid", float("nan"), float("inf"), 10**1_000],
-)
-def test_candidate_revision_rejects_invalid_numeric_identity_inputs(
-    invalid: object,
-) -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-
-    assert candidate_revision_id(
-        pair_id="btcusdt:cheap->rich",
-        long_quote=long_quote,
-        short_quote=short_quote,
-        settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
-        entry_route="taker_both",
-        exit_route="taker_both",
-        fee_evidence_fingerprint="fee-v1",
-        fee_assurance_tier="account",
-        model_epoch="model-v1",
-        economics={"entry_target_quantity": invalid},
-    ) == ""
-
-
-def test_candidate_revision_preserves_distinct_adjacent_float_economics() -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-
-    def revision(quantity: float) -> str:
-        return candidate_revision_id(
-            pair_id="btcusdt:cheap->rich",
-            long_quote=long_quote,
-            short_quote=short_quote,
-            settlement_timestamps_ms=(100_000, 100_000, 100_000, 100_000),
-            entry_route="taker_both",
-            exit_route="taker_both",
-            fee_evidence_fingerprint="fee-v1",
-            fee_assurance_tier="account",
-            model_epoch="model-v1",
-            economics={"entry_target_quantity": quantity},
-        )
-
-    baseline = 1.0
-    adjacent = math.nextafter(baseline, math.inf)
-    assert adjacent != baseline
-    assert revision(adjacent) != revision(baseline)
-
-
-def test_final_candidate_revision_rejects_invalid_numeric_identity_inputs() -> None:
-    assert final_candidate_revision_id(
-        evidence_candidate_revision_id="evidence-v1",
-        quantity=1.0,
-        long_price=100.0,
-        short_price=100.0,
-        entry_route="taker_both",
-        economics={"worst_case_profit_quote": float("nan")},
-    ) == ""
-
-
-def test_final_candidate_revision_changes_with_worst_case_profit() -> None:
-    kwargs = {
-        "evidence_candidate_revision_id": "evidence-v1",
-        "quantity": 1.0,
-        "long_price": 99.0,
-        "short_price": 101.0,
-        "entry_route": "taker_both",
-    }
-    assert final_candidate_revision_id(
-        **kwargs,
-        economics={"worst_case_profit_quote": 0.03},
-    ) != final_candidate_revision_id(
-        **kwargs,
-        economics={"worst_case_profit_quote": 0.031},
-    )
-
-
-def test_final_candidate_revision_binding_rejects_tampered_derived_profit() -> None:
-    candidate = _candidate(
-        entry_target_quantity=1.0,
-        entry_notional_quote=100.0,
-        entry_max_leg_notional_quote=101.0,
-        expected_edge_bps=5.0,
-        worst_case_edge_bps=3.0,
-        expected_profit_quote=0.05,
-        worst_case_profit_quote=0.031,
-    )
-    candidate.evidence_candidate_revision_id = "evidence-v1"
-    candidate.candidate_revision_id = "evidence-v1"
-    dispatch = EntryDispatchRuntime(SimpleNamespace())
-
-    assert dispatch._bind_final_entry_candidate_revision(
-        candidate,
-        quantity=1.0,
-        long_price=99.0,
-        short_price=101.0,
-        entry_route="taker_both",
-    ) == ""
-    assert candidate.candidate_revision_id == "evidence-v1"
-
-
-def test_opportunity_lease_tags_settlement_time_by_leg() -> None:
-    long_quote = _identity_quote("cheap")
-    short_quote = _identity_quote("rich")
-    long_quote.funding_timestamp_ms = 100_000
-    short_quote.funding_timestamp_ms = 200_000
-    kwargs = {
-        "pair_id": "btcusdt:cheap->rich",
-        "long_quote": long_quote,
-        "short_quote": short_quote,
-        "first_funding_timestamp_ms": 100_000,
-        "second_funding_timestamp_ms": 200_000,
-        "entry_route": "taker_both",
-        "exit_route": "taker_both",
-        "model_epoch": "model-v1",
-    }
-    baseline = opportunity_lease_id(**kwargs)
-    long_quote.funding_timestamp_ms = 200_000
-    short_quote.funding_timestamp_ms = 100_000
-    assert opportunity_lease_id(**kwargs) != baseline
 
 
 def test_full_pairing_reaches_real_opportunity_after_high_surface_blockers() -> None:
@@ -464,22 +144,13 @@ def test_full_pairing_reaches_real_opportunity_after_high_surface_blockers() -> 
     ]
 
     assert [row.symbol for row in eligible] == ["SPECIALUSDT"]
-    assert diagnostics["seed_pair_count"] == len(symbols) * 2
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == 1
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
-    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
-    assert len(diagnostics["pair_decisions"]) == diagnostics["seed_pair_count"]
-    decisions = {
-        row["pair_id"]: row for row in diagnostics["pair_decisions"]
-    }
-    assert decisions["specialusdt:cheap->rich"]["decision"] == "eligible"
-    assert decisions["bad0usdt:cheap->rich"] == {
-        "pair_id": "bad0usdt:cheap->rich",
-        "decision": "blocked",
-        "blocked_reasons": ["expected_edge_below_floor", "worst_case_edge_below_floor"],
-    }
+    assert diagnostics["directional_pair_count"] == len(symbols) * 2
+    by_pair_id = {row.pair_id: row for row in candidates}
+    assert by_pair_id["specialusdt:cheap->rich"].blocked is False
+    assert by_pair_id["bad0usdt:cheap->rich"].blocked_reasons == [
+        "expected_edge_below_floor",
+        "worst_case_edge_below_floor",
+    ]
 
 
 def test_full_pairing_decides_seven_venue_universe_under_500ms() -> None:
@@ -543,15 +214,11 @@ def test_full_pairing_decides_seven_venue_universe_under_500ms() -> None:
 
     assert len(candidates) == len(symbols)
     assert all(not row.blocked and row.economics_complete for row in candidates)
-    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == len(symbols)
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["directional_pair_count"] == len(symbols) * 7 * 6
     assert elapsed_s <= 0.5
 
 
-def test_full_canary_frontier_treats_uncovered_symbols_as_conservative() -> None:
+def test_full_frontier_uses_configured_fees_without_online_evidence() -> None:
     quotes: dict[str, QuoteSnapshot] = {}
     venues = [f"venue{index}" for index in range(7)]
     symbols = [f"C{index}USDT" for index in range(96)]
@@ -592,32 +259,8 @@ def test_full_canary_frontier_treats_uncovered_symbols_as_conservative() -> None
                 venue_status="active",
                 contract_normalization_complete=True,
             )
-    fee_evidence = FeeEvidenceBook(
-        schedules={
-            venue: FeeScheduleEvidence(
-                venue=venue,
-                taker_fee_bps=1.0,
-                maker_fee_bps=0.5,
-                observed_at_ms=1_000,
-                source="account_fee_api",
-                evidence_ref=f"test:{venue}",
-                covered_symbols=("COVEREDUSDT",),
-            )
-            for venue in venues
-        },
-        reason="",
-        schema_version=LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
-        local_file_verified=True,
-    )
     kwargs = {
         "strategy": StrategyConfig(
-            funding_canary_enabled=True,
-            funding_canary_allowed_venues=venues,
-            funding_canary_require_account_fee_evidence=False,
-            funding_canary_conservative_fee_buffer_bps=2.0,
-            funding_canary_conservative_fee_max_entry_notional_quote=15.0,
-            funding_canary_min_expected_net_edge_bps=-100.0,
-            funding_canary_min_worst_case_edge_bps=-100.0,
             min_funding_edge_bps=30.0,
             min_expected_edge_bps=-100.0,
             min_worst_case_edge_bps=-100.0,
@@ -627,8 +270,6 @@ def test_full_canary_frontier_treats_uncovered_symbols_as_conservative() -> None
         ),
         "venue_fee_bps": {venue: 1.0 for venue in venues},
         "venue_maker_fee_bps": {venue: 0.5 for venue in venues},
-        "fee_evidence": fee_evidence,
-        "expected_fee_identity_hashes": {},
         "passive_execution_enabled": True,
         "observed_at_ms": 1_000,
     }
@@ -645,19 +286,13 @@ def test_full_canary_frontier_treats_uncovered_symbols_as_conservative() -> None
 
     assert len(candidates) == len(symbols)
     assert all(not row.blocked and row.economics_complete for row in candidates)
-    assert all(
-        row.funding_canary_fee_assurance_tier == "conservative"
-        for row in candidates
-    )
-    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == len(symbols)
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert all(row.long_taker_fee_bps == 1.0 for row in candidates)
+    assert all(row.short_taker_fee_bps == 1.0 for row in candidates)
+    assert diagnostics["directional_pair_count"] == len(symbols) * 7 * 6
     assert elapsed_s <= 0.5
 
 
-def test_full_canary_frontier_excludes_final_quantity_below_pair_minimum() -> None:
+def test_full_frontier_excludes_final_quantity_below_pair_minimum() -> None:
     def quote(
         *,
         venue: str,
@@ -737,13 +372,6 @@ def test_full_canary_frontier_excludes_final_quantity_below_pair_minimum() -> No
     }
     kwargs = {
         "strategy": StrategyConfig(
-            funding_canary_enabled=True,
-            funding_canary_allowed_venues=["long", "short"],
-            funding_canary_require_account_fee_evidence=False,
-            funding_canary_conservative_fee_buffer_bps=2.0,
-            funding_canary_conservative_fee_max_entry_notional_quote=15.0,
-            funding_canary_min_expected_net_edge_bps=-100.0,
-            funding_canary_min_worst_case_edge_bps=-100.0,
             min_expected_edge_bps=-100.0,
             min_worst_case_edge_bps=-100.0,
             min_scan_minutes_before_funding=0,
@@ -775,11 +403,7 @@ def test_full_canary_frontier_excludes_final_quantity_below_pair_minimum() -> No
     assert thin.economics_complete is False
     assert "entry_pair_minimum_not_met" in thin.blocked_reasons
     assert [row.symbol for row in complete_viable] == ["GOODUSDT"]
-    assert diagnostics["seed_pair_count"] == 4
-    assert diagnostics["pair_decision_count"] == 4
-    assert diagnostics["eligible_candidate_count"] == 1
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["directional_pair_count"] == 4
 
 
 def test_full_pairing_never_stops_at_an_exact_work_budget() -> None:
@@ -842,12 +466,7 @@ def test_full_pairing_never_stops_at_an_exact_work_budget() -> None:
 
     assert len(candidates) == len(symbols)
     assert all(not row.blocked and row.economics_complete for row in candidates)
-    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == len(symbols)
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
-    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
+    assert diagnostics["directional_pair_count"] == len(symbols) * 7 * 6
 
 
 def test_enhanced_live_decides_every_direction_without_candidate_cap() -> None:
@@ -917,12 +536,7 @@ def test_enhanced_live_decides_every_direction_without_candidate_cap() -> None:
 
     assert len(candidates) == len(symbols) * 7 * 6
     assert all(row.blocked for row in candidates)
-    assert diagnostics["seed_pair_count"] == len(symbols) * 42
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == 0
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
-    assert diagnostics["frontier_stop_reason"] == "all_pairs_decided"
+    assert diagnostics["directional_pair_count"] == len(symbols) * 42
 
 
 @pytest.mark.parametrize(
@@ -1049,11 +663,7 @@ def test_full_pairing_matches_randomized_pairwise_oracle(
     assert [row.ranking_edge_bps for row in full_eligible] == pytest.approx(
         [row.ranking_edge_bps for row in oracle_eligible]
     )
-    assert diagnostics["seed_pair_count"] == len(symbols) * 7 * 6
-    assert diagnostics["pair_decision_count"] == diagnostics["seed_pair_count"]
-    assert diagnostics["eligible_candidate_count"] == len(full_eligible)
-    assert diagnostics["omitted_eligible_count"] == 0
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["directional_pair_count"] == len(symbols) * 7 * 6
 
 
 def test_edge_breakdown_has_one_expected_and_worst_formula() -> None:
@@ -1426,9 +1036,7 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
         "funding_edge_below_floor": 1,
         "quote_after_candidate_watermark": 1,
     }
-    assert diagnostics["seed_pair_count"] == 2
-    assert diagnostics["pair_decision_count"] == 2
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["directional_pair_count"] == 2
 
 
 def test_funding_forecast_worst_case_uses_short_lower_and_long_upper_bounds() -> None:
@@ -2139,6 +1747,7 @@ def test_every_funding_mode_blocks_unproven_common_base_contracts() -> None:
             funding_economics_mode="enhanced_live",
             funding_forecast_mode="live",
         ),
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
         observed_at_ms=10,
     )[0]
 
@@ -2150,6 +1759,7 @@ def test_every_funding_mode_blocks_unproven_common_base_contracts() -> None:
         quotes,
         ["BTCUSDT"],
         strategy=StrategyConfig(),
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
         observed_at_ms=10,
     )[0]
     assert v1_candidate.blocked is True
@@ -2196,7 +1806,11 @@ def test_funding_contract_normalization_requires_literal_boolean_true() -> None:
     }
 
     candidate = build_same_symbol_pairs(
-        quotes, ["BTCUSDT"], strategy=StrategyConfig(), observed_at_ms=10
+        quotes,
+        ["BTCUSDT"],
+        strategy=StrategyConfig(),
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
+        observed_at_ms=10,
     )[0]
 
     assert candidate.economics_complete is False
@@ -2342,7 +1956,11 @@ def test_staggered_candidate_is_admitted_on_first_settlement_not_total_carry() -
     }
 
     candidate = build_same_symbol_pairs(
-        quotes, ["BTCUSDT"], strategy=StrategyConfig(), observed_at_ms=10
+        quotes,
+        ["BTCUSDT"],
+        strategy=StrategyConfig(),
+        venue_fee_bps={"binance": 0.0, "okx": 0.0},
+        observed_at_ms=10,
     )[0]
 
     assert candidate.opportunity_type == "staggered"
@@ -2357,7 +1975,7 @@ def test_staggered_candidate_is_admitted_on_first_settlement_not_total_carry() -
     assert candidate.expected_edge_bps > candidate.total_funding_edge_bps
 
 
-def test_funding_candidate_fails_closed_without_explicit_taker_fee_evidence() -> None:
+def test_funding_candidate_requires_valid_configured_taker_fees() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
             venue="cheap",
@@ -2381,9 +1999,14 @@ def test_funding_candidate_fails_closed_without_explicit_taker_fee_evidence() ->
         ),
     }
 
+    diagnostics: dict[str, object] = {}
     missing = build_same_symbol_pairs(
-        quotes, ["BTCUSDT"], strategy=StrategyConfig(), observed_at_ms=10
-    )[0]
+        quotes,
+        ["BTCUSDT"],
+        strategy=StrategyConfig(),
+        observed_at_ms=10,
+        diagnostics=diagnostics,
+    )
     explicit_zero = build_same_symbol_pairs(
         quotes,
         ["BTCUSDT"],
@@ -2392,13 +2015,16 @@ def test_funding_candidate_fails_closed_without_explicit_taker_fee_evidence() ->
         observed_at_ms=10,
     )[0]
 
-    assert missing.economics_complete is False
-    assert missing.taker_fee_evidence_complete is False
-    assert "missing_taker_fee_evidence" in missing.blocked_reasons
-    assert explicit_zero.taker_fee_evidence_complete is True
+    assert missing == []
+    assert diagnostics["rejection_counts"] == {
+        "configured_taker_fee_unavailable": 1,
+        "funding_edge_below_floor": 1,
+    }
+    assert explicit_zero.long_taker_fee_bps == 0.0
+    assert explicit_zero.short_taker_fee_bps == 0.0
 
 
-def test_funding_candidate_rejects_boolean_taker_fee_evidence() -> None:
+def test_funding_candidate_rejects_boolean_configured_taker_fee() -> None:
     quotes = {
         "cheap:BTCUSDT": QuoteSnapshot(
             venue="cheap",
@@ -2422,224 +2048,21 @@ def test_funding_candidate_rejects_boolean_taker_fee_evidence() -> None:
         ),
     }
 
-    candidate = build_same_symbol_pairs(
+    diagnostics: dict[str, object] = {}
+    candidates = build_same_symbol_pairs(
         quotes,
         ["BTCUSDT"],
         strategy=StrategyConfig(),
         venue_fee_bps={"cheap": True, "rich": 0.0},  # type: ignore[dict-item]
         observed_at_ms=10,
-    )[0]
-
-    assert candidate.economics_complete is False
-    assert candidate.taker_fee_evidence_complete is False
-    assert "missing_taker_fee_evidence" in candidate.blocked_reasons
-
-
-def test_funding_pairing_binds_account_fee_evidence_to_expected_identities(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    evidence_path = tmp_path / "pairing-account-fees.json"
-    raw_evidence = {
-        "schema_version": 3,
-        "venues": {
-            venue: {
-                "taker_fee_bps": 1.0,
-                "maker_fee_bps": 0.5,
-                "observed_at_ms": 1_000,
-                "source": "account_fee_api",
-                "evidence_ref": f"pairing:{venue}",
-                "account_identity_hash": identity_hash,
-            }
-            for venue, identity_hash in {
-                "cheap": "a" * 64,
-                "rich": "b" * 64,
-            }.items()
-        },
-        "integrity": {
-            "algorithm": "hmac-sha256",
-            "key_id": "lightfee-fee-evidence-v3",
-            "signature": "",
-        },
-    }
-    monkeypatch.setenv("LIGHTFEE_FEE_EVIDENCE_HMAC_KEY", "pairing-secret")
-    evidence_path.write_text(
-        json.dumps(sign_fee_evidence_payload(raw_evidence, "pairing-secret")),
-        encoding="utf-8",
-    )
-    evidence = load_fee_evidence(evidence_path, now_ms=1_100, max_age_ms=10_000)
-    quotes = {
-        "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap",
-            symbol="BTCUSDT",
-            bid=99.9,
-            ask=100.0,
-            funding_rate_bps=2.0,
-            funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000,
-            ask_size=10.0,
-        ),
-        "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich",
-            symbol="BTCUSDT",
-            bid=100.3,
-            ask=100.4,
-            funding_rate_bps=8.0,
-            funding_timestamp_ms=1_000_000,
-            funding_interval_ms=28_800_000,
-            bid_size=10.0,
-        ),
-    }
-    common = {
-        "strategy": StrategyConfig(),
-        "venue_fee_bps": {"cheap": 1.0, "rich": 1.0},
-        "venue_maker_fee_bps": {"cheap": 0.5, "rich": 0.5},
-        "fee_evidence": evidence,
-        "observed_at_ms": 1_100,
-    }
-
-    matching = build_same_symbol_pairs(
-        quotes,
-        ["BTCUSDT"],
-        expected_fee_identity_hashes={"cheap": "a" * 64, "rich": "b" * 64},
-        **common,
-    )[0]
-    mismatching = build_same_symbol_pairs(
-        quotes,
-        ["BTCUSDT"],
-        expected_fee_identity_hashes={"cheap": "c" * 64, "rich": "b" * 64},
-        **common,
-    )[0]
-
-    assert matching.account_fee_evidence_complete is True
-    assert matching.account_fee_evidence_provenance == evidence.provenance_for(
-        "cheap", "rich"
-    )
-    assert mismatching.account_fee_evidence_complete is False
-    assert "account_fee_account_identity_mismatch" in mismatching.blocked_reasons
-
-    local_path = tmp_path / "pairing-account-fees-v4.json"
-    local_payload = {
-        "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
-        "venues": {
-            venue: {
-                "taker_fee_bps": 1.0,
-                "maker_fee_bps": 0.5,
-                "observed_at_ms": 1_000,
-                "source": "account_fee_api",
-                "evidence_ref": f"local:{venue}",
-                "covered_symbols": ["BTCUSDT"],
-                "symbol_schedules": {
-                    "BTCUSDT": {
-                        "taker_fee_bps": 1.0,
-                        "maker_fee_bps": 0.5,
-                        "observed_at_ms": 1_000,
-                        "evidence_ref": f"local:{venue}:BTCUSDT",
-                    }
-                },
-            }
-            for venue in ("cheap", "rich")
-        },
-    }
-    local_path.write_text(json.dumps(local_payload), encoding="utf-8")
-    local_path.chmod(0o600)
-    local_evidence = load_fee_evidence(
-        local_path, now_ms=1_100, max_age_ms=10_000
-    )
-    local_candidate = build_same_symbol_pairs(
-        quotes,
-        ["BTCUSDT"],
-        expected_fee_identity_hashes={},
-        **(common | {"fee_evidence": local_evidence}),
-    )[0]
-
-    assert local_candidate.account_fee_evidence_complete is True
-    assert all(
-        row["account_fee_evidence_authoritative"] is True
-        for row in local_candidate.account_fee_evidence_provenance
+        diagnostics=diagnostics,
     )
 
-    uncovered_quotes = {
-        key.replace("BTCUSDT", "SOLUSDT"): replace(
-            quote,
-            symbol="SOLUSDT",
-            observed_at_ms=1_000,
-            funding_rate_observed_at_ms=1_000,
-            funding_rate_event_at_ms=1_000,
-            funding_rate_received_at_ms=1_000,
-            funding_rate_source="test_fixture",
-            funding_rate_sample_id=(
-                f"funding:{quote.venue}:SOLUSDT:1000:"
-                f"{float(quote.funding_rate_bps):.17g}:1000000"
-            ),
-            underlying="SOL",
-            quote_currency="USDT",
-            contract_type="linear",
-            contract_multiplier=1.0,
-            mark_index_source="venue_mark_index",
-            price_precision=2,
-            quantity_precision=3,
-            price_tick=0.01,
-            quantity_step_base=0.001,
-            min_quantity_base=0.001,
-            min_notional_quote=1.0,
-            min_notional_evidence_complete=True,
-            venue_status="active",
-            contract_normalization_complete=True,
-        )
-        for key, quote in quotes.items()
+    assert candidates == []
+    assert diagnostics["rejection_counts"] == {
+        "configured_taker_fee_unavailable": 1,
+        "funding_edge_below_floor": 1,
     }
-    uncovered_candidate = build_same_symbol_pairs(
-        uncovered_quotes,
-        ["SOLUSDT"],
-        strategy=StrategyConfig(
-            funding_canary_enabled=True,
-            funding_canary_allowed_venues=["cheap", "rich"],
-            funding_canary_require_account_fee_evidence=False,
-            funding_canary_conservative_fee_buffer_bps=2.0,
-            min_expected_edge_bps=-10_000.0,
-            min_worst_case_edge_bps=-10_000.0,
-            funding_canary_min_expected_net_edge_bps=-10_000.0,
-            funding_canary_min_worst_case_edge_bps=-10_000.0,
-        ),
-        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
-        venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},
-        fee_evidence=local_evidence,
-        expected_fee_identity_hashes={},
-        passive_execution_enabled=True,
-        observed_at_ms=1_100,
-    )[0]
-
-    assert uncovered_candidate.account_fee_evidence_complete is False
-    assert uncovered_candidate.blocked is False
-    assert uncovered_candidate.economics_complete is True
-    assert "account_fee_symbol_coverage_missing" not in uncovered_candidate.blocked_reasons
-    assert uncovered_candidate.funding_canary_fee_assurance_tier == "conservative"
-    assert uncovered_candidate.funding_canary_hard_max_entry_notional_quote == 15.0
-    assert uncovered_candidate.entry_max_leg_notional_quote <= 15.0 + 1e-9
-    assert uncovered_candidate.long_taker_fee_bps == pytest.approx(3.0)
-    assert uncovered_candidate.short_taker_fee_bps == pytest.approx(3.0)
-    assert uncovered_candidate.entry_fee_bps == pytest.approx(6.0)
-    assert uncovered_candidate.exit_fee_bps == pytest.approx(6.0)
-
-    strict_candidate = build_same_symbol_pairs(
-        uncovered_quotes,
-        ["SOLUSDT"],
-        strategy=StrategyConfig(
-            funding_canary_enabled=True,
-            funding_canary_require_account_fee_evidence=True,
-        ),
-        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
-        venue_maker_fee_bps={"cheap": 0.5, "rich": 0.5},
-        fee_evidence=local_evidence,
-        expected_fee_identity_hashes={},
-        passive_execution_enabled=True,
-        observed_at_ms=1_100,
-    )[0]
-
-    assert strict_candidate.blocked is True
-    assert strict_candidate.economics_complete is False
-    assert "account_fee_symbol_coverage_missing" in strict_candidate.blocked_reasons
 
 
 def test_risk_allocator_returns_one_common_base_quantity_and_falls_back_on_missing_margin() -> None:
@@ -2758,7 +2181,6 @@ def test_live_final_entry_revalidation_selects_executable_passive_orientation() 
         exit_fee_bps=2.0,
         long_taker_fee_bps=1.0,
         short_taker_fee_bps=1.0,
-        taker_fee_evidence_complete=True,
         economics_observed_at_ms=1_000,
         model_epoch="v1_exact",
     )
@@ -2999,8 +2421,6 @@ def test_risk_allocator_fails_closed_for_nonfinite_size_or_margin_evidence(
         settlement_crowding_bucket_ms=300_000,
         max_correlation_group_exposure_quote=0.0,
         correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=0.0,
     )
 
     assert invalid_size.base_quantity == 0.0
@@ -3031,8 +2451,6 @@ def test_risk_allocator_malformed_settlement_timestamp_is_safe_and_blocks_when_r
         settlement_crowding_bucket_ms=300_000,
         max_correlation_group_exposure_quote=0.0,
         correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=0.0,
     )
 
     assert admission.allowed is False
@@ -3070,8 +2488,6 @@ def test_risk_allocator_malformed_recovered_position_is_evidence_gap_not_excepti
         settlement_crowding_bucket_ms=300_000,
         max_correlation_group_exposure_quote=0.0,
         correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=0.0,
     )
 
     assert admission.allowed is False
@@ -3168,8 +2584,6 @@ def test_risk_allocator_enforces_portfolio_venue_symbol_and_settlement_limits() 
         settlement_crowding_bucket_ms=300_000,
         max_correlation_group_exposure_quote=0.0,
         correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=0.0,
     )
 
     assert admission.allowed is False
@@ -3204,8 +2618,6 @@ def test_risk_allocator_enforces_granular_position_count_limits() -> None:
         "settlement_crowding_bucket_ms": 300_000,
         "max_correlation_group_exposure_quote": 0.0,
         "correlation_group_by_symbol": {},
-        "expected_shortfall_bps": 0.0,
-        "expected_shortfall_budget_quote": 0.0,
     }
     allocator = StrategyRiskAllocator()
 
@@ -3236,7 +2648,7 @@ def test_risk_allocator_enforces_granular_position_count_limits() -> None:
     assert per_pair.reason == "max_concurrent_positions_per_venue_pair"
 
 
-def test_risk_allocator_fails_closed_when_enabled_settlement_or_es_budget_lacks_evidence() -> None:
+def test_risk_allocator_fails_closed_when_settlement_budget_lacks_evidence() -> None:
     missing_settlement = StrategyRiskAllocator().assess_portfolio_admission(
         open_positions=[],
         symbol="BTCUSDT",
@@ -3256,83 +2668,9 @@ def test_risk_allocator_fails_closed_when_enabled_settlement_or_es_budget_lacks_
         settlement_crowding_bucket_ms=300_000,
         max_correlation_group_exposure_quote=0.0,
         correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=0.0,
-    )
-    missing_es = StrategyRiskAllocator().assess_portfolio_admission(
-        open_positions=[],
-        symbol="BTCUSDT",
-        long_venue="cheap",
-        short_venue="rich",
-        long_entry_price=100.0,
-        short_entry_price=100.0,
-        base_quantity=0.1,
-        first_funding_timestamp_ms=1_000,
-        max_concurrent_positions=0,
-        max_single_venue_exposure_quote=0.0,
-        max_symbol_exposure_quote=0.0,
-        max_concurrent_venue_pairs=0,
-        max_venue_pair_exposure_quote=0.0,
-        max_global_gross_exposure_quote=0.0,
-        max_settlement_bucket_exposure_quote=0.0,
-        settlement_crowding_bucket_ms=300_000,
-        max_correlation_group_exposure_quote=0.0,
-        correlation_group_by_symbol={},
-        expected_shortfall_bps=0.0,
-        expected_shortfall_budget_quote=1.0,
     )
 
     assert missing_settlement.reason == "missing_candidate_settlement_time"
-    assert missing_es.reason == "missing_expected_shortfall_model"
-
-
-def test_risk_allocator_uses_each_open_position_entry_es_or_blocks() -> None:
-    base_position = {
-        "symbol": "BTCUSDT",
-        "long_venue": "cheap",
-        "short_venue": "rich",
-        "long_quantity": 1.0,
-        "short_quantity": 1.0,
-        "long_entry_price": 100.0,
-        "short_entry_price": 100.0,
-        "funding_timestamp_ms": 1_000,
-    }
-    allocator = StrategyRiskAllocator()
-    common = {
-        "symbol": "ETHUSDT",
-        "long_venue": "cheap",
-        "short_venue": "other",
-        "long_entry_price": 100.0,
-        "short_entry_price": 100.0,
-        "base_quantity": 1.0,
-        "first_funding_timestamp_ms": 1_000,
-        "max_concurrent_positions": 0,
-        "max_single_venue_exposure_quote": 0.0,
-        "max_symbol_exposure_quote": 0.0,
-        "max_concurrent_venue_pairs": 0,
-        "max_venue_pair_exposure_quote": 0.0,
-        "max_global_gross_exposure_quote": 0.0,
-        "max_settlement_bucket_exposure_quote": 0.0,
-        "settlement_crowding_bucket_ms": 300_000,
-        "max_correlation_group_exposure_quote": 0.0,
-        "correlation_group_by_symbol": {},
-        "expected_shortfall_bps": 10.0,
-        "expected_shortfall_budget_quote": 0.60,
-    }
-
-    missing = allocator.assess_portfolio_admission(
-        open_positions=[SimpleNamespace(**base_position)], **common
-    )
-    complete = allocator.assess_portfolio_admission(
-        open_positions=[SimpleNamespace(**base_position, expected_shortfall_bps_entry=50.0)],
-        **common,
-    )
-
-    assert missing.allowed is False
-    assert missing.reason == "incomplete_open_position_expected_shortfall_evidence"
-    # Existing risk is 100 * 50 bps and new risk is 100 * 10 bps.
-    assert complete.allowed is True
-    assert complete.projected_expected_shortfall_quote == pytest.approx(0.60)
 
 
 def test_final_entry_revalidation_fails_closed_when_final_book_erases_alpha() -> None:
@@ -3379,7 +2717,9 @@ def test_final_revalidation_prices_the_selected_passive_leg_and_only_hedge_vwap(
         entry_fee_bps=2.0,
         entry_slippage_bps=3.0,
         entry_target_quantity=1.0,
-        **_verified_fee_provenance_candidate_fields(observed_at_ms=10),
+        long_taker_fee_bps=1.0,
+        short_taker_fee_bps=1.0,
+        economics_observed_at_ms=10,
     )
 
     decision = FundingEntryRevalidator().revalidate_before_first_leg(
@@ -3415,7 +2755,6 @@ def test_standard_fallback_revalidates_with_four_taker_costs() -> None:
         entry_fee_bps=1.0,
         long_taker_fee_bps=3.0,
         short_taker_fee_bps=4.0,
-        taker_fee_evidence_complete=True,
         entry_slippage_bps=5.0,
         entry_target_quantity=1.0,
     )
@@ -3515,7 +2854,6 @@ def test_final_entry_revalidation_treats_truthy_passive_override_as_standard_ioc
         entry_fee_bps=1.0,
         long_taker_fee_bps=3.0,
         short_taker_fee_bps=4.0,
-        taker_fee_evidence_complete=True,
         entry_target_quantity=1.0,
     )
 
@@ -3585,659 +2923,4 @@ def test_v1_final_revalidation_does_not_apply_shadow_forecast_to_first_stage_wor
     assert decision.allowed is True
     assert decision.edge.worst_case_edge_bps == pytest.approx(
         decision.edge.expected_net_edge_bps - candidate.execution_buffer_bps
-    )
-
-
-def test_funding_canary_requires_same_epoch_account_fee_evidence(tmp_path, monkeypatch) -> None:
-    evidence_path = tmp_path / "account-fees.json"
-    evidence_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 3,
-                "venues": {
-                    "cheap": {
-                        "taker_fee_bps": 0.8,
-                        "maker_fee_bps": 0.2,
-                        "observed_at_ms": 1_000,
-                        "source": "account_fee_api",
-                        "evidence_ref": "fee-snapshot-1",
-                        "account_identity_hash": "a" * 64,
-                    },
-                    "rich": {
-                        "taker_fee_bps": 0.7,
-                        "maker_fee_bps": 0.2,
-                        "observed_at_ms": 1_000,
-                        "source": "account_fee_api",
-                        "evidence_ref": "fee-snapshot-1",
-                        "account_identity_hash": "b" * 64,
-                    },
-                },
-                "integrity": {
-                    "algorithm": "hmac-sha256",
-                    "key_id": "lightfee-fee-evidence-v3",
-                    "signature": "",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LIGHTFEE_FEE_EVIDENCE_HMAC_KEY", "secret")
-    raw_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    evidence_path.write_text(
-        json.dumps(sign_fee_evidence_payload(raw_evidence, "secret")),
-        encoding="utf-8",
-    )
-    evidence = load_fee_evidence(
-        evidence_path,
-        now_ms=1_100,
-        max_age_ms=10_000,
-    )
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_canary_enabled=True,
-                funding_canary_allowed_venues=["cheap", "rich"],
-                funding_canary_max_concurrent_positions=1,
-                funding_canary_max_entry_notional_quote=30.0,
-                funding_canary_min_expected_net_edge_bps=8.0,
-                funding_canary_min_worst_case_edge_bps=3.0,
-                funding_canary_require_account_fee_evidence=True,
-            ),
-            runtime=SimpleNamespace(
-                mode="paper",
-                fee_evidence_path=str(evidence_path),
-                fee_evidence_max_age_ms=10_000,
-                fee_evidence_integrity_key_env="",
-                fee_evidence_account_identity_hashes={
-                    "cheap": "a" * 64,
-                    "rich": "b" * 64,
-                },
-            ),
-            venues=[
-                VenueConfig(
-                    venue="cheap", taker_fee_bps=0.8, maker_fee_bps=0.2
-                ),
-                VenueConfig(
-                    venue="rich", taker_fee_bps=0.7, maker_fee_bps=0.2
-                ),
-            ],
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-    candidate = _candidate(
-        entry_notional_quote=30.0,
-        expected_net_edge_bps=8.0,
-        worst_case_edge_bps=3.0,
-        long_taker_fee_bps=0.8,
-        short_taker_fee_bps=0.7,
-        account_fee_evidence_complete=True,
-        account_fee_evidence_observed_at_ms=1_000,
-        account_fee_evidence_source="account_fee_api",
-        account_fee_evidence_fingerprint=evidence.fingerprint_for("cheap", "rich"),
-        account_fee_evidence_provenance=evidence.provenance_for("cheap", "rich"),
-    )
-
-    # Production consumes the candidate only after the sidecar JSON boundary.
-    # Provenance is an untrusted assertion at this point; the final canary gate
-    # below independently reloads and verifies the signed local evidence.
-    snapshot_path = tmp_path / "sidecar.json"
-    snapshot = SidecarSnapshot(
-        published_at_ms=1_000,
-        market_observed_at_ms=1_000,
-        candidate_build_observed_at_ms=1_000,
-        candidate_build_diagnostics={
-            "input_quote_count": 2,
-            "requested_symbol_count": 1,
-            "requested_symbols": ["BTCUSDT"],
-            "requested_venues": ["cheap", "rich"],
-            "directional_pair_count": 1,
-            "output_candidate_count": 1,
-            "future_input_quote_count": 0,
-            "rejection_counts": {},
-        },
-        source_mode="direct_market",
-        acquisition_mode="fresh_sidecar",
-        funding_lifecycle=[
-            FundingLifecycle(
-                venue=venue,
-                observed_at_ms=1_000,
-                symbol_count=1,
-                coverage_usable=1,
-            )
-            for venue in ("cheap", "rich")
-        ],
-        market_lifecycle=[
-            MarketLifecycle(
-                venue=venue,
-                observed_at_ms=1_000,
-                symbol_count=1,
-                coverage_usable=1,
-            )
-            for venue in ("cheap", "rich")
-        ],
-        liquidity_lifecycle=[
-            LiquidityLifecycle(
-                venue=venue,
-                observed_at_ms=1_000,
-                symbol_count=1,
-                coverage_usable=1,
-            )
-            for venue in ("cheap", "rich")
-        ],
-        quotes={
-            f"{venue}:BTCUSDT": QuoteSnapshot(
-                venue=venue,
-                symbol="BTCUSDT",
-                bid=100.0,
-                ask=100.1,
-                observed_at_ms=1_000,
-                funding_rate_bps=1.0,
-                funding_timestamp_ms=1_000_000,
-                funding_interval_ms=28_800_000,
-                underlying="BTC",
-                quote_currency="USDT",
-                contract_type="linear",
-                contract_multiplier=1.0,
-                mark_index_source="venue_index",
-                price_precision=1,
-                quantity_precision=3,
-                price_tick=0.1,
-                quantity_step_base=0.001,
-                min_quantity_base=0.001,
-                min_notional_quote=1.0,
-                min_notional_evidence_complete=True,
-                venue_status="active",
-                contract_normalization_complete=True,
-            )
-            for venue in ("cheap", "rich")
-        },
-        # This test isolates the final canary trust boundary.  Marking the
-        # synthetic candidate diagnostic-only avoids pretending its hand-built
-        # economics came from the production pairing formula.
-        candidates=[
-            replace(
-                candidate,
-                blocked=True,
-                blocked_reasons=["synthetic_round_trip_fixture"],
-                economics_complete=False,
-                economics_incomplete_reason="synthetic_round_trip_fixture",
-                funding_timestamp_ms=1_000_000,
-                first_funding_timestamp_ms=1_000_000,
-                long_funding_timestamp_ms=1_000_000,
-                short_funding_timestamp_ms=1_000_000,
-            )
-        ],
-    )
-    publish_snapshot(snapshot, snapshot_path)
-    loaded_snapshot = load_snapshot(snapshot_path)
-    assert loaded_snapshot is not None
-    candidate = loaded_snapshot.candidates[0]
-    assert candidate.account_fee_evidence_complete is True
-    assert candidate.account_fee_evidence_observed_at_ms == 1_000
-    assert candidate.account_fee_evidence_source == "account_fee_api"
-    assert candidate.account_fee_evidence_fingerprint == evidence.fingerprint_for(
-        "cheap", "rich"
-    )
-    assert candidate.account_fee_evidence_provenance == evidence.provenance_for(
-        "cheap", "rich"
-    )
-
-    assert dispatch._funding_canary_admission_reason(candidate, 1_100) == ""
-    stale_candidate = replace(candidate, account_fee_evidence_observed_at_ms=999)
-    assert (
-        dispatch._funding_canary_admission_reason(stale_candidate, 1_100)
-        == "funding_canary_fee_evidence_epoch_mismatch"
-    )
-    understated_passive_candidate = replace(
-        candidate,
-        entry_maker_leg="long",
-        entry_fee_bps=0.1,
-        exit_fee_bps=0.1,
-    )
-    assert (
-        dispatch._funding_canary_admission_reason(understated_passive_candidate, 1_100)
-        == "funding_canary_fee_cost_understated"
-    )
-
-    local_payload = {
-        "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
-        "venues": {
-            "cheap": {
-                "taker_fee_bps": 0.8,
-                "maker_fee_bps": 0.2,
-                "observed_at_ms": 1_000,
-                "source": "account_fee_api",
-                "evidence_ref": "local-fee-snapshot-1",
-                "covered_symbols": ["BTCUSDT"],
-                "symbol_schedules": {
-                    "BTCUSDT": {
-                        "taker_fee_bps": 0.8,
-                        "maker_fee_bps": 0.2,
-                        "observed_at_ms": 1_000,
-                        "evidence_ref": "local-fee-snapshot-1:BTCUSDT",
-                    }
-                },
-            },
-            "rich": {
-                "taker_fee_bps": 0.7,
-                "maker_fee_bps": 0.2,
-                "observed_at_ms": 1_000,
-                "source": "account_fee_api",
-                "evidence_ref": "local-fee-snapshot-1",
-                "covered_symbols": ["BTCUSDT"],
-                "symbol_schedules": {
-                    "BTCUSDT": {
-                        "taker_fee_bps": 0.7,
-                        "maker_fee_bps": 0.2,
-                        "observed_at_ms": 1_000,
-                        "evidence_ref": "local-fee-snapshot-1:BTCUSDT",
-                    }
-                },
-            },
-        },
-    }
-    evidence_path.write_text(json.dumps(local_payload), encoding="utf-8")
-    evidence_path.chmod(0o600)
-    local_evidence = load_fee_evidence(
-        evidence_path, now_ms=1_100, max_age_ms=10_000
-    )
-    local_candidate = replace(
-        candidate,
-        account_fee_evidence_fingerprint=local_evidence.fingerprint_for(
-            "cheap", "rich", symbol="BTCUSDT"
-        ),
-        account_fee_evidence_provenance=local_evidence.provenance_for(
-            "cheap", "rich", symbol="BTCUSDT"
-        ),
-    )
-
-    assert dispatch._funding_canary_admission_reason(local_candidate, 1_100) == ""
-
-    uncovered = replace(local_candidate, symbol="SOLUSDT")
-    assert (
-        dispatch._funding_canary_admission_reason(uncovered, 1_100)
-        == "funding_canary_account_fee_evidence_unverified"
-    )
-
-    dispatch.ctx.config.venues[0].taker_fee_bps = 1.2
-    assert (
-        dispatch._funding_canary_admission_reason(local_candidate, 1_100)
-        == "funding_canary_fee_cost_understated"
-    )
-
-
-def test_funding_canary_cohort_survives_fee_refresh_but_resets_on_rate_change() -> None:
-    strategy = StrategyConfig()
-    base = _candidate(
-        account_fee_evidence_provenance=[
-            {
-                "document_sha256": "epoch-one",
-                "schedule_sha256": "stable-fee-contract",
-            }
-        ]
-    )
-    refreshed = replace(
-        base,
-        account_fee_evidence_provenance=[
-            {
-                "document_sha256": "epoch-two",
-                "schedule_sha256": "stable-fee-contract",
-            }
-        ],
-    )
-    changed = replace(
-        refreshed,
-        account_fee_evidence_provenance=[
-            {
-                "document_sha256": "epoch-three",
-                "schedule_sha256": "changed-fee-contract",
-            }
-        ],
-    )
-
-    assert _funding_canary_cohort_id(base, strategy) == _funding_canary_cohort_id(
-        refreshed, strategy
-    )
-    assert _funding_canary_cohort_id(base, strategy) != _funding_canary_cohort_id(
-        changed, strategy
-    )
-
-
-def test_funding_canary_runtime_accepts_configurable_bounded_scale() -> None:
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_canary_enabled=True,
-                funding_canary_allowed_venues=["cheap", "rich"],
-                funding_canary_max_concurrent_positions=2,
-                funding_canary_max_entry_notional_quote=1_000.0,
-                funding_canary_conservative_fee_max_entry_notional_quote=30.0,
-            ),
-            runtime=SimpleNamespace(mode="paper"),
-            venues=[
-                VenueConfig(venue="cheap", taker_fee_bps=1.0),
-                VenueConfig(venue="rich", taker_fee_bps=1.0),
-            ],
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-
-    assert (
-        dispatch._funding_canary_admission_reason(
-            _candidate(
-                taker_fee_evidence_complete=True,
-                expected_net_edge_bps=5.0,
-                long_taker_fee_bps=3.0,
-                short_taker_fee_bps=3.0,
-                entry_fee_bps=6.0,
-                exit_fee_bps=6.0,
-            ),
-            1_000,
-        )
-        == ""
-    )
-
-
-def test_funding_canary_runtime_applies_pair_specific_economics_floors() -> None:
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_canary_enabled=True,
-                funding_canary_allowed_venues=["cheap", "rich"],
-                funding_canary_min_expected_net_edge_bps=0.0,
-                funding_canary_min_worst_case_edge_bps=0.0,
-                funding_canary_min_expected_net_edge_bps_by_venue_pair={
-                    "rich:cheap": 6.0
-                },
-            ),
-            runtime=SimpleNamespace(mode="paper"),
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-
-    assert (
-        dispatch._funding_canary_admission_reason(
-            _candidate(taker_fee_evidence_complete=True, entry_notional_quote=15.0),
-            1_000,
-        )
-        == "funding_canary_expected_edge_below_floor"
-    )
-
-
-def test_funding_canary_runtime_supports_non_statement_venues_with_conservative_fees() -> None:
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_new_entries_enabled=True,
-                funding_canary_enabled=True,
-                funding_canary_allowed_venues=["gate", "hyperliquid"],
-            ),
-            runtime=SimpleNamespace(
-                mode="live",
-                fee_evidence_max_age_ms=24 * 60 * 60 * 1000,
-                fee_evidence_integrity_key_env="",
-            ),
-            venues=[
-                VenueConfig(venue="gate", taker_fee_bps=1.0),
-                VenueConfig(venue="hyperliquid", taker_fee_bps=1.0),
-            ],
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-
-    assert (
-        dispatch._funding_canary_admission_reason(
-            _candidate(
-                long_venue="gate",
-                short_venue="hyperliquid",
-                entry_notional_quote=15.0,
-                taker_fee_evidence_complete=True,
-                expected_net_edge_bps=5.0,
-                long_taker_fee_bps=3.0,
-                short_taker_fee_bps=3.0,
-                entry_fee_bps=6.0,
-                exit_fee_bps=6.0,
-            ),
-            1_000,
-        )
-        == ""
-    )
-
-
-def test_funding_canary_pairing_clamps_conservative_size_by_more_expensive_leg() -> None:
-    common = {
-        "symbol": "BTCUSDT",
-        "funding_timestamp_ms": 1_000_000,
-        "funding_interval_ms": 28_800_000,
-        "bid_size": 10.0,
-        "ask_size": 10.0,
-        "underlying": "BTC",
-        "quote_currency": "USDT",
-        "contract_type": "linear",
-        "contract_multiplier": 1.0,
-        "mark_index_source": "venue_index",
-        "price_precision": 2,
-        "quantity_precision": 3,
-        "price_tick": 0.01,
-        "quantity_step_base": 0.001,
-        "min_quantity_base": 0.001,
-        "min_notional_quote": 1.0,
-        "min_notional_evidence_complete": True,
-        "venue_status": "active",
-        "contract_normalization_complete": True,
-    }
-    quotes = {
-        "cheap:BTCUSDT": QuoteSnapshot(
-            venue="cheap", bid=99.0, ask=100.0, funding_rate_bps=1.0, **common
-        ),
-        "rich:BTCUSDT": QuoteSnapshot(
-            venue="rich", bid=110.0, ask=111.0, funding_rate_bps=20.0, **common
-        ),
-    }
-    strategy = StrategyConfig(
-        entry_notional_cap_quote=50.0,
-        live_entry_notional_cap_quote=50.0,
-        funding_missing_margin_fallback_notional_quote=50.0,
-        max_top_book_usage_ratio=1.0,
-        funding_canary_enabled=True,
-        funding_canary_require_account_fee_evidence=False,
-        funding_canary_max_entry_notional_quote=50.0,
-        funding_canary_conservative_fee_max_entry_notional_quote=15.0,
-        funding_canary_conservative_fee_buffer_bps=0.0,
-    )
-
-    candidate = build_same_symbol_pairs(
-        quotes,
-        ["BTCUSDT"],
-        strategy=strategy,
-        venue_fee_bps={"cheap": 1.0, "rich": 1.0},
-        observed_at_ms=10,
-    )[0]
-
-    assert candidate.funding_canary_fee_assurance_tier == "conservative"
-    assert candidate.funding_canary_hard_max_entry_notional_quote == 15.0
-    assert candidate.entry_max_leg_notional_quote <= 15.0 + 1e-9
-    assert candidate.entry_notional_quote == pytest.approx(
-        candidate.entry_target_quantity * (100.0 + 110.0) / 2.0
-    )
-    assert candidate.funding_canary_size_constrained is True
-
-
-def test_funding_canary_final_clamp_never_exceeds_cap_under_price_and_step_changes() -> None:
-    events: list[tuple[str, dict[str, object]]] = []
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_new_entries_enabled=True,
-                funding_canary_enabled=True,
-                funding_canary_require_account_fee_evidence=False,
-                funding_canary_max_entry_notional_quote=50.0,
-                funding_canary_conservative_fee_max_entry_notional_quote=15.0,
-            ),
-            runtime=SimpleNamespace(mode="live"),
-        ),
-        journal=SimpleNamespace(
-            append=lambda kind, payload: events.append((kind, payload))
-        ),
-    )
-    candidate = _candidate(
-        taker_fee_evidence_complete=True,
-        account_fee_evidence_complete=False,
-        entry_target_quantity=1.0,
-    )
-
-    for long_price, short_price, step in (
-        (100.0, 110.0, 0.001),
-        (250.0, 200.0, 0.01),
-        (9_999.0, 10_001.0, 0.0001),
-        (0.25, 0.30, 1.0),
-    ):
-        clamped, reason = dispatch._funding_canary_clamp_quantity(
-            candidate,
-            1_000,
-            quantity=1_000.0,
-            long_price=long_price,
-            short_price=short_price,
-            common_step=step,
-        )
-        assert reason == ""
-        assert clamped <= 1_000.0
-        assert clamped * max(long_price, short_price) <= 15.0 + 1e-9
-        assert candidate.entry_notional_quote == pytest.approx(
-            clamped * (long_price + short_price) / 2.0
-        )
-
-    assert any(kind == "runtime.funding_canary_size_clamped" for kind, _ in events)
-
-
-def test_funding_canary_conservative_gate_prices_mixed_symbol_authority_per_leg(
-    tmp_path,
-) -> None:
-    evidence_path = tmp_path / "mixed-account-fees.json"
-    evidence_path.write_text(
-        json.dumps(
-            {
-                "schema_version": LOCAL_FEE_EVIDENCE_SCHEMA_VERSION,
-                "venues": {
-                    "cheap": {
-                        "taker_fee_bps": 1.5,
-                        "maker_fee_bps": 0.4,
-                        "observed_at_ms": 1_000,
-                        "source": "account_fee_api",
-                        "evidence_ref": "cheap-mixed",
-                        "covered_symbols": ["BTCUSDT"],
-                        "symbol_schedules": {
-                            "BTCUSDT": {
-                                "taker_fee_bps": 1.5,
-                                "maker_fee_bps": 0.4,
-                                "observed_at_ms": 1_000,
-                                "evidence_ref": "cheap:BTCUSDT",
-                            }
-                        },
-                    },
-                    "rich": {
-                        "taker_fee_bps": 1.2,
-                        "maker_fee_bps": 0.3,
-                        "observed_at_ms": 1_000,
-                        "source": "account_fee_api",
-                        "evidence_ref": "rich-mixed",
-                        "covered_symbols": ["SOLUSDT"],
-                        "symbol_schedules": {
-                            "SOLUSDT": {
-                                "taker_fee_bps": 1.2,
-                                "maker_fee_bps": 0.3,
-                                "observed_at_ms": 1_000,
-                                "evidence_ref": "rich:SOLUSDT",
-                            }
-                        },
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    evidence_path.chmod(0o600)
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_canary_enabled=True,
-                funding_canary_allowed_venues=["cheap", "rich"],
-                funding_canary_require_account_fee_evidence=False,
-                funding_canary_conservative_fee_buffer_bps=2.0,
-                funding_canary_min_expected_net_edge_bps=0.0,
-                funding_canary_min_worst_case_edge_bps=0.0,
-            ),
-            runtime=SimpleNamespace(
-                mode="paper",
-                funding_fee_evidence_path=str(evidence_path),
-                funding_fee_evidence_max_age_ms=10_000,
-                fee_evidence_account_identity_hashes={},
-            ),
-            venues=[
-                VenueConfig(
-                    venue="cheap", taker_fee_bps=1.0, maker_fee_bps=0.2
-                ),
-                VenueConfig(
-                    venue="rich", taker_fee_bps=1.0, maker_fee_bps=0.2
-                ),
-            ],
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-    candidate = _candidate(
-        entry_notional_quote=15.0,
-        taker_fee_evidence_complete=True,
-        account_fee_evidence_complete=False,
-        long_taker_fee_bps=1.5,
-        short_taker_fee_bps=3.0,
-        entry_maker_leg="long",
-        exit_maker_leg="short",
-        entry_fee_bps=3.4,
-        exit_fee_bps=4.5,
-    )
-
-    assert dispatch._funding_canary_admission_reason(candidate, 1_100) == ""
-    assert (
-        dispatch._funding_canary_admission_reason(
-            replace(candidate, entry_fee_bps=3.3), 1_100
-        )
-        == "funding_canary_fee_cost_understated"
-    )
-    assert (
-        dispatch._funding_canary_admission_reason(
-            replace(candidate, exit_fee_bps=4.4), 1_100
-        )
-        == "funding_canary_fee_cost_understated"
-    )
-
-
-def test_funding_canary_profile_can_be_disabled_without_blocking_live_entry() -> None:
-    dispatch = object.__new__(EntryDispatchRuntime)
-    dispatch.ctx = SimpleNamespace(
-        config=SimpleNamespace(
-            strategy=StrategyConfig(
-                funding_new_entries_enabled=True,
-                funding_canary_enabled=False,
-            ),
-            runtime=SimpleNamespace(mode="live"),
-        ),
-        state=SimpleNamespace(open_positions=[], pending_entries=[]),
-    )
-
-    assert dispatch._funding_canary_admission_reason(_candidate(), 1_000) == ""
-    assert (
-        dispatch._funding_canary_submission_reason(
-            _candidate(),
-            1_000,
-            quantity=0.1,
-            long_price=100.0,
-            short_price=101.0,
-        )
-        == ""
     )

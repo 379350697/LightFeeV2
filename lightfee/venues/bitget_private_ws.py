@@ -353,7 +353,11 @@ def start_bitget_private_ws(transport, symbols: list[str]) -> None:
     base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _bitget_private_ws_url(base_url)
     private_state = transport._private_ws_state
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    # Bitget subscribes to account-wide USDT-FUTURES order/position topics;
+    # retain the transport-owned mapping across candidate changes.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
 
     task = asyncio.create_task(
         _bitget_private_ws_loop(

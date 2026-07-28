@@ -31,30 +31,13 @@ from lightfee.ops.production_health import (
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from lightfee.ops.auto_fail_closed_events import build_auto_fail_closed_summary
-from lightfee.sidecar.publisher import (
-    FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
-    funding_entry_snapshot_identity,
-    funding_entry_snapshot_manifest_path,
-    load_funding_entry_snapshot,
-)
-from lightfee.spread.quote_snapshot import (
-    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    load_spread_quote_snapshot,
-    producer_generation_id,
-    spread_quote_snapshot_path,
-)
-from lightfee.spread.universe import (
-    SPREAD_SAMPLING_MAX_PAIR_COUNT,
-    spread_sampling_pair_bound,
-)
 from scripts.diagnose_live import _build_stale_risk_state_alignment_summary
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS = 60_000
-FUNDING_ENTRY_MAX_FUTURE_SKEW_MS = 1_000
 PRODUCTION_SERVICE_NAMES = (
-    "lightfee-spread-bbo.service",
+    "lightfee-sidecar.service",
     "lightfee-spread-sidecar.service",
     "lightfee-live.service",
 )
@@ -64,15 +47,6 @@ PRODUCTION_SERVICE_NAMES = (
 # the two selected legs immediately before dispatch; requiring every configured
 # venue to be fresh in one global verifier sample would make an unrelated slow
 # venue a new admission gate.
-_SPREAD_BBO_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
-    {
-        "spread_bbo_venue_coverage_incomplete",
-        "spread_bbo_venue_degraded",
-        "spread_bbo_symbol_degraded",
-        "spread_bbo_publication_stale",
-        "spread_bbo_quote_stale",
-    }
-)
 _SPREAD_SNAPSHOT_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
     {
         "spread_snapshot_stale",
@@ -94,224 +68,27 @@ def _read_json(path: str) -> dict:
     return data
 
 
-def _funding_entry_snapshot_report(
+def _sidecar_snapshot_report(
     path: str | Path,
     *,
     now_ms: int,
     max_age_ms: int,
 ) -> HealthReport:
-    """Verify the atomic complete live-entry generation, not the slow audit."""
-
-    def _manifest_int(name: str, *, default: int = -1) -> int:
-        value = manifest.get(name, default)
-        if isinstance(value, bool):
-            return default
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _diagnostic_int(name: str) -> int:
-        value = candidate_diagnostics.get(name, 0)
-        if isinstance(value, bool):
-            return 0
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
-    fingerprints: list[str] = []
-    manifest_path = funding_entry_snapshot_manifest_path(path)
-    manifest: dict = {}
-    identity = None
-    snapshot = None
-    for _attempt in range(2):
-        try:
-            candidate_manifest = _read_json(str(manifest_path))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        identity_before = funding_entry_snapshot_identity(path, verify_digest=True)
-        candidate_snapshot = load_funding_entry_snapshot(path)
-        identity_after = funding_entry_snapshot_identity(path, verify_digest=True)
-        if (
-            identity_before is not None
-            and identity_before == identity_after
-            and candidate_snapshot is not None
-            and str(candidate_manifest.get("generation_id", "") or "")
-            == identity_before[0]
-        ):
-            manifest = candidate_manifest
-            identity = identity_before
-            snapshot = candidate_snapshot
-            break
-    if identity is None or snapshot is None or not manifest:
-        fingerprints.append("funding_entry_generation_missing_or_invalid")
-
-    ready_at_ms = int(getattr(snapshot, "ready_at_ms", 0) or 0)
-    ready_age_ms = now_ms - ready_at_ms if ready_at_ms > 0 else None
-    if (
-        ready_age_ms is None
-        or ready_age_ms < -FUNDING_ENTRY_MAX_FUTURE_SKEW_MS
-        or ready_age_ms > max(int(max_age_ms), 0)
-    ):
-        fingerprints.append("funding_entry_generation_stale")
-
-    payload_size = _manifest_int("payload_size_bytes")
-    manifest_candidate_count = _manifest_int("candidate_count")
-    manifest_quote_count = _manifest_int("quote_count")
-    manifest_schema_version = _manifest_int("schema_version")
-    page_count = _manifest_int("page_count")
-    max_page_size_bytes = _manifest_int("max_page_size_bytes")
-    candidates = list(getattr(snapshot, "candidates", []) or [])
-    quotes = dict(getattr(snapshot, "quotes", {}) or {})
-    candidate_diagnostics = dict(
-        getattr(snapshot, "candidate_build_diagnostics", {}) or {}
-    )
-    source_data_ready = candidate_diagnostics.get("source_data_ready") is True
-    eligible_frontier_complete = (
-        candidate_diagnostics.get("eligible_frontier_complete") is True
-    )
-    entry_frontier_ready = source_data_ready and eligible_frontier_complete
-    seed_pair_count = _diagnostic_int("seed_pair_count")
-    pair_decision_count = _diagnostic_int("pair_decision_count")
-    eligible_candidate_count = _diagnostic_int("eligible_candidate_count")
-    omitted_eligible_count = _diagnostic_int("omitted_eligible_count")
-    frontier_stop_reason = str(
-        candidate_diagnostics.get("frontier_stop_reason", "") or ""
-    )
-    if payload_size < 0:
-        fingerprints.append("funding_entry_payload_size_invalid")
-    if (
-        manifest_schema_version != 7
-        or page_count <= 0
-        or max_page_size_bytes <= 0
-        or max_page_size_bytes > FUNDING_ENTRY_SNAPSHOT_MAX_BYTES
-    ):
-        fingerprints.append("funding_entry_page_manifest_invalid")
-    if (
-        manifest_candidate_count != len(candidates)
-        or manifest_quote_count != len(quotes)
-    ):
-        fingerprints.append("funding_entry_manifest_count_mismatch")
-    if (
-        pair_decision_count != seed_pair_count
-        or eligible_candidate_count != len(candidates)
-        or omitted_eligible_count != 0
-    ):
-        fingerprints.append("funding_entry_opportunity_omitted")
-    if any(
-        bool(getattr(candidate, "blocked", True))
-        or getattr(candidate, "economics_complete", False) is not True
-        for candidate in candidates
-    ):
-        fingerprints.append("funding_entry_candidate_not_executable")
-    candidate_venues = {
-        str(venue or "").strip().lower()
-        for candidate in candidates
-        for venue in (
-            getattr(candidate, "long_venue", ""),
-            getattr(candidate, "short_venue", ""),
+    """Check the one atomically replaced sidecar snapshot."""
+    try:
+        snapshot = _read_json(str(path))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return HealthReport(
+            name="sidecar_snapshot",
+            ok=False,
+            severity="critical",
+            fingerprints=["funding_sidecar_snapshot_missing_or_invalid"],
+            details={"path": str(path), "error": str(exc)[:500]},
         )
-        if str(venue or "").strip()
-    }
-    degraded_venues = {
-        str(venue or "").strip().lower()
-        for venue in (getattr(snapshot, "degraded_venues", []) or [])
-        if str(venue or "").strip()
-    }
-    degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}
-    symbol_degraded_venues = {
-        str(venue or "").strip().lower()
-        for venue, symbols in (
-            degraded_symbols.items() if isinstance(degraded_symbols, dict) else []
-        )
-        if str(venue or "").strip() and symbols
-    }
-    scoped_degraded_venues = degraded_venues | symbol_degraded_venues
-    unscoped_degradation = bool(
-        not scoped_degraded_venues
-        and (
-            getattr(snapshot, "degraded_domains", [])
-            or (degraded_symbols and not isinstance(degraded_symbols, dict))
-        )
-    )
-    if candidates and (
-        str(getattr(snapshot, "acquisition_mode", "") or "") != "fresh_sidecar"
-        or bool(candidate_venues & scoped_degraded_venues)
-        or unscoped_degradation
-    ):
-        fingerprints.append("funding_entry_candidate_evidence_degraded")
-    if not candidates and not source_data_ready:
-        fingerprints.append("funding_entry_source_data_unavailable")
-    if not eligible_frontier_complete:
-        fingerprints.append("funding_entry_frontier_incomplete")
-
-    return HealthReport(
-        name="sidecar_snapshot",
-        ok=not fingerprints,
-        severity="critical" if fingerprints else "info",
-        fingerprints=fingerprints,
-        details={
-            "data_plane": "funding_entry_v7",
-            "manifest_path": str(manifest_path),
-            "generation_id": identity[0] if identity is not None else "",
-            "ready_at_ms": ready_at_ms,
-            "ready_age_ms": ready_age_ms,
-            "payload_size_bytes": payload_size,
-            "page_max_bytes": FUNDING_ENTRY_SNAPSHOT_MAX_BYTES,
-            "page_count": page_count,
-            "max_page_size_bytes": max_page_size_bytes,
-            "candidate_count": len(candidates),
-            "quote_count": len(quotes),
-            "diagnostics_only": not bool(candidates),
-            "source_data_ready": source_data_ready,
-            "eligible_frontier_complete": eligible_frontier_complete,
-            "entry_frontier_ready": entry_frontier_ready,
-            "seed_pair_count": seed_pair_count,
-            "pair_decision_count": pair_decision_count,
-            "eligible_candidate_count": eligible_candidate_count,
-            "omitted_eligible_count": omitted_eligible_count,
-            "frontier_stop_reason": frontier_stop_reason,
-        },
-    )
-
-
-def _sidecar_audit_observation(report: HealthReport) -> HealthReport:
-    """Expose background audit health without making it the live liveness gate."""
-
-    source = report.details
-    degraded_symbols = source.get("degraded_symbols", {})
-    degraded_symbol_counts = (
-        {
-            str(venue): len(symbols)
-            for venue, symbols in degraded_symbols.items()
-            if isinstance(symbols, list)
-        }
-        if isinstance(degraded_symbols, dict)
-        else {}
-    )
-    return HealthReport(
-        name="sidecar_audit_snapshot",
-        ok=True,
-        severity="info",
-        fingerprints=[],
-        details={
-            "data_plane": "background_full_audit",
-            "audit_ok": report.ok,
-            "audit_fingerprints": list(report.fingerprints),
-            "observed_at_ms": source.get("observed_at_ms"),
-            "age_ms": source.get("age_ms"),
-            "quote_venues": source.get("quote_venues", []),
-            "missing_venues": source.get("missing_venues", []),
-            "degraded_venues": source.get("degraded_venues", []),
-            "degraded_domains": source.get("degraded_domains", []),
-            "degraded_symbol_counts": degraded_symbol_counts,
-            "candidate_count": source.get("candidate_count", 0),
-            "unblocked_candidate_count": source.get(
-                "unblocked_candidate_count",
-                0,
-            ),
-        },
+    return analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=now_ms,
+        max_age_ms=max_age_ms,
     )
 
 
@@ -441,159 +218,6 @@ def _process_started_at_ms(pid: int) -> int:
     if ticks_per_s <= 0:
         return 0
     return int((boot_epoch_s + start_ticks / ticks_per_s) * 1000)
-
-
-def _spread_bbo_runtime_report(
-    path: str | Path,
-    *,
-    app_config,
-    now_ms: int | None,
-) -> HealthReport:
-    fingerprints: list[str] = []
-    details: dict[str, object] = {"path": str(path)}
-    snapshot = load_spread_quote_snapshot(path)
-    if snapshot is None:
-        fingerprints.append("spread_bbo_snapshot_missing_or_invalid")
-    else:
-        checked_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
-        expected_venues = {
-            str(venue.venue or "").strip().lower()
-            for venue in getattr(app_config, "venues", [])
-            if str(venue.venue or "").strip()
-        }
-        ttl_ms = max(
-            int(getattr(getattr(app_config, "strategy", None), "spread_signal_ttl_ms", 0) or 0),
-            1,
-        )
-        publish_age_ms = checked_at_ms - int(snapshot.published_at_ms or 0)
-        quote_ages_by_key = {
-            key: checked_at_ms - int(quote.observed_at_ms or 0)
-            for key, quote in snapshot.quotes.items()
-        }
-        fresh_quotes = {
-            key: quote
-            for key, quote in snapshot.quotes.items()
-            if 0 <= quote_ages_by_key[key] <= ttl_ms
-        }
-        observed_venues = {quote.venue for quote in fresh_quotes.values()}
-        venues_by_symbol: dict[str, set[str]] = {}
-        for quote in fresh_quotes.values():
-            symbol = str(getattr(quote, "symbol", "") or "").strip().upper()
-            venue = str(getattr(quote, "venue", "") or "").strip().lower()
-            if symbol and venue:
-                venues_by_symbol.setdefault(symbol, set()).add(venue)
-        observed_pair_count = sum(
-            len(venues) * (len(venues) - 1) // 2
-            for venues in venues_by_symbol.values()
-        )
-        sampling_symbols = list(getattr(snapshot, "sampling_symbols", []) or [])
-        configured_venues = set(snapshot.configured_venues)
-        evaluated_pair_bound = spread_sampling_pair_bound(
-            sampling_symbols,
-            configured_venues,
-        )
-        degraded_venues = sorted(
-            {
-                str(venue).strip().lower()
-                for venue in getattr(snapshot, "degraded_venues", [])
-                if str(venue).strip()
-            }
-        )
-        degraded_symbols = {
-            str(venue).strip().lower(): sorted(
-                {
-                    str(symbol).strip().upper()
-                    for symbol in symbols
-                    if str(symbol).strip()
-                }
-            )
-            for venue, symbols in getattr(snapshot, "degraded_symbols", {}).items()
-            if str(venue).strip() and symbols
-        }
-        quote_ages_ms = list(quote_ages_by_key.values())
-        strict_symbol_completeness = bool(
-            getattr(
-                getattr(app_config, "strategy", None),
-                "spread_live_enabled",
-                False,
-            )
-        )
-        details.update(
-            {
-                "published_at_ms": snapshot.published_at_ms,
-                "publish_age_ms": publish_age_ms,
-                "batch_started_at_ms": snapshot.batch_started_at_ms,
-                "quote_count": len(snapshot.quotes),
-                "fresh_quote_count": len(fresh_quotes),
-                "stale_quote_count": len(snapshot.quotes) - len(fresh_quotes),
-                "configured_venues": sorted(configured_venues),
-                "observed_venues": sorted(observed_venues),
-                "degraded_venues": degraded_venues,
-                "degraded_symbols": degraded_symbols,
-                "max_quote_age_ms": max(quote_ages_ms, default=None),
-                "signal_ttl_ms": ttl_ms,
-                "checked_at_ms": checked_at_ms,
-                "producer_generation_id": snapshot.producer_generation_id,
-                "schema_version": getattr(snapshot, "schema_version", 0),
-                "sampling_symbol_count": len(sampling_symbols),
-                "observed_pair_count": observed_pair_count,
-                "evaluated_pair_bound": evaluated_pair_bound,
-                "evaluated_pair_limit": SPREAD_SAMPLING_MAX_PAIR_COUNT,
-                "strict_symbol_completeness": strict_symbol_completeness,
-                "execution_contract": (
-                    "live" if strict_symbol_completeness else "paper_only"
-                ),
-            }
-        )
-        if getattr(snapshot, "schema_version", 0) != SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION:
-            fingerprints.append("spread_bbo_sampling_contract_unavailable")
-        if not sampling_symbols:
-            fingerprints.append("spread_bbo_sampling_universe_empty")
-        if evaluated_pair_bound > SPREAD_SAMPLING_MAX_PAIR_COUNT:
-            fingerprints.append("spread_bbo_sampling_pair_budget_exceeded")
-        if configured_venues != expected_venues:
-            fingerprints.append("spread_bbo_configured_venue_mismatch")
-        if observed_venues != expected_venues:
-            fingerprints.append("spread_bbo_venue_coverage_incomplete")
-        if strict_symbol_completeness and degraded_venues:
-            fingerprints.append("spread_bbo_venue_degraded")
-        if strict_symbol_completeness and degraded_symbols:
-            fingerprints.append("spread_bbo_symbol_degraded")
-        if publish_age_ms < 0 or publish_age_ms > ttl_ms:
-            fingerprints.append("spread_bbo_publication_stale")
-        if strict_symbol_completeness and any(
-            age < 0 or age > ttl_ms for age in quote_ages_ms
-        ):
-            fingerprints.append("spread_bbo_quote_stale")
-
-        try:
-            main_pid = _systemd_main_pid("lightfee-spread-bbo.service")
-            process_started_at_ms = _process_started_at_ms(main_pid)
-        except (OSError, subprocess.SubprocessError):
-            main_pid = 0
-            process_started_at_ms = 0
-        details["main_pid"] = main_pid
-        details["process_started_at_ms"] = process_started_at_ms
-        expected_generation_id = producer_generation_id(main_pid) if main_pid > 0 else ""
-        details["expected_generation_id"] = expected_generation_id
-        if process_started_at_ms <= 0:
-            fingerprints.append("spread_bbo_process_start_unavailable")
-        if not expected_generation_id or (
-            snapshot.producer_generation_id != expected_generation_id
-        ):
-            fingerprints.append("spread_bbo_snapshot_generation_mismatch")
-
-    report = HealthReport(
-        name="spread_bbo_runtime",
-        ok=not fingerprints,
-        severity="critical" if fingerprints else "info",
-        fingerprints=fingerprints,
-        details=details,
-    )
-    return _keep_pair_scoped_market_observations_nonblocking(
-        report,
-        market_observation_fingerprints=_SPREAD_BBO_MARKET_OBSERVATION_FINGERPRINTS,
-    )
 
 
 def _spread_snapshot_runtime_report(
@@ -868,7 +492,6 @@ def main() -> None:
         "--snapshot", default="/opt/lightfee-v2/runtime/opportunity-input-snapshot.json"
     )
     parser.add_argument("--spread-snapshot", default=None)
-    parser.add_argument("--spread-bbo-snapshot", default=None)
     parser.add_argument("--config", default=None)
     parser.add_argument("--current-state", default=default_current_state)
     parser.add_argument("--resolv-conf", default="/etc/resolv.conf")
@@ -888,7 +511,7 @@ def main() -> None:
     parser.add_argument(
         "--require-entry-enabled",
         action="store_true",
-        help="Fail readiness when the live funding canary entry policy is disabled.",
+        help="Fail readiness when the live funding entry policy is disabled.",
     )
     parser.add_argument(
         "--require-active-services",
@@ -925,23 +548,24 @@ def main() -> None:
 
     ownership_fingerprints: list[str] = []
     live_unit = unit_texts.get("lightfee-live.service", "")
-    spread_bbo_unit = unit_texts.get("lightfee-spread-bbo.service", "")
     spread_sidecar_unit = unit_texts.get("lightfee-spread-sidecar.service", "")
-    if "-m lightfee.apps.spread_bbo" not in spread_bbo_unit:
-        ownership_fingerprints.append("dedicated_spread_bbo_entrypoint_missing")
-    if "lightfee-spread-bbo.service" not in spread_sidecar_unit:
+    funding_sidecar_unit = unit_texts.get("lightfee-sidecar.service", "")
+    if not any(
+        entrypoint in funding_sidecar_unit
+        for entrypoint in ("lightfee-sidecar", "-m lightfee.apps.sidecar")
+    ):
+        ownership_fingerprints.append("funding_sidecar_entrypoint_missing")
+    if "lightfee-sidecar.service" not in spread_sidecar_unit:
         ownership_fingerprints.append("spread_consumer_dependency_missing")
     if "lightfee-sidecar.service" in live_unit:
         ownership_fingerprints.append("live_funding_sidecar_dependency_present")
-    if "lightfee-sidecar.service" in spread_bbo_unit:
-        ownership_fingerprints.append("spread_bbo_funding_sidecar_dependency_present")
     reports.append(
         HealthReport(
-            name="spread_bbo_ownership",
+            name="production_process_ownership",
             ok=not ownership_fingerprints,
             severity="critical" if ownership_fingerprints else "info",
             fingerprints=ownership_fingerprints,
-            details={"writer_model": "dedicated_process"},
+            details={"process_model": "funding_sidecar+live+spread_paper"},
         )
     )
 
@@ -973,68 +597,11 @@ def main() -> None:
                 )
             )
 
-    entry_manifest_path = funding_entry_snapshot_manifest_path(args.snapshot)
-    entry_snapshot_path = Path(args.snapshot)
-    if (
-        app_config is not None
-        and app_config.runtime.opportunity_input_mode == "single_process_entry"
-    ):
-        # Funding-entry handoff is retired in this mode.  A previous deployment
-        # can leave its V6 snapshot or manifest behind; it must not make the
-        # live-service health gate fail after the runtime has stopped reading it.
+    sidecar_snapshot_path = Path(args.snapshot)
+    if sidecar_snapshot_path.exists():
         reports.append(
-            HealthReport(
-                name="funding_entry_handoff",
-                ok=True,
-                severity="info",
-                fingerprints=[],
-                details={
-                    "mode": "single_process_entry",
-                    "status": "not_required",
-                    "path": args.snapshot,
-                    "retired_snapshot_present": entry_snapshot_path.exists(),
-                    "retired_manifest_present": entry_manifest_path.exists(),
-                },
-            )
-        )
-    elif entry_manifest_path.exists():
-        reports.append(
-            _funding_entry_snapshot_report(
+            _sidecar_snapshot_report(
                 args.snapshot,
-                now_ms=now_ms,
-                max_age_ms=args.snapshot_max_age_ms,
-            )
-        )
-        if entry_snapshot_path.exists():
-            reports.append(
-                _sidecar_audit_observation(
-                    analyze_sidecar_snapshot(
-                        _read_json(args.snapshot),
-                        now_ms=now_ms,
-                        max_age_ms=args.snapshot_max_age_ms,
-                    )
-                )
-            )
-        else:
-            reports.append(
-                HealthReport(
-                    name="sidecar_audit_snapshot",
-                    ok=True,
-                    severity="info",
-                    fingerprints=[],
-                    details={
-                        "data_plane": "background_full_audit",
-                        "audit_ok": False,
-                        "audit_fingerprints": ["snapshot_file_missing"],
-                        "path": args.snapshot,
-                    },
-                )
-            )
-    elif entry_snapshot_path.exists():
-        # Backward-compatible diagnostics for pre-V6 and explicit fixture paths.
-        reports.append(
-            analyze_sidecar_snapshot(
-                _read_json(args.snapshot),
                 now_ms=now_ms,
                 max_age_ms=args.snapshot_max_age_ms,
             )
@@ -1042,40 +609,16 @@ def main() -> None:
     else:
         reports.append(
             HealthReport(
-                name="funding_entry_handoff",
-                ok=True,
-                severity="info",
-                fingerprints=[],
+                name="sidecar_snapshot",
+                ok=False,
+                severity="critical",
+                fingerprints=["funding_sidecar_snapshot_missing"],
                 details={
-                    "mode": "single_process_entry",
-                    "status": "not_required",
+                    "status": "missing",
                     "path": args.snapshot,
                 },
             )
         )
-
-    if require_active_services:
-        spread_bbo_snapshot = args.spread_bbo_snapshot or str(
-            spread_quote_snapshot_path(args.snapshot)
-        )
-        if app_config is None:
-            reports.append(
-                HealthReport(
-                    name="spread_bbo_runtime",
-                    ok=False,
-                    severity="critical",
-                    fingerprints=["spread_bbo_runtime_config_unavailable"],
-                    details={"path": spread_bbo_snapshot},
-                )
-            )
-        else:
-            reports.append(
-                _spread_bbo_runtime_report(
-                    spread_bbo_snapshot,
-                    app_config=app_config,
-                    now_ms=args.now_ms or None,
-                )
-            )
 
     spread_snapshot_path = args.spread_snapshot
     if spread_snapshot_path is None and args.current_state == default_current_state:

@@ -6,7 +6,6 @@ Do not change passive maker business conditions while extracting it.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Any
 
 from lightfee.core.domain import Side
@@ -25,67 +24,6 @@ if TYPE_CHECKING:
 class PassiveMakerRuntime:
     def __init__(self, ctx: PassiveMakerRuntimeContext) -> None:
         self.ctx = ctx
-
-    def _assert_funding_canary_reprice_invariant(
-        self,
-        pending,
-        *,
-        new_price: float,
-        now_ms: int,
-        entry_id: str,
-    ) -> None:
-        if not bool(
-            getattr(pending, "funding_canary_enabled_at_entry", False)
-        ):
-            return
-        try:
-            cap = float(
-                getattr(
-                    pending,
-                    "funding_canary_hard_max_entry_notional_quote",
-                    0.0,
-                )
-                or 0.0
-            )
-            target_quantity = max(
-                float(getattr(pending, "target_quantity", 0.0) or 0.0),
-                float(getattr(pending, "long_quantity", 0.0) or 0.0),
-                float(getattr(pending, "short_quantity", 0.0) or 0.0),
-                float(getattr(pending, "entry_target_quantity", 0.0) or 0.0),
-            )
-            final_price = float(new_price or 0.0)
-        except (TypeError, ValueError, OverflowError):
-            cap = target_quantity = final_price = float("nan")
-        final_notional = target_quantity * final_price
-        if (
-            all(
-                math.isfinite(value)
-                for value in (cap, target_quantity, final_price, final_notional)
-            )
-            and cap > 0.0
-            and target_quantity > 0.0
-            and final_price > 0.0
-            and final_notional <= cap + 1e-9
-        ):
-            return
-        reason = "funding_canary_final_notional_invariant_breached"
-        self.ctx.journal.append(
-            reason,
-            {
-                "entry_id": entry_id,
-                "symbol": str(getattr(pending, "symbol", "") or ""),
-                "target_quantity": target_quantity,
-                "new_price": final_price,
-                "entry_max_leg_notional_quote": final_notional,
-                "funding_canary_hard_max_entry_notional_quote": cap,
-                "candidate_revision_id": str(
-                    getattr(pending, "candidate_revision_id", "") or ""
-                ),
-                "reason": reason,
-                "ts_ms": now_ms,
-            },
-        )
-        raise RuntimeError(reason)
 
     @property
     def _maker_event_state(self) -> dict[str, object]:
@@ -307,12 +245,6 @@ class PassiveMakerRuntime:
         now_ms: int,
         entry_id: str,
     ) -> None:
-        self._assert_funding_canary_reprice_invariant(
-            pending,
-            new_price=new_price,
-            now_ms=now_ms,
-            entry_id=entry_id,
-        )
         override = self._runtime_method_override("_reprice_passive_maker")
         if override is not None:
             return await override(
@@ -331,12 +263,6 @@ class PassiveMakerRuntime:
         now_ms: int,
         entry_id: str,
     ):
-        self._assert_funding_canary_reprice_invariant(
-            pending,
-            new_price=new_price,
-            now_ms=now_ms,
-            entry_id=entry_id,
-        )
         override = self._runtime_method_override("_reprice_passive_maker_l2")
         if override is not None:
             return await override(
@@ -377,29 +303,14 @@ class PassiveMakerRuntime:
 
         self._refresh_runtime_market_data_config_state()
         local_l2_enabled = self._local_l2_effective_enabled()
-        non_parity_mode = self.ctx.config.runtime.opportunity_input_mode == "non_parity"
 
         if self._entry_readiness_provider_uses_ws_bbo():
             await self._maybe_tick_maker_event_ws_bbo(now_ms, pending_passive)
         elif local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
             await self._maybe_tick_maker_event_local_l2(now_ms, pending_passive)
-        elif non_parity_mode:
-            # --- Explicit non-parity fallback: sidecar mid-price ---
-            await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
         else:
-            # Neither parity nor non-parity — sidecar fallback must be explicit opt-in.
-            # local_l2_enabled=False alone does NOT activate the sidecar path.
-            self.ctx.journal.append(
-                "runtime.maker_event_no_eligible_mode",
-                {
-                    "ts_ms": now_ms,
-                    "local_l2_enabled": local_l2_enabled,
-                    "local_l2_configured_enabled": self.ctx.config.strategy.local_l2_enabled,
-                    "opportunity_input_mode": self.ctx.config.runtime.opportunity_input_mode,
-                    "reason": "non-parity fallback requires explicit opportunity_input_mode='non_parity'",
-                },
-            )
+            await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
 
     async def _maybe_tick_maker_event_local_l2(
         self, now_ms: int, pending_passive: list,

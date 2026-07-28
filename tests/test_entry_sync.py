@@ -357,7 +357,7 @@ class TestEntrySyncHedgeRejectAfterMakerFill:
 
 class TestEntrySyncPostFirstFillDecision:
     @pytest.mark.asyncio
-    async def test_canary_rejects_oversized_first_request_before_submit(
+    async def test_legacy_canary_cap_does_not_block_first_request(
         self, adapters, journal, btc_context
     ):
         ctx = replace(
@@ -370,43 +370,27 @@ class TestEntrySyncPostFirstFillDecision:
 
         result = await executor.execute(ctx)
 
-        assert result.state == EntryState.FAILED
-        assert result.reject_reason == (
-            "funding_canary_final_notional_invariant_breached"
-        )
-        assert adapters[Venue.BINANCE].place_order_call_count == 0
-        assert adapters[Venue.OKX].place_order_call_count == 0
-        assert any(
-            record["kind"]
-            == "funding_canary_final_notional_invariant_breached"
-            for record in journal.read_all()
-        )
+        assert result.state == EntryState.COMPLETED
+        assert adapters[Venue.BINANCE].place_order_call_count == 1
+        assert adapters[Venue.OKX].place_order_call_count == 1
+        assert all("funding_canary" not in record["kind"] for record in journal.read_all())
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("invalid_field", ["cap", "quantity", "price"])
-    async def test_canary_rejects_non_finite_first_request_before_submit(
+    @pytest.mark.parametrize("legacy_cap", [float("nan"), float("inf"), 0.0])
+    async def test_non_finite_legacy_canary_cap_is_not_an_order_gate(
         self,
         adapters,
         journal,
         btc_context,
-        invalid_field,
+        legacy_cap,
     ):
         quantity = 0.0002
-        cap = 15.0
-        long_price = btc_context.long_price_hint
-        if invalid_field == "cap":
-            cap = float("nan")
-        elif invalid_field == "quantity":
-            quantity = float("nan")
-        else:
-            long_price = float("inf")
         ctx = replace(
             btc_context,
             long_quantity=quantity,
             short_quantity=quantity,
-            long_price_hint=long_price,
             funding_canary_enabled_at_entry=True,
-            funding_canary_hard_max_entry_notional_quote=cap,
+            funding_canary_hard_max_entry_notional_quote=legacy_cap,
             candidate_revision_id="canary-non-finite",
         )
 
@@ -415,15 +399,12 @@ class TestEntrySyncPostFirstFillDecision:
             journal=journal,
         ).execute(ctx)
 
-        assert result.state == EntryState.FAILED
-        assert result.reject_reason == (
-            "funding_canary_final_notional_invariant_breached"
-        )
-        assert adapters[Venue.BINANCE].place_order_call_count == 0
-        assert adapters[Venue.OKX].place_order_call_count == 0
+        assert result.state == EntryState.COMPLETED
+        assert adapters[Venue.BINANCE].place_order_call_count == 1
+        assert adapters[Venue.OKX].place_order_call_count == 1
 
     @pytest.mark.asyncio
-    async def test_canary_hedge_reprice_breach_unwinds_first_fill(
+    async def test_legacy_canary_cap_does_not_interrupt_post_fill_hedge(
         self, adapters, journal, btc_context
     ):
         binance_ada = adapters[Venue.BINANCE]
@@ -469,18 +450,10 @@ class TestEntrySyncPostFirstFillDecision:
 
         result = await executor.execute(ctx)
 
-        assert result.state == EntryState.FAILED
-        assert result.reject_reason == "unwound_after_first_fill"
-        assert binance_ada.place_order_call_count == 2
-        assert binance_ada.last_request.reduce_only is True
-        assert okx_ada.place_order_call_count == 0
-        breaches = [
-            record["payload"]
-            for record in journal.read_all()
-            if record["kind"]
-            == "funding_canary_final_notional_invariant_breached"
-        ]
-        assert breaches[-1]["leg"] == "hedge_after_first_fill"
+        assert result.state == EntryState.COMPLETED
+        assert binance_ada.place_order_call_count == 1
+        assert okx_ada.place_order_call_count == 1
+        assert all("funding_canary" not in record["kind"] for record in journal.read_all())
 
     @pytest.mark.asyncio
     async def test_reprices_hedge_and_uses_actual_first_fill_quantity(
@@ -976,97 +949,11 @@ class TestPassiveMakerLifecycle:
 
     """Task 8: Maker post_only must use submit_passive_order not place_order."""
 
-    @pytest.mark.asyncio
-    async def test_canary_passive_reprice_breach_stops_before_cancel_replace(
-        self,
-        journal,
-    ):
-        calls = []
-
-        async def reprice_override(*args):
-            calls.append(args)
-
-        runtime = PassiveMakerRuntime(
-            SimpleNamespace(
-                journal=journal,
-                _reprice_passive_maker=reprice_override,
-            )
+    def test_passive_reprice_has_no_canary_invariant_gate(self):
+        assert not hasattr(
+            PassiveMakerRuntime,
+            "_assert_funding_canary_reprice_invariant",
         )
-        pending = SimpleNamespace(
-            symbol="BTCUSDT",
-            target_quantity=0.1,
-            long_quantity=0.1,
-            short_quantity=0.1,
-            entry_target_quantity=0.1,
-            funding_canary_enabled_at_entry=True,
-            funding_canary_hard_max_entry_notional_quote=15.0,
-            candidate_revision_id="canary-passive-revision",
-        )
-
-        with pytest.raises(
-            RuntimeError,
-            match="funding_canary_final_notional_invariant_breached",
-        ):
-            await runtime._call_reprice_passive_maker(
-                pending,
-                160.0,
-                140.0,
-                "reprice",
-                2_000,
-                "entry-canary-passive",
-            )
-
-        assert calls == []
-        breach = [
-            record["payload"]
-            for record in journal.read_all()
-            if record["kind"]
-            == "funding_canary_final_notional_invariant_breached"
-        ][-1]
-        assert breach["entry_max_leg_notional_quote"] == pytest.approx(16.0)
-        assert breach["funding_canary_hard_max_entry_notional_quote"] == 15.0
-
-    @pytest.mark.asyncio
-    async def test_canary_passive_reprice_rejects_non_finite_cap(
-        self,
-        journal,
-    ):
-        calls = []
-
-        async def reprice_override(*args):
-            calls.append(args)
-
-        runtime = PassiveMakerRuntime(
-            SimpleNamespace(
-                journal=journal,
-                _reprice_passive_maker=reprice_override,
-            )
-        )
-        pending = SimpleNamespace(
-            symbol="BTCUSDT",
-            target_quantity=0.1,
-            long_quantity=0.1,
-            short_quantity=0.1,
-            entry_target_quantity=0.1,
-            funding_canary_enabled_at_entry=True,
-            funding_canary_hard_max_entry_notional_quote=float("inf"),
-            candidate_revision_id="canary-passive-non-finite",
-        )
-
-        with pytest.raises(
-            RuntimeError,
-            match="funding_canary_final_notional_invariant_breached",
-        ):
-            await runtime._call_reprice_passive_maker(
-                pending,
-                100.0,
-                100.0,
-                "reprice",
-                2_000,
-                "entry-canary-passive-non-finite",
-            )
-
-        assert calls == []
 
     @pytest.mark.asyncio
     async def test_entry_maker_uses_submit_passive_order_not_place_order(self):

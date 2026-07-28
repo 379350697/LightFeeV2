@@ -168,9 +168,6 @@ def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespac
         calculation_version="v1_exact",
         model_epoch="v1_exact",
         forecast_worst_funding_edge_bps=0.0,
-        # Zero is a valid simulated fee, but all-taker live candidates must
-        # carry explicit fee evidence rather than rely on a default.
-        taker_fee_evidence_complete=True,
         # This harness exercises exchange-admission paths after a candidate has
         # already passed the mandatory live economics contract.
         economics_complete=True,

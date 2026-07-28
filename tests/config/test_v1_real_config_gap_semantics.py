@@ -81,29 +81,6 @@ class TestEntryMinSizeRoundUpWhitelist:
         assert len(cfg.entry_min_size_round_up_whitelist) == 2
 
 
-class TestDirectMarketEnrichedMode:
-    """direct_market_enriched is a valid V1 opportunity input mode with provenance depth."""
-
-    def test_direct_market_enriched_is_valid_mode(self):
-        """V1 direct_market_enriched is a real provider mode, not historical residue."""
-        from lightfee.config.compatibility import VALID_OPPORTUNITY_INPUT_MODES
-
-        assert "direct_market_enriched" in VALID_OPPORTUNITY_INPUT_MODES, (
-            "direct_market_enriched missing from VALID_OPPORTUNITY_INPUT_MODES — "
-            "V1 uses this for enriched provider with hints and transfer resolution"
-        )
-
-    def test_direct_market_enriched_passes_validation(self):
-        """Config with direct_market_enriched should validate."""
-        config = AppConfig(
-            symbols=["BTCUSDT"],
-            runtime=RuntimeConfig(opportunity_input_mode="direct_market_enriched"),
-        )
-        issues = validate_config(config)
-        mode_issues = [i for i in issues if "opportunity_input_mode" in i]
-        assert len(mode_issues) == 0, f"direct_market_enriched should validate: {mode_issues}"
-
-
 class TestChillybotFieldsRemainRejected:
     """Confirm retired Chillybot behavior stays filtered out."""
 

@@ -4,26 +4,18 @@ last-good fallback, and per-symbol degradation tracking (V1 parity)."""
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from functools import partial
 import logging
-import threading
 import time
 from math import ceil, isfinite
 from pathlib import Path
 from typing import Mapping, Optional
 
-from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.config.schema import AppConfig, VenueConfig
 from lightfee.core.domain import Venue
-from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import FundingCandidateService
 from lightfee.sidecar.publisher import (
-    funding_entry_snapshot_identity,
-    load_funding_entry_snapshot,
     load_snapshot,
-    publish_funding_entry_snapshot,
     publish_snapshot,
 )
 from lightfee.sidecar.snapshot import (
@@ -37,24 +29,7 @@ from lightfee.sidecar.snapshot import (
     entry_targeted_oi_revalidation_required,
     funding_rate_evidence_reason,
 )
-from lightfee.spread.quote_snapshot import (
-    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    SpreadQuoteSnapshot,
-    publish_spread_quote_snapshot,
-    spread_metadata_snapshot_path,
-    spread_quote_snapshot_path,
-)
-from lightfee.spread.universe import (
-    resolve_spread_sampling_symbols,
-    spread_sampling_selection_required,
-)
-from lightfee.strategy.fee_evidence import effective_fee_maps, load_fee_evidence
 from lightfee.sidecar.sources.exchange import ExchangeSource
-from lightfee.sidecar.spread_bbo import (
-    SpreadBboDataPlane,
-    quote_cache_contract_eligible as _quote_cache_contract_eligible,
-)
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
 from lightfee.venues.specs import get_spec
 
@@ -64,10 +39,55 @@ DEFAULT_FUNDING_TIMEOUT_S = (
 )
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
-FUNDING_AUDIT_MIN_INTERVAL_S = 60.0
-FUNDING_ENTRY_BBO_FRONTIER_S = 0.45
 
 logger = logging.getLogger("lightfee.sidecar.service")
+
+
+def _quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
+    """Return whether a quote is complete enough for restart last-good use."""
+
+    if quote.contract_normalization_complete is not True:
+        return False
+    if str(quote.contract_type or "").strip().lower() != "linear":
+        return False
+    if str(quote.venue_status or "").strip().lower() != "active":
+        return False
+    if not all(
+        str(value or "").strip()
+        for value in (quote.underlying, quote.quote_currency, quote.mark_index_source)
+    ):
+        return False
+    numeric_contract = (
+        quote.contract_multiplier,
+        quote.price_tick,
+        quote.quantity_step_base,
+        quote.min_quantity_base,
+    )
+    if not all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        and float(value) > 0.0
+        for value in numeric_contract
+    ):
+        return False
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (quote.price_precision, quote.quantity_precision)
+    ):
+        return False
+    if not (
+        quote.min_notional_evidence_complete is True
+        and isinstance(quote.min_notional_quote, (int, float))
+        and not isinstance(quote.min_notional_quote, bool)
+        and isfinite(float(quote.min_notional_quote))
+        and float(quote.min_notional_quote) >= 0.0
+    ):
+        return False
+    return all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (quote.funding_timestamp_ms, quote.funding_interval_ms)
+    )
 
 
 class SidecarService:
@@ -79,28 +99,13 @@ class SidecarService:
     quotes for that venue so candidates are not lost.
     """
 
-    def __init__(
-        self,
-        config: AppConfig,
-        *,
-        enable_spread_bbo: bool = True,
-        in_process_entry: bool = False,
-    ) -> None:
+    def __init__(self, config: AppConfig) -> None:
         self.config = config
-        # The live runtime can own this collection directly.  In that mode it
-        # must not restore or publish the file-based funding entry handoff.
-        self.in_process_entry = bool(in_process_entry)
-        self.embedded_spread_bbo_enabled = bool(enable_spread_bbo) and not self.in_process_entry
+        self.snapshot_path = config.runtime.sidecar_snapshot_path
         self._venue_configs_by_name = _canonical_venue_configs(config.venues)
-        if self.in_process_entry:
-            forecast_path = Path(
-                config.runtime.funding_basis_risk_checkpoint_path
-            ).with_name("funding-forecast-in-process-calibration.json")
-        else:
-            self.snapshot_path = config.runtime.sidecar_snapshot_path
-            forecast_path = Path(self.snapshot_path).with_name(
-                f"{Path(self.snapshot_path).name}.funding-forecast-calibration.json"
-            )
+        forecast_path = Path(self.snapshot_path).with_name(
+            f"{Path(self.snapshot_path).name}.funding-forecast-calibration.json"
+        )
         self._forecast_calibrator = FundingForecastCalibrator(
             forecast_path,
             min_samples=config.strategy.funding_forecast_min_samples,
@@ -111,31 +116,16 @@ class SidecarService:
         runtime = config.runtime
         self._funding_timeout_s = runtime.sidecar_funding_timeout_s
         self._candidate_service = self._new_candidate_service()
-        self._audit_publish_task: asyncio.Task | None = None
-        self._audit_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="lightfee-funding-audit",
-        )
-        self._audit_pending_build: dict[str, object] | None = None
-        self._last_audit_schedule_monotonic: float = 0.0
-        self._entry_frontier_oracle_tasks: set[asyncio.Task] = set()
         self._entry_venue_fetch_tasks: dict[str, asyncio.Task] = {}
         self._entry_venue_latest_results: dict[str, tuple] = {}
         self._entry_venue_late_tasks: set[asyncio.Task] = set()
-        self._funding_entry_bbo_fetch_tasks: dict[str, asyncio.Task] = {}
-        self._funding_entry_bbo_latest_results: dict[str, tuple] = {}
-        self._funding_entry_bbo_late_tasks: set[asyncio.Task] = set()
         self.entry_venue_republish_event = asyncio.Event()
         self._entry_cache_only_refresh = False
 
         self._exchange_sources: dict[str, ExchangeSource] = {}
-        self._funding_entry_bbo_sources: dict[str, ExchangeSource] = {}
-        self._spread_bbo_sources: dict[str, ExchangeSource] = {}
         from lightfee.venues.transport import EndpointRateLimiter
 
         self._public_rate_limiters: dict[str, EndpointRateLimiter] = {}
-        self._funding_entry_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
-        self._spread_bbo_rate_limiters: dict[str, EndpointRateLimiter] = {}
 
         # V1 parity: last-good fallback cache.  Initialise before reading the
         # prior snapshot so a restart can retain still-valid per-key evidence.
@@ -144,8 +134,6 @@ class SidecarService:
         self._last_good_at_ms_by_key: dict[str, int] = {}
         self._last_liquidity_publish_at_ms: int = 0
         self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
-        self._in_process_top_books: dict[str, dict[str, TopBookQuote]] | None = None
-
         for venue_name in self._venue_configs_by_name:
             venue = Venue.from_str(venue_name)
             spec = get_spec(venue)
@@ -158,145 +146,50 @@ class SidecarService:
                 rate_limiter=rate_limiter,
                 http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
             )
-            # Funding entry prices have their own sparse BBO-only lane.  One
-            # bulk request per refresh cannot inherit slow funding/OI waits,
-            # while 250ms local pacing bounds the lane to four requests/sec.
-            entry_bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
-            self._funding_entry_bbo_rate_limiters[
-                venue_name
-            ] = entry_bbo_rate_limiter
-            self._funding_entry_bbo_sources[venue_name] = ExchangeSource(
-                spec,
-                rate_limiter=entry_bbo_rate_limiter,
-                http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-                consume_global_rate_limit_budget=False,
-            )
-            self._funding_entry_bbo_sources[
-                venue_name
-            ].share_contract_metadata_cache_from(
-                self._exchange_sources[venue_name]
-            )
-            # BBO owns a reserved, per-venue public budget.  It still paces
-            # requests and honours any 429 it receives, but funding/OI cannot
-            # consume its slots or bind it to the main event loop's cooldown
-            # runtime.  Four bulk requests/sec is deliberately conservative.
-            if self.embedded_spread_bbo_enabled:
-                bbo_rate_limiter = EndpointRateLimiter(1000, 8000, 250)
-                self._spread_bbo_rate_limiters[venue_name] = bbo_rate_limiter
-                self._spread_bbo_sources[venue_name] = ExchangeSource(
-                    spec,
-                    rate_limiter=bbo_rate_limiter,
-                    http_max_connections=SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS,
-                    consume_global_rate_limit_budget=False,
-                )
-                self._spread_bbo_sources[
-                    venue_name
-                ].share_contract_metadata_cache_from(
-                    self._exchange_sources[venue_name]
-                )
 
-        if not self.in_process_entry:
-            # A restart must not erase a cadence that the exchange has already
-            # demonstrated.  This is a local snapshot read only; it adds no public
-            # REST request and leaves unknown schedules unknown.
-            try:
-                prior_snapshot = load_snapshot(self.snapshot_path)
-            except (KeyError, TypeError, ValueError):
-                # A malformed or legacy snapshot must not turn a safe restart into
-                # an outage.  It merely leaves funding cadence cold/unknown.
-                logger.warning("sidecar funding schedule restore skipped: malformed snapshot")
-                prior_snapshot = None
-            if prior_snapshot is not None:
-                self._forecast_calibrator.prime(prior_snapshot.quotes)
-                quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
-                for quote in prior_snapshot.quotes.values():
-                    quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
-                for venue_name, source in self._exchange_sources.items():
-                    source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
-                restored = _restorable_prior_last_good_quotes(
-                    prior_snapshot,
-                    configured_venues=set(self._venue_configs_by_name),
-                    configured_symbols=_canonical_symbol_set(config.symbols),
-                    now_ms=int(time.time() * 1000),
-                    max_age_ms=max(
-                        int(runtime.live_scan_last_good_max_age_ms or 0),
-                        0,
-                    ),
-                )
-                self._last_good_quotes = restored
-                self._last_good_at_ms_by_key = {
-                    key: int(quote.observed_at_ms)
-                    for key, quote in restored.items()
-                }
-                self._last_good_at_ms = max(
-                    self._last_good_at_ms_by_key.values(),
-                    default=0,
-                )
-
-        self._spread_bbo_data_plane = (
-            SpreadBboDataPlane(
-                config,
-                sources=self._spread_bbo_sources,
-                metadata_quotes=lambda: self._last_good_quotes,
-                metadata_quote_eligible=_quote_cache_contract_eligible,
-                snapshot_path=spread_quote_snapshot_path(self.snapshot_path),
-                snapshot_schema_version=SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
+        # A restart must not erase a cadence that the exchange has already
+        # demonstrated. This local read adds no public REST request.
+        try:
+            prior_snapshot = load_snapshot(self.snapshot_path)
+        except (KeyError, TypeError, ValueError):
+            logger.warning("sidecar funding schedule restore skipped: malformed snapshot")
+            prior_snapshot = None
+        if prior_snapshot is not None:
+            self._forecast_calibrator.prime(prior_snapshot.quotes)
+            quotes_by_venue: dict[str, list[QuoteSnapshot]] = {}
+            for quote in prior_snapshot.quotes.values():
+                quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
+            for venue_name, source in self._exchange_sources.items():
+                source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
+            restored = _restorable_prior_last_good_quotes(
+                prior_snapshot,
+                configured_venues=set(self._venue_configs_by_name),
+                configured_symbols=_canonical_symbol_set(config.symbols),
+                now_ms=int(time.time() * 1000),
+                max_age_ms=max(int(runtime.live_scan_last_good_max_age_ms or 0), 0),
             )
-            if self.embedded_spread_bbo_enabled
-            else None
-        )
+            self._last_good_quotes = restored
+            self._last_good_at_ms_by_key = {
+                key: int(quote.observed_at_ms) for key, quote in restored.items()
+            }
+            self._last_good_at_ms = max(self._last_good_at_ms_by_key.values(), default=0)
 
     async def close(self) -> None:
         entry_fetch_tasks = list(
             getattr(self, "_entry_venue_fetch_tasks", {}).values()
         )
-        entry_bbo_fetch_tasks = list(
-            getattr(self, "_funding_entry_bbo_fetch_tasks", {}).values()
-        )
-        for task in [*entry_fetch_tasks, *entry_bbo_fetch_tasks]:
+        for task in entry_fetch_tasks:
             if not task.done():
                 task.cancel()
-        all_entry_tasks = [*entry_fetch_tasks, *entry_bbo_fetch_tasks]
-        if all_entry_tasks:
-            await asyncio.gather(*all_entry_tasks, return_exceptions=True)
+        if entry_fetch_tasks:
+            await asyncio.gather(*entry_fetch_tasks, return_exceptions=True)
         self._entry_venue_fetch_tasks = {}
         self._entry_venue_late_tasks = set()
-        self._funding_entry_bbo_fetch_tasks = {}
-        self._funding_entry_bbo_late_tasks = set()
         republish_event = getattr(self, "entry_venue_republish_event", None)
         if isinstance(republish_event, asyncio.Event):
             republish_event.clear()
-        self._audit_pending_build = None
-        audit_task = getattr(self, "_audit_publish_task", None)
-        if audit_task is not None:
-            if not audit_task.done():
-                audit_task.cancel()
-            await asyncio.gather(audit_task, return_exceptions=True)
-        self._audit_publish_task = None
-        frontier_oracle_tasks = list(
-            getattr(self, "_entry_frontier_oracle_tasks", set())
-        )
-        for task in frontier_oracle_tasks:
-            if not task.done():
-                task.cancel()
-        if frontier_oracle_tasks:
-            await asyncio.gather(*frontier_oracle_tasks, return_exceptions=True)
-        self._entry_frontier_oracle_tasks = set()
-        audit_executor = getattr(self, "_audit_executor", None)
-        if audit_executor is not None:
-            # Full audit files are installed atomically and are not part of
-            # the live entry read path.  Do not let an uncooperative audit
-            # calculation hold process shutdown indefinitely; pending work is
-            # canceled and an already-running worker is allowed to unwind.
-            audit_executor.shutdown(wait=False, cancel_futures=True)
-        self._audit_executor = None
         for group_name, sources in (
             ("exchange", list(getattr(self, "_exchange_sources", {}).values())),
-            (
-                "funding_entry_bbo",
-                list(getattr(self, "_funding_entry_bbo_sources", {}).values()),
-            ),
-            ("spread_bbo", list(getattr(self, "_spread_bbo_sources", {}).values())),
         ):
             for src in sources:
                 try:
@@ -307,97 +200,11 @@ class SidecarService:
                         extra={"source_group": group_name},
                     )
 
-    async def run_spread_bbo_data_plane(self, stop_event: asyncio.Event) -> None:
-        if self._spread_bbo_data_plane is None:
-            raise RuntimeError("embedded spread BBO data plane is disabled")
-        if spread_sampling_selection_required(self.config):
-            while not stop_event.is_set():
-                sampling_symbols = resolve_spread_sampling_symbols(
-                    self.config,
-                    self._last_good_quotes,
-                    quote_eligible=_quote_cache_contract_eligible,
-                )
-                if sampling_symbols:
-                    self._spread_bbo_data_plane.set_sampling_symbols(sampling_symbols)
-                    logger.info(
-                        "embedded spread BBO sampling universe frozen: "
-                        "symbols=%d global_symbols=%d",
-                        len(sampling_symbols),
-                        len(self.config.symbols),
-                    )
-                    break
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-            if stop_event.is_set():
-                return
-        thread_stop = threading.Event()
-        runner = asyncio.create_task(
-            asyncio.to_thread(
-                _run_spread_bbo_in_thread,
-                self._spread_bbo_data_plane,
-                list(self._spread_bbo_sources.values()),
-                thread_stop,
-            )
-        )
-        stop_task = asyncio.create_task(stop_event.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {runner, stop_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if runner in done and not stop_event.is_set():
-                await runner
-                raise RuntimeError("spread BBO thread exited unexpectedly")
-            thread_stop.set()
-            await runner
-        finally:
-            thread_stop.set()
-            if not stop_task.done():
-                stop_task.cancel()
-            await asyncio.gather(stop_task, return_exceptions=True)
-            # ``asyncio.to_thread`` cancellation cannot stop the underlying
-            # thread.  Keep service shutdown from racing ``close()`` against
-            # BBO clients that still belong to the thread's event loop.
-            if not runner.done():
-                await asyncio.shield(runner)
-
     # ------------------------------------------------------------------
     # Main refresh
     # ------------------------------------------------------------------
 
-    async def refresh_in_process_entry(
-        self,
-        top_books: Mapping[tuple[str, str], TopBookQuote],
-    ) -> SidecarSnapshot:
-        """Build the live entry view from runtime-owned WebSocket BBOs.
-
-        This intentionally shares the candidate and fee contracts with the
-        compatibility sidecar while keeping the result in memory.  It neither
-        restores nor publishes a funding-entry snapshot generation.
-        """
-        if not self.in_process_entry:
-            raise RuntimeError("in-process entry refresh requires in_process_entry=True")
-
-        configured_venues = set(self._configured_venue_names())
-        configured_symbols = _canonical_symbol_set(self.config.symbols)
-        by_venue: dict[str, dict[str, TopBookQuote]] = {}
-        for (raw_venue, raw_symbol), top_book in top_books.items():
-            venue = str(raw_venue).strip().lower()
-            symbol = str(raw_symbol).strip().upper()
-            if venue not in configured_venues or symbol not in configured_symbols:
-                continue
-            by_venue.setdefault(venue, {})[f"{venue}:{symbol}"] = top_book
-
-        self._in_process_top_books = by_venue
-        try:
-            return await self.refresh_once()
-        finally:
-            self._in_process_top_books = None
-
     async def refresh_once(self) -> SidecarSnapshot:
-        in_process_entry = bool(getattr(self, "in_process_entry", False))
         refresh_started_at_ms = int(time.time() * 1000)
         symbols = list(
             dict.fromkeys(
@@ -416,59 +223,23 @@ class SidecarService:
         fallback_used_keys: set[str] = set()
         fresh_cacheable_quote_keys: set[str] = set()
         market_quality_failed_symbols: dict[str, set[str]] = {}
-        spread_market_degraded_venues: set[str] = set()
         requested_symbol_count = len(_canonical_symbol_set(symbols))
         listed_symbols_by_venue: dict[str, set[str]] = {}
 
         # --- Funding + Market fetch (per venue, funding timeout) ---
-        if in_process_entry:
-            funding_results = await self._fetch_all_venues(
-                symbols,
-                timeout_s=self._funding_timeout_s,
-                funding_metadata_only=True,
-            )
-            # The runtime's WebSocket cache owns entry BBO in this mode.  Do
-            # not start the sidecar's duplicate REST BBO collection lane.
-            entry_bbo_results = [
-                (venue_name, None, None, set())
-                for venue_name in self._configured_venue_names()
-            ]
-        else:
-            funding_results, entry_bbo_results = await asyncio.gather(
-                self._fetch_all_venues(
-                    symbols,
-                    timeout_s=self._funding_timeout_s,
-                ),
-                self._fetch_funding_entry_bbo_all_venues(symbols),
-            )
-        entry_bbo_by_venue = {
-            venue_name: (venue_quotes, error)
-            for venue_name, venue_quotes, error, _failed_symbols in entry_bbo_results
-        }
+        funding_results = await self._fetch_all_venues(
+            symbols,
+            timeout_s=self._funding_timeout_s,
+        )
 
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
-            entry_bbo_quotes, _entry_bbo_error = entry_bbo_by_venue.get(
-                venue_name,
-                (None, RuntimeError("funding entry BBO result unavailable")),
-            )
-            if in_process_entry:
-                entry_bbo_quotes = (
-                    getattr(self, "_in_process_top_books", {}) or {}
-                ).get(venue_name, {})
             if error is not None:
                 degraded_venues.add(venue_name)
-                spread_market_degraded_venues.add(venue_name)
                 # V1 parity: last-good fallback — inject previous quotes
                 raw_fallback = self._inject_last_good(
                     venue_name,
                     symbols,
                     now_ms=refresh_started_at_ms,
-                )
-                raw_fallback = _overlay_funding_entry_top_books(
-                    venue_name,
-                    raw_fallback,
-                    entry_bbo_quotes,
-                    requested_symbols=_canonical_symbol_set(symbols),
                 )
                 fallback_market_failures = _market_failure_reasons(raw_fallback)
                 fallback_crossed_symbols = {
@@ -593,12 +364,6 @@ class SidecarService:
                 venue_quotes,
                 requested_symbols=_canonical_symbol_set(symbols),
             )
-            venue_quotes = _overlay_funding_entry_top_books(
-                venue_name,
-                venue_quotes,
-                entry_bbo_quotes,
-                requested_symbols=_canonical_symbol_set(symbols),
-            )
             listed_symbols = _snapshot_map_symbols(venue_quotes)
             listed_symbols_by_venue[venue_name] = set(listed_symbols)
             market_failures = _market_failure_reasons(venue_quotes)
@@ -677,9 +442,6 @@ class SidecarService:
             )
             if funding_usable <= 0 or market_usable <= 0:
                 degraded_venues.add(venue_name)
-            if market_usable <= 0:
-                spread_market_degraded_venues.add(venue_name)
-
             if venue_quotes:
                 for key, q in venue_quotes.items():
                     if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
@@ -727,66 +489,6 @@ class SidecarService:
                     degraded_reason=market_reason,
                 )
             )
-
-        # Publish the spread-only market view before liquidity enrichment,
-        # funding candidate construction, and the much larger V4 snapshot.
-        # The view contains no private data and does not alter the V1/live
-        # opportunity-input contract consumed by the trading runtime.
-        # Capture the fast-path publication time as soon as the concurrent
-        # market fetch completes. The later candidate-build watermark remains
-        # separate because liquidity evidence is fetched after this point.
-        spread_quote_published_at_ms = int(time.time() * 1000)
-        spread_quotes = {
-            key: quote
-            for key, quote in quotes.items()
-            if 0 < int(getattr(quote, "observed_at_ms", 0) or 0)
-            <= spread_quote_published_at_ms
-        }
-        spread_future_symbols: dict[str, set[str]] = {}
-        for key, quote in quotes.items():
-            if key in spread_quotes:
-                continue
-            venue = str(getattr(quote, "venue", "") or "").strip().lower()
-            symbol = _snapshot_item_symbol(key, quote)
-            if venue and symbol:
-                spread_future_symbols.setdefault(venue, set()).add(symbol)
-        spread_degraded_symbols = {
-            venue: sorted(symbols)
-            for venue, symbols in market_quality_failed_symbols.items()
-            if symbols
-        }
-        for venue, symbols in spread_future_symbols.items():
-            spread_degraded_symbols[venue] = sorted(
-                set(spread_degraded_symbols.get(venue, [])) | symbols
-            )
-        data_plane = getattr(self, "_spread_bbo_data_plane", None)
-        if (
-            not in_process_entry
-            and bool(getattr(self, "embedded_spread_bbo_enabled", True))
-            and not bool(getattr(data_plane, "active", False))
-        ):
-            try:
-                publish_spread_quote_snapshot(
-                    SpreadQuoteSnapshot(
-                        schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-                        published_at_ms=spread_quote_published_at_ms,
-                        market_observed_at_ms=_latest_valid_quote_observation_ms(
-                            spread_quotes,
-                            decision_at_ms=spread_quote_published_at_ms,
-                            fallback_ms=refresh_started_at_ms,
-                        ),
-                        batch_started_at_ms=refresh_started_at_ms,
-                        configured_venues=sorted(self._configured_venue_names()),
-                        degraded_venues=sorted(spread_market_degraded_venues),
-                        degraded_symbols=spread_degraded_symbols,
-                        quotes=spread_quotes,
-                    ),
-                    spread_quote_snapshot_path(self.snapshot_path),
-                )
-            except (OSError, TypeError, ValueError):
-                # One-shot/recovery compatibility only.  The normal service
-                # gives compact publication ownership to the BBO data plane.
-                logger.exception("spread quote compatibility publication failed")
 
         # The live entry generation must not await a seven-venue/full-symbol
         # liquidity pass.  Derive only strict proof already present on the
@@ -1007,39 +709,6 @@ class SidecarService:
             fresh_cacheable_quote_keys,
             published_at_ms=published_ms,
         )
-        # Both dedicated and embedded BBO modes publish hot-only v5 rows. The
-        # consumer therefore always needs the same full v3 metadata handoff;
-        # omitting it in embedded mode would turn every valid BBO into
-        # metadata_unavailable and create a permanent zero-sampling service.
-        if not in_process_entry:
-            try:
-                metadata_quotes = dict(self._last_good_quotes)
-                if metadata_quotes:
-                    publish_spread_quote_snapshot(
-                        SpreadQuoteSnapshot(
-                            schema_version=FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-                            published_at_ms=published_ms,
-                            market_observed_at_ms=_latest_valid_quote_observation_ms(
-                                metadata_quotes,
-                                decision_at_ms=published_ms,
-                                fallback_ms=refresh_started_at_ms,
-                            ),
-                            batch_started_at_ms=refresh_started_at_ms,
-                            configured_venues=sorted(self._configured_venue_names()),
-                            degraded_venues=sorted(degraded_venues),
-                            degraded_symbols={
-                                venue: list(symbols)
-                                for venue, symbols in degraded_symbols.items()
-                                if symbols
-                            },
-                            quotes=metadata_quotes,
-                        ),
-                        spread_metadata_snapshot_path(self.snapshot_path),
-                        validate_contract=False,
-                    )
-            except (OSError, TypeError, ValueError):
-                logger.exception("spread metadata handoff publication failed")
-
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,
             market_observed_at_ms=_latest_valid_quote_observation_ms(
@@ -1054,18 +723,12 @@ class SidecarService:
             degraded_venues=sorted(degraded_venues),
             degraded_domains=[],
             degraded_symbols=degraded_symbols,
-            source_mode=(
-                "single_process_entry" if in_process_entry else "direct_market"
-            ),
-            acquisition_mode=(
-                "direct_market_view"
-                if in_process_entry
-                else _resolve_acquisition_mode(
-                    degraded_venues,
-                    degraded_symbols,
-                    fallback_used_keys,
-                    has_usable_payload=bool(quotes),
-                )
+            source_mode="direct_market",
+            acquisition_mode=_resolve_acquisition_mode(
+                degraded_venues,
+                degraded_symbols,
+                fallback_used_keys,
+                has_usable_payload=bool(quotes),
             ),
             candidate_build_observed_at_ms=candidate_build_observed_at_ms,
             candidate_build_diagnostics=candidate_build_diagnostics,
@@ -1073,338 +736,20 @@ class SidecarService:
             candidates=candidates,
         )
 
-        if not in_process_entry:
-            # Install the complete V7 live-entry generation first. The full
-            # snapshot remains the audit/compatibility surface and may be tens
-            # of megabytes; it must not define when funding-live can observe
-            # this generation.
-            entry_manifest = await asyncio.to_thread(
-                publish_funding_entry_snapshot,
-                snapshot,
-                self.snapshot_path,
-            )
-            if not isinstance(entry_manifest, dict):
-                entry_manifest = {}
-            # The publisher obtains this from the installed manifest inode,
-            # the same cross-process readiness clock used by consumers.
-            candidate_build_diagnostics["entry_snapshot_install_completed_at_ms"] = (
-                int(entry_manifest.get("ready_at_ms", 0) or 0)
-            )
-            generation_id = str(entry_manifest.get("generation_id", "") or "")
-            if (
-                generation_id
-                and entry_manifest.get("eligible_frontier_complete") is True
-            ):
-                self._schedule_entry_frontier_oracle(snapshot, generation_id)
-            if not snapshot.quotes and not snapshot.candidates:
-                # The fail-closed unavailable artifact is tiny and contains no
-                # full candidate work. Preserve the synchronous operational
-                # compatibility surface without reintroducing the 28MB hot path.
-                await asyncio.to_thread(publish_snapshot, snapshot, self.snapshot_path)
-            else:
-                self._schedule_audit_snapshot_publish(
-                    snapshot,
-                    candidate_service=candidate_service,
-                    quotes=quotes,
-                    symbols=symbols,
-                    observed_at_ms=candidate_build_observed_at_ms,
-                )
+        # The single sidecar snapshot is the live input and audit record.
+        # Atomic replacement keeps readers from observing a partial refresh;
+        # no candidate-only manifest, page set, or background audit projection
+        # participates in entry.
+        await asyncio.to_thread(publish_snapshot, snapshot, self.snapshot_path)
         return snapshot
 
-    def _schedule_entry_frontier_oracle(
-        self,
-        snapshot: SidecarSnapshot,
-        generation_id: str,
-    ) -> None:
-        """Verify every published eligible pair without delaying live entry.
-
-        Pair construction already examines the full directed universe.  This
-        independent, post-install read verifies the separate serialization and
-        manifest path did not omit, reorder, or duplicate one of those eligible
-        rows.  A discrepancy replaces the current generation with an empty,
-        explicitly incomplete frontier before another entry cycle can use it.
-        """
-        expected_ids = tuple(
-            str(candidate.pair_id or "").strip().lower()
-            for candidate in snapshot.candidates
-            if not candidate.blocked and candidate.economics_complete is True
-        )
-        if any(not pair_id for pair_id in expected_ids):
-            # Do not leave a syntactically publishable but unauditable row
-            # executable while waiting for the asynchronous transport oracle.
-            # Pair identity is the join key used by every later admission,
-            # recovery and omission check, so a missing value is itself a
-            # complete-frontier violation.
-            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
-            failed_diagnostics.update(
-                {
-                    "eligible_frontier_complete": False,
-                    "omitted_eligible_count": max(
-                        int(
-                            failed_diagnostics.get(
-                                "omitted_eligible_count",
-                                0,
-                            )
-                            or 0
-                        ),
-                        1,
-                    ),
-                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
-                    "entry_frontier_oracle_expected_count": len(expected_ids),
-                    "entry_frontier_oracle_observed_count": 0,
-                }
-            )
-            publish_funding_entry_snapshot(
-                replace(
-                    snapshot,
-                    candidate_build_diagnostics=failed_diagnostics,
-                ),
-                self.snapshot_path,
-            )
-            logger.critical(
-                "funding_entry_opportunity_omitted: eligible candidate missing pair_id"
-            )
-            return
-        task = asyncio.create_task(
-            self._verify_entry_frontier_oracle(
-                snapshot,
-                generation_id=generation_id,
-                expected_ids=expected_ids,
-            ),
-            name=f"funding-entry-frontier-oracle:{generation_id[:12]}",
-        )
-        tasks = getattr(self, "_entry_frontier_oracle_tasks", None)
-        if not isinstance(tasks, set):
-            tasks = set()
-            self._entry_frontier_oracle_tasks = tasks
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
-
-    async def _verify_entry_frontier_oracle(
-        self,
-        snapshot: SidecarSnapshot,
-        *,
-        generation_id: str,
-        expected_ids: tuple[str, ...],
-    ) -> None:
-        """Fail closed if the complete eligible frontier changes in transit."""
-        try:
-            identity = await asyncio.to_thread(
-                funding_entry_snapshot_identity,
-                self.snapshot_path,
-                verify_digest=True,
-            )
-            if identity is None or identity[0] != generation_id:
-                # A newer refresh is authoritative (or the manifest is already
-                # invalid and therefore fail-closed in the runtime); never let
-                # an old observer overwrite a later generation.
-                return
-            loaded = await asyncio.to_thread(
-                load_funding_entry_snapshot,
-                self.snapshot_path,
-            )
-            identity_after_load = await asyncio.to_thread(
-                funding_entry_snapshot_identity,
-                self.snapshot_path,
-                verify_digest=True,
-            )
-            if (
-                identity_after_load is None
-                or identity_after_load[0] != generation_id
-            ):
-                # The manifest advanced while the page set was being loaded.
-                # G2 is authoritative; an observer for G1 must not replace
-                # it with G1's fail-closed artifact based on a mixed read.
-                return
-            actual_ids = (
-                tuple(
-                    str(candidate.pair_id or "").strip().lower()
-                    for candidate in loaded.candidates
-                )
-                if loaded is not None
-                else ()
-            )
-            if loaded is not None and actual_ids == expected_ids:
-                return
-
-            omitted = len(set(expected_ids) - set(actual_ids))
-            unexpected = len(set(actual_ids) - set(expected_ids))
-            # A reorder or duplicate is an omission of the ordered frontier
-            # contract even when its two sets happen to match.
-            mismatch_count = max(omitted + unexpected, 1)
-            failed_diagnostics = dict(snapshot.candidate_build_diagnostics)
-            failed_diagnostics.update(
-                {
-                    "eligible_frontier_complete": False,
-                    "omitted_eligible_count": max(
-                        int(failed_diagnostics.get("omitted_eligible_count", 0) or 0),
-                        mismatch_count,
-                    ),
-                    "frontier_stop_reason": "funding_entry_opportunity_omitted",
-                    "entry_frontier_oracle_expected_count": len(expected_ids),
-                    "entry_frontier_oracle_observed_count": len(actual_ids),
-                    "entry_frontier_oracle_reordered": (
-                        omitted == 0 and unexpected == 0
-                    ),
-                }
-            )
-            failed_snapshot = replace(
-                snapshot,
-                candidate_build_diagnostics=failed_diagnostics,
-            )
-            await asyncio.to_thread(
-                publish_funding_entry_snapshot,
-                failed_snapshot,
-                self.snapshot_path,
-            )
-            logger.critical(
-                "funding_entry_opportunity_omitted: generation=%s expected=%s observed=%s",
-                generation_id,
-                len(expected_ids),
-                len(actual_ids),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("funding entry complete-frontier oracle failed")
-
     async def refresh_entry_from_latest_cache(self) -> SidecarSnapshot:
-        """Republish the coalesced V7 view without starting public HTTP work."""
+        """Republish the current sidecar view without starting public HTTP work."""
         self._entry_cache_only_refresh = True
         try:
             return await self.refresh_once()
         finally:
             self._entry_cache_only_refresh = False
-
-    def _schedule_audit_snapshot_publish(
-        self,
-        snapshot: SidecarSnapshot,
-        *,
-        candidate_service: FundingCandidateService,
-        quotes: dict[str, QuoteSnapshot],
-        symbols: list[str],
-        observed_at_ms: int,
-    ) -> None:
-        """Schedule a CPU-only full-frontier audit without new public IO.
-
-        The entry refresh owns broad-universe quote and liquidity collection.
-        This writer verifies pair construction and snapshot serialization from
-        that immutable generation; it must never replay a venue-wide OI/funding
-        fetch in the background.
-        """
-        if bool(getattr(self, "_entry_cache_only_refresh", False)):
-            return
-        task = getattr(self, "_audit_publish_task", None)
-        if task is not None and not task.done():
-            return
-        now_monotonic = time.monotonic()
-        last_schedule = float(
-            getattr(self, "_last_audit_schedule_monotonic", 0.0) or 0.0
-        )
-        if (
-            last_schedule > 0.0
-            and now_monotonic - last_schedule < FUNDING_AUDIT_MIN_INTERVAL_S
-        ):
-            return
-        self._audit_pending_build = {
-            "snapshot": snapshot,
-            "candidate_service": candidate_service,
-            "quotes": dict(quotes),
-            "symbols": list(symbols),
-            "observed_at_ms": int(observed_at_ms),
-        }
-        self._last_audit_schedule_monotonic = now_monotonic
-        self._audit_publish_task = asyncio.create_task(
-            self._run_audit_snapshot_writer(),
-            name="funding-audit-snapshot-writer",
-        )
-
-    async def _run_audit_snapshot_writer(self) -> None:
-        while True:
-            pending = self._audit_pending_build
-            self._audit_pending_build = None
-            if pending is None:
-                self._audit_publish_task = None
-                return
-            try:
-                entry_snapshot = pending["snapshot"]
-                candidate_service = pending["candidate_service"]
-                quotes = pending["quotes"]
-                symbols = pending["symbols"]
-                observed_at_ms = int(pending["observed_at_ms"])
-                audit_quotes = {
-                    key: replace(quote) for key, quote in quotes.items()
-                }
-                audit_liquidity_lifecycle = [
-                    replace(row) for row in entry_snapshot.liquidity_lifecycle
-                ]
-                audit_diagnostics: dict[str, object] = {}
-                deferred_oi_targets = sorted(
-                    {
-                        (quote.venue.lower(), quote.symbol.upper())
-                        for quote in audit_quotes.values()
-                        if _quote_requires_entry_targeted_oi_revalidation(quote)
-                    }
-                )
-                # Audit consumers need to distinguish an intentional
-                # candidate-scoped OI handoff from a failed source request.
-                # The actual handoff remains fail-closed in live admission.
-                audit_diagnostics[
-                    "entry_targeted_oi_revalidation_required_count"
-                ] = len(deferred_oi_targets)
-                audit_diagnostics[
-                    "entry_targeted_oi_revalidation_required_venues"
-                ] = sorted({venue for venue, _symbol in deferred_oi_targets})
-                loop = asyncio.get_running_loop()
-                executor = getattr(self, "_audit_executor", None)
-                candidates = await loop.run_in_executor(
-                    executor,
-                    partial(
-                        candidate_service.build,
-                        audit_quotes,
-                        symbols,
-                        observed_at_ms=observed_at_ms,
-                        diagnostics=audit_diagnostics,
-                    ),
-                )
-                audit_diagnostics["quarantined_future_quote_count"] = int(
-                    entry_snapshot.candidate_build_diagnostics.get(
-                        "quarantined_future_quote_count",
-                        0,
-                    )
-                    or 0
-                )
-                audit_diagnostics["quarantined_future_quote_keys"] = list(
-                    entry_snapshot.candidate_build_diagnostics.get(
-                        "quarantined_future_quote_keys",
-                        [],
-                    )
-                    or []
-                )
-                audit_diagnostics["requested_venues"] = list(
-                    entry_snapshot.candidate_build_diagnostics.get(
-                        "requested_venues",
-                        [],
-                    )
-                    or []
-                )
-                snapshot = replace(
-                    entry_snapshot,
-                    quotes=audit_quotes,
-                    candidate_build_diagnostics=audit_diagnostics,
-                    liquidity_lifecycle=audit_liquidity_lifecycle,
-                    candidates=candidates,
-                )
-                await loop.run_in_executor(
-                    executor,
-                    partial(
-                        publish_snapshot,
-                        snapshot,
-                        self.snapshot_path,
-                    ),
-                )
-            except Exception:
-                logger.exception("full funding audit snapshot publication failed")
 
     def _update_last_good_quote_cache(
         self,
@@ -1639,171 +984,6 @@ class SidecarService:
                 results_by_venue[venue_name] = latest[venue_name]
         return [results_by_venue[venue_name] for venue_name in venue_names]
 
-    async def _fetch_funding_entry_bbo_all_venues(
-        self,
-        symbols: list[str],
-    ) -> list[
-        tuple[
-            str,
-            Optional[dict[str, TopBookQuote]],
-            Optional[Exception],
-            set[str],
-        ]
-    ]:
-        """Refresh entry BBO without waiting for slow funding metadata.
-
-        Funding and contract requests remain alive as singleflight work in
-        ``_fetch_all_venues``.  This sparse lane reacquires top-of-book on its
-        own bounded schedule so cached funding rows do not inherit the age of
-        a slow metadata request.
-        """
-
-        requested = _canonical_symbol_set(symbols)
-
-        async def _fetch_one(
-            venue_name: str,
-        ) -> tuple[
-            str,
-            Optional[dict[str, TopBookQuote]],
-            Optional[Exception],
-            set[str],
-        ]:
-            sources = getattr(self, "_funding_entry_bbo_sources", {})
-            source = sources.get(venue_name) if isinstance(sources, dict) else None
-            if source is None:
-                return (
-                    venue_name,
-                    None,
-                    RuntimeError("funding entry BBO source unavailable"),
-                    set(requested),
-                )
-            try:
-                result = await source.fetch_spread_bbo(symbols)
-                filtered = {
-                    key: quote
-                    for key, quote in (result or {}).items()
-                    if _snapshot_item_symbol(key, quote) in requested
-                }
-                return (venue_name, filtered, None, set())
-            except Exception as exc:
-                return (venue_name, None, exc, set())
-
-        venue_names = self._configured_venue_names()
-        inflight = getattr(self, "_funding_entry_bbo_fetch_tasks", None)
-        if not isinstance(inflight, dict):
-            inflight = {}
-            self._funding_entry_bbo_fetch_tasks = inflight
-        latest = getattr(self, "_funding_entry_bbo_latest_results", None)
-        if not isinstance(latest, dict):
-            latest = {}
-            self._funding_entry_bbo_latest_results = latest
-        late_tasks = getattr(self, "_funding_entry_bbo_late_tasks", None)
-        if not isinstance(late_tasks, set):
-            late_tasks = set()
-            self._funding_entry_bbo_late_tasks = late_tasks
-        republish_event = getattr(self, "entry_venue_republish_event", None)
-        if not isinstance(republish_event, asyncio.Event):
-            republish_event = asyncio.Event()
-            self.entry_venue_republish_event = republish_event
-        if bool(getattr(self, "_entry_cache_only_refresh", False)):
-            return [
-                latest.get(
-                    venue_name,
-                    (
-                        venue_name,
-                        None,
-                        RuntimeError("funding entry BBO latest cache unavailable"),
-                        set(),
-                    ),
-                )
-                for venue_name in venue_names
-            ]
-
-        def _record_completion(task: asyncio.Task, venue_name: str) -> None:
-            if not task.cancelled():
-                try:
-                    latest[venue_name] = task.result()
-                except Exception as exc:
-                    latest[venue_name] = (venue_name, None, exc, set())
-            if task in late_tasks:
-                late_tasks.discard(task)
-                republish_event.set()
-
-        task_to_venue: dict[asyncio.Task, str] = {}
-        for venue_name in venue_names:
-            task = inflight.get(venue_name)
-            if task is not None and task.done():
-                _record_completion(task, venue_name)
-                inflight.pop(venue_name, None)
-                task = None
-            if task is None:
-                task = asyncio.create_task(
-                    _fetch_one(venue_name),
-                    name=f"funding-entry-bbo-fetch:{venue_name}",
-                )
-                inflight[venue_name] = task
-                task.add_done_callback(
-                    lambda completed, venue=venue_name: _record_completion(
-                        completed, venue
-                    )
-                )
-                if venue_name in latest:
-                    late_tasks.add(task)
-            task_to_venue[task] = venue_name
-
-        missing_tasks = {
-            task
-            for task, venue_name in task_to_venue.items()
-            if venue_name not in latest
-        }
-        if missing_tasks:
-            done, pending = await asyncio.wait(
-                missing_tasks,
-                timeout=FUNDING_ENTRY_BBO_FRONTIER_S,
-                return_when=asyncio.ALL_COMPLETED,
-            )
-        else:
-            done, pending = set(), set()
-
-        results_by_venue: dict[
-            str,
-            tuple[
-                str,
-                Optional[dict[str, TopBookQuote]],
-                Optional[Exception],
-                set[str],
-            ],
-        ] = {}
-        for task in done:
-            venue_name = task_to_venue[task]
-            if inflight.get(venue_name) is task:
-                inflight.pop(venue_name, None)
-            _record_completion(task, venue_name)
-            results_by_venue[venue_name] = latest[venue_name]
-        for task in pending:
-            venue_name = task_to_venue[task]
-            late_tasks.add(task)
-            results_by_venue[venue_name] = latest.get(
-                venue_name,
-                (
-                    venue_name,
-                    None,
-                    TimeoutError(
-                        "funding entry BBO evidence deadline "
-                        f"{FUNDING_ENTRY_BBO_FRONTIER_S:.3f}s; "
-                        "background fetch inflight"
-                    ),
-                    set(),
-                ),
-            )
-        for task in task_to_venue:
-            if not task.done() and task not in pending:
-                late_tasks.add(task)
-        for venue_name in venue_names:
-            if venue_name not in results_by_venue and venue_name in latest:
-                results_by_venue[venue_name] = latest[venue_name]
-        return [results_by_venue[venue_name] for venue_name in venue_names]
-
     def _configured_venue_names(self) -> list[str]:
         """Return the canonical, stable, unique operational venue scope."""
         configured = getattr(self, "_venue_configs_by_name", None)
@@ -1849,15 +1029,10 @@ class SidecarService:
         """Keep direct test/recovery construction compatible with the service."""
         calibrator = getattr(self, "_forecast_calibrator", None)
         if calibrator is None:
-            if getattr(self, "in_process_entry", False):
-                forecast_path = Path(
-                    self.config.runtime.funding_basis_risk_checkpoint_path
-                ).with_name("funding-forecast-in-process-calibration.json")
-            else:
-                snapshot_path = Path(self.snapshot_path)
-                forecast_path = snapshot_path.with_name(
-                    f"{snapshot_path.name}.funding-forecast-calibration.json"
-                )
+            snapshot_path = Path(self.snapshot_path)
+            forecast_path = snapshot_path.with_name(
+                f"{snapshot_path.name}.funding-forecast-calibration.json"
+            )
             strategy = self.config.strategy
             calibrator = FundingForecastCalibrator(
                 forecast_path,
@@ -1878,25 +1053,6 @@ class SidecarService:
         if not isinstance(venue_configs, dict):
             venue_configs = _canonical_venue_configs(config.venues)
             self._venue_configs_by_name = venue_configs
-        evidence_path = resolve_config_artifact_path(
-            config,
-            getattr(
-                config.runtime,
-                "funding_fee_evidence_path",
-                config.runtime.fee_evidence_path,
-            ),
-        )
-        evidence = load_fee_evidence(
-            evidence_path,
-            now_ms=int(now_ms if now_ms is not None else time.time() * 1000),
-            max_age_ms=int(
-                getattr(
-                    config.runtime,
-                    "funding_fee_evidence_max_age_ms",
-                    config.runtime.fee_evidence_max_age_ms,
-                )
-            ),
-        )
         configured_taker = {
             venue_name: float(venue.taker_fee_bps or 0.0)
             for venue_name, venue in venue_configs.items()
@@ -1909,25 +1065,15 @@ class SidecarService:
             )
             for venue_name, venue in venue_configs.items()
         }
-        taker_fees, maker_fees = effective_fee_maps(
-            configured_taker,
-            configured_maker,
-            evidence,
-            allow_verified_maker_rebates=True,
-        )
         return FundingCandidateService(
             strategy=config.strategy,
-            venue_fee_bps=taker_fees,
-            venue_maker_fee_bps=maker_fees,
+            venue_fee_bps=configured_taker,
+            venue_maker_fee_bps=configured_maker,
             venue_notional_caps={
                 venue_name: float(venue.max_notional or 0.0)
                 for venue_name, venue in venue_configs.items()
             },
             passive_execution_enabled=(str(config.runtime.mode or "").lower() == "live"),
-            fee_evidence=evidence,
-            expected_fee_identity_hashes=dict(
-                config.runtime.fee_evidence_account_identity_hashes
-            ),
         )
 
     def _ensure_candidate_service(self) -> FundingCandidateService:
@@ -2001,36 +1147,6 @@ class SidecarService:
                 continue
             result[key] = replace(q)
         return result
-
-
-def _run_spread_bbo_in_thread(
-    data_plane: SpreadBboDataPlane,
-    sources: list[ExchangeSource],
-    thread_stop: threading.Event,
-) -> None:
-    """Own the BBO event loop and HTTP clients outside the heavy sidecar loop."""
-
-    async def run() -> None:
-        local_stop = asyncio.Event()
-
-        async def bridge_stop() -> None:
-            while not thread_stop.is_set():
-                await asyncio.sleep(0.05)
-            local_stop.set()
-
-        bridge_task = asyncio.create_task(bridge_stop())
-        try:
-            await data_plane.run(local_stop)
-        finally:
-            bridge_task.cancel()
-            await asyncio.gather(bridge_task, return_exceptions=True)
-            for source in sources:
-                try:
-                    await source.close()
-                except Exception:
-                    logger.exception("spread BBO thread source close failed")
-
-    asyncio.run(run())
 
 
 def _resolve_acquisition_mode(
@@ -2217,97 +1333,6 @@ def _canonicalize_venue_quotes(
         accepted.pop(f"{identity[0]}:{identity[1]}", None)
         failures[identity[1]] = "duplicate_quote_identity"
     return accepted, failures
-
-
-def _overlay_funding_entry_top_books(
-    venue_name: str,
-    metadata_quotes: dict[str, QuoteSnapshot] | None,
-    top_books: dict[str, TopBookQuote] | None,
-    *,
-    requested_symbols: set[str],
-) -> dict[str, QuoteSnapshot]:
-    """Overlay only identity-safe, receipt-clock BBO on metadata rows.
-
-    A BBO row cannot create funding evidence by itself.  It may only refresh
-    the executable market fields of an existing funding/contract row, and only
-    when the local receipt clock proves that it is at least as new as the
-    embedded market observation.
-    """
-
-    expected_venue = str(venue_name or "").strip().lower()
-    merged = dict(metadata_quotes or {})
-    for raw_key, top in (top_books or {}).items():
-        top_venue = str(getattr(top, "venue", "") or "").strip().lower()
-        top_symbol = str(getattr(top, "symbol", "") or "").strip().upper()
-        expected_key = f"{expected_venue}:{top_symbol}"
-        if (
-            not top_symbol
-            or top_symbol not in requested_symbols
-            or top_venue != expected_venue
-            or str(raw_key).strip() != expected_key
-        ):
-            continue
-        base = merged.get(expected_key)
-        if base is None:
-            continue
-        received_raw = getattr(top, "received_at_ms", None)
-        observed_raw = getattr(top, "observed_at_ms", None)
-        if (
-            isinstance(received_raw, bool)
-            or not isinstance(received_raw, int)
-            or received_raw <= 0
-            or isinstance(observed_raw, bool)
-            or not isinstance(observed_raw, int)
-            or observed_raw != received_raw
-            or received_raw < int(getattr(base, "observed_at_ms", 0) or 0)
-        ):
-            continue
-        values: list[float] = []
-        invalid_number = False
-        for raw_value in (
-            getattr(top, "bid", None),
-            getattr(top, "ask", None),
-            getattr(top, "bid_size", None),
-            getattr(top, "ask_size", None),
-        ):
-            if isinstance(raw_value, bool):
-                invalid_number = True
-                break
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError, OverflowError):
-                invalid_number = True
-                break
-            if not isfinite(value):
-                invalid_number = True
-                break
-            values.append(value)
-        if invalid_number:
-            continue
-        bid, ask, bid_size, ask_size = values
-        if (
-            bid <= 0.0
-            or ask <= 0.0
-            or bid > ask
-            or bid_size < 0.0
-            or ask_size < 0.0
-        ):
-            continue
-        merged[expected_key] = replace(
-            base,
-            bid=bid,
-            ask=ask,
-            bid_size=bid_size,
-            ask_size=ask_size,
-            bid_depth=(),
-            ask_depth=(),
-            observed_at_ms=received_raw,
-            market_event_at_ms=int(
-                getattr(top, "exchange_event_at_ms", 0) or 0
-            ),
-            source=str(getattr(top, "source", "") or "funding_entry_bbo"),
-        )
-    return merged
 
 
 def _market_failure_reasons(

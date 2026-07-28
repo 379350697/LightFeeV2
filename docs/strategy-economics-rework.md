@@ -1,6 +1,10 @@
 # 双策略经济学整改运行手册
 
-状态：**本地实现与完整 pytest 回归已通过；未部署、未完成 24 小时 soak，未 cloud-verified。**
+> 历史方案（已退休）。本文记录的是 2026-07-14 后的加法式经济学设计，不能作为当前
+> 生产运行或准入合同。当前实现恢复为单一 funding sidecar、配置保守费率、候选两腿最终
+> 检查和 V1 平仓/恢复语义；canary、账户费率证据、cohort/provenance、动态 ES、全局
+> frontier 完整性和相关定时器均不再进入生产路径。离线分析可以独立读取其历史产物。
+> 部署和验收以当前配置、服务单元和 `docs/bugs/BUG_INDEX.md` 为准，且仍须单独授权。
 
 本次变更把资金费与价差策略的候选收益统一到不可变的
 `EdgeBreakdown`。`expected_net_edge_bps`、`worst_case_edge_bps` 和

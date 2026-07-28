@@ -1453,6 +1453,14 @@ class VenueTransport(MarketDataClient):
         # Each venue transport owns one PrivateWsState. Workers update this
         # directly via record_order/update_position/record_connection_*.
         self._private_ws_state = PrivateWsState()
+        # The private account stream outlives an individual entry candidate.
+        # Workers hold this dictionary by reference so an account-wide venue
+        # can recognise a newly tracked contract without replacing its socket.
+        self._private_ws_symbol_map: dict[str, str] = {}
+        # Only Gate and OKX consume this queue: their private channels are
+        # explicitly instrument-scoped and must subscribe newly added symbols
+        # in-band.  Account-wide venues use the shared map directly.
+        self._private_ws_pending_symbol_updates: set[str] = set()
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -1804,6 +1812,12 @@ class VenueTransport(MarketDataClient):
         Each venue handles auth/subscribe/heartbeat/reconnect independently.
         The worker must call record_private_ws_success/failure on real paths.
         """
+        self._private_ws_symbol_map = {
+            self._venue_symbol(symbol): symbol
+            for symbol in symbols
+            if symbol
+        }
+        self._private_ws_pending_symbol_updates.clear()
         venue = self._spec.venue_id
         if venue == Venue.BINANCE:
             self._start_binance_private_ws(symbols)
@@ -1823,6 +1837,43 @@ class VenueTransport(MarketDataClient):
     def stop_private_ws(self) -> None:
         """Stop all private WS workers for this venue."""
         self._private_ws_state.abort_workers()
+
+    def update_private_ws_symbols(self, symbols: list[str]) -> set[str]:
+        """Add newly tracked symbols without coupling worker life to candidates.
+
+        Symbols are intentionally monotonic for a running worker.  Retaining a
+        previous symbol cannot submit or modify an order; it only lets the
+        account stream continue to decode late fills and position updates.  A
+        running Gate/OKX worker consumes the returned additions as in-band
+        subscription changes, while account-wide workers observe the shared
+        mapping immediately.
+        """
+        additions: dict[str, str] = {}
+        for symbol in symbols:
+            if not symbol:
+                continue
+            venue_symbol = self._venue_symbol(symbol)
+            if venue_symbol not in self._private_ws_symbol_map:
+                additions[venue_symbol] = symbol
+        if not additions:
+            return set()
+
+        self._private_ws_symbol_map.update(additions)
+        if self._spec.venue_id in (Venue.GATE, Venue.OKX):
+            self._private_ws_pending_symbol_updates.update(additions)
+        return set(additions)
+
+    def consume_private_ws_symbol_updates(self) -> dict[str, str]:
+        """Return and clear pending instrument-scoped private subscriptions."""
+        if not self._private_ws_pending_symbol_updates:
+            return {}
+        venue_symbols = set(self._private_ws_pending_symbol_updates)
+        self._private_ws_pending_symbol_updates.clear()
+        return {
+            venue_symbol: self._private_ws_symbol_map[venue_symbol]
+            for venue_symbol in venue_symbols
+            if venue_symbol in self._private_ws_symbol_map
+        }
 
     def private_ws_worker_count(self) -> int:
         """V1: number of active private WS workers for this venue."""

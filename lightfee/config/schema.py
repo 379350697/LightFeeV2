@@ -23,7 +23,6 @@ V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
     "okx": 5_000_000.0,
 }
 V1_ENTRY_OPEN_INTEREST_FLOOR_DEFAULT_QUOTE = 1_000_000.0
-_OPPORTUNITY_INPUT_MODE_UNSET = object()
 
 
 def _is_valid_generate_time(s: str) -> bool:
@@ -68,14 +67,6 @@ class DailyUniverseConfig:
 @dataclass
 class RuntimeConfig:
     mode: str = "paper"
-    opportunity_input_mode: str = field(default=_OPPORTUNITY_INPUT_MODE_UNSET)  # type: ignore[assignment]
-    # Distinguish a direct legacy fixture from an explicit production migration
-    # setting without exposing provenance in the TOML schema.
-    _opportunity_input_mode_configured: bool = field(
-        default=False,
-        init=False,
-        repr=False,
-    )
     # V1 directed_pairs: pair direction restriction (CONFIG-001)
     directed_pairs: list[DirectedPairConfig] = field(default_factory=list)
     # V1 daily_universe: generated symbol universe (CONFIG-002)
@@ -86,10 +77,6 @@ class RuntimeConfig:
     sidecar_perp_liquidity_budget_ms: int = 30000
     entry_open_interest_refresh_timeout_ms: int = 750
     entry_open_interest_cache_fallback_max_age_ms: int = 30 * 60 * 1000
-    entry_open_interest_store_path: str = (
-        "runtime/entry-open-interest-evidence-v1.sqlite3"
-    )
-    entry_open_interest_background_refresh_ms: int = 15 * 60 * 1000
     sidecar_funding_timeout_s: float = 30.0
     sidecar_liquidity_timeout_s: float = 10.0
     sidecar_hint_budget_ms: int = 500
@@ -98,34 +85,8 @@ class RuntimeConfig:
     # malformed, stale or wrong-epoch checkpoint deliberately cold-starts
     # instead of borrowing statistics from another model.
     spread_stats_checkpoint_path: str = "runtime/spread-stats-v2-checkpoint.json"
-    # Dynamic funding basis-risk evidence is persisted independently from the
-    # sidecar snapshot.  It is an entry-admission input, so a missing or stale
-    # checkpoint cold-starts rather than silently reusing an arbitrary price
-    # history after a restart.
-    funding_basis_risk_checkpoint_path: str = (
-        "runtime/funding-basis-risk-v1-checkpoint.json"
-    )
-    # Strict spread-paper schema-v3 evidence.  It remains isolated from the
-    # funding collector so one strategy cannot overwrite the other's cohort.
-    fee_evidence_path: str = "runtime/account-fee-evidence.json"
-    # Strict spread-paper evidence keeps its independent 24-hour ceiling.
-    fee_evidence_max_age_ms: int = 24 * 60 * 60 * 1000
-    # Legacy schema-v3 settings remain available only for strict spread-paper
-    # compatibility.  Funding schema v4 relies on the local 0600 file boundary.
-    fee_evidence_integrity_key_env: str = ""
-    fee_evidence_account_identity_hashes: dict[str, str] = field(
-        default_factory=dict
-    )
-    # Funding-only schema-v4 account rates.  This local 0600 snapshot is
-    # deliberately separate from strict spread-paper evidence/configuration.
-    # Account fee tiers change infrequently: refresh once per day and retain
-    # a per-symbol last-good observation for at most five days.
-    funding_fee_evidence_path: str = "runtime/funding-account-fee-evidence.json"
-    funding_fee_evidence_max_age_ms: int = 5 * 24 * 60 * 60 * 1000
     spread_sidecar_refresh_ms: int = 1000
     spread_sidecar_fetch_timeout_s: float = 10.0
-    spread_sidecar_source_mode: str = "sidecar_snapshot"
-    spread_sidecar_direct_fetch_enabled: bool = False
     live_scan_last_good_max_age_ms: int = 600000
     live_scan_recovery_success_count: int = 3
     live_scan_revalidate_edge_buffer_bps: float = 2.0
@@ -137,10 +98,6 @@ class RuntimeConfig:
     # from recovery's aggregate/probe budget: ordinary entry must never be
     # held behind an unrelated venue's account request.
     entry_account_truth_per_venue_timeout_ms: int = 2000
-    # Compatibility-only spelling used by the first CL-159 rollout.  Keep it
-    # nullable so the canonical setting above remains authoritative whenever
-    # an operator has not explicitly supplied the legacy key.
-    entry_account_truth_probe_timeout_ms: int | None = None
     hyperliquid_info_coordinator_dir: str = DEFAULT_HYPERLIQUID_INFO_COORDINATOR_DIR
     max_order_quote_age_ms: int = 6000
     # One-way, bounded IPC from the live Local-L2 runtime to the public
@@ -168,13 +125,6 @@ class RuntimeConfig:
     maker_event_lane_enabled: bool = True
     maker_event_lane_min_wake_interval_ms: int = 40
     shutdown_grace_period_ms: int = 3000
-
-    def __post_init__(self) -> None:
-        if self.opportunity_input_mode is _OPPORTUNITY_INPUT_MODE_UNSET:
-            self.opportunity_input_mode = "single_process_entry"
-            return
-        self._opportunity_input_mode_configured = True
-
 
 @dataclass
 class StrategyConfig:
@@ -214,37 +164,6 @@ class StrategyConfig:
     # recovery and close/reconciliation paths are deliberately independent of
     # this switch, so a missing config key can never strand an existing leg.
     funding_new_entries_enabled: bool = False
-    # A funding canary is an additional admission layer for new positions
-    # only.  It cannot interfere with pending hedges, recovery or closing an
-    # existing live position.
-    funding_canary_enabled: bool = False
-    funding_canary_allowed_venues: list[str] = field(
-        default_factory=lambda: [
-            "aster",
-            "binance",
-            "bitget",
-            "bybit",
-            "gate",
-            "hyperliquid",
-            "okx",
-        ]
-    )
-    funding_canary_max_concurrent_positions: int = 8
-    funding_canary_max_entry_notional_quote: float = 50.0
-    funding_canary_min_expected_net_edge_bps: float = 3.0
-    funding_canary_min_worst_case_edge_bps: float = 0.0
-    funding_canary_min_expected_net_edge_bps_by_venue_pair: dict[str, float] = field(
-        default_factory=dict
-    )
-    funding_canary_min_worst_case_edge_bps_by_venue_pair: dict[str, float] = field(
-        default_factory=dict
-    )
-    # Strict mode requires signed account-specific evidence for both legs.
-    # When false, a pair without that evidence may only use the smaller
-    # conservative tier below, priced from configured fee upper bounds.
-    funding_canary_require_account_fee_evidence: bool = False
-    funding_canary_conservative_fee_max_entry_notional_quote: float = 15.0
-    funding_canary_conservative_fee_buffer_bps: float = 2.0
     # Cold-start admission only: require a minimally representative funding
     # universe before allowing new entries. Candidate-level funding proof
     # remains mandatory independently of this aggregate readiness signal.
@@ -278,25 +197,6 @@ class StrategyConfig:
     funding_correlation_group_by_symbol: dict[str, str] = field(
         default_factory=dict
     )
-    funding_expected_shortfall_bps: float = 0.0
-    funding_expected_shortfall_budget_quote: float = 0.0
-    funding_es_cold_start_max_entry_notional_quote: float = 15.0
-    funding_es_cold_start_bps: float = 100.0
-    # Historical Expected Shortfall of the *paired basis*, not outright asset
-    # volatility.  These defaults collect bounded shadow evidence while the
-    # entry freeze is in force.  A live funding entry may only be enabled once
-    # this model and its positive capital budget are explicitly configured.
-    funding_dynamic_expected_shortfall_enabled: bool = True
-    funding_dynamic_expected_shortfall_window_ms: int = 21_600_000
-    funding_dynamic_expected_shortfall_max_samples: int = 7_200
-    funding_dynamic_expected_shortfall_max_pairs: int = 1_024
-    funding_dynamic_expected_shortfall_horizon_ms: int = 60_000
-    funding_dynamic_expected_shortfall_min_samples: int = 120
-    funding_dynamic_expected_shortfall_min_history_ms: int = 300_000
-    funding_dynamic_expected_shortfall_confidence: float = 0.95
-    funding_dynamic_expected_shortfall_quote_skew_ms: int = 250
-    funding_dynamic_expected_shortfall_checkpoint_max_age_ms: int = 21_600_000
-    funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms: int = 60_000
     spread_reversion_enabled: bool = False
     # This remains an independent paper-only strategy. The explicit live gate
     # stays false even when signal generation or paper execution is enabled.
@@ -368,9 +268,6 @@ class StrategyConfig:
     spread_paper_bot_ids: list[str] = field(
         default_factory=lambda: ["tt_conservative"]
     )
-    spread_paper_research_manifest_path: str = (
-        "config/research/spread_v2_signed_reversion.json"
-    )
     spread_paper_markout_secs: list[int] = field(
         default_factory=lambda: [60, 300, 900, 1800]
     )
@@ -380,19 +277,8 @@ class StrategyConfig:
     # later-quote execution model.  It is charged on every paper entry/exit
     # leg and is journalled separately from raw book VWAP.
     spread_paper_latency_buffer_bps: float = 0.5
-    # Official paper results require executable L2 on both entry and exit
-    # legs as well as account-scoped fee evidence.  Turning either off keeps
-    # the tracker useful for diagnostics but suppresses official PnL.
+    # Paper fills still require executable L2 on both entry and exit legs.
     spread_paper_require_l2_vwap: bool = True
-    spread_paper_require_account_fee_evidence: bool = True
-    # Maker rebates can improve paper economics but are admitted only when a
-    # signed private-account evidence document explicitly records them.
-    spread_allow_verified_maker_rebates: bool = False
-    # A deterministic cutover labels every paper observation.  Zero preserves
-    # current in-sample diagnostics; non-zero is required for an OOS-only
-    # acceptance run.
-    spread_paper_oos_start_ms: int = 0
-    spread_paper_require_out_of_sample: bool = False
     entry_exit_reserve_bps: float = 3.0
     normal_close_slippage_limit_bps: float = 3.0
     exit_shadow_enabled: bool = False
@@ -589,11 +475,6 @@ class StrategyConfig:
 class PersistenceConfig:
     event_log_path: str = "runtime/events.jsonl"
     spread_paper_event_log_path: str = "runtime/spread-paper-events.jsonl"
-    # Must be an absolute path on an independently retained failure domain
-    # (for example, a separately snapshotted/mounted state volume).  Spread
-    # paper admission fails closed when this is blank or shares the journal
-    # directory, because journal+head rollback is otherwise undetectable.
-    spread_paper_rollback_anchor_path: str = ""
     spread_paper_event_log_hard_max_bytes: int = 67_108_864
     snapshot_path: str = "runtime/state.json"
     tuning_diagnostics_enabled: bool = True

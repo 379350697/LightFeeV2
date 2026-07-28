@@ -2,7 +2,7 @@
 
 from lightfee.config.schema import StrategyConfig
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
-from lightfee.strategy.discovery import BlockReason, discover_tradeable_candidates
+from lightfee.strategy.discovery import discover_tradeable_candidates
 from lightfee.strategy.market_view import (
     compute_raw_cross_bps,
     compute_reference_mid,
@@ -151,59 +151,12 @@ class TestDiscovery:
         result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert len(result) == 1
 
-    def test_canary_filters_disallowed_venues_before_bounded_tracking(self):
+    def test_static_economics_filter_but_notional_is_a_sizing_constraint(self):
         config = StrategyConfig(
             funding_new_entries_enabled=True,
-            funding_canary_enabled=True,
-            funding_canary_allowed_venues=["bybit", "okx"],
             min_funding_edge_bps=0.0,
-        )
-        disallowed = CandidateInput(
-            long_venue="aster",
-            short_venue="bybit",
-            symbol="HIGH",
-            funding_diff_bps=20.0,
-            funding_edge_bps=20.0,
-            expected_edge_bps=12.0,
-            worst_case_edge_bps=5.0,
-            ranking_edge_bps=20.0,
-            entry_notional_quote=30.0,
-            first_funding_timestamp_ms=FUNDING_TS_MS,
-        )
-        allowed = CandidateInput(
-            long_venue="bybit",
-            short_venue="okx",
-            symbol="LOW",
-            funding_diff_bps=10.0,
-            funding_edge_bps=10.0,
-            expected_edge_bps=9.0,
-            worst_case_edge_bps=4.0,
-            ranking_edge_bps=10.0,
-            entry_notional_quote=30.0,
-            first_funding_timestamp_ms=FUNDING_TS_MS,
-            account_fee_evidence_complete=True,
-        )
-
-        result = discover_tradeable_candidates(
-            [disallowed, allowed],
-            config,
-            NOW_IN_SCAN_WINDOW_MS,
-        )
-
-        assert result == [allowed]
-        assert disallowed.blocked_reasons == []
-
-    def test_canary_static_economics_filter_but_notional_is_a_sizing_constraint(self):
-        config = StrategyConfig(
-            funding_new_entries_enabled=True,
-            funding_canary_enabled=True,
-            funding_canary_allowed_venues=["bybit", "okx"],
-            funding_canary_max_entry_notional_quote=30.0,
-            funding_canary_min_expected_net_edge_bps=8.0,
-            funding_canary_min_worst_case_edge_bps=3.0,
-            min_funding_edge_bps=0.0,
-            min_expected_edge_bps=1.0,
-            min_worst_case_edge_bps=0.0,
+            min_expected_edge_bps=8.0,
+            min_worst_case_edge_bps=3.0,
         )
 
         def candidate(symbol: str, *, expected: float, worst: float, notional: float):
@@ -218,7 +171,6 @@ class TestDiscovery:
                 ranking_edge_bps=20.0,
                 entry_notional_quote=notional,
                 first_funding_timestamp_ms=FUNDING_TS_MS,
-                account_fee_evidence_complete=True,
             )
 
         low_expected = candidate("LOW_EXPECTED", expected=7.99, worst=4.0, notional=30.0)
@@ -235,10 +187,7 @@ class TestDiscovery:
         assert result == [oversized, eligible]
         assert low_expected.blocked_reasons == []
         assert low_worst.blocked_reasons == []
-        assert (
-            BlockReason.FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED.value
-            not in oversized.blocked_reasons
-        )
+        assert oversized.blocked_reasons == []
 
     def test_ranks_by_ranking_edge_desc(self):
         config = StrategyConfig(max_concurrent_positions=8, funding_new_entries_enabled=True)

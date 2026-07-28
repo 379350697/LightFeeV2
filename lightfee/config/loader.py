@@ -39,6 +39,46 @@ _RETIRED_TRANSFER_BIAS_FIELDS = frozenset(
     }
 )
 
+_REMOVED_PRODUCTION_FIELDS = {
+    "runtime": frozenset(
+        {
+            "opportunity_input_mode",
+            "entry_open_interest_store_path",
+            "entry_open_interest_background_refresh_ms",
+            "fee_evidence_path",
+            "fee_evidence_max_age_ms",
+            "fee_evidence_integrity_key_env",
+            "fee_evidence_account_identity_hashes",
+            "funding_fee_evidence_path",
+            "funding_fee_evidence_max_age_ms",
+            "spread_sidecar_source_mode",
+            "spread_sidecar_direct_fetch_enabled",
+            "entry_account_truth_probe_timeout_ms",
+        }
+    ),
+    "strategy": frozenset(
+        {
+            "funding_canary_enabled",
+            "funding_canary_allowed_venues",
+            "funding_canary_max_concurrent_positions",
+            "funding_canary_max_entry_notional_quote",
+            "funding_canary_min_expected_net_edge_bps",
+            "funding_canary_min_worst_case_edge_bps",
+            "funding_canary_min_expected_net_edge_bps_by_venue_pair",
+            "funding_canary_min_worst_case_edge_bps_by_venue_pair",
+            "funding_canary_require_account_fee_evidence",
+            "funding_canary_conservative_fee_max_entry_notional_quote",
+            "funding_canary_conservative_fee_buffer_bps",
+            "spread_paper_research_manifest_path",
+            "spread_paper_require_account_fee_evidence",
+            "spread_allow_verified_maker_rebates",
+            "spread_paper_oos_start_ms",
+            "spread_paper_require_out_of_sample",
+        }
+    ),
+    "persistence": frozenset({"spread_paper_rollback_anchor_path"}),
+}
+
 
 def load_config(path: str | Path) -> AppConfig:
     """Load and validate a TOML config file. Raises ConfigError on failure."""
@@ -49,6 +89,9 @@ def load_config(path: str | Path) -> AppConfig:
     chillybot_errors = check_raw_toml_for_chillybot(raw)
     if chillybot_errors:
         raise ConfigError("\n".join(chillybot_errors))
+    removed_errors = _removed_production_field_errors(raw)
+    if removed_errors:
+        raise ConfigError("\n".join(removed_errors))
 
     symbols = raw.get("symbols", [])
     if isinstance(symbols, str):
@@ -83,6 +126,20 @@ def _read_toml(path: str | Path) -> dict[str, Any]:
         return tomllib.load(f)
 
 
+def _removed_production_field_errors(raw: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for section, removed_fields in _REMOVED_PRODUCTION_FIELDS.items():
+        values = raw.get(section, {})
+        if not isinstance(values, dict):
+            continue
+        for field_name in sorted(removed_fields.intersection(values)):
+            errors.append(
+                f"removed production field: {section}.{field_name}; "
+                "delete it from the config"
+            )
+    return errors
+
+
 def _merge_defaults(base: Any, raw: dict[str, Any]) -> None:
     """Merge raw dict values into a dataclass instance in-place."""
     for key, value in raw.items():
@@ -93,7 +150,6 @@ def _merge_defaults(base: Any, raw: dict[str, Any]) -> None:
 def _load_runtime(raw: dict[str, Any]) -> RuntimeConfig:
     cfg = default_runtime()
     _merge_defaults(cfg, raw)
-    cfg._opportunity_input_mode_configured = "opportunity_input_mode" in raw
     return cfg
 
 

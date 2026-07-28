@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import math
-import os
-from pathlib import Path
 from typing import Any
 
 from lightfee.config.compatibility import (
     ENTRY_READINESS_PROVIDER_ON_DEMAND,
     REMOVED_FIELD_MESSAGES,
-    VALID_OPPORTUNITY_INPUT_MODES,
     entry_readiness_provider_configured,
     resolve_entry_readiness_provider,
 )
-from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.config.schema import (
     AppConfig,
     ENTRY_READINESS_PROVIDERS,
@@ -24,14 +20,6 @@ from lightfee.config.universe import validate_directed_pairs
 from lightfee.core.domain import Venue
 from lightfee.marketdata.open_interest import (
     ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
-)
-from lightfee.strategy.fee_evidence import (
-    LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
-    TRUSTED_FEE_EVIDENCE_HMAC_ENV,
-)
-from lightfee.strategy.funding_canary_policy import (
-    ALL_LIVE_FUNDING_VENUES,
-    canonical_venue_pair,
 )
 
 
@@ -44,12 +32,6 @@ def validate_config(config: AppConfig) -> list[str]:
 
     if config.runtime.mode not in ("paper", "live"):
         issues.append(f"runtime.mode must be 'paper' or 'live', got: {config.runtime.mode}")
-
-    if config.runtime.opportunity_input_mode not in VALID_OPPORTUNITY_INPUT_MODES:
-        issues.append(
-            f"runtime.opportunity_input_mode must be one of "
-            f"{sorted(VALID_OPPORTUNITY_INPUT_MODES)}, got: {config.runtime.opportunity_input_mode}"
-        )
 
     if config.runtime.maker_event_lane_enabled and config.runtime.maker_event_lane_min_wake_interval_ms <= 0:
         issues.append(
@@ -80,51 +62,6 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= "
             f"{ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS}"
-        )
-    entry_oi_store_path = str(
-        getattr(config.runtime, "entry_open_interest_store_path", "")
-        or ""
-    ).strip()
-    if not entry_oi_store_path:
-        issues.append(
-            "runtime.entry_open_interest_store_path must not be empty"
-        )
-    else:
-        try:
-            resolved_entry_oi_store_path = resolve_config_artifact_path(
-                config, entry_oi_store_path
-            )
-        except (TypeError, ValueError, OSError):
-            issues.append(
-                "runtime.entry_open_interest_store_path must resolve to a "
-                "valid artifact path"
-            )
-        else:
-            if (
-                resolved_entry_oi_store_path.exists()
-                and resolved_entry_oi_store_path.is_dir()
-            ):
-                issues.append(
-                    "runtime.entry_open_interest_store_path must not be "
-                    "an existing directory"
-                )
-            elif not _artifact_parent_is_usable_or_creatable(
-                resolved_entry_oi_store_path
-            ):
-                issues.append(
-                    "runtime.entry_open_interest_store_path parent must "
-                    "be a usable directory or creatable"
-                )
-    if not _is_positive_int(
-        getattr(
-            config.runtime,
-            "entry_open_interest_background_refresh_ms",
-            15 * 60_000,
-        )
-    ):
-        issues.append(
-            "runtime.entry_open_interest_background_refresh_ms must be a "
-            "positive integer"
         )
     if config.runtime.live_scan_last_good_max_age_ms <= 0:
         issues.append(
@@ -157,39 +94,8 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             "runtime.entry_account_truth_per_venue_timeout_ms must be a positive integer"
         )
-    legacy_entry_truth_timeout = config.runtime.entry_account_truth_probe_timeout_ms
-    if legacy_entry_truth_timeout is not None and not _is_positive_int(
-        legacy_entry_truth_timeout
-    ):
-        issues.append(
-            "runtime.entry_account_truth_probe_timeout_ms must be a positive integer "
-            "when set"
-        )
     if not str(config.runtime.hyperliquid_info_coordinator_dir or "").strip():
         issues.append("runtime.hyperliquid_info_coordinator_dir must be non-empty")
-    if not str(config.runtime.funding_basis_risk_checkpoint_path or "").strip():
-        issues.append("runtime.funding_basis_risk_checkpoint_path must be non-empty")
-    if not str(config.runtime.fee_evidence_path or "").strip():
-        issues.append("runtime.fee_evidence_path must be non-empty")
-    if not str(config.runtime.funding_fee_evidence_path or "").strip():
-        issues.append("runtime.funding_fee_evidence_path must be non-empty")
-    elif _canonical_path(
-        config.runtime.funding_fee_evidence_path,
-        config=config,
-    ) == _canonical_path(
-        config.runtime.fee_evidence_path,
-        config=config,
-    ):
-        issues.append(
-            "runtime.funding_fee_evidence_path must differ from "
-            "runtime.fee_evidence_path"
-        )
-    if not _is_positive_int(config.runtime.fee_evidence_max_age_ms):
-        issues.append("runtime.fee_evidence_max_age_ms must be a positive integer")
-    if not _is_positive_int(config.runtime.funding_fee_evidence_max_age_ms):
-        issues.append(
-            "runtime.funding_fee_evidence_max_age_ms must be a positive integer"
-        )
     if config.runtime.local_l2_depth_bridge_enabled:
         if not str(config.runtime.local_l2_depth_bridge_path or "").strip():
             issues.append("runtime.local_l2_depth_bridge_path must be set when enabled")
@@ -222,18 +128,12 @@ def validate_config(config: AppConfig) -> list[str]:
     # keeps entry freeze, risk monitoring and paper-only intent fail-closed.
     for field_name in (
         "funding_new_entries_enabled",
-        "funding_canary_enabled",
-        "funding_canary_require_account_fee_evidence",
-        "funding_dynamic_expected_shortfall_enabled",
         "risk_monitor_enabled",
         "spread_live_enabled",
         "spread_paper_enabled",
         "spread_dynamic_net_edge_enabled",
         "spread_rank_by_capital_efficiency",
         "spread_paper_require_l2_vwap",
-        "spread_paper_require_account_fee_evidence",
-        "spread_allow_verified_maker_rebates",
-        "spread_paper_require_out_of_sample",
     ):
         value = getattr(config.strategy, field_name)
         if value is not True and value is not False:
@@ -284,249 +184,9 @@ def validate_config(config: AppConfig) -> list[str]:
         "funding_max_global_gross_exposure_quote": config.strategy.funding_max_global_gross_exposure_quote,
         "funding_max_settlement_bucket_exposure_quote": config.strategy.funding_max_settlement_bucket_exposure_quote,
         "funding_max_correlation_group_exposure_quote": config.strategy.funding_max_correlation_group_exposure_quote,
-        "funding_expected_shortfall_bps": config.strategy.funding_expected_shortfall_bps,
-        "funding_expected_shortfall_budget_quote": config.strategy.funding_expected_shortfall_budget_quote,
-        "funding_es_cold_start_max_entry_notional_quote": (
-            config.strategy.funding_es_cold_start_max_entry_notional_quote
-        ),
-        "funding_es_cold_start_bps": config.strategy.funding_es_cold_start_bps,
     }.items():
         if not _is_finite_nonnegative(value):
             issues.append(f"strategy.{field_name} must be finite and >= 0")
-    for field_name, value in {
-        "funding_dynamic_expected_shortfall_window_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_window_ms
-        ),
-        "funding_dynamic_expected_shortfall_max_samples": (
-            config.strategy.funding_dynamic_expected_shortfall_max_samples
-        ),
-        "funding_dynamic_expected_shortfall_max_pairs": (
-            config.strategy.funding_dynamic_expected_shortfall_max_pairs
-        ),
-        "funding_dynamic_expected_shortfall_horizon_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_horizon_ms
-        ),
-        "funding_dynamic_expected_shortfall_min_samples": (
-            config.strategy.funding_dynamic_expected_shortfall_min_samples
-        ),
-        "funding_dynamic_expected_shortfall_min_history_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_min_history_ms
-        ),
-        "funding_dynamic_expected_shortfall_quote_skew_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_quote_skew_ms
-        ),
-        "funding_dynamic_expected_shortfall_checkpoint_max_age_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_checkpoint_max_age_ms
-        ),
-        "funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms": (
-            config.strategy.funding_dynamic_expected_shortfall_checkpoint_publish_interval_ms
-        ),
-    }.items():
-        if not _is_positive_int(value):
-            issues.append(f"strategy.{field_name} must be a positive integer")
-    dynamic_es_window_ms = config.strategy.funding_dynamic_expected_shortfall_window_ms
-    dynamic_es_horizon_ms = config.strategy.funding_dynamic_expected_shortfall_horizon_ms
-    dynamic_es_history_ms = config.strategy.funding_dynamic_expected_shortfall_min_history_ms
-    if (
-        _is_positive_int(dynamic_es_horizon_ms)
-        and _is_positive_int(dynamic_es_window_ms)
-        and dynamic_es_horizon_ms > dynamic_es_window_ms
-    ):
-        issues.append(
-            "strategy.funding_dynamic_expected_shortfall_horizon_ms must not exceed window_ms"
-        )
-    if (
-        _is_positive_int(dynamic_es_history_ms)
-        and _is_positive_int(dynamic_es_window_ms)
-        and dynamic_es_history_ms > dynamic_es_window_ms
-    ):
-        issues.append(
-            "strategy.funding_dynamic_expected_shortfall_min_history_ms must not exceed window_ms"
-        )
-    try:
-        dynamic_es_confidence = float(
-            config.strategy.funding_dynamic_expected_shortfall_confidence
-        )
-    except (TypeError, ValueError):
-        dynamic_es_confidence = 0.0
-    if not math.isfinite(dynamic_es_confidence) or not 0.0 < dynamic_es_confidence < 1.0:
-        issues.append(
-            "strategy.funding_dynamic_expected_shortfall_confidence must be finite and within (0, 1)"
-        )
-    if (
-        config.runtime.mode == "live"
-        and config.strategy.funding_new_entries_enabled is True
-    ):
-        if config.strategy.funding_dynamic_expected_shortfall_enabled is not True:
-            issues.append(
-                "strategy.funding_dynamic_expected_shortfall_enabled must be true when live funding entries are enabled"
-            )
-        if not _is_positive_finite(
-            config.strategy.funding_expected_shortfall_budget_quote
-        ):
-            issues.append(
-                "strategy.funding_expected_shortfall_budget_quote must be > 0 when live funding entries are enabled"
-            )
-        for field_name, value in {
-            "funding_es_cold_start_max_entry_notional_quote": (
-                config.strategy.funding_es_cold_start_max_entry_notional_quote
-            ),
-            "funding_es_cold_start_bps": config.strategy.funding_es_cold_start_bps,
-        }.items():
-            if not _is_positive_finite(value):
-                issues.append(
-                    f"strategy.{field_name} must be > 0 when live funding entries are enabled"
-                )
-    if config.strategy.funding_canary_enabled is True:
-        allowed_venues = config.strategy.funding_canary_allowed_venues
-        if (
-            not isinstance(allowed_venues, list)
-            or len({str(venue or "").strip().lower() for venue in allowed_venues if str(venue or "").strip()})
-            < 2
-        ):
-            issues.append(
-                "strategy.funding_canary_allowed_venues must contain at least two venues"
-            )
-        else:
-            normalized_venues = {
-                str(venue or "").strip().lower()
-                for venue in allowed_venues
-                if str(venue or "").strip()
-            }
-            unsupported = sorted(normalized_venues - ALL_LIVE_FUNDING_VENUES)
-            if unsupported:
-                issues.append(
-                    "strategy.funding_canary_allowed_venues contains unsupported "
-                    "live perp venues: " + ", ".join(unsupported)
-                )
-        if not _is_positive_int(config.strategy.funding_canary_max_concurrent_positions):
-            issues.append(
-                "strategy.funding_canary_max_concurrent_positions must be a positive integer"
-            )
-        for field_name, value in {
-            "funding_canary_max_entry_notional_quote": (
-                config.strategy.funding_canary_max_entry_notional_quote
-            ),
-            "funding_canary_min_expected_net_edge_bps": (
-                config.strategy.funding_canary_min_expected_net_edge_bps
-            ),
-            "funding_canary_min_worst_case_edge_bps": (
-                config.strategy.funding_canary_min_worst_case_edge_bps
-            ),
-            "funding_canary_conservative_fee_max_entry_notional_quote": (
-                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
-            ),
-            "funding_canary_conservative_fee_buffer_bps": (
-                config.strategy.funding_canary_conservative_fee_buffer_bps
-            ),
-        }.items():
-            if not _is_finite_nonnegative(value) or (
-                field_name
-                in {
-                    "funding_canary_max_entry_notional_quote",
-                    "funding_canary_conservative_fee_max_entry_notional_quote",
-                }
-                and float(value) <= 0.0
-            ):
-                comparator = (
-                    "> 0"
-                    if field_name
-                    in {
-                        "funding_canary_max_entry_notional_quote",
-                        "funding_canary_conservative_fee_max_entry_notional_quote",
-                    }
-                    else ">= 0"
-                )
-                issues.append(f"strategy.{field_name} must be finite and {comparator}")
-        if (
-            _is_positive_finite(
-                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
-            )
-            and _is_positive_finite(
-                config.strategy.funding_canary_max_entry_notional_quote
-            )
-            and float(
-                config.strategy.funding_canary_conservative_fee_max_entry_notional_quote
-            )
-            > float(config.strategy.funding_canary_max_entry_notional_quote)
-        ):
-            issues.append(
-                "strategy.funding_canary_conservative_fee_max_entry_notional_quote "
-                "must not exceed funding_canary_max_entry_notional_quote"
-            )
-        for field_name, raw_map in {
-            "funding_canary_min_expected_net_edge_bps_by_venue_pair": (
-                config.strategy.funding_canary_min_expected_net_edge_bps_by_venue_pair
-            ),
-            "funding_canary_min_worst_case_edge_bps_by_venue_pair": (
-                config.strategy.funding_canary_min_worst_case_edge_bps_by_venue_pair
-            ),
-        }.items():
-            if not isinstance(raw_map, dict):
-                issues.append(f"strategy.{field_name} must be a mapping")
-                continue
-            for raw_pair, value in raw_map.items():
-                parts = (
-                    str(raw_pair or "")
-                    .strip()
-                    .lower()
-                    .replace("|", ":")
-                    .split(":")
-                )
-                pair = canonical_venue_pair(*parts) if len(parts) == 2 else ""
-                if (
-                    not pair
-                    or any(venue not in ALL_LIVE_FUNDING_VENUES for venue in parts)
-                    or not _is_finite_nonnegative(value)
-                ):
-                    issues.append(
-                        f"strategy.{field_name} contains invalid venue pair floor: "
-                        f"{raw_pair}"
-                    )
-    if (
-        config.runtime.mode == "live"
-        and config.strategy.funding_new_entries_enabled is True
-        and config.strategy.funding_canary_enabled is True
-    ):
-        if (
-            _is_positive_int(config.runtime.funding_fee_evidence_max_age_ms)
-            and int(config.runtime.funding_fee_evidence_max_age_ms)
-            > LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS
-        ):
-            issues.append(
-                "runtime.funding_fee_evidence_max_age_ms must be <= 432000000 "
-                "for a live funding canary"
-            )
-    if (
-        config.strategy.spread_paper_enabled is True
-        and str(config.strategy.spread_paper_model_epoch or "").startswith("v3_")
-        and config.strategy.spread_paper_require_account_fee_evidence is True
-    ):
-        configured_key_env = str(
-            config.runtime.fee_evidence_integrity_key_env or ""
-        ).strip()
-        if configured_key_env and configured_key_env != TRUSTED_FEE_EVIDENCE_HMAC_ENV:
-            issues.append(
-                "runtime.fee_evidence_integrity_key_env must be blank or the fixed "
-                "LIGHTFEE_FEE_EVIDENCE_HMAC_KEY for v3 spread paper"
-            )
-        identities = config.runtime.fee_evidence_account_identity_hashes
-        if not isinstance(identities, dict):
-            issues.append(
-                "runtime.fee_evidence_account_identity_hashes must be a mapping"
-            )
-        else:
-            required_venues = {
-                str(venue.venue or "").strip().lower()
-                for venue in config.venues
-                if str(venue.venue or "").strip()
-            }
-            for venue in sorted(required_venues):
-                if not _is_sha256_hex(identities.get(venue)):
-                    issues.append(
-                        "runtime.fee_evidence_account_identity_hashes must contain "
-                        f"a SHA256 identity hash for v3 spread paper venue {venue}"
-                    )
     if not _is_finite_ratio(config.strategy.funding_risk_health_buffer_ratio):
         issues.append(
             "strategy.funding_risk_health_buffer_ratio must be finite and within (0, 1]"
@@ -690,12 +350,6 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append(
                 "strategy.spread_paper_latency_buffer_bps must be finite and >= 0"
             )
-        if config.strategy.spread_paper_require_out_of_sample is True and not _is_positive_int(
-            config.strategy.spread_paper_oos_start_ms
-        ):
-            issues.append(
-                "strategy.spread_paper_oos_start_ms must be a positive integer when out-of-sample is required"
-            )
         if not _is_positive_int(config.strategy.spread_paper_terminal_secs):
             issues.append(
                 "strategy.spread_paper_terminal_secs must be a positive integer"
@@ -708,15 +362,6 @@ def validate_config(config: AppConfig) -> list[str]:
         ):
             issues.append(
                 "strategy.spread_paper_markout_secs must be a non-empty list of positive integers"
-            )
-        manifest_path = str(
-            config.strategy.spread_paper_research_manifest_path or ""
-        ).strip()
-        if not manifest_path:
-            issues.append("strategy.spread_paper_research_manifest_path must be set")
-        elif not _canonical_path(manifest_path, config=config).is_file():
-            issues.append(
-                "strategy.spread_paper_research_manifest_path must reference a file"
             )
 
     if (
@@ -890,28 +535,6 @@ def _is_finite_nonnegative(value: object) -> bool:
     return math.isfinite(numeric) and numeric >= 0.0
 
 
-def _canonical_path(
-    value: object,
-    *,
-    config: AppConfig | None = None,
-) -> Path:
-    """Normalize aliases so two strategy inputs cannot resolve to one file."""
-    return resolve_config_artifact_path(config, value)
-
-
-def _artifact_parent_is_usable_or_creatable(path: Path) -> bool:
-    parent = path.parent
-    if parent.exists():
-        return parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
-
-    probe = parent
-    while not probe.exists():
-        if probe == probe.parent:
-            return False
-        probe = probe.parent
-    return probe.is_dir() and os.access(probe, os.W_OK | os.X_OK)
-
-
 def _is_finite_ratio(value: object) -> bool:
     """A usable margin-health ratio preserves some collateral and is bounded."""
     if isinstance(value, bool):
@@ -948,17 +571,6 @@ def _is_nonnegative_int(value: object) -> bool:
 def _is_positive_finite(value: object) -> bool:
     """Strictly positive finite numeric policy value, never a boolean."""
     return _is_finite_nonnegative(value) and float(value) > 0.0
-
-
-def _is_sha256_hex(value: object) -> bool:
-    text = str(value or "").strip().lower()
-    if len(text) != 64:
-        return False
-    try:
-        int(text, 16)
-    except ValueError:
-        return False
-    return True
 
 
 def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:

@@ -32,25 +32,26 @@ CRITICAL_FILES = [
     "lightfee/engine/state.py",
     "lightfee/sidecar/snapshot.py",
     "lightfee/sidecar/publisher.py",
-    "lightfee/sidecar/spread_bbo.py",
-    "lightfee/sidecar/spread_bbo_service.py",
     "lightfee/sidecar/v1_compat.py",
-    "lightfee/spread/quote_snapshot.py",
-    "lightfee/apps/spread_bbo.py",
+    "lightfee/spread/service.py",
+    "lightfee/spread/paper_runtime.py",
     "lightfee/config/schema.py",
     "lightfee/engine/lifecycle.py",
     "lightfee/ops/production_health.py",
     "scripts/verify_production_services.py",
-    "scripts/refresh_account_fee_evidence.py",
     "scripts/run_trade_optimization_report.sh",
     "deploy/systemd/lightfee-live.service",
-    "deploy/systemd/lightfee-spread-bbo.service",
+    "deploy/systemd/lightfee-sidecar.service",
     "deploy/systemd/lightfee-spread-sidecar.service",
     "deploy/systemd/lightfee-trade-optimization-report.service",
     "deploy/systemd/lightfee-trade-optimization-report.timer",
-    "deploy/systemd/lightfee-fee-evidence-refresh.service",
-    "deploy/systemd/lightfee-fee-evidence-refresh.timer",
     "deploy/network/NetworkManager-lightfee-dns.conf",
+]
+
+RETIRED_SYSTEMD_UNITS = [
+    "lightfee-spread-bbo.service",
+    "lightfee-fee-evidence-refresh.service",
+    "lightfee-fee-evidence-refresh.timer",
 ]
 
 # --- Files/dirs to exclude from sync ---
@@ -316,14 +317,138 @@ verify_remote_production_health() {{
 }}
 
 install_systemd_units() {{
-  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-bbo.service" /etc/systemd/system/lightfee-spread-bbo.service
+  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-sidecar.service" /etc/systemd/system/lightfee-sidecar.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-sidecar.service" /etc/systemd/system/lightfee-spread-sidecar.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-live.service" /etc/systemd/system/lightfee-live.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.service" /etc/systemd/system/lightfee-trade-optimization-report.service
   install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-trade-optimization-report.timer" /etc/systemd/system/lightfee-trade-optimization-report.timer
-  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.service" /etc/systemd/system/lightfee-fee-evidence-refresh.service
-  install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.timer" /etc/systemd/system/lightfee-fee-evidence-refresh.timer
   chmod 0755 "$REMOTE_PATH/scripts/run_trade_optimization_report.sh"
+}}
+
+verify_retired_systemd_unit() {{
+  local unit="$1" unit_file active_state load_state enabled_state
+  unit_file="/etc/systemd/system/$unit"
+  if ! active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)"; then
+    echo "retired systemd unit active-state query failed: $unit" >&2
+    return 1
+  fi
+  if [[ -z "$active_state" ]]; then
+    echo "retired systemd unit active-state query returned empty: $unit" >&2
+    return 1
+  fi
+  if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)"; then
+    echo "retired systemd unit load-state query failed: $unit" >&2
+    return 1
+  fi
+  if [[ -z "$load_state" ]]; then
+    echo "retired systemd unit load-state query returned empty: $unit" >&2
+    return 1
+  fi
+  case "$load_state:$active_state" in
+    not-found:inactive|loaded:inactive)
+      ;;
+    *)
+      echo "retired systemd unit not inactive or absent: $unit load_state=$load_state active_state=$active_state" >&2
+      return 1
+      ;;
+  esac
+  if ! enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)"; then
+    enabled_state="${{enabled_state:-}}"
+  fi
+  case "$enabled_state" in
+    disabled|not-found)
+      ;;
+    *)
+      if [[ -z "$enabled_state" ]]; then
+        echo "retired systemd unit enabled-state query returned empty: $unit" >&2
+      else
+        echo "retired systemd unit not disabled or absent: $unit state=$enabled_state" >&2
+      fi
+      return 1
+      ;;
+  esac
+  if [[ -e "$unit_file" ]]; then
+    echo "retired systemd unit file still exists: $unit_file" >&2
+    return 1
+  fi
+}}
+
+retire_systemd_units() {{
+  local unit unit_file
+  for unit in {' '.join(RETIRED_SYSTEMD_UNITS)}; do
+    unit_file="/etc/systemd/system/$unit"
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+    rm -f "$unit_file"
+  done
+  systemctl daemon-reload
+  for unit in {' '.join(RETIRED_SYSTEMD_UNITS)}; do
+    verify_retired_systemd_unit "$unit"
+  done
+  systemctl reset-failed {' '.join(RETIRED_SYSTEMD_UNITS)} >/dev/null 2>&1 || true
+}}
+
+retire_remote_systemd_units() {{
+  ssh $SSH_OPTS {remote_host} 'set -eu
+units="{' '.join(RETIRED_SYSTEMD_UNITS)}"
+verify_retired_remote_systemd_unit() {{
+  unit="$1"
+  unit_file="/etc/systemd/system/$unit"
+  if ! active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)"; then
+    echo "retired systemd unit active-state query failed: $unit" >&2
+    exit 1
+  fi
+  if [ -z "$active_state" ]; then
+    echo "retired systemd unit active-state query returned empty: $unit" >&2
+    exit 1
+  fi
+  if ! load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)"; then
+    echo "retired systemd unit load-state query failed: $unit" >&2
+    exit 1
+  fi
+  if [ -z "$load_state" ]; then
+    echo "retired systemd unit load-state query returned empty: $unit" >&2
+    exit 1
+  fi
+  case "$load_state:$active_state" in
+    not-found:inactive|loaded:inactive)
+      ;;
+    *)
+      echo "retired systemd unit not inactive or absent: $unit load_state=$load_state active_state=$active_state" >&2
+      exit 1
+      ;;
+  esac
+  if ! enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)"; then
+    enabled_state="${{enabled_state:-}}"
+  fi
+  case "$enabled_state" in
+    disabled|not-found)
+      ;;
+    *)
+      if [ -z "$enabled_state" ]; then
+        echo "retired systemd unit enabled-state query returned empty: $unit" >&2
+      else
+        echo "retired systemd unit not disabled or absent: $unit state=$enabled_state" >&2
+      fi
+      exit 1
+      ;;
+  esac
+  if [ -e "$unit_file" ]; then
+    echo "retired systemd unit file still exists: $unit_file" >&2
+    exit 1
+  fi
+}}
+for unit in $units; do
+  unit_file="/etc/systemd/system/$unit"
+  systemctl stop "$unit" >/dev/null 2>&1 || true
+  systemctl disable "$unit" >/dev/null 2>&1 || true
+  rm -f "$unit_file"
+done
+systemctl daemon-reload
+for unit in $units; do
+  verify_retired_remote_systemd_unit "$unit"
+done
+systemctl reset-failed $units >/dev/null 2>&1 || true'
 }}
 
 echo "=== Generating deploy manifest ==="
@@ -350,8 +475,11 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   echo "=== Installing systemd units ==="
   install_systemd_units
 
+  echo "=== Retiring removed systemd units ==="
+  retire_systemd_units
+
   echo "=== Restarting production services ==="
-  systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
+  systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
   sleep 12
 
   echo "=== Verifying production health ==="
@@ -383,10 +511,13 @@ echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
 echo "=== Installing systemd units ==="
-ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-bbo.service /etc/systemd/system/lightfee-spread-bbo.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-sidecar.service /etc/systemd/system/lightfee-spread-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-live.service /etc/systemd/system/lightfee-live.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.service /etc/systemd/system/lightfee-trade-optimization-report.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.timer /etc/systemd/system/lightfee-trade-optimization-report.timer && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.service /etc/systemd/system/lightfee-fee-evidence-refresh.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-fee-evidence-refresh.timer /etc/systemd/system/lightfee-fee-evidence-refresh.timer && chmod 0755 {remote_path}/scripts/run_trade_optimization_report.sh"
+ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-sidecar.service /etc/systemd/system/lightfee-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-spread-sidecar.service /etc/systemd/system/lightfee-spread-sidecar.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-live.service /etc/systemd/system/lightfee-live.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.service /etc/systemd/system/lightfee-trade-optimization-report.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-trade-optimization-report.timer /etc/systemd/system/lightfee-trade-optimization-report.timer && chmod 0755 {remote_path}/scripts/run_trade_optimization_report.sh"
+
+echo "=== Retiring removed systemd units ==="
+retire_remote_systemd_units
 
 echo "=== Restarting production services ==="
-ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable --now lightfee-fee-evidence-refresh.timer && systemctl enable lightfee-spread-bbo.service && systemctl restart lightfee-spread-bbo.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
+ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
 sleep 12
 
 echo "=== Verifying production health ==="

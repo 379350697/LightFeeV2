@@ -48,7 +48,6 @@ from lightfee.engine.entry_dispatch_runtime import (
 )
 from lightfee.engine.execution_planner import min_hedgeable_chunk_from_notional
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
-from lightfee.engine.funding_risk_runtime import FundingRiskRuntime
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
@@ -83,9 +82,6 @@ from lightfee.engine.task_cancellation import (
     cancel_task_with_bounded_drain,
 )
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
-from lightfee.strategy.candidate_identity import (
-    candidate_revision_id as build_candidate_revision_id,
-)
 from lightfee.engine.order_truth_resolution import (
     open_order_items,
     resolve_accepted_order_truth,
@@ -192,13 +188,7 @@ from lightfee.sidecar.snapshot import (
     decide_snapshot_freshness,
     has_usable_funding_payload,
 )
-from lightfee.sidecar.publisher import (
-    funding_entry_snapshot_identity,
-    funding_entry_snapshot_manifest_path,
-    funding_entry_snapshot_path,
-    load_funding_entry_snapshot,
-    load_snapshot,
-)
+from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
 from lightfee.venues.transport import (
     TransportErrorCategory,
@@ -317,15 +307,10 @@ class LiveRuntime:
         self._current_state_export_task: asyncio.Task | None = None
         self._entry_evidence_generation: int = 0
         self._entry_evidence_prewarm_generation: int = 0
-        self._entry_evidence_prewarm_task: asyncio.Task | None = None
         self._entry_evidence_cancel_cleanup_tasks: set[asyncio.Task] = set()
         self._sidecar_entry_installing_since_ms: int = 0
         self._sidecar_entry_install_status: str = ""
         self._sidecar_entry_invalid_reported: bool = False
-        self._in_process_entry_source: object | None = None
-        self._in_process_entry_refresh_task: asyncio.Task | None = None
-        self._in_process_entry_snapshot = None
-        self._single_process_entry_bbo_baseline_keys: set[tuple[str, str]] = set()
         self._venue_adapters = venue_adapters or {}
         self.residual_repair_runtime = ResidualRepairRuntime(self)
         self.pending_entry_runtime = PendingEntryRuntime(self)
@@ -353,8 +338,10 @@ class LiveRuntime:
         # V1 rate-limit reload tracking
         self._last_rate_limit_reload_ms: int = 0
 
-        # V1 private WS tracking: each venue gets workers started once.
-        # Tracked per venue to handle reconfiguration gracefully.
+        # Private account streams are process-scoped after their first valid
+        # activation.  The per-venue sets grow monotonically so a transient
+        # entry candidate cannot stop or replace a worker that may still
+        # receive late fills or position updates.
         self._private_ws_started: set[Venue] = set()
         self._private_ws_symbols: dict[Venue, set[str]] = {}
 
@@ -406,7 +393,6 @@ class LiveRuntime:
         self.entry_readiness_provider = build_entry_readiness_provider(self)
         self.market_data_runtime = MarketDataRuntime(self)
         self.entry_gate_runtime = EntryGateRuntime(self)
-        self.funding_risk_runtime = FundingRiskRuntime(self)
         self.entry_dispatch_runtime = EntryDispatchRuntime(self)
         self._refresh_runtime_market_data_config_state()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
@@ -436,11 +422,6 @@ class LiveRuntime:
         self._last_entry_admission_filter_samples: list[dict] = []
         self._last_snapshot_freshness_filter_blockers: Counter[str] = Counter()
         self._last_snapshot_freshness_filter_samples: list[dict] = []
-        self._funding_canary_clamp_event_keys: dict[str, int] = {}
-        self._entry_preparation_task: asyncio.Task | None = None
-        self._entry_preparation_key: tuple[str, ...] | None = None
-        self._entry_preparation_result: dict[str, Any] | None = None
-        self._entry_preparation_ready_at_ms: int = 0
         self._entry_account_truth_task: asyncio.Task | None = None
         self._entry_account_truth_gate_task: asyncio.Task | None = None
         self._entry_account_truth_generation: dict[str, Any] | None = None
@@ -450,16 +431,6 @@ class LiveRuntime:
             str, dict[str, Any]
         ] = {}
         self._entry_account_truth_venue_tasks: dict[str, asyncio.Task] = {}
-        self._entry_data_plane_preparation_task: asyncio.Task | None = None
-        self._entry_data_plane_preparation_key: tuple[str, ...] | None = None
-        # A newer active queue can arrive while the previous data-plane
-        # activation is connecting.  Keep only the latest complete scope and
-        # let the single worker reconcile it before it exits.  This prevents a
-        # backfilled primary from being logically selected without ever being
-        # subscribed on the WS-BBO/L2 data plane.
-        self._entry_data_plane_preparation_pending: (
-            tuple[list, tuple[str, ...]] | None
-        ) = None
         self._prescan_l2_sync_task: asyncio.Task | None = None
         self._snapshot_freshness_decision_last_emit_ms: dict[
             tuple[str, str, str, str, str, str], int
@@ -3178,76 +3149,6 @@ class LiveRuntime:
         setattr(candidate, "candidate_revision_id", revision_id)
         return revision_id
 
-    def _emit_sidecar_canary_clamp_if_needed(self, candidate, *, now_ms: int) -> None:
-        """Emit the normal discovery-stage 50-to-15 clamp exactly once/revision."""
-        if not bool(getattr(candidate, "funding_canary_size_constrained", False)):
-            return
-        revision_id = self._bind_entry_candidate_revision_id(candidate)
-        if not revision_id:
-            return
-        requested_quantity = float(
-            getattr(candidate, "funding_canary_requested_quantity", 0.0) or 0.0
-        )
-        requested_notional = float(
-            getattr(
-                candidate,
-                "funding_canary_requested_max_leg_notional_quote",
-                0.0,
-            )
-            or 0.0
-        )
-        final_quantity = float(
-            getattr(candidate, "entry_target_quantity", 0.0) or 0.0
-        )
-        final_notional = float(
-            getattr(candidate, "entry_max_leg_notional_quote", 0.0) or 0.0
-        )
-        event_key = "|".join(
-            (
-                self._bind_entry_opportunity_lease_id(candidate),
-                str(getattr(candidate, "funding_canary_fee_assurance_tier", "") or ""),
-                f"{float(getattr(candidate, 'funding_canary_hard_max_entry_notional_quote', 0.0) or 0.0):.12g}",
-                f"{requested_quantity:.12g}",
-                f"{final_quantity:.12g}",
-            )
-        )
-        emitted = self._funding_canary_clamp_event_keys
-        cutoff_ms = now_ms - 60 * 60 * 1_000
-        for key, emitted_at_ms in list(emitted.items()):
-            if emitted_at_ms < cutoff_ms:
-                emitted.pop(key, None)
-        if event_key in emitted:
-            return
-        if len(emitted) >= 4_096:
-            oldest = min(emitted, key=emitted.get)
-            emitted.pop(oldest, None)
-        emitted[event_key] = now_ms
-        self.journal.append(
-            "runtime.funding_canary_size_clamped",
-            {
-                "pair_id": self._candidate_pair_id(candidate),
-                "candidate_revision_id": revision_id,
-                "requested_quantity": requested_quantity,
-                "requested_max_leg_notional_quote": requested_notional,
-                "final_quantity": final_quantity,
-                "entry_max_leg_notional_quote": final_notional,
-                "funding_canary_fee_assurance_tier": str(
-                    getattr(candidate, "funding_canary_fee_assurance_tier", "")
-                    or ""
-                ),
-                "funding_canary_hard_max_entry_notional_quote": float(
-                    getattr(
-                        candidate,
-                        "funding_canary_hard_max_entry_notional_quote",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                "clamp_stage": "sidecar_risk_allocation",
-                "ts_ms": now_ms,
-            },
-        )
-
     def _bind_entry_opportunity_lease_id(self, candidate) -> str:
         """Bind the stable funding-epoch identity used for audit grouping."""
         lease_id = str(
@@ -4636,191 +4537,6 @@ class LiveRuntime:
                 break
         return extras
 
-    def _entry_open_interest_ready_for_l2_activation(
-        self,
-        candidate,
-        *,
-        now_ms: int,
-    ) -> bool:
-        reason, _evidence = (
-            self.entry_dispatch_runtime._entry_open_interest_submit_reason(
-                candidate,
-                now_ms=now_ms,
-            )
-        )
-        return not reason
-
-    def _entry_l2_activation_finalists(self, candidates, *, max_count: int = 3) -> list:
-        limit = max(int(max_count or 0), 0)
-        if limit <= 0:
-            return []
-        now_ms = wall_clock_now_ms()
-        finalists: list = []
-        for candidate in list(candidates or []):
-            if not self._entry_open_interest_ready_for_l2_activation(
-                candidate,
-                now_ms=now_ms,
-            ):
-                continue
-            finalists.append(candidate)
-            if len(finalists) >= limit:
-                break
-        return finalists
-
-    async def _build_entry_preparation_generation(
-        self,
-        candidates: list,
-        *,
-        snapshot,
-        preparation_key: tuple[str, ...],
-    ) -> dict[str, Any]:
-        """Build slow safety/data-plane prerequisites outside the live tick."""
-        catalog_prepared = await self._filter_candidates_supported_by_venue_catalog(
-            list(candidates)
-        )
-        # Admission and private-balance checks are deliberately executed here
-        # only to refresh their raw evidence caches.  Their allow/deny result
-        # is quantity/revision sensitive and must be recomputed for the
-        # current candidates when this generation is consumed.
-        warm_candidates = self._filter_candidates_by_entry_admission(
-            catalog_prepared,
-            now_ms=wall_clock_now_ms(),
-            stage="shortlist",
-        )
-        await self._filter_candidates_by_entry_balance_admission(
-            warm_candidates,
-            now_ms=wall_clock_now_ms(),
-            stage="complete_eligible_frontier",
-        )
-        return {
-            "preparation_key": preparation_key,
-            "catalog_allowed_pair_ids": {
-                self._candidate_pair_id(candidate)
-                for candidate in catalog_prepared
-            },
-            "ready_at_ms": wall_clock_now_ms(),
-        }
-
-    def _schedule_entry_data_plane_preparation(self, candidates: list) -> None:
-        """Refresh L2/BBO subscriptions independently from safety eligibility."""
-        prepared = list(candidates or [])
-        # The compatibility provider remains authoritative for the live data
-        # plane.  The new in-process input mode changes where candidates come
-        # from, not whether a venue supplies local L2 or websocket BBO.
-        local_l2_enabled = self._local_l2_effective_enabled()
-        ws_bbo_enabled = self._entry_readiness_provider_uses_ws_bbo()
-        l2_finalists = (
-            self._entry_l2_activation_finalists(prepared)
-            if local_l2_enabled
-            else prepared
-        )
-        tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
-            l2_finalists
-        )
-        self._tracked_primary_pair_ids = {
-            opportunity.pair_id
-            for opportunity in tracked
-            if opportunity.class_.value == "primary_tracked"
-        }
-        if local_l2_enabled and tracked:
-            ready_now_ms = wall_clock_now_ms()
-            for opportunity in tracked:
-                self.entry_l2_sessions.track_opportunity(
-                    opportunity,
-                    ready_now_ms,
-                )
-            self._refresh_entry_l2_session_readiness(ready_now_ms)
-        generation_key = tuple(sorted(
-            self._candidate_pair_id(candidate) for candidate in prepared
-        ))
-        task = self._entry_data_plane_preparation_task
-        if task is not None and task.done():
-            try:
-                task.result()
-            except Exception:
-                logger.exception("funding entry data-plane preparation failed")
-            self._entry_data_plane_preparation_task = None
-            task = None
-        if task is not None:
-            # The worker is intentionally single-flight: venue subscription
-            # clients are not safe to race.  It consumes this latest request
-            # before completing, so a queue promotion cannot be stranded on
-            # the old primary scope.
-            self._entry_data_plane_preparation_pending = (
-                prepared,
-                generation_key,
-            )
-            return
-        pending_entries_present = bool(getattr(self.state, "pending_entries", None))
-        if not prepared and not (local_l2_enabled and pending_entries_present):
-            self._entry_data_plane_preparation_key = generation_key
-            return
-        if (
-            local_l2_enabled
-            and not tracked_candidates
-            and not pending_entries_present
-            and not ws_bbo_enabled
-        ):
-            self._entry_data_plane_preparation_key = generation_key
-            self._entry_data_plane_preparation_pending = None
-            return
-
-        async def _prepare() -> None:
-            pending_prepared = prepared
-            pending_generation_key = generation_key
-            while True:
-                pending_l2_finalists = (
-                    self._entry_l2_activation_finalists(pending_prepared)
-                    if local_l2_enabled
-                    else pending_prepared
-                )
-                tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
-                    pending_l2_finalists
-                )
-                self._tracked_primary_pair_ids = {
-                    opportunity.pair_id
-                    for opportunity in tracked
-                    if opportunity.class_.value == "primary_tracked"
-                }
-                if ws_bbo_enabled and tracked_candidates:
-                    await self._ensure_entry_bbo_active_for_candidates(
-                        tracked_candidates,
-                        wall_clock_now_ms(),
-                    )
-                if local_l2_enabled and (
-                    tracked_candidates or pending_entries_present
-                ):
-                    await self._ensure_l2_active_for_candidates(
-                        tracked_candidates,
-                        wall_clock_now_ms(),
-                        tracked_opportunities=tracked,
-                    )
-                    for opportunity in tracked:
-                        self.entry_l2_sessions.track_opportunity(
-                            opportunity,
-                            wall_clock_now_ms(),
-                        )
-                    await self._sync_local_l2_data(
-                        wall_clock_now_ms(),
-                        scan_promoted=True,
-                    )
-                    ready_now_ms = wall_clock_now_ms()
-                    self._refresh_entry_l2_session_readiness(ready_now_ms)
-                    self._apply_shadow_promotion_if_eligible(tracked, ready_now_ms)
-
-                pending = self._entry_data_plane_preparation_pending
-                self._entry_data_plane_preparation_pending = None
-                if pending is None:
-                    return
-                pending_prepared, pending_generation_key = pending
-                self._entry_data_plane_preparation_key = pending_generation_key
-
-        self._entry_data_plane_preparation_key = generation_key
-        self._entry_data_plane_preparation_task = asyncio.create_task(
-            _prepare(),
-            name="funding-entry-data-plane-preparation",
-        )
-
     def _entry_account_truth_generation_is_ready(
         self,
         now_ms: int | None = None,
@@ -4863,20 +4579,11 @@ class LiveRuntime:
         self._entry_account_truth_last_good_venue_receipts.clear()
 
     def _entry_account_truth_per_venue_timeout_ms(self) -> int:
-        """Return the canonical target-leg budget with one release of alias support."""
-        legacy = getattr(
+        """Return the target-leg account-truth budget."""
+        configured = getattr(
             self.config.runtime,
-            "entry_account_truth_probe_timeout_ms",
-            None,
-        )
-        configured = (
-            legacy
-            if legacy is not None
-            else getattr(
-                self.config.runtime,
-                "entry_account_truth_per_venue_timeout_ms",
-                2_000,
-            )
+            "entry_account_truth_per_venue_timeout_ms",
+            2_000,
         )
         try:
             return max(int(configured or 0), 1)
@@ -5144,6 +4851,208 @@ class LiveRuntime:
             "finished_at_ms": finished_at_ms,
         }
 
+    async def _collect_entry_candidate_truth_for_venue(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+        symbol: str,
+    ) -> dict[str, Any]:
+        """Read position and open-order truth for one candidate leg only."""
+        venue_name = venue.value
+        symbol_key = str(symbol or "").upper()
+        started_at_ms = wall_clock_now_ms()
+        positions: list[dict[str, Any]] = []
+        open_orders: list[dict[str, Any]] = []
+        probe_evidence: list[dict[str, Any]] = []
+        errors: list[str] = []
+        max_age_ms = max(
+            int(self.config.runtime.private_position_max_age_ms or 0),
+            1,
+        )
+        transport = getattr(adapter, "_transport", adapter)
+        private_state = getattr(transport, "private_ws_state", None)
+        if callable(private_state):
+            private_state = private_state()
+
+        private_position = None
+        if private_state is not None:
+            position_if_fresh = getattr(private_state, "position_if_fresh", None)
+            if callable(position_if_fresh):
+                private_position = position_if_fresh(
+                    symbol_key,
+                    max_age_ms,
+                    started_at_ms,
+                )
+            active_orders_if_fresh = getattr(
+                private_state,
+                "active_orders_for_symbol_if_fresh",
+                None,
+            )
+            if callable(active_orders_if_fresh):
+                private_orders = active_orders_if_fresh(
+                    symbol_key,
+                    max_age_ms,
+                    started_at_ms,
+                )
+                if private_orders:
+                    for order in private_orders:
+                        open_orders.append(
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol_key,
+                                "order_id": str(getattr(order, "order_id", "") or ""),
+                                "client_order_id": str(
+                                    getattr(order, "client_order_id", "") or ""
+                                ),
+                                "state": str(
+                                    getattr(getattr(order, "state", None), "value", "")
+                                    or ""
+                                ),
+                                "updated_at_ms": int(
+                                    getattr(order, "updated_at_ms", 0) or 0
+                                ),
+                            }
+                        )
+                    finished_at_ms = wall_clock_now_ms()
+                    return {
+                        "venue": venue_name,
+                        "truth_supported": True,
+                        "truth_available": True,
+                        "complete": False,
+                        "positions": [],
+                        "open_orders": open_orders,
+                        "probe_evidence": [
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol_key,
+                                "endpoint": "private_ws",
+                                "classification": "active_order_push",
+                                "finished_at_ms": finished_at_ms,
+                            }
+                        ],
+                        "errors": [],
+                        "truth_probe_count": 1,
+                        "started_at_ms": started_at_ms,
+                        "finished_at_ms": finished_at_ms,
+                    }
+
+        if private_position is not None:
+            position = PositionSnapshot(
+                venue=venue,
+                symbol=symbol_key,
+                side=Side.BUY if private_position.size >= 0 else Side.SELL,
+                quantity=abs(float(private_position.size or 0.0)),
+                entry_price=0.0,
+                observed_at_ms=int(private_position.updated_at_ms or 0),
+            )
+            positions.append(
+                self._recovery_ledger_position_payload(
+                    position,
+                    venue_name=venue_name,
+                    symbol=symbol_key,
+                )
+            )
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": symbol_key,
+                    "endpoint": "private_ws",
+                    "classification": "position_push",
+                    "finished_at_ms": started_at_ms,
+                }
+            )
+            if abs(position.quantity) > 1e-12:
+                finished_at_ms = wall_clock_now_ms()
+                return {
+                    "venue": venue_name,
+                    "truth_supported": True,
+                    "truth_available": True,
+                    "complete": False,
+                    "positions": positions,
+                    "open_orders": [],
+                    "probe_evidence": probe_evidence,
+                    "errors": [],
+                    "truth_probe_count": 1,
+                    "started_at_ms": started_at_ms,
+                    "finished_at_ms": finished_at_ms,
+                }
+        else:
+            fetch_position = getattr(adapter, "fetch_position", None)
+            if not callable(fetch_position):
+                fetch_position = getattr(transport, "fetch_position", None)
+            if not callable(fetch_position):
+                errors.append(f"{venue_name}:{symbol_key}:fetch_position_unavailable")
+            else:
+                try:
+                    position = await fetch_position(symbol_key)
+                    if position is None:
+                        raise RuntimeError("fetch_position_returned_none")
+                    positions.append(
+                        self._recovery_ledger_position_payload(
+                            position,
+                            venue_name=venue_name,
+                            symbol=symbol_key,
+                        )
+                    )
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol_key,
+                            "endpoint": "fetch_position",
+                            "classification": "position_probe_succeeded",
+                            "finished_at_ms": wall_clock_now_ms(),
+                        }
+                    )
+                except Exception as exc:
+                    errors.append(f"{venue_name}:{symbol_key}:positions:{exc}")
+
+        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+        if not callable(fetch_open_orders):
+            fetch_open_orders = getattr(transport, "fetch_open_orders", None)
+        try:
+            if callable(fetch_open_orders):
+                rows = open_order_items(await fetch_open_orders(symbol_key))
+            else:
+                rows = await self.residual_repair_runtime._fetch_residual_repair_open_orders(
+                    adapter,
+                    venue,
+                    symbol_key,
+                )
+            open_orders.extend(
+                self._recovery_ledger_open_order_payloads(
+                    rows,
+                    venue_name=venue_name,
+                    symbol=symbol_key,
+                )
+            )
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": symbol_key,
+                    "endpoint": "fetch_open_orders",
+                    "classification": "open_order_probe_succeeded",
+                    "finished_at_ms": wall_clock_now_ms(),
+                }
+            )
+        except Exception as exc:
+            errors.append(f"{venue_name}:{symbol_key}:open_orders:{exc}")
+
+        finished_at_ms = wall_clock_now_ms()
+        complete = not errors and len(probe_evidence) >= 2
+        return {
+            "venue": venue_name,
+            "truth_supported": bool(probe_evidence),
+            "truth_available": not errors,
+            "complete": complete,
+            "positions": positions,
+            "open_orders": open_orders,
+            "probe_evidence": probe_evidence,
+            "errors": errors,
+            "truth_probe_count": len(probe_evidence),
+            "started_at_ms": started_at_ms,
+            "finished_at_ms": finished_at_ms,
+        }
+
     async def _entry_account_truth_target_receipts(
         self,
         candidate,
@@ -5151,12 +5060,14 @@ class LiveRuntime:
         now_ms = wall_clock_now_ms()
         receipts: dict[str, dict[str, Any]] = {}
         required_venues = self._entry_account_truth_candidate_venues(candidate)
+        symbol = str(getattr(candidate, "symbol", "") or "").upper()
         timeout_count = 0
         timeout_ms = self._entry_account_truth_per_venue_timeout_ms()
         pending: list[tuple[Venue, asyncio.Task]] = []
         for venue in required_venues:
             venue_name = venue.value
-            cached = self._entry_account_truth_venue_receipts.get(venue_name)
+            receipt_key = f"{venue_name}:{symbol}"
+            cached = self._entry_account_truth_venue_receipts.get(receipt_key)
             if self._entry_account_truth_receipt_is_fresh_complete(
                 cached,
                 now_ms=now_ms,
@@ -5186,16 +5097,20 @@ class LiveRuntime:
                     "finished_at_ms": wall_clock_now_ms(),
                 }
                 continue
-            task = self._entry_account_truth_venue_tasks.get(venue_name)
+            task = self._entry_account_truth_venue_tasks.get(receipt_key)
             if task is None or task.done():
                 task = asyncio.create_task(
                     asyncio.wait_for(
-                        self._collect_entry_account_truth_for_venue(venue, adapter),
+                        self._collect_entry_candidate_truth_for_venue(
+                            venue,
+                            adapter,
+                            symbol,
+                        ),
                         timeout=timeout_ms / 1_000.0,
                     ),
-                    name=f"funding-entry-account-truth:{venue_name}",
+                    name=f"funding-entry-account-truth:{venue_name}:{symbol}",
                 )
-                self._entry_account_truth_venue_tasks[venue_name] = task
+                self._entry_account_truth_venue_tasks[receipt_key] = task
             pending.append((venue, task))
 
         if pending:
@@ -5205,12 +5120,13 @@ class LiveRuntime:
             )
             for (venue, _task), result in zip(pending, results):
                 venue_name = venue.value
+                receipt_key = f"{venue_name}:{symbol}"
                 if (
                     _task.done()
-                    and self._entry_account_truth_venue_tasks.get(venue_name)
+                    and self._entry_account_truth_venue_tasks.get(receipt_key)
                     is _task
                 ):
-                    self._entry_account_truth_venue_tasks.pop(venue_name, None)
+                    self._entry_account_truth_venue_tasks.pop(receipt_key, None)
                 if isinstance(result, asyncio.TimeoutError):
                     timeout_count += 1
                     receipt = {
@@ -5252,19 +5168,19 @@ class LiveRuntime:
                         receipt.get("finished_at_ms", 0) or 0
                     )
                     self._entry_account_truth_last_good_venue_receipts[
-                        venue_name
+                        receipt_key
                     ] = dict(receipt)
                 else:
                     last_good = (
                         self._entry_account_truth_last_good_venue_receipts.get(
-                            venue_name
+                            receipt_key
                         )
                     )
                     if isinstance(last_good, Mapping):
                         receipt["last_good_finished_at_ms"] = int(
                             last_good.get("finished_at_ms", 0) or 0
                         )
-                self._entry_account_truth_venue_receipts[venue_name] = dict(receipt)
+                self._entry_account_truth_venue_receipts[receipt_key] = dict(receipt)
                 receipts[venue_name] = receipt
         return receipts, timeout_count
 
@@ -5539,180 +5455,6 @@ class LiveRuntime:
             await self._entry_account_truth_dispatch_readiness(candidate)
         )
         return ready
-
-    async def _entry_preparation_for_tick(
-        self,
-        candidates: list,
-        *,
-        snapshot,
-    ) -> dict[str, Any] | None:
-        """Adopt or start one bounded background preparation generation."""
-        # Catalog and private account evidence are route prerequisites, not
-        # economic-revision evidence.  Funding/BBO updates can change a
-        # candidate revision every publication cycle; including revision or
-        # requested size here would permanently outrun a slower private API.
-        preparation_key = tuple(
-            sorted(
-                {
-                    self._candidate_pair_id(candidate)
-                    for candidate in candidates
-                }
-            )
-        )
-        if not candidates:
-            return {
-                "preparation_key": preparation_key,
-                "allowed_pair_ids": set(),
-                "tracked_pair_ids": set(),
-                "primary_pair_ids": set(),
-                "ready_at_ms": wall_clock_now_ms(),
-            }
-
-        def _adopt_completed_task(task: asyncio.Task) -> dict[str, Any] | None:
-            try:
-                result = task.result()
-            except Exception as exc:
-                self.journal.append(
-                    "runtime.entry_preparation_failed",
-                    {
-                        "error": f"{type(exc).__name__}: {exc}"[:240],
-                        "ts_ms": wall_clock_now_ms(),
-                    },
-                )
-                result = None
-            self._entry_preparation_task = None
-            if result is not None:
-                # Adopt the completed domain truth even if the candidate
-                # frontier changed while it was running. Its allowed pair set
-                # can safely serve the overlap while the next generation
-                # fills the delta.
-                self._entry_preparation_result = result
-                self._entry_preparation_ready_at_ms = int(
-                    result.get("ready_at_ms", 0) or 0
-                )
-            return result
-
-        def _cached_view() -> dict[str, Any] | None:
-            cached = self._entry_preparation_result
-            now_ms = wall_clock_now_ms()
-            if (
-                cached is None
-                or now_ms - self._entry_preparation_ready_at_ms > 5_000
-            ):
-                return None
-            cached_key = tuple(cached.get("preparation_key", ()))
-            # An exact generation with an empty allowed set is a completed,
-            # fail-closed admission decision, not a pending generation.
-            if cached_key == preparation_key:
-                return cached
-            # Catalog/account truth is scoped to pair identities, not to a
-            # ranked frontier generation.  Reuse the proven overlap while a
-            # background generation fills additions; exact-set equality here
-            # creates a permanent pending loop when frontier membership churns.
-            if set(cached_key).intersection(preparation_key):
-                return cached
-            return None
-
-        async def _materialize_current_view(
-            raw_result: dict[str, Any],
-        ) -> dict[str, Any]:
-            catalog_allowed = set(
-                raw_result.get("catalog_allowed_pair_ids", set())
-            )
-            current = [
-                candidate
-                for candidate in candidates
-                if self._candidate_pair_id(candidate) in catalog_allowed
-            ]
-            current = self._filter_candidates_by_entry_admission(
-                current,
-                now_ms=wall_clock_now_ms(),
-                stage="shortlist",
-            )
-            # The generation above populated the private balance cache.  This
-            # pass is therefore local/fast while correctly applying the
-            # current revision's size instead of a stale allowed-pair set.
-            current = await self._filter_candidates_by_entry_balance_admission(
-                current,
-                now_ms=wall_clock_now_ms(),
-                stage="complete_eligible_frontier",
-            )
-            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
-                current
-            )
-            view = dict(raw_result)
-            view["allowed_pair_ids"] = {
-                self._candidate_pair_id(candidate) for candidate in current
-            }
-            view["tracked_pair_ids"] = {
-                self._candidate_pair_id(candidate)
-                for candidate in tracked_candidates
-            }
-            view["primary_pair_ids"] = {
-                opportunity.pair_id
-                for opportunity in tracked
-                if opportunity.class_.value == "primary_tracked"
-            }
-            return view
-
-        task = self._entry_preparation_task
-        if task is not None and task.done():
-            _adopt_completed_task(task)
-
-        cached_view = _cached_view()
-        if cached_view is not None:
-            cached_key = tuple(
-                self._entry_preparation_result.get("preparation_key", ())
-            )
-            now_ms = wall_clock_now_ms()
-            if self._entry_preparation_task is None and (
-                cached_key != preparation_key
-                or now_ms - self._entry_preparation_ready_at_ms > 1_000
-            ):
-                self._entry_preparation_key = preparation_key
-                self._entry_preparation_task = asyncio.create_task(
-                    self._build_entry_preparation_generation(
-                        list(candidates),
-                        snapshot=snapshot,
-                        preparation_key=preparation_key,
-                    ),
-                    name="funding-entry-preparation-refresh",
-                )
-            return await _materialize_current_view(cached_view)
-        if self._entry_preparation_task is None:
-            self._entry_preparation_key = preparation_key
-            self._entry_preparation_task = asyncio.create_task(
-                self._build_entry_preparation_generation(
-                    list(candidates),
-                    snapshot=snapshot,
-                    preparation_key=preparation_key,
-                ),
-                name="funding-entry-preparation",
-            )
-        # If a different generation is already running, let it finish.  It
-        # may contain valid account/catalog truth for most of this frontier;
-        # cancel-and-restart here creates a permanent pending livelock under
-        # normal ranking churn.
-        task = self._entry_preparation_task
-        if task is not None:
-            done, _pending = await asyncio.wait({task}, timeout=0.010)
-            if task in done:
-                result = _adopt_completed_task(task)
-                if result is not None:
-                    result_key = tuple(result.get("preparation_key", ()))
-                    if result_key == preparation_key:
-                        return await _materialize_current_view(result)
-                    if self._entry_preparation_task is None:
-                        self._entry_preparation_key = preparation_key
-                        self._entry_preparation_task = asyncio.create_task(
-                            self._build_entry_preparation_generation(
-                                list(candidates),
-                                snapshot=snapshot,
-                                preparation_key=preparation_key,
-                            ),
-                            name="funding-entry-preparation-revision-refresh",
-                        )
-        return None
 
     @staticmethod
     def _entry_quote_truth_empty_stats():
@@ -6008,23 +5750,9 @@ class LiveRuntime:
     async def stop(self) -> None:
         """Graceful shutdown: stop loop, WS clients, adapter shutdown, export final state, flush journal."""
         self._running = False
-        prewarm_task = getattr(self, "_entry_evidence_prewarm_task", None)
-        if prewarm_task is not None and not prewarm_task.done():
-            prewarm_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await prewarm_task
-        self._entry_evidence_prewarm_task = None
-        in_process_entry_task = getattr(self, "_in_process_entry_refresh_task", None)
-        if in_process_entry_task is not None and not in_process_entry_task.done():
-            in_process_entry_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await in_process_entry_task
-        self._in_process_entry_refresh_task = None
         for task_name in (
-            "_entry_preparation_task",
             "_entry_account_truth_task",
             "_entry_account_truth_gate_task",
-            "_entry_data_plane_preparation_task",
             "_prescan_l2_sync_task",
         ):
             task = getattr(self, task_name, None)
@@ -6039,7 +5767,6 @@ class LiveRuntime:
                 with suppress(asyncio.CancelledError):
                     await task
         self._entry_account_truth_venue_tasks.clear()
-        self._entry_data_plane_preparation_pending = None
         shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + shutdown_timeout_s
@@ -6170,16 +5897,6 @@ class LiveRuntime:
             if callable(close):
                 close()
 
-        in_process_entry_source = getattr(self, "_in_process_entry_source", None)
-        close_in_process_entry_source = getattr(in_process_entry_source, "close", None)
-        if callable(close_in_process_entry_source):
-            await _await_shutdown_task(
-                "close_network",
-                "in_process_entry_source.close",
-                close_in_process_entry_source(),
-            )
-        self._in_process_entry_source = None
-
         # Stop WebSocket L2 streams (V1: abort workers before adapter shutdown)
         await _await_shutdown_task(
             "close_network",
@@ -6297,89 +6014,9 @@ class LiveRuntime:
                 "snapshot_freshness_candidate_count": 0,
                 "snapshot_freshness_all_candidate_count": len(candidates),
                 "snapshot_freshness_skipped_untracked_count": len(candidates),
-                "funding_basis_risk": {
-                    "model_version": "funding_basis_es_v2",
-                    "checkpoint_healthy": False,
-                    "source": "fresh_snapshot_required",
-                },
             }
         )
-        self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
-
-    @staticmethod
-    def _candidate_frontier_incomplete_reason(snapshot) -> str | None:
-        """Validate V7's complete eligible frontier, with V6 compatibility."""
-        diagnostics = dict(
-            getattr(snapshot, "candidate_build_diagnostics", {}) or {}
-        )
-        v7_fields = {
-            "eligible_frontier_complete",
-            "pair_decision_count",
-            "eligible_candidate_count",
-            "omitted_eligible_count",
-        }
-        if any(field in diagnostics for field in v7_fields):
-            if not all(field in diagnostics for field in v7_fields):
-                return "eligible_frontier_contract_invalid"
-
-            def _nonnegative_int(name: str) -> int | None:
-                value = diagnostics.get(name)
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    return None
-                return value
-
-            pair_decision_count = _nonnegative_int("pair_decision_count")
-            seed_pair_count = _nonnegative_int("seed_pair_count")
-            eligible_candidate_count = _nonnegative_int(
-                "eligible_candidate_count"
-            )
-            omitted_eligible_count = _nonnegative_int("omitted_eligible_count")
-            if (
-                pair_decision_count is None
-                or seed_pair_count is None
-                or eligible_candidate_count is None
-                or omitted_eligible_count is None
-            ):
-                return "eligible_frontier_contract_invalid"
-            if diagnostics.get("eligible_frontier_complete") is not True:
-                return "eligible_frontier_incomplete"
-            if pair_decision_count != seed_pair_count:
-                return "pair_decision_count_mismatch"
-            if omitted_eligible_count != 0:
-                return "eligible_candidates_omitted"
-            if eligible_candidate_count != len(
-                list(getattr(snapshot, "candidates", []) or [])
-            ):
-                return "eligible_candidate_count_mismatch"
-            return None
-
-        # V6 stays readable during rollout.  Its explicit incomplete marker
-        # keeps the old fail-closed meaning; fixtures with no marker remain
-        # compatible with the legacy reader.
-        if diagnostics.get("seed_frontier_complete") is False:
-            return "seed_frontier_incomplete"
-        return None
-
-    @staticmethod
-    def _complete_empty_frontier_ready(snapshot) -> bool:
-        """Accept only a producer-proven, fully decided zero-candidate frontier."""
-        if snapshot is None or list(getattr(snapshot, "candidates", []) or []):
-            return False
-        diagnostics = dict(
-            getattr(snapshot, "candidate_build_diagnostics", {}) or {}
-        )
-        return bool(
-            diagnostics.get("complete_empty_frontier_ready") is True
-            and diagnostics.get("diagnostics_only") is True
-            and diagnostics.get("source_data_ready") is True
-            and diagnostics.get("entry_frontier_ready") is True
-            and diagnostics.get("eligible_candidate_count") == 0
-            and diagnostics.get("omitted_eligible_count") == 0
-            and diagnostics.get("pair_decision_count")
-            == diagnostics.get("seed_pair_count")
-            and LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is None
-        )
 
     def _snapshot_target_only_retention_reason(
         self,
@@ -6425,189 +6062,239 @@ class LiveRuntime:
 
     @staticmethod
     def _unusable_snapshot_reason(snapshot) -> tuple[str, str]:
-        if LiveRuntime._candidate_frontier_incomplete_reason(snapshot) is not None:
-            return (
-                "candidate_frontier_incomplete",
-                "runtime.candidate_frontier_incomplete",
-            )
         return "snapshot_unavailable", "runtime.snapshot_unavailable"
 
-    def _uses_single_process_entry_input(self) -> bool:
-        mode = (
-            str(self.config.runtime.opportunity_input_mode or "").strip().lower()
-        )
-        if mode != "single_process_entry":
-            return False
-        # The production TOML must opt in explicitly.  Direct RuntimeConfig()
-        # construction remains a legacy sidecar-compatible test/integration
-        # fixture while exposing the production default for validation.
-        return bool(
-            getattr(self.config.runtime, "_opportunity_input_mode_configured", True)
-        )
-
-    def _in_process_entry_top_books(self) -> dict[tuple[str, str], object]:
-        """Read only the runtime-owned WebSocket BBO cache for entry input."""
-        cache = getattr(self, "ws_bbo_cache", None)
-        get_quote = getattr(cache, "get_quote", None)
-        if not callable(get_quote):
-            return {}
-        top_books: dict[tuple[str, str], object] = {}
-        symbols = {
-            str(symbol).strip().upper()
-            for symbol in self.config.symbols
-            if str(symbol).strip()
-        }
-        for venue_config in self.config.venues:
-            venue = str(getattr(venue_config, "venue", "") or "").strip().lower()
-            if not venue:
-                continue
-            for symbol in symbols:
-                quote = get_quote(venue, symbol)
-                if quote is not None:
-                    top_books[(venue, symbol)] = quote
-        return top_books
-
-    def _ensure_in_process_entry_source(self):
-        source = self._in_process_entry_source
-        if source is None:
-            from lightfee.sidecar.service import SidecarService
-
-            source = SidecarService(
-                self.config,
-                enable_spread_bbo=False,
-                in_process_entry=True,
-            )
-            self._in_process_entry_source = source
-        return source
-
-    async def _in_process_entry_snapshot_for_tick(self):
-        """Return the latest in-memory entry view without snapshot-file I/O."""
-        task = self._in_process_entry_refresh_task
-        if task is not None and task.done():
-            try:
-                self._in_process_entry_snapshot = task.result()
-            except Exception:
-                logger.exception("in-process funding entry refresh failed")
-            self._in_process_entry_refresh_task = None
-
-        # The metadata-only source never supplies executable prices. Keep the
-        # entire configured source universe warm before reading the cache.
-        await self.market_data_runtime._ensure_single_process_entry_bbo_source_active(
-            wall_clock_now_ms()
-        )
-
-        if self._in_process_entry_refresh_task is None:
-            source = self._ensure_in_process_entry_source()
-            self._in_process_entry_refresh_task = asyncio.create_task(
-                source.refresh_in_process_entry(self._in_process_entry_top_books()),
-                name="in-process-funding-entry-refresh",
-            )
-        return self._in_process_entry_snapshot
-
     def _entry_consumer_frontier(self, candidates):
-        """Preserve the complete V7/in-process opportunity frontier."""
-        # V7 sidecar snapshots and the in-process source both publish the full
-        # frontier.  Execution-stage windows limit costly work later; trimming
-        # here would strand valid lower-ranked candidates.
+        """Keep ranking intact until each candidate is checked in turn."""
         return list(candidates)
 
-    def _current_sidecar_snapshot_generation(self) -> tuple[object, bool | None]:
+    def _current_sidecar_snapshot_generation(self) -> tuple[object, bool]:
         path = self.config.runtime.sidecar_snapshot_path
-        entry_identity = funding_entry_snapshot_identity(path)
-        if entry_identity is not None:
-            self._sidecar_entry_installing_since_ms = 0
-            self._sidecar_entry_install_status = "ready"
-            self._sidecar_entry_invalid_reported = False
-            return ("funding-entry-v7", *entry_identity), True
-        # Payload and manifest are installed by two atomic renames. Between
-        # those renames the old manifest correctly refuses the new payload,
-        # but that transient state does not mean the entry data plane vanished.
-        # Keep the last verified in-memory generation; never fall back to the
-        # multi-megabyte audit file during a normal publication window.
-        if (
-            funding_entry_snapshot_path(path).exists()
-            or funding_entry_snapshot_manifest_path(path).exists()
-        ):
-            now_ms = wall_clock_now_ms()
-            if self._sidecar_entry_installing_since_ms <= 0:
-                self._sidecar_entry_installing_since_ms = now_ms
-            install_age_ms = max(
-                now_ms - self._sidecar_entry_installing_since_ms,
-                0,
-            )
-            invalid_after_ms = max(
-                min(
-                    int(self.config.runtime.sidecar_snapshot_max_age_ms or 0),
-                    10_000,
-                ),
-                2_000,
-            )
-            self._sidecar_entry_install_status = (
-                "invalid_after_install_timeout"
-                if install_age_ms >= invalid_after_ms
-                else "installing"
-            )
-            return (
-                "funding-entry-v7-installing",
-                self._sidecar_entry_install_status,
-            ), None
-        self._sidecar_entry_installing_since_ms = 0
-        self._sidecar_entry_install_status = ""
-        self._sidecar_entry_invalid_reported = False
-        if str(self.config.runtime.mode or "").lower() == "live":
-            # The full audit snapshot is not a live data plane.  Loading it
-            # can synchronously consume more than the complete market TTL and
-            # recreate the timestamp-after-now regression.  A missing V7
-            # generation is therefore a fast, explicit pending state.
-            return ("funding-entry-v7-missing",), None
         try:
             stat = Path(path).stat()
-            return ("legacy-full", stat.st_mtime_ns, stat.st_size), False
+            return ("sidecar", stat.st_mtime_ns, stat.st_size), True
         except OSError:
             return ("missing",), False
 
     async def _sidecar_snapshot_for_tick(self):
-        # V1 reads the current sidecar file for every scan, then falls back only
-        # when that read cannot provide a usable snapshot.  V7's loader already
-        # validates one immutable manifest/page generation before returning, so
-        # its result must be consumed directly instead of being compared with a
-        # later filesystem generation.  That comparison let a fast publisher
-        # permanently strand the runtime on an old cache.
-        _identity, use_entry_snapshot = self._current_sidecar_snapshot_generation()
-        if use_entry_snapshot is None:
-            return None
+        # V1 reads one atomically replaced sidecar snapshot on every scan.
+        # A missing or malformed file is handled by normal snapshot freshness;
+        # it never falls back to a second entry-specific data plane.
+        self._current_sidecar_snapshot_generation()
         path = self.config.runtime.sidecar_snapshot_path
-        loader = (
-            (lambda: load_funding_entry_snapshot(path))
-            if use_entry_snapshot
-            else (lambda: load_snapshot(path))
-        )
         try:
-            return await asyncio.to_thread(loader)
+            return await asyncio.to_thread(load_snapshot, path)
         except Exception:
-            logger.exception("funding entry snapshot tick read failed")
+            logger.exception("sidecar snapshot tick read failed")
             return None
+
+    async def _run_ranked_candidate_entry_flow(
+        self,
+        candidates: list,
+        *,
+        snapshot,
+        price_hints: dict[str, float],
+    ) -> None:
+        """Check ranked candidates one at a time without a frontier deadline."""
+        max_slots = max(self.config.strategy.max_concurrent_positions, 1)
+        remaining_slots = max(max_slots - len(self.state.open_positions), 0)
+        selection_blockers: Counter[str] = Counter()
+        admission_blockers: Counter[str] = Counter()
+        candidate_blockers: dict[str, str] = {}
+        checked = 0
+        dispatched = 0
+        last_reason = "no_tradeable_candidate"
+
+        for source_candidate in candidates:
+            if remaining_slots <= 0 or not can_enter_new_positions(self.state):
+                break
+            checked += 1
+            candidate_rows = await self._filter_candidates_supported_by_venue_catalog(
+                [source_candidate]
+            )
+            candidate_rows = self._filter_candidates_by_entry_admission(
+                candidate_rows,
+                now_ms=wall_clock_now_ms(),
+                stage="ranked_candidate",
+            )
+            candidate_rows = await self._filter_candidates_by_entry_balance_admission(
+                candidate_rows,
+                now_ms=wall_clock_now_ms(),
+                stage="ranked_candidate",
+            )
+            if not candidate_rows:
+                last_reason = "candidate_admission_blocked"
+                continue
+            candidate = candidate_rows[0]
+
+            now_ms = wall_clock_now_ms()
+            if self._entry_local_l2_effective_enabled():
+                tracked, _tracked_candidates = self._select_v1_entry_tracked_scope(
+                    [candidate]
+                )
+                await self._ensure_l2_active_for_candidates(
+                    [candidate],
+                    now_ms,
+                    tracked_opportunities=tracked,
+                )
+                await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
+
+            quote_task = asyncio.create_task(
+                self._entry_quote_revalidate_for_candidates(
+                    [candidate],
+                    snapshot=snapshot,
+                    now_ms=wall_clock_now_ms(),
+                    candidate_scope="ranked_candidate",
+                    activation_candidates=[candidate],
+                ),
+                name=f"entry-quote:{self._candidate_pair_id(candidate)}",
+            )
+            oi_task = asyncio.create_task(
+                self._refresh_entry_candidate_open_interest_evidence(
+                    [candidate],
+                    snapshot=snapshot,
+                    now_ms=wall_clock_now_ms(),
+                    candidate_scope="ranked_candidate",
+                ),
+                name=f"entry-oi:{self._candidate_pair_id(candidate)}",
+            )
+            quote_result, oi_result = await asyncio.gather(
+                quote_task,
+                oi_task,
+                return_exceptions=True,
+            )
+            if isinstance(quote_result, BaseException):
+                last_reason = "candidate_quote_revalidation_failed"
+                self.journal.append(
+                    "runtime.entry_candidate_revalidation_failed",
+                    {
+                        "pair_id": self._candidate_pair_id(candidate),
+                        "domain": "quote",
+                        "error": f"{type(quote_result).__name__}: {quote_result}"[:240],
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
+                continue
+            if isinstance(oi_result, BaseException):
+                last_reason = "candidate_open_interest_revalidation_failed"
+                self.journal.append(
+                    "runtime.entry_candidate_revalidation_failed",
+                    {
+                        "pair_id": self._candidate_pair_id(candidate),
+                        "domain": "open_interest",
+                        "error": f"{type(oi_result).__name__}: {oi_result}"[:240],
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
+                continue
+            quote_overlay, _quote_stats = quote_result
+            candidate_rows = self._filter_candidates_by_snapshot_freshness(
+                [candidate],
+                snapshot=snapshot,
+                now_ms=wall_clock_now_ms(),
+                metrics={},
+                ages={},
+                budgets={},
+                publish_intervals={},
+                entry_quote_truth_overlay=quote_overlay,
+                record_result=False,
+            )
+            if not candidate_rows:
+                last_reason = "candidate_market_evidence_unavailable"
+                continue
+
+            market_quotes = self._entry_quote_truth_market_quotes(
+                snapshot.quotes,
+                quote_overlay,
+            )
+            candidate_rows = self._reprice_entry_candidates_for_selection(
+                candidate_rows,
+                market_quotes=market_quotes,
+                now_ms=wall_clock_now_ms(),
+                record_result=False,
+            )
+            finalists = self._select_entry_candidates(
+                candidate_rows,
+                now_ms=wall_clock_now_ms(),
+                remaining_slots=1,
+                selection_blocker_counts=selection_blockers,
+                candidate_blockers=candidate_blockers,
+                market_quotes=market_quotes,
+                admission_blocker_counts=admission_blockers,
+            )
+            if not finalists:
+                last_reason = "candidate_final_selection_blocked"
+                continue
+            candidate = finalists[0]
+            account_ready, global_recovery_block, account_reason = (
+                await self._entry_account_truth_dispatch_readiness(candidate)
+            )
+            if not account_ready:
+                last_reason = account_reason or "candidate_account_truth_unavailable"
+                if global_recovery_block:
+                    break
+                continue
+
+            selected_at_ms = wall_clock_now_ms()
+            submit_deadline_ms = max(
+                int(self.config.strategy.selected_submit_deadline_ms or 0),
+                0,
+            )
+            selected_deadline = (
+                asyncio.get_running_loop().time() + submit_deadline_ms / 1_000.0
+                if submit_deadline_ms > 0
+                else None
+            )
+            pending_before = len(self.state.pending_entries)
+            dispatched_ok = await self._dispatch_entry(
+                candidate,
+                selected_at_ms,
+                price_hint=self._entry_quote_truth_price_hint(
+                    candidate,
+                    price_hints=price_hints,
+                    overlay=quote_overlay,
+                ),
+                selected_deadline_monotonic=selected_deadline,
+                selected_at_ms=selected_at_ms,
+            )
+            if dispatched_ok:
+                dispatched += 1
+                remaining_slots -= 1
+                self._invalidate_entry_account_truth_generation()
+                last_reason = "entries_dispatched"
+            else:
+                last_reason = "entry_final_revalidation_failed"
+            if len(self.state.pending_entries) > pending_before:
+                break
+
+        self.state.last_scan["tradeable_count"] = len(candidates)
+        self.state.last_scan["ranked_candidate_checked_count"] = checked
+        self.state.last_scan["selected_candidate_count"] = dispatched
+        self.state.last_scan["dispatched_candidate_count"] = dispatched
+        self.state.last_scan["remaining_slots"] = remaining_slots
+        if dispatched == 0:
+            self.state.last_scan["no_entry_reason"] = last_reason
+            self.journal.append(
+                "scan.no_entry_ranked_candidates",
+                {
+                    "reason": last_reason,
+                    "strategy_tradeable_count": len(candidates),
+                    "checked_candidate_count": checked,
+                    "selection_blockers": dict(selection_blockers),
+                    "admission_blockers": dict(admission_blockers),
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
 
     async def tick(self) -> None:
         """Full engine tick: consume snapshot, scan, supervise, manage positions."""
         now_ms = wall_clock_now_ms()
         self.state.last_tick_ms = now_ms
         self.state.tick_count += 1
-        self._entry_evidence_generation += 1
-        entry_evidence_generation = self._entry_evidence_generation
-        previous_prewarm = self._entry_evidence_prewarm_task
-        self._entry_evidence_prewarm_task = None
-        if previous_prewarm is not None and not previous_prewarm.done():
-            await self._cancel_entry_evidence_task(previous_prewarm)
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
 
-        # Single-process entry ownership keeps funding/BBO/account-fee evidence
-        # in memory.  Legacy coarse_sidecar keeps the V6 file handoff intact.
-        snapshot = (
-            await self._in_process_entry_snapshot_for_tick()
-            if self._uses_single_process_entry_input()
-            else await self._sidecar_snapshot_for_tick()
-        )
+        snapshot = await self._sidecar_snapshot_for_tick()
         # Every awaited stage invalidates an earlier wall-clock observation.
         # This prevents a slow initial load from making newly received REST
         # evidence appear to originate in the future.
@@ -6618,10 +6305,7 @@ class LiveRuntime:
 
         # V1: evaluate_snapshot_freshness — multi-state freshness evaluation
         def usable_entry_snapshot(candidate) -> bool:
-            return bool(
-                has_usable_funding_payload(candidate)
-                or self._complete_empty_frontier_ready(candidate)
-            )
+            return has_usable_funding_payload(candidate)
         freshness_decision = decide_snapshot_freshness(
             snapshot=snapshot,
             max_age_ms=max_age,
@@ -6636,14 +6320,7 @@ class LiveRuntime:
         targeted_retention_reason = ""
         if freshness == SnapshotFreshness.MISSING:
             self._live_scan_success_streak = 0
-            install_status = self._sidecar_entry_install_status
-            missing_reason = (
-                "funding_entry_snapshot_invalid_after_install_timeout"
-                if install_status == "invalid_after_install_timeout"
-                else "funding_entry_snapshot_installing"
-                if install_status == "installing"
-                else "snapshot_missing"
-            )
+            missing_reason = "snapshot_missing"
             self._finalize_unusable_snapshot_scan(
                 snapshot=snapshot,
                 now_ms=now_ms,
@@ -6652,21 +6329,12 @@ class LiveRuntime:
             )
             payload = {
                 "ts_ms": now_ms,
-                "blocking_stage": "entry_snapshot_install",
+                "blocking_stage": "sidecar_snapshot",
                 "blocking_domain": "snapshot_publication",
-                "blocking_status": install_status or "missing",
+                "blocking_status": "missing",
                 "blocking_reason": missing_reason,
             }
             self.journal.append("runtime.snapshot_missing", payload)
-            if (
-                install_status == "invalid_after_install_timeout"
-                and not self._sidecar_entry_invalid_reported
-            ):
-                self._sidecar_entry_invalid_reported = True
-                self.journal.append(
-                    "runtime.funding_entry_snapshot_install_invalid",
-                    payload,
-                )
             return
         if freshness == SnapshotFreshness.STALE:
             targeted_retention_reason = (
@@ -6698,49 +6366,6 @@ class LiveRuntime:
                     ),
                 )
                 return
-        frontier_incomplete_reason = self._candidate_frontier_incomplete_reason(
-            snapshot
-        )
-        if frontier_incomplete_reason is not None:
-            self._live_scan_success_streak = 0
-            self._finalize_unusable_snapshot_scan(
-                snapshot=snapshot,
-                now_ms=now_ms,
-                freshness="unavailable",
-                no_entry_reason="candidate_frontier_incomplete",
-            )
-            payload = self._snapshot_health_payload(
-                snapshot=snapshot,
-                now_ms=now_ms,
-                max_age_ms=max_age,
-                freshness="unavailable",
-            )
-            diagnostics = dict(
-                getattr(snapshot, "candidate_build_diagnostics", {}) or {}
-            )
-            payload.update(
-                {
-                    "frontier_contract": (
-                        "eligible_frontier_v7"
-                        if any(
-                            field in diagnostics
-                            for field in (
-                                "eligible_frontier_complete",
-                                "pair_decision_count",
-                                "eligible_candidate_count",
-                                "omitted_eligible_count",
-                            )
-                        )
-                        else "seed_frontier_v6"
-                    ),
-                    "frontier_contract_reason": frontier_incomplete_reason,
-                }
-            )
-            self.journal.append(
-                "runtime.candidate_frontier_incomplete",
-                payload,
-            )
-            return
         if freshness == SnapshotFreshness.DEGRADED:
             # Some venues degraded but can still trade on healthy ones
             if not usable_entry_snapshot(snapshot):
@@ -6877,37 +6502,6 @@ class LiveRuntime:
         self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = (
             self.state.last_scan["snapshot_freshness_all_candidate_count"]
         )
-        if freshness == SnapshotFreshness.FRESH:
-            try:
-                self.state.last_scan["funding_basis_risk"] = (
-                    self.funding_risk_runtime.observe_fresh_snapshot(
-                        snapshot,
-                        now_ms=now_ms,
-                    )
-                )
-            except Exception as exc:
-                self.funding_risk_runtime.mark_unhealthy(type(exc).__name__)
-                # Dynamic ES is strictly an entry admission input.  A local
-                # checkpoint/model failure must not stop V1 close, recovery or
-                # exchange-truth work, but it leaves every new live entry
-                # fail-closed through the runtime's unhealthy risk state.
-                self.state.last_scan["funding_basis_risk"] = {
-                    "model_version": "funding_basis_es_v2",
-                    "checkpoint_healthy": False,
-                    "error": type(exc).__name__,
-                    "source": "fresh_sidecar_snapshot",
-                }
-                self.journal.append(
-                    "runtime.funding_basis_risk_observation_error",
-                    {"error": type(exc).__name__, "ts_ms": now_ms},
-                )
-        else:
-            self.funding_risk_runtime.mark_unhealthy("fresh_snapshot_required")
-            self.state.last_scan["funding_basis_risk"] = {
-                "model_version": "funding_basis_es_v2",
-                "checkpoint_healthy": False,
-                "source": "fresh_snapshot_required",
-            }
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             self.journal.append(
@@ -7078,1363 +6672,12 @@ class LiveRuntime:
                     "ts_ms": now_ms,
                 },
             )
-            entry_pipeline_loop = asyncio.get_running_loop()
-            entry_pipeline_started_monotonic = entry_pipeline_loop.time()
-            entry_pipeline_hard_deadline = (
-                entry_pipeline_started_monotonic
-                + self._ENTRY_EVIDENCE_PIPELINE_DEADLINE_S
-            )
-
-            def _entry_pipeline_remaining_s() -> float:
-                return max(
-                    entry_pipeline_hard_deadline - entry_pipeline_loop.time(),
-                    0.0,
-                )
-
-            async def _entry_pipeline_await(awaitable, *, stage: str):
-                def _record_deadline_exceeded() -> None:
-                    self.state.last_scan["no_entry_reason"] = (
-                        "entry_evidence_deadline_exceeded"
-                    )
-                    self.state.last_scan["entry_evidence_deadline_stage"] = stage
-                    self.journal.append(
-                        "runtime.entry_evidence_deadline_exceeded",
-                        {
-                            "stage": stage,
-                            "blocking_stage": stage,
-                            "blocking_domain": "entry_evidence",
-                            "blocking_status": "timeout",
-                            "blocking_reason": "entry_evidence_deadline_exceeded",
-                            "elapsed_ms": max(
-                                int(
-                                    (
-                                        entry_pipeline_loop.time()
-                                        - entry_pipeline_started_monotonic
-                                    )
-                                    * 1_000
-                                ),
-                                0,
-                            ),
-                            "ts_ms": wall_clock_now_ms(),
-                        },
-                    )
-
-                task = asyncio.ensure_future(awaitable)
-                if task.done():
-                    return task.result()
-                remaining_s = _entry_pipeline_remaining_s()
-                if remaining_s <= 0.0:
-                    await self._cancel_entry_evidence_task(task)
-                    _record_deadline_exceeded()
-                    raise asyncio.TimeoutError(stage)
-                try:
-                    done, _pending = await asyncio.wait(
-                        {task},
-                        timeout=remaining_s,
-                    )
-                except asyncio.CancelledError:
-                    await self._cancel_entry_evidence_task(task)
-                    raise
-                if task in done:
-                    try:
-                        return task.result()
-                    except asyncio.TimeoutError:
-                        # Preserve the prior stage-level timeout semantics for
-                        # an awaitable that raises its own TimeoutError.
-                        _record_deadline_exceeded()
-                        raise
-                await self._cancel_entry_evidence_task(task)
-                _record_deadline_exceeded()
-                raise asyncio.TimeoutError(stage)
-
-            # Bind legacy-compatible candidates to their economic revision
-            # before evidence acquisition.  The funding-epoch identity is an
-            # audit grouping key only: every current revision must receive its
-            # own quote/OI/final-reprice decision before it can be rejected.
-            for candidate in tradeable:
-                self._bind_entry_candidate_revision_id(candidate)
-                self._emit_sidecar_canary_clamp_if_needed(
-                    candidate,
-                    now_ms=wall_clock_now_ms(),
-                )
-                self._bind_entry_opportunity_lease_id(candidate)
-            preparation = await self._entry_preparation_for_tick(
+            await self._run_ranked_candidate_entry_flow(
                 tradeable,
                 snapshot=snapshot,
+                price_hints=price_hints,
             )
-            if preparation is None:
-                self.state.last_scan["no_entry_reason"] = "entry_preparation_pending"
-                self.state.last_scan["blocking_stage"] = "entry_preparation"
-                self.state.last_scan["blocking_domain"] = "safety_prerequisites"
-                self.state.last_scan["blocking_status"] = "pending"
-                self.state.last_scan["blocking_reason"] = (
-                    "entry_preparation_pending"
-                )
-                self.journal.append(
-                    "runtime.entry_preparation_pending",
-                    {
-                        "candidate_count": len(tradeable),
-                        "blocking_stage": "entry_preparation",
-                        "blocking_domain": "safety_prerequisites",
-                        "blocking_status": "pending",
-                        "blocking_reason": "entry_preparation_pending",
-                        "ts_ms": wall_clock_now_ms(),
-                    },
-                )
-                return
-            allowed_pair_ids = set(preparation.get("allowed_pair_ids", set()))
-            tradeable = [
-                candidate
-                for candidate in tradeable
-                if self._candidate_pair_id(candidate) in allowed_pair_ids
-            ]
-            self.state.last_scan["catalog_admission_balance_passed_count"] = len(
-                tradeable
-            )
-            if self.config.runtime.mode == "live" and tradeable:
-                await self._entry_account_truth_ready_for_tick()
-            # The whole published frontier remains available to the execution
-            # queue.  V1-compatible failed-route suppression is persisted in
-            # the selector, so the next ordinary tick promotes the next page
-            # without recursively re-entering tick() or reusing stale data.
-            l2_tracking_tradeable = list(tradeable)
-            entry_execution_queue_candidates = self._ordered_entry_execution_queue(
-                l2_tracking_tradeable
-            )
-            self._schedule_entry_data_plane_preparation(
-                entry_execution_queue_candidates
-            )
-            tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
-                entry_execution_queue_candidates
-            )
-            # Tracking identity belongs to the current ranked frontier even
-            # while its background activation generation is still missing a
-            # book.  Readiness remains fail-closed on actual book evidence;
-            # do not erase the primary identity merely because it is waiting.
-            self._tracked_primary_pair_ids = {
-                opportunity.pair_id
-                for opportunity in tracked
-                if opportunity.class_.value == "primary_tracked"
-            }
-            now_ms = wall_clock_now_ms()
-            self.state.last_scan["eligible_frontier_balance_passed_count"] = len(
-                l2_tracking_tradeable
-            )
-            # Discovery stays complete: ``l2_tracking_tradeable`` is the
-            # full V7 eligible frontier and remains the source of every later
-            # queue allocation.  Only network revalidation is bounded to the
-            # active primary+shadow window; optional prewarm is best-effort
-            # background work and never determines opportunity discovery.
-            prewarm_extra_candidates = self._select_entry_prewarm_extra_candidates(
-                l2_tracking_tradeable,
-                tracked_candidates,
-            )
-            oi_prewarm_candidates = list(l2_tracking_tradeable)
-            self.state.last_scan["complete_eligible_frontier_count"] = len(
-                l2_tracking_tradeable
-            )
-            self.state.last_scan["active_execution_queue_candidate_count"] = len(
-                tracked_candidates
-            )
-            self.state.last_scan["deferred_execution_queue_candidate_count"] = max(
-                len(l2_tracking_tradeable) - len(tracked_candidates),
-                0,
-            )
-            self.state.last_scan["entry_execution_queue_attempted_count"] = len(
-                self._entry_execution_queue_attempted_pair_ids
-            )
-            self.state.last_scan["quote_prewarm_extra_candidate_count"] = len(
-                prewarm_extra_candidates
-            )
-            self.state.last_scan["quote_prewarm_extra_target_count"] = 0
-            self.state.last_scan["quote_prewarm_extra_resolved_count"] = 0
-            self.state.last_scan["quote_prewarm_extra_failed_count"] = 0
-            self.state.last_scan["oi_prewarm_frontier_candidate_count"] = len(
-                oi_prewarm_candidates
-            )
-            entry_quote_keys: set[tuple[str, str]] = set()
-            for candidate in tracked_candidates:
-                symbol = str(getattr(candidate, "symbol", "") or "").upper()
-                if not symbol:
-                    continue
-                for venue_attr in ("long_venue", "short_venue"):
-                    venue = str(getattr(candidate, venue_attr, "") or "").lower()
-                    if venue:
-                        entry_quote_keys.add((venue, symbol))
-            snapshot_freshness_metrics: dict = {}
-            snapshot_freshness_ages: dict = {}
-            snapshot_freshness_budgets: dict = {}
-            snapshot_freshness_publish_intervals: dict = {}
-            snapshot_freshness_status: dict = {}
-            if tracked_candidates:
-                (
-                    snapshot_freshness_metrics,
-                    snapshot_freshness_ages,
-                    snapshot_freshness_budgets,
-                    snapshot_freshness_publish_intervals,
-                    snapshot_freshness_status,
-                ) = self._snapshot_freshness_observability(
-                    snapshot=snapshot,
-                    candidates=tracked_candidates,
-                    now_ms=now_ms,
-                )
-                self.state.last_scan["snapshot_freshness_metrics"] = (
-                    snapshot_freshness_metrics
-                )
-                self.state.last_scan["snapshot_freshness_observed_age_ms"] = (
-                    snapshot_freshness_ages
-                )
-                self.state.last_scan["snapshot_freshness_budget_ms"] = (
-                    snapshot_freshness_budgets
-                )
-                self.state.last_scan["snapshot_freshness_publish_interval_ms"] = (
-                    snapshot_freshness_publish_intervals
-                )
-                self.state.last_scan["snapshot_freshness_status"] = (
-                    snapshot_freshness_status
-                )
-                self.state.last_scan["snapshot_freshness_candidate_scope"] = (
-                    "active_execution_queue"
-                )
-                self.state.last_scan["snapshot_freshness_candidate_count"] = len(
-                    tracked_candidates
-                )
-                self.state.last_scan["snapshot_freshness_all_candidate_count"] = len(
-                    l2_tracking_tradeable
-                )
-                self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = max(
-                    len(l2_tracking_tradeable) - len(tracked_candidates),
-                    0,
-                )
-            entry_bbo_prewarm_attempted = (
-                self._entry_effective_readiness_provider_uses_ws_bbo()
-                and bool(l2_tracking_tradeable)
-            )
-            skipped_untracked_quote_count = 0
-            prewarm_extra_quote_target_count = 0
-            if entry_bbo_prewarm_attempted:
-                all_quote_targets = self._entry_quote_revalidate_targets(
-                    l2_tracking_tradeable,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                )
-                tracked_quote_targets = self._entry_quote_revalidate_targets(
-                    tracked_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                )
-                prewarm_extra_quote_targets = self._entry_quote_revalidate_targets(
-                    prewarm_extra_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                )
-                prewarm_extra_quote_target_count = len(prewarm_extra_quote_targets)
-                skipped_untracked_quote_count = max(
-                    len(all_quote_targets)
-                    - len(tracked_quote_targets)
-                    - prewarm_extra_quote_target_count,
-                    0,
-                )
-            entry_freshness_filter_candidates = tracked_candidates
-            entry_freshness_filter_scope = "active_execution_queue"
-            self.state.last_scan["snapshot_freshness_filter_candidate_scope"] = (
-                entry_freshness_filter_scope
-            )
-            self.state.last_scan["snapshot_freshness_filter_candidate_count"] = len(
-                entry_freshness_filter_candidates
-            )
-            self.state.last_scan["snapshot_freshness_filter_all_candidate_count"] = len(
-                l2_tracking_tradeable
-            )
-            self.state.last_scan[
-                "snapshot_freshness_filter_skipped_untracked_count"
-            ] = max(
-                len(l2_tracking_tradeable) - len(entry_freshness_filter_candidates),
-                0,
-            )
-
-            now_ms = wall_clock_now_ms()
-            if entry_freshness_filter_candidates:
-                if hasattr(snapshot, "funding_lifecycle") and snapshot.funding_lifecycle:
-                    funding_warmup_required = getattr(
-                        self.config.strategy,
-                        "funding_warmup_min_coverage_ratio",
-                        0.5,
-                    )
-                    total_count = sum(
-                        fl.symbol_count for fl in snapshot.funding_lifecycle
-                    )
-                    usable_count = sum(
-                        fl.coverage_usable for fl in snapshot.funding_lifecycle
-                    )
-                    venue_count = len(snapshot.funding_lifecycle)
-                    funding_coverage_ratio = (
-                        usable_count / total_count if total_count > 0 else 0.0
-                    )
-                    funding_warmup_ok = (
-                        venue_count >= 1
-                        and total_count > 0
-                        and funding_coverage_ratio >= funding_warmup_required
-                    )
-                    self.state.last_scan["funding_warmup_coverage_ratio"] = (
-                        funding_coverage_ratio
-                    )
-                    self.state.last_scan["funding_warmup_ok"] = funding_warmup_ok
-                    if not funding_warmup_ok:
-                        self.journal.append(
-                            "runtime.funding_warmup_insufficient",
-                            {
-                                "funding_venue_count": venue_count,
-                                "funding_symbol_count": total_count,
-                                "funding_usable_symbol_count": usable_count,
-                                "funding_coverage_ratio": funding_coverage_ratio,
-                                "warmup_ratio_required": funding_warmup_required,
-                                "blocking": False,
-                                "admission_scope": "per_candidate_funding_proof",
-                                "ts_ms": now_ms,
-                            },
-                        )
-
-            # The 3s hard budget starts at evidence revalidation. Catalog,
-            # private balance, recovery safety and data-plane activation have
-            # independent freshness contracts and must not consume it.
-            entry_pipeline_started_monotonic = entry_pipeline_loop.time()
-            entry_pipeline_hard_deadline = (
-                entry_pipeline_started_monotonic
-                + self._ENTRY_EVIDENCE_PIPELINE_DEADLINE_S
-            )
-            evidence_coordinator: dict[str, Any] = {
-                "candidate_count": len(entry_freshness_filter_candidates),
-                "quote": {},
-                "open_interest": {},
-                "economics": {},
-                "selected_index": None,
-                "selection_ready_event": asyncio.Event(),
-            }
-
-            # Preserve exact leaf diagnostics from the published evidence
-            # before network revalidation begins.  A failed refresh must not
-            # erase the original stale/invalid quote or OI reason merely
-            # because no row reached the final ready frontier.  When refresh
-            # repairs the row, the authoritative pass below replaces this
-            # preflight result with the fresh truth.
-            self._filter_candidates_by_snapshot_freshness(
-                entry_freshness_filter_candidates,
-                snapshot=snapshot,
-                now_ms=wall_clock_now_ms(),
-                metrics=snapshot_freshness_metrics,
-                ages=snapshot_freshness_ages,
-                budgets=snapshot_freshness_budgets,
-                publish_intervals=snapshot_freshness_publish_intervals,
-                entry_quote_truth_overlay={},
-                emit_events=False,
-                mutate_liquidity_state=False,
-            )
-            preflight_snapshot_blockers = Counter(
-                self._last_snapshot_freshness_filter_blockers
-            )
-
-            def _incremental_candidate_is_executable(
-                candidate_index: int,
-            ) -> bool | str:
-                """Evaluate one evidence-complete row without mutating scan state."""
-                if not 0 <= candidate_index < len(entry_freshness_filter_candidates):
-                    return False
-                candidate = entry_freshness_filter_candidates[candidate_index]
-                overlay = evidence_coordinator.get("quote_overlay", {})
-                if not isinstance(overlay, dict):
-                    return False
-                check_now_ms = wall_clock_now_ms()
-                local_metrics: dict = {}
-                local_ages: dict = {}
-                local_budgets: dict = {}
-                local_intervals: dict = {}
-                viable = self._filter_candidates_by_snapshot_freshness(
-                    [candidate],
-                    snapshot=snapshot,
-                    now_ms=check_now_ms,
-                    metrics=local_metrics,
-                    ages=local_ages,
-                    budgets=local_budgets,
-                    publish_intervals=local_intervals,
-                    entry_quote_truth_overlay=overlay,
-                    record_result=False,
-                )
-                market_quotes = self._entry_quote_truth_market_quotes(
-                    snapshot.quotes,
-                    overlay,
-                )
-                viable = self._reprice_entry_candidates_for_selection(
-                    viable,
-                    market_quotes=market_quotes,
-                    now_ms=wall_clock_now_ms(),
-                    record_result=False,
-                )
-                if not viable:
-                    return False
-                first_funding_timestamp_ms = int(
-                    getattr(viable[0], "first_funding_timestamp_ms", 0) or 0
-                )
-                if (
-                    first_funding_timestamp_ms > 0
-                    and self._entry_finalization_window_blocker(
-                        first_funding_timestamp_ms,
-                        check_now_ms,
-                    )
-                    is not None
-                ):
-                    # A ranked row outside the finalization window is terminal
-                    # for this tick.  Let the evidence cursor advance instead
-                    # of allowing it to hold back a lower finalization-ready
-                    # opportunity.  Local-L2/capacity and global safety gates
-                    # remain later fail-closed checks.
-                    return "selection_blocked"
-                if viable:
-                    evidence_coordinator["selected_pair_id"] = (
-                        self._candidate_pair_id(viable[0])
-                    )
-                    evidence_coordinator["selected_at_ms"] = wall_clock_now_ms()
-                return bool(viable)
-
-            evidence_coordinator["candidate_ready_validator"] = (
-                _incremental_candidate_is_executable
-            )
-            oi_refresh_task = asyncio.create_task(
-                self._refresh_entry_candidate_open_interest_evidence(
-                    entry_freshness_filter_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                    evidence_role="entry_execution",
-                    candidate_scope=entry_freshness_filter_scope,
-                    evidence_coordinator=evidence_coordinator,
-                )
-            )
-            async def _empty_quote_refresh():
-                return {}, self._entry_quote_truth_empty_stats()
-
-            async def _empty_oi_refresh():
-                return self._entry_open_interest_empty_stats()
-
-            if entry_freshness_filter_candidates:
-                quote_refresh_awaitable = (
-                    self._entry_quote_revalidate_for_candidates(
-                        entry_freshness_filter_candidates,
-                        snapshot=snapshot,
-                        now_ms=now_ms,
-                        candidate_scope=entry_freshness_filter_scope,
-                        skipped_untracked_count=skipped_untracked_quote_count,
-                        evidence_role="entry_execution",
-                        # The completed preparation generation already
-                        # activated the active primary+shadow data plane.
-                        # The full frontier remains queued for later backfill.
-                        activation_candidates=[],
-                        evidence_coordinator=evidence_coordinator,
-                    )
-                )
-            else:
-                quote_refresh_awaitable = _empty_quote_refresh()
-            quote_refresh_task = asyncio.create_task(
-                quote_refresh_awaitable,
-                name="funding-entry-quote-revalidation",
-            )
-            selection_ready_wait_task = asyncio.create_task(
-                evidence_coordinator["selection_ready_event"].wait(),
-                name="funding-entry-selection-ready",
-            )
-            evidence_tasks = {quote_refresh_task, oi_refresh_task}
-            try:
-                # Both domains progress concurrently.  Enter selection as
-                # soon as the highest fully-resolved executable row signals;
-                # lower rows continue within the shared deadline and remain
-                # available if the first dispatch fails.
-                while not evidence_coordinator["selection_ready_event"].is_set():
-                    if all(task.done() for task in evidence_tasks):
-                        break
-                    remaining_s = _entry_pipeline_remaining_s()
-                    if remaining_s <= 0.0:
-                        break
-                    pending_wait = {
-                        task for task in evidence_tasks if not task.done()
-                    }
-                    pending_wait.add(selection_ready_wait_task)
-                    await asyncio.wait(
-                        pending_wait,
-                        timeout=remaining_s,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if selection_ready_wait_task.done():
-                        break
-                if (
-                    not evidence_coordinator["selection_ready_event"].is_set()
-                    and any(not task.done() for task in evidence_tasks)
-                    and _entry_pipeline_remaining_s() <= 0.0
-                ):
-                    ready_at_deadline = any(
-                        state == "ready"
-                        for state in evidence_coordinator.get(
-                            "economics", {}
-                        ).values()
-                    )
-                    for task in (*evidence_tasks, selection_ready_wait_task):
-                        await self._cancel_entry_evidence_task(task)
-                    if not ready_at_deadline:
-                        self.state.last_scan["no_entry_reason"] = (
-                            "entry_evidence_deadline_exceeded"
-                        )
-                        self.state.last_scan["entry_evidence_deadline_stage"] = (
-                            "quote_or_open_interest_revalidation"
-                        )
-                        self.journal.append(
-                            "runtime.entry_evidence_deadline_exceeded",
-                            {
-                                "stage": "quote_or_open_interest_revalidation",
-                                "blocking_stage": (
-                                    "quote_or_open_interest_revalidation"
-                                ),
-                                "blocking_domain": "entry_evidence",
-                                "blocking_status": "timeout",
-                                "blocking_reason": (
-                                    "entry_evidence_deadline_exceeded"
-                                ),
-                                "ts_ms": wall_clock_now_ms(),
-                            },
-                        )
-                        return
-                entry_quote_truth_overlay = evidence_coordinator.get(
-                    "quote_overlay", {}
-                )
-                if not isinstance(entry_quote_truth_overlay, dict):
-                    entry_quote_truth_overlay = {}
-                if quote_refresh_task.done() and not quote_refresh_task.cancelled():
-                    (
-                        completed_overlay,
-                        _entry_quote_truth_stats,
-                    ) = quote_refresh_task.result()
-                    entry_quote_truth_overlay = completed_overlay
-                else:
-                    _entry_quote_truth_stats = self._entry_quote_truth_empty_stats()
-            except BaseException:
-                for task in (*evidence_tasks, selection_ready_wait_task):
-                    await self._cancel_entry_evidence_task(task)
-                raise
-            finally:
-                if selection_ready_wait_task.done():
-                    try:
-                        selection_ready_wait_task.result()
-                    except asyncio.CancelledError:
-                        pass
-
-            def _sync_primary_backfill_failures_from_evidence() -> bool:
-                quote_states = evidence_coordinator.get("quote", {})
-                oi_states = evidence_coordinator.get("open_interest", {})
-                economics_states = evidence_coordinator.get("economics", {})
-                changed = False
-                failure_now_ms = wall_clock_now_ms()
-                for index, candidate in enumerate(
-                    entry_freshness_filter_candidates
-                ):
-                    economics_state = economics_states.get(index)
-                    quote_state = quote_states.get(index)
-                    oi_state = oi_states.get(index)
-                    if economics_state == "ready":
-                        changed = (
-                            self._clear_entry_primary_backfill_failure(
-                                candidate,
-                                expected_reasons={
-                                    "entry_quote_revalidation_failed",
-                                    "entry_open_interest_revalidation_failed",
-                                    "entry_economics_revalidation_failed",
-                                },
-                            )
-                            or changed
-                        )
-                        continue
-                    pair_id = self._candidate_pair_id(candidate)
-                    if pair_id not in self._tracked_primary_pair_ids:
-                        continue
-                    if self._local_l2_effective_enabled():
-                        session = self.entry_l2_sessions.sessions.get(pair_id)
-                        primary_l2_ready = (
-                            session is not None
-                            and session.both_legs_ready(
-                                failure_now_ms,
-                                self._entry_local_l2_stale_after_ms(),
-                            )
-                        )
-                        if not primary_l2_ready:
-                            # Bootstrap/promotion owns this case.  Public
-                            # evidence cannot evict a primary until its scarce
-                            # L2 resource is actually ready; otherwise every
-                            # first activation churns before books can arm.
-                            continue
-                    if quote_state == "failed":
-                        changed = self._record_entry_primary_backfill_failure(
-                            candidate,
-                            reason="entry_quote_revalidation_failed",
-                            now_ms=failure_now_ms,
-                        ) or changed
-                    elif oi_state == "failed":
-                        changed = self._record_entry_primary_backfill_failure(
-                            candidate,
-                            reason="entry_open_interest_revalidation_failed",
-                            now_ms=failure_now_ms,
-                        ) or changed
-                    elif economics_state == "failed":
-                        changed = self._record_entry_primary_backfill_failure(
-                            candidate,
-                            reason="entry_economics_revalidation_failed",
-                            now_ms=failure_now_ms,
-                        ) or changed
-                if changed and self._local_l2_effective_enabled():
-                    self._schedule_entry_data_plane_preparation(
-                        self._ordered_entry_execution_queue(
-                            l2_tracking_tradeable
-                        )
-                    )
-                return changed
-
-            async def _settle_entry_evidence_tasks(*, wait: bool) -> None:
-                pending = {task for task in evidence_tasks if not task.done()}
-                if wait and pending and _entry_pipeline_remaining_s() > 0.0:
-                    _done, pending = await asyncio.wait(
-                        pending,
-                        timeout=_entry_pipeline_remaining_s(),
-                    )
-                for task in pending:
-                    await self._cancel_entry_evidence_task(task)
-                for task in evidence_tasks:
-                    if not task.done():
-                        continue
-                    try:
-                        task.result()
-                    except asyncio.CancelledError:
-                        pass
-                _sync_primary_backfill_failures_from_evidence()
-                if not selection_ready_wait_task.done():
-                    await self._cancel_entry_evidence_task(
-                        selection_ready_wait_task
-                    )
-            emit_stale_quote_diagnostics(
-                entry_quote_keys,
-                resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
-            )
-            for quote in entry_quote_truth_overlay.values():
-                symbol = str(getattr(quote, "symbol", "") or "").upper()
-                bid = float(getattr(quote, "bid", 0.0) or 0.0)
-                ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                if symbol and bid > 0.0 and ask > bid:
-                    price_hints[symbol] = (bid + ask) / 2.0
-            now_ms = wall_clock_now_ms()
-            if self._running:
-                async def _prewarm_latest_generation() -> None:
-                    try:
-                        if entry_evidence_generation != self._entry_evidence_generation:
-                            return
-                        if entry_bbo_prewarm_attempted and prewarm_extra_candidates:
-                            await self._entry_quote_revalidate_for_candidates(
-                                prewarm_extra_candidates,
-                                snapshot=snapshot,
-                                now_ms=wall_clock_now_ms(),
-                                candidate_scope="prewarm_extra",
-                                skipped_untracked_count=skipped_untracked_quote_count,
-                                evidence_role="prewarm_only",
-                                activation_candidates=[
-                                    *tracked_candidates,
-                                    *prewarm_extra_candidates,
-                                ],
-                            )
-                        if entry_evidence_generation != self._entry_evidence_generation:
-                            return
-                        await self._refresh_entry_candidate_open_interest_evidence(
-                            oi_prewarm_candidates,
-                            snapshot=snapshot,
-                            now_ms=wall_clock_now_ms(),
-                            evidence_role="prewarm_only",
-                            candidate_scope="l2_tracking_tradeable",
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        try:
-                            self.journal.append(
-                                "runtime.entry_evidence_prewarm_failed",
-                                {
-                                    "error": f"{type(exc).__name__}: {exc}"[:240],
-                                    "candidate_count": len(oi_prewarm_candidates),
-                                    "ts_ms": wall_clock_now_ms(),
-                                },
-                            )
-                        except RuntimeError:
-                            # A test/one-shot owner can close the journal while
-                            # a canceled prewarm is unwinding. Production stop
-                            # awaits/cancels this task before journal shutdown.
-                            pass
-
-                if entry_evidence_generation == self._entry_evidence_generation:
-                    self._entry_evidence_prewarm_generation = (
-                        entry_evidence_generation
-                    )
-                    self._entry_evidence_prewarm_task = asyncio.create_task(
-                        _prewarm_latest_generation()
-                    )
-            _sync_primary_backfill_failures_from_evidence()
-
-            def _evidence_ready_frontier() -> list:
-                quote_states = evidence_coordinator.get("quote", {})
-                oi_states = evidence_coordinator.get("open_interest", {})
-                economics_states = evidence_coordinator.get("economics", {})
-                return [
-                    candidate
-                    for index, candidate in enumerate(
-                        entry_freshness_filter_candidates
-                    )
-                    if quote_states.get(index) == "ready"
-                    and oi_states.get(index) == "ready"
-                    and economics_states.get(index) == "ready"
-                ]
-
-            # Remember whether the first authoritative frontier already saw
-            # both evidence domains fully settled.  The same-tick fallback
-            # may need to rebuild once for rows that completed after early
-            # selection, but a fully settled frontier can be reused as-is.
-            # Re-running freshness/repricing for every rejected finalist is
-            # both noisy and quadratic in the eligible frontier size.
-            initial_evidence_frontier_complete = all(
-                task.done() for task in evidence_tasks
-            )
-            evidence_ready_frontier = _evidence_ready_frontier()
-            tradeable = self._filter_candidates_by_snapshot_freshness(
-                evidence_ready_frontier,
-                snapshot=snapshot,
-                now_ms=now_ms,
-                metrics=snapshot_freshness_metrics,
-                ages=snapshot_freshness_ages,
-                budgets=snapshot_freshness_budgets,
-                publish_intervals=snapshot_freshness_publish_intervals,
-                entry_quote_truth_overlay=entry_quote_truth_overlay,
-            )
-            if not evidence_ready_frontier and preflight_snapshot_blockers:
-                # The authoritative pass above had no rows to inspect.  Recheck
-                # the published frontier against the final quote overlay so the
-                # journal receives the actual leaf blocker, while a repaired
-                # preflight failure is not replayed as stale final truth.
-                self._filter_candidates_by_snapshot_freshness(
-                    entry_freshness_filter_candidates,
-                    snapshot=snapshot,
-                    now_ms=wall_clock_now_ms(),
-                    metrics=snapshot_freshness_metrics,
-                    ages=snapshot_freshness_ages,
-                    budgets=snapshot_freshness_budgets,
-                    publish_intervals=snapshot_freshness_publish_intervals,
-                    entry_quote_truth_overlay=entry_quote_truth_overlay,
-                )
-            selection_market_quotes = self._entry_quote_truth_market_quotes(
-                snapshot.quotes,
-                entry_quote_truth_overlay,
-            )
-            pre_reprice_tradeable = list(tradeable)
-            tradeable = self._reprice_entry_candidates_for_selection(
-                tradeable,
-                market_quotes=selection_market_quotes,
-                now_ms=wall_clock_now_ms(),
-            )
-            repriced_pair_ids = {
-                self._candidate_pair_id(candidate) for candidate in tradeable
-            }
-            reprice_failure_state_changed = False
-            reprice_now_ms = wall_clock_now_ms()
-            for candidate in pre_reprice_tradeable:
-                if self._candidate_pair_id(candidate) in repriced_pair_ids:
-                    reprice_failure_state_changed = (
-                        self._clear_entry_primary_backfill_failure(
-                            candidate,
-                            expected_reasons={"entry_final_reprice_failed"},
-                        )
-                        or reprice_failure_state_changed
-                    )
-                    continue
-                reprice_failure_state_changed = (
-                    self._record_entry_primary_backfill_failure(
-                        candidate,
-                        reason="entry_final_reprice_failed",
-                        now_ms=reprice_now_ms,
-                    )
-                    or reprice_failure_state_changed
-                )
-            if self._local_l2_effective_enabled() and tradeable:
-                self._schedule_entry_data_plane_preparation(tradeable)
-            elif (
-                reprice_failure_state_changed
-                and self._local_l2_effective_enabled()
-            ):
-                self._schedule_entry_data_plane_preparation(
-                    self._ordered_entry_execution_queue(
-                        l2_tracking_tradeable
-                    )
-                )
-            self.state.last_scan["tradeable_count"] = len(tradeable)
-            self.state.last_scan["selected_candidate_count"] = 0
-            self.state.last_scan["dispatched_candidate_count"] = 0
-            now_ms = wall_clock_now_ms()
-            if not tradeable:
-                await _settle_entry_evidence_tasks(wait=False)
-                # The primary+shadow pool limits concurrent proof work, not
-                # opportunity discovery.  Persist terminal failures so the
-                # next ordinary V1 scan promotes the next rows from the
-                # complete frontier.  Do not recursively re-enter tick(): a
-                # fresh scan must establish its own snapshot/account truth.
-                backfill_excluded_pair_ids: set[str] = set()
-                newly_excluded_pair_ids: set[str] = set()
-                quote_states = evidence_coordinator.get("quote", {})
-                oi_states = evidence_coordinator.get("open_interest", {})
-                for index, candidate in enumerate(
-                    entry_freshness_filter_candidates
-                ):
-                    pair_id = self._candidate_pair_id(candidate)
-                    if not pair_id or pair_id in backfill_excluded_pair_ids:
-                        continue
-                    if quote_states.get(index) == "failed":
-                        reason = "entry_quote_revalidation_failed"
-                    elif oi_states.get(index) == "failed":
-                        reason = "entry_open_interest_revalidation_failed"
-                    else:
-                        continue
-                    self._record_entry_primary_backfill_failure(
-                        candidate,
-                        reason=reason,
-                        now_ms=wall_clock_now_ms(),
-                    )
-                    backfill_excluded_pair_ids.add(pair_id)
-                    newly_excluded_pair_ids.add(pair_id)
-                for candidate in pre_reprice_tradeable:
-                    pair_id = self._candidate_pair_id(candidate)
-                    if (
-                        not pair_id
-                        or pair_id in repriced_pair_ids
-                        or pair_id in backfill_excluded_pair_ids
-                    ):
-                        continue
-                    self._record_entry_primary_backfill_failure(
-                        candidate,
-                        reason="entry_final_reprice_failed",
-                        now_ms=wall_clock_now_ms(),
-                    )
-                    backfill_excluded_pair_ids.add(pair_id)
-                    newly_excluded_pair_ids.add(pair_id)
-                remaining_backfill_count = sum(
-                    self._candidate_pair_id(candidate)
-                    not in backfill_excluded_pair_ids
-                    for candidate in l2_tracking_tradeable
-                )
-                if (
-                    newly_excluded_pair_ids
-                    and remaining_backfill_count > 0
-                    and not self._local_l2_effective_enabled()
-                ):
-                    self.journal.append(
-                        "runtime.entry_execution_queue_backfill",
-                        {
-                            "complete_eligible_frontier_count": len(
-                                l2_tracking_tradeable
-                            ),
-                            "failed_batch_candidate_count": len(
-                                newly_excluded_pair_ids
-                            ),
-                            "remaining_queue_candidate_count": (
-                                remaining_backfill_count
-                            ),
-                            "active_execution_queue_candidate_count": len(
-                                tracked_candidates
-                            ),
-                            "handoff": "next_full_tick",
-                            "ts_ms": wall_clock_now_ms(),
-                        },
-                    )
-                evidence_deadline_count = int(
-                    self.state.last_scan.get(
-                        "entry_evidence_deadline_exceeded_count",
-                        0,
-                    )
-                    or 0
-                ) + int(
-                    self.state.last_scan.get(
-                        "oi_entry_evidence_deadline_exceeded_count",
-                        0,
-                    )
-                    or 0
-                )
-                if evidence_deadline_count > 0:
-                    self.state.last_scan["no_entry_reason"] = (
-                        "entry_evidence_deadline_exceeded"
-                    )
-                    self.state.last_scan["entry_evidence_deadline_stage"] = (
-                        "quote_or_open_interest_revalidation"
-                    )
-                else:
-                    self.state.last_scan["no_entry_reason"] = (
-                        self._no_tradeable_reason_from_candidate_blockers(
-                            strategy_blocked_reason_counts,
-                            Counter(),
-                        )
-                    )
-            if tradeable:
-                self.journal.append(
-                    "runtime.candidates_tradeable",
-                    {"count": len(tradeable), "ts_ms": now_ms},
-                )
-                # V1: scan.shortlist_ready — basic shortlist generated, before post-shortlist processing
-                self.journal.append(
-                    "scan.shortlist_ready",
-                    {
-                        "stage": "execution_freshness_filtered",
-                        "raw_candidate_count": raw_candidate_count,
-                        "strategy_tradeable_count": strategy_tradeable_count,
-                        "tracked_candidate_count": len(tracked_candidates),
-                        "candidate_count": len(tradeable),
-                        "tradeable_count": len(tradeable),
-                        "shortlist_candidate_count": len(tradeable),
-                        "shortlist_tradeable_count": len(tradeable),
-                        "quote_truth_must_resolve_count": self.state.last_scan.get(
-                            "quote_truth_must_resolve_count",
-                            0,
-                        ),
-                        "quote_truth_failed_count": self.state.last_scan.get(
-                            "quote_truth_failed_count",
-                            0,
-                        ),
-                        "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
-                        "best_pair_id": tradeable[0].pair_id if tradeable else None,
-                        "ts_ms": now_ms,
-                    },
-                )
-                # V1: selected_candidates is a final-entry list, not the raw
-                # shortlist. It excludes candidates still waiting on the final
-                # entry window, primary L2 tracking, or dual-ready books.
-                max_slots = max(self.config.strategy.max_concurrent_positions, 1)
-                remaining_slots = max(max_slots - len(self.state.open_positions), 0)
-                self.state.last_scan["max_concurrent_positions"] = max_slots
-                self.state.last_scan["open_position_count"] = len(self.state.open_positions)
-                self.state.last_scan["remaining_slots"] = remaining_slots
-                admission_blocker_counts: Counter[str] = Counter()
-                selection_blocker_counts: Counter[str] = Counter()
-                candidate_blockers: dict[str, str] = {}
-                if _entry_pipeline_remaining_s() <= 0.0:
-                    self.state.last_scan["no_entry_reason"] = (
-                        "entry_evidence_deadline_exceeded"
-                    )
-                    self.state.last_scan["entry_evidence_deadline_stage"] = (
-                        "final_selection"
-                    )
-                    self.journal.append(
-                        "runtime.entry_evidence_deadline_exceeded",
-                        {
-                            "stage": "final_selection",
-                            "blocking_stage": "final_selection",
-                            "blocking_domain": "entry_evidence",
-                            "blocking_status": "timeout",
-                            "blocking_reason": "entry_evidence_deadline_exceeded",
-                            "elapsed_ms": max(
-                                int(
-                                    (
-                                        entry_pipeline_loop.time()
-                                        - entry_pipeline_started_monotonic
-                                    )
-                                    * 1_000
-                                ),
-                                0,
-                            ),
-                            "ts_ms": wall_clock_now_ms(),
-                        },
-                    )
-                    return
-                now_ms = wall_clock_now_ms()
-                finalists = self._select_entry_candidates(
-                    tradeable,
-                    now_ms=now_ms,
-                    remaining_slots=remaining_slots,
-                    selection_blocker_counts=selection_blocker_counts,
-                    candidate_blockers=candidate_blockers,
-                    market_quotes=selection_market_quotes,
-                    admission_blocker_counts=admission_blocker_counts,
-                )
-                selection_failure_state_changed = False
-                selection_failure_now_ms = wall_clock_now_ms()
-                for candidate in tradeable:
-                    pair_id = self._candidate_pair_id(candidate)
-                    blocker = str(candidate_blockers.get(pair_id, "") or "")
-                    if not self._entry_execution_queue_terminal_failure(blocker):
-                        continue
-                    selection_failure_state_changed = (
-                        self._record_entry_primary_backfill_failure(
-                            candidate,
-                            reason=blocker,
-                            now_ms=selection_failure_now_ms,
-                        )
-                        or selection_failure_state_changed
-                    )
-                if (
-                    selection_failure_state_changed
-                    and self._local_l2_effective_enabled()
-                ):
-                    self._schedule_entry_data_plane_preparation(
-                        self._ordered_entry_execution_queue(
-                            l2_tracking_tradeable
-                        )
-                    )
-                self.state.last_scan["selected_candidate_count"] = len(finalists)
-                dispatched = 0
-                dispatch_failure_state_changed = False
-                account_truth_blocked_before_dispatch = False
-                account_truth_block_reason = ""
-                attempted_pair_ids: set[str] = set()
-                selected_deadline_ms = max(
-                    int(self.config.strategy.selected_submit_deadline_ms or 0),
-                    0,
-                )
-                for candidate in finalists:
-                    if len(self.state.open_positions) >= max_slots:
-                        break
-                    pair_id = self._candidate_pair_id(candidate)
-                    (
-                        account_truth_ready,
-                        account_truth_global_block,
-                        account_truth_reason,
-                    ) = await self._entry_account_truth_dispatch_readiness(
-                        candidate
-                    )
-                    if not account_truth_ready:
-                        attempted_pair_ids.add(pair_id)
-                        account_truth_block_reason = account_truth_reason
-                        if account_truth_global_block:
-                            account_truth_blocked_before_dispatch = True
-                            break
-                        continue
-                    # Each finalist becomes selected only when its own final
-                    # revalidation begins. A slow or rejected rank-1 row must
-                    # not consume rank-2's quote-to-submit safety budget.
-                    selected_at_ms = wall_clock_now_ms()
-                    attempted_pair_ids.add(pair_id)
-                    selected_deadline_monotonic = (
-                        entry_pipeline_loop.time()
-                        + selected_deadline_ms / 1_000.0
-                        if selected_deadline_ms > 0
-                        else None
-                    )
-                    now_ms = wall_clock_now_ms()
-                    mid_price = self._entry_quote_truth_price_hint(
-                        candidate,
-                        price_hints=price_hints,
-                        overlay=entry_quote_truth_overlay,
-                    )
-                    dispatch_succeeded = await self._dispatch_entry(
-                        candidate,
-                        now_ms,
-                        price_hint=mid_price,
-                        selected_deadline_monotonic=selected_deadline_monotonic,
-                        selected_at_ms=selected_at_ms,
-                    )
-                    if dispatch_succeeded:
-                        if (
-                            account_truth_block_reason
-                            and self.state.last_scan.get("blocking_domain")
-                            == "exchange_account_truth"
-                        ):
-                            for key in (
-                                "no_entry_reason",
-                                "blocking_stage",
-                                "blocking_domain",
-                                "blocking_status",
-                                "blocking_reason",
-                            ):
-                                self.state.last_scan.pop(key, None)
-                            account_truth_block_reason = ""
-                        dispatch_failure_state_changed = (
-                            self._clear_entry_primary_backfill_failure(candidate)
-                            or dispatch_failure_state_changed
-                        )
-                        dispatched += 1
-                        self._invalidate_entry_account_truth_generation()
-                    else:
-                        dispatch_failure_state_changed = (
-                            self._record_entry_primary_backfill_failure(
-                                candidate,
-                                reason="entry_final_revalidation_failed",
-                                now_ms=wall_clock_now_ms(),
-                            )
-                            or dispatch_failure_state_changed
-                        )
-                # Early selection intentionally leaves lower-ranked evidence
-                # tasks running.  If every selected row fails at the final
-                # dispatch gate, use the remaining common deadline to finish
-                # the frontier and keep selecting unattempted rows in this
-                # tick.  Completed evidence is still eligible: tying fallback
-                # to a pending task stranded rank-5+ when the refresh happened
-                # to finish before the first dispatch rejection.
-                fallback_tradeable_base: list | None = None
-                fallback_market_quotes = selection_market_quotes
-                fallback_requires_refresh = (
-                    not initial_evidence_frontier_complete
-                )
-                while (
-                    dispatched == 0
-                    and bool(attempted_pair_ids)
-                    and not account_truth_blocked_before_dispatch
-                    and _entry_pipeline_remaining_s() > 0.0
-                ):
-                    await _settle_entry_evidence_tasks(
-                        wait=fallback_requires_refresh
-                    )
-                    if fallback_tradeable_base is None:
-                        if fallback_requires_refresh:
-                            completed_overlay = evidence_coordinator.get(
-                                "quote_overlay",
-                                entry_quote_truth_overlay,
-                            )
-                            if isinstance(completed_overlay, dict):
-                                entry_quote_truth_overlay = completed_overlay
-                            if (
-                                quote_refresh_task.done()
-                                and not quote_refresh_task.cancelled()
-                            ):
-                                completed_overlay, _completed_stats = (
-                                    quote_refresh_task.result()
-                                )
-                                entry_quote_truth_overlay = completed_overlay
-                            fallback_tradeable_base = (
-                                self._filter_candidates_by_snapshot_freshness(
-                                    _evidence_ready_frontier(),
-                                    snapshot=snapshot,
-                                    now_ms=wall_clock_now_ms(),
-                                    metrics={},
-                                    ages={},
-                                    budgets={},
-                                    publish_intervals={},
-                                    entry_quote_truth_overlay=(
-                                        entry_quote_truth_overlay
-                                    ),
-                                    record_result=False,
-                                )
-                            )
-                            fallback_market_quotes = (
-                                self._entry_quote_truth_market_quotes(
-                                    snapshot.quotes,
-                                    entry_quote_truth_overlay,
-                                )
-                            )
-                            fallback_tradeable_base = (
-                                self._reprice_entry_candidates_for_selection(
-                                    fallback_tradeable_base,
-                                    market_quotes=fallback_market_quotes,
-                                    now_ms=wall_clock_now_ms(),
-                                    record_result=False,
-                                )
-                            )
-                        else:
-                            fallback_tradeable_base = list(tradeable)
-                    fallback_tradeable = [
-                        row
-                        for row in fallback_tradeable_base
-                        if self._candidate_pair_id(row) not in attempted_pair_ids
-                    ]
-                    fallback_finalists = self._select_entry_candidates(
-                        fallback_tradeable,
-                        now_ms=wall_clock_now_ms(),
-                        remaining_slots=remaining_slots,
-                        selection_blocker_counts=selection_blocker_counts,
-                        candidate_blockers=candidate_blockers,
-                        market_quotes=fallback_market_quotes,
-                        admission_blocker_counts=admission_blocker_counts,
-                    )
-                    if not fallback_finalists:
-                        break
-                    finalists.extend(fallback_finalists)
-                    attempted_fallback = False
-                    for candidate in fallback_finalists:
-                        if len(self.state.open_positions) >= max_slots:
-                            break
-                        pair_id = self._candidate_pair_id(candidate)
-                        (
-                            account_truth_ready,
-                            account_truth_global_block,
-                            account_truth_reason,
-                        ) = await self._entry_account_truth_dispatch_readiness(
-                            candidate
-                        )
-                        if not account_truth_ready:
-                            attempted_fallback = True
-                            attempted_pair_ids.add(pair_id)
-                            account_truth_block_reason = account_truth_reason
-                            if account_truth_global_block:
-                                account_truth_blocked_before_dispatch = True
-                                break
-                            continue
-                        attempted_fallback = True
-                        attempted_pair_ids.add(pair_id)
-                        selected_at_ms = wall_clock_now_ms()
-                        selected_deadline_monotonic = (
-                            entry_pipeline_loop.time()
-                            + selected_deadline_ms / 1_000.0
-                            if selected_deadline_ms > 0
-                            else None
-                        )
-                        mid_price = self._entry_quote_truth_price_hint(
-                            candidate,
-                            price_hints=price_hints,
-                            overlay=entry_quote_truth_overlay,
-                        )
-                        dispatch_succeeded = await self._dispatch_entry(
-                            candidate,
-                            wall_clock_now_ms(),
-                            price_hint=mid_price,
-                            selected_deadline_monotonic=(
-                                selected_deadline_monotonic
-                            ),
-                            selected_at_ms=selected_at_ms,
-                        )
-                        if dispatch_succeeded:
-                            if (
-                                account_truth_block_reason
-                                and self.state.last_scan.get("blocking_domain")
-                                == "exchange_account_truth"
-                            ):
-                                for key in (
-                                    "no_entry_reason",
-                                    "blocking_stage",
-                                    "blocking_domain",
-                                    "blocking_status",
-                                    "blocking_reason",
-                                ):
-                                    self.state.last_scan.pop(key, None)
-                                account_truth_block_reason = ""
-                            dispatch_failure_state_changed = (
-                                self._clear_entry_primary_backfill_failure(
-                                    candidate
-                                )
-                                or dispatch_failure_state_changed
-                            )
-                            dispatched += 1
-                            self._invalidate_entry_account_truth_generation()
-                        else:
-                            dispatch_failure_state_changed = (
-                                self._record_entry_primary_backfill_failure(
-                                    candidate,
-                                    reason="entry_final_revalidation_failed",
-                                    now_ms=wall_clock_now_ms(),
-                                )
-                                or dispatch_failure_state_changed
-                            )
-                    if not attempted_fallback:
-                        break
-                await _settle_entry_evidence_tasks(wait=False)
-                attempted_backfill_pair_ids = {
-                    pair_id
-                    for pair_id in attempted_pair_ids
-                    if pair_id
-                }
-                remaining_dispatch_backfill_count = sum(
-                    self._candidate_pair_id(candidate)
-                    not in attempted_backfill_pair_ids
-                    for candidate in l2_tracking_tradeable
-                )
-                if (
-                    dispatched == 0
-                    and attempted_backfill_pair_ids
-                    and not account_truth_blocked_before_dispatch
-                    and remaining_dispatch_backfill_count > 0
-                    and not self._local_l2_effective_enabled()
-                ):
-                    self.journal.append(
-                        "runtime.entry_execution_queue_backfill",
-                        {
-                            "complete_eligible_frontier_count": len(
-                                l2_tracking_tradeable
-                            ),
-                            "failed_batch_candidate_count": len(
-                                attempted_backfill_pair_ids
-                            ),
-                            "remaining_queue_candidate_count": (
-                                remaining_dispatch_backfill_count
-                            ),
-                            "active_execution_queue_candidate_count": len(
-                                tracked_candidates
-                            ),
-                            "reason": "entry_final_revalidation_failed",
-                            "handoff": "next_full_tick",
-                            "ts_ms": wall_clock_now_ms(),
-                        },
-                    )
-                if (
-                    dispatch_failure_state_changed
-                    and self._local_l2_effective_enabled()
-                ):
-                    self._schedule_entry_data_plane_preparation(
-                        self._ordered_entry_execution_queue(
-                            l2_tracking_tradeable
-                        )
-                    )
-                self.state.last_scan["dispatched_candidate_count"] = dispatched
-                if dispatched > 0:
-                    self._emit_entry_opportunity_funnel(
-                        reason="entries_dispatched",
-                        snapshot=snapshot,
-                        tradeable=tradeable,
-                        selected=finalists,
-                        dispatched_candidate_count=dispatched,
-                        remaining_slots=remaining_slots,
-                        tradeable_selection_blocker_counts=selection_blocker_counts,
-                        candidate_blockers=candidate_blockers,
-                        now_ms=now_ms,
-                        admission_blocker_counts=admission_blocker_counts,
-                    )
-                if dispatched == 0:
-                    reason = (
-                        self.state.last_scan.get("blocking_reason")
-                        if account_truth_block_reason
-                        else self._v1_tradeable_no_entry_reason(
-                            selection_blocker_counts,
-                            admission_blocker_counts,
-                        )
-                        or "no_entry_dispatched"
-                    )
-                    self._emit_scan_no_entry_diagnostics(
-                        reason=reason,
-                        snapshot=snapshot,
-                        tradeable=tradeable,
-                        selected_candidate_count=len(finalists),
-                        dispatched_candidate_count=dispatched,
-                        remaining_slots=remaining_slots,
-                        tradeable_selection_blocker_counts=selection_blocker_counts,
-                        candidate_blockers=candidate_blockers,
-                        now_ms=now_ms,
-                        admission_blocker_counts=admission_blocker_counts,
-                        strategy_blocked_reason_counts=(
-                            strategy_blocked_reason_counts
-                        ),
-                        strategy_blocked_reason_samples=(
-                            strategy_blocked_reason_samples
-                        ),
-                    )
-            elif can_enter_new_positions(self.state) and self.entry_executor is not None:
-                self._emit_scan_no_entry_diagnostics(
-                    reason=self._no_tradeable_reason_from_candidate_blockers(
-                        strategy_blocked_reason_counts,
-                        self._last_snapshot_freshness_filter_blockers,
-                    ),
-                    snapshot=snapshot,
-                    tradeable=[],
-                    selected_candidate_count=0,
-                    dispatched_candidate_count=0,
-                    remaining_slots=max(
-                        self.config.strategy.max_concurrent_positions,
-                        1,
-                    ) - len(self.state.open_positions),
-                    tradeable_selection_blocker_counts=Counter(),
-                    candidate_blockers={},
-                    now_ms=now_ms,
-                    strategy_blocked_reason_counts=strategy_blocked_reason_counts,
-                    strategy_blocked_reason_samples=strategy_blocked_reason_samples,
-                )
-
+            return
     # ------------------------------------------------------------------
     # Risk snapshot runtime cache (V1: fetch_account_risk_with_runtime_cache)
     # ------------------------------------------------------------------
@@ -9221,26 +7464,6 @@ class LiveRuntime:
                 )
                 return False
 
-        canary_reason = self._funding_canary_pending_request_invariant_reason(
-            pending,
-            quantity=target_quantity,
-            price=max(long_price_hint, short_price_hint),
-            stage="terminal_dual_taker_fallback",
-            now_ms=now_ms,
-            entry_id=entry_id,
-        )
-        if canary_reason:
-            self.journal.append(
-                "execution.entry_fallback_to_taker_skipped",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "reason": canary_reason,
-                    "terminal_reason": terminal_reason,
-                },
-            )
-            return False
-
         self.journal.append(
             "execution.entry_fallback_to_taker",
             {
@@ -9580,66 +7803,6 @@ class LiveRuntime:
                 now_ms=now_ms,
             )
 
-    def _funding_canary_pending_request_invariant_reason(
-        self,
-        pending,
-        *,
-        quantity: float,
-        price: float,
-        stage: str,
-        now_ms: int,
-        entry_id: str,
-    ) -> str:
-        """Enforce the immutable canary cap on every pending-entry order path."""
-
-        if not bool(getattr(pending, "funding_canary_enabled_at_entry", False)):
-            return ""
-        try:
-            cap = float(
-                getattr(
-                    pending,
-                    "funding_canary_hard_max_entry_notional_quote",
-                    0.0,
-                )
-                or 0.0
-            )
-            request_quantity = float(quantity or 0.0)
-            request_price = float(price or 0.0)
-        except (TypeError, ValueError):
-            cap = request_quantity = request_price = 0.0
-        request_notional = request_quantity * request_price
-        if (
-            math.isfinite(cap)
-            and math.isfinite(request_quantity)
-            and math.isfinite(request_price)
-            and math.isfinite(request_notional)
-            and cap > 0.0
-            and request_quantity > 0.0
-            and request_price > 0.0
-            and request_notional <= cap + 1e-9
-        ):
-            return ""
-
-        reason = "funding_canary_final_notional_invariant_breached"
-        self.journal.append(
-            reason,
-            {
-                "entry_id": entry_id,
-                "candidate_revision_id": str(
-                    getattr(pending, "candidate_revision_id", "") or ""
-                ),
-                "symbol": str(getattr(pending, "symbol", "") or ""),
-                "stage": stage,
-                "quantity": request_quantity,
-                "price": request_price,
-                "entry_max_leg_notional_quote": request_notional,
-                "funding_canary_hard_max_entry_notional_quote": cap,
-                "reason": reason,
-                "ts_ms": now_ms,
-            },
-        )
-        return reason
-
     async def _submit_pending_entry_passive_order_with_retries(
         self,
         *,
@@ -9688,16 +7851,6 @@ class LiveRuntime:
                         },
                     )
                     raise _PendingEntryPassiveSubmitFinalized(rule_reason)
-                canary_reason = self._funding_canary_pending_request_invariant_reason(
-                    pending,
-                    quantity=quantity,
-                    price=price_hint,
-                    stage=f"{stage_prefix}_attempt_{attempt_index}",
-                    now_ms=wall_clock_now_ms(),
-                    entry_id=entry_id,
-                )
-                if canary_reason:
-                    raise _PendingEntryPassiveSubmitFinalized(canary_reason)
             attempt_now_ms = wall_clock_now_ms()
             quote_gate_reason, quote_gate_evidence = (
                 self._pending_entry_passive_repost_quote_gate(
@@ -14101,25 +12254,6 @@ class LiveRuntime:
                 )
                 return False
 
-            canary_reason = self._funding_canary_pending_request_invariant_reason(
-                pending,
-                quantity=normalized,
-                price=hedge_price,
-                stage="recovery_missing_hedge",
-                now_ms=now_ms,
-                entry_id=pending.pending_id,
-            )
-            if canary_reason:
-                # The maker leg already exists.  Shrinking only the hedge would
-                # create naked delta, so the only cap-safe outcome is the V1
-                # abort path, which flattens the first leg.
-                await self._abort_pending_entry(
-                    pending,
-                    pending.pending_id,
-                    canary_reason,
-                )
-                return False
-
             from lightfee.venues.cid import generate_exchange_cid
             recovery_attempt = int(
                 getattr(pending, "hedge_attempt_count", 0) or 0
@@ -14591,22 +12725,6 @@ class LiveRuntime:
                     "pending_entry.hedge_quantity_below_min_notional",
                     {"entry_id": entry_id, "symbol": pending.symbol,
                      "raw_quantity": missing, "normalized_quantity": normalized},
-                )
-                return False
-
-            canary_reason = self._funding_canary_pending_request_invariant_reason(
-                pending,
-                quantity=normalized,
-                price=hedge_price,
-                stage="normal_missing_hedge",
-                now_ms=now_ms,
-                entry_id=entry_id,
-            )
-            if canary_reason:
-                await self._abort_pending_entry(
-                    pending,
-                    entry_id,
-                    canary_reason,
                 )
                 return False
 
@@ -15553,11 +13671,13 @@ class LiveRuntime:
     # ------------------------------------------------------------------
 
     def _ensure_private_ws_started(self, now_ms: int) -> None:
-        """V1: start private WS workers for live adapters when credentials/symbols ready.
+        """Maintain private account streams without binding them to candidate churn.
 
-        Called each tick until all live adapters with private health support have
-        workers running. Tracked symbol changes trigger worker replacement.
-        Idempotent: skips venues that already have workers for the same symbol set.
+        V1 starts one private worker and lets that worker own reconnects.  V2
+        may discover a new valid symbol after startup, so it extends the
+        worker's symbol mapping/subscriptions in place.  Removing a candidate
+        never stops a worker: private truth for a late fill or recovered
+        position must remain available until explicit service shutdown.
         """
         if self.config.runtime.mode == "paper":
             return
@@ -15572,30 +13692,14 @@ class LiveRuntime:
                 continue
 
             symbols = tracked_symbols.get(venue, set())
-            prev_symbols = self._private_ws_symbols.get(venue, set())
-
-            # V1: empty symbols → stop any existing workers, clear tracking
+            # No current candidate is not a transport lifecycle event.  Keep
+            # an already running account stream alive; the explicit shutdown
+            # path remains its sole normal stop owner.
             if not symbols:
-                if prev_symbols:
-                    transport.stop_private_ws()
-                    self._private_ws_started.discard(venue)
-                    self._private_ws_symbols.pop(venue, None)
-                    self.journal.append(
-                        "runtime.private_ws_stopped",
-                        {
-                            "venue": venue.value,
-                            "reason": "no tracked symbols",
-                        },
-                    )
                 continue
 
-            # Start if never started or symbols changed
-            if venue not in self._private_ws_started or symbols != prev_symbols:
-                if symbols != prev_symbols and venue in self._private_ws_started:
-                    # V1: worker replacement on symbol change
-                    transport.stop_private_ws()
-
-                transport.start_private_ws(list(symbols))
+            if venue not in self._private_ws_started:
+                transport.start_private_ws(sorted(symbols))
                 self._private_ws_started.add(venue)
                 self._private_ws_symbols[venue] = set(symbols)
                 self.journal.append(
@@ -15605,6 +13709,27 @@ class LiveRuntime:
                         "symbol_count": len(symbols),
                     },
                 )
+                continue
+
+            previous_symbols = self._private_ws_symbols.setdefault(venue, set())
+            additions = symbols - previous_symbols
+            if not additions:
+                continue
+
+            update_symbols = getattr(transport, "update_private_ws_symbols", None)
+            if not callable(update_symbols):
+                # Every production VenueTransport implements this method.  Do
+                # not fall back to stop/start for a partial or test adapter:
+                # replacement is precisely the unsafe lifecycle behavior this
+                # owner prevents.
+                logger.warning(
+                    "private WS symbol update unavailable; retaining existing worker venue=%s additions=%d",
+                    venue.value,
+                    len(additions),
+                )
+                continue
+            update_symbols(sorted(additions))
+            previous_symbols.update(additions)
 
     def _current_tracked_private_symbols(self) -> dict[Venue, set[str]]:
         """Collect symbols that need private WS tracking from current state.
@@ -16861,28 +14986,11 @@ class LiveRuntime:
                     # V4/early-V5 compatibility only. Fresh V5/V6 candidates
                     # always publish an explicit common-base target quantity.
                     requested_quantity = legacy_notional / legacy_reference_price
-            hard_cap = max(
-                float(
-                    getattr(
-                        candidate,
-                        "funding_canary_hard_max_entry_notional_quote",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                0.0,
-            )
             # The standard two-taker route buys the long at ask and sells the
             # short at bid.  The unrelated short ask is not an executable leg
             # price and must not permanently undersize a profitable pair.
             conservative_max_price = max(long_ask, short_bid, 0.0)
-            if hard_cap > 0.0 and conservative_max_price > 0.0:
-                clamped_quantity = min(
-                    requested_quantity,
-                    hard_cap / conservative_max_price,
-                )
-            else:
-                clamped_quantity = requested_quantity
+            final_quantity = requested_quantity
 
             long_step = max(
                 float(getattr(long_quote, "quantity_step_base", 0.0) or 0.0),
@@ -16901,16 +15009,50 @@ class LiveRuntime:
                 )
                 continue
 
-            pre_canary_quantity = requested_quantity
+            live_notional_cap = 0.0
+            if self.config.runtime.mode == "live":
+                configured_cap = max(
+                    float(
+                        getattr(
+                            self.config.strategy,
+                            "entry_notional_cap_quote",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                    0.0,
+                )
+                configured_live_cap = max(
+                    float(
+                        getattr(
+                            self.config.strategy,
+                            "live_entry_notional_cap_quote",
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                    0.0,
+                )
+                live_notional_cap = (
+                    min(configured_cap, configured_live_cap)
+                    if configured_live_cap > 0.0
+                    else configured_cap
+                )
+
+            def _cap_to_live_notional(quantity: float, price: float) -> float:
+                if live_notional_cap <= 0.0 or price <= 0.0:
+                    return quantity
+                return min(quantity, live_notional_cap / price)
+
+            aligned_quantity = _cap_to_live_notional(
+                requested_quantity,
+                conservative_max_price,
+            )
             if has_explicit_target_quantity and common_step > 0.0:
-                pre_canary_quantity = _align_base_quantity_down(
-                    pre_canary_quantity,
+                aligned_quantity = _align_base_quantity_down(
+                    aligned_quantity,
                     common_step,
                 )
-            canary_constrained = bool(
-                hard_cap > 0.0
-                and clamped_quantity + 1e-12 < requested_quantity
-            )
             strategy_min_notional = max(
                 float(
                     getattr(
@@ -16942,18 +15084,6 @@ class LiveRuntime:
                     0.0,
                 ),
             }
-            original_minimum_reason, _ = (
-                self.entry_dispatch_runtime._entry_pair_minimum_reason(
-                    quantity=pre_canary_quantity,
-                    long_price=long_ask,
-                    short_price=short_bid,
-                    long_metadata=long_minimum_metadata,
-                    short_metadata=short_minimum_metadata,
-                    strategy_min_notional=strategy_min_notional,
-                    canary_constrained=False,
-                )
-            )
-
             def _align_and_check_pair_minimum(
                 quantity: float,
                 long_price: float,
@@ -16963,11 +15093,7 @@ class LiveRuntime:
                 if has_explicit_target_quantity and common_step > 0.0:
                     aligned = _align_base_quantity_down(aligned, common_step)
                 if aligned <= 0.0:
-                    return 0.0, (
-                        "funding_canary_cap_below_pair_minimum"
-                        if canary_constrained and not original_minimum_reason
-                        else "entry_pair_minimum_not_met"
-                    )
+                    return 0.0, "entry_pair_minimum_not_met"
                 if not has_explicit_target_quantity:
                     return aligned, ""
                 reason, _details = (
@@ -16978,15 +15104,12 @@ class LiveRuntime:
                         long_metadata=long_minimum_metadata,
                         short_metadata=short_minimum_metadata,
                         strategy_min_notional=strategy_min_notional,
-                        canary_constrained=(
-                            canary_constrained and not original_minimum_reason
-                        ),
                     )
                 )
                 return aligned, reason
 
-            clamped_quantity, quantity_blocker = _align_and_check_pair_minimum(
-                clamped_quantity,
+            final_quantity, quantity_blocker = _align_and_check_pair_minimum(
+                aligned_quantity,
                 long_ask,
                 short_bid,
             )
@@ -16999,35 +15122,27 @@ class LiveRuntime:
                     )
                 )
                 continue
-            if clamped_quantity <= 0.0:
-                reason = (
-                    "funding_canary_cap_below_pair_minimum"
-                    if canary_constrained and not original_minimum_reason
-                    else "entry_pair_minimum_not_met"
-                )
+            if final_quantity <= 0.0:
+                reason = "entry_pair_minimum_not_met"
                 blocker_counts[reason] += 1
                 blocker_samples.append(
                     self._entry_reprice_blocker_sample(candidate, reason)
                 )
                 continue
-            candidate.funding_canary_size_constrained = bool(
-                clamped_quantity + 1e-12 < requested_quantity
-                or getattr(candidate, "funding_canary_size_constrained", False)
-            )
             candidate.entry_target_quantity = (
-                clamped_quantity if has_explicit_target_quantity else 0.0
+                final_quantity if has_explicit_target_quantity else 0.0
             )
             candidate.entry_max_leg_notional_quote = (
-                clamped_quantity * conservative_max_price
+                final_quantity * conservative_max_price
             )
-            candidate.entry_notional_quote = clamped_quantity * (
+            candidate.entry_notional_quote = final_quantity * (
                 long_ask + short_bid
             ) / 2.0
 
             quote_lease = self.entry_dispatch_runtime._local_l2_final_quote_lease(
                 candidate,
                 now_ms,
-                target_quantity=clamped_quantity,
+                target_quantity=final_quantity,
             )
             require_l2_vwap = bool(
                 quote_lease is not None
@@ -17051,7 +15166,7 @@ class LiveRuntime:
                 short_sell_vwap=float(
                     getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0
                 ),
-                required_base_quantity=clamped_quantity,
+                required_base_quantity=final_quantity,
                 l2_vwap_complete=(
                     getattr(quote_lease, "l2_vwap_complete", False) is True
                 ),
@@ -17062,88 +15177,6 @@ class LiveRuntime:
                     getattr(candidate, "entry_maker_leg", "")
                 ),
             )
-            final_max_price = max(
-                decision.long_entry_price,
-                decision.short_entry_price,
-                0.0,
-            )
-            if (
-                decision.allowed
-                and hard_cap > 0.0
-                and final_max_price > 0.0
-                and clamped_quantity * final_max_price
-                > hard_cap + max(1e-9, hard_cap * 1e-12)
-            ):
-                clamped_quantity = min(
-                    clamped_quantity,
-                    hard_cap / final_max_price,
-                )
-                clamped_quantity, quantity_blocker = _align_and_check_pair_minimum(
-                    clamped_quantity,
-                    decision.long_entry_price,
-                    decision.short_entry_price,
-                )
-                if quantity_blocker:
-                    blocker_counts[quantity_blocker] += 1
-                    blocker_samples.append(
-                        self._entry_reprice_blocker_sample(
-                            candidate,
-                            quantity_blocker,
-                        )
-                    )
-                    continue
-                candidate.funding_canary_size_constrained = True
-                candidate.entry_target_quantity = (
-                    clamped_quantity if has_explicit_target_quantity else 0.0
-                )
-                quote_lease = self.entry_dispatch_runtime._local_l2_final_quote_lease(
-                    candidate,
-                    now_ms,
-                    target_quantity=clamped_quantity,
-                )
-                if require_l2_vwap and quote_lease is None:
-                    reason = "missing_final_l2_vwap"
-                    blocker_counts[reason] += 1
-                    blocker_samples.append(
-                        self._entry_reprice_blocker_sample(candidate, reason)
-                    )
-                    continue
-                if quote_lease is not None:
-                    long_bid = float(
-                        getattr(quote_lease, "long_bid", 0.0) or 0.0
-                    )
-                    long_ask = float(
-                        getattr(quote_lease, "long_ask", 0.0) or 0.0
-                    )
-                    short_bid = float(
-                        getattr(quote_lease, "short_bid", 0.0) or 0.0
-                    )
-                    short_ask = float(
-                        getattr(quote_lease, "short_ask", 0.0) or 0.0
-                    )
-                decision = revalidator.revalidate_before_first_leg(
-                    candidate,
-                    long_ask=long_ask,
-                    short_bid=short_bid,
-                    long_bid=long_bid,
-                    short_ask=short_ask,
-                    long_buy_vwap=float(
-                        getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0
-                    ),
-                    short_sell_vwap=float(
-                        getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0
-                    ),
-                    required_base_quantity=clamped_quantity,
-                    l2_vwap_complete=(
-                        getattr(quote_lease, "l2_vwap_complete", False) is True
-                    ),
-                    require_l2_vwap=require_l2_vwap,
-                    now_ms=now_ms,
-                    config=self.config.strategy,
-                    execution_is_passive=bool(
-                        getattr(candidate, "entry_maker_leg", "")
-                    ),
-                )
             if not decision.allowed:
                 reason = decision.reason or "final_economics_rejected"
                 blocker_counts[reason] += 1
@@ -17151,8 +15184,11 @@ class LiveRuntime:
                     self._entry_reprice_blocker_sample(candidate, reason)
                 )
                 continue
-            clamped_quantity, quantity_blocker = _align_and_check_pair_minimum(
-                clamped_quantity,
+            final_quantity, quantity_blocker = _align_and_check_pair_minimum(
+                _cap_to_live_notional(
+                    final_quantity,
+                    max(decision.long_entry_price, decision.short_entry_price),
+                ),
                 decision.long_entry_price,
                 decision.short_entry_price,
             )
@@ -17163,18 +15199,6 @@ class LiveRuntime:
                         candidate,
                         quantity_blocker,
                     )
-                )
-                continue
-            if (
-                hard_cap > 0.0
-                and clamped_quantity
-                * max(decision.long_entry_price, decision.short_entry_price)
-                > hard_cap + max(1e-9, hard_cap * 1e-12)
-            ):
-                reason = "funding_canary_final_notional_invariant_breached"
-                blocker_counts[reason] += 1
-                blocker_samples.append(
-                    self._entry_reprice_blocker_sample(candidate, reason)
                 )
                 continue
             edge = decision.edge
@@ -17189,12 +15213,12 @@ class LiveRuntime:
             candidate.long_entry_vwap = decision.long_entry_price
             candidate.short_entry_vwap = decision.short_entry_price
             candidate.entry_target_quantity = (
-                clamped_quantity if has_explicit_target_quantity else 0.0
+                final_quantity if has_explicit_target_quantity else 0.0
             )
-            candidate.entry_notional_quote = clamped_quantity * (
+            candidate.entry_notional_quote = final_quantity * (
                 decision.long_entry_price + decision.short_entry_price
             ) / 2.0
-            candidate.entry_max_leg_notional_quote = clamped_quantity * max(
+            candidate.entry_max_leg_notional_quote = final_quantity * max(
                 decision.long_entry_price,
                 decision.short_entry_price,
             )
@@ -17237,74 +15261,6 @@ class LiveRuntime:
                 )
                 else 0
             )
-            # Repricing uses the same identity contract as the sidecar.  The
-            # fresh QuoteSnapshot objects retain contract rules from the
-            # immutable generation while replacing only executable BBO data.
-            candidate.candidate_revision_id = build_candidate_revision_id(
-                pair_id=self._candidate_pair_id(candidate),
-                long_quote=long_quote,
-                short_quote=short_quote,
-                settlement_timestamps_ms=(
-                    int(
-                        getattr(candidate, "first_funding_timestamp_ms", 0)
-                        or getattr(candidate, "funding_timestamp_ms", 0)
-                        or 0
-                    ),
-                    int(
-                        getattr(candidate, "long_funding_timestamp_ms", 0) or 0
-                    ),
-                    int(
-                        getattr(candidate, "short_funding_timestamp_ms", 0) or 0
-                    ),
-                    int(
-                        getattr(candidate, "second_funding_timestamp_ms", 0) or 0
-                    ),
-                ),
-                entry_route=str(
-                    getattr(candidate, "entry_maker_leg", "") or "taker_both"
-                ),
-                exit_route=str(
-                    getattr(candidate, "exit_maker_leg", "") or "taker_both"
-                ),
-                fee_evidence_fingerprint=str(
-                    getattr(
-                        candidate,
-                        "account_fee_evidence_fingerprint",
-                        "",
-                    )
-                    or ""
-                ),
-                fee_assurance_tier=str(
-                    getattr(
-                        candidate,
-                        "funding_canary_fee_assurance_tier",
-                        "unavailable",
-                    )
-                    or "unavailable"
-                ),
-                model_epoch=str(
-                    getattr(candidate, "model_epoch", "")
-                    or getattr(candidate, "calculation_version", "")
-                    or ""
-                ),
-                economics={
-                    "entry_target_quantity": getattr(
-                        candidate,
-                        "entry_target_quantity",
-                        0.0,
-                    ),
-                    "long_entry_price": decision.long_entry_price,
-                    "short_entry_price": decision.short_entry_price,
-                    "entry_cross_bps": edge.entry_cross_bps,
-                    "entry_fee_bps": edge.entry_fee_bps,
-                    "exit_fee_bps": edge.exit_fee_bps,
-                    "entry_slippage_bps": edge.entry_slippage_bps,
-                    "expected_net_edge_bps": edge.expected_net_edge_bps,
-                    "worst_case_edge_bps": edge.worst_case_edge_bps,
-                    "ranking_edge_bps": edge.ranking_edge_bps,
-                },
-            )
-
             def _open_interest_receipt_row(venue: str, quote) -> dict:
                 reason = str(
                     getattr(quote, "open_interest_evidence_reason", "") or ""
@@ -17510,6 +15466,18 @@ class LiveRuntime:
             quote_lease_reason,
             quote_lease,
             quote_lease_evidence,
+        )
+
+    def _final_quote_lease_reason(
+        self,
+        candidate,
+        lease,
+        now_ms: int,
+    ) -> str:
+        return self.entry_dispatch_runtime._final_quote_lease_reason(
+            candidate,
+            lease,
+            now_ms,
         )
 
     @staticmethod

@@ -86,401 +86,6 @@ def _fresh_seven_venue_snapshot() -> dict:
     }
 
 
-def _v7_entry_manifest(
-    generation_id: str,
-    *,
-    candidate_count: int,
-    quote_count: int,
-    seed_pair_count: int = 0,
-    pair_decision_count: int = 0,
-    eligible_candidate_count: int = 0,
-    omitted_eligible_count: int = 0,
-    eligible_frontier_complete: bool = True,
-) -> dict:
-    """Minimal verified-shape manifest for isolated health-report tests."""
-    return {
-        "schema_version": 7,
-        "generation_id": generation_id,
-        "payload_size_bytes": 100,
-        "candidate_count": candidate_count,
-        "quote_count": quote_count,
-        "page_count": 1,
-        "max_page_size_bytes": 100,
-        "seed_pair_count": seed_pair_count,
-        "pair_decision_count": pair_decision_count,
-        "eligible_candidate_count": eligible_candidate_count,
-        "omitted_eligible_count": omitted_eligible_count,
-        "eligible_frontier_complete": eligible_frontier_complete,
-    }
-
-
-def test_funding_entry_health_rejects_empty_generation_when_source_data_is_degraded(
-    tmp_path,
-) -> None:
-    from lightfee.sidecar.publisher import (
-        publish_funding_entry_snapshot,
-    )
-    from lightfee.sidecar.snapshot import (
-        FundingLifecycle,
-        LiquidityLifecycle,
-        MarketLifecycle,
-        SidecarSnapshot,
-    )
-
-    now_ms = int(time.time() * 1000)
-    path = tmp_path / "opportunity-input-snapshot.json"
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms - 120_000,
-        market_observed_at_ms=now_ms - 121_000,
-        candidate_build_observed_at_ms=now_ms - 120_500,
-        candidate_build_diagnostics={
-            "input_quote_count": 0,
-            "requested_symbol_count": 1,
-            "requested_symbols": ["BTCUSDT"],
-            "requested_venues": [
-                "aster",
-                "binance",
-                "bitget",
-                "bybit",
-                "gate",
-                "hyperliquid",
-                "okx",
-            ],
-            "directional_pair_count": 0,
-            "output_candidate_count": 0,
-            "future_input_quote_count": 0,
-            "rejection_counts": {},
-        },
-        funding_lifecycle=[
-            FundingLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
-            for venue in (
-                "aster",
-                "binance",
-                "bitget",
-                "bybit",
-                "gate",
-                "hyperliquid",
-                "okx",
-            )
-        ],
-        market_lifecycle=[
-            MarketLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
-            for venue in (
-                "aster",
-                "binance",
-                "bitget",
-                "bybit",
-                "gate",
-                "hyperliquid",
-                "okx",
-            )
-        ],
-        liquidity_lifecycle=[
-            LiquidityLifecycle(venue, now_ms - 121_000, 0, 0, "no candidate")
-            for venue in (
-                "aster",
-                "binance",
-                "bitget",
-                "bybit",
-                "gate",
-                "hyperliquid",
-                "okx",
-            )
-        ],
-        degraded_venues=[
-            "aster",
-            "binance",
-            "bitget",
-            "bybit",
-            "gate",
-            "hyperliquid",
-            "okx",
-        ],
-        degraded_domains=["funding", "market", "liquidity"],
-        source_mode="direct_market",
-        acquisition_mode="fresh_sidecar",
-    )
-    publish_funding_entry_snapshot(snapshot, path)
-
-    report = vps._funding_entry_snapshot_report(
-        path,
-        now_ms=int(time.time() * 1000),
-        max_age_ms=1_000,
-    )
-
-    assert not report.ok
-    assert "funding_entry_source_data_unavailable" in report.fingerprints
-    assert report.name == "sidecar_snapshot"
-    assert report.details["data_plane"] == "funding_entry_v7"
-    assert report.details["candidate_count"] == 0
-    assert report.details["quote_count"] == 0
-
-    concurrent_publish_report = vps._funding_entry_snapshot_report(
-        path,
-        now_ms=report.details["ready_at_ms"] - 500,
-        max_age_ms=1_000,
-    )
-    assert not concurrent_publish_report.ok
-    assert (
-        "funding_entry_source_data_unavailable"
-        in concurrent_publish_report.fingerprints
-    )
-
-    manifest_path = vps.funding_entry_snapshot_manifest_path(path)
-    manifest = json.loads(manifest_path.read_text())
-    manifest["candidate_count"] = "invalid"
-    manifest_path.write_text(json.dumps(manifest))
-
-    malformed_report = vps._funding_entry_snapshot_report(
-        path,
-        now_ms=int(time.time() * 1000),
-        max_age_ms=1_000,
-    )
-    assert not malformed_report.ok
-    assert "funding_entry_generation_missing_or_invalid" in malformed_report.fingerprints
-
-
-def test_funding_entry_health_retries_until_manifest_and_snapshot_share_generation(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    now_ms = int(time.time() * 1000)
-    manifests = iter(
-        [
-            _v7_entry_manifest("generation-1", candidate_count=1, quote_count=0),
-            _v7_entry_manifest("generation-2", candidate_count=0, quote_count=0),
-        ]
-    )
-    snapshot = SimpleNamespace(
-        ready_at_ms=now_ms,
-        candidates=[],
-        quotes={},
-        acquisition_mode="unavailable",
-        degraded_venues=["binance"],
-        degraded_domains=["funding", "market", "liquidity"],
-        degraded_symbols={},
-        candidate_build_diagnostics={
-            "source_data_ready": True,
-            "eligible_frontier_complete": True,
-            "entry_frontier_ready": True,
-            "seed_pair_count": 0,
-            "pair_decision_count": 0,
-            "eligible_candidate_count": 0,
-            "omitted_eligible_count": 0,
-            "frontier_stop_reason": "all_pairs_decided",
-        },
-    )
-
-    monkeypatch.setattr(vps, "_read_json", lambda _path: next(manifests))
-    monkeypatch.setattr(
-        vps,
-        "funding_entry_snapshot_identity",
-        lambda _path, *, verify_digest: ("generation-2", 1, 100),
-    )
-    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
-
-    report = vps._funding_entry_snapshot_report(
-        tmp_path / "opportunity-input-snapshot.json",
-        now_ms=now_ms,
-        max_age_ms=1_000,
-    )
-
-    assert report.ok
-    assert report.details["generation_id"] == "generation-2"
-
-
-@pytest.mark.parametrize("frontier_value", [None, False])
-def test_funding_entry_health_rejects_incomplete_frontier_with_ready_source_data(
-    monkeypatch,
-    tmp_path,
-    frontier_value,
-) -> None:
-    now_ms = int(time.time() * 1000)
-    diagnostics = {
-        "source_data_ready": True,
-        "seed_pair_count": 4_811,
-        "pair_decision_count": 64,
-        "eligible_candidate_count": 0,
-        "omitted_eligible_count": 0,
-        "frontier_stop_reason": "candidate_frontier_incomplete",
-    }
-    if frontier_value is not None:
-        diagnostics["eligible_frontier_complete"] = frontier_value
-    snapshot = SimpleNamespace(
-        ready_at_ms=now_ms,
-        candidates=[],
-        quotes={},
-        acquisition_mode="unavailable",
-        degraded_venues=[],
-        degraded_domains=[],
-        degraded_symbols={},
-        candidate_build_diagnostics=diagnostics,
-    )
-    monkeypatch.setattr(
-        vps,
-        "_read_json",
-        lambda _path: _v7_entry_manifest(
-            "generation-1",
-            candidate_count=0,
-            quote_count=0,
-            seed_pair_count=4_811,
-            pair_decision_count=64,
-            eligible_frontier_complete=False,
-        ),
-    )
-    monkeypatch.setattr(
-        vps,
-        "funding_entry_snapshot_identity",
-        lambda _path, *, verify_digest: ("generation-1", 1, 100),
-    )
-    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
-
-    report = vps._funding_entry_snapshot_report(
-        tmp_path / "opportunity-input-snapshot.json",
-        now_ms=now_ms,
-        max_age_ms=1_000,
-    )
-
-    assert report.ok is False
-    assert "funding_entry_frontier_incomplete" in report.fingerprints
-    assert report.details["source_data_ready"] is True
-    assert report.details["entry_frontier_ready"] is False
-    assert report.details["seed_pair_count"] == 4_811
-    assert report.details["pair_decision_count"] == 64
-    assert report.details["frontier_stop_reason"] == "candidate_frontier_incomplete"
-
-
-def test_funding_entry_health_rejects_an_omitted_eligible_pair(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    now_ms = int(time.time() * 1000)
-    snapshot = SimpleNamespace(
-        ready_at_ms=now_ms,
-        candidates=[
-            SimpleNamespace(
-                long_venue="binance",
-                short_venue="bybit",
-                blocked=False,
-                economics_complete=True,
-            )
-        ],
-        quotes={},
-        acquisition_mode="fresh_sidecar",
-        degraded_venues=[],
-        degraded_domains=[],
-        degraded_symbols={},
-        candidate_build_diagnostics={
-            "source_data_ready": True,
-            "eligible_frontier_complete": False,
-            "seed_pair_count": 2,
-            "pair_decision_count": 2,
-            "eligible_candidate_count": 2,
-            "omitted_eligible_count": 1,
-            "frontier_stop_reason": "funding_entry_opportunity_omitted",
-        },
-    )
-    monkeypatch.setattr(
-        vps,
-        "_read_json",
-        lambda _path: _v7_entry_manifest(
-            "generation-1",
-            candidate_count=1,
-            quote_count=0,
-            seed_pair_count=2,
-            pair_decision_count=2,
-            eligible_candidate_count=2,
-            omitted_eligible_count=1,
-            eligible_frontier_complete=False,
-        ),
-    )
-    monkeypatch.setattr(
-        vps,
-        "funding_entry_snapshot_identity",
-        lambda _path, *, verify_digest: ("generation-1", 1, 100),
-    )
-    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
-
-    report = vps._funding_entry_snapshot_report(
-        tmp_path / "opportunity-input-snapshot.json",
-        now_ms=now_ms,
-        max_age_ms=1_000,
-    )
-
-    assert report.ok is False
-    assert "funding_entry_opportunity_omitted" in report.fingerprints
-    assert report.details["omitted_eligible_count"] == 1
-
-
-@pytest.mark.parametrize(
-    ("degraded_venues", "degraded_symbols"),
-    [
-        (["okx"], {}),
-        ([], {"okx": ["TRXUSDT"]}),
-    ],
-)
-def test_funding_entry_health_allows_complete_candidate_with_unrelated_degradation(
-    monkeypatch,
-    tmp_path,
-    degraded_venues,
-    degraded_symbols,
-) -> None:
-    now_ms = int(time.time() * 1000)
-    snapshot = SimpleNamespace(
-        ready_at_ms=now_ms,
-        candidates=[
-            SimpleNamespace(
-                long_venue="binance",
-                short_venue="bybit",
-                blocked=False,
-                economics_complete=True,
-            )
-        ],
-        quotes={},
-        acquisition_mode="fresh_sidecar",
-        degraded_venues=degraded_venues,
-        degraded_domains=["market"],
-        degraded_symbols=degraded_symbols,
-        candidate_build_diagnostics={
-            "source_data_ready": True,
-            "eligible_frontier_complete": True,
-            "entry_frontier_ready": True,
-            "seed_pair_count": 200,
-            "pair_decision_count": 200,
-            "eligible_candidate_count": 1,
-            "omitted_eligible_count": 0,
-            "frontier_stop_reason": "all_pairs_decided",
-        },
-    )
-    monkeypatch.setattr(
-        vps,
-        "_read_json",
-        lambda _path: _v7_entry_manifest(
-            "generation-1",
-            candidate_count=1,
-            quote_count=0,
-            seed_pair_count=200,
-            pair_decision_count=200,
-            eligible_candidate_count=1,
-        ),
-    )
-    monkeypatch.setattr(
-        vps,
-        "funding_entry_snapshot_identity",
-        lambda _path, *, verify_digest: ("generation-1", 1, 100),
-    )
-    monkeypatch.setattr(vps, "load_funding_entry_snapshot", lambda _path: snapshot)
-
-    report = vps._funding_entry_snapshot_report(
-        tmp_path / "opportunity-input-snapshot.json",
-        now_ms=now_ms,
-        max_age_ms=1_000,
-    )
-
-    assert report.ok is True
-    assert "funding_entry_candidate_evidence_degraded" not in report.fingerprints
-
-
 def _complete_unblocked_candidate() -> dict:
     return {
         "long_venue": "binance",
@@ -516,7 +121,6 @@ def _complete_unblocked_candidate() -> dict:
         "expected_net_edge_bps": 10.0,
         "long_taker_fee_bps": 0.0,
         "short_taker_fee_bps": 0.0,
-        "taker_fee_evidence_complete": True,
         "forecast_distribution_stable": False,
         "forecast_stability_reason": "not_calibrated",
         "forecast_worst_funding_edge_bps": 8.0,
@@ -1394,7 +998,6 @@ def test_spread_snapshot_rejects_causal_and_state_misgreen_paths():
 def test_strategy_entry_policy_reports_disabled_live_entries_without_hiding_state():
     class Strategy:
         funding_new_entries_enabled = False
-        funding_canary_enabled = False
         spread_reversion_enabled = True
         spread_paper_enabled = True
         spread_live_enabled = False
@@ -1413,6 +1016,25 @@ def test_strategy_entry_policy_reports_disabled_live_entries_without_hiding_stat
     )
     assert not required.ok
     assert "funding_live_entry_disabled" in required.fingerprints
+
+
+def test_strategy_entry_policy_accepts_enabled_live_funding_without_canary_state():
+    strategy = SimpleNamespace(
+        funding_new_entries_enabled=True,
+        spread_reversion_enabled=True,
+        spread_paper_enabled=True,
+        spread_live_enabled=False,
+    )
+
+    report = analyze_strategy_entry_policy(
+        strategy,
+        runtime_mode="live",
+        require_entry_enabled=True,
+    )
+
+    assert report.ok
+    assert report.details["funding_live_entry_ready"] is True
+    assert "funding_canary_enabled" not in report.details
 
 
 def test_verifier_spread_health_uses_runtime_liveness_budget_not_signal_ttl():
@@ -1439,83 +1061,10 @@ def test_systemd_active_report_fails_closed_on_inactive(monkeypatch):
         ),
     )
 
-    report = vps._systemd_active_report("lightfee-spread-bbo.service")
+    report = vps._systemd_active_report("lightfee-spread-sidecar.service")
 
     assert not report.ok
     assert "systemd_service_not_active" in report.fingerprints
-
-
-def test_spread_bbo_runtime_rejects_snapshot_from_previous_process(monkeypatch):
-    now_ms = 1_778_787_000_000
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=now_ms - 100,
-        batch_started_at_ms=now_ms - 10_000,
-        producer_generation_id="boot:41",
-        configured_venues=["okx"],
-        sampling_symbols=["BTCUSDT"],
-        quotes={
-            "okx:BTCUSDT": SimpleNamespace(
-                venue="okx",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 100,
-            )
-        },
-    )
-    config = SimpleNamespace(
-        venues=[SimpleNamespace(venue="okx")],
-        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: now_ms - 1_000)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=now_ms,
-    )
-
-    assert not report.ok
-    assert "spread_bbo_snapshot_generation_mismatch" in report.fingerprints
-
-
-def test_spread_bbo_runtime_samples_clock_after_snapshot_load(monkeypatch):
-    published_at_ms = 2_000
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=published_at_ms,
-        batch_started_at_ms=1_900,
-        producer_generation_id="boot:42",
-        configured_venues=["okx"],
-        sampling_symbols=["BTCUSDT"],
-        quotes={
-            "okx:BTCUSDT": SimpleNamespace(
-                venue="okx",
-                symbol="BTCUSDT",
-                observed_at_ms=published_at_ms,
-            )
-        },
-    )
-    config = SimpleNamespace(
-        venues=[SimpleNamespace(venue="okx")],
-        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps.time, "time", lambda: 2.1)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_800)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=None,
-    )
-
-    assert report.ok
-    assert report.details["checked_at_ms"] == 2_100
 
 
 def test_spread_runtime_samples_clock_after_snapshot_load(monkeypatch):
@@ -1562,111 +1111,6 @@ def test_spread_runtime_samples_clock_after_snapshot_load(monkeypatch):
 
     assert report.ok
     assert report.details["publish_age_ms"] == 50
-
-
-def test_spread_bbo_runtime_keeps_live_market_degradation_observable_not_global_gate(
-    monkeypatch,
-):
-    now_ms = 2_000
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=now_ms - 100,
-        batch_started_at_ms=now_ms - 200,
-        producer_generation_id="boot:42",
-        configured_venues=["binance", "okx"],
-        sampling_symbols=["BTCUSDT", "ETHUSDT"],
-        degraded_venues=["okx"],
-        degraded_symbols={"binance": ["ETHUSDT"]},
-        quotes={
-            "binance:BTCUSDT": SimpleNamespace(
-                venue="binance",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 100,
-            ),
-            "okx:BTCUSDT": SimpleNamespace(
-                venue="okx",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 100,
-            ),
-        },
-    )
-    config = SimpleNamespace(
-        venues=[SimpleNamespace(venue="binance"), SimpleNamespace(venue="okx")],
-        strategy=SimpleNamespace(
-            spread_signal_ttl_ms=1_000,
-            spread_live_enabled=True,
-        ),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=now_ms,
-    )
-
-    assert report.ok
-    assert report.fingerprints == []
-    assert report.details["nonblocking_market_observations"] == [
-        "spread_bbo_symbol_degraded",
-        "spread_bbo_venue_degraded",
-    ]
-    assert report.details["execution_admission_contract"] == (
-        "selected_pair_two_leg_freshness_fail_closed"
-    )
-    assert report.details["degraded_venues"] == ["okx"]
-    assert report.details["degraded_symbols"] == {"binance": ["ETHUSDT"]}
-
-
-def test_spread_bbo_runtime_keeps_global_quote_gap_observable_not_global_gate(
-    monkeypatch,
-):
-    now_ms = 2_000
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=now_ms - 1_100,
-        batch_started_at_ms=now_ms - 1_200,
-        producer_generation_id="boot:42",
-        configured_venues=["binance", "okx"],
-        sampling_symbols=["BTCUSDT"],
-        degraded_venues=[],
-        degraded_symbols={},
-        quotes={
-            "binance:BTCUSDT": SimpleNamespace(
-                venue="binance",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 1_100,
-            ),
-        },
-    )
-    config = SimpleNamespace(
-        venues=[SimpleNamespace(venue="binance"), SimpleNamespace(venue="okx")],
-        strategy=SimpleNamespace(
-            spread_signal_ttl_ms=1_000,
-            spread_live_enabled=True,
-        ),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=now_ms,
-    )
-
-    assert report.ok
-    assert report.details["nonblocking_market_observations"] == [
-        "spread_bbo_publication_stale",
-        "spread_bbo_quote_stale",
-        "spread_bbo_venue_coverage_incomplete",
-    ]
-    assert report.details["observed_venues"] == []
 
 
 def test_spread_snapshot_runtime_keeps_market_staleness_observable_not_global_gate(
@@ -1750,110 +1194,6 @@ def test_spread_snapshot_runtime_keeps_contract_failures_blocking(monkeypatch):
     assert report.details["nonblocking_market_observations"] == [
         "spread_snapshot_stale"
     ]
-
-
-def test_spread_bbo_runtime_keeps_paper_only_symbol_gaps_observable_not_blocking(
-    monkeypatch,
-):
-    now_ms = 2_000
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=now_ms - 100,
-        batch_started_at_ms=now_ms - 200,
-        producer_generation_id="boot:42",
-        configured_venues=["binance", "hyperliquid"],
-        sampling_symbols=["BTCUSDT", "ETHUSDT"],
-        degraded_venues=[],
-        degraded_symbols={"hyperliquid": ["ETHUSDT"]},
-        quotes={
-            "binance:BTCUSDT": SimpleNamespace(
-                venue="binance",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 100,
-            ),
-            "hyperliquid:BTCUSDT": SimpleNamespace(
-                venue="hyperliquid",
-                symbol="BTCUSDT",
-                observed_at_ms=now_ms - 100,
-            ),
-            "hyperliquid:ETHUSDT": SimpleNamespace(
-                venue="hyperliquid",
-                symbol="ETHUSDT",
-                observed_at_ms=now_ms - 1_100,
-            ),
-        },
-    )
-    config = SimpleNamespace(
-        venues=[
-            SimpleNamespace(venue="binance"),
-            SimpleNamespace(venue="hyperliquid"),
-        ],
-        strategy=SimpleNamespace(
-            spread_signal_ttl_ms=1_000,
-            spread_live_enabled=False,
-        ),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=now_ms,
-    )
-
-    assert report.ok
-    assert report.details["execution_contract"] == "paper_only"
-    assert report.details["fresh_quote_count"] == 2
-    assert report.details["stale_quote_count"] == 1
-    assert report.details["degraded_symbols"] == {"hyperliquid": ["ETHUSDT"]}
-
-
-def test_spread_bbo_runtime_rejects_declared_budget_despite_missing_venues(monkeypatch):
-    now_ms = 2_000
-    venues = [f"v{index}" for index in range(7)]
-    symbols = [f"S{index}USDT" for index in range(30)]
-    quotes = {
-        f"{venue}:{symbol}": SimpleNamespace(
-            venue=venue,
-            symbol=symbol,
-            observed_at_ms=now_ms - 100,
-        )
-        for venue in venues[:2]
-        for symbol in symbols
-    }
-    snapshot = SimpleNamespace(
-        schema_version=5,
-        published_at_ms=now_ms - 100,
-        batch_started_at_ms=now_ms - 200,
-        producer_generation_id="boot:42",
-        configured_venues=venues,
-        degraded_venues=[],
-        degraded_symbols={},
-        sampling_symbols=symbols,
-        quotes=quotes,
-    )
-    config = SimpleNamespace(
-        venues=[SimpleNamespace(venue=venue) for venue in venues],
-        strategy=SimpleNamespace(spread_signal_ttl_ms=1_000),
-    )
-    monkeypatch.setattr(vps, "load_spread_quote_snapshot", lambda path: snapshot)
-    monkeypatch.setattr(vps, "_systemd_main_pid", lambda name: 42)
-    monkeypatch.setattr(vps, "_process_started_at_ms", lambda pid: 1_000)
-    monkeypatch.setattr(vps, "producer_generation_id", lambda pid: f"boot:{pid}")
-
-    report = vps._spread_bbo_runtime_report(
-        "/tmp/spread-bbo.json",
-        app_config=config,
-        now_ms=now_ms,
-    )
-
-    assert not report.ok
-    assert "spread_bbo_sampling_pair_budget_exceeded" in report.fingerprints
-    assert report.details["observed_pair_count"] == 30
-    assert report.details["evaluated_pair_bound"] == 630
 
 
 def test_current_state_flags_stale_fail_closed_clean_state():
@@ -2399,18 +1739,11 @@ def test_verify_production_services_cli_json_success(tmp_path):
     (unit_dir / "lightfee-sidecar.service").write_text(
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1\n"
-        "ExecStart=/root/projects/LightFee/target/release/opportunity_input_sidecar --config /root/projects/LightFee/config/live.auto.toml\n"
-        "LimitNOFILE=65536\n"
-    )
-    (unit_dir / "lightfee-spread-bbo.service").write_text(
-        "[Service]\n"
-        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
-        "[Unit]\nWants=lightfee-spread-bbo.service\n"
+        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -2551,18 +1884,11 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
     (unit_dir / "lightfee-sidecar.service").write_text(
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "Environment=LIGHTFEE_EXTERNAL_SPREAD_BBO=1\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
-    (unit_dir / "lightfee-spread-bbo.service").write_text(
-        "[Service]\n"
-        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
-        "LimitNOFILE=65536\n"
-    )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
-        "[Unit]\nWants=lightfee-spread-bbo.service\n"
+        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -3233,21 +2559,20 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
-    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
     spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
-    assert analyze_systemd_unit("lightfee-spread-bbo.service", spread_bbo).ok
     assert analyze_systemd_unit("lightfee-spread-sidecar.service", spread_sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
+    assert not Path("deploy/systemd/lightfee-spread-bbo.service").exists()
 
 
-def test_production_live_and_spread_bbo_units_do_not_depend_on_funding_sidecar():
+def test_live_is_independent_while_spread_consumes_funding_sidecar_snapshot():
     live = Path("deploy/systemd/lightfee-live.service").read_text()
-    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
+    spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
 
     assert "lightfee-sidecar.service" not in live
-    assert "lightfee-sidecar.service" not in spread_bbo
+    assert "lightfee-sidecar.service" in spread_sidecar
 
 
 def test_trade_optimization_report_timer_is_six_hour_readonly_job():
@@ -3262,12 +2587,10 @@ def test_trade_optimization_report_timer_is_six_hour_readonly_job():
     assert "Unit=lightfee-trade-optimization-report.service" in timer
 
 
-def test_account_fee_evidence_timer_refreshes_daily():
-    timer = Path("deploy/systemd/lightfee-fee-evidence-refresh.timer").read_text()
-
-    assert "OnUnitActiveSec=24h" in timer
-    assert "Persistent=true" in timer
-    assert "Unit=lightfee-fee-evidence-refresh.service" in timer
+def test_account_fee_evidence_refresh_is_offline_only():
+    assert not Path("deploy/systemd/lightfee-fee-evidence-refresh.timer").exists()
+    assert not Path("deploy/systemd/lightfee-fee-evidence-refresh.service").exists()
+    assert Path("scripts/refresh_account_fee_evidence.py").exists()
 
 
 def test_spread_sidecar_systemd_template_uses_module_entrypoint():
@@ -3732,16 +3055,17 @@ def test_current_state_tick_stale_remains_critical_without_runtime_progress():
     assert report.details["tick_stale_suppressed_by_runtime_progress"] is False
 
 
-def test_cli_allows_missing_funding_handoff_and_reports_missing_current_state(tmp_path):
+def test_cli_reports_missing_required_funding_snapshot_and_current_state(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()
     (unit_dir / "lightfee-sidecar.service").write_text(
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "ExecStart=/root/projects/LightFee/target/release/opportunity_input_sidecar --config /root/projects/LightFee/config/live.auto.toml\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
+        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -3786,17 +3110,16 @@ def test_cli_allows_missing_funding_handoff_and_reports_missing_current_state(tm
     handoff = next(
         report
         for report in payload["reports"]
-        if report["name"] == "funding_entry_handoff"
+        if report["name"] == "sidecar_snapshot"
     )
-    assert handoff["details"]["status"] == "not_required"
+    assert handoff["details"]["status"] == "missing"
+    assert "funding_sidecar_snapshot_missing" in fingerprints
     assert "current_state_file_missing" in fingerprints
 
 
-def test_cli_single_process_entry_ignores_stale_retired_funding_handoff(tmp_path):
+def test_cli_rejects_retired_single_process_entry_config(tmp_path):
     snapshot = tmp_path / "opportunity-input-snapshot.json"
     snapshot.write_text('{"published_at_ms": 1}')
-    manifest_path = vps.funding_entry_snapshot_manifest_path(snapshot)
-    manifest_path.write_text('{"generation_id": "retired", "ready_at_ms": 1}')
     config = tmp_path / "live.toml"
     config.write_text(
         'symbols = ["BTCUSDT"]\n\n'
@@ -3830,16 +3153,11 @@ def test_cli_single_process_entry_ignores_stale_retired_funding_handoff(tmp_path
 
     assert result.returncode == 1, result.stderr + result.stdout
     payload = json.loads(result.stdout)
-    handoff = next(
+    config_report = next(
         report
         for report in payload["reports"]
-        if report["name"] == "funding_entry_handoff"
+        if report["name"] == "strategy_entry_policy"
     )
-    assert handoff["ok"] is True
-    assert handoff["details"]["status"] == "not_required"
-    assert handoff["details"]["retired_snapshot_present"] is True
-    assert handoff["details"]["retired_manifest_present"] is True
-    assert all(
-        report["name"] not in {"sidecar_snapshot", "sidecar_audit_snapshot"}
-        for report in payload["reports"]
-    )
+    assert config_report["ok"] is False
+    assert "production_config_unreadable" in config_report["fingerprints"]
+    assert "removed production field: runtime.opportunity_input_mode" in config_report["details"]["error"]

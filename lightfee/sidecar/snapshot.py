@@ -1452,18 +1452,6 @@ class CandidateInput:
     # rather than a second edge formula.
     long_taker_fee_bps: float = 0.0
     short_taker_fee_bps: float = 0.0
-    taker_fee_evidence_complete: bool = False
-    # Static configured fee maps establish a conservative pricing floor.
-    # Account-scoped evidence is separate provenance required by the live
-    # funding canary; older snapshots remain diagnostic but cannot inherit it.
-    account_fee_evidence_complete: bool = False
-    account_fee_evidence_observed_at_ms: int = 0
-    account_fee_evidence_source: str = ""
-    # The exact signed document and per-venue records that priced this
-    # candidate.  These are frozen into entry evidence; source/time alone are
-    # not sufficient to detect a substituted private-account export.
-    account_fee_evidence_fingerprint: str = ""
-    account_fee_evidence_provenance: list[dict[str, object]] = field(default_factory=list)
     opportunity_type: str = "aligned"
     blocked: bool = False
     blocked_reasons: list[str] = field(default_factory=list)
@@ -1471,14 +1459,8 @@ class CandidateInput:
     short_venue_index: int = 0
     entry_notional_quote: float = 0.0
     # V1 keeps the matched pair notional on the average executable price.
-    # A canary cap is instead a per-leg safety invariant and therefore uses
-    # the more expensive leg; never overload one field with both meanings.
+    # The per-leg value remains an execution-quantity safety invariant.
     entry_max_leg_notional_quote: float = 0.0
-    funding_canary_fee_assurance_tier: str = "unavailable"
-    funding_canary_hard_max_entry_notional_quote: float = 0.0
-    funding_canary_size_constrained: bool = False
-    funding_canary_requested_quantity: float = 0.0
-    funding_canary_requested_max_leg_notional_quote: float = 0.0
     contract_price_consistency_ratio: float = 1.0
     contract_price_consistency_long_price: float = 0.0
     contract_price_consistency_short_price: float = 0.0
@@ -1614,8 +1596,8 @@ class SidecarSnapshot:
 
     schema_version: int = SNAPSHOT_SCHEMA_VERSION
     published_at_ms: int = 0
-    # Consumer-only V6 installation watermark. It is authenticated by the
-    # adjacent manifest and deliberately excluded from the inner V5 payload.
+    # Optional producer-ready watermark. Normal snapshots use their atomic
+    # publication timestamp when this field is absent.
     ready_at_ms: int = 0
     market_observed_at_ms: int = 0
     funding_lifecycle: list[FundingLifecycle] = field(default_factory=list)

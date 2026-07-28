@@ -412,40 +412,14 @@ class TestHealthDomainDiagnostics:
 
 
 class TestSidecarScanDiscovery:
-    """OPP-003: Sidecar scan pairs are filtered by directed_pairs."""
+    """Funding opportunities have one production input: the sidecar snapshot."""
 
-    def test_disabled_mode_returns_empty(self):
-        """Disabled mode produces explicit empty pairs, not a silent omission."""
-        from lightfee.config.schema import AppConfig, RuntimeConfig
+    def test_runtime_has_no_compatibility_input_mode(self):
+        from lightfee.config.schema import RuntimeConfig
 
-        config = AppConfig(
-            symbols=["BTCUSDT"],
-            runtime=RuntimeConfig(opportunity_input_mode="disabled"),
-        )
-        assert config.runtime.opportunity_input_mode == "disabled"
-        # Disabled mode should be distinguishable from unconfigured
-        assert config.runtime.opportunity_input_mode != "coarse_sidecar"
+        config = RuntimeConfig()
 
-    def test_sidecar_scan_mode_distinct_from_coarse(self):
-        """Sidecar scan is a distinct mode from coarse sidecar."""
-        from lightfee.config.schema import AppConfig, RuntimeConfig
-
-        config = AppConfig(
-            symbols=["BTCUSDT"],
-            runtime=RuntimeConfig(opportunity_input_mode="sidecar_scan"),
-        )
-        assert config.runtime.opportunity_input_mode == "sidecar_scan"
-        assert config.runtime.opportunity_input_mode != "coarse_sidecar"
-
-    def test_non_parity_mode_is_explicit(self):
-        """Non-parity fallback is explicitly configured, not a hidden default."""
-        from lightfee.config.schema import AppConfig, RuntimeConfig
-
-        config = AppConfig(
-            symbols=["BTCUSDT"],
-            runtime=RuntimeConfig(opportunity_input_mode="non_parity"),
-        )
-        assert config.runtime.opportunity_input_mode == "non_parity"
+        assert "opportunity_input_mode" not in config.__dataclass_fields__
 
 
 # ── DEV-001: Chillybot Removal is Explicit ─────────────────────────────────

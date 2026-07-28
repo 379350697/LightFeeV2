@@ -279,63 +279,6 @@ class TestDailyUniverseConfig:
 # ── CONFIG-003: Runtime Opportunity Modes ──────────────────────────────────
 
 
-class TestOpportunityModes:
-    """CONFIG-003: Runtime distinguishes direct_market, coarse_sidecar, sidecar_scan, disabled, and non-parity fallback modes."""
-
-    def test_direct_market_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "direct_market"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_coarse_sidecar_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "coarse_sidecar"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_single_process_entry_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "single_process_entry"
-        assert validate_config(config) == []
-
-    def test_sidecar_backed_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "sidecar_backed"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_sidecar_scan_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "sidecar_scan"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_disabled_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "disabled"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_non_parity_fallback_mode_valid(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "non_parity"
-        issues = validate_config(config)
-        assert len(issues) == 0
-
-    def test_invalid_mode_rejected(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.runtime.opportunity_input_mode = "invalid_mode"
-        issues = validate_config(config)
-        assert any("opportunity_input_mode" in i for i in issues)
-
-    def test_non_parity_fallback_is_opt_in(self):
-        """Non-parity fallback mode must be explicitly set, not default."""
-        config = AppConfig(symbols=["BTCUSDT"])
-        assert config.runtime.opportunity_input_mode != "non_parity"
-        assert config.runtime.opportunity_input_mode == "single_process_entry"
-
-
 # ── CONFIG-004: Config Validation Errors ───────────────────────────────────
 
 
@@ -371,7 +314,6 @@ class TestConfigValidationErrors:
                 symbols=["BTCUSDT"],
                 runtime=RuntimeConfig(
                     mode="paper",
-                    opportunity_input_mode="coarse_sidecar",
                     daily_universe=DailyUniverseConfig(
                         enabled=True,
                         generate_time_local="08:00:00",

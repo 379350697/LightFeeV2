@@ -10,10 +10,6 @@ import json
 
 from lightfee.config.schema import StrategyConfig
 from lightfee.sidecar.snapshot import CandidateInput
-from lightfee.strategy.funding_canary_policy import (
-    canary_edge_floors,
-    canary_fee_assurance_tier,
-)
 
 
 class BlockReason(Enum):
@@ -29,13 +25,6 @@ class BlockReason(Enum):
     TRANSFER_UNAVAILABLE = "transfer_unavailable"
     MISSING_CANDIDATE_IDENTITY = "missing_candidate_identity_or_funding_timestamp"
     FUNDING_NEW_ENTRIES_DISABLED = "funding_new_entries_disabled"
-    FUNDING_CANARY_VENUE_NOT_ALLOWED = "funding_canary_venue_not_allowed"
-    FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE = (
-        "funding_canary_fee_assurance_unavailable"
-    )
-    FUNDING_CANARY_NOTIONAL_CAP_EXCEEDED = (
-        "funding_canary_notional_cap_exceeded"
-    )
     INCOMPLETE_ECONOMICS = "incomplete_economics"
 
 
@@ -80,35 +69,10 @@ def funding_entry_static_block_reasons(
             if str(reason)
         )
 
-    canary_allowed_venues = {
-        str(venue or "").strip().lower()
-        for venue in config.funding_canary_allowed_venues
-        if str(venue or "").strip()
-    }
-    canary_venue_filter_enabled = (
-        config.funding_canary_enabled is True
-        and (
-            include_entry_control is False
-            or config.funding_new_entries_enabled is True
-        )
-    )
-
     # This is deliberately an entry-only gate: it never affects pending hedge,
     # residual repair, recovery, or any close lifecycle.
     if include_entry_control and config.funding_new_entries_enabled is not True:
         reasons.append(BlockReason.FUNDING_NEW_ENTRIES_DISABLED.value)
-    if canary_venue_filter_enabled and (
-        str(candidate.long_venue or "").strip().lower()
-        not in canary_allowed_venues
-        or str(candidate.short_venue or "").strip().lower()
-        not in canary_allowed_venues
-    ):
-        reasons.append(BlockReason.FUNDING_CANARY_VENUE_NOT_ALLOWED.value)
-    assurance_tier = canary_fee_assurance_tier(candidate, config)
-    if canary_venue_filter_enabled and assurance_tier == "unavailable":
-        reasons.append(
-            BlockReason.FUNDING_CANARY_FEE_ASSURANCE_UNAVAILABLE.value
-        )
     if require_complete_economics and (
         candidate.economics_complete is not True
         or candidate.economics_observed_at_ms <= 0
@@ -137,21 +101,11 @@ def funding_entry_static_block_reasons(
         if max_gap_ms > 0 and stagger_gap_ms > max_gap_ms:
             reasons.append(BlockReason.STAGGER_GAP_TOO_WIDE.value)
 
-    min_expected_edge_bps = config.min_expected_edge_bps
-    min_worst_case_edge_bps = config.min_worst_case_edge_bps
-    if canary_venue_filter_enabled:
-        canary_expected, canary_worst = canary_edge_floors(
-            config,
-            candidate.long_venue,
-            candidate.short_venue,
-        )
-        min_expected_edge_bps = max(min_expected_edge_bps, canary_expected)
-        min_worst_case_edge_bps = max(min_worst_case_edge_bps, canary_worst)
     if candidate.funding_edge_bps < config.min_funding_edge_bps:
         reasons.append(BlockReason.FUNDING_EDGE_BELOW_FLOOR.value)
-    if candidate.expected_edge_bps < min_expected_edge_bps:
+    if candidate.expected_edge_bps < config.min_expected_edge_bps:
         reasons.append(BlockReason.EXPECTED_EDGE_BELOW_FLOOR.value)
-    if candidate.worst_case_edge_bps < min_worst_case_edge_bps:
+    if candidate.worst_case_edge_bps < config.min_worst_case_edge_bps:
         reasons.append(BlockReason.WORST_CASE_EDGE_BELOW_FLOOR.value)
     if candidate.entry_notional_quote <= 0:
         reasons.append(BlockReason.ZERO_ORDER_SIZE.value)

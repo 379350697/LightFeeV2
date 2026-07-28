@@ -311,7 +311,12 @@ def start_bybit_private_ws(transport, symbols: list[str]) -> None:
     base_url = transport._spec.private_base_url.rstrip("/")
     ws_url = _bybit_private_ws_url(base_url)
     private_state = transport._private_ws_state
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    # Bybit's private order/execution/position topics are account-wide.  Keep
+    # a shared mutable mapping so a new candidate does not require a socket
+    # replacement.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
 
     task = asyncio.create_task(
         _bybit_private_ws_loop(

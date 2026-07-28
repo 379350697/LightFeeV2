@@ -1,7 +1,11 @@
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 from scripts import verify_deploy_manifest as manifest
+
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 
 def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch):
@@ -24,7 +28,7 @@ def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch
 
 def test_spread_sidecar_template_is_deploy_critical():
     assert "deploy/systemd/lightfee-spread-sidecar.service" in manifest.CRITICAL_FILES
-    assert "deploy/systemd/lightfee-sidecar.service" not in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-sidecar.service" in manifest.CRITICAL_FILES
 
 
 def test_trade_optimization_timer_assets_are_deploy_critical():
@@ -33,10 +37,10 @@ def test_trade_optimization_timer_assets_are_deploy_critical():
     assert "deploy/systemd/lightfee-trade-optimization-report.timer" in manifest.CRITICAL_FILES
 
 
-def test_fee_evidence_refresh_assets_are_deploy_critical():
-    assert "scripts/refresh_account_fee_evidence.py" in manifest.CRITICAL_FILES
-    assert "deploy/systemd/lightfee-fee-evidence-refresh.service" in manifest.CRITICAL_FILES
-    assert "deploy/systemd/lightfee-fee-evidence-refresh.timer" in manifest.CRITICAL_FILES
+def test_fee_evidence_refresh_assets_are_offline_only():
+    assert "scripts/refresh_account_fee_evidence.py" not in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-fee-evidence-refresh.service" not in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-fee-evidence-refresh.timer" not in manifest.CRITICAL_FILES
 
 
 def _stub_manifest_generation(monkeypatch):
@@ -168,13 +172,14 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert 'echo "=== Remote-local deploy mode: skipping rsync/scp ==="' in script
     assert (
         "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer "
-        "&& systemctl enable --now lightfee-fee-evidence-refresh.timer "
-        "&& systemctl enable lightfee-spread-bbo.service "
-        "&& systemctl restart lightfee-spread-bbo.service "
+        "&& systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service "
+        "&& systemctl restart lightfee-sidecar.service "
         "&& systemctl restart lightfee-spread-sidecar.service "
         "&& systemctl restart lightfee-live.service"
     ) in script
-    assert "lightfee-sidecar.service" not in script
+    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-bbo.service"' not in script
+    assert "systemctl restart lightfee-spread-bbo.service" not in script
+    assert "systemctl enable --now lightfee-fee-evidence-refresh.timer" not in script
     assert "sleep 12" in script
 
 
@@ -240,7 +245,7 @@ def test_generate_deploy_script_installs_trade_optimization_timer(tmp_path, monk
     assert "systemctl restart lightfee-trade-optimization-report.service" not in script
 
 
-def test_generate_deploy_script_installs_fee_evidence_refresh_timer(
+def test_generate_deploy_script_retires_removed_systemd_units_before_restart(
     tmp_path, monkeypatch
 ):
     _stub_manifest_generation(monkeypatch)
@@ -252,16 +257,275 @@ def test_generate_deploy_script_installs_fee_evidence_refresh_timer(
         ssh_port=2222,
     )
 
-    assert (
-        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.service" /etc/systemd/system/lightfee-fee-evidence-refresh.service'
-        in script
+    units = " ".join(manifest.RETIRED_SYSTEMD_UNITS)
+    first_retire = script.index('echo "=== Retiring removed systemd units ==="')
+    first_restart = script.index('echo "=== Restarting production services ==="')
+    last_retire = script.rindex('echo "=== Retiring removed systemd units ==="')
+    last_restart = script.rindex('echo "=== Restarting production services ==="')
+    assert first_retire < first_restart
+    assert last_retire < last_restart
+    local_helper = script[
+        script.index("verify_retired_systemd_unit() {"):
+        script.index("retire_remote_systemd_units() {")
+    ]
+    remote_helper = script[
+        script.index("retire_remote_systemd_units() {"):
+        script.index('echo "=== Generating deploy manifest ==="')
+    ]
+    remote_retire_call = script.rindex("retire_remote_systemd_units")
+    assert remote_retire_call < last_restart
+    assert f"for unit in {units}; do" in local_helper
+    assert f'units="{units}"' in remote_helper
+    for helper in (local_helper, remote_helper):
+        assert 'systemctl stop "$unit" >/dev/null 2>&1 || true' in helper
+        assert 'systemctl disable "$unit" >/dev/null 2>&1 || true' in helper
+        assert 'rm -f "$unit_file"' in helper
+        assert 'systemctl daemon-reload' in helper
+        assert 'systemctl is-active "$unit"' not in helper
+        assert (
+            'active_state="$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null)"'
+            in helper
+        )
+        assert (
+            'load_state="$(systemctl show "$unit" --property=LoadState --value 2>/dev/null)"'
+            in helper
+        )
+        assert 'enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)"' in helper
+        assert 'case "$load_state:$active_state" in' in helper
+        assert "not-found:inactive|loaded:inactive" in helper
+        assert "disabled|not-found" in helper
+        assert "retired systemd unit active-state query failed" in helper
+        assert "retired systemd unit active-state query returned empty" in helper
+        assert "retired systemd unit load-state query failed" in helper
+        assert "retired systemd unit load-state query returned empty" in helper
+        assert "retired systemd unit not inactive or absent" in helper
+        assert "retired systemd unit enabled-state query returned empty" in helper
+        assert "retired systemd unit not disabled or absent" in helper
+        assert "retired systemd unit file still exists" in helper
+    assert 'verify_retired_systemd_unit "$unit"' in local_helper
+    assert 'verify_retired_remote_systemd_unit "$unit"' in remote_helper
+    assert "return 1" in local_helper
+    assert "exit 1" in remote_helper
+    assert f"systemctl reset-failed {units} >/dev/null 2>&1 || true" in local_helper
+    assert "systemctl reset-failed $units >/dev/null 2>&1 || true" in remote_helper
+    assert "disable --now" not in script
+    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.service"' not in script
+    assert "systemctl enable --now lightfee-fee-evidence-refresh.timer" not in script
+
+
+def _local_retired_unit_verifier(script: str) -> str:
+    return script[
+        script.index("verify_retired_systemd_unit() {"):
+        script.index("retire_systemd_units() {")
+    ]
+
+
+def _remote_retired_unit_verifier(script: str) -> str:
+    start = script.index("verify_retired_remote_systemd_unit() {")
+    return script[start:script.index("for unit in $units; do", start)]
+
+
+def _write_fake_systemctl(tmp_path: Path) -> Path:
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir(exist_ok=True)
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/bin/sh
+case "$1" in
+  show)
+    case "$3" in
+      --property=ActiveState)
+        if [ "${LIGHTFEE_FAKE_ACTIVE_RC:-0}" != "0" ]; then
+          printf '%s\\n' "${LIGHTFEE_FAKE_ACTIVE_STATE-}"
+          exit "$LIGHTFEE_FAKE_ACTIVE_RC"
+        fi
+        printf '%s\\n' "${LIGHTFEE_FAKE_ACTIVE_STATE-}"
+        ;;
+      --property=LoadState)
+        if [ "${LIGHTFEE_FAKE_LOAD_RC:-0}" != "0" ]; then
+          printf '%s\\n' "${LIGHTFEE_FAKE_LOAD_STATE-}"
+          exit "$LIGHTFEE_FAKE_LOAD_RC"
+        fi
+        printf '%s\\n' "${LIGHTFEE_FAKE_LOAD_STATE-}"
+        ;;
+      *)
+        exit 64
+        ;;
+    esac
+    ;;
+  is-enabled)
+    printf '%s\\n' "${LIGHTFEE_FAKE_ENABLED_STATE-}"
+    exit "${LIGHTFEE_FAKE_ENABLED_RC:-0}"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+""",
+        encoding="utf-8",
     )
-    assert (
-        'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-fee-evidence-refresh.timer" /etc/systemd/system/lightfee-fee-evidence-refresh.timer'
-        in script
+    systemctl.chmod(0o755)
+    return fake_bin
+
+
+def _run_retired_unit_verifier(
+    *,
+    verifier: str,
+    verifier_function: str,
+    tmp_path: Path,
+    env_overrides: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    fake_bin = _write_fake_systemctl(tmp_path)
+    env = os.environ.copy()
+    env.update(env_overrides)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    command = (
+        f"{verifier}\n"
+        f"{verifier_function} lightfee-generated-contract-test.service\n"
     )
-    assert "systemctl enable --now lightfee-fee-evidence-refresh.timer" in script
-    assert "systemctl restart lightfee-fee-evidence-refresh.service" not in script
+    return _REAL_SUBPROCESS_RUN(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_local_retired_unit_verifier(
+    *,
+    script: str,
+    tmp_path: Path,
+    env_overrides: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return _run_retired_unit_verifier(
+        verifier=_local_retired_unit_verifier(script),
+        verifier_function="verify_retired_systemd_unit",
+        tmp_path=tmp_path,
+        env_overrides=env_overrides,
+    )
+
+
+def _run_remote_retired_unit_verifier(
+    *,
+    script: str,
+    tmp_path: Path,
+    env_overrides: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return _run_retired_unit_verifier(
+        verifier=_remote_retired_unit_verifier(script),
+        verifier_function="verify_retired_remote_systemd_unit",
+        tmp_path=tmp_path,
+        env_overrides=env_overrides,
+    )
+
+
+def test_generated_retired_unit_verifier_accepts_only_verified_safe_states(
+    tmp_path, monkeypatch
+):
+    _stub_manifest_generation(monkeypatch)
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+    active_safe = {
+        "LIGHTFEE_FAKE_ACTIVE_STATE": "inactive",
+        "LIGHTFEE_FAKE_LOAD_STATE": "loaded",
+        "LIGHTFEE_FAKE_ENABLED_STATE": "disabled",
+    }
+    absent_safe = {
+        "LIGHTFEE_FAKE_ACTIVE_STATE": "inactive",
+        "LIGHTFEE_FAKE_LOAD_STATE": "not-found",
+        "LIGHTFEE_FAKE_ENABLED_STATE": "not-found",
+        "LIGHTFEE_FAKE_ENABLED_RC": "1",
+    }
+    runners = (
+        ("local", _run_local_retired_unit_verifier),
+        ("ssh", _run_remote_retired_unit_verifier),
+    )
+
+    for runner_name, run_verifier in runners:
+        assert run_verifier(
+            script=script,
+            tmp_path=tmp_path,
+            env_overrides=active_safe,
+        ).returncode == 0, runner_name
+        assert run_verifier(
+            script=script,
+            tmp_path=tmp_path,
+            env_overrides=absent_safe,
+        ).returncode == 0, runner_name
+
+    failing_cases = [
+        (
+            "active query error",
+            {**active_safe, "LIGHTFEE_FAKE_ACTIVE_RC": "7"},
+            "active-state query failed",
+        ),
+        (
+            "active empty",
+            {**active_safe, "LIGHTFEE_FAKE_ACTIVE_STATE": ""},
+            "active-state query returned empty",
+        ),
+        (
+            "active",
+            {**active_safe, "LIGHTFEE_FAKE_ACTIVE_STATE": "active"},
+            "not inactive or absent",
+        ),
+        (
+            "activating",
+            {**active_safe, "LIGHTFEE_FAKE_ACTIVE_STATE": "activating"},
+            "not inactive or absent",
+        ),
+        (
+            "deactivating",
+            {**active_safe, "LIGHTFEE_FAKE_ACTIVE_STATE": "deactivating"},
+            "not inactive or absent",
+        ),
+        (
+            "load query error",
+            {**active_safe, "LIGHTFEE_FAKE_LOAD_RC": "8"},
+            "load-state query failed",
+        ),
+        (
+            "load empty",
+            {**active_safe, "LIGHTFEE_FAKE_LOAD_STATE": ""},
+            "load-state query returned empty",
+        ),
+        (
+            "load unknown",
+            {**active_safe, "LIGHTFEE_FAKE_LOAD_STATE": "masked"},
+            "not inactive or absent",
+        ),
+        (
+            "enabled empty",
+            {**active_safe, "LIGHTFEE_FAKE_ENABLED_STATE": ""},
+            "enabled-state query returned empty",
+        ),
+        (
+            "enabled",
+            {**active_safe, "LIGHTFEE_FAKE_ENABLED_STATE": "enabled"},
+            "not disabled or absent",
+        ),
+        (
+            "static",
+            {**active_safe, "LIGHTFEE_FAKE_ENABLED_STATE": "static"},
+            "not disabled or absent",
+        ),
+    ]
+    for runner_name, run_verifier in runners:
+        for label, env_overrides, expected_stderr in failing_cases:
+            result = run_verifier(
+                script=script,
+                tmp_path=tmp_path,
+                env_overrides=env_overrides,
+            )
+            case_label = f"{runner_name} {label}"
+            assert result.returncode != 0, case_label
+            assert expected_stderr in result.stderr, case_label
 
 
 def test_generate_deploy_script_preserves_remote_version_and_skips_local_caches(

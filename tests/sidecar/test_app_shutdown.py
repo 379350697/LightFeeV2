@@ -341,38 +341,3 @@ async def test_run_cancels_inflight_refresh_when_runner_is_cancelled():
 
     assert refresh_cancelled.is_set()
     assert service.closed is True
-
-
-@pytest.mark.asyncio
-async def test_run_propagates_bbo_data_plane_failure_and_cancels_refresh():
-    refresh_cancelled = asyncio.Event()
-
-    class FakeService:
-        def __init__(self):
-            self.closed = False
-
-        async def refresh_once(self):
-            try:
-                await asyncio.Future()
-            except asyncio.CancelledError:
-                refresh_cancelled.set()
-                raise
-
-        async def run_spread_bbo_data_plane(self, stop_event):
-            raise RuntimeError("bbo publisher failed")
-
-        async def close(self):
-            self.closed = True
-
-    service = FakeService()
-
-    with pytest.raises(RuntimeError, match="bbo publisher failed"):
-        await sidecar_app._run(
-            service,
-            once=False,
-            refresh_interval_s=60.0,
-            install_shutdown_handlers=lambda _stop_event: lambda: None,
-        )
-
-    assert refresh_cancelled.is_set()
-    assert service.closed is True

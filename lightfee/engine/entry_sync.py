@@ -118,71 +118,6 @@ class EntrySyncExecutor:
         self.post_first_fill_decider = overrides.get("post_first_fill_decider")
 
     @staticmethod
-    def _funding_canary_request_invariant_reason(
-        ctx: EntryContext,
-        request: OrderRequest,
-    ) -> str:
-        if not ctx.funding_canary_enabled_at_entry:
-            return ""
-        try:
-            cap = float(ctx.funding_canary_hard_max_entry_notional_quote or 0.0)
-            price = float(request.price or 0.0)
-            quantity = float(request.quantity or 0.0)
-        except (TypeError, ValueError, OverflowError):
-            return "funding_canary_final_notional_invariant_breached"
-        if price <= 0.0:
-            try:
-                price = float(
-                    ctx.long_price_hint
-                    if request.venue == ctx.long_venue
-                    else ctx.short_price_hint
-                )
-            except (TypeError, ValueError, OverflowError):
-                return "funding_canary_final_notional_invariant_breached"
-        notional = quantity * price
-        if (
-            not all(
-                math.isfinite(value)
-                for value in (cap, quantity, price, notional)
-            )
-            or isinstance(ctx.funding_canary_hard_max_entry_notional_quote, bool)
-            or isinstance(request.quantity, bool)
-            or isinstance(request.price, bool)
-            or cap <= 0.0
-            or quantity <= 0.0
-            or price <= 0.0
-            or notional > cap + 1e-9
-        ):
-            return "funding_canary_final_notional_invariant_breached"
-        return ""
-
-    def _journal_funding_canary_request_breach(
-        self,
-        ctx: EntryContext,
-        request: OrderRequest,
-        *,
-        leg: str,
-        now_ms: int,
-    ) -> None:
-        self.journal.append(
-            "funding_canary_final_notional_invariant_breached",
-            {
-                "position_id": ctx.entry_id,
-                "candidate_revision_id": ctx.candidate_revision_id,
-                "symbol": request.symbol,
-                "venue": request.venue.value,
-                "leg": leg,
-                "quantity": request.quantity,
-                "price": request.price,
-                "funding_canary_hard_max_entry_notional_quote": (
-                    ctx.funding_canary_hard_max_entry_notional_quote
-                ),
-                "reason": "funding_canary_final_notional_invariant_breached",
-                "ts_ms": now_ms,
-            },
-        )
-
-    @staticmethod
     def _align_quantity_down_on_frozen_grid(
         quantity: float,
         step: float,
@@ -472,22 +407,6 @@ class EntrySyncExecutor:
         # Build order requests with clientOrderId, TIF, reduce_only
         maker_req, hedge_req = build_entry_orders(ctx)
 
-        maker_canary_reason = self._funding_canary_request_invariant_reason(
-            ctx,
-            maker_req,
-        )
-        if maker_canary_reason:
-            self._journal_funding_canary_request_breach(
-                ctx,
-                maker_req,
-                leg="maker",
-                now_ms=now_ms,
-            )
-            result.state = EntryState.FAILED
-            result.route = ExecutionRoute.REJECTED
-            result.reject_reason = maker_canary_reason
-            return result
-
         # --- Phase 1: Submit maker ---
         maker_submitted_at_ms = int(time.time() * 1000)
         maker_result = await self._submit_maker(
@@ -647,31 +566,6 @@ class EntrySyncExecutor:
                     "position_id": ctx.entry_id,
                     **direct_hedge_evidence,
                 },
-            )
-        hedge_canary_reason = self._funding_canary_request_invariant_reason(
-            ctx,
-            hedge_req,
-        )
-        if hedge_canary_reason:
-            self._journal_funding_canary_request_breach(
-                ctx,
-                hedge_req,
-                leg="hedge_after_first_fill",
-                now_ms=now_ms,
-            )
-            return await self._unwind_first_leg_after_fill(
-                result=result,
-                ctx=ctx,
-                maker_request=maker_req,
-                maker_fill=maker_fill,
-                decision={
-                    "action": "unwind_first_leg",
-                    "reason": hedge_canary_reason,
-                    "market_evidence": dict(
-                        post_fill.get("market_evidence", {}) or {}
-                    ),
-                },
-                now_ms=now_ms,
             )
         self.journal.append(
             "entry.post_first_fill_decision",

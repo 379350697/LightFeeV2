@@ -305,6 +305,31 @@ class PrivateWsState:
                 return None
             return self._orders.get(key)
 
+    def active_orders_for_symbol_if_fresh(
+        self,
+        symbol: str,
+        max_age_ms: int,
+        wall_clock_now_ms: int,
+    ) -> list[PrivateOrderUpdate]:
+        """Return fresh concrete active-order truth for one symbol."""
+        symbol_key = str(symbol or "").upper()
+        with self._lock:
+            return sorted(
+                [
+                    update
+                    for update in self._orders.values()
+                    if str(update.symbol or "").upper() == symbol_key
+                    and update.state is not None
+                    and not update.state.is_terminal()
+                    and (
+                        max_age_ms <= 0
+                        or wall_clock_now_ms - update.updated_at_ms <= max_age_ms
+                    )
+                ],
+                key=lambda update: (update.updated_at_ms, update.order_id),
+                reverse=True,
+            )
+
     def order_progress_if_fresh(
         self,
         client_order_id: Optional[str] = None,

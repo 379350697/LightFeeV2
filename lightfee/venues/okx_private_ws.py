@@ -353,10 +353,14 @@ async def _okx_private_ws_loop(
     """V1 OKX private WS loop — connect, login, subscribe, message + watchdog loop."""
     from lightfee.marketdata.resilience import compute_backoff_ms
 
-    subscribe_messages = _build_okx_private_subscribe_messages(symbol_map)
+    if ct_val_map is None:
+        ct_val_map = {}
     failures = 0
 
     while True:
+        # Rebuild from the current shared map before each real transport
+        # reconnect.  The same map also receives in-band additions below.
+        subscribe_messages = _build_okx_private_subscribe_messages(symbol_map)
         # 1) Connect
         try:
             ws = await websockets.connect(ws_url)
@@ -451,6 +455,36 @@ async def _okx_private_ws_loop(
 
         try:
             while True:
+                consume_updates = getattr(
+                    transport,
+                    "consume_private_ws_symbol_updates",
+                    None,
+                )
+                updates = (
+                    consume_updates()
+                    if subscribed and callable(consume_updates)
+                    else {}
+                )
+                if updates:
+                    update_ct_val_map = _build_okx_ct_val_map(transport, updates)
+                    missing_ct_val = sorted(set(updates) - set(update_ct_val_map))
+                    if missing_ct_val:
+                        transport.record_private_ws_failure(
+                            _now_ms(),
+                            "okx private ws ctVal metadata missing: "
+                            + ",".join(missing_ct_val[:10]),
+                            unhealthy_after=1,
+                        )
+                        logger.warning(
+                            "okx private WS subscription skipped: missing ctVal for %d symbols",
+                            len(missing_ct_val),
+                        )
+                    else:
+                        ct_val_map.update(update_ct_val_map)
+                        for update_message in _build_okx_private_subscribe_messages(
+                            updates
+                        ):
+                            await ws.send(update_message)
                 try:
                     message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -545,7 +579,11 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
     ws_url = _okx_private_ws_url(base_url)
     private_state = transport._private_ws_state
 
-    symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    # OKX private topics are instrument-scoped.  The transport-owned map is
+    # retained and the active worker subscribes additions in-band.
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if symbol_map is None:
+        symbol_map = {transport._venue_symbol(s): s for s in symbols}
     ct_val_map = _build_okx_ct_val_map(transport, symbol_map)
     missing_ct_val = sorted(set(symbol_map) - set(ct_val_map))
     if missing_ct_val:

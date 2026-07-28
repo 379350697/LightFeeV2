@@ -12,7 +12,6 @@ import math
 from collections import Counter, OrderedDict, deque
 from typing import Any
 
-from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.business_contract import quote_rewarm_handoff_contract
@@ -29,7 +28,6 @@ from lightfee.marketdata.open_interest import (
     open_interest_timestamps_are_fresh,
     open_interest_uses_cache_fallback,
 )
-from lightfee.persistence.open_interest_store import OpenInterestEvidenceStore
 from lightfee.sidecar.snapshot import funding_rate_evidence_reason
 
 ENTRY_OPEN_INTEREST_HOT_CACHE_MAX_ENTRIES = 256
@@ -253,30 +251,14 @@ class EntryOpenInterestRefresher:
         self,
         *,
         targeted_budget_s: float | None = None,
-        durable_store: OpenInterestEvidenceStore | None = None,
-        durable_store_path: str | None = None,
-        prewarm_interval_ms: int = 15 * 60_000,
     ) -> None:
         self._clients: dict[str, Any] = {}
         self._cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._inflight_started_at_ms: dict[tuple[str, str], int] = {}
-        self._prewarm_inflight_keys: set[tuple[str, str]] = set()
         self._venue_semaphores: dict[str, asyncio.Semaphore] = {}
-        self._prewarm_venue_gates: dict[str, asyncio.Lock] = {}
         self._cache_max_entries = ENTRY_OPEN_INTEREST_HOT_CACHE_MAX_ENTRIES
-        self._durable_store = durable_store
-        if self._durable_store is None and str(durable_store_path or "").strip():
-            self._durable_store = OpenInterestEvidenceStore(durable_store_path)
-        self._prewarm_interval_ms = max(int(prewarm_interval_ms or 0), 1)
-        # This is a transport single-flight bound, not an opportunity-membership
-        # cap.  The caller keeps the complete eligible frontier queued and
-        # launches more targets as capacity is released.
-        self._max_inflight = 64
-        self._max_prewarm_inflight = 4
-        self._last_prewarm_started_ms = 0
         self._reused_count = 0
-        self._deferred_count = 0
         self._cancelled_count = 0
         if targeted_budget_s is None:
             from lightfee.venues.market_data import (
@@ -296,61 +278,20 @@ class EntryOpenInterestRefresher:
             await asyncio.gather(*inflight, return_exceptions=True)
         self._inflight.clear()
         self._inflight_started_at_ms.clear()
-        self._prewarm_inflight_keys.clear()
         self._cache.clear()
         self._venue_semaphores.clear()
-        self._prewarm_venue_gates.clear()
         for client in list(self._clients.values()):
             close = getattr(client, "close", None)
             if callable(close):
                 await close()
         self._clients.clear()
 
-    def cancel_prewarm(self) -> None:
-        """Preempt low-priority OI maintenance in favor of entry execution."""
-        for key in list(self._prewarm_inflight_keys):
-            task = self._inflight.pop(key, None)
-            self._inflight_started_at_ms.pop(key, None)
-            self._prewarm_inflight_keys.discard(key)
-            if task is not None and not task.done():
-                self._cancelled_count += 1
-                task.cancel()
-
-    def prewarm_due(self, *, now_ms: int) -> bool:
-        return (
-            self._last_prewarm_started_ms <= 0
-            or int(now_ms) - self._last_prewarm_started_ms >= self._prewarm_interval_ms
-        )
-
-    def mark_prewarm_started(self, *, now_ms: int) -> None:
-        self._last_prewarm_started_ms = int(now_ms)
-
-    def delete_expired(
-        self,
-        *,
-        now_ms: int,
-        max_age_ms: int = ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
-    ) -> int:
-        store = self._durable_store
-        if store is None:
-            return 0
-        return store.delete_expired(now_ms=now_ms, max_age_ms=max_age_ms)
-
-    def _active_inflight_count(self, *, include_prewarm: bool = True) -> int:
+    def _active_inflight_count(self) -> int:
         return sum(
             1
-            for key, task in self._inflight.items()
+            for task in self._inflight.values()
             if not task.done()
-            and (include_prewarm or key not in self._prewarm_inflight_keys)
         )
-
-    def _prewarm_venue_gate(self, venue: str) -> asyncio.Lock:
-        venue_key = str(venue or "").strip().lower()
-        gate = self._prewarm_venue_gates.get(venue_key)
-        if gate is None:
-            gate = asyncio.Lock()
-            self._prewarm_venue_gates[venue_key] = gate
-        return gate
 
     def _remember_observed_open_interest(
         self,
@@ -359,7 +300,6 @@ class EntryOpenInterestRefresher:
         symbol: str,
         payload: dict[str, Any] | None,
         now_ms: int,
-        persist: bool,
     ) -> bool:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
@@ -404,14 +344,6 @@ class EntryOpenInterestRefresher:
         self._cache.move_to_end(cache_key)
         while len(self._cache) > self._cache_max_entries:
             self._cache.popitem(last=False)
-        store = self._durable_store
-        if persist and store is not None:
-            store.store_observed(
-                venue=venue_key,
-                symbol=symbol_key,
-                payload=payload,
-                now_ms=now_ms,
-            )
         return True
 
     def scheduler_metrics(self, *, now_ms: int) -> dict[str, int]:
@@ -427,12 +359,12 @@ class EntryOpenInterestRefresher:
         return {
             "inflight_count": self._active_inflight_count(),
             "queued_count": 0,
-            "max_inflight": self._max_inflight,
+            "max_inflight": 2,
             "oldest_age_ms": (
                 max(int(now_ms) - oldest_started, 0) if oldest_started else 0
             ),
             "reused_count": self._reused_count,
-            "deferred_count": self._deferred_count,
+            "deferred_count": 0,
             "cancelled_count": self._cancelled_count,
         }
 
@@ -450,23 +382,6 @@ class EntryOpenInterestRefresher:
         cached = self._cache.get((venue_key, symbol_key))
         if cached is not None:
             self._cache.move_to_end((venue_key, symbol_key))
-        else:
-            store = self._durable_store
-            if store is not None:
-                cached = store.load_observed(
-                    venue=venue_key,
-                    symbol=symbol_key,
-                    now_ms=now_ms,
-                    max_age_ms=max_age_ms,
-                )
-                if cached is not None:
-                    self._remember_observed_open_interest(
-                        venue=venue_key,
-                        symbol=symbol_key,
-                        payload=cached,
-                        now_ms=now_ms,
-                        persist=False,
-                    )
         return _open_interest_cache_fallback_payload(
             venue=venue_key,
             symbol=symbol_key,
@@ -501,16 +416,9 @@ class EntryOpenInterestRefresher:
         cache_fallback_max_age_ms: int = (
             ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
         ),
-        priority: str = "entry_execution",
     ) -> dict[str, Any] | None:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
-        priority_key = str(priority or "entry_execution").strip().lower()
-        is_prewarm = priority_key in {
-            "prewarm",
-            "prewarm_only",
-            "maintenance",
-        } or priority_key.startswith("prewarm")
         if not symbol_key:
             return {
                 "open_interest_quote": None,
@@ -524,8 +432,7 @@ class EntryOpenInterestRefresher:
         received_at_ms = int((cached or {}).get("open_interest_received_at_ms", 0) or 0)
         event_at_ms = int((cached or {}).get("open_interest_event_at_ms", 0) or 0)
         if (
-            not is_prewarm
-            and cached is not None
+            cached is not None
             and normalize_open_interest_status(
                 cached.get("open_interest_evidence_status", "unavailable")
             ) == "observed"
@@ -545,127 +452,15 @@ class EntryOpenInterestRefresher:
         ):
             return dict(cached)
 
-        if not is_prewarm:
-            store = self._durable_store
-            durable = None
-            if store is not None:
-                durable = store.load_observed(
-                    venue=venue_key,
-                    symbol=symbol_key,
-                    now_ms=now_ms,
-                    max_age_ms=cache_fallback_max_age_ms,
-                )
-            if durable is not None:
-                self._remember_observed_open_interest(
-                    venue=venue_key,
-                    symbol=symbol_key,
-                    payload=durable,
-                    now_ms=now_ms,
-                    persist=False,
-                )
-                fallback = _open_interest_cache_fallback_payload(
-                    venue=venue_key,
-                    symbol=symbol_key,
-                    payload=durable,
-                    now_ms=now_ms,
-                    reason="entry_oi_durable_cache_fallback",
-                    max_age_ms=cache_fallback_max_age_ms,
-                )
-                if fallback is not None:
-                    return {
-                        **fallback,
-                        **self.scheduler_metrics(now_ms=now_ms),
-                    }
-
-        if not is_prewarm:
-            self.cancel_prewarm()
         task = self._inflight.get(inflight_key)
-        owns_inflight_task = False
         if task is None or task.done():
-            if is_prewarm:
-                same_venue_prewarm_active = False
-                for existing_key in self._prewarm_inflight_keys:
-                    if existing_key == inflight_key or existing_key[0] != venue_key:
-                        continue
-                    existing_task = self._inflight.get(existing_key)
-                    if existing_task is not None and not existing_task.done():
-                        same_venue_prewarm_active = True
-                        break
-                if same_venue_prewarm_active:
-                    self._deferred_count += 1
-                    fallback = self.cached_open_interest(
-                        venue_key,
-                        symbol_key,
-                        now_ms=now_ms,
-                        max_age_ms=cache_fallback_max_age_ms,
-                        reason="entry_oi_prewarm_venue_capacity_cache_fallback",
-                    )
-                    if fallback is not None:
-                        return {
-                            **fallback,
-                            "oi_scheduler_deferred_count": 1,
-                            **self.scheduler_metrics(now_ms=now_ms),
-                        }
-                    return {
-                        "open_interest_quote": None,
-                        "open_interest_evidence_status": "deferred",
-                        "open_interest_evidence_reason": (
-                            "entry_oi_prewarm_venue_capacity_reserved"
-                        ),
-                        "oi_scheduler_deferred_count": 1,
-                        **self.scheduler_metrics(now_ms=now_ms),
-                    }
-            live_inflight = self._active_inflight_count(include_prewarm=False)
-            prewarm_inflight = self._active_inflight_count() - live_inflight
-            capacity_exceeded = (
-                prewarm_inflight >= self._max_prewarm_inflight
-                or self._active_inflight_count() >= self._max_inflight
-            )
-            if not is_prewarm:
-                capacity_exceeded = live_inflight >= self._max_inflight
-            if capacity_exceeded:
-                self._deferred_count += 1
-                fallback = self.cached_open_interest(
-                    venue_key,
-                    symbol_key,
-                    now_ms=now_ms,
-                    max_age_ms=cache_fallback_max_age_ms,
-                    reason="entry_evidence_scheduler_cache_fallback",
-                )
-                if fallback is not None:
-                    return {
-                        **fallback,
-                        "oi_scheduler_deferred_count": 1,
-                        **self.scheduler_metrics(now_ms=now_ms),
-                    }
-                deferred_reason = (
-                    "entry_oi_prewarm_scheduler_capacity_reserved"
-                    if is_prewarm
-                    else "entry_evidence_scheduler_capacity_exceeded"
-                )
-                return {
-                    "open_interest_quote": None,
-                    "open_interest_evidence_status": "deferred",
-                    "open_interest_evidence_reason": deferred_reason,
-                    "oi_scheduler_deferred_count": 1,
-                    **self.scheduler_metrics(now_ms=now_ms),
-                }
             async def _load() -> dict[str, Any] | None:
-                if is_prewarm:
-                    async with self._prewarm_venue_gate(venue_key):
-                        batch = await self.refresh_open_interest_batch(
-                            venue_key,
-                            [symbol_key],
-                            now_ms=now_ms,
-                            force_refresh=force_refresh,
-                        )
-                else:
-                    batch = await self.refresh_open_interest_batch(
-                        venue_key,
-                        [symbol_key],
-                        now_ms=now_ms,
-                        force_refresh=force_refresh,
-                    )
+                batch = await self.refresh_open_interest_batch(
+                    venue_key,
+                    [symbol_key],
+                    now_ms=now_ms,
+                    force_refresh=force_refresh,
+                )
                 return batch.get(symbol_key)
 
             task = asyncio.create_task(
@@ -674,13 +469,9 @@ class EntryOpenInterestRefresher:
             )
             self._inflight[inflight_key] = task
             self._inflight_started_at_ms[inflight_key] = int(now_ms)
-            owns_inflight_task = True
-            if is_prewarm:
-                self._prewarm_inflight_keys.add(inflight_key)
 
             def _completed(done: asyncio.Task) -> None:
                 if self._inflight.get(inflight_key) is done:
-                    self._prewarm_inflight_keys.discard(inflight_key)
                     self._inflight.pop(inflight_key, None)
                     self._inflight_started_at_ms.pop(inflight_key, None)
                 if done.cancelled():
@@ -710,7 +501,6 @@ class EntryOpenInterestRefresher:
                     symbol=symbol_key,
                     payload=payload,
                     now_ms=completion_now_ms,
-                    persist=True,
                 )
 
             task.add_done_callback(_completed)
@@ -720,40 +510,21 @@ class EntryOpenInterestRefresher:
         # singleflight request and leave a connection/rate-limit task orphaned.
         try:
             result = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if is_prewarm and task.cancelled():
-                return {
-                    "open_interest_quote": None,
-                    "open_interest_evidence_status": "deferred",
-                    "open_interest_evidence_reason": "entry_oi_prewarm_cancelled",
-                    **self.scheduler_metrics(now_ms=now_ms),
-                }
-            if priority_key == "prewarm_only" and owns_inflight_task:
-                if self._inflight.get(inflight_key) is task:
-                    self._inflight.pop(inflight_key, None)
-                    self._inflight_started_at_ms.pop(inflight_key, None)
-                    self._prewarm_inflight_keys.discard(inflight_key)
-                if not task.done():
-                    self._cancelled_count += 1
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            raise
         except Exception as exc:
             status = _open_interest_exception_status(exc)
-            if not is_prewarm:
-                fallback = self.cached_open_interest(
-                    venue_key,
-                    symbol_key,
-                    now_ms=now_ms,
-                    max_age_ms=cache_fallback_max_age_ms,
-                    reason=f"{status}_cache_fallback",
-                )
-                if fallback is not None:
-                    return {
-                        **fallback,
-                        **_open_interest_exception_phase_timings(exc),
-                        **self.scheduler_metrics(now_ms=now_ms),
-                    }
+            fallback = self.cached_open_interest(
+                venue_key,
+                symbol_key,
+                now_ms=now_ms,
+                max_age_ms=cache_fallback_max_age_ms,
+                reason=f"{status}_cache_fallback",
+            )
+            if fallback is not None:
+                return {
+                    **fallback,
+                    **_open_interest_exception_phase_timings(exc),
+                    **self.scheduler_metrics(now_ms=now_ms),
+                }
             raise
         if result is None:
             return None
@@ -783,16 +554,15 @@ class EntryOpenInterestRefresher:
                 or result.get("open_interest_evidence_status")
                 or "targeted_refresh_failed"
             )
-            if not is_prewarm:
-                fallback = self.cached_open_interest(
-                    venue_key,
-                    symbol_key,
-                    now_ms=now_ms,
-                    max_age_ms=cache_fallback_max_age_ms,
-                    reason=f"{reason}_cache_fallback",
-                )
-                if fallback is not None:
-                    result = {**result, **fallback}
+            fallback = self.cached_open_interest(
+                venue_key,
+                symbol_key,
+                now_ms=now_ms,
+                max_age_ms=cache_fallback_max_age_ms,
+                reason=f"{reason}_cache_fallback",
+            )
+            if fallback is not None:
+                result = {**result, **fallback}
         return {
             **result,
             **self.scheduler_metrics(now_ms=now_ms),
@@ -1445,15 +1215,6 @@ class MarketDataRuntime:
         def candidate_oi_allows_l2(candidate) -> bool:
             evidence = getattr(candidate, "entry_open_interest_evidence", None)
             if not isinstance(evidence, dict):
-                return False
-            revision_id = str(
-                getattr(candidate, "evidence_candidate_revision_id", "")
-                or getattr(candidate, "candidate_revision_id", "")
-                or ""
-            )
-            if not revision_id:
-                return False
-            if str(evidence.get("candidate_revision_id") or "") != revision_id:
                 return False
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
             if not symbol:
@@ -3494,7 +3255,7 @@ class MarketDataRuntime:
 
     @staticmethod
     def _snapshot_publication_at_ms(snapshot) -> int:
-        """Use the verified V7 install watermark, with legacy compatibility."""
+        """Use the normal snapshot publication watermark."""
         return int(
             getattr(snapshot, "ready_at_ms", 0)
             or getattr(snapshot, "published_at_ms", 0)
@@ -3983,30 +3744,8 @@ class MarketDataRuntime:
         refresher = getattr(self, "entry_open_interest_refresher", None)
         if refresher is not None:
             return refresher
-        runtime_config = self.ctx.config.runtime
-        durable_store_path = str(
-            getattr(
-                runtime_config,
-                "entry_open_interest_store_path",
-                "runtime/entry-open-interest-evidence-v1.sqlite3",
-            )
-            or ""
-        ).strip()
-        if durable_store_path:
-            durable_store_path = str(
-                resolve_config_artifact_path(self.ctx.config, durable_store_path)
-            )
         refresher = EntryOpenInterestRefresher(
             targeted_budget_s=self._entry_open_interest_refresh_timeout_s(),
-            durable_store_path=durable_store_path,
-            prewarm_interval_ms=_positive_runtime_ms(
-                getattr(
-                    runtime_config,
-                    "entry_open_interest_background_refresh_ms",
-                    15 * 60_000,
-                ),
-                default=15 * 60_000,
-            ),
         )
         setattr(self, "entry_open_interest_refresher", refresher)
         return refresher
@@ -4069,85 +3808,11 @@ class MarketDataRuntime:
             self._entry_open_interest_cache_fallback_max_age_ms()
         )
 
-        def _record_prewarm_scan_stats() -> None:
-            self.ctx.state.last_scan["oi_prewarm_extra_candidate_scope"] = (
-                candidate_scope
-            )
-            self.ctx.state.last_scan["oi_prewarm_extra_candidate_count"] = stats[
-                "candidate_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_target_count"] = stats[
-                "target_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_attempt_count"] = stats[
-                "attempt_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_resolved_count"] = stats[
-                "resolved_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_failed_count"] = stats[
-                "failed_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_timeout_count"] = stats[
-                "timeout_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_unsupported_count"] = stats[
-                "unsupported_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_deferred_count"] = stats[
-                "deferred_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_cleanup_deleted_count"] = stats[
-                "cleanup_deleted_count"
-            ]
-            self.ctx.state.last_scan["oi_prewarm_extra_cleanup_failed_count"] = stats[
-                "cleanup_failed_count"
-            ]
-            if stats.get("prewarm_skipped_reason"):
-                self.ctx.state.last_scan["oi_prewarm_extra_skipped_reason"] = stats[
-                    "prewarm_skipped_reason"
-                ]
-
-        refresher = None
         if evidence_role == "prewarm_only":
-            refresher = self._entry_open_interest_refresher()
-            prewarm_due = getattr(refresher, "prewarm_due", None)
-            if callable(prewarm_due) and not prewarm_due(now_ms=now_ms):
-                stats["deferred_count"] = len(candidates or [])
-                stats["prewarm_skipped_reason"] = (
-                    "entry_oi_prewarm_cadence_not_due"
-                )
-                _record_prewarm_scan_stats()
-                return stats
-            delete_expired = getattr(refresher, "delete_expired", None)
-            if callable(delete_expired):
-                try:
-                    stats["cleanup_deleted_count"] = int(
-                        delete_expired(
-                            now_ms=now_ms,
-                            max_age_ms=oi_cache_fallback_max_age_ms,
-                        )
-                        or 0
-                    )
-                except Exception as exc:  # pragma: no cover - defensive telemetry
-                    stats["cleanup_failed_count"] = 1
-                    self.ctx.journal.append(
-                        "runtime.entry_oi_durable_cleanup_failed",
-                        {
-                            "error": f"{type(exc).__name__}: {exc}"[:240],
-                            "candidate_scope": candidate_scope,
-                            "evidence_role": evidence_role,
-                            "ts_ms": now_ms,
-                        },
-                    )
-            mark_prewarm_started = getattr(refresher, "mark_prewarm_started", None)
-            if callable(mark_prewarm_started):
-                mark_prewarm_started(now_ms=now_ms)
-            if not candidates:
-                _record_prewarm_scan_stats()
-                return stats
-        elif not candidates:
+            raise ValueError("entry OI prewarm was removed; refresh candidates on demand")
+        if not candidates:
             return stats
+        refresher = None
 
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
         structural_probe_due: set[tuple[str, str]] = set()
@@ -4247,8 +3912,7 @@ class MarketDataRuntime:
                     ),
                 )
                 if (
-                    evidence_role != "prewarm_only"
-                    and evidence_status == "observed"
+                    evidence_status == "observed"
                     and evidence_is_fresh
                     and key not in structural_probe_due
                 ):
@@ -4303,12 +3967,9 @@ class MarketDataRuntime:
                         candidate_index=candidate_index,
                         state="ready",
                     )
-            if evidence_role == "prewarm_only":
-                _record_prewarm_scan_stats()
-            else:
-                self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
-                self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
-                self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
+            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
+            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
+            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
             return stats
 
         if refresher is None:
@@ -4748,10 +4409,7 @@ class MarketDataRuntime:
                 started_monotonic = loop.time()
                 try:
                     structural_force_refresh = (venue, symbol) in structural_probe_due
-                    force_refresh = (
-                        evidence_role == "prewarm_only"
-                        or structural_force_refresh
-                    )
+                    force_refresh = structural_force_refresh
                     if structural_force_refresh:
                         # Throttle the *attempt*, not only successful low/high
                         # observations.  A timeout/rate-limit must not cause a
@@ -4785,7 +4443,6 @@ class MarketDataRuntime:
                             force_refresh=force_refresh,
                             max_age_ms=oi_max_age_ms,
                             cache_fallback_max_age_ms=oi_cache_fallback_max_age_ms,
-                            priority=evidence_role,
                         )
                     except TypeError:
                         # Compatibility for injected legacy/test refreshers.
@@ -4851,37 +4508,11 @@ class MarketDataRuntime:
             queued_keys = list(target_rows)
             target_tasks: dict[tuple[str, str], asyncio.Task] = {}
             task_keys: dict[asyncio.Task, tuple[str, str]] = {}
-            # Queue the complete frontier behind the refresher's transport
-            # single-flight capacity.  As each target settles, the next ranked
-            # target is launched, so capacity pressure delays lower routes
-            # instead of permanently classifying them as ineligible.
-            transport_limit = int(getattr(refresher, "_max_inflight", 0) or 0)
             max_in_flight = max(len(target_rows), 1)
-            if transport_limit > 0:
-                max_in_flight = min(max_in_flight, transport_limit)
-            if evidence_role == "prewarm_only":
-                prewarm_limit = int(
-                    getattr(refresher, "_max_prewarm_inflight", 0) or 0
-                )
-                if prewarm_limit > 0:
-                    max_in_flight = min(max_in_flight, prewarm_limit)
 
             def _launch_more_targets() -> None:
                 while queued_keys and len(task_keys) < max_in_flight:
-                    next_index = 0
-                    if evidence_role == "prewarm_only":
-                        active_venues = {key[0] for key in task_keys.values()}
-                        next_index = next(
-                            (
-                                index
-                                for index, queued_key in enumerate(queued_keys)
-                                if queued_key[0] not in active_venues
-                            ),
-                            -1,
-                        )
-                        if next_index < 0:
-                            break
-                    key = queued_keys.pop(next_index)
+                    key = queued_keys.pop(0)
                     venue, symbol, quote, previous_status = target_rows[key]
                     task = asyncio.create_task(
                         _refresh_single_target(
@@ -4943,9 +4574,7 @@ class MarketDataRuntime:
                 return selection_ready
 
             loop = asyncio.get_running_loop()
-            cycle_deadline = None
-            if evidence_role != "prewarm_only":
-                cycle_deadline = loop.time() + oi_refresh_timeout_s
+            cycle_deadline = loop.time() + oi_refresh_timeout_s
             pending = set(target_tasks.values())
             _highest_resolved_candidate_is_ready()
             try:
@@ -5046,36 +4675,33 @@ class MarketDataRuntime:
                 )
             _highest_resolved_candidate_is_ready()
 
-        if evidence_role == "prewarm_only":
-            _record_prewarm_scan_stats()
-        else:
-            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
-                "attempt_count"
-            ]
-            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
-                "resolved_count"
-            ]
-            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
-                "failed_count"
-            ]
-            self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
-                "timeout_count"
-            ]
-            self.ctx.state.last_scan[
-                "oi_targeted_refresh_superseded_count"
-            ] = stats["superseded_by_ready_candidate_count"]
-            self.ctx.state.last_scan["oi_targeted_refresh_deferred_count"] = stats[
-                "deferred_count"
-            ]
-            self.ctx.state.last_scan[
-                "oi_entry_evidence_deadline_exceeded_count"
-            ] = stats["entry_evidence_deadline_exceeded_count"]
-            self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
-                "unsupported_count"
-            ]
-            self.ctx.state.last_scan[
-                "entry_blocked_after_targeted_refresh_count"
-            ] = stats["blocked_after_targeted_refresh_count"]
+        self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
+            "attempt_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
+            "resolved_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
+            "failed_count"
+        ]
+        self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
+            "timeout_count"
+        ]
+        self.ctx.state.last_scan[
+            "oi_targeted_refresh_superseded_count"
+        ] = stats["superseded_by_ready_candidate_count"]
+        self.ctx.state.last_scan["oi_targeted_refresh_deferred_count"] = stats[
+            "deferred_count"
+        ]
+        self.ctx.state.last_scan[
+            "oi_entry_evidence_deadline_exceeded_count"
+        ] = stats["entry_evidence_deadline_exceeded_count"]
+        self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
+            "unsupported_count"
+        ]
+        self.ctx.state.last_scan[
+            "entry_blocked_after_targeted_refresh_count"
+        ] = stats["blocked_after_targeted_refresh_count"]
         return stats
 
     @staticmethod
@@ -5763,15 +5389,6 @@ class MarketDataRuntime:
             getattr(snapshot, "candidate_build_diagnostics", {}) or {}
         )
 
-        def _diagnostic_int(name: str) -> int:
-            value = candidate_diagnostics.get(name, 0)
-            if isinstance(value, bool):
-                return 0
-            try:
-                return int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-
         top_degraded_symbols: list[str] = []
         if isinstance(degraded_symbols, dict):
             for symbols in degraded_symbols.values():
@@ -5901,23 +5518,6 @@ class MarketDataRuntime:
             "source_mode": str(getattr(snapshot, "source_mode", "") or ""),
             "acquisition_mode": str(getattr(snapshot, "acquisition_mode", "") or ""),
             "source_data_ready": candidate_diagnostics.get("source_data_ready") is True,
-            "eligible_frontier_complete": (
-                candidate_diagnostics.get("eligible_frontier_complete") is True
-            ),
-            "entry_frontier_ready": (
-                candidate_diagnostics.get("entry_frontier_ready") is True
-            ),
-            "frontier_input_pair_count": _diagnostic_int("seed_pair_count"),
-            "pair_decision_count": _diagnostic_int("pair_decision_count"),
-            "eligible_candidate_count": _diagnostic_int(
-                "eligible_candidate_count"
-            ),
-            "omitted_eligible_count": _diagnostic_int(
-                "omitted_eligible_count"
-            ),
-            "frontier_stop_reason": str(
-                candidate_diagnostics.get("frontier_stop_reason", "") or ""
-            ),
             "snapshot_path": snapshot_path,
             "config_hash": config_hash,
             "ts_ms": now_ms,

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -31,20 +29,6 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
 )
-
-
-def _schedule_audit_build(
-    service: SidecarService,
-    snapshot: SidecarSnapshot,
-    candidate_service,
-) -> None:
-    service._schedule_audit_snapshot_publish(
-        snapshot,
-        candidate_service=candidate_service,
-        quotes={},
-        symbols=[],
-        observed_at_ms=snapshot.published_at_ms,
-    )
 
 
 def _complete_contract_fields(*, quantity_precision: int = 3) -> dict[str, object]:
@@ -117,7 +101,7 @@ def test_funding_candidate_service_reuses_prepared_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
+async def test_refresh_once_publishes_full_single_snapshot_without_candidate_cap(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -135,10 +119,6 @@ async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
     service._last_good_at_ms_by_key = {}
     service._last_liquidity_publish_at_ms = 0
     service._last_liquidity_publish_at_ms_by_key = {}
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._audit_executor = None
 
     class RecordingBuilder:
         def __init__(self) -> None:
@@ -152,9 +132,6 @@ async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
     service._new_candidate_service = lambda *, now_ms=None: builder
 
     async def no_funding(symbols, timeout_s, **_kwargs):
-        return []
-
-    async def no_entry_bbo(symbols):
         return []
 
     async def no_liquidity(
@@ -163,100 +140,33 @@ async def test_refresh_once_builds_live_entry_frontier_without_top32_cap(
         return []
 
     service._fetch_all_venues = no_funding
-    service._fetch_funding_entry_bbo_all_venues = no_entry_bbo
     service._fetch_liquidity_all_venues = no_liquidity
     monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: 1.0)
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_funding_entry_snapshot",
-        lambda *_args, **_kwargs: {},
-    )
+    published: list[SidecarSnapshot] = []
     monkeypatch.setattr(
         "lightfee.sidecar.service.publish_snapshot",
-        lambda *_args, **_kwargs: None,
+        lambda snapshot, _path: published.append(snapshot),
     )
 
     await service.refresh_once()
 
     assert builder.calls
     assert "max_candidates" not in builder.calls[0]
+    assert published and published[0].candidates == []
 
 
-@pytest.mark.asyncio
-async def test_in_process_entry_never_uses_funding_snapshot_handoff(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = object.__new__(SidecarService)
-    service.in_process_entry = True
-    service.embedded_spread_bbo_enabled = False
-    service.config = AppConfig(
+def test_funding_sidecar_exposes_only_the_single_snapshot_data_plane(tmp_path) -> None:
+    config = AppConfig(
         symbols=["BTCUSDT"],
         venues=[VenueConfig(venue="binance")],
     )
-    service.snapshot_path = tmp_path / "sidecar.json"
-    service.config.runtime.sidecar_snapshot_path = str(service.snapshot_path)
-    service._funding_timeout_s = 1.0
-    service._liquidity_timeout_s = 1.0
-    service._last_good_quotes = {}
-    service._last_good_at_ms = 0
-    service._last_good_at_ms_by_key = {}
-    service._last_liquidity_publish_at_ms = 0
-    service._last_liquidity_publish_at_ms_by_key = {}
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._audit_executor = None
+    config.runtime.sidecar_snapshot_path = str(tmp_path / "sidecar.json")
 
-    class RecordingBuilder:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
+    service = SidecarService(config)
 
-        def build(self, *_args, **kwargs):
-            self.calls.append(dict(kwargs))
-            return []
-
-    builder = RecordingBuilder()
-    service._new_candidate_service = lambda *, now_ms=None: builder
-
-    async def no_funding(symbols, timeout_s, **_kwargs):
-        return []
-
-    async def unexpected_entry_bbo(*_args, **_kwargs):
-        raise AssertionError("single-process path started a sidecar BBO fetch")
-
-    service._fetch_all_venues = no_funding
-    service._fetch_funding_entry_bbo_all_venues = unexpected_entry_bbo
-    monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: 1.0)
-    for name in (
-        "load_snapshot",
-        "publish_funding_entry_snapshot",
-        "publish_snapshot",
-        "publish_spread_quote_snapshot",
-    ):
-        monkeypatch.setattr(
-            f"lightfee.sidecar.service.{name}",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError(f"single-process path called {name}")
-            ),
-        )
-
-    snapshot = await service.refresh_in_process_entry(
-        {
-            ("binance", "BTCUSDT"): TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=100.0,
-                ask=101.0,
-                observed_at_ms=1_000,
-                received_at_ms=1_000,
-                source="ws_bbo",
-            )
-        }
-    )
-
-    assert snapshot.source_mode == "single_process_entry"
-    assert snapshot.acquisition_mode == "direct_market_view"
-    assert builder.calls
+    assert not hasattr(service, "refresh_in_process_entry")
+    assert not hasattr(service, "in_process_entry")
+    assert not hasattr(service, "embedded_spread_bbo_enabled")
 
 
 def test_liquidity_lifecycle_explains_source_quote_excluded_from_data_plane() -> None:
@@ -290,23 +200,15 @@ def test_liquidity_lifecycle_explains_source_quote_excluded_from_data_plane() ->
     assert lifecycle[0].degraded_reason == "liquidity_quote_unavailable:1"
 
 
-def test_canary_conservative_tier_defers_symbol_specific_buffer_to_pairing(
-    tmp_path,
-) -> None:
+def test_candidate_service_uses_configured_venue_fees_without_online_evidence() -> None:
     service = object.__new__(SidecarService)
     service.config = AppConfig(
         symbols=["BTCUSDT"],
-        strategy=StrategyConfig(
-            funding_canary_enabled=True,
-            funding_canary_require_account_fee_evidence=False,
-            funding_canary_conservative_fee_buffer_bps=2.0,
-        ),
         venues=[
             VenueConfig(venue="cheap", taker_fee_bps=1.0, maker_fee_bps=0.1),
             VenueConfig(venue="rich", taker_fee_bps=2.0, maker_fee_bps=0.2),
         ],
     )
-    service.config.runtime.funding_fee_evidence_path = str(tmp_path / "missing.json")
 
     candidate_service = service._new_candidate_service(now_ms=1_000)
 
@@ -627,367 +529,10 @@ def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> 
     )) == ["binance:BTCUSDT"]
 
 
-@pytest.mark.asyncio
-async def test_audit_writer_is_nonblocking_and_drops_overlapping_generations(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = object.__new__(SidecarService)
-    service.config = AppConfig(venues=[])
-    service.snapshot_path = tmp_path / "sidecar.json"
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._audit_executor = ThreadPoolExecutor(max_workers=1)
-
-    service._configured_venue_names = lambda: []
-    started = threading.Event()
-    release = threading.Event()
-
-    class BlockingBuilder:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def build(self, *_args, **_kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                started.set()
-                assert release.wait(timeout=2.0)
-            return []
-
-    builder = BlockingBuilder()
-    published_generations: list[int] = []
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_snapshot",
-        lambda snapshot, _path: published_generations.append(
-            snapshot.published_at_ms
-        ),
-    )
-
-    try:
-        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=1), builder)
-        task = service._audit_publish_task
-        assert task is not None
-        for _ in range(100):
-            if started.is_set():
-                break
-            await asyncio.sleep(0.001)
-        assert started.is_set()
-
-        # A running diagnostic audit does not queue more OI work behind itself.
-        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=2), builder)
-        _schedule_audit_build(service, SidecarSnapshot(published_at_ms=3), builder)
-        assert service._audit_pending_build is None
-        assert not task.done()
-
-        release.set()
-        await asyncio.wait_for(task, timeout=2.0)
-    finally:
-        release.set()
-        service._audit_executor.shutdown(wait=True, cancel_futures=True)
-
-    assert published_generations == [1]
-    assert builder.calls == 1
-    assert service._audit_publish_task is None
-
-
-@pytest.mark.asyncio
-async def test_audit_schedule_skips_cache_republish_and_respects_minimum_interval(
-    monkeypatch,
-) -> None:
-    service = object.__new__(SidecarService)
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._entry_cache_only_refresh = True
-    runs = 0
-
-    async def run_once() -> None:
-        nonlocal runs
-        runs += 1
-        service._audit_pending_build = None
-        service._audit_publish_task = None
-
-    service._run_audit_snapshot_writer = run_once
-    clock = 100.0
-    monkeypatch.setattr("lightfee.sidecar.service.time.monotonic", lambda: clock)
-
-    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=1), object())
-    await asyncio.sleep(0)
-    assert runs == 0
-
-    service._entry_cache_only_refresh = False
-    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=2), object())
-    await asyncio.sleep(0)
-    assert runs == 1
-
-    clock += 59.0
-    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=3), object())
-    await asyncio.sleep(0)
-    assert runs == 1
-
-    clock += 1.0
-    _schedule_audit_build(service, SidecarSnapshot(published_at_ms=4), object())
-    await asyncio.sleep(0)
-    assert runs == 2
-
-
-@pytest.mark.asyncio
-async def test_audit_failure_does_not_poison_next_generation(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = object.__new__(SidecarService)
-    service.config = AppConfig(venues=[])
-    service.snapshot_path = tmp_path / "sidecar.json"
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._audit_executor = ThreadPoolExecutor(max_workers=1)
-
-    service._configured_venue_names = lambda: []
-
-    class FailingBuilder:
-        def build(self, *_args, **_kwargs):
-            raise RuntimeError("audit-build-failed")
-
-    class HealthyBuilder:
-        def build(self, *_args, **_kwargs):
-            return []
-
-    published_generations: list[int] = []
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_snapshot",
-        lambda snapshot, _path: published_generations.append(
-            snapshot.published_at_ms
-        ),
-    )
-
-    try:
-        _schedule_audit_build(
-            service,
-            SidecarSnapshot(published_at_ms=1),
-            FailingBuilder(),
-        )
-        failed_task = service._audit_publish_task
-        assert failed_task is not None
-        await asyncio.wait_for(failed_task, timeout=2.0)
-        assert published_generations == []
-
-        service._last_audit_schedule_monotonic = 0.0
-        _schedule_audit_build(
-            service,
-            SidecarSnapshot(published_at_ms=2),
-            HealthyBuilder(),
-        )
-        healthy_task = service._audit_publish_task
-        assert healthy_task is not None
-        await asyncio.wait_for(healthy_task, timeout=2.0)
-    finally:
-        service._audit_executor.shutdown(wait=True, cancel_futures=True)
-
-    assert published_generations == [2]
-    assert service._audit_publish_task is None
-
-
-@pytest.mark.asyncio
-async def test_audit_preserves_symbol_scoped_liquidity_degradation(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    service = object.__new__(SidecarService)
-    service.config = AppConfig(venues=[])
-    service.snapshot_path = tmp_path / "sidecar.json"
-    service._audit_pending_build = None
-    service._audit_publish_task = None
-    service._last_audit_schedule_monotonic = 0.0
-    service._audit_executor = ThreadPoolExecutor(max_workers=1)
-
-    class EmptyBuilder:
-        def build(self, *_args, **_kwargs):
-            return []
-
-    published: list[SidecarSnapshot] = []
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_snapshot",
-        lambda snapshot, _path: published.append(snapshot),
-    )
-    entry_snapshot = SidecarSnapshot(
-        published_at_ms=1,
-        liquidity_lifecycle=[
-            LiquidityLifecycle(
-                venue="okx",
-                observed_at_ms=1,
-                symbol_count=5,
-                coverage_usable=4,
-                degraded_reason="liquidity_quote_unavailable:1",
-            )
-        ],
-        degraded_venues=[],
-        degraded_domains=[],
-        degraded_symbols={"okx": ["MISSINGUSDT"]},
-    )
-
-    try:
-        _schedule_audit_build(service, entry_snapshot, EmptyBuilder())
-        task = service._audit_publish_task
-        assert task is not None
-        await asyncio.wait_for(task, timeout=2.0)
-    finally:
-        service._audit_executor.shutdown(wait=True, cancel_futures=True)
-
-    assert len(published) == 1
-    audited = published[0]
-    assert audited.degraded_venues == []
-    assert audited.degraded_domains == []
-    assert audited.degraded_symbols == {"okx": ["MISSINGUSDT"]}
-    assert audited.liquidity_lifecycle[0].degraded_reason == (
-        "liquidity_quote_unavailable:1"
-    )
-
-
-@pytest.mark.asyncio
-async def test_close_cancels_blocked_audit_without_hanging() -> None:
-    service = object.__new__(SidecarService)
-    service._entry_venue_fetch_tasks = {}
-    service._entry_venue_late_tasks = set()
-    service.entry_venue_republish_event = asyncio.Event()
-    service._audit_pending_build = {"snapshot": object()}
-    service._exchange_sources = {}
-    service._spread_bbo_sources = {}
-    cancelled = asyncio.Event()
-
-    async def blocked_audit() -> None:
-        try:
-            await asyncio.Event().wait()
-        finally:
-            cancelled.set()
-
-    class RecordingExecutor:
-        def __init__(self) -> None:
-            self.calls: list[tuple[bool, bool]] = []
-
-        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
-            self.calls.append((wait, cancel_futures))
-
-    executor = RecordingExecutor()
-    service._audit_executor = executor
-    service._audit_publish_task = asyncio.create_task(blocked_audit())
-    await asyncio.sleep(0)
-
-    await asyncio.wait_for(service.close(), timeout=0.1)
-
-    assert cancelled.is_set()
-    assert service._audit_publish_task is None
-    assert service._audit_pending_build is None
-    assert executor.calls == [(False, True)]
-
-
-@pytest.mark.asyncio
-async def test_entry_frontier_oracle_replaces_a_transport_omission_with_fail_closed_generation(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    """The post-install oracle must never leave an omitted route executable."""
-    service = object.__new__(SidecarService)
-    service.snapshot_path = tmp_path / "sidecar.json"
-    snapshot = SidecarSnapshot(
-        candidates=[
-            CandidateInput(
-                long_venue="binance",
-                short_venue="bybit",
-                symbol="BTCUSDT",
-                funding_diff_bps=1.0,
-                funding_edge_bps=1.0,
-                expected_edge_bps=1.0,
-                worst_case_edge_bps=1.0,
-                ranking_edge_bps=1.0,
-                pair_id="btcusdt:binance->bybit",
-                economics_complete=True,
-            )
-        ],
-        candidate_build_diagnostics={
-            "seed_pair_count": 1,
-            "pair_decision_count": 1,
-            "eligible_candidate_count": 1,
-            "omitted_eligible_count": 0,
-            "eligible_frontier_complete": True,
-            "frontier_stop_reason": "all_pairs_decided",
-        },
-    )
-    published: list[SidecarSnapshot] = []
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.funding_entry_snapshot_identity",
-        lambda _path, *, verify_digest: ("generation-1", 1, 1),
-    )
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.load_funding_entry_snapshot",
-        lambda _path: SidecarSnapshot(candidates=[]),
-    )
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_funding_entry_snapshot",
-        lambda failed_snapshot, _path: published.append(failed_snapshot),
-    )
-
-    await service._verify_entry_frontier_oracle(
-        snapshot,
-        generation_id="generation-1",
-        expected_ids=("btcusdt:binance->bybit",),
-    )
-
-    assert len(published) == 1
-    failed = published[0].candidate_build_diagnostics
-    assert failed["eligible_frontier_complete"] is False
-    assert failed["omitted_eligible_count"] == 1
-    assert failed["frontier_stop_reason"] == "funding_entry_opportunity_omitted"
-
-
-@pytest.mark.asyncio
-async def test_entry_frontier_oracle_missing_pair_id_fails_closed_before_task_start(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    """An eligible row without its identity cannot wait for async auditing."""
-    service = object.__new__(SidecarService)
-    service.snapshot_path = tmp_path / "sidecar.json"
-    service._entry_frontier_oracle_tasks = set()
-    snapshot = SidecarSnapshot(
-        candidates=[
-            CandidateInput(
-                long_venue="binance",
-                short_venue="bybit",
-                symbol="BTCUSDT",
-                funding_diff_bps=1.0,
-                funding_edge_bps=1.0,
-                expected_edge_bps=1.0,
-                worst_case_edge_bps=1.0,
-                ranking_edge_bps=1.0,
-                economics_complete=True,
-            )
-        ],
-        candidate_build_diagnostics={
-            "seed_pair_count": 1,
-            "pair_decision_count": 1,
-            "eligible_candidate_count": 1,
-            "omitted_eligible_count": 0,
-            "eligible_frontier_complete": True,
-            "frontier_stop_reason": "all_pairs_decided",
-        },
-    )
-    published: list[SidecarSnapshot] = []
-    monkeypatch.setattr(
-        "lightfee.sidecar.service.publish_funding_entry_snapshot",
-        lambda failed_snapshot, _path: published.append(failed_snapshot),
-    )
-
-    service._schedule_entry_frontier_oracle(snapshot, "generation-1")
-
-    assert service._entry_frontier_oracle_tasks == set()
-    assert len(published) == 1
-    failed = published[0].candidate_build_diagnostics
-    assert failed["eligible_frontier_complete"] is False
-    assert failed["omitted_eligible_count"] == 1
-    assert failed["frontier_stop_reason"] == "funding_entry_opportunity_omitted"
+def test_sidecar_has_no_post_publish_frontier_oracle() -> None:
+    """Candidate admission must depend on each candidate, never a global oracle."""
+    assert not hasattr(SidecarService, "_schedule_entry_frontier_oracle")
+    assert not hasattr(SidecarService, "_verify_entry_frontier_oracle")
 
 
 @pytest.mark.asyncio
@@ -1126,14 +671,13 @@ def test_pairing_canonicalizes_duplicate_requested_symbols_once() -> None:
         quotes,
         ["BTCUSDT", "btcusdt", " BTCUSDT "],
         diagnostics=diagnostics,
+        venue_fee_bps={"binance": 1.0, "okx": 1.0},
     )
 
     assert len(candidates) == 1
     assert diagnostics["requested_symbol_count"] == 1
     assert diagnostics["output_candidate_count"] == 1
-    assert diagnostics["seed_pair_count"] == 2
-    assert diagnostics["pair_decision_count"] == 2
-    assert diagnostics["eligible_frontier_complete"] is True
+    assert diagnostics["directional_pair_count"] == 2
 
 
 class TestSidecarPairingV2:
@@ -1159,7 +703,10 @@ class TestSidecarPairingV2:
             live_entry_notional_cap_quote=30.0,
             funding_missing_margin_fallback_notional_quote=15.0,
         )
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], strategy=strategy,
+            venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) == 1
         c = candidates[0]
         assert c.pair_id == "btcusdt:binance->okx"
@@ -1187,7 +734,10 @@ class TestSidecarPairingV2:
             live_entry_notional_cap_quote=30.0,
             funding_missing_margin_fallback_notional_quote=15.0,
         )
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], strategy=strategy,
+            venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) >= 1
         c = candidates[0]
         # funding_diff > 0 and short_mid >= long_mid
@@ -1208,7 +758,9 @@ class TestSidecarPairingV2:
                 funding_interval_ms=28_800_000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) >= 1
         c = candidates[0]
         diff = abs(1700000000000 - 1700000001000)
@@ -1231,7 +783,9 @@ class TestSidecarPairingV2:
                 funding_interval_ms=28_800_000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) >= 1
         c = candidates[0]
         assert c.interval_aligned is False
@@ -1252,7 +806,9 @@ class TestSidecarPairingV2:
                 funding_interval_ms=28_800_000,
             ),
         }
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"])
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) >= 1
         c = candidates[0]
         # binance has earlier timestamp → first_funding_leg = "long"
@@ -1282,7 +838,10 @@ class TestSidecarPairingV2:
             live_entry_notional_cap_quote=30.0,
             funding_missing_margin_fallback_notional_quote=15.0,
         )
-        candidates = build_same_symbol_pairs(q, ["BTCUSDT"], strategy=strategy)
+        candidates = build_same_symbol_pairs(
+            q, ["BTCUSDT"], strategy=strategy,
+            venue_fee_bps={"binance": 1.0, "okx": 1.0},
+        )
         assert len(candidates) >= 1
         c = candidates[0]
         assert c.entry_notional_quote > 0.0

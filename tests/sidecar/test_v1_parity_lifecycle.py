@@ -103,20 +103,13 @@ def _strict_liquidity_quote(**overrides) -> QuoteSnapshot:
 
 
 async def _wait_for_full_audit_publish(service) -> None:
-    """Wait only in tests that assert the asynchronous audit artifact."""
-    task = service._audit_publish_task
-    if task is not None:
-        await task
+    """Compatibility no-op after removal of the background audit projection."""
+    del service
 
 
 def _stub_auxiliary_market_sources(service) -> None:
-    """Keep lifecycle-unit tests on their explicit quote fixtures."""
-
-    async def empty_bbo(_symbols):
-        return {}
-
-    for source in service._funding_entry_bbo_sources.values():
-        source.fetch_spread_bbo = empty_bbo
+    """Compatibility no-op after removal of the second sidecar BBO plane."""
+    del service
 
 
 class TestLifecycleCoverageDegradation:
@@ -927,20 +920,19 @@ class TestRefreshPublicationSemantics:
         snapshot = await svc.refresh_once()
 
         assert snapshot.market_observed_at_ms == 1000
-        assert snapshot.published_at_ms == 7000
-        assert svc._last_good_at_ms == 7000
+        assert snapshot.published_at_ms == 6000
+        assert svc._last_good_at_ms == 6000
         assert snapshot.quotes["binance:BTCUSDT"].observed_at_ms == 1000
         assert snapshot.quotes["binance:BTCUSDT"].source == "sidecar_quote"
         assert snapshot.liquidity_lifecycle[0].observed_at_ms == 1000
-        assert snapshot.liquidity_lifecycle[0].published_at_ms == 7000
-        assert snapshot.liquidity_lifecycle[0].publish_interval_ms == 6000
+        assert snapshot.liquidity_lifecycle[0].published_at_ms == 6000
+        assert snapshot.liquidity_lifecycle[0].publish_interval_ms == 5000
         assert snapshot.liquidity_lifecycle[0].domain == "perp_liquidity"
         assert snapshot.liquidity_lifecycle[0].source == "sidecar_perp_liquidity"
 
     @pytest.mark.asyncio
     async def test_slow_venue_does_not_block_live_entry_generation(self, tmp_path):
         from lightfee.config.schema import AppConfig
-        from lightfee.sidecar.publisher import funding_entry_snapshot_path
         from lightfee.sidecar.service import SidecarService
 
         release_slow = asyncio.Event()
@@ -997,7 +989,7 @@ class TestRefreshPublicationSemantics:
         assert elapsed < 0.55
         assert {"binance:BTCUSDT", "okx:BTCUSDT"} <= set(first.quotes)
         assert "bybit" in first.degraded_venues
-        assert funding_entry_snapshot_path(snapshot_path).exists()
+        assert snapshot_path.exists()
 
         release_slow.set()
         await asyncio.wait_for(
@@ -1088,8 +1080,8 @@ class TestRefreshPublicationSemantics:
         successful = await svc.refresh_once()
 
         assert successful.liquidity_lifecycle[0].coverage_usable == 1
-        assert successful.liquidity_lifecycle[0].publish_interval_ms == 10000
-        assert svc._last_liquidity_publish_at_ms == 11000
+        assert successful.liquidity_lifecycle[0].publish_interval_ms == 9000
+        assert svc._last_liquidity_publish_at_ms == 10000
 
     @pytest.mark.asyncio
     async def test_liquidity_publish_interval_is_tracked_per_venue(self, monkeypatch, tmp_path):
@@ -1166,8 +1158,8 @@ class TestRefreshPublicationSemantics:
         rows = {row.venue: row for row in snapshot.liquidity_lifecycle}
 
         assert rows["okx"].coverage_usable == 1
-        assert rows["okx"].publish_interval_ms == 10000
-        assert rows["okx"].published_at_ms == 11000
+        assert rows["okx"].publish_interval_ms == 9000
+        assert rows["okx"].published_at_ms == 10000
         assert rows["bybit"].coverage_usable == 0
         assert rows["bybit"].publish_interval_ms == 0
         assert rows["bybit"].published_at_ms == 4000
@@ -1175,7 +1167,7 @@ class TestRefreshPublicationSemantics:
             svc._last_liquidity_publish_at_ms_by_key[
                 ("perp_liquidity", "sidecar_perp_liquidity", "okx")
             ]
-            == 11000
+            == 10000
         )
         assert (
             svc._last_liquidity_publish_at_ms_by_key[

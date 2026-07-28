@@ -7,8 +7,6 @@ Do not change entry dispatch, order admission, or journal payload semantics whil
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import math
 import re
 import time
@@ -26,7 +24,6 @@ from lightfee.core.domain import (
     Venue,
 )
 from lightfee.core.errors import OrderSubmitError
-from lightfee.config.paths import resolve_config_artifact_path
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
 from lightfee.engine.business_contract import classify_entry_quantity_contract
 from lightfee.engine.entry_readiness import QuoteLease
@@ -45,9 +42,7 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
 )
 from lightfee.marketdata.open_interest import (
-    observed_open_interest_proof_reason,
     open_interest_max_age_ms_for_evidence,
-    open_interest_sample_id,
     open_interest_timestamps_are_fresh,
 )
 from lightfee.engine.runtime_context import EntryDispatchRuntimeContext
@@ -64,19 +59,6 @@ from lightfee.marketdata.liquidity import (
     execution_liquidity_from_local_l2,
 )
 from lightfee.strategy.funding_entry_revalidator import FundingEntryRevalidator
-from lightfee.strategy.fee_evidence import (
-    LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS,
-    TRUSTED_FEE_EVIDENCE_KEY_ID,
-    effective_fee_maps,
-    load_fee_evidence,
-)
-from lightfee.strategy.funding_canary_policy import (
-    canary_edge_floors,
-    canary_fee_assurance_tier,
-    canary_notional_cap,
-    canonical_venue_pair,
-)
-from lightfee.strategy.candidate_identity import final_candidate_revision_id
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 from lightfee.venues.cid import generate_exchange_cid
 from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
@@ -86,130 +68,6 @@ _ASTER_HEADROOM_NUMBER_RE = re.compile(
     r"\b(?P<key>requested_notional|remaining_openable_notional)="
     r"(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
 )
-_FUNDING_CANARY_POLICY_VERSION = "funding-canary-v2"
-_FUNDING_ES_COLD_START_REASONS = frozenset(
-    {
-        "basis_risk_cold_start",
-        "insufficient_basis_history",
-        "insufficient_basis_return_samples",
-        "nonpositive_basis_expected_shortfall",
-    }
-)
-
-
-def _funding_canary_cohort_id(candidate: object, strategy: object) -> str:
-    """Hash the immutable policy identity required for canary promotion.
-
-    Venue-pair data is intentionally excluded so a single release cohort may
-    test multiple approved pairs.  Economics version, forecast mode, fee
-    document identity, route and hard release limits are included; mixing any
-    of them would make a 30-loop acceptance sample non-comparable.
-    """
-
-    raw_provenance = getattr(candidate, "account_fee_evidence_provenance", []) or []
-    schedule_digests = sorted(
-        {
-            str(item.get("schedule_sha256") or "")
-            for item in raw_provenance
-            if isinstance(item, dict) and str(item.get("schedule_sha256") or "")
-        }
-    )
-    account_identity_hashes = sorted(
-        {
-            str(item.get("account_identity_hash") or "").lower()
-            for item in raw_provenance
-            if isinstance(item, dict)
-            and _is_sha256_hex(str(item.get("account_identity_hash") or ""))
-        }
-    )
-    execution_budget = _funding_canary_execution_budget(candidate)
-    min_expected, min_worst = canary_edge_floors(
-        strategy,
-        getattr(candidate, "long_venue", ""),
-        getattr(candidate, "short_venue", ""),
-    )
-    assurance_tier = canary_fee_assurance_tier(candidate, strategy)
-    material = {
-        "policy_version": _FUNDING_CANARY_POLICY_VERSION,
-        "calculation_version": str(
-            getattr(candidate, "calculation_version", "") or ""
-        ).lower(),
-        "model_epoch": str(getattr(candidate, "model_epoch", "") or "").lower(),
-        "funding_economics_mode": str(
-            getattr(strategy, "funding_economics_mode", "") or ""
-        ).lower(),
-        "funding_forecast_mode": str(
-            getattr(strategy, "funding_forecast_mode", "") or ""
-        ).lower(),
-        "entry_maker_leg": str(getattr(candidate, "entry_maker_leg", "") or "").lower(),
-        "exit_maker_leg": str(getattr(candidate, "exit_maker_leg", "") or "").lower(),
-        "fee_schedule_sha256": schedule_digests,
-        "fee_account_identity_hashes": account_identity_hashes,
-        "budgeted_execution_cost_bps": (
-            execution_budget[0] if execution_budget is not None else None
-        ),
-        "execution_reserve_bps": (
-            execution_budget[1] if execution_budget is not None else None
-        ),
-        "forecast_uncertainty_haircut_bps": getattr(
-            strategy, "funding_forecast_uncertainty_haircut_bps", None
-        ),
-        "fee_assurance_tier": assurance_tier,
-        "venue_pair": (
-            canonical_venue_pair(
-                getattr(candidate, "long_venue", ""),
-                getattr(candidate, "short_venue", ""),
-            )
-            if assurance_tier != "account"
-            else ""
-        ),
-        "long_taker_fee_bps": getattr(candidate, "long_taker_fee_bps", None),
-        "short_taker_fee_bps": getattr(candidate, "short_taker_fee_bps", None),
-        "max_entry_notional_quote": canary_notional_cap(candidate, strategy),
-        "min_expected_net_edge_bps": min_expected,
-        "min_worst_case_edge_bps": min_worst,
-    }
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _is_sha256_hex(value: object) -> bool:
-    text = str(value or "").strip().lower()
-    if len(text) != 64:
-        return False
-    try:
-        int(text, 16)
-    except ValueError:
-        return False
-    return True
-
-
-def _funding_canary_execution_budget(candidate: object) -> tuple[float, float] | None:
-    """Return the immutable execution-cost budget and reserve in bps.
-
-    The release gate must compare like with like: realised fees plus measured
-    implementation shortfall are execution costs, while forecast/funding or
-    holding-period PnL are not.  A canary therefore persists the pre-trade
-    cost budget separately from its edge floors.
-    """
-
-    cost_fields = (
-        "entry_fee_bps",
-        "exit_fee_bps",
-        "entry_slippage_bps",
-        "exit_slippage_bps",
-        "adverse_selection_bps",
-    )
-    try:
-        costs = [float(getattr(candidate, field, 0.0) or 0.0) for field in cost_fields]
-        reserve = float(getattr(candidate, "execution_buffer_bps", 0.0) or 0.0)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not all(math.isfinite(value) and value >= 0.0 for value in (*costs, reserve)):
-        return None
-    return sum(costs), reserve
-
-
 def _entry_leverage_evidence_payload(
     evidence: EntryLeverageEvidence | None,
 ) -> dict[str, Any]:
@@ -2344,7 +2202,6 @@ class EntryDispatchRuntime:
         long_metadata: dict,
         short_metadata: dict,
         strategy_min_notional: float,
-        canary_constrained: bool,
     ) -> tuple[str, dict]:
         failures: list[dict[str, float | str]] = []
         for leg, price, metadata in (
@@ -2372,12 +2229,7 @@ class EntryDispatchRuntime:
                 )
         if not failures:
             return "", {}
-        reason = (
-            "funding_canary_cap_below_pair_minimum"
-            if canary_constrained
-            else "entry_pair_minimum_not_met"
-        )
-        return reason, {"pair_minimum_failures": failures}
+        return "entry_pair_minimum_not_met", {"pair_minimum_failures": failures}
 
     @staticmethod
     def _entry_normalized_price_consistency_reason(
@@ -2691,6 +2543,32 @@ class EntryDispatchRuntime:
             )
         return quantity, margin_constrained
 
+    def _quote_lease_current_candidate_revision_id(
+        self,
+        candidate,
+    ) -> str:
+        revision_id = str(
+            getattr(candidate, "candidate_revision_id", "") or ""
+        ).strip()
+        if revision_id:
+            return revision_id
+        binder = getattr(self.ctx, "_bind_entry_candidate_revision_id", None)
+        if callable(binder):
+            with suppress(Exception):
+                return str(binder(candidate) or "").strip()
+        return ""
+
+    @staticmethod
+    def _quote_lease_candidate_revision_mismatch(
+        candidate_revision_id: str,
+        lease_revision_id: str,
+    ) -> bool:
+        return bool(
+            candidate_revision_id
+            and lease_revision_id
+            and lease_revision_id != candidate_revision_id
+        )
+
     def _entry_quote_lease_execution_check(
         self,
         candidate,
@@ -2709,9 +2587,7 @@ class EntryDispatchRuntime:
             "short_venue": str(getattr(candidate, "short_venue", "")),
             "max_age_ms": self._entry_quote_lease_max_age_ms(),
             "candidate_revision_id": str(
-                getattr(candidate, "evidence_candidate_revision_id", "")
-                or getattr(candidate, "candidate_revision_id", "")
-                or ""
+                getattr(candidate, "candidate_revision_id", "") or ""
             ),
         }
         def blocked(reason: str, lease: object | None):
@@ -2763,6 +2639,12 @@ class EntryDispatchRuntime:
                 ),
             }
         )
+        lease_revision_id = str(evidence["lease_candidate_revision_id"] or "").strip()
+        candidate_revision_id = self._quote_lease_current_candidate_revision_id(
+            candidate
+        )
+        evidence["candidate_revision_id"] = candidate_revision_id
+        evidence["lease_candidate_revision_id"] = lease_revision_id
         expected_lease_provider = provider_name
         if provider_name == "ws_bbo_l2_on_demand":
             expected_lease_provider = "ws_bbo_quote_lease"
@@ -2774,13 +2656,11 @@ class EntryDispatchRuntime:
             return blocked("quote_lease_long_venue_mismatch", lease)
         if str(getattr(lease, "short_venue", "")) != evidence["short_venue"]:
             return blocked("quote_lease_short_venue_mismatch", lease)
-        if (
-            evidence["candidate_revision_id"]
-            and evidence["lease_candidate_revision_id"]
-            != evidence["candidate_revision_id"]
+        if self._quote_lease_candidate_revision_mismatch(
+            candidate_revision_id,
+            lease_revision_id,
         ):
             return blocked("quote_lease_candidate_revision_mismatch", lease)
-
         expires_at_ms = evidence["expires_at_ms"]
         if expires_at_ms <= 0 or now_ms >= expires_at_ms:
             return blocked("expired_quote_lease", lease)
@@ -2857,14 +2737,15 @@ class EntryDispatchRuntime:
             return "missing_final_quote_lease"
         if lease.pair_id != self._candidate_pair_id(candidate):
             return "final_quote_lease_pair_mismatch"
-        candidate_revision_id = str(
-            getattr(candidate, "evidence_candidate_revision_id", "")
-            or getattr(candidate, "candidate_revision_id", "")
-            or ""
+        candidate_revision_id = self._quote_lease_current_candidate_revision_id(
+            candidate
         )
-        if (
-            candidate_revision_id
-            and lease.candidate_revision_id != candidate_revision_id
+        lease_revision_id = str(
+            getattr(lease, "candidate_revision_id", "") or ""
+        ).strip()
+        if self._quote_lease_candidate_revision_mismatch(
+            candidate_revision_id,
+            lease_revision_id,
         ):
             return "final_quote_lease_candidate_revision_mismatch"
         if lease.expires_at_ms <= 0 or now_ms >= lease.expires_at_ms:
@@ -3049,12 +2930,6 @@ class EntryDispatchRuntime:
                 # calibrated forecast gate.  Keep this check at the first
                 # live boundary and repeat it in final revalidation below.
                 policy_reason = self._live_economics_contract_reason(candidate)
-                if not policy_reason:
-                    policy_reason = self._funding_canary_admission_reason(
-                        candidate,
-                        now_ms,
-                        check_notional=False,
-                    )
             if policy_reason:
                 self._emit_entry_dispatch_viability_blocked(
                     candidate,
@@ -3216,532 +3091,6 @@ class EntryDispatchRuntime:
                 return True
         return False
 
-    def _funding_canary_admission_reason(
-        self,
-        candidate,
-        now_ms: int,
-        *,
-        check_concurrency: bool = True,
-        check_notional: bool = True,
-    ) -> str:
-        """Return a canary-only block reason for a *new* funding entry.
-
-        It runs at initial admission and again immediately before the first
-        submit after final economics/size repricing.  It must not gate a
-        pending hedge, residual repair, recovery or close; once a leg exists,
-        V1 safety semantics require completing or reducing risk irrespective
-        of later experimental configuration changes.
-        """
-
-        strategy = self.ctx.config.strategy
-        runtime = self.ctx.config.runtime
-        runtime_mode = str(runtime.mode or "paper").lower()
-        if strategy.funding_canary_enabled is not True:
-            return ""
-        allowed_venues = {
-            str(venue or "").strip().lower()
-            for venue in strategy.funding_canary_allowed_venues
-            if str(venue or "").strip()
-        }
-        long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
-        short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
-        if long_venue not in allowed_venues or short_venue not in allowed_venues:
-            return "funding_canary_venue_not_allowed"
-        assurance_tier = canary_fee_assurance_tier(candidate, strategy)
-        if assurance_tier == "unavailable":
-            return "funding_canary_fee_assurance_unavailable"
-        try:
-            notional = float(
-                getattr(candidate, "entry_max_leg_notional_quote", 0.0)
-                or getattr(candidate, "entry_notional_quote", 0.0)
-                or 0.0
-            )
-            expected_net = float(getattr(candidate, "expected_net_edge_bps", 0.0) or 0.0)
-            worst_case = float(getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0)
-            max_notional = canary_notional_cap(candidate, strategy)
-            configured_concurrency = int(
-                strategy.funding_canary_max_concurrent_positions
-            )
-            min_expected, min_worst_case = canary_edge_floors(
-                strategy, long_venue, short_venue
-            )
-        except (TypeError, ValueError, OverflowError):
-            return "funding_canary_invalid_economics"
-        if not all(
-            math.isfinite(value)
-            for value in (notional, expected_net, worst_case, max_notional)
-        ):
-            return "funding_canary_invalid_economics"
-        if configured_concurrency <= 0:
-            return "funding_canary_concurrency_cap_invalid"
-        if max_notional <= 0.0 or min_expected < 0.0 or min_worst_case < 0.0:
-            return "funding_canary_invalid_economics"
-        if check_notional and (
-            notional <= 0.0 or notional > max_notional + 1e-9
-        ):
-            return "funding_canary_notional_cap_exceeded"
-        if expected_net < min_expected:
-            return "funding_canary_expected_edge_below_floor"
-        if worst_case < min_worst_case:
-            return "funding_canary_worst_case_edge_below_floor"
-
-        # Count both paired positions and pre-first-fill work.  A canary must
-        # not race a second candidate through while the first pair is still
-        # waiting for its hedge acknowledgement.
-        if check_concurrency:
-            active_count = len(self.ctx.state.open_positions) + len(
-                self.ctx.state.pending_entries
-            )
-            if active_count >= configured_concurrency:
-                return "funding_canary_concurrency_cap_reached"
-
-        # The final-price rebinding is part of the canary contract itself.  A
-        # real live funding entry without the canary is rejected by the
-        # admission gate below; keeping this branch conditional also lets
-        # focused non-canary execution tests exercise their own concern
-        # without manufacturing canary cost inputs.
-        if (
-            runtime_mode == "live"
-            and strategy.funding_new_entries_enabled is True
-            and strategy.funding_canary_enabled is True
-        ):
-            try:
-                evidence_max_age_ms = int(
-                    getattr(
-                        runtime,
-                        "funding_fee_evidence_max_age_ms",
-                        runtime.fee_evidence_max_age_ms,
-                    )
-                )
-            except (TypeError, ValueError, OverflowError):
-                return "funding_canary_fee_evidence_age_invalid"
-            if not (0 < evidence_max_age_ms <= LIVE_CANARY_FEE_EVIDENCE_MAX_AGE_MS):
-                return "funding_canary_fee_evidence_age_invalid"
-
-        if assurance_tier == "conservative":
-            venue_configs = {
-                str(getattr(venue, "venue", "") or "").strip().lower(): venue
-                for venue in getattr(self.ctx.config, "venues", [])
-            }
-            try:
-                buffer_bps = float(
-                    strategy.funding_canary_conservative_fee_buffer_bps or 0.0
-                )
-                long_config = venue_configs[long_venue]
-                short_config = venue_configs[short_venue]
-                long_fee = float(getattr(candidate, "long_taker_fee_bps", 0.0) or 0.0)
-                short_fee = float(getattr(candidate, "short_taker_fee_bps", 0.0) or 0.0)
-                entry_fee = float(getattr(candidate, "entry_fee_bps", 0.0) or 0.0)
-                exit_fee = float(getattr(candidate, "exit_fee_bps", 0.0) or 0.0)
-            except (KeyError, TypeError, ValueError, OverflowError):
-                return "funding_canary_conservative_fee_config_invalid"
-            if not all(
-                math.isfinite(value) and value >= 0.0
-                for value in (
-                    buffer_bps,
-                    long_fee,
-                    short_fee,
-                    entry_fee,
-                    exit_fee,
-                )
-            ):
-                return "funding_canary_conservative_fee_config_invalid"
-
-            evidence_path = resolve_config_artifact_path(
-                runtime,
-                getattr(
-                    runtime,
-                    "funding_fee_evidence_path",
-                    getattr(runtime, "fee_evidence_path", ""),
-                ),
-            )
-            evidence = load_fee_evidence(
-                evidence_path,
-                now_ms=now_ms,
-                max_age_ms=int(
-                    getattr(
-                        runtime,
-                        "funding_fee_evidence_max_age_ms",
-                        getattr(runtime, "fee_evidence_max_age_ms", 0),
-                    )
-                    or 0
-                ),
-            )
-            expected_identity_hashes = getattr(
-                runtime, "fee_evidence_account_identity_hashes", {}
-            )
-            if not isinstance(expected_identity_hashes, dict):
-                expected_identity_hashes = {}
-            candidate_symbol = str(
-                getattr(candidate, "symbol", "") or ""
-            ).strip().upper()
-
-            def required_leg_fees(
-                venue: str, venue_config: object
-            ) -> tuple[float, float]:
-                static_taker = float(getattr(venue_config, "taker_fee_bps"))
-                configured_maker = getattr(venue_config, "maker_fee_bps", None)
-                static_maker = float(
-                    static_taker if configured_maker is None else configured_maker
-                )
-                authoritative = evidence.account_authoritative_for(
-                    expected_identity_hashes,
-                    venue,
-                    symbol=candidate_symbol,
-                )
-                if not authoritative:
-                    conservative_taker = static_taker + buffer_bps
-                    # No private proof means no maker discount on this leg.
-                    return conservative_taker, conservative_taker
-                schedule = evidence.schedule_for(venue)
-                if schedule is None:
-                    raise ValueError("missing authoritative fee schedule")
-                symbol_schedule = next(
-                    (
-                        row
-                        for row in schedule.symbol_schedules
-                        if row.symbol == candidate_symbol
-                    ),
-                    None,
-                )
-                evidence_taker = (
-                    symbol_schedule.taker_fee_bps
-                    if symbol_schedule is not None
-                    else schedule.taker_fee_bps
-                )
-                evidence_maker = (
-                    symbol_schedule.maker_fee_bps
-                    if symbol_schedule is not None
-                    else schedule.maker_fee_bps
-                )
-                return (
-                    max(static_taker, evidence_taker),
-                    max(static_maker, evidence_maker),
-                )
-
-            try:
-                long_required, long_required_maker = required_leg_fees(
-                    long_venue, long_config
-                )
-                short_required, short_required_maker = required_leg_fees(
-                    short_venue, short_config
-                )
-            except (TypeError, ValueError, OverflowError):
-                return "funding_canary_conservative_fee_config_invalid"
-            if not all(
-                math.isfinite(value) and value >= 0.0
-                for value in (
-                    long_required,
-                    long_required_maker,
-                    short_required,
-                    short_required_maker,
-                )
-            ):
-                return "funding_canary_conservative_fee_config_invalid"
-
-            def required_pair_fee(maker_leg: object) -> float | None:
-                selected = str(maker_leg or "").strip().lower()
-                if selected not in {"", "long", "short"}:
-                    return None
-                return (
-                    long_required_maker if selected == "long" else long_required
-                ) + (
-                    short_required_maker if selected == "short" else short_required
-                )
-
-            required_entry_fee = required_pair_fee(
-                getattr(candidate, "entry_maker_leg", "")
-            )
-            required_exit_fee = required_pair_fee(
-                getattr(candidate, "exit_maker_leg", "")
-            )
-            if (
-                long_fee + 1e-12 < long_required
-                or short_fee + 1e-12 < short_required
-                or required_entry_fee is None
-                or required_exit_fee is None
-                or entry_fee + 1e-12 < required_entry_fee
-                or exit_fee + 1e-12 < required_exit_fee
-            ):
-                return "funding_canary_fee_cost_understated"
-            return ""
-
-        evidence_path = resolve_config_artifact_path(
-            runtime,
-            getattr(runtime, "funding_fee_evidence_path", runtime.fee_evidence_path),
-        )
-        evidence = load_fee_evidence(
-            evidence_path,
-            now_ms=now_ms,
-            max_age_ms=int(
-                getattr(
-                    runtime,
-                    "funding_fee_evidence_max_age_ms",
-                    runtime.fee_evidence_max_age_ms,
-                )
-            ),
-        )
-        if not evidence.complete_for(long_venue, short_venue):
-            return "funding_canary_account_fee_evidence_unavailable"
-        expected_identity_hashes = getattr(
-            runtime, "fee_evidence_account_identity_hashes", {}
-        )
-        if not isinstance(expected_identity_hashes, dict):
-            expected_identity_hashes = {}
-        candidate_symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
-        if not evidence.account_authoritative_for(
-            expected_identity_hashes,
-            long_venue,
-            short_venue,
-            symbol=candidate_symbol,
-        ):
-            return "funding_canary_account_fee_evidence_unverified"
-        if getattr(candidate, "account_fee_evidence_complete", False) is not True:
-            return "funding_canary_candidate_fee_provenance_missing"
-        if (
-            int(getattr(candidate, "account_fee_evidence_observed_at_ms", 0) or 0)
-            != evidence.observed_at_ms_for(long_venue, short_venue)
-            or str(getattr(candidate, "account_fee_evidence_source", "") or "")
-            != evidence.source_for(long_venue, short_venue)
-        ):
-            return "funding_canary_fee_evidence_epoch_mismatch"
-        expected_fingerprint = evidence.fingerprint_for(
-            long_venue, short_venue, symbol=candidate_symbol
-        )
-        expected_provenance = evidence.provenance_for(
-            long_venue, short_venue, symbol=candidate_symbol
-        )
-        if (
-            not expected_fingerprint
-            or str(
-                getattr(candidate, "account_fee_evidence_fingerprint", "") or ""
-            )
-            != expected_fingerprint
-            or getattr(candidate, "account_fee_evidence_provenance", None)
-            != expected_provenance
-        ):
-            return "funding_canary_fee_evidence_provenance_mismatch"
-        try:
-            long_fee = float(getattr(candidate, "long_taker_fee_bps", 0.0) or 0.0)
-            short_fee = float(getattr(candidate, "short_taker_fee_bps", 0.0) or 0.0)
-        except (TypeError, ValueError, OverflowError):
-            return "funding_canary_invalid_fee_economics"
-        long_schedule = evidence.schedule_for(long_venue)
-        short_schedule = evidence.schedule_for(short_venue)
-        venue_configs = {
-            str(getattr(venue, "venue", "") or "").strip().lower(): venue
-            for venue in getattr(self.ctx.config, "venues", [])
-        }
-        try:
-            long_config = venue_configs[long_venue]
-            short_config = venue_configs[short_venue]
-            configured_taker = {
-                long_venue: float(long_config.taker_fee_bps),
-                short_venue: float(short_config.taker_fee_bps),
-            }
-            configured_maker = {
-                long_venue: float(
-                    long_config.maker_fee_bps
-                    if long_config.maker_fee_bps is not None
-                    else long_config.taker_fee_bps
-                ),
-                short_venue: float(
-                    short_config.maker_fee_bps
-                    if short_config.maker_fee_bps is not None
-                    else short_config.taker_fee_bps
-                ),
-            }
-            required_taker, required_maker = effective_fee_maps(
-                configured_taker,
-                configured_maker,
-                evidence,
-            )
-            long_required_taker = required_taker[long_venue]
-            short_required_taker = required_taker[short_venue]
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return "funding_canary_account_fee_config_invalid"
-        if (
-            long_schedule is None
-            or short_schedule is None
-            or long_fee + 1e-12 < long_required_taker
-            or short_fee + 1e-12 < short_required_taker
-        ):
-            return "funding_canary_fee_cost_understated"
-        # The candidate may price a V1 passive maker leg.  Checking only the
-        # two taker fields would then leave its aggregate entry/exit economics
-        # free to understate the account's maker schedule.  Reconstruct the
-        # same two-leg role contract and require the frozen aggregate costs to
-        # cover it before any first leg can be submitted.
-        try:
-            entry_fee = float(getattr(candidate, "entry_fee_bps", 0.0) or 0.0)
-            exit_fee = float(getattr(candidate, "exit_fee_bps", 0.0) or 0.0)
-        except (TypeError, ValueError, OverflowError):
-            return "funding_canary_invalid_fee_economics"
-        if not math.isfinite(entry_fee) or not math.isfinite(exit_fee):
-            return "funding_canary_invalid_fee_economics"
-
-        def fee_for_roles(maker_leg: object) -> float | None:
-            selected = str(maker_leg or "").strip().lower()
-            if selected not in {"", "long", "short"}:
-                return None
-            long_cost = (
-                required_maker[long_venue]
-                if selected == "long"
-                else long_required_taker
-            )
-            short_cost = (
-                required_maker[short_venue]
-                if selected == "short"
-                else short_required_taker
-            )
-            return long_cost + short_cost
-
-        required_entry_fee = fee_for_roles(
-            getattr(candidate, "entry_maker_leg", "")
-        )
-        required_exit_fee = fee_for_roles(getattr(candidate, "exit_maker_leg", ""))
-        if (
-            required_entry_fee is None
-            or required_exit_fee is None
-            or entry_fee + 1e-12 < required_entry_fee
-            or exit_fee + 1e-12 < required_exit_fee
-        ):
-            return "funding_canary_fee_cost_understated"
-        return ""
-
-    def _funding_canary_submission_reason(
-        self,
-        candidate,
-        now_ms: int,
-        *,
-        quantity: float,
-        long_price: float,
-        short_price: float,
-        enforce_notional: bool = True,
-    ) -> str:
-        """Rebind canary limits to final executable economics and size.
-
-        ``entry_notional_quote`` is only shortlist input.  The cap is per leg,
-        so the more expensive final executable leg is used after L2 repricing,
-        allocator rounding and route selection.  Legacy V1-compatible paths
-        without a final quantity retain their pre-existing candidate notional;
-        typed v3 paths always provide final quantity and fail closed if invalid.
-        """
-
-        strategy = self.ctx.config.strategy
-        runtime_mode = str(self.ctx.config.runtime.mode or "paper").lower()
-        if (
-            runtime_mode == "live"
-            and strategy.funding_new_entries_enabled is True
-            and strategy.funding_canary_enabled is True
-        ):
-            try:
-                final_quantity = float(quantity or 0.0)
-                final_long_price = float(long_price)
-                final_short_price = float(short_price)
-            except (TypeError, ValueError, OverflowError):
-                return "funding_canary_final_notional_invalid"
-            if final_quantity > 0.0:
-                average_notional = (
-                    final_quantity * (final_long_price + final_short_price) / 2.0
-                )
-                executable_notional = (
-                    max(final_long_price, final_short_price) * final_quantity
-                )
-            else:
-                average_notional = 0.0
-                executable_notional = 0.0
-            if (
-                not math.isfinite(average_notional)
-                or not math.isfinite(executable_notional)
-                or average_notional <= 0.0
-                or executable_notional <= 0.0
-            ):
-                return "funding_canary_final_notional_invalid"
-            candidate.entry_notional_quote = average_notional
-            candidate.entry_max_leg_notional_quote = executable_notional
-            candidate.funding_canary_fee_assurance_tier = (
-                canary_fee_assurance_tier(candidate, strategy)
-            )
-            candidate.funding_canary_hard_max_entry_notional_quote = (
-                canary_notional_cap(candidate, strategy)
-            )
-            if enforce_notional and (
-                executable_notional
-                > candidate.funding_canary_hard_max_entry_notional_quote + 1e-9
-            ):
-                return "funding_canary_final_notional_invariant_breached"
-            if _funding_canary_execution_budget(candidate) is None:
-                return "funding_canary_execution_cost_budget_invalid"
-        return self._funding_canary_admission_reason(
-            candidate,
-            now_ms,
-            check_concurrency=False,
-            check_notional=enforce_notional,
-        )
-
-    def _funding_canary_clamp_quantity(
-        self,
-        candidate,
-        now_ms: int,
-        *,
-        quantity: float,
-        long_price: float,
-        short_price: float,
-        common_step: float,
-    ) -> tuple[float, str]:
-        """Shrink a live canary to its per-leg cap, never enlarge it."""
-
-        strategy = self.ctx.config.strategy
-        if not (
-            str(self.ctx.config.runtime.mode or "paper").lower() == "live"
-            and strategy.funding_new_entries_enabled is True
-            and strategy.funding_canary_enabled is True
-        ):
-            return quantity, ""
-        tier = canary_fee_assurance_tier(candidate, strategy)
-        if tier == "unavailable":
-            return 0.0, "funding_canary_fee_assurance_unavailable"
-        try:
-            original = float(quantity)
-            max_price = max(float(long_price), float(short_price))
-            cap = float(canary_notional_cap(candidate, strategy))
-            step = float(common_step)
-        except (TypeError, ValueError, OverflowError):
-            return 0.0, "funding_canary_final_notional_invalid"
-        if not all(math.isfinite(v) for v in (original, max_price, cap, step)):
-            return 0.0, "funding_canary_final_notional_invalid"
-        if original <= 0.0 or max_price <= 0.0 or cap <= 0.0 or step <= 0.0:
-            return 0.0, "funding_canary_final_notional_invalid"
-        clamped = _align_base_quantity_down(min(original, cap / max_price), step)
-        if clamped <= 0.0:
-            return 0.0, "funding_canary_cap_below_pair_minimum"
-        average_notional = clamped * (float(long_price) + float(short_price)) / 2.0
-        max_leg_notional = clamped * max_price
-        candidate.entry_target_quantity = clamped
-        candidate.entry_notional_quote = average_notional
-        candidate.entry_max_leg_notional_quote = max_leg_notional
-        candidate.funding_canary_fee_assurance_tier = tier
-        candidate.funding_canary_hard_max_entry_notional_quote = cap
-        if clamped + 1e-12 < original:
-            candidate.funding_canary_size_constrained = True
-            self.ctx.journal.append(
-                "runtime.funding_canary_size_clamped",
-                {
-                    "symbol": str(getattr(candidate, "symbol", "") or ""),
-                    "long_venue": str(getattr(candidate, "long_venue", "") or ""),
-                    "short_venue": str(getattr(candidate, "short_venue", "") or ""),
-                    "requested_quantity": original,
-                    "clamped_quantity": clamped,
-                    "entry_notional_quote": average_notional,
-                    "entry_max_leg_notional_quote": max_leg_notional,
-                    "funding_canary_fee_assurance_tier": tier,
-                    "funding_canary_hard_max_entry_notional_quote": cap,
-                    "ts_ms": now_ms,
-                },
-            )
-        return clamped, ""
-
     def _live_economics_contract_reason(self, candidate) -> str:
         """Return the fail-closed reason when a live candidate is stale by contract.
 
@@ -3764,8 +3113,6 @@ class EntryDispatchRuntime:
         # Every route has at least one taker leg on entry or exit.  Do not
         # let a hand-built/partially decoded candidate turn an absent fee map
         # into an optimistic zero merely because it selected no passive leg.
-        if getattr(candidate, "taker_fee_evidence_complete", False) is not True:
-            return "missing_taker_fee_evidence"
         if active_version != "enhanced_live":
             return ""
 
@@ -4404,29 +3751,6 @@ class EntryDispatchRuntime:
                 )
                 return False
 
-        # The shortlist may have passed the 8/3 bps canary floors while fresh
-        # executable BBO/VWAP repricing puts the actual first leg below them.
-        # Re-run the same admission contract only after the immutable final
-        # edge has replaced the candidate view and bind its cap to final price.
-        canary_reason = self._funding_canary_submission_reason(
-            candidate,
-            now_ms,
-            quantity=required_base_quantity,
-            long_price=final_economics.long_entry_price,
-            short_price=final_economics.short_entry_price,
-            enforce_notional=enforce_canary_notional,
-        )
-        if canary_reason:
-            self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=canary_reason,
-                blocked_reasons=[canary_reason],
-                source=source,
-                decision="skip_before_first_leg",
-                extra={"canary_final_revalidation": True},
-            )
-            return False
         return True
 
     async def _resolve_entry_quantity_steps(
@@ -4877,12 +4201,6 @@ class EntryDispatchRuntime:
         )
         expected_edge_bps_entry = float(getattr(candidate, "expected_edge_bps", 0.0) or 0.0)
         worst_case_edge_bps_entry = _float_attr("worst_case_edge_bps")
-        enhanced_live_candidate = (
-            self.ctx.config.runtime.mode == "live"
-            and _float_attr("entry_target_quantity") > 0.0
-        )
-        if not enhanced_live_candidate:
-            expected_shortfall_bps_entry = 0.0
         first_funding_leg = str(getattr(candidate, "first_funding_leg", "") or "")
         entry_maker_leg = (
             "long"
@@ -4926,7 +4244,9 @@ class EntryDispatchRuntime:
             total_funding_edge_bps_entry=total_funding_edge_bps_entry,
             expected_edge_bps_entry=expected_edge_bps_entry,
             worst_case_edge_bps_entry=worst_case_edge_bps_entry,
-            expected_shortfall_bps_entry=expected_shortfall_bps_entry,
+            # Expected-shortfall admission is retired.  The field remains in
+            # durable state solely so historical pending entries can recover.
+            expected_shortfall_bps_entry=0.0,
             calculation_version=_str_attr("calculation_version", "v1_exact"),
             model_epoch=_str_attr("model_epoch", _str_attr("calculation_version", "v1_exact")),
             economics_observed_at_ms=_positive_ms(
@@ -4964,19 +4284,10 @@ class EntryDispatchRuntime:
             entry_max_leg_notional_quote=_float_attr(
                 "entry_max_leg_notional_quote"
             ),
-            funding_canary_enabled_at_entry=bool(
-                self.ctx.config.runtime.mode == "live"
-                and self.ctx.config.strategy.funding_canary_enabled is True
-            ),
-            funding_canary_fee_assurance_tier=_str_attr(
-                "funding_canary_fee_assurance_tier"
-            ),
-            funding_canary_hard_max_entry_notional_quote=_float_attr(
-                "funding_canary_hard_max_entry_notional_quote"
-            ),
-            funding_canary_size_constrained=bool(
-                getattr(candidate, "funding_canary_size_constrained", False)
-            ),
+            funding_canary_enabled_at_entry=False,
+            funding_canary_fee_assurance_tier="",
+            funding_canary_hard_max_entry_notional_quote=0.0,
+            funding_canary_size_constrained=False,
             long_symbol_rule_at_entry=self._freeze_symbol_rule_at_entry(
                 venue=long_venue,
                 symbol=candidate.symbol,
@@ -5040,15 +4351,6 @@ class EntryDispatchRuntime:
         evidence = getattr(candidate, "entry_open_interest_evidence", None)
         if not isinstance(evidence, dict):
             return "entry_open_interest_evidence_unavailable", {}
-        revision_id = str(
-            getattr(candidate, "evidence_candidate_revision_id", "")
-            or getattr(candidate, "candidate_revision_id", "")
-            or ""
-        )
-        if not revision_id:
-            return "entry_open_interest_revision_unavailable", evidence
-        if str(evidence.get("candidate_revision_id") or "") != revision_id:
-            return "entry_open_interest_revision_mismatch", evidence
         max_age_ms = max(
             int(
                 getattr(
@@ -5081,7 +4383,6 @@ class EntryDispatchRuntime:
                 event_at_ms = int(row.get("event_at_ms") or 0)
                 received_at_ms = int(row.get("received_at_ms") or 0)
                 value_quote = float(row.get("value_quote"))
-                raw_value = float(row.get("raw_value"))
             except (TypeError, ValueError, OverflowError):
                 return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
             if (
@@ -5090,49 +4391,8 @@ class EntryDispatchRuntime:
                 or event_at_ms < 0
                 or not math.isfinite(value_quote)
                 or value_quote < 0.0
-                or not math.isfinite(raw_value)
-                or raw_value < 0.0
-                or not str(row.get("raw_unit") or "").strip()
-                or not str(row.get("source") or "").strip()
-                or not str(row.get("venue_symbol") or "").strip()
-                or not str(row.get("sample_id") or "").strip()
             ):
                 return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
-            expected_sample_id = open_interest_sample_id(
-                venue=expected_venue,
-                canonical_symbol=symbol,
-                venue_symbol=str(row.get("venue_symbol") or ""),
-                observed_at_ms=event_at_ms or observed_at_ms,
-                source=str(row.get("source") or ""),
-                raw_value=raw_value,
-                value_quote=value_quote,
-            )
-            if str(row.get("sample_id") or "") != expected_sample_id:
-                return "entry_open_interest_sample_id_mismatch", {
-                    "leg": leg,
-                    **row,
-                }
-            proof_reason = observed_open_interest_proof_reason(
-                venue=expected_venue,
-                canonical_symbol=symbol,
-                venue_symbol=str(row.get("venue_symbol") or ""),
-                value_quote=value_quote,
-                raw_value=raw_value,
-                raw_unit=str(row.get("raw_unit") or ""),
-                contract_multiplier=row.get("contract_multiplier"),
-                conversion_mark_price=row.get("conversion_mark_price"),
-                observed_at_ms=observed_at_ms,
-                event_at_ms=event_at_ms,
-                received_at_ms=received_at_ms,
-                source=str(row.get("source") or ""),
-                sample_id=str(row.get("sample_id") or ""),
-            )
-            if proof_reason:
-                return "entry_open_interest_proof_invalid", {
-                    "leg": leg,
-                    "proof_reason": proof_reason,
-                    **row,
-                }
             open_interest_floor = float(
                 self.ctx.config.strategy.entry_open_interest_floor_quote(
                     expected_venue
@@ -5165,68 +4425,6 @@ class EntryDispatchRuntime:
                     **row,
                 }
         return "", evidence
-
-    def _bind_final_entry_candidate_revision(
-        self,
-        candidate,
-        *,
-        quantity: float,
-        long_price: float,
-        short_price: float,
-        entry_route: str,
-    ) -> str:
-        """Freeze the exact submitted quantity/prices without forging new proof."""
-        if self._final_entry_economics_binding_reason(
-            candidate,
-            quantity=quantity,
-            long_price=long_price,
-            short_price=short_price,
-        ):
-            return ""
-        evidence_revision_id = str(
-            getattr(candidate, "evidence_candidate_revision_id", "")
-            or getattr(candidate, "candidate_revision_id", "")
-            or ""
-        )
-        if not evidence_revision_id:
-            return ""
-        candidate.evidence_candidate_revision_id = evidence_revision_id
-        final_revision_id = final_candidate_revision_id(
-            evidence_candidate_revision_id=evidence_revision_id,
-            quantity=quantity,
-            long_price=long_price,
-            short_price=short_price,
-            entry_route=entry_route,
-            economics={
-                "entry_notional_quote": getattr(
-                    candidate, "entry_notional_quote", 0.0
-                ),
-                "entry_max_leg_notional_quote": getattr(
-                    candidate, "entry_max_leg_notional_quote", 0.0
-                ),
-                "entry_fee_bps": getattr(candidate, "entry_fee_bps", 0.0),
-                "entry_slippage_bps": getattr(
-                    candidate, "entry_slippage_bps", 0.0
-                ),
-                "expected_edge_bps": getattr(
-                    candidate, "expected_edge_bps", 0.0
-                ),
-                "worst_case_edge_bps": getattr(
-                    candidate, "worst_case_edge_bps", 0.0
-                ),
-                "ranking_edge_bps": getattr(
-                    candidate, "ranking_edge_bps", 0.0
-                ),
-                "expected_profit_quote": getattr(
-                    candidate, "expected_profit_quote", 0.0
-                ),
-                "worst_case_profit_quote": getattr(
-                    candidate, "worst_case_profit_quote", 0.0
-                ),
-            },
-        )
-        candidate.candidate_revision_id = final_revision_id
-        return final_revision_id
 
     def _entry_open_interest_submit_blocked(self, candidate, *, now_ms: int) -> bool:
         reason, evidence = self._entry_open_interest_submit_reason(
@@ -5458,35 +4656,9 @@ class EntryDispatchRuntime:
         try:
             # V1: execution.entry_selected — engine decided to open this candidate
             candidate_pair_id = self._candidate_pair_id(candidate)
-            canary_budget = _funding_canary_execution_budget(candidate)
             planned_entry_notional_quote = max(
                 float(ctx.long_price_hint), float(ctx.short_price_hint)
             ) * float(effective_quantity)
-            fee_provenance = list(
-                getattr(candidate, "account_fee_evidence_provenance", []) or []
-            )
-            fee_evidence_integrity_verified = bool(fee_provenance) and all(
-                isinstance(item, dict) and item.get("integrity_verified") is True
-                for item in fee_provenance
-            )
-            fee_evidence_identity_bound = bool(fee_provenance) and all(
-                isinstance(item, dict)
-                and _is_sha256_hex(item.get("account_identity_hash"))
-                and _is_sha256_hex(item.get("document_sha256"))
-                and item.get("integrity_key_id") == TRUSTED_FEE_EVIDENCE_KEY_ID
-                for item in fee_provenance
-            )
-            fee_evidence_authoritative = bool(fee_provenance) and all(
-                isinstance(item, dict)
-                and item.get("account_fee_evidence_authoritative") is True
-                for item in fee_provenance
-            )
-            strategy = self.ctx.config.strategy
-            canary_assurance_tier = canary_fee_assurance_tier(candidate, strategy)
-            canary_min_expected, canary_min_worst = canary_edge_floors(
-                strategy, ctx.long_venue, ctx.short_venue
-            )
-            canary_cap = canary_notional_cap(candidate, strategy)
             selected_seq = self.ctx.journal.append(
                 "execution.entry_selected",
                 {
@@ -5516,15 +4688,6 @@ class EntryDispatchRuntime:
                     "calculation_version": ctx.calculation_version,
                     "model_epoch": ctx.model_epoch,
                     "economics_observed_at_ms": ctx.economics_observed_at_ms,
-                    # This marker makes a selected live canary an immutable
-                    # audit cohort.  No closure may be promoted merely by
-                    # matching pair/symbol after the fact.
-                    "funding_canary": (
-                        self.ctx.config.strategy.funding_canary_enabled is True
-                    ),
-                    # A paper dispatch may legitimately exercise the same
-                    # canary policy.  Persist its mode so the promotion report
-                    # can never count a simulated closure as live evidence.
                     "runtime_mode": str(
                         self.ctx.config.runtime.mode or ""
                     ).lower(),
@@ -5545,47 +4708,8 @@ class EntryDispatchRuntime:
                     "worst_case_edge_bps": float(
                         getattr(candidate, "worst_case_edge_bps", 0.0) or 0.0
                     ),
-                    "account_fee_evidence_fingerprint": str(
-                        getattr(
-                            candidate, "account_fee_evidence_fingerprint", ""
-                        )
-                        or ""
-                    ),
-                    "account_fee_evidence_provenance": list(
-                        getattr(
-                            candidate, "account_fee_evidence_provenance", []
-                        )
-                        or []
-                    ),
                     "economics_complete": getattr(candidate, "economics_complete", False)
                     is True,
-                    "account_fee_evidence_complete": getattr(
-                        candidate, "account_fee_evidence_complete", False
-                    )
-                    is True,
-                    "account_fee_evidence_integrity_verified": fee_evidence_integrity_verified,
-                    "account_fee_evidence_identity_bound": fee_evidence_identity_bound,
-                    "account_fee_evidence_authoritative": fee_evidence_authoritative,
-                    "funding_canary_fee_assurance_tier": canary_assurance_tier,
-                    "funding_canary_policy_version": _FUNDING_CANARY_POLICY_VERSION,
-                    "funding_canary_cohort_id": _funding_canary_cohort_id(
-                        candidate, strategy
-                    ),
-                    "funding_canary_hard_max_entry_notional_quote": (
-                        canary_cap
-                    ),
-                    "funding_canary_hard_min_expected_net_edge_bps": (
-                        canary_min_expected
-                    ),
-                    "funding_canary_hard_min_worst_case_edge_bps": (
-                        canary_min_worst
-                    ),
-                    "canary_budgeted_execution_cost_bps": (
-                        canary_budget[0] if canary_budget is not None else None
-                    ),
-                    "canary_execution_reserve_bps": (
-                        canary_budget[1] if canary_budget is not None else None
-                    ),
                     "ts_ms": now_ms,
                 },
             )
@@ -5952,17 +5076,16 @@ class EntryDispatchRuntime:
             long_quantity_metadata,
             short_quantity_metadata,
         ) = quantity_resolution
-        # Portfolio-risk admission is part of the enhanced v3 live contract.
-        # Legacy candidates deliberately retain their V1 lifecycle semantics;
-        # paper execution is a research surface and must not be silently
-        # redefined by a live-only portfolio limit.
-        enhanced_live_candidate = (
+        # Private margin and portfolio limits are live-entry checks only.
+        # Recovery, passive close and residual repair do not pass through
+        # this branch.  The retired expected-shortfall model deliberately has
+        # no influence on size or admission here.
+        live_candidate = (
             self.ctx.config.runtime.mode == "live"
             and float(getattr(candidate, "entry_target_quantity", 0.0) or 0.0) > 0.0
         )
         leverage_evidence_for_sizing: dict[Venue, EntryLeverageEvidence] = {}
-        expected_shortfall_bps_entry = 0.0
-        if enhanced_live_candidate:
+        if live_candidate:
             strategy = self.ctx.config.strategy
 
             # A new pair may not be admitted against incomplete portfolio
@@ -5995,159 +5118,6 @@ class EntryDispatchRuntime:
                 risk_short_price = float(
                     getattr(quote_lease, "short_bid", 0.0) or price_hint
                 )
-            basis_es = self.ctx.funding_risk_runtime.estimate_candidate(
-                candidate,
-                long_venue=long_venue,
-                short_venue=short_venue,
-                now_ms=now_ms,
-            )
-            common_es_step = _common_base_quantity_step(
-                okx_base_step,
-                long_quantity_step,
-                short_quantity_step,
-            )
-            es_cold_start = (
-                not basis_es.evidence_complete
-                and basis_es.reason in _FUNDING_ES_COLD_START_REASONS
-            )
-            if not basis_es.evidence_complete and not es_cold_start:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=basis_es.reason,
-                    blocked_reasons=[basis_es.reason],
-                    source="funding_basis_expected_shortfall",
-                    decision="skip_before_first_leg",
-                    extra={
-                        "expected_shortfall_bps": basis_es.expected_shortfall_bps,
-                        "sample_count": basis_es.sample_count,
-                        "return_count": basis_es.return_count,
-                        "history_ms": basis_es.history_ms,
-                        "confidence": basis_es.confidence,
-                        "model_version": basis_es.model_version,
-                    },
-                )
-                return False
-            if es_cold_start:
-                cold_start_cap = float(
-                    strategy.funding_es_cold_start_max_entry_notional_quote or 0.0
-                )
-                cold_start_quantity = _align_base_quantity_down(
-                    cold_start_cap / max(risk_long_price, risk_short_price),
-                    common_es_step,
-                )
-                if cold_start_quantity <= 0.0:
-                    self._emit_entry_dispatch_viability_blocked(
-                        candidate,
-                        now_ms,
-                        reason="expected_shortfall_cold_start_quantity_below_common_grid",
-                        blocked_reasons=[
-                            "expected_shortfall_cold_start_quantity_below_common_grid"
-                        ],
-                        source="funding_basis_expected_shortfall",
-                        decision="skip_before_first_leg",
-                        extra={"cold_start_notional_cap_quote": cold_start_cap},
-                    )
-                    return False
-                quantity = min(quantity, cold_start_quantity)
-                candidate.entry_target_quantity = quantity
-                candidate.entry_notional_quote = quantity * (
-                    risk_long_price + risk_short_price
-                ) / 2.0
-                candidate.entry_max_leg_notional_quote = quantity * max(
-                    risk_long_price, risk_short_price
-                )
-            # The static field remains a conservative floor.  During an
-            # evidence cold start, the explicit stress value replaces only the
-            # missing sample estimate and is paired with the smaller cap above.
-            expected_shortfall_bps_entry = max(
-                (
-                    float(strategy.funding_es_cold_start_bps or 0.0)
-                    if es_cold_start
-                    else basis_es.expected_shortfall_bps
-                ),
-                float(strategy.funding_expected_shortfall_bps or 0.0),
-            )
-            es_quantity_limit = (
-                StrategyRiskAllocator().limit_base_quantity_by_expected_shortfall(
-                    long_entry_price=risk_long_price,
-                    short_entry_price=risk_short_price,
-                    current_base_quantity=quantity,
-                    expected_shortfall_bps=expected_shortfall_bps_entry,
-                    expected_shortfall_budget_quote=(
-                        strategy.funding_expected_shortfall_budget_quote
-                    ),
-                )
-            )
-            es_quantity = _align_base_quantity_down(
-                es_quantity_limit.base_quantity,
-                common_es_step,
-            )
-            if not es_quantity_limit.evidence_complete or es_quantity <= 0.0:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=(
-                        es_quantity_limit.reason
-                        or "expected_shortfall_quantity_below_common_grid"
-                    ),
-                    blocked_reasons=[
-                        es_quantity_limit.reason
-                        or "expected_shortfall_quantity_below_common_grid"
-                    ],
-                    source="strategy_risk_allocator",
-                    decision="skip_before_first_leg",
-                    extra={
-                        "expected_shortfall_bps": expected_shortfall_bps_entry,
-                        "expected_shortfall_budget_quote": (
-                            strategy.funding_expected_shortfall_budget_quote
-                        ),
-                        "common_base_quantity_step": common_es_step,
-                        "maximum_reference_notional_quote": (
-                            es_quantity_limit.maximum_reference_notional_quote
-                        ),
-                    },
-                )
-                return False
-            if es_quantity + 1e-12 < quantity:
-                quantity = es_quantity
-                candidate.entry_target_quantity = quantity
-                candidate.entry_notional_quote = quantity * (
-                    risk_long_price + risk_short_price
-                ) / 2.0
-                candidate.entry_max_leg_notional_quote = quantity * max(
-                    risk_long_price, risk_short_price
-                )
-            self.ctx.journal.append(
-                "runtime.entry_expected_shortfall_sizing",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "expected_shortfall_bps": expected_shortfall_bps_entry,
-                    "dynamic_expected_shortfall_bps": basis_es.expected_shortfall_bps,
-                    "legacy_floor_bps": float(
-                        strategy.funding_expected_shortfall_bps or 0.0
-                    ),
-                    "expected_shortfall_budget_quote": (
-                        strategy.funding_expected_shortfall_budget_quote
-                    ),
-                    "maximum_reference_notional_quote": (
-                        es_quantity_limit.maximum_reference_notional_quote
-                    ),
-                    "requested_common_quantity": raw_quantity,
-                    "expected_shortfall_common_quantity": quantity,
-                    "expected_shortfall_constrained": es_quantity_limit.constrained,
-                    "model_version": basis_es.model_version,
-                    "cold_start": es_cold_start,
-                    "cold_start_reason": basis_es.reason if es_cold_start else "",
-                    "sample_count": basis_es.sample_count,
-                    "return_count": basis_es.return_count,
-                    "history_ms": basis_es.history_ms,
-                    "confidence": basis_es.confidence,
-                    "ts_ms": now_ms,
-                },
-            )
             leverage_ready, leverage_evidence_for_sizing = (
                 await self._inspect_live_entry_leverage_for_candidate(
                     candidate=candidate,
@@ -6230,10 +5200,6 @@ class EntryDispatchRuntime:
                 correlation_group_by_symbol=(
                     strategy.funding_correlation_group_by_symbol
                 ),
-                expected_shortfall_bps=expected_shortfall_bps_entry,
-                expected_shortfall_budget_quote=(
-                    strategy.funding_expected_shortfall_budget_quote
-                ),
                 max_concurrent_positions_per_venue=(
                     strategy.max_concurrent_positions_per_venue
                 ),
@@ -6272,9 +5238,6 @@ class EntryDispatchRuntime:
                         ),
                         "projected_correlation_group_exposure_quote": (
                             risk_admission.projected_correlation_group_exposure_quote
-                        ),
-                        "projected_expected_shortfall_quote": (
-                            risk_admission.projected_expected_shortfall_quote
                         ),
                         "risk_evidence_complete": risk_admission.evidence_complete,
                     },
@@ -6344,33 +5307,10 @@ class EntryDispatchRuntime:
             short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
         )
 
-        common_canary_step = _common_base_quantity_step(
+        common_base_quantity_step = _common_base_quantity_step(
             okx_base_step,
             long_quantity_step,
             short_quantity_step,
-        )
-        pre_canary_quantity = quantity
-        quantity, canary_clamp_reason = self._funding_canary_clamp_quantity(
-            candidate,
-            now_ms,
-            quantity=quantity,
-            long_price=long_order_price_hint,
-            short_price=short_order_price_hint,
-            common_step=common_canary_step,
-        )
-        if canary_clamp_reason:
-            self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=canary_clamp_reason,
-                blocked_reasons=[canary_clamp_reason],
-                source="funding_canary_risk_allocator",
-                decision="skip_before_first_leg",
-            )
-            return False
-        canary_size_constrained = bool(
-            quantity + 1e-12 < pre_canary_quantity
-            or getattr(candidate, "funding_canary_size_constrained", False)
         )
         pair_minimum_reason, pair_minimum_evidence = (
             self._entry_pair_minimum_reason(
@@ -6380,7 +5320,6 @@ class EntryDispatchRuntime:
                 long_metadata=long_quantity_metadata,
                 short_metadata=short_quantity_metadata,
                 strategy_min_notional=min_notional,
-                canary_constrained=canary_size_constrained,
             )
         )
         if pair_minimum_reason:
@@ -6432,7 +5371,7 @@ class EntryDispatchRuntime:
                 min_notional_quote=hedge_min_notional,
                 # Every fill chunk must be executable on both venues, not
                 # merely on the hedge venue's smaller native step.
-                step_base_quantity=common_canary_step,
+                step_base_quantity=common_base_quantity_step,
                 price_hint=(
                     hedge_planner_price if hedge_planner_price > 0.0 else None
                 ),
@@ -6455,7 +5394,7 @@ class EntryDispatchRuntime:
                     "maker_min_notional_quote": maker_min_notional,
                     "hedge_min_notional_quote": hedge_min_notional,
                     "hedge_min_quantity": hedge_min_quantity,
-                    "common_base_quantity_step": common_canary_step,
+                    "common_base_quantity_step": common_base_quantity_step,
                     "reason": "min_hedgeable_chunk_invalid",
                     "ts_ms": now_ms,
                 },
@@ -6509,7 +5448,7 @@ class EntryDispatchRuntime:
         # economics contract, and derive bounded limits from those exact
         # levels. A passive route deliberately retains V1 post-only pricing.
         local_l2_execution = self._local_l2_effective_enabled()
-        if enhanced_live_candidate and entry_type == EntryType.STANDARD_DUAL_TAKER:
+        if live_candidate and entry_type == EntryType.STANDARD_DUAL_TAKER:
             execution_quote_lease = (
                 self._local_l2_final_quote_lease(
                     candidate,
@@ -6539,47 +5478,6 @@ class EntryDispatchRuntime:
                     execution_quote_lease,
                     candidate,
                 )
-            clamped_quantity, clamp_reason = self._funding_canary_clamp_quantity(
-                candidate,
-                now_ms,
-                quantity=effective_quantity,
-                long_price=final_long_price,
-                short_price=final_short_price,
-                common_step=common_canary_step,
-            )
-            if clamp_reason:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=clamp_reason,
-                    blocked_reasons=[clamp_reason],
-                    source="final_submit_canary",
-                    decision="skip_before_first_leg",
-                )
-                return False
-            if clamped_quantity + 1e-12 < effective_quantity:
-                canary_size_constrained = True
-                effective_quantity = clamped_quantity
-                plan.full_target_quantity = clamped_quantity
-                plan.initial_maker_target_quantity = clamped_quantity
-                if local_l2_execution:
-                    execution_quote_lease = self._local_l2_final_quote_lease(
-                        candidate,
-                        now_ms,
-                        target_quantity=effective_quantity,
-                    )
-                if execution_quote_lease is None:
-                    self._emit_entry_dispatch_viability_blocked(
-                        candidate,
-                        now_ms,
-                        reason="final_execution_quote_unavailable_after_canary_clamp",
-                        blocked_reasons=[
-                            "final_execution_quote_unavailable_after_canary_clamp"
-                        ],
-                        source="final_submit_canary",
-                        decision="skip_before_first_leg",
-                    )
-                    return False
             if not self._revalidate_final_entry_economics(
                 candidate=candidate,
                 quote_lease=execution_quote_lease,
@@ -6592,70 +5490,15 @@ class EntryDispatchRuntime:
             quote_lease = execution_quote_lease
 
         if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            # Sweep-limit prices, not VWAP, are the actual per-leg hard-order
-            # bounds.  Re-clamp on those prices and rebuild L2 for the smaller
-            # quantity until the fixed point is stable.
-            for _iteration in range(3):
-                if local_l2_execution:
-                    long_order_price_hint, short_order_price_hint = (
-                        _standard_ioc_price_hints(quote_lease)
-                    )
-                else:
-                    long_order_price_hint, short_order_price_hint = (
-                        _ws_bbo_ioc_price_hints(quote_lease, candidate)
-                    )
-                clamped_quantity, clamp_reason = self._funding_canary_clamp_quantity(
-                    candidate,
-                    now_ms,
-                    quantity=effective_quantity,
-                    long_price=long_order_price_hint,
-                    short_price=short_order_price_hint,
-                    common_step=common_canary_step,
+            if local_l2_execution:
+                long_order_price_hint, short_order_price_hint = (
+                    _standard_ioc_price_hints(quote_lease)
                 )
-                if clamp_reason:
-                    self._emit_entry_dispatch_viability_blocked(
-                        candidate,
-                        now_ms,
-                        reason=clamp_reason,
-                        blocked_reasons=[clamp_reason],
-                        source="final_ioc_sweep_canary",
-                        decision="skip_before_first_leg",
-                    )
-                    return False
-                if clamped_quantity + 1e-12 >= effective_quantity:
-                    break
-                canary_size_constrained = True
-                effective_quantity = clamped_quantity
-                plan.full_target_quantity = clamped_quantity
-                plan.initial_maker_target_quantity = clamped_quantity
-                if local_l2_execution:
-                    quote_lease = self._local_l2_final_quote_lease(
-                        candidate,
-                        now_ms,
-                        target_quantity=effective_quantity,
-                    )
-                if quote_lease is None or not self._revalidate_final_entry_economics(
-                    candidate=candidate,
-                    quote_lease=quote_lease,
-                    required_base_quantity=effective_quantity,
-                    now_ms=now_ms,
-                    source="final_ioc_sweep_canary",
-                    execution_is_passive=False,
-                ):
-                    return False
             else:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason="funding_canary_ioc_clamp_did_not_converge",
-                    blocked_reasons=["funding_canary_ioc_clamp_did_not_converge"],
-                    source="final_ioc_sweep_canary",
-                    decision="skip_before_first_leg",
+                long_order_price_hint, short_order_price_hint = (
+                    _ws_bbo_ioc_price_hints(quote_lease, candidate)
                 )
-                return False
             if getattr(quote_lease, "l2_vwap_complete", False) is True:
-                # ``price_hint`` is audit/UI evidence only here; actual legs
-                # use their distinct bounded IOC limits above.
                 price_hint = (
                     float(getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0)
                     + float(getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0)
@@ -6688,7 +5531,6 @@ class EntryDispatchRuntime:
                 long_metadata=long_quantity_metadata,
                 short_metadata=short_quantity_metadata,
                 strategy_min_notional=min_notional,
-                canary_constrained=canary_size_constrained,
             )
         )
         if final_pair_minimum_reason:
@@ -6700,37 +5542,6 @@ class EntryDispatchRuntime:
                 source="final_entry_pair_minimum",
                 decision="skip_before_first_leg",
                 extra=final_pair_minimum_evidence,
-            )
-            return False
-
-        # The actual first-leg quantity can differ from the shortlist through
-        # venue rounding, risk allocation and route planning.  Bind the hard
-        # USD cap to those final order prices/quantity before an entry context
-        # or order id is created.
-        canary_submission_reason = self._funding_canary_submission_reason(
-            candidate,
-            now_ms,
-            quantity=(
-                plan.full_target_quantity
-                if entry_type == EntryType.PASSIVE_INCREMENTAL
-                else effective_quantity
-            ),
-            long_price=long_order_price_hint,
-            short_price=short_order_price_hint,
-        )
-        if canary_submission_reason:
-            self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=canary_submission_reason,
-                blocked_reasons=[canary_submission_reason],
-                source="final_submit_canary",
-                decision="skip_before_first_leg",
-                extra={
-                    "effective_quantity": effective_quantity,
-                    "long_order_price_hint": long_order_price_hint,
-                    "short_order_price_hint": short_order_price_hint,
-                },
             )
             return False
 
@@ -6992,93 +5803,13 @@ class EntryDispatchRuntime:
                     },
                 )
 
-            passive_target_quantity = float(plan.full_target_quantity or 0.0)
-            clamped_passive_quantity, passive_clamp_reason = (
-                self._funding_canary_clamp_quantity(
-                    candidate,
-                    now_ms,
-                    quantity=passive_target_quantity,
-                    long_price=long_order_price_hint,
-                    short_price=short_order_price_hint,
-                    common_step=common_canary_step,
-                )
-            )
-            if passive_clamp_reason:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=passive_clamp_reason,
-                    blocked_reasons=[passive_clamp_reason],
-                    source="final_passive_reprice_canary",
-                    decision="skip_before_first_leg",
-                )
-                return False
-            passive_quantity_changed = (
-                clamped_passive_quantity + 1e-12 < passive_target_quantity
-            )
-            if passive_quantity_changed:
-                canary_size_constrained = True
-                plan.full_target_quantity = clamped_passive_quantity
-                plan.initial_maker_target_quantity = min(
-                    plan.initial_maker_target_quantity,
-                    clamped_passive_quantity,
-                )
-                effective_quantity = plan.initial_maker_target_quantity
-                if enhanced_live_candidate and local_l2_execution:
-                    resized_quote_lease = self._local_l2_final_quote_lease(
-                        candidate,
-                        now_ms,
-                        target_quantity=plan.full_target_quantity,
-                    )
-                    if resized_quote_lease is None:
-                        self._emit_entry_dispatch_viability_blocked(
-                            candidate,
-                            now_ms,
-                            reason=(
-                                "final_l2_passive_quote_unavailable_after_canary_clamp"
-                            ),
-                            blocked_reasons=[
-                                "final_l2_passive_quote_unavailable_after_canary_clamp"
-                            ],
-                            source="final_passive_reprice_canary",
-                            decision="skip_before_first_leg",
-                            extra={
-                                "passive_target_quantity": passive_target_quantity,
-                                "clamped_passive_quantity": clamped_passive_quantity,
-                            },
-                        )
-                        return False
-                    # Preserve the post-only guard's exact maker price while
-                    # refreshing the opposite taker leg and depth/VWAP for the
-                    # reduced quantity.  Reusing the pre-clamp lease would bind
-                    # economics to a quantity that is no longer submitted.
-                    if repriced_price > 0.0:
-                        if maker_leg == Side.BUY:
-                            resized_quote_lease = replace(
-                                resized_quote_lease,
-                                long_bid=repriced_price,
-                            )
-                        else:
-                            resized_quote_lease = replace(
-                                resized_quote_lease,
-                                short_ask=repriced_price,
-                            )
-                    quote_lease = resized_quote_lease
-                    if maker_leg == Side.BUY:
-                        long_order_price_hint = float(quote_lease.long_bid or 0.0)
-                        short_order_price_hint = float(quote_lease.short_bid or 0.0)
-                    else:
-                        long_order_price_hint = float(quote_lease.long_ask or 0.0)
-                        short_order_price_hint = float(quote_lease.short_ask or 0.0)
-            if enhanced_live_candidate and (
-                repriced_price > 0.0 or passive_quantity_changed
-            ):
+            if live_candidate and repriced_price > 0.0:
                 if not self._revalidate_final_entry_economics(
                     candidate=candidate,
                     quote_lease=quote_lease,
                     required_base_quantity=plan.full_target_quantity,
                     now_ms=now_ms,
-                    source="final_passive_reprice_canary",
+                    source="final_passive_reprice",
                     execution_is_passive=True,
                 ):
                     return False
@@ -7108,7 +5839,6 @@ class EntryDispatchRuntime:
                     long_metadata=long_quantity_metadata,
                     short_metadata=short_quantity_metadata,
                     strategy_min_notional=min_notional,
-                    canary_constrained=canary_size_constrained,
                 )
             )
             if passive_minimum_reason:
@@ -7123,30 +5853,12 @@ class EntryDispatchRuntime:
                 )
                 return False
 
-            passive_submission_reason = self._funding_canary_submission_reason(
-                candidate,
-                now_ms,
-                quantity=plan.full_target_quantity,
-                long_price=long_order_price_hint,
-                short_price=short_order_price_hint,
-            )
-            if passive_submission_reason:
-                self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=passive_submission_reason,
-                    blocked_reasons=[passive_submission_reason],
-                    source="final_passive_reprice_canary",
-                    decision="skip_before_first_leg",
-                )
-                return False
-
         final_submission_quantity = (
             plan.full_target_quantity
             if entry_type == EntryType.PASSIVE_INCREMENTAL
             else effective_quantity
         )
-        if enhanced_live_candidate:
+        if live_candidate:
             final_economics_reason = self._apply_final_entry_economics(
                 candidate,
                 quantity=final_submission_quantity,
@@ -7164,7 +5876,7 @@ class EntryDispatchRuntime:
                 )
                 return False
         final_binding_reason = ""
-        if enhanced_live_candidate:
+        if live_candidate:
             final_binding_reason = self._final_entry_economics_binding_reason(
                 candidate,
                 quantity=final_submission_quantity,
@@ -7177,25 +5889,7 @@ class EntryDispatchRuntime:
                 now_ms,
                 reason=final_binding_reason,
                 blocked_reasons=[final_binding_reason],
-                source="final_candidate_revision_binding",
-                decision="skip_before_first_leg",
-            )
-            return False
-        final_candidate_revision = self._bind_final_entry_candidate_revision(
-            candidate,
-            quantity=final_submission_quantity,
-            long_price=long_order_price_hint,
-            short_price=short_order_price_hint,
-            entry_route=route.value,
-        )
-        if enhanced_live_candidate and not final_candidate_revision:
-            reason = "final_candidate_revision_unavailable"
-            self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=reason,
-                blocked_reasons=[reason],
-                source="final_candidate_revision_binding",
+                source="final_candidate_economics_binding",
                 decision="skip_before_first_leg",
             )
             return False
@@ -7206,7 +5900,7 @@ class EntryDispatchRuntime:
         requires_final_quote_lease = (
             self.ctx.config.runtime.mode == "live"
             and (
-                enhanced_live_candidate
+                live_candidate
                 or self._entry_readiness_provider_uses_quote_lease()
                 or self._local_l2_effective_enabled()
             )
@@ -7260,29 +5954,6 @@ class EntryDispatchRuntime:
                     },
                 )
                 return False
-            final_canary_reason = self._funding_canary_submission_reason(
-                candidate,
-                submit_now_ms,
-                quantity=(
-                    plan.full_target_quantity
-                    if entry_type == EntryType.PASSIVE_INCREMENTAL
-                    else effective_quantity
-                ),
-                long_price=long_order_price_hint,
-                short_price=short_order_price_hint,
-            )
-            if final_canary_reason:
-                self.ctx.journal.append(
-                    "funding_canary_final_notional_invariant_breached",
-                    {
-                        "symbol": candidate.symbol,
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "reason": final_canary_reason,
-                        "ts_ms": submit_now_ms,
-                    },
-                )
-                return False
         now_ms = submit_now_ms
         if (
             self.ctx.config.runtime.mode == "live"
@@ -7305,10 +5976,10 @@ class EntryDispatchRuntime:
             entry_type=entry_type,
             route=route,
             now_ms=now_ms,
-            expected_shortfall_bps_entry=expected_shortfall_bps_entry,
+            expected_shortfall_bps_entry=0.0,
             long_quantity_metadata=long_quantity_metadata,
             short_quantity_metadata=short_quantity_metadata,
-            common_base_quantity_step=common_canary_step,
+            common_base_quantity_step=common_base_quantity_step,
         )
 
         if self._selected_pre_submit_deadline_exceeded(

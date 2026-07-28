@@ -628,6 +628,31 @@ class _MessageThenBlockingFakeWebSocket(_BlockingFakeWebSocket):
         return await super().recv()
 
 
+class _QueuedFakeWebSocket(_FakeWebSocket):
+    """Fake websocket that lets tests feed messages after connection."""
+
+    def __init__(self):
+        super().__init__(messages=[])
+        self._queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+    def feed(self, msg: str) -> None:
+        self._queue.put_nowait(msg)
+
+    async def recv(self) -> str:
+        item = await self._queue.get()
+        if item is None:
+            from websockets.exceptions import ConnectionClosed
+            raise ConnectionClosed(1000, "closed by test")
+        return item
+
+    async def close(self) -> None:
+        self.closed = True
+        self._queue.put_nowait(None)
+
+    async def __aexit__(self, *args):
+        await self.close()
+
+
 def _fake_connect(fake_ws: _FakeWebSocket):
     """Return a callable that returns the async context manager.
 
@@ -1079,6 +1104,84 @@ class TestAsterWorkerLifecycle:
 
         # listenKey start is internal — success on connect + message
         assert transport._success_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_incremental_symbol_update_keeps_parser_map_live_for_truth_events(self):
+        """Aster account stream decodes symbols added after the worker starts."""
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.transport import LiveCredential, VenueTransport
+
+        transport = VenueTransport(
+            get_spec(Venue.ASTER),
+            mode="paper",
+            credential=LiveCredential(api_key="test-api-key", api_secret="test-secret"),
+        )
+        ws = _QueuedFakeWebSocket()
+        connect_urls: list[str] = []
+
+        async def _request_listen_key(method, path, *, api_key, params=None):
+            if method == "POST":
+                return {"listenKey": "lk-incremental"}
+            return {}
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return ws
+
+        transport._request_listen_key = _request_listen_key
+        with patch(
+            "lightfee.venues.aster_private_ws.websockets.connect",
+            side_effect=_connect,
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            try:
+                await _wait_until(lambda: bool(connect_urls))
+                added = transport.update_private_ws_symbols(["BTCUSDT"])
+                assert added == {"BTCUSDT"}
+                assert transport.consume_private_ws_symbol_updates() == {}
+
+                ws.feed(json.dumps({
+                    "e": "TRADE_LITE",
+                    "s": "BTCUSDT",
+                    "i": 333,
+                    "c": "aster-incremental-btc",
+                    "l": "0.25",
+                    "L": "65000.00",
+                    "T": 1700000004000,
+                }))
+                ws.feed(json.dumps({
+                    "e": "ACCOUNT_UPDATE",
+                    "E": 1700000005000,
+                    "a": {"P": [{
+                        "s": "BTCUSDT",
+                        "pa": "0.40",
+                        "ps": "SHORT",
+                    }]},
+                }))
+
+                await _wait_until(
+                    lambda: (
+                        transport.private_ws_state.order_by_client_id(
+                            "aster-incremental-btc"
+                        )
+                        is not None
+                    )
+                )
+                await _wait_until(
+                    lambda: transport.private_ws_state.position("BTCUSDT") is not None
+                )
+            finally:
+                transport.stop_private_ws()
+                await _sleep_short()
+
+        update = transport.private_ws_state.order_by_client_id("aster-incremental-btc")
+        assert update is not None
+        assert update.symbol == "BTCUSDT"
+        assert update.filled_quantity == 0.25
+        position = transport.private_ws_state.position("BTCUSDT")
+        assert position is not None
+        assert position.size == -0.40
+        assert position.updated_at_ms == 1700000005000
 
     @pytest.mark.asyncio
     async def test_failure_on_listen_key_start(self):
@@ -2476,3 +2579,115 @@ class TestBitgetV1PrivateOrderParser:
         # V1: handle_bitget_private_message for Bitget explicitly sets state=None
         # (bitget.rs:4915). State is resolved later via REST detail during merge.
         assert update.filled_quantity == 0.0
+
+
+# ============================================================================
+# Runtime private worker ownership regression (CL-161)
+# ============================================================================
+
+
+class _LifecycleTransport:
+    def __init__(self) -> None:
+        self.starts: list[list[str]] = []
+        self.stops = 0
+        self.updates: list[list[str]] = []
+
+    def start_private_ws(self, symbols: list[str]) -> None:
+        self.starts.append(list(symbols))
+
+    def stop_private_ws(self) -> None:
+        self.stops += 1
+
+    def update_private_ws_symbols(self, symbols: list[str]) -> set[str]:
+        self.updates.append(list(symbols))
+        return set(symbols)
+
+
+class _LifecycleAdapter:
+    supports_private_health = True
+
+    def __init__(self, transport: _LifecycleTransport) -> None:
+        self._transport = transport
+
+
+class TestRuntimePrivateWsLifecycle:
+    """Candidate changes must not own the private account stream lifecycle."""
+
+    @staticmethod
+    def _runtime_with_transport(transport: _LifecycleTransport):
+        from lightfee.config.schema import AppConfig, RuntimeConfig
+        from lightfee.engine.runtime import LiveRuntime
+
+        runtime = LiveRuntime(AppConfig(runtime=RuntimeConfig(mode="live")))
+        runtime._venue_adapters = {
+            Venue.BINANCE: _LifecycleAdapter(transport),
+        }
+        journal_events: list[tuple[str, dict]] = []
+        runtime.journal.append = lambda kind, payload, **_kwargs: journal_events.append(
+            (kind, payload)
+        )
+        return runtime, journal_events
+
+    def test_empty_candidate_interval_never_stops_existing_worker(self):
+        transport = _LifecycleTransport()
+        runtime, journal_events = self._runtime_with_transport(transport)
+        tracked = {Venue.BINANCE: {"ETHUSDT"}}
+        runtime._current_tracked_private_symbols = lambda: tracked
+
+        runtime._ensure_private_ws_started(1)
+        tracked = {}
+        runtime._ensure_private_ws_started(2)
+        tracked = {Venue.BINANCE: {"ETHUSDT"}}
+        runtime._ensure_private_ws_started(3)
+
+        assert transport.starts == [["ETHUSDT"]]
+        assert transport.stops == 0
+        assert transport.updates == []
+        assert Venue.BINANCE in runtime._private_ws_started
+        assert all(kind != "runtime.private_ws_stopped" for kind, _ in journal_events)
+
+    def test_new_symbol_updates_running_worker_in_place(self):
+        transport = _LifecycleTransport()
+        runtime, _ = self._runtime_with_transport(transport)
+        tracked = {Venue.BINANCE: {"ETHUSDT"}}
+        runtime._current_tracked_private_symbols = lambda: tracked
+
+        runtime._ensure_private_ws_started(1)
+        tracked = {Venue.BINANCE: {"BTCUSDT"}}
+        runtime._ensure_private_ws_started(2)
+
+        assert transport.starts == [["ETHUSDT"]]
+        assert transport.stops == 0
+        assert transport.updates == [["BTCUSDT"]]
+        assert runtime._private_ws_symbols[Venue.BINANCE] == {"ETHUSDT", "BTCUSDT"}
+
+
+class TestPrivateWsSymbolUpdateQueue:
+    def test_okx_additions_are_queued_for_in_band_subscription(self):
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(get_spec(Venue.OKX), mode="paper")
+        transport.start_private_ws(["ETHUSDT"])
+        added = transport.update_private_ws_symbols(["BTCUSDT"])
+
+        assert added == {"BTC-USDT-SWAP"}
+        assert transport.consume_private_ws_symbol_updates() == {
+            "BTC-USDT-SWAP": "BTCUSDT"
+        }
+        assert transport.consume_private_ws_symbol_updates() == {}
+
+    def test_binance_additions_do_not_queue_a_reconnect_or_subscription(self):
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(get_spec(Venue.BINANCE), mode="paper")
+        transport.start_private_ws(["ETHUSDT"])
+        added = transport.update_private_ws_symbols(["BTCUSDT"])
+
+        assert added == {"BTCUSDT"}
+        assert transport._private_ws_symbol_map == {
+            "ETHUSDT": "ETHUSDT",
+            "BTCUSDT": "BTCUSDT",
+        }
+        assert transport.consume_private_ws_symbol_updates() == {}

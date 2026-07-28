@@ -1,0 +1,139 @@
+{
+  "v1_source": {
+    "commit": "ca4b166",
+    "entry": "src/execution_core/entry_sync.rs: execute_incremental_entry; first-leg fill is followed only by a sized hedge or residual/pending recovery",
+    "recovery": "src/engine/recovery.rs: startup recovery retains pending first-leg exposure and blocks normal entry until reconciliation"
+  },
+  "entry_context": {
+    "entry_id": "v1-execution-fixture-btc-001",
+    "symbol": "BTCUSDT",
+    "long_venue": "binance",
+    "short_venue": "okx",
+    "long_quantity": 0.01,
+    "short_quantity": 0.01,
+    "long_price_hint": 50000.0,
+    "short_price_hint": 50010.0,
+    "maker_leg": "buy",
+    "entry_type": "standard_dual_taker"
+  },
+  "entry_cases": [
+    {
+      "name": "symmetric_fill_opens_position",
+      "maker": {"outcome": "fill", "quantity": 0.01},
+      "hedge": {"outcome": "fill", "quantity": 0.01},
+      "expected": {
+        "state": "completed",
+        "route": "passive_incremental",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 1,
+        "has_uncertainty": false,
+        "has_open_position": true,
+        "has_pending_entry": false,
+        "has_residual": false
+      }
+    },
+    {
+      "name": "maker_zero_fill_rejected_never_submits_hedge",
+      "maker": {"outcome": "rejected"},
+      "expected": {
+        "state": "failed",
+        "route": "rejected",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 0,
+        "has_uncertainty": false,
+        "has_open_position": false,
+        "has_pending_entry": false,
+        "has_residual": false
+      }
+    },
+    {
+      "name": "maker_uncertain_is_pending_and_never_submits_hedge",
+      "maker": {"outcome": "uncertain"},
+      "expected": {
+        "state": "failed_with_residual",
+        "route": "rejected",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 0,
+        "has_uncertainty": true,
+        "has_open_position": false,
+        "has_pending_entry": true,
+        "has_residual": false
+      }
+    },
+    {
+      "name": "partial_maker_full_hedge_stays_pending_below_match_ratio",
+      "maker": {"outcome": "fill", "quantity": 0.001},
+      "hedge": {"outcome": "fill", "quantity": 0.001},
+      "executor": {"min_matched_ratio": 0.5},
+      "expected": {
+        "state": "failed_with_residual",
+        "route": "rejected",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 1,
+        "has_uncertainty": false,
+        "has_open_position": false,
+        "has_pending_entry": true,
+        "has_residual": false
+      }
+    },
+    {
+      "name": "partial_hedge_creates_exact_unhedged_residual",
+      "maker": {"outcome": "fill", "quantity": 0.01},
+      "hedge": {"outcome": "fill", "quantity": 0.005},
+      "expected": {
+        "state": "failed_with_residual",
+        "route": "rejected",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 1,
+        "has_uncertainty": false,
+        "has_open_position": false,
+        "has_pending_entry": true,
+        "has_residual": true,
+        "residual_quantity": 0.005,
+        "residual_venue": "binance"
+      }
+    },
+    {
+      "name": "second_leg_rejection_creates_exact_first_leg_residual",
+      "maker": {"outcome": "fill", "quantity": 0.01},
+      "hedge": {"outcome": "rejected"},
+      "expected": {
+        "state": "failed_with_residual",
+        "route": "rejected",
+        "maker_order_calls": 1,
+        "hedge_order_calls": 1,
+        "has_uncertainty": false,
+        "has_open_position": false,
+        "has_pending_entry": true,
+        "has_residual": true,
+        "residual_quantity": 0.01,
+        "residual_venue": "binance"
+      }
+    }
+  ],
+  "restart_pending": {
+    "snapshot": {
+      "pending_id": "v1-restart-pending-001",
+      "symbol": "BTCUSDT",
+      "long_venue": "binance",
+      "short_venue": "okx",
+      "target_quantity": 0.01,
+      "long_side": "buy",
+      "short_side": "sell",
+      "created_at_ms": 1700000000000,
+      "maker_order_id": "maker-fill-001",
+      "maker_client_order_id": "lfmakerrestart001",
+      "maker_leg_filled": 0.01,
+      "hedge_leg_filled": 0.0,
+      "uncertain_outcome": true,
+      "maker_leg": "long",
+      "outcome": "hedge_rejected"
+    },
+    "expected": {
+      "lifecycle": "reconciling",
+      "has_pending_entry": true,
+      "startup_recovery_ready": true,
+      "missing_hedge_quantity": 0.01
+    }
+  }
+}

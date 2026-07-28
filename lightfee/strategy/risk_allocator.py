@@ -36,78 +36,11 @@ class StrategyRiskAdmission:
     projected_global_gross_exposure_quote: float
     projected_settlement_bucket_exposure_quote: float
     projected_correlation_group_exposure_quote: float
-    projected_expected_shortfall_quote: float
     evidence_complete: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ExpectedShortfallQuantityLimit:
-    """Common-base cap implied by a paired-basis Expected Shortfall budget."""
-
-    base_quantity: float
-    reference_notional_quote: float
-    maximum_reference_notional_quote: float
-    constrained: bool
-    evidence_complete: bool
-    reason: str
 
 
 class StrategyRiskAllocator:
     """Find a common base quantity under cap, depth and budget constraints."""
-
-    def limit_base_quantity_by_expected_shortfall(
-        self,
-        *,
-        long_entry_price: float,
-        short_entry_price: float,
-        current_base_quantity: float,
-        expected_shortfall_bps: float,
-        expected_shortfall_budget_quote: float,
-    ) -> ExpectedShortfallQuantityLimit:
-        """Reduce, never increase, a paired order to its ES capital budget.
-
-        The budget is quote loss at the historical one-sided ES horizon.  It
-        uses the matched reference notional (the more expensive executable
-        leg), not the sum of legs, because the latter would double-count the
-        same common-base basis exposure.
-        """
-
-        values = (
-            long_entry_price,
-            short_entry_price,
-            current_base_quantity,
-            expected_shortfall_bps,
-            expected_shortfall_budget_quote,
-        )
-        if not all(_is_finite_number(value) for value in values):
-            return ExpectedShortfallQuantityLimit(
-                0.0, 0.0, 0.0, False, False, "nonfinite_expected_shortfall_input"
-            )
-        long_price = float(long_entry_price)
-        short_price = float(short_entry_price)
-        quantity = float(current_base_quantity)
-        es_bps = float(expected_shortfall_bps)
-        budget = float(expected_shortfall_budget_quote)
-        reference_price = max(long_price, short_price)
-        if reference_price <= 0.0 or quantity <= 0.0:
-            return ExpectedShortfallQuantityLimit(
-                0.0, 0.0, 0.0, False, False, "invalid_expected_shortfall_candidate"
-            )
-        if es_bps <= 0.0 or budget <= 0.0:
-            return ExpectedShortfallQuantityLimit(
-                0.0, 0.0, 0.0, False, False, "missing_expected_shortfall_model"
-            )
-        maximum_reference_notional = budget * 10_000.0 / es_bps
-        capped_quantity = min(quantity, maximum_reference_notional / reference_price)
-        reference_notional = capped_quantity * reference_price
-        return ExpectedShortfallQuantityLimit(
-            base_quantity=max(capped_quantity, 0.0),
-            reference_notional_quote=max(reference_notional, 0.0),
-            maximum_reference_notional_quote=maximum_reference_notional,
-            constrained=capped_quantity + 1e-12 < quantity,
-            evidence_complete=True,
-            reason="",
-        )
 
     def allocate(
         self,
@@ -301,8 +234,6 @@ class StrategyRiskAllocator:
         settlement_crowding_bucket_ms: int,
         max_correlation_group_exposure_quote: float,
         correlation_group_by_symbol: dict[str, str],
-        expected_shortfall_bps: float,
-        expected_shortfall_budget_quote: float,
         max_concurrent_positions_per_venue: int = 0,
         max_concurrent_positions_per_symbol: int = 0,
         max_concurrent_positions_per_venue_pair: int = 0,
@@ -325,8 +256,6 @@ class StrategyRiskAllocator:
             max_global_gross_exposure_quote,
             max_settlement_bucket_exposure_quote,
             max_correlation_group_exposure_quote,
-            expected_shortfall_bps,
-            expected_shortfall_budget_quote,
         )
         if not all(_is_finite_number(value) for value in policy_values):
             return _risk_admission_block("nonfinite_risk_input")
@@ -369,11 +298,7 @@ class StrategyRiskAllocator:
         settlement_exposure: dict[int, float] = {}
         correlation_exposure: dict[str, float] = {}
         global_gross = 0.0
-        expected_shortfall = 0.0
         positions = list(open_positions)
-        expected_shortfall_budget_enabled = expected_shortfall_budget_quote > 0.0
-        if expected_shortfall_budget_enabled and expected_shortfall_bps <= 0.0:
-            return _risk_admission_block("missing_expected_shortfall_model")
         enhanced_limits_enabled = any(
             float(value or 0.0) > 0.0
             for value in (
@@ -381,7 +306,6 @@ class StrategyRiskAllocator:
                 max_global_gross_exposure_quote,
                 max_settlement_bucket_exposure_quote,
                 max_correlation_group_exposure_quote,
-                expected_shortfall_budget_quote,
             )
         )
         bucket_ms = _nonnegative_int(settlement_crowding_bucket_ms)
@@ -431,17 +355,6 @@ class StrategyRiskAllocator:
                 )
             elif max_settlement_bucket_exposure_quote > 0.0:
                 return _risk_admission_block("incomplete_open_position_settlement_time")
-            if expected_shortfall_budget_enabled:
-                # ES is an entry-time property of the existing position.  It
-                # is not valid to substitute the new candidate's volatility
-                # estimate here: doing so can materially understate a prior,
-                # more volatile position and admit excess portfolio risk.
-                position_es_bps = _position_expected_shortfall_bps(position)
-                if position_es_bps is None:
-                    return _risk_admission_block(
-                        "incomplete_open_position_expected_shortfall_evidence"
-                    )
-                expected_shortfall += position_reference * position_es_bps / 10_000.0
 
         projected_venue = dict(venue_exposure)
         projected_venue[long_venue_key] = projected_venue.get(long_venue_key, 0.0) + candidate_long
@@ -450,7 +363,6 @@ class StrategyRiskAllocator:
         projected_pair = pair_exposure.get(pair_key, 0.0) + reference
         projected_global_gross = global_gross + gross
         projected_group = correlation_exposure.get(correlation_group, 0.0) + reference
-        projected_es = expected_shortfall + reference * max(float(expected_shortfall_bps or 0.0), 0.0) / 10_000.0
         settlement_bucket_exposure = 0.0
         first_timestamp = _nonnegative_int(first_funding_timestamp_ms)
         if max_settlement_bucket_exposure_quote > 0.0:
@@ -471,7 +383,6 @@ class StrategyRiskAllocator:
             projected_global_gross_exposure_quote=projected_global_gross,
             projected_settlement_bucket_exposure_quote=settlement_bucket_exposure,
             projected_correlation_group_exposure_quote=projected_group,
-            projected_expected_shortfall_quote=projected_es,
             evidence_complete=True,
         )
         if max_concurrent_positions > 0 and len(positions) >= max_concurrent_positions:
@@ -523,9 +434,6 @@ class StrategyRiskAllocator:
             and projected_group > max_correlation_group_exposure_quote
         ):
             return _risk_admission_with_reason(admission, "max_correlation_group_exposure")
-        if expected_shortfall_budget_enabled:
-            if projected_es > expected_shortfall_budget_quote:
-                return _risk_admission_with_reason(admission, "expected_shortfall_budget")
         return admission
 
 
@@ -588,12 +496,6 @@ def _position_exposure(
     )
 
 
-def _position_expected_shortfall_bps(position: object) -> float | None:
-    """Return the immutable entry ES model evidence for an open position."""
-    value = _finite_float(getattr(position, "expected_shortfall_bps_entry", None))
-    return value if value is not None and value > 0.0 else None
-
-
 def _finite_float(value: object) -> float | None:
     try:
         numeric = float(value or 0.0)
@@ -614,7 +516,6 @@ def _risk_admission_block(reason: str) -> StrategyRiskAdmission:
         projected_global_gross_exposure_quote=0.0,
         projected_settlement_bucket_exposure_quote=0.0,
         projected_correlation_group_exposure_quote=0.0,
-        projected_expected_shortfall_quote=0.0,
         evidence_complete=False,
     )
 
@@ -634,6 +535,5 @@ def _risk_admission_with_reason(
         projected_global_gross_exposure_quote=admission.projected_global_gross_exposure_quote,
         projected_settlement_bucket_exposure_quote=admission.projected_settlement_bucket_exposure_quote,
         projected_correlation_group_exposure_quote=admission.projected_correlation_group_exposure_quote,
-        projected_expected_shortfall_quote=admission.projected_expected_shortfall_quote,
         evidence_complete=admission.evidence_complete,
     )
