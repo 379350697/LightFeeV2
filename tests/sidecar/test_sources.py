@@ -73,7 +73,7 @@ class TestExchangeSource:
         assert src._client._rate_limiter is limiter
 
     @pytest.mark.asyncio
-    async def test_failed_final_bbo_cannot_reuse_aged_funding_ticker_price(self):
+    async def test_scan_bbo_is_used_without_a_second_bulk_request(self):
         class FakeClient:
             async def fetch_funding_tickers(self, symbols, *, include_open_interest):
                 return {
@@ -88,7 +88,7 @@ class TestExchangeSource:
                 }
 
             async def fetch_top_book_quotes(self, symbols):
-                raise TimeoutError("final BBO unavailable")
+                raise AssertionError("funding sidecar made a duplicate BBO request")
 
         src = object.__new__(ExchangeSource)
         src.venue = "binance"
@@ -97,10 +97,10 @@ class TestExchangeSource:
         quotes = await src.fetch_market_quotes(["BTCUSDT"])
         quote = quotes["binance:BTCUSDT"]
 
-        assert quote.bid == 0.0
-        assert quote.ask == 0.0
-        assert quote.observed_at_ms == 0
-        assert quote.source == "sidecar_bbo_unavailable"
+        assert quote.bid == 100.0
+        assert quote.ask == 101.0
+        assert quote.observed_at_ms == 123
+        assert quote.source == "sidecar_quote"
 
     @pytest.mark.asyncio
     async def test_funding_metadata_does_not_fetch_or_retain_a_top_book(self):
@@ -134,32 +134,30 @@ class TestExchangeSource:
         assert quote.source == "funding_metadata"
 
     @pytest.mark.asyncio
-    async def test_partial_final_bbo_invalidates_only_missing_symbol(self):
+    async def test_missing_scan_bbo_invalidates_only_missing_symbol(self):
         class FakeClient:
             async def fetch_funding_tickers(self, symbols, *, include_open_interest):
                 return {
-                    f"binance:{symbol}": FundingTicker(
+                    "binance:BTCUSDT": FundingTicker(
                         venue="binance",
-                        symbol=symbol,
+                        symbol="BTCUSDT",
                         bid=100.0,
                         ask=101.0,
                         market_received_at_ms=123,
-                    )
-                    for symbol in symbols
+                    ),
+                    "binance:ETHUSDT": FundingTicker(
+                        venue="binance",
+                        symbol="ETHUSDT",
+                        bid=0.0,
+                        ask=0.0,
+                        market_received_at_ms=123,
+                        venue_status="active",
+                        contract_normalization_complete=True,
+                    ),
                 }
 
             async def fetch_top_book_quotes(self, symbols):
-                from lightfee.marketdata.ws_bbo import TopBookQuote
-
-                return {
-                    "binance:BTCUSDT": TopBookQuote(
-                        venue="binance",
-                        symbol="BTCUSDT",
-                        bid=200.0,
-                        ask=201.0,
-                        received_at_ms=456,
-                    )
-                }
+                raise AssertionError("funding sidecar made a duplicate BBO request")
 
         src = object.__new__(ExchangeSource)
         src.venue = "binance"
@@ -167,8 +165,8 @@ class TestExchangeSource:
 
         quotes = await src.fetch_market_quotes(["BTCUSDT", "ETHUSDT"])
 
-        assert quotes["binance:BTCUSDT"].bid == 200.0
-        assert quotes["binance:BTCUSDT"].observed_at_ms == 456
+        assert quotes["binance:BTCUSDT"].bid == 100.0
+        assert quotes["binance:BTCUSDT"].observed_at_ms == 123
         assert quotes["binance:ETHUSDT"].bid == 0.0
         assert quotes["binance:ETHUSDT"].source == "sidecar_bbo_unavailable"
 
@@ -201,17 +199,7 @@ class TestExchangeSource:
                 }
 
             async def fetch_top_book_quotes(self, symbols):
-                from lightfee.marketdata.ws_bbo import TopBookQuote
-
-                return {
-                    "binance:BTCUSDT": TopBookQuote(
-                        venue="binance",
-                        symbol="BTCUSDT",
-                        bid=200.0,
-                        ask=201.0,
-                        received_at_ms=456,
-                    )
-                }
+                raise AssertionError("funding sidecar made a duplicate BBO request")
 
         src = object.__new__(ExchangeSource)
         src.venue = "binance"
@@ -222,7 +210,7 @@ class TestExchangeSource:
         assert set(quotes) == {"binance:BTCUSDT"}
 
     @pytest.mark.asyncio
-    async def test_zero_placeholder_is_kept_when_final_bbo_proves_listing(self):
+    async def test_zero_scan_bbo_remains_fail_closed_until_live_revalidation(self):
         class FakeClient:
             async def fetch_funding_tickers(self, symbols, *, include_open_interest):
                 return {
@@ -232,21 +220,13 @@ class TestExchangeSource:
                         bid=0.0,
                         ask=0.0,
                         open_interest_evidence_status="unavailable",
+                        venue_status="active",
+                        contract_normalization_complete=True,
                     )
                 }
 
             async def fetch_top_book_quotes(self, symbols):
-                from lightfee.marketdata.ws_bbo import TopBookQuote
-
-                return {
-                    "binance:BTCUSDT": TopBookQuote(
-                        venue="binance",
-                        symbol="BTCUSDT",
-                        bid=200.0,
-                        ask=201.0,
-                        received_at_ms=456,
-                    )
-                }
+                raise AssertionError("funding sidecar made a duplicate BBO request")
 
         src = object.__new__(ExchangeSource)
         src.venue = "binance"
@@ -254,8 +234,9 @@ class TestExchangeSource:
 
         quotes = await src.fetch_market_quotes(["BTCUSDT"])
 
-        assert quotes["binance:BTCUSDT"].bid == 200.0
-        assert quotes["binance:BTCUSDT"].ask == 201.0
+        assert quotes["binance:BTCUSDT"].bid == 0.0
+        assert quotes["binance:BTCUSDT"].ask == 0.0
+        assert quotes["binance:BTCUSDT"].source == "sidecar_bbo_unavailable"
 
 
 class TestLiquiditySource:

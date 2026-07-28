@@ -1896,6 +1896,64 @@ class TestProductionSidecarParserRegressions:
         assert result["okx:BTCUSDT"].bid == pytest.approx(10.0)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "venue_key"),
+        [(binance_spec, "binance"), (aster_spec, "aster")],
+    )
+    async def test_binance_style_market_ticker_recycles_failed_transport_once(
+        self,
+        spec_fn,
+        venue_key,
+    ):
+        spec = spec_fn()
+
+        class FakeBinanceStyleClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.ticker_attempts = 0
+                self.recycle_count = 0
+
+            async def _recycle_public_http_client(self):
+                self.recycle_count += 1
+
+            async def _public_get(self, path, params=None):
+                if path == spec.funding_ticker_path:
+                    self.ticker_attempts += 1
+                    if self.ticker_attempts == 1:
+                        raise PublicTransportError(
+                            PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                            f"timeout: GET {path}",
+                        )
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "bidPrice": "10",
+                            "askPrice": "11",
+                        }
+                    ]
+                if path == spec.premium_index_path:
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "10.5",
+                        }
+                    ]
+                if path == spec.volume_24h_path:
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "1000"}]
+                return {}
+
+        client = FakeBinanceStyleClient()
+        result = await client._fetch_binance_style(
+            ["BTCUSDT"],
+            include_open_interest=False,
+        )
+
+        assert client.ticker_attempts == 2
+        assert client.recycle_count == 1
+        assert result[f"{venue_key}:BTCUSDT"].bid == pytest.approx(10.0)
+
+    @pytest.mark.asyncio
     async def test_okx_market_tickers_does_not_retry_http_response_errors(self):
         class FakeOkxClient(MarketDataClient):
             def __init__(self):

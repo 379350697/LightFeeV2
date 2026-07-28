@@ -168,13 +168,12 @@ class ExchangeSource:
         return result
 
     async def fetch_market_quotes(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
-        """Fetch bid/ask/mark for symbols as QuoteSnapshot."""
+        """Fetch scan-time bid/ask/mark for symbols as QuoteSnapshot."""
         tickers = await self._client.fetch_funding_tickers(
             symbols,
             include_open_interest=False,
         )
         result: dict[str, QuoteSnapshot] = {}
-        absent_row_candidates: set[str] = set()
         for key, ft in tickers.items():
             listing_status = str(
                 ft.open_interest_evidence_status or ""
@@ -188,30 +187,18 @@ class ExchangeSource:
                 and ft.contract_normalization_complete is not True
             ):
                 # Venue-wide requests receive the cross-venue symbol union.
-                # Keep the row provisionally: a fresh final BBO can still
-                # prove that it is listed despite an empty first response.
-                absent_row_candidates.add(key)
-            result[key] = self._from_funding_ticker(ft)
-        # Funding, contract, and fee metadata are slow variables. Reacquire a
-        # lightweight BBO after that work so candidate prices keep the actual
-        # response-arrival clock instead of inheriting an aged first request.
-        try:
-            top_books = await self._client.fetch_top_book_quotes(symbols)
-        except Exception:
-            top_books = {}
-        for key, quote in list(result.items()):
-            top = top_books.get(key)
-            if top is None:
-                if key in absent_row_candidates:
-                    # Both independent BBO reads omitted the row and there is
-                    # no active contract identity.  This is a cross-venue
-                    # union absence, not degraded market evidence.
-                    result.pop(key, None)
-                    continue
-                # The funding ticker remains useful for slow funding/contract
-                # metadata, but its embedded price was observed before that
-                # work completed.  It must never masquerade as a fresh entry
-                # quote when the final BBO request failed or omitted the symbol.
+                # An absent scan row is not a degraded market quote.
+                continue
+            quote = self._from_funding_ticker(ft)
+            if (
+                float(quote.bid or 0.0) <= 0.0
+                or float(quote.ask or 0.0) <= 0.0
+                or int(quote.observed_at_ms or 0) <= 0
+            ):
+                # The single sidecar scan BBO is discovery evidence only.  A
+                # missing row cannot become executable through stale metadata;
+                # the live entry path always reacquires its candidate two-leg
+                # BBO/L2 immediately before ordering.
                 quote.bid = 0.0
                 quote.ask = 0.0
                 quote.bid_size = 0.0
@@ -219,24 +206,7 @@ class ExchangeSource:
                 quote.observed_at_ms = 0
                 quote.market_event_at_ms = 0
                 quote.source = "sidecar_bbo_unavailable"
-                continue
-            received_at_ms = int(top.received_at_ms or top.observed_at_ms or 0)
-            if received_at_ms <= 0:
-                quote.bid = 0.0
-                quote.ask = 0.0
-                quote.bid_size = 0.0
-                quote.ask_size = 0.0
-                quote.observed_at_ms = 0
-                quote.market_event_at_ms = 0
-                quote.source = "sidecar_bbo_unavailable"
-                continue
-            quote.bid = float(top.bid)
-            quote.ask = float(top.ask)
-            quote.bid_size = float(top.bid_size or 0.0)
-            quote.ask_size = float(top.ask_size or 0.0)
-            quote.observed_at_ms = received_at_ms
-            quote.market_event_at_ms = int(top.exchange_event_at_ms or 0)
-            quote.source = str(top.source or "sidecar_rest_bbo")
+            result[key] = quote
         return result
 
     async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:

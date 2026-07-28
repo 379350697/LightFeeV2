@@ -2683,10 +2683,15 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        # 1. bookTicker (bid/ask)
-        raw_tickers, market_received_at_ms = await self._public_get_with_received_at(
-            spec.funding_ticker_path
+        # 1. bookTicker (bid/ask).  Aster and Binance use this same venue-wide
+        # endpoint for the sidecar scan.  Recycle a poisoned keep-alive pool
+        # once on a statusless transport failure, while retaining the
+        # configured per-request timeout and never retrying an HTTP response.
+        raw_tickers = await self._public_get_with_recycled_transport_retry(
+            spec.funding_ticker_path,
+            attempt_timeout_s=self._exchange_http_timeout_ms / 1000.0,
         )
+        market_received_at_ms = _now_ms()
         items = raw_tickers if isinstance(raw_tickers, list) else [raw_tickers]
 
         ticker_map: dict[str, dict] = {}
