@@ -27,6 +27,31 @@ from lightfee.venues.transport import EndpointRateLimiter
 logger = logging.getLogger("lightfee.sidecar.spread_bbo_service")
 
 
+def _hyperliquid_listed_sampling_symbols(
+    symbols: list[str],
+    *,
+    quotes,
+    quote_eligible,
+) -> list[str]:
+    """Keep the Hyperliquid WS subscription set within its listed universe.
+
+    The sampling universe is a cross-venue pair frontier, not a declaration
+    that every venue lists every symbol.  Hyperliquid closes a multiplexed
+    socket when it receives unsupported coin subscriptions, so use the
+    primary-sidecar's exact venue metadata as the subscription contract.
+    """
+
+    listed: list[str] = []
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            continue
+        quote = quotes.get(f"{Venue.HYPERLIQUID.value}:{symbol}")
+        if quote is not None and quote_eligible(quote):
+            listed.append(symbol)
+    return listed
+
+
 class HyperliquidSpreadBboSource:
     """Fresh Hyperliquid BBOs backed by the official BBO WebSocket."""
 
@@ -244,10 +269,18 @@ class SpreadBboProcessService:
             if sampling_symbols:
                 self.data_plane.set_sampling_symbols(sampling_symbols)
                 if self.hyperliquid_source is not None:
-                    await self.hyperliquid_source.start(sampling_symbols)
+                    hyperliquid_symbols = _hyperliquid_listed_sampling_symbols(
+                        sampling_symbols,
+                        quotes=generation.quotes,
+                        quote_eligible=lambda quote: self.metadata.quote_eligible(
+                            quote, generation=generation
+                        ),
+                    )
+                    await self.hyperliquid_source.start(hyperliquid_symbols)
                 logger.info(
-                    "spread BBO sampling universe frozen: symbols=%d global_symbols=%d",
+                    "spread BBO sampling universe frozen: symbols=%d hyperliquid_symbols=%d global_symbols=%d",
                     len(sampling_symbols),
+                    len(hyperliquid_symbols) if self.hyperliquid_source is not None else 0,
                     len(self.config.symbols),
                 )
                 break

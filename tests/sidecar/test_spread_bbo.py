@@ -180,6 +180,28 @@ def test_dedicated_bbo_plane_rejects_zero_size_as_non_executable(tmp_path) -> No
     assert plane._degraded_symbols == {"okx": {"BTCUSDT"}}
 
 
+def test_hyperliquid_bbo_subscribes_only_to_listed_sampling_symbols() -> None:
+    from lightfee.sidecar.spread_bbo_service import (
+        _hyperliquid_listed_sampling_symbols,
+    )
+
+    now_ms = int(time.time() * 1_000)
+    btc = _eligible_metadata_quote("hyperliquid", now_ms)
+    eth = _eligible_metadata_quote("hyperliquid", now_ms)
+    eth.symbol = "ETHUSDT"
+
+    listed = _hyperliquid_listed_sampling_symbols(
+        ["BTCUSDT", "ETHUSDT", "NOTLISTEDUSDT"],
+        quotes={
+            "hyperliquid:BTCUSDT": btc,
+            "hyperliquid:ETHUSDT": eth,
+        },
+        quote_eligible=lambda quote: quote.symbol == "BTCUSDT",
+    )
+
+    assert listed == ["BTCUSDT"]
+
+
 @pytest.mark.asyncio
 async def test_hyperliquid_ws_gap_uses_one_bulk_rest_fallback_for_all_symbols() -> None:
     from lightfee.marketdata.ws_bbo import TopBookQuote

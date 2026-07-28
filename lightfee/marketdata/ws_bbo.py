@@ -1347,6 +1347,9 @@ class HyperliquidMultiplexBboWsClient:
     """One Hyperliquid WebSocket carrying a bounded set of BBO subscriptions."""
 
     OPEN_TIMEOUT_SECONDS = 10.0
+    # Match V1's shared public-WS action pacing.  A bounded startup burst must
+    # not make the exchange drop the entire multiplexed connection.
+    SUBSCRIPTION_PACING_SECONDS = 0.025
 
     def __init__(self, cache: VenueBboCache) -> None:
         self.cache = cache
@@ -1416,8 +1419,11 @@ class HyperliquidMultiplexBboWsClient:
             ) as ws:
                 self._ws = ws
                 self._connected = True
-                for wire in tuple(self._symbol_by_wire):
+                wires = tuple(self._symbol_by_wire)
+                for index, wire in enumerate(wires):
                     await self._send_subscribe(ws, wire)
+                    if index + 1 < len(wires):
+                        await asyncio.sleep(self.SUBSCRIPTION_PACING_SECONDS)
                 async for raw_msg in ws:
                     self._handle_message(raw_msg)
         finally:
