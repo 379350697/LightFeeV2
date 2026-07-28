@@ -650,6 +650,11 @@ _FUNDING_CACHE_MIN_FUTURE_MS = 30_000  # 30 seconds
 _GATE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
 _OKX_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
 _BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS = 60 * 60 * 1_000
+# Contract specifications are an execution proof, but they do not change at
+# BBO cadence.  Keep the raw venue-wide document locally so an unlisted symbol
+# in the cross-venue universe cannot force every scan to re-download it.
+_SLOW_LIQUIDITY_SNAPSHOT_MAX_AGE_MS = 60 * 1_000
+_SLOW_OPEN_INTEREST_SNAPSHOT_MAX_AGE_MS = 30 * 1_000
 
 
 def _next_hour_boundary(now_ms: int) -> int:
@@ -752,6 +757,11 @@ class MarketDataClient:
         self._binance_style_contract_metadata_by_key: dict[
             str, tuple[dict[str, Any], int]
         ] = {}
+        # Venue-wide public responses which are deliberately slower than the
+        # market-data clock.  This is an in-process cache only: a failed
+        # request never extends a previous response and callers retain the
+        # original observation time instead of manufacturing freshness.
+        self._public_payload_cache: dict[str, tuple[Any, int]] = {}
         # V1-style evidence cache for Binance-compatible per-symbol OI.
         # key -> (open_interest_quote, mark_price, observed_at_ms, status, reason)
         self._binance_style_open_interest_cache: dict[
@@ -900,6 +910,60 @@ class MarketDataClient:
     async def _public_get(self, path: str, params: Optional[dict[str, Any]] = None) -> Any:
         """Execute a public GET request with rate-limit pacing."""
         return await self._public_request("GET", path, params=params)
+
+    async def _cached_public_get(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        max_age_ms: int,
+    ) -> Any:
+        """Return a bounded-age public GET response without faking freshness.
+
+        Broad discovery passes the full cross-venue symbol union to every
+        adapter.  A symbol not listed on one venue used to make its otherwise
+        static contract endpoint run every pass.  Cache by the complete wire
+        request instead of by requested symbols, so that condition cannot turn
+        a negative listing lookup into repeated exchange work.
+        """
+
+        payload, _received_at_ms = await self._cached_public_get_with_received_at(
+            path,
+            params=params,
+            max_age_ms=max_age_ms,
+        )
+        return payload
+
+    async def _cached_public_get_with_received_at(
+        self,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        max_age_ms: int,
+    ) -> tuple[Any, int]:
+        """Return a bounded-age payload together with its real receipt time."""
+
+        ttl_ms = max(int(max_age_ms or 0), 0)
+        normalized_params = tuple(
+            sorted(
+                (str(key), repr(value))
+                for key, value in (params or {}).items()
+            )
+        )
+        key = f"{path}?{normalized_params!r}"
+        cached = self._public_payload_cache.get(key)
+        if cached is not None:
+            payload, observed_at_ms = cached
+            now_ms = int(time.time() * 1_000)
+            age_ms = now_ms - int(observed_at_ms or 0)
+            if 0 <= age_ms <= ttl_ms:
+                return payload, int(observed_at_ms)
+            if age_ms > ttl_ms:
+                self._public_payload_cache.pop(key, None)
+        payload = await self._public_get(path, params=params)
+        received_at_ms = int(time.time() * 1_000)
+        self._public_payload_cache[key] = (payload, received_at_ms)
+        return payload, received_at_ms
 
     async def _public_post(self, path: str, body: Optional[dict[str, Any]] = None) -> Any:
         """Execute a public POST request with rate-limit pacing."""
@@ -2731,7 +2795,10 @@ class MarketDataClient:
 
         if spec.funding_contracts_path and missing_contract_metadata:
             try:
-                exchange_info = await self._public_get(spec.funding_contracts_path)
+                exchange_info = await self._cached_public_get(
+                    spec.funding_contracts_path,
+                    max_age_ms=_BINANCE_STYLE_CONTRACT_METADATA_MAX_AGE_MS,
+                )
             except PublicTransportError:
                 exchange_info = {}
             contract_items = (
@@ -2805,7 +2872,10 @@ class MarketDataClient:
         # 3. 24hr (volume)
         vol_map: dict[str, float] = {}
         if spec.volume_24h_path:
-            raw_24 = await self._public_get(spec.volume_24h_path)
+            raw_24 = await self._cached_public_get(
+                spec.volume_24h_path,
+                max_age_ms=_SLOW_LIQUIDITY_SNAPSHOT_MAX_AGE_MS,
+            )
             items_24 = raw_24 if isinstance(raw_24, list) else [raw_24]
             for item in items_24:
                 sym = str(item.get("symbol", ""))
@@ -3150,9 +3220,10 @@ class MarketDataClient:
         # instrument metadata can prove the base-quantity conversion.
         instrument_map: dict[str, dict[str, Any]] = {}
         try:
-            instruments_raw = await self._public_get(
+            instruments_raw = await self._cached_public_get(
                 "/api/v5/public/instruments",
                 params={"instType": "SWAP"},
+                max_age_ms=_OKX_CONTRACT_METADATA_MAX_AGE_MS,
             )
         except PublicTransportError:
             instruments_raw = {}
@@ -3394,8 +3465,11 @@ class MarketDataClient:
         }
         if spec.open_interest_path:
             try:
-                oi_raw = await self._public_get(spec.open_interest_path, params={"instType": "SWAP"})
-                oi_received_at_ms = _now_ms()
+                oi_raw, oi_received_at_ms = await self._cached_public_get_with_received_at(
+                    spec.open_interest_path,
+                    params={"instType": "SWAP"},
+                    max_age_ms=_SLOW_OPEN_INTEREST_SNAPSHOT_MAX_AGE_MS,
+                )
                 oi_data = oi_raw.get("data", [])
                 items_oi = oi_data if isinstance(oi_data, list) else [oi_data]
                 for item in items_oi:
@@ -3621,9 +3695,10 @@ class MarketDataClient:
                 if cursor:
                     params["cursor"] = cursor
                 try:
-                    instruments_raw = await self._public_get(
+                    instruments_raw = await self._cached_public_get(
                         spec.funding_contracts_path,
                         params=params,
+                        max_age_ms=_OKX_CONTRACT_METADATA_MAX_AGE_MS,
                     )
                 except PublicTransportError:
                     metadata_failed = True
@@ -3830,9 +3905,10 @@ class MarketDataClient:
         # unit contract rather than relying on a venue-wide assumption.
         contract_map: dict[str, dict[str, Any]] = {}
         try:
-            contracts_raw = await self._public_get(
+            contracts_raw = await self._cached_public_get(
                 "/api/v2/mix/market/contracts",
                 params={"productType": "USDT-FUTURES"},
+                max_age_ms=_OKX_CONTRACT_METADATA_MAX_AGE_MS,
             )
         except PublicTransportError:
             contracts_raw = {}

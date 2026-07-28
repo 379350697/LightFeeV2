@@ -81,7 +81,10 @@ async def test_bulk_bbo_makes_one_lightweight_request_only():
 
 
 @pytest.mark.asyncio
-async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata():
+async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata(monkeypatch):
+    now_ms = 2_000_000_000_000
+    monkeypatch.setattr("lightfee.marketdata.bulk_bbo._now_ms", lambda: now_ms)
+
     class FakeOkxClient(MarketDataClient):
         async def _public_get_with_received_at(self, path, params=None):
             return ({"data": [{
@@ -91,12 +94,12 @@ async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata():
                 "bidSz": "2",
                 "askSz": "3",
                 "ts": "1999",
-            }]}, 2_000)
+            }]}, now_ms)
 
     okx = FakeOkxClient(okx_spec())
     okx._okx_contract_metadata_by_key["okx:BTCUSDT"] = (
         {"ctVal": "0.01"},
-        1_900,
+        now_ms - 100,
     )
 
     class FakeGateClient(MarketDataClient):
@@ -108,12 +111,12 @@ async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata():
                 "highest_size": "2",
                 "lowest_size": "3",
                 "time_ms": "1999",
-            }], 2_000)
+            }], now_ms)
 
     gate = FakeGateClient(gate_spec())
     gate._gate_contract_metadata_by_key["gate:BTCUSDT"] = (
         {"quanto_multiplier": "0.001"},
-        1_900,
+        now_ms - 100,
     )
 
     okx_quote = (await okx.fetch_top_book_quotes(["BTCUSDT"]))["okx:BTCUSDT"]
@@ -123,6 +126,74 @@ async def test_okx_and_gate_bbo_sizes_use_shared_contract_metadata():
     assert okx_quote.ask_size == pytest.approx(0.03)
     assert gate_quote.bid_size == pytest.approx(0.002)
     assert gate_quote.ask_size == pytest.approx(0.003)
+
+
+@pytest.mark.asyncio
+async def test_cold_okx_and_gate_bbo_workers_hydrate_lot_sizes_once(monkeypatch):
+    now_ms = 2_000_000_000_000
+    monkeypatch.setattr("lightfee.marketdata.bulk_bbo._now_ms", lambda: now_ms)
+
+    class FakeColdOkxClient(MarketDataClient):
+        def __init__(self):
+            super().__init__(okx_spec())
+            self.metadata_calls = []
+            self.bbo_calls = 0
+
+        async def _cached_public_get_with_received_at(
+            self, path, *, params=None, max_age_ms
+        ):
+            self.metadata_calls.append((path, params, max_age_ms))
+            return ({"data": [{"instId": "BTC-USDT-SWAP", "ctVal": "0.01"}]}, now_ms)
+
+        async def _public_get_with_received_at(self, path, params=None):
+            self.bbo_calls += 1
+            return ({"data": [{
+                "instId": "BTC-USDT-SWAP",
+                "bidPx": "100",
+                "askPx": "101",
+                "bidSz": "2",
+                "askSz": "3",
+            }]}, now_ms)
+
+    class FakeColdGateClient(MarketDataClient):
+        def __init__(self):
+            super().__init__(gate_spec())
+            self.metadata_calls = []
+            self.bbo_calls = 0
+
+        async def _cached_public_get_with_received_at(
+            self, path, *, params=None, max_age_ms
+        ):
+            self.metadata_calls.append((path, params, max_age_ms))
+            return ([{"name": "BTC_USDT", "quanto_multiplier": "0.001"}], now_ms)
+
+        async def _public_get_with_received_at(self, path, params=None):
+            self.bbo_calls += 1
+            return ([{
+                "contract": "BTC_USDT",
+                "highest_bid": "100",
+                "lowest_ask": "101",
+                "highest_size": "2",
+                "lowest_size": "3",
+            }], now_ms)
+
+    okx = FakeColdOkxClient()
+    gate = FakeColdGateClient()
+
+    okx_quotes = await okx.fetch_top_book_quotes(["BTCUSDT"])
+    gate_quotes = await gate.fetch_top_book_quotes(["BTCUSDT"])
+    await okx.fetch_top_book_quotes(["BTCUSDT"])
+    await gate.fetch_top_book_quotes(["BTCUSDT"])
+
+    assert okx_quotes["okx:BTCUSDT"].bid_size == pytest.approx(0.02)
+    assert gate_quotes["gate:BTCUSDT"].ask_size == pytest.approx(0.003)
+    assert okx.metadata_calls == [
+        ("/api/v5/public/instruments", {"instType": "SWAP"}, 3_600_000),
+    ]
+    assert gate.metadata_calls == [
+        ("/api/v4/futures/usdt/contracts", None, 3_600_000),
+    ]
+    assert (okx.bbo_calls, gate.bbo_calls) == (2, 2)
 
 
 @pytest.mark.asyncio

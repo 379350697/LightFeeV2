@@ -404,6 +404,59 @@ def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_spread_sidecar_summary_keeps_direct_bbo_staleness_degraded() -> None:
+    from lightfee.sidecar.publisher import publish_snapshot
+    from lightfee.sidecar.snapshot import SidecarSnapshot
+    from lightfee.spread.models import SpreadSnapshot
+    from lightfee.spread.publisher import publish_spread_snapshot
+    import scripts.diagnose_live as diagnose_live
+
+    d = _make_tmpdir()
+    try:
+        publish_snapshot(
+            SidecarSnapshot(
+                published_at_ms=10_000,
+                market_observed_at_ms=9_900,
+                candidate_build_observed_at_ms=9_950,
+                candidate_build_diagnostics={
+                    "input_quote_count": 0,
+                    "requested_symbol_count": 0,
+                    "requested_symbols": [],
+                    "requested_venues": [],
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                source_mode="direct_market",
+                acquisition_mode="fresh_sidecar",
+                quotes={},
+                candidates=[],
+            ),
+            os.path.join(d, "opportunity-input-snapshot.json"),
+        )
+        publish_spread_snapshot(
+            SpreadSnapshot(
+                published_at_ms=10_100,
+                market_observed_at_ms=10_100,
+                source_mode="spread_bbo_snapshot_stale",
+                degraded_venues=["aster", "binance"],
+                candidates=[],
+            ),
+            os.path.join(d, "spread-opportunities-current.json"),
+        )
+
+        summary = diagnose_live._build_spread_sidecar_summary(d, now_ms=10_500)
+
+        assert summary["spread_sidecar_source"] == "spread_bbo_snapshot_stale"
+        assert summary["spread_sidecar_source_state"] == "current_source_degraded"
+        assert summary["spread_sidecar_current_degraded"] is True
+        assert summary["main_sidecar_snapshot_age_ms"] is None
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_spread_sidecar_summary_exposes_top_paper_admission_rejection() -> None:
     from lightfee.spread.models import SpreadSnapshot
     from lightfee.spread.publisher import publish_spread_snapshot

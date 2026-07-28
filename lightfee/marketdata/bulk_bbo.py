@@ -15,8 +15,10 @@ from lightfee.venues.market_data import (
     _GATE_CONTRACT_METADATA_MAX_AGE_MS,
     _OKX_CONTRACT_METADATA_MAX_AGE_MS,
     _funding_timestamp_ms_or_seconds,
+    _now_ms,
     _positive_exchange_number,
     _safe_float,
+    PublicTransportError,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +42,93 @@ def _symbol_map(
         venue_symbol = client._to_venue_symbol(canonical)
         venue_symbols[venue_symbol] = canonical
     return venue_symbols
+
+
+async def _hydrate_contract_size_metadata(
+    client: "MarketDataClient",
+    requested: set[str],
+) -> None:
+    """Fill this worker's static lot-size cache before parsing BBO depth.
+
+    The funding sidecar and dedicated BBO sidecar are separate processes, so
+    their in-memory contract metadata is not shared. OKX and Gate publish BBO
+    sizes in contract lots; a cold BBO process must first obtain the static
+    venue-wide contract document before it can claim executable base depth.
+    The client retains that document for one hour with its real receipt time.
+    """
+
+    venue = client.venue
+    if venue not in (Venue.OKX, Venue.GATE):
+        return
+
+    if venue == Venue.OKX:
+        cache = client._okx_contract_metadata_by_key
+        cache_prefix = "okx"
+        field = "ctVal"
+        max_age_ms = _OKX_CONTRACT_METADATA_MAX_AGE_MS
+        path = "/api/v5/public/instruments"
+        params: dict[str, str] | None = {"instType": "SWAP"}
+    else:
+        cache = client._gate_contract_metadata_by_key
+        cache_prefix = "gate"
+        field = "quanto_multiplier"
+        max_age_ms = _GATE_CONTRACT_METADATA_MAX_AGE_MS
+        path = client.spec.funding_contracts_path
+        params = None
+
+    now_ms = _now_ms()
+    missing_metadata = any(
+        _cached_multiplier(
+            cache,
+            f"{cache_prefix}:{canonical}",
+            field=field,
+            received_at_ms=now_ms,
+            max_age_ms=max_age_ms,
+        )
+        <= 0.0
+        for canonical in requested
+    )
+    if not missing_metadata or not path:
+        return
+
+    try:
+        raw, metadata_received_at_ms = await client._cached_public_get_with_received_at(
+            path,
+            params=params,
+            max_age_ms=max_age_ms,
+        )
+    except PublicTransportError:
+        # Unknown lot conversion is not an implicit 1x conversion. The data
+        # plane will reject the zero-size quote while other venues continue.
+        return
+    if metadata_received_at_ms <= 0:
+        return
+
+    venue_symbols = _symbol_map(client, requested)
+    if venue == Venue.OKX:
+        items = raw.get("data", []) if isinstance(raw, dict) else []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            canonical = venue_symbols.get(str(item.get("instId", "") or ""))
+            if canonical is not None:
+                cache[f"{cache_prefix}:{canonical}"] = (
+                    dict(item),
+                    metadata_received_at_ms,
+                )
+        return
+
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        venue_symbol = str(item.get("name", item.get("contract", "")) or "")
+        canonical = venue_symbols.get(venue_symbol)
+        if canonical is not None:
+            cache[f"{cache_prefix}:{canonical}"] = (
+                dict(item),
+                metadata_received_at_ms,
+            )
 
 
 async def _fetch_payload(
@@ -243,6 +332,7 @@ async def fetch_top_book_quotes(
     }
     if not requested:
         return {}
+    await _hydrate_contract_size_metadata(client, requested)
     raw, received_at_ms = await _fetch_payload(client)
     if received_at_ms <= 0:
         return {}

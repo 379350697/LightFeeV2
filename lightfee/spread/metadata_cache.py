@@ -9,12 +9,8 @@ from pathlib import Path
 import time
 from types import MappingProxyType
 
+from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
-from lightfee.spread.quote_snapshot import (
-    FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION,
-    load_spread_quote_snapshot,
-    spread_metadata_snapshot_path,
-)
 
 
 def quote_cache_contract_eligible(quote: QuoteSnapshot) -> bool:
@@ -85,7 +81,11 @@ class SpreadMetadataSnapshotCache:
     """Load each metadata generation once and retain only a valid last good."""
 
     def __init__(self, sidecar_snapshot_path: str | Path, *, max_age_ms: int) -> None:
-        self.metadata_path = spread_metadata_snapshot_path(sidecar_snapshot_path)
+        # The primary sidecar already atomically publishes complete contract,
+        # funding and liquidity evidence.  Reading that generation on change
+        # avoids a second ~10 MB full-snapshot file and lets the BBO process
+        # retain slow metadata without re-fetching it from exchanges.
+        self.metadata_path = Path(sidecar_snapshot_path)
         self._generation = SpreadMetadataGeneration(
             quotes=MappingProxyType({}),
             published_at_ms=0,
@@ -114,12 +114,8 @@ class SpreadMetadataSnapshotCache:
         if mtime_ns <= 0 or mtime_ns == self._attempted_mtime_ns:
             return False
         self._attempted_mtime_ns = mtime_ns
-        snapshot = load_spread_quote_snapshot(self.metadata_path)
-        if (
-            snapshot is None
-            or snapshot.schema_version != FULL_SPREAD_QUOTE_SNAPSHOT_SCHEMA_VERSION
-            or not snapshot.quotes
-        ):
+        snapshot = load_snapshot(self.metadata_path)
+        if snapshot is None or not snapshot.quotes:
             return False
         generation = SpreadMetadataGeneration(
             quotes=MappingProxyType(dict(snapshot.quotes)),

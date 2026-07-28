@@ -1777,8 +1777,15 @@ def test_verify_production_services_cli_json_success(tmp_path):
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
-    (unit_dir / "lightfee-spread-sidecar.service").write_text(
+    (unit_dir / "lightfee-spread-bbo.service").write_text(
         "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
+        "LimitNOFILE=65536\n"
+    )
+    (unit_dir / "lightfee-spread-sidecar.service").write_text(
+        "[Unit]\nWants=lightfee-sidecar.service lightfee-spread-bbo.service\nAfter=lightfee-sidecar.service lightfee-spread-bbo.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -1922,8 +1929,15 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
-    (unit_dir / "lightfee-spread-sidecar.service").write_text(
+    (unit_dir / "lightfee-spread-bbo.service").write_text(
         "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
+        "LimitNOFILE=65536\n"
+    )
+    (unit_dir / "lightfee-spread-sidecar.service").write_text(
+        "[Unit]\nWants=lightfee-sidecar.service lightfee-spread-bbo.service\nAfter=lightfee-sidecar.service lightfee-spread-bbo.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -2594,12 +2608,14 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
+    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
     spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
+    assert analyze_systemd_unit("lightfee-spread-bbo.service", spread_bbo).ok
     assert analyze_systemd_unit("lightfee-spread-sidecar.service", spread_sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
-    assert not Path("deploy/systemd/lightfee-spread-bbo.service").exists()
+    assert "-m lightfee.apps.spread_bbo" in spread_bbo
 
 
 def test_live_is_independent_while_spread_consumes_funding_sidecar_snapshot():

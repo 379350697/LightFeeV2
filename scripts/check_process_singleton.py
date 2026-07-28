@@ -38,6 +38,13 @@ SPREAD_SIDECAR_PATTERNS = [
     "spread_sidecar",
 ]
 
+SPREAD_BBO_PATTERNS = [
+    "lightfee.apps.spread_bbo",
+    "lightfee-spread-bbo",
+    "lightfee_spread_bbo",
+    "spread_bbo",
+]
+
 LIVE_PATTERNS = [
     "lightfee.apps.live",
     "lightfee-live",
@@ -197,6 +204,12 @@ def main() -> None:
         "spread-sidecar", spread_sidecars, min_required=required_min
     )
 
+    print("\n--- Spread BBO Processes ---")
+    spread_bbos = count_matching(processes, SPREAD_BBO_PATTERNS)
+    spread_bbo_ok = check_singleton(
+        "spread-bbo", spread_bbos, min_required=required_min
+    )
+
     # Check live runtime processes
     print("\n--- Live Runtime Processes ---")
     lives = count_matching(processes, LIVE_PATTERNS)
@@ -217,10 +230,11 @@ def main() -> None:
 
     # Summary
     print("\n=== Summary ===")
-    all_ok = sidecar_ok and spread_sidecar_ok and live_ok
+    all_ok = sidecar_ok and spread_bbo_ok and spread_sidecar_ok and live_ok
     status = "PASS" if all_ok else "FAIL"
     print(f"Status: {status}")
     print(f"  sidecar processes:        {len(sidecars)} (limit: 1)")
+    print(f"  spread-bbo processes:     {len(spread_bbos)} (limit: 1)")
     print(f"  spread-sidecar processes: {len(spread_sidecars)} (limit: 1)")
     print(f"  live processes:           {len(lives)} (limit: 1)")
     print(f"  snapshot writers:         {len(writers)}")
@@ -232,6 +246,8 @@ def main() -> None:
             kill_extras("sidecar", sidecars)
         if len(spread_sidecars) > 1:
             kill_extras("spread-sidecar", spread_sidecars)
+        if len(spread_bbos) > 1:
+            kill_extras("spread-bbo", spread_bbos)
         if len(lives) > 1:
             kill_extras("live", lives)
 
@@ -240,18 +256,21 @@ def main() -> None:
         processes2 = get_process_list()
         sidecars2 = count_matching(processes2, SIDECAR_PATTERNS)
         spread_sidecars2 = count_matching(processes2, SPREAD_SIDECAR_PATTERNS)
+        spread_bbos2 = count_matching(processes2, SPREAD_BBO_PATTERNS)
         lives2 = count_matching(processes2, LIVE_PATTERNS)
         required_counts = {1} if args.strict else {0, 1}
         all_ok = all(
             count in required_counts
             for count in (
                 len(sidecars2),
+                len(spread_bbos2),
                 len(spread_sidecars2),
                 len(lives2),
             )
         )
         print(
             f"\nAfter cleanup: sidecar={len(sidecars2)}, "
+            f"spread-bbo={len(spread_bbos2)}, "
             f"spread-sidecar={len(spread_sidecars2)}, live={len(lives2)}"
         )
         print(f"Status: {'PASS' if all_ok else 'FAIL (manual intervention needed)'}")

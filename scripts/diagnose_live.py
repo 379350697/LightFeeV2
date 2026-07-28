@@ -9849,6 +9849,11 @@ def _build_spread_sidecar_summary(
     if source in {
         "sidecar_snapshot_stale",
         "sidecar_snapshot_unavailable",
+        "sidecar_snapshot_quotes_stale",
+        "sidecar_snapshot_degraded",
+        "spread_bbo_snapshot_unavailable",
+        "spread_bbo_snapshot_stale",
+        "spread_bbo_snapshot_universe_unavailable",
         "missing_or_malformed",
     }:
         source_state = "current_source_degraded"

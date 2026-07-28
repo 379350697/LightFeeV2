@@ -629,6 +629,11 @@ def analyze_spread_snapshot(
         "sidecar_snapshot_stale",
         "sidecar_snapshot_quotes_stale",
         "sidecar_snapshot_degraded",
+        "direct_spread_bbo",
+        "direct_spread_bbo_partial",
+        "spread_bbo_snapshot_unavailable",
+        "spread_bbo_snapshot_stale",
+        "spread_bbo_snapshot_universe_unavailable",
     }
     if source_mode not in allowed_source_modes:
         fingerprints.append("spread_source_mode_unknown")
@@ -637,6 +642,9 @@ def analyze_spread_snapshot(
         "sidecar_snapshot_stale",
         "sidecar_snapshot_quotes_stale",
         "sidecar_snapshot_degraded",
+        "spread_bbo_snapshot_unavailable",
+        "spread_bbo_snapshot_stale",
+        "spread_bbo_snapshot_universe_unavailable",
     }:
         fingerprints.append(f"spread_source_{source_mode}")
     degraded_venues = snapshot.get("degraded_venues", [])
@@ -651,14 +659,14 @@ def analyze_spread_snapshot(
         else set()
     )
     scoped_symbol_partial = bool(
-        source_mode == "sidecar_snapshot_partial"
+        source_mode in {"sidecar_snapshot_partial", "direct_spread_bbo_partial"}
         and not degraded_venues
         and degraded_symbol_venues
         and degraded_symbol_venues <= EXPECTED_VENUES
         and valid_quote_count > 0
     )
-    if source_mode == "sidecar_snapshot_partial" and not scoped_symbol_partial:
-        fingerprints.append("spread_source_sidecar_snapshot_partial")
+    if source_mode in {"sidecar_snapshot_partial", "direct_spread_bbo_partial"} and not scoped_symbol_partial:
+        fingerprints.append(f"spread_source_{source_mode}")
     if (isinstance(degraded_venues, list) and degraded_venues) or (
         isinstance(degraded_symbols, dict)
         and any(bool(symbols) for symbols in degraded_symbols.values())
@@ -713,6 +721,7 @@ def analyze_spread_snapshot(
 
     warning_fingerprints = {
         "spread_source_sidecar_snapshot_partial",
+        "spread_source_direct_spread_bbo_partial",
         "spread_degraded_inputs",
     }
     severity = (

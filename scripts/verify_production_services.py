@@ -38,6 +38,7 @@ AUTO_FAIL_CLOSED_RECENT_WINDOW_MS = 24 * 3600 * 1000
 DEFAULT_SPREAD_SNAPSHOT_MAX_AGE_MS = 60_000
 PRODUCTION_SERVICE_NAMES = (
     "lightfee-sidecar.service",
+    "lightfee-spread-bbo.service",
     "lightfee-spread-sidecar.service",
     "lightfee-live.service",
 )
@@ -54,6 +55,10 @@ _SPREAD_SNAPSHOT_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
         "spread_source_sidecar_snapshot_quotes_stale",
         "spread_source_sidecar_snapshot_degraded",
         "spread_source_sidecar_snapshot_partial",
+        "spread_source_direct_spread_bbo_partial",
+        "spread_source_spread_bbo_snapshot_unavailable",
+        "spread_source_spread_bbo_snapshot_stale",
+        "spread_source_spread_bbo_snapshot_universe_unavailable",
         "spread_degraded_inputs",
         "spread_input_pipeline_stalled",
     }
@@ -517,7 +522,7 @@ def main() -> None:
         "--require-active-services",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Require all three production systemd services and current BBO output.",
+        help="Require all four production systemd services and current BBO output.",
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -549,6 +554,7 @@ def main() -> None:
     ownership_fingerprints: list[str] = []
     live_unit = unit_texts.get("lightfee-live.service", "")
     spread_sidecar_unit = unit_texts.get("lightfee-spread-sidecar.service", "")
+    spread_bbo_unit = unit_texts.get("lightfee-spread-bbo.service", "")
     funding_sidecar_unit = unit_texts.get("lightfee-sidecar.service", "")
     if not any(
         entrypoint in funding_sidecar_unit
@@ -557,6 +563,13 @@ def main() -> None:
         ownership_fingerprints.append("funding_sidecar_entrypoint_missing")
     if "lightfee-sidecar.service" not in spread_sidecar_unit:
         ownership_fingerprints.append("spread_consumer_dependency_missing")
+    if not any(
+        entrypoint in spread_bbo_unit
+        for entrypoint in ("lightfee-spread-bbo", "-m lightfee.apps.spread_bbo")
+    ):
+        ownership_fingerprints.append("spread_bbo_entrypoint_missing")
+    if "lightfee-spread-bbo.service" not in spread_sidecar_unit:
+        ownership_fingerprints.append("spread_bbo_consumer_dependency_missing")
     if "lightfee-sidecar.service" in live_unit:
         ownership_fingerprints.append("live_funding_sidecar_dependency_present")
     reports.append(
@@ -565,7 +578,7 @@ def main() -> None:
             ok=not ownership_fingerprints,
             severity="critical" if ownership_fingerprints else "info",
             fingerprints=ownership_fingerprints,
-            details={"process_model": "funding_sidecar+live+spread_paper"},
+            details={"process_model": "funding_sidecar+spread_bbo+spread_paper+live"},
         )
     )
 
