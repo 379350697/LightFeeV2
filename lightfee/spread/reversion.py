@@ -33,8 +33,10 @@ class SpreadReversionConfig:
     entry_z: float = 2.0
     exit_z: float = 0.5
     min_net_edge_bps: float = 5.0
-    signal_ttl_ms: int = 1000
-    quote_skew_ms: int = 250
+    # This config is consumed by the paper/research signal process only.
+    # Executable entry keeps the separate strict StrategyConfig budgets.
+    signal_ttl_ms: int = 30000
+    quote_skew_ms: int = 30000
     live_notional_quote: float = 20.0
     max_gross_quote: float = 50.0
     taker_fee_bps_by_venue: dict[str, float] = field(default_factory=dict)
@@ -93,8 +95,8 @@ class SpreadReversionConfig:
             entry_z=s.spread_entry_z,
             exit_z=s.spread_exit_z,
             min_net_edge_bps=s.spread_min_net_edge_bps,
-            signal_ttl_ms=s.spread_signal_ttl_ms,
-            quote_skew_ms=s.spread_quote_skew_ms,
+            signal_ttl_ms=s.spread_research_quote_ttl_ms,
+            quote_skew_ms=s.spread_research_quote_skew_ms,
             live_notional_quote=s.spread_live_notional_quote,
             max_gross_quote=s.spread_max_gross_quote,
             taker_fee_bps_by_venue=taker_fees,

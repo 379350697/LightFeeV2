@@ -626,6 +626,7 @@ def analyze_spread_snapshot(
         "sidecar_snapshot",
         "sidecar_snapshot_partial",
         "sidecar_snapshot_unavailable",
+        "sidecar_snapshot_universe_unavailable",
         "sidecar_snapshot_stale",
         "sidecar_snapshot_quotes_stale",
         "sidecar_snapshot_degraded",
@@ -634,6 +635,7 @@ def analyze_spread_snapshot(
         fingerprints.append("spread_source_mode_unknown")
     if source_mode in {
         "sidecar_snapshot_unavailable",
+        "sidecar_snapshot_universe_unavailable",
         "sidecar_snapshot_stale",
         "sidecar_snapshot_quotes_stale",
         "sidecar_snapshot_degraded",

@@ -427,8 +427,11 @@ class SpreadSidecarService:
             int(self.config.runtime.sidecar_snapshot_max_age_ms or 0),
             1,
         )
+        # Spread is research/paper-only. Its samples use the bounded research
+        # window of the main sidecar snapshot, never the one-second executable
+        # BBO lease used by a future live spread dispatcher.
         quote_max_age_ms = max(
-            int(self.config.strategy.spread_signal_ttl_ms or 0),
+            int(self.config.strategy.spread_research_quote_ttl_ms or 0),
             1,
         )
         published_at_ms = int(snapshot.published_at_ms or 0)
@@ -572,8 +575,8 @@ class SpreadSidecarService:
             excluded_symbols=list(strategy.spread_paper_excluded_symbols),
             allowed_opportunity_labels=list(strategy.spread_paper_allowed_opportunity_labels),
             episode_cooldown_ms=int(strategy.spread_paper_episode_cooldown_ms),
-            quote_ttl_ms=strategy.spread_signal_ttl_ms,
-            quote_skew_ms=strategy.spread_quote_skew_ms,
+            quote_ttl_ms=strategy.spread_research_quote_ttl_ms,
+            quote_skew_ms=strategy.spread_research_quote_skew_ms,
             latency_buffer_bps=float(strategy.spread_paper_latency_buffer_bps),
             require_l2_vwap=strategy.spread_paper_require_l2_vwap,
         )

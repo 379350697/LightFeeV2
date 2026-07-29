@@ -51,6 +51,7 @@ _SPREAD_SNAPSHOT_MARKET_OBSERVATION_FINGERPRINTS = frozenset(
     {
         "spread_snapshot_stale",
         "spread_source_sidecar_snapshot_stale",
+        "spread_source_sidecar_snapshot_universe_unavailable",
         "spread_source_sidecar_snapshot_quotes_stale",
         "spread_source_sidecar_snapshot_degraded",
         "spread_source_sidecar_snapshot_partial",

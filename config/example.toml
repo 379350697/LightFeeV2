@@ -104,8 +104,12 @@ spread_entry_z = 2.0
 spread_exit_z = 0.5
 spread_stop_z = 3.5
 spread_min_net_edge_bps = 5.0
+# Strict executable evidence budget. It is not used by paper/research samples.
 spread_signal_ttl_ms = 1000
 spread_quote_skew_ms = 250
+# Main-sidecar research sample bounds; spread remains paper-only.
+spread_research_quote_ttl_ms = 30000
+spread_research_quote_skew_ms = 30000
 spread_max_hold_ms = 1800000
 spread_slippage_reserve_bps = 2.0
 spread_adverse_selection_buffer_bps = 1.0

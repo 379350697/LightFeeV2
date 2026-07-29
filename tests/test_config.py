@@ -798,6 +798,24 @@ class TestConfigValidation:
         assert any("spread_signal_ttl_ms must be <= 1000" in issue for issue in issues)
         assert any("spread_quote_skew_ms must be <= 250" in issue for issue in issues)
 
+    def test_spread_research_snapshot_budgets_are_separate_from_execution_contract(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.spread_research_quote_ttl_ms = 30_001
+        config.strategy.spread_research_quote_skew_ms = 30_001
+
+        issues = validate_config(config)
+
+        assert config.strategy.spread_signal_ttl_ms == 1_000
+        assert config.strategy.spread_quote_skew_ms == 250
+        assert any(
+            "spread_research_quote_ttl_ms must be <= 30000" in issue
+            for issue in issues
+        )
+        assert any(
+            "spread_research_quote_skew_ms must be <= 30000" in issue
+            for issue in issues
+        )
+
     def test_spread_v2_statistical_safety_contract_cannot_be_relaxed(self):
         config = AppConfig(symbols=["BTCUSDT"])
         config.strategy.spread_min_samples = 119

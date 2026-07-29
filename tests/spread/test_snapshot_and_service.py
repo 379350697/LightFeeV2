@@ -170,6 +170,8 @@ def _config(tmp_path, *, paper_enabled: bool = False) -> AppConfig:
             spread_paper_enabled=paper_enabled,
             spread_signal_ttl_ms=1_000,
             spread_quote_skew_ms=250,
+            spread_research_quote_ttl_ms=30_000,
+            spread_research_quote_skew_ms=30_000,
             spread_paper_require_l2_vwap=True,
         ),
         persistence=PersistenceConfig(
@@ -267,7 +269,9 @@ async def test_expired_funding_snapshot_disables_only_spread_input(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_signal_ttl_does_not_expire_the_fresh_funding_snapshot(tmp_path) -> None:
+async def test_research_ttl_keeps_fresh_main_snapshot_samples_without_relaxing_execution_budget(
+    tmp_path,
+) -> None:
     config = _config(tmp_path)
     funding_snapshot = _snapshot(published_at_ms=10_000)
     publish_snapshot(funding_snapshot, config.runtime.sidecar_snapshot_path)
@@ -279,15 +283,20 @@ async def test_signal_ttl_does_not_expire_the_fresh_funding_snapshot(tmp_path) -
     finally:
         await service.close()
 
-    # The one-second signal TTL rejects individual quotes, while the main
-    # sidecar generation remains inside its separate 60-second budget.
-    assert quotes == {}
+    # Paper/research consumes the main sidecar's 30-second sample budget. The
+    # strict one-second execution lease remains on StrategyConfig for any
+    # future live dispatcher and is never used here.
+    assert set(quotes) == {"cheap:BTCUSDT", "rich:BTCUSDT"}
     assert degraded == set()
-    assert source == "sidecar_snapshot_partial"
+    assert source == "sidecar_snapshot"
     assert input_count == 2
-    assert observed == 0
-    assert symbols == {"cheap": ["BTCUSDT"], "rich": ["BTCUSDT"]}
+    assert observed == 10_000
+    assert symbols == {}
     assert decision == 11_001
+    assert service.signal_config.signal_ttl_ms == 30_000
+    assert service.signal_config.quote_skew_ms == 30_000
+    assert config.strategy.spread_signal_ttl_ms == 1_000
+    assert config.strategy.spread_quote_skew_ms == 250
 
 
 def test_paper_jsonl_and_atomic_checkpoint_restore_open_position(tmp_path) -> None:

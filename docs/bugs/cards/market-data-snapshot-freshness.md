@@ -40,6 +40,13 @@ fallback or BBO process. If the main snapshot is missing, malformed, or stale,
 spread-sidecar publishes a degraded empty spread snapshot. The live order path
 still reacquires selected-leg executable evidence immediately before dispatch.
 
+The current spread strategy is paper/research-only. Its main-snapshot sample
+TTL and cross-venue skew use the explicit, bounded 30-second
+`spread_research_*` budgets. The strict 1-second `spread_signal_ttl_ms` and
+250ms `spread_quote_skew_ms` remain executable-evidence budgets; they are not
+silently widened or reused as research sampling rules. A paper observation must
+never be represented as an executable quote.
+
 Sidecar public IO must also be resource-bounded. Sidecar-owned public
 `httpx.AsyncClient` instances need both a keepalive cap and a total connection
 cap, while credentialed `VenueTransport` order/position/account IO must not

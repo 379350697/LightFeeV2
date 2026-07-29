@@ -210,8 +210,14 @@ class StrategyConfig:
     spread_exit_z: float = 0.5
     spread_stop_z: float = 3.5
     spread_min_net_edge_bps: float = 5.0
+    # Strict values below are reserved for any future executable spread path.
+    # The current spread process is paper/research only and consumes the main
+    # sidecar's bounded snapshot cadence through the explicitly named research
+    # budgets that follow.
     spread_signal_ttl_ms: int = 1000
     spread_quote_skew_ms: int = 250
+    spread_research_quote_ttl_ms: int = 30000
+    spread_research_quote_skew_ms: int = 30000
     spread_max_hold_ms: int = 1800000
     spread_slippage_reserve_bps: float = 2.0
     spread_adverse_selection_buffer_bps: float = 1.0

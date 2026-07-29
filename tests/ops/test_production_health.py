@@ -6,8 +6,6 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from lightfee.ops.production_health import (
     analyze_current_state,
     analyze_resolver_config,
@@ -1221,6 +1219,50 @@ def test_spread_snapshot_runtime_keeps_market_staleness_observable_not_global_ga
         "spread_input_pipeline_stalled",
         "spread_snapshot_stale",
         "spread_source_sidecar_snapshot_stale",
+    ]
+
+
+def test_spread_snapshot_runtime_keeps_research_universe_gap_observable_not_global_gate(
+    monkeypatch,
+):
+    now_ms = 10_000
+    snapshot = {
+        "schema_version": 4,
+        "decision_at_ms": now_ms - 200,
+        "published_at_ms": now_ms - 100,
+        "market_observed_at_ms": 0,
+        "source_mode": "sidecar_snapshot_universe_unavailable",
+        "degraded_venues": ["cheap", "rich"],
+        "degraded_symbols": {},
+        "input_quote_count": 2,
+        "valid_quote_count": 0,
+        "evaluated_pair_count": 0,
+        "accepted_pair_count": 0,
+        "paper_configured_enabled": False,
+        "paper_admission_enabled": False,
+        "paper_tracked_count": 0,
+        "paper_refresh_status": "disabled",
+        "paper_event_count": 0,
+        "paper_last_success_at_ms": 0,
+        "rejection_counts": {},
+        "paper_admission_rejection_counts": {},
+        "candidates": [],
+    }
+    monkeypatch.setattr(vps, "_read_json", lambda path: snapshot)
+
+    report = vps._spread_snapshot_runtime_report(
+        "/tmp/spread.json",
+        max_age_ms=1_000,
+        now_ms=now_ms,
+    )
+
+    assert report.ok
+    assert report.fingerprints == []
+    assert report.details["nonblocking_market_observations"] == [
+        "spread_degraded_inputs",
+        "spread_input_pipeline_stalled",
+        "spread_snapshot_stale",
+        "spread_source_sidecar_snapshot_universe_unavailable",
     ]
 
 
