@@ -11,13 +11,12 @@ import hashlib
 import hmac
 import json
 import logging
-import time
 from typing import Any, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from lightfee.core.domain import PassiveOrderState, Side, Venue
+from lightfee.core.domain import PassiveOrderState
 from lightfee.marketdata.private_ws import (
     PrivateOrderUpdate,
     _now_ms,
@@ -32,6 +31,8 @@ logger = logging.getLogger(__name__)
 OKX_PRIVATE_WS_IDLE_TIMEOUT_SECS = 90
 OKX_PRIVATE_WS_WATCHDOG_TICK_SECS = 5
 OKX_PRIVATE_WS_PING_INTERVAL_SECS = 20
+OKX_PRIVATE_WS_SUBSCRIBE_RETRY_INITIAL_MS = 1_000
+OKX_PRIVATE_WS_SUBSCRIBE_RETRY_MAX_MS = 30_000
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,238 @@ def _build_okx_private_subscribe_messages(
                 )
             )
     return messages
+
+
+def _shared_okx_private_ws_symbol_map(
+    transport,
+    symbols: list[str],
+) -> dict[str, str]:
+    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
+    if not isinstance(symbol_map, dict):
+        symbol_map = {}
+        transport._private_ws_symbol_map = symbol_map
+    for symbol in symbols:
+        if symbol:
+            symbol_map.setdefault(transport._venue_symbol(symbol), symbol)
+    return symbol_map
+
+
+def _okx_symbol_map_with_ct_val(
+    symbol_map: dict[str, str],
+    ct_val_map: dict[str, float],
+) -> dict[str, str]:
+    return {
+        venue_symbol: symbol
+        for venue_symbol, symbol in symbol_map.items()
+        if venue_symbol in ct_val_map
+    }
+
+
+def _next_okx_private_subscription_id(transport, channel: str) -> str:
+    sequence = int(getattr(transport, "_okx_private_ws_subscribe_sequence", 0) or 0) + 1
+    transport._okx_private_ws_subscribe_sequence = sequence
+    return f"lfp{sequence:x}{channel[:1]}"
+
+
+def _register_okx_private_subscription_requests(
+    transport,
+    symbol_map: dict[str, str],
+    pending_subscriptions: dict[str, dict[str, Any]],
+) -> list[str]:
+    inst_ids = list(symbol_map.keys())
+    messages: list[str] = []
+    for channel in ("orders", "positions"):
+        for i in range(0, len(inst_ids), 100):
+            chunk = inst_ids[i : i + 100]
+            if not chunk:
+                continue
+            request_id = _next_okx_private_subscription_id(transport, channel)
+            args = [
+                {"channel": channel, "instType": "SWAP", "instId": inst_id}
+                for inst_id in chunk
+            ]
+            message = json.dumps(
+                {
+                    "id": request_id,
+                    "op": "subscribe",
+                    "args": args,
+                }
+            )
+            pending_subscriptions[request_id] = {
+                "message": message,
+                "symbols": {
+                    inst_id: symbol_map[inst_id]
+                    for inst_id in chunk
+                    if inst_id in symbol_map
+                },
+                "expected": {
+                    (channel, inst_id)
+                    for inst_id in chunk
+                },
+                "acked": set(),
+                "attempts": 0,
+                "last_sent_ms": 0,
+                "next_retry_ms": 0,
+            }
+            messages.append(message)
+    transport._okx_private_ws_pending_subscriptions = pending_subscriptions
+    return messages
+
+
+def _okx_subscription_retry_delay_ms(attempts: int) -> int:
+    exponent = max(min(int(attempts or 1) - 1, 5), 0)
+    delay = OKX_PRIVATE_WS_SUBSCRIBE_RETRY_INITIAL_MS * (2 ** exponent)
+    return min(delay, OKX_PRIVATE_WS_SUBSCRIBE_RETRY_MAX_MS)
+
+
+def _okx_subscription_pending_for_inst(
+    pending_subscriptions: dict[str, dict[str, Any]],
+    inst_id: str,
+) -> bool:
+    return any(
+        inst_id in (state.get("symbols") or {})
+        for state in pending_subscriptions.values()
+    )
+
+
+async def _send_okx_private_subscription_message(
+    transport,
+    ws,
+    pending_subscriptions: dict[str, dict[str, Any]],
+    message: str,
+    unhealthy_after_failures: int,
+) -> bool:
+    request_id = ""
+    try:
+        payload = json.loads(message)
+        request_id = str(payload.get("id") or "")
+    except json.JSONDecodeError:
+        request_id = ""
+    try:
+        await ws.send(message)
+    except Exception as exc:
+        if request_id and request_id in pending_subscriptions:
+            state = pending_subscriptions[request_id]
+            attempts = int(state.get("attempts") or 0) + 1
+            state["attempts"] = attempts
+            state["next_retry_ms"] = (
+                _now_ms() + _okx_subscription_retry_delay_ms(attempts)
+            )
+        transport.record_private_ws_failure(
+            _now_ms(),
+            f"okx private ws subscribe send failed: {exc}",
+            unhealthy_after_failures,
+        )
+        return False
+    if request_id and request_id in pending_subscriptions:
+        state = pending_subscriptions[request_id]
+        state["attempts"] = int(state.get("attempts") or 0) + 1
+        state["last_sent_ms"] = _now_ms()
+        state["next_retry_ms"] = 0
+    return True
+
+
+def _activate_okx_acknowledged_subscriptions(
+    transport,
+    inst_id: str,
+    symbol_map: dict[str, str],
+    active_symbol_map: dict[str, str],
+    acked_channels_by_inst: dict[str, set[str]],
+) -> None:
+    if acked_channels_by_inst.get(inst_id, set()) < {"orders", "positions"}:
+        return
+    symbol = symbol_map.get(inst_id)
+    if symbol is None:
+        return
+    active_symbol_map[inst_id] = symbol
+    pending_updates = getattr(transport, "_private_ws_pending_symbol_updates", None)
+    if isinstance(pending_updates, set):
+        pending_updates.discard(inst_id)
+    transport._okx_private_ws_active_symbol_map = active_symbol_map
+
+
+def _apply_okx_private_subscription_event(
+    transport,
+    payload: dict[str, Any],
+    pending_subscriptions: dict[str, dict[str, Any]],
+    active_symbol_map: dict[str, str],
+    symbol_map: dict[str, str],
+    acked_channels_by_inst: dict[str, set[str]],
+    unhealthy_after_failures: int,
+) -> None:
+    event = str(payload.get("event") or "")
+    if event not in {"subscribe", "error"}:
+        return
+    request_id = str(payload.get("id") or "")
+    state = pending_subscriptions.get(request_id)
+    arg = payload.get("arg")
+    if not isinstance(arg, dict):
+        arg = {}
+    channel = str(arg.get("channel") or "")
+    inst_id = str(arg.get("instId") or "")
+    code = str(payload.get("code") or "")
+
+    if event == "error" or (event == "subscribe" and code not in {"", "0"}):
+        if state is not None:
+            attempts = int(state.get("attempts") or 1)
+            state["next_retry_ms"] = (
+                _now_ms() + _okx_subscription_retry_delay_ms(attempts)
+            )
+        transport.record_private_ws_failure(
+            _now_ms(),
+            "okx private ws subscribe rejected"
+            f": id={request_id or '-'} channel={channel or '-'}"
+            f" instId={inst_id or '-'} code={code or '-'}"
+            f" msg={payload.get('msg') or ''}",
+            unhealthy_after_failures,
+        )
+        return
+
+    if state is None or not channel or not inst_id:
+        return
+    ack_key = (channel, inst_id)
+    expected = state.get("expected")
+    if not isinstance(expected, set) or ack_key not in expected:
+        return
+    acked = state.get("acked")
+    if not isinstance(acked, set):
+        acked = set()
+        state["acked"] = acked
+    acked.add(ack_key)
+    acked_channels_by_inst.setdefault(inst_id, set()).add(channel)
+    _activate_okx_acknowledged_subscriptions(
+        transport,
+        inst_id,
+        symbol_map,
+        active_symbol_map,
+        acked_channels_by_inst,
+    )
+    if expected.issubset(acked):
+        pending_subscriptions.pop(request_id, None)
+    transport._okx_private_ws_pending_subscriptions = pending_subscriptions
+
+
+async def _retry_okx_private_subscriptions(
+    transport,
+    ws,
+    pending_subscriptions: dict[str, dict[str, Any]],
+    unhealthy_after_failures: int,
+) -> None:
+    now_ms = _now_ms()
+    for state in list(pending_subscriptions.values()):
+        next_retry_ms = int(state.get("next_retry_ms") or 0)
+        if next_retry_ms <= 0 or next_retry_ms > now_ms:
+            continue
+        message = str(state.get("message") or "")
+        if not message:
+            continue
+        await _send_okx_private_subscription_message(
+            transport,
+            ws,
+            pending_subscriptions,
+            message,
+            unhealthy_after_failures,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +570,98 @@ async def _fetch_okx_server_timestamp(transport) -> str:
     raise ValueError("failed to fetch okx server time")
 
 
+async def _apply_okx_private_ws_symbol_updates(
+    transport,
+    ws,
+    symbol_map: dict[str, str],
+    active_symbol_map: dict[str, str],
+    pending_subscriptions: dict[str, dict[str, Any]],
+    ct_val_map: dict[str, float],
+    unhealthy_after_failures: int,
+) -> None:
+    pending_updates = getattr(transport, "_private_ws_pending_symbol_updates", None)
+    if not isinstance(pending_updates, set) or not pending_updates:
+        return
+
+    additions = {
+        str(venue_symbol): str(symbol_map[venue_symbol])
+        for venue_symbol in pending_updates
+        if str(venue_symbol) and venue_symbol in symbol_map
+    }
+    if not additions:
+        return
+
+    update_ct_val_map = _build_okx_ct_val_map(transport, additions)
+    missing_ct_val = sorted(set(additions) - set(update_ct_val_map))
+    if missing_ct_val:
+        reported_missing = getattr(
+            transport,
+            "_private_ws_pending_symbol_update_missing_ctval",
+            set(),
+        )
+        if not isinstance(reported_missing, set):
+            reported_missing = set()
+        newly_missing = [
+            venue_symbol
+            for venue_symbol in missing_ct_val
+            if venue_symbol not in reported_missing
+        ]
+        if newly_missing:
+            transport.record_private_ws_failure(
+                _now_ms(),
+                "okx private ws ctVal metadata missing for symbol update: "
+                + ",".join(newly_missing[:10]),
+                unhealthy_after_failures,
+            )
+        reported_missing.update(missing_ct_val)
+        transport._private_ws_pending_symbol_update_missing_ctval = reported_missing
+
+    ready_additions = {
+        venue_symbol: symbol
+        for venue_symbol, symbol in additions.items()
+        if venue_symbol in update_ct_val_map
+    }
+    if not ready_additions:
+        return
+
+    symbol_map.update(ready_additions)
+    ct_val_map.update(
+        {
+            venue_symbol: update_ct_val_map[venue_symbol]
+            for venue_symbol in ready_additions
+        }
+    )
+    unsent_additions = {
+        venue_symbol: symbol
+        for venue_symbol, symbol in ready_additions.items()
+        if venue_symbol not in active_symbol_map
+        and not _okx_subscription_pending_for_inst(
+            pending_subscriptions,
+            venue_symbol,
+        )
+    }
+    for subscribe_message in _register_okx_private_subscription_requests(
+        transport,
+        unsent_additions,
+        pending_subscriptions,
+    ):
+        await _send_okx_private_subscription_message(
+            transport,
+            ws,
+            pending_subscriptions,
+            subscribe_message,
+            unhealthy_after_failures,
+        )
+
+    reported_missing = getattr(
+        transport,
+        "_private_ws_pending_symbol_update_missing_ctval",
+        set(),
+    )
+    if isinstance(reported_missing, set):
+        reported_missing.difference_update(ready_additions)
+
+
 async def _okx_private_ws_loop(
     transport,
     api_key: str,
@@ -391,6 +716,16 @@ async def _okx_private_ws_loop(
             await ws.close()
             await asyncio.sleep(delay / 1000.0)
             continue
+
+        pending_subscriptions: dict[str, dict[str, Any]] = {}
+        acked_channels_by_inst: dict[str, set[str]] = {}
+        active_symbol_map: dict[str, str] = {}
+        transport._okx_private_ws_active_symbol_map = active_symbol_map
+        subscribe_messages = _register_okx_private_subscription_requests(
+            transport,
+            _okx_symbol_map_with_ct_val(symbol_map, ct_val_map),
+            pending_subscriptions,
+        )
 
         # 3) Sign login
         sign_message = f"{timestamp}GET/users/self/verify"
@@ -455,39 +790,41 @@ async def _okx_private_ws_loop(
 
         try:
             while True:
-                consume_updates = getattr(
-                    transport,
-                    "consume_private_ws_symbol_updates",
-                    None,
-                )
-                updates = (
-                    consume_updates()
-                    if subscribed and callable(consume_updates)
-                    else {}
-                )
-                if updates:
-                    update_ct_val_map = _build_okx_ct_val_map(transport, updates)
-                    missing_ct_val = sorted(set(updates) - set(update_ct_val_map))
-                    if missing_ct_val:
-                        transport.record_private_ws_failure(
-                            _now_ms(),
-                            "okx private ws ctVal metadata missing: "
-                            + ",".join(missing_ct_val[:10]),
-                            unhealthy_after=1,
-                        )
-                        logger.warning(
-                            "okx private WS subscription skipped: missing ctVal for %d symbols",
-                            len(missing_ct_val),
-                        )
-                    else:
-                        ct_val_map.update(update_ct_val_map)
-                        for update_message in _build_okx_private_subscribe_messages(
-                            updates
-                        ):
-                            await ws.send(update_message)
+                if subscribed:
+                    await _retry_okx_private_subscriptions(
+                        transport,
+                        ws,
+                        pending_subscriptions,
+                        unhealthy_after_failures,
+                    )
+                    await _apply_okx_private_ws_symbol_updates(
+                        transport,
+                        ws,
+                        symbol_map,
+                        active_symbol_map,
+                        pending_subscriptions,
+                        ct_val_map,
+                        unhealthy_after_failures,
+                    )
                 try:
                     message = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
+                    if subscribed:
+                        await _retry_okx_private_subscriptions(
+                            transport,
+                            ws,
+                            pending_subscriptions,
+                            unhealthy_after_failures,
+                        )
+                        await _apply_okx_private_ws_symbol_updates(
+                            transport,
+                            ws,
+                            symbol_map,
+                            active_symbol_map,
+                            pending_subscriptions,
+                            ct_val_map,
+                            unhealthy_after_failures,
+                        )
                     continue
                 except ConnectionClosed as e:
                     transport.record_private_ws_failure(
@@ -503,9 +840,27 @@ async def _okx_private_ws_loop(
                 last_message_ms = _now_ms()
                 transport.record_private_ws_success(last_message_ms)
 
+                payload = None
+                try:
+                    parsed = json.loads(message)
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    _apply_okx_private_subscription_event(
+                        transport,
+                        payload,
+                        pending_subscriptions,
+                        active_symbol_map,
+                        symbol_map,
+                        acked_channels_by_inst,
+                        unhealthy_after_failures,
+                    )
+
                 to_send, subscribed = handle_okx_private_message(
                     private_state,
-                    symbol_map,
+                    active_symbol_map,
                     subscribe_messages,
                     message,
                     subscribed,
@@ -514,7 +869,29 @@ async def _okx_private_ws_loop(
 
                 if to_send:
                     for sub_msg in to_send:
-                        await ws.send(sub_msg)
+                        await _send_okx_private_subscription_message(
+                            transport,
+                            ws,
+                            pending_subscriptions,
+                            sub_msg,
+                            unhealthy_after_failures,
+                        )
+                if subscribed:
+                    await _retry_okx_private_subscriptions(
+                        transport,
+                        ws,
+                        pending_subscriptions,
+                        unhealthy_after_failures,
+                    )
+                    await _apply_okx_private_ws_symbol_updates(
+                        transport,
+                        ws,
+                        symbol_map,
+                        active_symbol_map,
+                        pending_subscriptions,
+                        ct_val_map,
+                        unhealthy_after_failures,
+                    )
 
         except Exception as e:
             transport.record_private_ws_failure(
@@ -579,11 +956,7 @@ def start_okx_private_ws(transport, symbols: list[str]) -> None:
     ws_url = _okx_private_ws_url(base_url)
     private_state = transport._private_ws_state
 
-    # OKX private topics are instrument-scoped.  The transport-owned map is
-    # retained and the active worker subscribes additions in-band.
-    symbol_map = getattr(transport, "_private_ws_symbol_map", None)
-    if symbol_map is None:
-        symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    symbol_map = _shared_okx_private_ws_symbol_map(transport, symbols)
     ct_val_map = _build_okx_ct_val_map(transport, symbol_map)
     missing_ct_val = sorted(set(symbol_map) - set(ct_val_map))
     if missing_ct_val:

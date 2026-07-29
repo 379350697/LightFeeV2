@@ -6,8 +6,8 @@ import argparse
 import asyncio
 import logging
 import signal
-import sys
 
+from lightfee.apps.logging_config import configure_app_logging
 from lightfee.config.loader import load_config
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.venues.registry import build_adapter_map
@@ -303,11 +303,7 @@ async def async_main(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    configure_app_logging(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="lightfee-live: Live trading process")
     parser.add_argument(

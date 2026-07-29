@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
 
+from lightfee.apps.logging_config import configure_app_logging
 from lightfee.apps.sidecar import _install_shutdown_handlers
 from lightfee.apps.sidecar import _run as _run_refresh_loop
 from lightfee.config.loader import load_config
@@ -31,11 +31,7 @@ async def _run(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    configure_app_logging(level=logging.INFO)
     parser = argparse.ArgumentParser(
         description="lightfee-spread-sidecar: spread-reversion signal process"
     )

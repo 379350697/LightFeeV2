@@ -59,13 +59,15 @@ def _bitget_passive_order_state(status: str) -> Optional[PassiveOrderState]:
 def _build_bitget_subscribe(inst_type: str) -> str:
     """V1 build_bitget_subscribe: subscribe to positions + orders channels.
 
-    V1 bitget.rs:4871 — no per-symbol instId in subscribe args.
+    The current private-channel schema uses ``instId=default`` for the
+    account-wide product subscription; it continues to cover symbols added to
+    the transport-owned parser map without replacing the socket.
     """
     return json.dumps({
         "op": "subscribe",
         "args": [
-            {"instType": inst_type, "channel": "positions"},
-            {"instType": inst_type, "channel": "orders"},
+            {"instType": inst_type, "channel": "positions", "instId": "default"},
+            {"instType": inst_type, "channel": "orders", "instId": "default"},
         ],
     })
 

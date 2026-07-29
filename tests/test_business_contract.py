@@ -327,7 +327,7 @@ def test_close_reconciliation_evidence_contract_does_not_trust_terminal_marker_w
     assert result["diagnostic_severity"] == "critical"
 
 
-def test_close_reconciliation_evidence_contract_uses_frozen_exchange_truth_when_current_probe_dirty():
+def test_close_reconciliation_evidence_contract_rejects_unscoped_frozen_exchange_truth_when_current_probe_dirty():
     result = close_reconciliation_evidence_contract(
         {
             "position_id": "entry-h",
@@ -345,10 +345,10 @@ def test_close_reconciliation_evidence_contract_uses_frozen_exchange_truth_when_
         current_exchange_truth_clean=False,
     )
 
-    assert result["action"] == "terminal_flat_accounting_gap"
-    assert result["terminality"] == "terminal_flat_accounting_gap"
-    assert result["blocks_business_terminal"] is False
-    assert result["diagnostic_severity"] == "info"
+    assert result["action"] == "unresolved_close_accounting_gap"
+    assert result["terminality"] == "unresolved_close_accounting_gap"
+    assert result["blocks_business_terminal"] is True
+    assert result["diagnostic_severity"] == "critical"
 
 
 def test_close_reconciliation_state_releases_terminal_flat_accounting_gap():

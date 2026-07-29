@@ -6,9 +6,9 @@ import argparse
 import asyncio
 import logging
 import signal
-import sys
 from collections.abc import Callable
 
+from lightfee.apps.logging_config import configure_app_logging
 from lightfee.config.loader import load_config
 from lightfee.sidecar.service import SidecarService
 
@@ -175,11 +175,7 @@ async def _run(
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        stream=sys.stderr,
-    )
+    configure_app_logging(level=logging.INFO)
 
     parser = argparse.ArgumentParser(description="lightfee-sidecar: Opportunity input data plane")
     parser.add_argument("--config", "-c", default="config/example.toml", help="Path to config TOML")

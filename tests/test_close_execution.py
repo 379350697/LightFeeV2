@@ -78,6 +78,42 @@ def _make_position(**overrides) -> OpenPosition:
     return OpenPosition(**defaults)
 
 
+def _pair_scoped_flat_account_truth(
+    *,
+    symbol: str,
+    long_venue: str,
+    short_venue: str,
+) -> dict[str, object]:
+    venues = [str(long_venue), str(short_venue)]
+    return {
+        "available": True,
+        "truth_supported": True,
+        "positions": [
+            {"venue": venue, "symbol": symbol, "quantity": 0.0}
+            for venue in venues
+        ],
+        "open_orders": [],
+        "probe_evidence": [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_all_positions",
+                "classification": "position_probe_unfiltered_succeeded",
+            }
+            for venue in venues
+        ]
+        + [
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "endpoint": "fetch_open_orders",
+                "classification": "open_order_probe_unfiltered_succeeded",
+            }
+            for venue in venues
+        ],
+    }
+
+
 def _fake_fill(
     venue, symbol, side, quantity, price=50000.0,
     order_id="f001", fee_quote=2.5,
@@ -758,13 +794,11 @@ def test_terminal_flat_accounting_gap_is_retained_as_accounting_only_backfill():
         "pending_backfill": True,
         "missing_leg": "long",
         "last_evidence_gap_reason": "missing_long_close_trade_statement",
-        "exchange_truth": {
-            "truth_available": True,
-            "positions_flat": True,
-            "open_orders_flat": True,
-            "positions": [],
-            "open_orders": [],
-        },
+        "exchange_truth": _pair_scoped_flat_account_truth(
+            symbol="LABUSDT",
+            long_venue=Venue.BITGET.value,
+            short_venue=Venue.OKX.value,
+        ),
     }
 
     archived = runtime._archive_terminal_flat_pending_close_reconciliation(
@@ -1054,11 +1088,11 @@ def test_accounting_only_backfill_does_not_block_entry_gate():
                 "long_venue": Venue.BITGET.value,
                 "short_venue": Venue.OKX.value,
             },
-            "exchange_truth": {
-                "truth_available": True,
-                "positions_flat": True,
-                "open_orders_flat": True,
-            },
+            "exchange_truth": _pair_scoped_flat_account_truth(
+                symbol="LABUSDT",
+                long_venue=Venue.BITGET.value,
+                short_venue=Venue.OKX.value,
+            ),
         }
     ]
     gate = EntryGateRuntime(ctx)

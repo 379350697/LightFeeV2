@@ -567,9 +567,12 @@ def _truth_records_cover_scope(
     venues: set[str],
     quantity_key: str | None = None,
     open_orders_key: str | None = None,
+    truth: dict[str, Any] | None = None,
+    probe_endpoint: str | set[str] | None = None,
+    probe_success_classifications: set[str] | None = None,
 ) -> bool:
-    if not isinstance(records, list) or not records:
-        return True
+    if not isinstance(records, list):
+        return False
     scoped: list[dict[str, Any]] = []
     for raw in records:
         if not isinstance(raw, dict):
@@ -578,18 +581,41 @@ def _truth_records_cover_scope(
         record_venue = str(raw.get("venue") or "").lower()
         if symbol and record_symbol and record_symbol != symbol:
             continue
+        if venues and not record_venue:
+            continue
         if venues and record_venue and record_venue not in venues:
             continue
         scoped.append(raw)
+
+    def _probe_covers(missing_venues: set[str]) -> bool:
+        if (
+            not missing_venues
+            or not isinstance(truth, dict)
+            or probe_endpoint is None
+            or not probe_success_classifications
+        ):
+            return False
+        return all(
+            _truth_probe_evidence_succeeded(
+                truth,
+                venue=venue,
+                symbol=symbol,
+                endpoint=probe_endpoint,
+                success_classifications=probe_success_classifications,
+            )
+            for venue in missing_venues
+        )
+
     if not scoped:
-        return False
+        return _probe_covers(set(venues))
     scoped_venues = {
         str(item.get("venue") or "").lower()
         for item in scoped
         if str(item.get("venue") or "")
     }
     if venues and scoped_venues and not venues.issubset(scoped_venues):
-        return False
+        if not _probe_covers(venues - scoped_venues):
+            return False
     if quantity_key is not None:
         return all(
             abs(_safe_float(item.get(quantity_key))) <= 1e-9
@@ -825,19 +851,33 @@ def _close_reconciliation_truth_covers_scope(
     symbol, venues = _close_reconciliation_scope(reconciliation)
     if passive_close_has_terminal_truth({"exchange_truth": truth}):
         positions = truth.get("positions")
+        open_order_truth = truth.get("open_order_truth")
+        if not isinstance(positions, list) or not isinstance(open_order_truth, list):
+            return False
         if not _truth_records_cover_scope(
             positions,
             symbol=symbol,
             venues=venues,
             quantity_key="quantity",
+            truth=truth,
+            probe_endpoint={"fetch_position", "fetch_all_positions"},
+            probe_success_classifications={
+                "position_truth",
+                "position_probe_unfiltered_succeeded",
+            },
         ):
             return False
-        open_order_truth = truth.get("open_order_truth")
         if not _truth_records_cover_scope(
             open_order_truth,
             symbol=symbol,
             venues=venues,
             open_orders_key="open_orders_empty",
+            truth=truth,
+            probe_endpoint="fetch_open_orders",
+            probe_success_classifications={
+                "open_order_truth",
+                "open_order_probe_unfiltered_succeeded",
+            },
         ):
             return False
         return True
@@ -866,17 +906,17 @@ def close_reconciliation_exchange_truth(
     embedded_truth = item.get("exchange_truth") or original_payload.get(
         "exchange_truth"
     )
+    if isinstance(current_exchange_truth, dict):
+        if _close_reconciliation_truth_covers_scope(current_exchange_truth, item):
+            return current_exchange_truth
+        return None
+
     if isinstance(embedded_truth, dict) and _close_reconciliation_truth_covers_scope(
         embedded_truth,
         item,
     ):
         return embedded_truth
-
-    if not isinstance(current_exchange_truth, dict):
-        return None
-    if not _close_reconciliation_truth_covers_scope(current_exchange_truth, item):
-        return None
-    return current_exchange_truth
+    return None
 
 
 def close_reconciliation_exchange_truth_clean(

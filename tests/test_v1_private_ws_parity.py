@@ -44,6 +44,24 @@ async def _wait_until(predicate, timeout: float = 1.0) -> None:
     assert predicate()
 
 
+def _okx_subscribe_request_ids(sent: list[str], inst_id: str) -> dict[str, str]:
+    request_ids: dict[str, str] = {}
+    for raw in sent:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("op") != "subscribe":
+            continue
+        request_id = str(payload.get("id") or "")
+        for arg in payload.get("args") or []:
+            if not isinstance(arg, dict):
+                continue
+            if arg.get("instId") == inst_id and request_id:
+                request_ids[str(arg.get("channel") or "")] = request_id
+    return request_ids
+
+
 # ============================================================================
 # V1 real-event parser fixtures
 # ============================================================================
@@ -629,25 +647,40 @@ class _MessageThenBlockingFakeWebSocket(_BlockingFakeWebSocket):
 
 
 class _QueuedFakeWebSocket(_FakeWebSocket):
-    """Fake websocket that lets tests feed messages after connection."""
+    """Fake websocket that lets tests feed messages after the worker starts."""
 
     def __init__(self):
         super().__init__(messages=[])
-        self._queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._closed_event = asyncio.Event()
 
-    def feed(self, msg: str) -> None:
-        self._queue.put_nowait(msg)
+    def feed(self, message: str) -> None:
+        self._queue.put_nowait(message)
 
     async def recv(self) -> str:
-        item = await self._queue.get()
-        if item is None:
+        if self.closed:
             from websockets.exceptions import ConnectionClosed
             raise ConnectionClosed(1000, "closed by test")
-        return item
+        get_task = asyncio.create_task(self._queue.get())
+        close_task = asyncio.create_task(self._closed_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {get_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if close_task in done:
+                from websockets.exceptions import ConnectionClosed
+                raise ConnectionClosed(1000, "closed by test")
+            return get_task.result()
+        finally:
+            for task in (get_task, close_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(get_task, close_task, return_exceptions=True)
 
     async def close(self) -> None:
         self.closed = True
-        self._queue.put_nowait(None)
+        self._closed_event.set()
 
     async def __aexit__(self, *args):
         await self.close()
@@ -694,6 +727,8 @@ class _FakeTransport:
         self._credential.account_address = ""
         self._symbol_metadata: dict = {}
         self._diagnostics: list[dict] = []
+        self._private_ws_symbol_map: dict[str, str] = {}
+        self._private_ws_pending_symbol_updates: set[str] = set()
 
     def record_private_ws_success(self, now_ms: int) -> None:
         self._success_count += 1
@@ -718,6 +753,12 @@ class _FakeTransport:
         return self._private_ws_state
 
     def start_private_ws(self, symbols):
+        self._private_ws_symbol_map = {
+            self._venue_symbol(symbol): symbol
+            for symbol in symbols
+            if symbol
+        }
+        self._private_ws_pending_symbol_updates.clear()
         venue = self._spec.venue_id
         if venue == Venue.BINANCE:
             from lightfee.venues.binance_private_ws import start_binance_private_ws
@@ -888,6 +929,44 @@ class TestBinanceWorkerLifecycle:
             # push_worker replaces existing workers; count should stay 1
             assert transport.private_ws_state.worker_count() == 1
 
+    @pytest.mark.asyncio
+    async def test_symbol_update_reaches_running_binance_worker(self):
+        """Binance listenKey streams are account-scoped; dynamic symbols update the live parser map."""
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport(venue=Venue.BINANCE)
+        ws = _QueuedFakeWebSocket()
+
+        with patch(
+            "lightfee.venues.binance_private_ws.websockets.connect",
+            side_effect=_fake_connect(ws),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: transport._success_count >= 1)
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            ws.feed(json.dumps({
+                "e": "executionReport",
+                "s": "BTCUSDT",
+                "i": "binance-dynamic-1",
+                "c": "binance-dynamic-client-1",
+                "X": "FILLED",
+                "z": "0.02",
+                "ap": "65000.00",
+                "T": 1700000000100,
+            }))
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id("binance-dynamic-1")
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("binance-dynamic-1")
+        assert update is not None
+        assert update.symbol == "BTCUSDT"
+        assert update.filled_quantity == pytest.approx(0.02)
+
 
 class TestOkxWorkerLifecycle:
     """OKX private WS worker lifecycle with fake websocket."""
@@ -963,6 +1042,320 @@ class TestOkxWorkerLifecycle:
             await _sleep_short()
 
         assert transport._failure_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_initial_okx_subscription_requires_both_channel_acks_before_parsing(self):
+        """Initial OKX subscription uses the same both-channel ACK gate."""
+        from lightfee.venues.okx_private_ws import start_okx_private_ws
+
+        transport = _FakeTransport()
+        transport._spec.venue_id = Venue.OKX
+        transport._spec.rest_url = "https://www.okx.com"
+        transport._spec.private_base_url = "https://www.okx.com"
+        transport._venue_symbol = lambda symbol: symbol.replace("USDT", "-USDT-SWAP")
+        transport._symbol_metadata = {"ETHUSDT": {"ct_val": 0.1}}
+
+        async def _fake_okx_request(method, path, **kwargs):
+            if "time" in path:
+                return {"data": [{"ts": "1700000000000"}]}
+            return {}
+        transport._request = _fake_okx_request
+
+        ws = _QueuedFakeWebSocket()
+        with patch(
+            "lightfee.venues.okx_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            start_okx_private_ws(transport, ["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "login"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"event": "login", "code": "0"}))
+            await _wait_until(
+                lambda: set(_okx_subscribe_request_ids(ws.sent, "ETH-USDT-SWAP"))
+                == {"orders", "positions"}
+            )
+            request_ids = _okx_subscribe_request_ids(ws.sent, "ETH-USDT-SWAP")
+            eth_order_message = json.dumps({
+                "arg": {
+                    "channel": "orders",
+                    "instType": "SWAP",
+                    "instId": "ETH-USDT-SWAP",
+                },
+                "data": [{
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "okx-initial-ack-1",
+                    "clOrdId": "okx-initial-ack-client-1",
+                    "accFillSz": "3",
+                    "avgPx": "3000.00",
+                    "state": "FILLED",
+                    "uTime": "1700000000300",
+                }],
+            })
+
+            ws.feed(json.dumps({
+                "event": "subscribe",
+                "code": "0",
+                "id": request_ids["orders"],
+                "arg": {
+                    "channel": "orders",
+                    "instType": "SWAP",
+                    "instId": "ETH-USDT-SWAP",
+                },
+            }))
+            ws.feed(eth_order_message)
+            await asyncio.sleep(0.05)
+            assert (
+                transport.private_ws_state.order_by_order_id("okx-initial-ack-1")
+                is None
+            )
+
+            ws.feed(json.dumps({
+                "event": "subscribe",
+                "code": "0",
+                "id": request_ids["positions"],
+                "arg": {
+                    "channel": "positions",
+                    "instType": "SWAP",
+                    "instId": "ETH-USDT-SWAP",
+                },
+            }))
+            ws.feed(eth_order_message)
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id(
+                    "okx-initial-ack-1"
+                )
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("okx-initial-ack-1")
+        assert update is not None
+        assert update.filled_quantity == pytest.approx(0.3)
+
+    @pytest.mark.asyncio
+    async def test_symbol_update_subscribes_existing_okx_worker_and_updates_ct_val(self):
+        """OKX runtime additions must subscribe on the live socket and parse with ctVal."""
+        from lightfee.venues.okx_private_ws import start_okx_private_ws
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport()
+        transport._spec.venue_id = Venue.OKX
+        transport._spec.rest_url = "https://www.okx.com"
+        transport._spec.private_base_url = "https://www.okx.com"
+        transport._venue_symbol = lambda symbol: symbol.replace("USDT", "-USDT-SWAP")
+        transport._symbol_metadata = {
+            "ETHUSDT": {"ct_val": 0.1},
+            "BTCUSDT": {"ct_val": 0.01},
+        }
+
+        async def _fake_okx_request(method, path, **kwargs):
+            if "time" in path:
+                return {"data": [{"ts": "1700000000000"}]}
+            return {}
+        transport._request = _fake_okx_request
+
+        ws = _QueuedFakeWebSocket()
+        with patch(
+            "lightfee.venues.okx_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            start_okx_private_ws(transport, ["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "login"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"event": "login", "code": "0"}))
+            await _wait_until(
+                lambda: sum('"op": "subscribe"' in msg for msg in ws.sent) >= 2
+            )
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            ws.feed(json.dumps({"event": "subscribe", "code": "0"}))
+            await _wait_until(
+                lambda: any("BTC-USDT-SWAP" in msg for msg in ws.sent)
+            )
+            request_ids = _okx_subscribe_request_ids(ws.sent, "BTC-USDT-SWAP")
+            assert set(request_ids) == {"orders", "positions"}
+
+            btc_order_message = json.dumps({
+                "arg": {
+                    "channel": "orders",
+                    "instType": "SWAP",
+                    "instId": "BTC-USDT-SWAP",
+                },
+                "data": [{
+                    "instId": "BTC-USDT-SWAP",
+                    "ordId": "okx-dynamic-1",
+                    "clOrdId": "okx-dynamic-client-1",
+                    "accFillSz": "2",
+                    "avgPx": "65000.00",
+                    "state": "FILLED",
+                    "uTime": "1700000000200",
+                }],
+            })
+            ws.feed(json.dumps({
+                "event": "subscribe",
+                "code": "0",
+                "id": request_ids["orders"],
+                "arg": {
+                    "channel": "orders",
+                    "instType": "SWAP",
+                    "instId": "BTC-USDT-SWAP",
+                },
+            }))
+            ws.feed(btc_order_message)
+            await asyncio.sleep(0.05)
+            assert (
+                transport.private_ws_state.order_by_order_id("okx-dynamic-1")
+                is None
+            )
+            assert transport._private_ws_pending_symbol_updates == {
+                "BTC-USDT-SWAP"
+            }
+
+            ws.feed(json.dumps({
+                "event": "subscribe",
+                "code": "0",
+                "id": request_ids["positions"],
+                "arg": {
+                    "channel": "positions",
+                    "instType": "SWAP",
+                    "instId": "BTC-USDT-SWAP",
+                },
+            }))
+            ws.feed(btc_order_message)
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id("okx-dynamic-1")
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("okx-dynamic-1")
+        assert update is not None
+        assert update.filled_quantity == pytest.approx(0.02)
+        assert "BTC-USDT-SWAP" not in transport._private_ws_pending_symbol_updates
+
+    @pytest.mark.asyncio
+    async def test_symbol_update_missing_okx_ct_val_is_retained_for_retry(self):
+        """OKX additions without trusted ctVal must fail closed and remain pending."""
+        from lightfee.venues.okx_private_ws import start_okx_private_ws
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport()
+        transport._spec.venue_id = Venue.OKX
+        transport._spec.rest_url = "https://www.okx.com"
+        transport._spec.private_base_url = "https://www.okx.com"
+        transport._venue_symbol = lambda symbol: symbol.replace("USDT", "-USDT-SWAP")
+        transport._symbol_metadata = {"ETHUSDT": {"ct_val": 0.1}}
+
+        async def _fake_okx_request(method, path, **kwargs):
+            if "time" in path:
+                return {"data": [{"ts": "1700000000000"}]}
+            return {}
+        transport._request = _fake_okx_request
+
+        ws = _QueuedFakeWebSocket()
+        with patch(
+            "lightfee.venues.okx_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            start_okx_private_ws(transport, ["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "login"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"event": "login", "code": "0"}))
+            await _wait_until(
+                lambda: sum('"op": "subscribe"' in msg for msg in ws.sent) >= 2
+            )
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            sent_before_update = len(ws.sent)
+            ws.feed(json.dumps({"event": "subscribe", "code": "0"}))
+            await _wait_until(lambda: transport._failure_count >= 1)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert transport._last_error.startswith(
+            "okx private ws ctVal metadata missing for symbol update"
+        )
+        assert transport._private_ws_pending_symbol_updates == {"BTC-USDT-SWAP"}
+        assert not any("BTC-USDT-SWAP" in msg for msg in ws.sent[sent_before_update:])
+
+    @pytest.mark.asyncio
+    async def test_symbol_update_okx_subscribe_error_retains_pending_and_retries(self):
+        """OKX subscribe rejection must not activate or clear the dynamic addition."""
+        from lightfee.venues.okx_private_ws import start_okx_private_ws
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport()
+        transport._spec.venue_id = Venue.OKX
+        transport._spec.rest_url = "https://www.okx.com"
+        transport._spec.private_base_url = "https://www.okx.com"
+        transport._venue_symbol = lambda symbol: symbol.replace("USDT", "-USDT-SWAP")
+        transport._symbol_metadata = {
+            "ETHUSDT": {"ct_val": 0.1},
+            "BTCUSDT": {"ct_val": 0.01},
+        }
+
+        async def _fake_okx_request(method, path, **kwargs):
+            if "time" in path:
+                return {"data": [{"ts": "1700000000000"}]}
+            return {}
+        transport._request = _fake_okx_request
+
+        ws = _QueuedFakeWebSocket()
+        with (
+            patch(
+                "lightfee.venues.okx_private_ws.websockets.connect",
+                side_effect=_fake_connect_awaitable(ws),
+            ),
+            patch(
+                "lightfee.venues.okx_private_ws.OKX_PRIVATE_WS_SUBSCRIBE_RETRY_INITIAL_MS",
+                1,
+            ),
+        ):
+            start_okx_private_ws(transport, ["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "login"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"event": "login", "code": "0"}))
+            await _wait_until(
+                lambda: sum('"op": "subscribe"' in msg for msg in ws.sent) >= 2
+            )
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            ws.feed(json.dumps({"msg": "pong"}))
+            await _wait_until(
+                lambda: set(_okx_subscribe_request_ids(ws.sent, "BTC-USDT-SWAP"))
+                == {"orders", "positions"}
+            )
+            request_ids = _okx_subscribe_request_ids(ws.sent, "BTC-USDT-SWAP")
+            order_request_id = request_ids["orders"]
+            order_send_count = lambda: sum(
+                order_request_id in msg and '"op": "subscribe"' in msg
+                for msg in ws.sent
+            )
+            assert order_send_count() == 1
+
+            ws.feed(json.dumps({
+                "event": "error",
+                "id": order_request_id,
+                "code": "60012",
+                "msg": "subscribe rejected",
+                "arg": {
+                    "channel": "orders",
+                    "instType": "SWAP",
+                    "instId": "BTC-USDT-SWAP",
+                },
+            }))
+            await _wait_until(lambda: transport._failure_count >= 1)
+            await asyncio.sleep(0.02)
+            ws.feed(json.dumps({"msg": "pong"}))
+            await _wait_until(lambda: order_send_count() >= 2)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert transport._last_error.startswith("okx private ws subscribe rejected")
+        assert transport._private_ws_pending_symbol_updates == {"BTC-USDT-SWAP"}
+        assert "BTC-USDT-SWAP" not in getattr(
+            transport,
+            "_okx_private_ws_active_symbol_map",
+            {},
+        )
 
 
 class TestPrivateWsResolver:
@@ -1413,6 +1806,50 @@ class TestBybitWorkerLifecycle:
         assert transport._success_count >= 2
 
     @pytest.mark.asyncio
+    async def test_symbol_update_reaches_running_bybit_worker(self):
+        """Bybit account-level private topics must parse newly tracked symbols live."""
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport(venue=Venue.BYBIT)
+        transport._spec.rest_url = "https://api.bybit.com"
+        ws = _QueuedFakeWebSocket()
+
+        with patch(
+            "lightfee.venues.bybit_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "auth"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"op": "auth", "success": True}))
+            await _wait_until(
+                lambda: any('"op": "subscribe"' in msg for msg in ws.sent)
+            )
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            ws.feed(json.dumps({
+                "topic": "execution",
+                "data": [{
+                    "symbol": "BTCUSDT",
+                    "orderId": "bybit-dynamic-1",
+                    "orderLinkId": "bybit-dynamic-client-1",
+                    "execQty": "0.02",
+                    "execPrice": "65000.00",
+                    "execTime": "1700000000100",
+                }],
+            }))
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id("bybit-dynamic-1")
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("bybit-dynamic-1")
+        assert update is not None
+        assert update.filled_quantity == pytest.approx(0.02)
+        assert transport._private_ws_pending_symbol_updates == set()
+
+    @pytest.mark.asyncio
     async def test_failure_on_connect_error(self):
         """connect failure → record_private_ws_failure."""
         transport = _FakeTransport(venue=Venue.BYBIT)
@@ -1496,6 +1933,63 @@ class TestBitgetWorkerLifecycle:
         assert transport._success_count >= 2
 
     @pytest.mark.asyncio
+    async def test_symbol_update_reaches_running_bitget_worker_with_default_scope(self):
+        """Bitget private orders/positions use instId=default and dynamic symbols update the live parser map."""
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport(venue=Venue.BITGET)
+        transport._spec.rest_url = "https://api.bitget.com"
+        ws = _QueuedFakeWebSocket()
+
+        with patch(
+            "lightfee.venues.bitget_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: any('"op": "login"' in msg for msg in ws.sent))
+            ws.feed(json.dumps({"event": "login", "code": "0"}))
+            await _wait_until(
+                lambda: any('"op": "subscribe"' in msg for msg in ws.sent)
+            )
+            subscribe_msg = next(
+                json.loads(msg)
+                for msg in ws.sent
+                if isinstance(msg, str) and '"op": "subscribe"' in msg
+            )
+            assert subscribe_msg["args"] == [
+                {"instType": "USDT-FUTURES", "channel": "positions", "instId": "default"},
+                {"instType": "USDT-FUTURES", "channel": "orders", "instId": "default"},
+            ]
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            ws.feed(json.dumps({
+                "arg": {
+                    "channel": "orders",
+                    "instType": "USDT-FUTURES",
+                    "instId": "default",
+                },
+                "data": [{
+                    "instId": "BTCUSDT",
+                    "orderId": "bitget-dynamic-1",
+                    "clientOid": "bitget-dynamic-client-1",
+                    "accBaseVolume": "0.05",
+                    "priceAvg": "65000.00",
+                    "uTime": "1700000000500",
+                }],
+            }))
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id("bitget-dynamic-1")
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("bitget-dynamic-1")
+        assert update is not None
+        assert update.symbol == "BTCUSDT"
+        assert update.filled_quantity == pytest.approx(0.05)
+
+    @pytest.mark.asyncio
     async def test_failure_on_connect_error(self):
         """connect failure → record_private_ws_failure."""
         transport = _FakeTransport(venue=Venue.BITGET)
@@ -1543,30 +2037,45 @@ class TestGateWorkerLifecycle:
 
     @pytest.mark.asyncio
     async def test_signed_subscribe_and_message_success(self):
-        """signed subscribe → message → success_count increases."""
+        """V1 contract-list subscribe requires both Gate channel ACKs before data."""
         transport = _FakeTransport(venue=Venue.GATE)
         transport._spec.rest_url = "https://api.gateio.ws/api/v4"
+        ws = _FakeWebSocket(
+            messages=[
+                json.dumps({
+                    "channel": "futures.orders",
+                    "event": "subscribe",
+                    "error": None,
+                    "result": {"status": "success"},
+                }),
+                json.dumps({
+                    "channel": "futures.positions",
+                    "event": "subscribe",
+                    "error": None,
+                    "result": {"status": "success"},
+                }),
+                json.dumps({
+                    "channel": "futures.orders",
+                    "event": "update",
+                    "result": [{
+                        "contract": "ETH_USDT",
+                        "id": "gate-lifecycle-1",
+                        "text": "gate-lifecycle-client-1",
+                        "fill_total": "0.02",
+                        "fill_price": "2140.0",
+                        "finish_as": "PARTIAL",
+                        "finish_time_ms": 1700000000000,
+                    }],
+                }),
+            ],
+            close_after=3,
+        )
 
-        with patch(
-            "lightfee.venues.gate_private_ws.websockets.connect",
-            side_effect=_fake_connect_awaitable(_FakeWebSocket(
-                messages=[
-                    json.dumps({
-                        "channel": "futures.orders",
-                        "event": "update",
-                        "result": [{
-                            "contract": "ETH_USDT",
-                            "id": "gate-lifecycle-1",
-                            "text": "gate-lifecycle-client-1",
-                            "fill_total": "0.02",
-                            "fill_price": "2140.0",
-                            "finish_as": "PARTIAL",
-                            "finish_time_ms": 1700000000000,
-                        }],
-                    }),
-                ],
-                close_after=1,
-            )),
+        with (
+            patch(
+                "lightfee.venues.gate_private_ws.websockets.connect",
+                side_effect=_fake_connect_awaitable(ws),
+            ),
         ):
             transport.start_private_ws(["ETHUSDT"])
             await _sleep_short()
@@ -1574,7 +2083,13 @@ class TestGateWorkerLifecycle:
             transport.stop_private_ws()
             await _sleep_short()
 
-        # connect success + message success (at least 2)
+        subscribe_payloads = [
+            json.loads(message)["payload"]
+            for message in ws.sent
+            if isinstance(message, str) and "futures." in message
+        ]
+        assert subscribe_payloads == [["ETHUSDT"], ["ETHUSDT"]]
+        # Initial dual ACK + message success.
         assert transport._success_count >= 2
 
     @pytest.mark.asyncio
@@ -1628,6 +2143,18 @@ class TestGateWorkerLifecycle:
             side_effect=_fake_connect_awaitable(_FakeWebSocket(
                 messages=[
                     json.dumps({
+                        "channel": "futures.orders",
+                        "event": "subscribe",
+                        "error": None,
+                        "result": {"status": "success"},
+                    }),
+                    json.dumps({
+                        "channel": "futures.positions",
+                        "event": "subscribe",
+                        "error": None,
+                        "result": {"status": "success"},
+                    }),
+                    json.dumps({
                         "channel": "futures.positions",
                         "event": "update",
                         "result": [{
@@ -1637,7 +2164,7 @@ class TestGateWorkerLifecycle:
                         }],
                     }),
                 ],
-                close_after=1,
+                close_after=3,
             )),
         ):
             transport.start_private_ws(["ETHUSDT"])
@@ -1649,6 +2176,245 @@ class TestGateWorkerLifecycle:
         pos = transport.private_ws_state.position("ETHUSDT")
         assert pos is not None, f"position cache should have ETHUSDT after futures.positions push"
         assert pos.size == 3.0
+
+    @pytest.mark.asyncio
+    async def test_symbol_update_subscribes_one_contract_and_waits_for_dual_ack(self):
+        """Dynamic Gate contracts remain inactive until orders + positions ACK."""
+        from lightfee.venues.transport import VenueTransport
+
+        transport = _FakeTransport(venue=Venue.GATE)
+        transport._spec.rest_url = "https://api.gateio.ws/api/v4"
+        transport._symbol_metadata = {
+            "ETHUSDT": {"quanto_multiplier": "1"},
+            "BTCUSDT": {"quanto_multiplier": "0.01"},
+        }
+        ws = _QueuedFakeWebSocket()
+
+        with patch(
+            "lightfee.venues.gate_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: len(ws.sent) >= 2)
+            initial_subscriptions = [
+                json.loads(message)
+                for message in ws.sent
+                if isinstance(message, str) and "futures." in message
+            ]
+            assert [message["payload"] for message in initial_subscriptions] == [
+                ["ETHUSDT"],
+                ["ETHUSDT"],
+            ]
+            for message in initial_subscriptions:
+                ws.feed(json.dumps({
+                    "id": message["id"],
+                    "channel": message["channel"],
+                    "event": "subscribe",
+                    "error": None,
+                    "result": {"status": "success"},
+                }))
+            await _wait_until(lambda: transport._success_count >= 1)
+
+            VenueTransport.update_private_ws_symbols(transport, ["BTCUSDT"])
+            await _wait_until(lambda: len(ws.sent) >= 4)
+            dynamic_subscriptions = [
+                json.loads(message)
+                for message in ws.sent[2:]
+                if isinstance(message, str) and "futures." in message
+            ]
+            assert [message["payload"] for message in dynamic_subscriptions] == [
+                ["BTCUSDT"],
+                ["BTCUSDT"],
+            ]
+
+            # A pre-ACK push must be ignored, even though the shared parser map
+            # has already learned BTCUSDT from update_private_ws_symbols().
+            ws.feed(json.dumps({
+                "channel": "futures.orders",
+                "event": "update",
+                "result": [{
+                    "contract": "BTCUSDT",
+                    "id": "gate-dynamic-1",
+                    "text": "gate-dynamic-client-1",
+                    "fill_total": "3",
+                    "fill_price": "65000.0",
+                    "finish_as": "FILLED",
+                    "finish_time_ms": 1700000000600,
+                }],
+            }))
+            await _sleep_short()
+            assert transport.private_ws_state.order_by_order_id("gate-dynamic-1") is None
+
+            for message in dynamic_subscriptions:
+                ws.feed(json.dumps({
+                    "id": message["id"],
+                    "channel": message["channel"],
+                    "event": "subscribe",
+                    "error": None,
+                    "result": {"status": "success"},
+                }))
+            await _wait_until(
+                lambda: "BTCUSDT" in getattr(
+                    transport,
+                    "_gate_private_ws_active_symbol_map",
+                    {},
+                )
+            )
+            ws.feed(json.dumps({
+                "channel": "futures.orders",
+                "event": "update",
+                "result": [{
+                    "contract": "BTCUSDT",
+                    "id": "gate-dynamic-2",
+                    "text": "gate-dynamic-client-2",
+                    "fill_total": "3",
+                    "fill_price": "65000.0",
+                    "finish_as": "FILLED",
+                    "finish_time_ms": 1700000000700,
+                }],
+            }))
+            await _wait_until(
+                lambda: transport.private_ws_state.order_by_order_id("gate-dynamic-2")
+                is not None
+            )
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        update = transport.private_ws_state.order_by_order_id("gate-dynamic-2")
+        assert update is not None
+        assert update.symbol == "BTCUSDT"
+        assert update.filled_quantity == pytest.approx(0.03)
+        assert not getattr(transport, "_private_ws_pending_symbol_updates", {})
+
+    @pytest.mark.asyncio
+    async def test_subscribe_error_never_activates_initial_contract(self):
+        """A Gate subscribe error is a health failure, not a successful connection."""
+        transport = _FakeTransport(venue=Venue.GATE)
+        transport._spec.rest_url = "https://api.gateio.ws/api/v4"
+        ws = _FakeWebSocket(
+            messages=[
+                json.dumps({
+                    "channel": "futures.orders",
+                    "event": "subscribe",
+                    "error": None,
+                    "result": {"status": "success"},
+                }),
+                json.dumps({
+                    "channel": "futures.positions",
+                    "event": "subscribe",
+                    "error": {"label": "INVALID_ARGUMENT", "message": "bad contract"},
+                    "result": None,
+                }),
+            ],
+            close_after=2,
+        )
+
+        with patch(
+            "lightfee.venues.gate_private_ws.websockets.connect",
+            side_effect=_fake_connect_awaitable(ws),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _sleep_short()
+            await asyncio.sleep(0.15)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert transport._failure_count >= 1
+        assert "subscribe rejected" in transport._last_error
+        assert not getattr(transport, "_gate_private_ws_active_symbol_map", {})
+
+    def test_dynamic_subscribe_error_keeps_contract_pending_for_reconnect(self):
+        """A dynamic ACK rejection preserves the contract for reconnect retry."""
+        from lightfee.venues.gate_private_ws import _apply_gate_private_subscription_event
+
+        transport = _FakeTransport(venue=Venue.GATE)
+        pending_subscriptions = {
+            "3": {
+                "channel": "futures.orders",
+                "contracts": ("BTCUSDT",),
+                "sent_at_ms": _now_ms(),
+            },
+        }
+        active_symbol_map: dict[str, str] = {}
+
+        rejection = _apply_gate_private_subscription_event(
+            transport,
+            {
+                "id": 3,
+                "channel": "futures.orders",
+                "event": "subscribe",
+                "error": {"label": "INVALID_ARGUMENT"},
+                "result": None,
+            },
+            pending_subscriptions,
+            {"BTCUSDT": "BTCUSDT"},
+            active_symbol_map,
+            {},
+        )
+
+        assert rejection is not None
+        assert "subscribe rejected" in rejection
+        assert pending_subscriptions["3"]["contracts"] == ("BTCUSDT",)
+        assert "BTCUSDT" not in active_symbol_map
+
+    def test_subscribe_ack_requires_explicit_success_status(self):
+        """A subscribe-shaped payload without Gate's success result is not an ACK."""
+        from lightfee.venues.gate_private_ws import _apply_gate_private_subscription_event
+
+        transport = _FakeTransport(venue=Venue.GATE)
+        pending_subscriptions = {
+            "1": {
+                "channel": "futures.orders",
+                "contracts": ("ETHUSDT",),
+                "sent_at_ms": _now_ms(),
+            },
+        }
+        active_symbol_map: dict[str, str] = {}
+
+        rejection = _apply_gate_private_subscription_event(
+            transport,
+            {
+                "id": 1,
+                "channel": "futures.orders",
+                "event": "subscribe",
+                "error": None,
+                "result": {},
+            },
+            pending_subscriptions,
+            {"ETHUSDT": "ETHUSDT"},
+            active_symbol_map,
+            {},
+        )
+
+        assert rejection is not None
+        assert "subscribe rejected" in rejection
+        assert "1" in pending_subscriptions
+        assert not active_symbol_map
+
+    @pytest.mark.asyncio
+    async def test_missing_subscribe_ack_is_a_connection_failure(self):
+        """An initial Gate subscription cannot become healthy by merely opening the socket."""
+        transport = _FakeTransport(venue=Venue.GATE)
+        transport._spec.rest_url = "https://api.gateio.ws/api/v4"
+        ws = _QueuedFakeWebSocket()
+
+        with (
+            patch(
+                "lightfee.venues.gate_private_ws.websockets.connect",
+                side_effect=_fake_connect_awaitable(ws),
+            ),
+            patch(
+                "lightfee.venues.gate_private_ws.GATE_PRIVATE_SUBSCRIBE_ACK_TIMEOUT_SECS",
+                0,
+            ),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: transport._failure_count >= 1)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert "subscribe ACK timeout" in transport._last_error
+        assert transport._success_count == 0
 
 
 # ============================================================================

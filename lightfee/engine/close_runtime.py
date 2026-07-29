@@ -1614,7 +1614,10 @@ class CloseRuntime:
             return False
         contract = classify_close_reconciliation_state(
             reconciliation,
-            current_exchange_truth_clean=True,
+            current_exchange_truth_clean=close_reconciliation_exchange_truth_clean(
+                reconciliation,
+                current_exchange_truth=exchange_truth,
+            ),
         )
         if contract.get("archive_reconciliation") is not True:
             return False
@@ -1750,13 +1753,18 @@ class CloseRuntime:
             getattr(self.ctx, "_last_recovery_exchange_truth", None),
             self._close_reconciliation_exchange_truth,
         ):
-            current_truth = raw_truth if isinstance(raw_truth, dict) else None
+            if raw_truth is None:
+                continue
+            if not isinstance(raw_truth, dict):
+                return None
+            current_truth = raw_truth
             exchange_truth = close_reconciliation_exchange_truth(
                 reconciliation,
                 current_exchange_truth=current_truth,
             )
             if exchange_truth is not None:
                 return exchange_truth
+            return None
         return close_reconciliation_exchange_truth(reconciliation)
 
     async def _refresh_close_reconciliation_account_truth(
@@ -2386,7 +2394,12 @@ class CloseRuntime:
                     truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
                     contract = classify_close_reconciliation_state(
                         payload,
-                        current_exchange_truth_clean=exchange_truth is not None,
+                        current_exchange_truth_clean=(
+                            close_reconciliation_exchange_truth_clean(
+                                reconciliation,
+                                current_exchange_truth=exchange_truth,
+                            )
+                        ),
                     )
                     self._annotate_terminal_flat_accounting_gap_payload(
                         payload,
@@ -2668,7 +2681,12 @@ class CloseRuntime:
                     truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
                     contract = classify_close_reconciliation_state(
                         payload,
-                        current_exchange_truth_clean=True,
+                        current_exchange_truth_clean=(
+                            close_reconciliation_exchange_truth_clean(
+                                payload,
+                                current_exchange_truth=exchange_truth,
+                            )
+                        ),
                     )
                     self._annotate_terminal_flat_accounting_gap_payload(
                         payload,
