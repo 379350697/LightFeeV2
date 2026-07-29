@@ -9871,6 +9871,8 @@ def _build_spread_sidecar_summary(
         "sidecar_snapshot_unavailable",
         "sidecar_snapshot_quotes_stale",
         "sidecar_snapshot_degraded",
+        # Historical snapshots written before the three-process topology was
+        # restored must remain diagnosable; no current producer emits these.
         "spread_bbo_snapshot_unavailable",
         "spread_bbo_snapshot_stale",
         "spread_bbo_snapshot_universe_unavailable",

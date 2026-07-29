@@ -8,7 +8,6 @@ import json
 import pytest
 
 from lightfee.config.schema import AppConfig, StrategyConfig, VenueConfig
-from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.pairing import (
     FundingCandidateService,
     _funding_contract_block_reasons,
@@ -319,6 +318,61 @@ def test_duplicate_venue_aliases_share_one_operational_fetch() -> None:
     assert list(_canonical_venue_configs(service.config.venues)) == ["binance"]
     assert source.calls == 1
     assert [venue for venue, *_ in results] == ["binance"]
+
+
+def test_slow_refresh_reuses_cached_venue_without_delaying_fresh_venues() -> None:
+    class FastSource:
+        async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            return {
+                "fast:BTCUSDT": QuoteSnapshot(
+                    venue="fast",
+                    symbol="BTCUSDT",
+                    bid=100.0,
+                    ask=101.0,
+                    observed_at_ms=2_000,
+                    funding_rate_bps=1.0,
+                    funding_timestamp_ms=3_000,
+                    funding_interval_ms=28_800_000,
+                )
+            }
+
+    class SlowSource:
+        async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
+            await asyncio.Event().wait()
+            return {}
+
+    cached = QuoteSnapshot(
+        venue="slow",
+        symbol="BTCUSDT",
+        bid=99.0,
+        ask=100.0,
+        observed_at_ms=1_000,
+        funding_rate_bps=1.0,
+        funding_timestamp_ms=2_000,
+        funding_interval_ms=28_800_000,
+    )
+    service = object.__new__(SidecarService)
+    service.config = AppConfig(
+        venues=[VenueConfig(venue="fast"), VenueConfig(venue="slow")]
+    )
+    service._exchange_sources = {"fast": FastSource(), "slow": SlowSource()}
+    service._entry_venue_fetch_tasks = {}
+    service._entry_venue_latest_results = {
+        "slow": ("slow", {"slow:BTCUSDT": cached}, None, set())
+    }
+    service._entry_venue_late_tasks = set()
+    service.entry_venue_republish_event = asyncio.Event()
+
+    results = asyncio.run(
+        asyncio.wait_for(
+            service._fetch_all_venues(["BTCUSDT"], timeout_s=0.05),
+            timeout=0.2,
+        )
+    )
+
+    by_venue = {venue: (quotes, error) for venue, quotes, error, _ in results}
+    assert by_venue["fast"][0]["fast:BTCUSDT"].observed_at_ms == 2_000
+    assert by_venue["slow"] == ({"slow:BTCUSDT": cached}, None)
 
 
 def test_partial_refresh_updates_last_good_cache_per_key() -> None:

@@ -29,15 +29,10 @@ def test_build_manifest_excludes_deploy_manifest_self_hash(tmp_path, monkeypatch
 
 
 def test_spread_sidecar_template_is_deploy_critical():
-    assert "lightfee/apps/spread_bbo.py" in manifest.CRITICAL_FILES
-    assert "lightfee/sidecar/spread_bbo.py" in manifest.CRITICAL_FILES
-    assert "lightfee/sidecar/spread_bbo_service.py" in manifest.CRITICAL_FILES
-    assert "lightfee/spread/metadata_cache.py" in manifest.CRITICAL_FILES
-    assert "lightfee/spread/quote_snapshot.py" in manifest.CRITICAL_FILES
     assert "lightfee/venues/market_data.py" in manifest.CRITICAL_FILES
     assert "deploy/systemd/lightfee-spread-sidecar.service" in manifest.CRITICAL_FILES
-    assert "deploy/systemd/lightfee-spread-bbo.service" in manifest.CRITICAL_FILES
     assert "deploy/systemd/lightfee-sidecar.service" in manifest.CRITICAL_FILES
+    assert "lightfee-spread-bbo.service" in manifest.RETIRED_SYSTEMD_UNITS
 
 
 def test_local_manifest_generation_fails_when_a_critical_file_is_untracked(
@@ -200,14 +195,14 @@ def test_generate_deploy_script_resolves_local_from_script_dir_for_remote_execut
     assert 'echo "=== Remote-local deploy mode: skipping rsync/scp ==="' in script
     assert (
         "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer "
-        "&& systemctl enable lightfee-sidecar.service lightfee-spread-bbo.service lightfee-spread-sidecar.service lightfee-live.service "
+        "&& systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service "
         "&& systemctl restart lightfee-sidecar.service "
-        "&& systemctl restart lightfee-spread-bbo.service "
         "&& systemctl restart lightfee-spread-sidecar.service "
         "&& systemctl restart lightfee-live.service"
     ) in script
-    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-bbo.service"' in script
-    assert "systemctl restart lightfee-spread-bbo.service" in script
+    assert 'install -m 0644 "$REMOTE_PATH/deploy/systemd/lightfee-spread-bbo.service"' not in script
+    assert "systemctl restart lightfee-spread-bbo.service" not in script
+    assert "lightfee-spread-bbo.service" in manifest.RETIRED_SYSTEMD_UNITS
     assert "systemctl enable --now lightfee-fee-evidence-refresh.timer" not in script
     assert "sleep 12" in script
 

@@ -33,20 +33,20 @@ contract is unified at the sidecar snapshot level: slow enrichment may degrade
 metadata, but it must not remove an otherwise usable venue quote or make the
 whole snapshot stale.
 
-The main sidecar is the default public quote/OI truth publisher. Spread-sidecar
-must consume `SidecarSnapshot.quotes` from `runtime.sidecar_snapshot_path` by
-default instead of independently pulling Binance/Aster-compatible quote or OI
-HTTP. If the main snapshot is missing, malformed, or stale, spread-sidecar
-publishes a degraded empty spread snapshot. Direct public fetch is an explicit
-emergency fallback only, and must record `source_mode=direct_market_fallback`.
+The main sidecar is the sole public discovery quote/OI truth publisher.
+Spread-sidecar must consume `SidecarSnapshot.quotes` from
+`runtime.sidecar_snapshot_path`; it has no independent public quote/OI HTTP
+fallback or BBO process. If the main snapshot is missing, malformed, or stale,
+spread-sidecar publishes a degraded empty spread snapshot. The live order path
+still reacquires selected-leg executable evidence immediately before dispatch.
 
 Sidecar public IO must also be resource-bounded. Sidecar-owned public
 `httpx.AsyncClient` instances need both a keepalive cap and a total connection
 cap, while credentialed `VenueTransport` order/position/account IO must not
-inherit that sidecar FD cap by default. The same cap applies to spread-sidecar
-direct-market fallback and paper quote repair sources, because they use the same
-public exchange source family. Liquidity lifecycle should reuse same-cycle quote
-snapshots when funding/market refresh already succeeded rather than re-entering
+inherit that sidecar FD cap by default. The spread sidecar has no direct-market
+fallback: it consumes only the funding sidecar snapshot. Any future, separately
+introduced public-data owner must apply the same cap. Liquidity lifecycle should
+reuse same-cycle quote snapshots when funding/market refresh already succeeded rather than re-entering
 the same public funding path. Sidecar and spread-sidecar app exit paths,
 including `--once` SIGTERM during an in-flight refresh, must close the service,
 and source cleanup must be best-effort across all exchange/liquidity/transfer
@@ -240,6 +240,7 @@ final BBO requirement.  CL-163 is local verified; deployment pending.
 | 2026-07-08 | Sidecar FD exhaustion and live restart cascade | local green, deploy pending | CL-156 caps sidecar and spread-sidecar direct public HTTP total connections without constraining credentialed `VenueTransport`, reuses same-cycle quote snapshots for liquidity lifecycle, closes sidecar/spread-sidecar services on SIGTERM/every app exit path including in-flight refresh cancellation, makes source close best-effort, requires `LimitNOFILE=65536`, verifies sidecar/spread-sidecar/live units, and removes live's hard `Requires=lightfee-sidecar.service` dependency. This is operational IO lifecycle hardening; it does not change quote TTL, OI/liquidity floors, entry admission, close truth, or owner recovery semantics. |
 | 2026-07-25 | Post-deploy snapshot/OI/quote deadline recurrence and Hyperliquid `429` | local verified; deploy pending | CL-159 now records per-venue collection-to-publication timing and rolling latency quantiles while retaining candidate-leg final revalidation. Hyperliquid `POST /info` callers share config-rooted pacing, public-metadata cache, and 429 exponential cooldown; strict read-only is unchanged. No TTL, OI, liquidity, or quote threshold changed. See [daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates](../daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates). |
 | 2026-07-26 | Durable targeted entry OI evidence and prewarm bounds | local green; deploy pending | CL-160 adds a proof-valid SQLite last-good store for targeted entry OI, foreground hot-proof -> exact durable <=30m -> exchange lookup order, a 256-entry LRU hot cache, low-priority cancellable 15 minute prewarm that force-refreshes the full required frontier, same-venue prewarm serialization, and strict observed-time durable replacement. No OI floor, TTL, liquidity, ranking, sizing, order, close, recovery, or deployment behavior changed. See [daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds](../daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds). |
+| 2026-07-29 | Spread BBO topology reversion | local verified; deployment pending | CL-164 restores the three-process topology: funding sidecar is the only public discovery owner; spread-sidecar reads its snapshot; the dedicated BBO app/unit/compact cache are removed. Whole-snapshot liveness remains separate from strict individual quote TTL, and singleton/deployment reject a residual fourth BBO process. |
 
 ## Regression Harness
 

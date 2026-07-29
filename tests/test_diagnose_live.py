@@ -409,7 +409,7 @@ def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_spread_sidecar_summary_keeps_direct_bbo_staleness_degraded() -> None:
+def test_spread_sidecar_summary_keeps_historical_bbo_staleness_degraded() -> None:
     from lightfee.sidecar.publisher import publish_snapshot
     from lightfee.sidecar.snapshot import SidecarSnapshot
     from lightfee.spread.models import SpreadSnapshot

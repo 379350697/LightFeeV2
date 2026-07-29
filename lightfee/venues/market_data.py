@@ -17,7 +17,7 @@ import random
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import httpx
 
@@ -35,9 +35,6 @@ from lightfee.venues.hyperliquid_info_coordinator import (
     should_coordinate_hyperliquid_info_request,
 )
 from lightfee.venues.specs import VenueSpec
-
-if TYPE_CHECKING:
-    from lightfee.marketdata.ws_bbo import TopBookQuote
 
 
 # ---------------------------------------------------------------------------
@@ -783,16 +780,6 @@ class MarketDataClient:
     def spec(self) -> VenueSpec:
         return self._spec
 
-    def share_contract_metadata_cache_from(self, other: "MarketDataClient") -> None:
-        """Share public contract evidence, never HTTP transport state."""
-        if self.venue != other.venue:
-            raise ValueError("contract metadata cache venue mismatch")
-        self._gate_contract_metadata_by_key = other._gate_contract_metadata_by_key
-        self._okx_contract_metadata_by_key = other._okx_contract_metadata_by_key
-        self._binance_style_contract_metadata_by_key = (
-            other._binance_style_contract_metadata_by_key
-        )
-
     # ------------------------------------------------------------------
     # HTTP lifecycle
     # ------------------------------------------------------------------
@@ -1190,15 +1177,6 @@ class MarketDataClient:
                 f"network: {method} {path}: {e}",
                 phase_timings=phase,
             )
-
-    async def fetch_top_book_quotes(
-        self,
-        symbols: list[str],
-    ) -> dict[str, "TopBookQuote"]:
-        """Fetch one lightweight venue-wide BBO payload without funding/OI."""
-        from lightfee.marketdata.bulk_bbo import fetch_top_book_quotes
-
-        return await fetch_top_book_quotes(self, symbols)
 
     # ------------------------------------------------------------------
     # Funding ticker fetch — main sidecar entry point

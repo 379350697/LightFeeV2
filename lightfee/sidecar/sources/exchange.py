@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Optional
 
 from lightfee.core.domain import Venue
-from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.venues.market_data import FundingTicker, MarketDataClient
 from lightfee.venues.specs import VenueSpec, get_spec
@@ -48,9 +47,6 @@ class ExchangeSource:
 
     async def close(self) -> None:
         await self._client.close()
-
-    def share_contract_metadata_cache_from(self, other: "ExchangeSource") -> None:
-        self._client.share_contract_metadata_cache_from(other._client)
 
     def prime_funding_schedule(self, quotes: list[QuoteSnapshot]) -> None:
         """Restore observed funding cadence from a prior published snapshot."""
@@ -212,7 +208,3 @@ class ExchangeSource:
     async def fetch_all(self, symbols: list[str]) -> dict[str, QuoteSnapshot]:
         """Fetch full quote snapshots with funding and market data."""
         return await self.fetch_market_quotes(symbols)
-
-    async def fetch_spread_bbo(self, symbols: list[str]) -> dict[str, TopBookQuote]:
-        """Fetch the lightweight BBO-only universe for spread sampling."""
-        return await self._client.fetch_top_book_quotes(symbols)

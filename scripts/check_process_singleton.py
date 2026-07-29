@@ -5,7 +5,8 @@ Cloud incident: 8 Rust opportunity_input_sidecar processes were simultaneously
 writing to runtime/opportunity-input-snapshot.json, causing snapshot corruption.
 
 This script:
-1. Checks that at most 1 sidecar and 1 live process are running
+1. Checks exactly one funding sidecar, spread sidecar, and live process
+2. Fails when the retired spread-BBO process is still running
 2. Can be used as a pre-start check in deployment scripts
 3. Verifies no zombie/stale processes are writing to the snapshot file
 
@@ -38,7 +39,7 @@ SPREAD_SIDECAR_PATTERNS = [
     "spread_sidecar",
 ]
 
-SPREAD_BBO_PATTERNS = [
+RETIRED_SPREAD_BBO_PATTERNS = [
     "lightfee.apps.spread_bbo",
     "lightfee-spread-bbo",
     "lightfee_spread_bbo",
@@ -136,15 +137,14 @@ def check_singleton(
     if count == 0:
         print(f"  {label}: 0 processes (not running)")
         return True
-    elif count == 1:
+    if count <= max_allowed:
         proc = matches[0]
         print(f"  {label}: 1 process (PID={proc['pid']}, cmd={proc['command'][:80]})")
         return True
-    else:
-        print(f"  {label}: {count} processes (VIOLATION — max {max_allowed}):")
-        for proc in matches:
-            print(f"    PID={proc['pid']}  {proc['command'][:100]}")
-        return False
+    print(f"  {label}: {count} processes (VIOLATION — max {max_allowed}):")
+    for proc in matches:
+        print(f"    PID={proc['pid']}  {proc['command'][:100]}")
+    return False
 
 
 def kill_extras(label: str, matches: list[dict], keep_count: int = 1) -> int:
@@ -204,10 +204,11 @@ def main() -> None:
         "spread-sidecar", spread_sidecars, min_required=required_min
     )
 
-    print("\n--- Spread BBO Processes ---")
-    spread_bbos = count_matching(processes, SPREAD_BBO_PATTERNS)
-    spread_bbo_ok = check_singleton(
-        "spread-bbo", spread_bbos, min_required=required_min
+    # The BBO process was retired when sampling returned to the funding
+    # sidecar.  It is an unexpected fourth process, not a second owner.
+    retired_spread_bbos = count_matching(processes, RETIRED_SPREAD_BBO_PATTERNS)
+    retired_spread_bbo_ok = check_singleton(
+        "retired-spread-bbo", retired_spread_bbos, max_allowed=0
     )
 
     # Check live runtime processes
@@ -230,12 +231,12 @@ def main() -> None:
 
     # Summary
     print("\n=== Summary ===")
-    all_ok = sidecar_ok and spread_bbo_ok and spread_sidecar_ok and live_ok
+    all_ok = sidecar_ok and spread_sidecar_ok and retired_spread_bbo_ok and live_ok
     status = "PASS" if all_ok else "FAIL"
     print(f"Status: {status}")
     print(f"  sidecar processes:        {len(sidecars)} (limit: 1)")
-    print(f"  spread-bbo processes:     {len(spread_bbos)} (limit: 1)")
     print(f"  spread-sidecar processes: {len(spread_sidecars)} (limit: 1)")
+    print(f"  retired spread-bbo processes: {len(retired_spread_bbos)} (limit: 0)")
     print(f"  live processes:           {len(lives)} (limit: 1)")
     print(f"  snapshot writers:         {len(writers)}")
 
@@ -246,8 +247,8 @@ def main() -> None:
             kill_extras("sidecar", sidecars)
         if len(spread_sidecars) > 1:
             kill_extras("spread-sidecar", spread_sidecars)
-        if len(spread_bbos) > 1:
-            kill_extras("spread-bbo", spread_bbos)
+        if retired_spread_bbos:
+            kill_extras("retired-spread-bbo", retired_spread_bbos, keep_count=0)
         if len(lives) > 1:
             kill_extras("live", lives)
 
@@ -256,22 +257,25 @@ def main() -> None:
         processes2 = get_process_list()
         sidecars2 = count_matching(processes2, SIDECAR_PATTERNS)
         spread_sidecars2 = count_matching(processes2, SPREAD_SIDECAR_PATTERNS)
-        spread_bbos2 = count_matching(processes2, SPREAD_BBO_PATTERNS)
+        retired_spread_bbos2 = count_matching(
+            processes2, RETIRED_SPREAD_BBO_PATTERNS
+        )
         lives2 = count_matching(processes2, LIVE_PATTERNS)
         required_counts = {1} if args.strict else {0, 1}
         all_ok = all(
             count in required_counts
             for count in (
                 len(sidecars2),
-                len(spread_bbos2),
                 len(spread_sidecars2),
+                len(retired_spread_bbos2),
                 len(lives2),
             )
         )
         print(
             f"\nAfter cleanup: sidecar={len(sidecars2)}, "
-            f"spread-bbo={len(spread_bbos2)}, "
-            f"spread-sidecar={len(spread_sidecars2)}, live={len(lives2)}"
+            f"spread-sidecar={len(spread_sidecars2)}, "
+            f"retired-spread-bbo={len(retired_spread_bbos2)}, "
+            f"live={len(lives2)}"
         )
         print(f"Status: {'PASS' if all_ok else 'FAIL (manual intervention needed)'}")
 

@@ -47,9 +47,6 @@ async def test_run_closes_service_after_shutdown_request():
             self.refresh_count += 1
             captured["stop_event"].set()
 
-        async def run_spread_bbo_data_plane(self, stop_event):
-            await stop_event.wait()
-
         async def close(self):
             self.closed = True
 
@@ -81,8 +78,6 @@ async def test_run_schedules_full_refresh_from_its_start_time():
     captured = {}
 
     class FakeService:
-        embedded_spread_bbo_enabled = False
-
         def __init__(self):
             self.full_refresh_started_at_s = []
             self.closed = False
@@ -126,8 +121,6 @@ async def test_cache_only_republish_does_not_postpone_full_refresh_deadline():
     captured = {}
 
     class FakeService:
-        embedded_spread_bbo_enabled = False
-
         def __init__(self):
             self.entry_venue_republish_event = asyncio.Event()
             self.full_refresh_started_at_s = []
@@ -199,9 +192,6 @@ async def test_run_once_cancels_inflight_refresh_after_shutdown_request():
                 refresh_cancelled.set()
                 raise
 
-        async def run_spread_bbo_data_plane(self, stop_event):
-            await stop_event.wait()
-
         async def close(self):
             self.closed = True
 
@@ -256,9 +246,6 @@ async def test_run_cancels_inflight_refresh_after_shutdown_request():
                 refresh_cancelled.set()
                 raise
 
-        async def run_spread_bbo_data_plane(self, stop_event):
-            await stop_event.wait()
-
         async def close(self):
             self.closed = True
 
@@ -311,9 +298,6 @@ async def test_run_cancels_inflight_refresh_when_runner_is_cancelled():
             except asyncio.CancelledError:
                 refresh_cancelled.set()
                 raise
-
-        async def run_spread_bbo_data_plane(self, stop_event):
-            await stop_event.wait()
 
         async def close(self):
             self.closed = True

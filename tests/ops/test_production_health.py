@@ -719,6 +719,38 @@ def test_spread_snapshot_accepts_fresh_explained_zero_candidates():
     assert report.ok
 
 
+def test_spread_snapshot_rejects_retired_direct_bbo_source() -> None:
+    report = analyze_spread_snapshot(
+        {
+            "schema_version": 4,
+            "decision_at_ms": 1778786998500,
+            "published_at_ms": 1778786999000,
+            "market_observed_at_ms": 1778786998000,
+            "source_mode": "direct_spread_bbo",
+            "degraded_venues": [],
+            "degraded_symbols": {},
+            "input_quote_count": 2,
+            "valid_quote_count": 2,
+            "evaluated_pair_count": 1,
+            "accepted_pair_count": 0,
+            "paper_configured_enabled": False,
+            "paper_admission_enabled": False,
+            "paper_tracked_count": 0,
+            "paper_refresh_status": "disabled",
+            "paper_event_count": 0,
+            "paper_last_success_at_ms": 0,
+            "rejection_counts": {"insufficient_history": 1},
+            "paper_admission_rejection_counts": {},
+            "candidates": [],
+        },
+        now_ms=1778787000000,
+        max_age_ms=10_000,
+    )
+
+    assert not report.ok
+    assert "spread_source_mode_unknown" in report.fingerprints
+
+
 def test_spread_snapshot_rejects_unexplained_zero_paper_admission() -> None:
     report = analyze_spread_snapshot(
         {
@@ -1777,15 +1809,8 @@ def test_verify_production_services_cli_json_success(tmp_path):
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
-    (unit_dir / "lightfee-spread-bbo.service").write_text(
-        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
-        "[Service]\n"
-        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
-        "LimitNOFILE=65536\n"
-    )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
-        "[Unit]\nWants=lightfee-sidecar.service lightfee-spread-bbo.service\nAfter=lightfee-sidecar.service lightfee-spread-bbo.service\n"
+        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -1929,15 +1954,8 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
         "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
         "LimitNOFILE=65536\n"
     )
-    (unit_dir / "lightfee-spread-bbo.service").write_text(
-        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
-        "[Service]\n"
-        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
-        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_bbo --config /opt/lightfee-v2/config/live.toml\n"
-        "LimitNOFILE=65536\n"
-    )
     (unit_dir / "lightfee-spread-sidecar.service").write_text(
-        "[Unit]\nWants=lightfee-sidecar.service lightfee-spread-bbo.service\nAfter=lightfee-sidecar.service lightfee-spread-bbo.service\n"
+        "[Unit]\nWants=lightfee-sidecar.service\nAfter=lightfee-sidecar.service\n"
         "[Service]\n"
         "EnvironmentFile=/etc/lightfee/lightfee.env\n"
         "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.spread_sidecar --config /opt/lightfee-v2/config/live.toml\n"
@@ -2608,14 +2626,12 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
-    spread_bbo = Path("deploy/systemd/lightfee-spread-bbo.service").read_text()
     spread_sidecar = Path("deploy/systemd/lightfee-spread-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
-    assert analyze_systemd_unit("lightfee-spread-bbo.service", spread_bbo).ok
     assert analyze_systemd_unit("lightfee-spread-sidecar.service", spread_sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
-    assert "-m lightfee.apps.spread_bbo" in spread_bbo
+    assert "lightfee-spread-bbo.service" not in spread_sidecar
 
 
 def test_live_is_independent_while_spread_consumes_funding_sidecar_snapshot():

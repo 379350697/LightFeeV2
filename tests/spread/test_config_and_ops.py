@@ -175,13 +175,25 @@ def test_singleton_counts_spread_sidecar_separately() -> None:
 
 
 def test_strict_singleton_requires_one_process(capsys) -> None:
-    assert singleton.check_singleton("spread-bbo", [], min_required=1) is False
+    assert singleton.check_singleton("spread-sidecar", [], min_required=1) is False
     assert (
         singleton.check_singleton(
-            "spread-bbo",
-            [{"pid": 7, "command": "python -m lightfee.apps.spread_bbo"}],
+            "spread-sidecar",
+            [{"pid": 7, "command": "python -m lightfee.apps.spread_sidecar"}],
             min_required=1,
         )
         is True
     )
     assert "VIOLATION" in capsys.readouterr().out
+
+
+def test_singleton_rejects_retired_bbo_process() -> None:
+    matches = singleton.count_matching(
+        [{"pid": 7, "command": "python -m lightfee.apps.spread_bbo"}],
+        singleton.RETIRED_SPREAD_BBO_PATTERNS,
+    )
+
+    assert (
+        singleton.check_singleton("retired-spread-bbo", matches, max_allowed=0)
+        is False
+    )

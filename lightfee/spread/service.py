@@ -9,8 +9,8 @@ from pathlib import Path
 import time
 
 from lightfee.config.schema import AppConfig
+from lightfee.sidecar.publisher import load_snapshot
 from lightfee.sidecar.snapshot import QuoteSnapshot
-from lightfee.spread.metadata_cache import SpreadMetadataSnapshotCache
 from lightfee.spread.models import SpreadSnapshot
 from lightfee.spread.paper_runtime import (
     SpreadPaperConfig,
@@ -20,10 +20,6 @@ from lightfee.spread.paper_runtime import (
     publish_paper_checkpoint,
 )
 from lightfee.spread.publisher import publish_spread_snapshot
-from lightfee.spread.quote_snapshot import (
-    load_spread_quote_snapshot,
-    spread_quote_snapshot_path,
-)
 from lightfee.spread.reversion import (
     SpreadReversionConfig,
     SpreadSignalEngine,
@@ -33,7 +29,10 @@ from lightfee.spread.stats_checkpoint import (
     publish_spread_stats_checkpoint,
     restore_spread_stats_checkpoint,
 )
-from lightfee.spread.universe import spread_sampling_selection_required
+from lightfee.spread.universe import (
+    resolve_spread_sampling_symbols,
+    spread_sampling_selection_required,
+)
 
 
 logger = logging.getLogger("lightfee.spread.service")
@@ -84,16 +83,6 @@ class SpreadSidecarService:
         self.config = config
         self.snapshot_path = config.runtime.spread_sidecar_snapshot_path
         self.sidecar_snapshot_path = config.runtime.sidecar_snapshot_path
-        self.spread_quote_snapshot_path = spread_quote_snapshot_path(
-            self.sidecar_snapshot_path
-        )
-        # This cache only parses the large primary snapshot when its atomic
-        # generation changes. The 250 ms signal loop otherwise performs a
-        # stat plus one compact BBO-snapshot read.
-        self._metadata_cache = SpreadMetadataSnapshotCache(
-            self.sidecar_snapshot_path,
-            max_age_ms=config.runtime.sidecar_snapshot_max_age_ms,
-        )
         self._spread_sampling_selection_required = spread_sampling_selection_required(
             config
         )
@@ -405,9 +394,9 @@ class SpreadSidecarService:
         dict[str, list[str]],
         int,
     ]:
-        """Join a compact fresh-BBO generation to cached slow evidence."""
+        """Read and filter the funding sidecar snapshot inside this process."""
 
-        snapshot = load_spread_quote_snapshot(self.spread_quote_snapshot_path)
+        snapshot = load_snapshot(self.sidecar_snapshot_path)
         decision_at_ms = (
             int(observed_ms)
             if observed_ms is not None
@@ -422,7 +411,7 @@ class SpreadSidecarService:
             return (
                 {},
                 configured_venues,
-                "spread_bbo_snapshot_unavailable",
+                "sidecar_snapshot_unavailable",
                 0,
                 0,
                 {},
@@ -430,10 +419,10 @@ class SpreadSidecarService:
             )
 
         input_quote_count = len(snapshot.quotes)
-        # A compact BBO generation has process-liveness freshness, while
-        # every individual BBO keeps the strict executable quote TTL below.
-        # Do not fold the two clocks together: it would again turn a one-second
-        # quote rule into an impossible full-snapshot rule.
+        # The funding sidecar generation has a process-liveness budget while
+        # every individual quote keeps the strict signal TTL below.  Never
+        # fold those two clocks together: a one-second quote rule must not
+        # become an impossible whole-snapshot availability requirement.
         snapshot_max_age_ms = max(
             int(self.config.runtime.sidecar_snapshot_max_age_ms or 0),
             1,
@@ -451,40 +440,40 @@ class SpreadSidecarService:
             return (
                 {},
                 configured_venues,
-                "spread_bbo_snapshot_stale",
+                "sidecar_snapshot_stale",
                 input_quote_count,
                 0,
                 {},
                 decision_at_ms,
             )
 
-        self._metadata_cache.refresh()
-        sampling_symbols = tuple(
-            dict.fromkeys(
-                str(symbol).strip().upper()
-                for symbol in snapshot.sampling_symbols
-                if str(symbol).strip()
+        if self._spread_sampling_selection_required:
+            sampling_symbols = resolve_spread_sampling_symbols(
+                self.config,
+                snapshot.quotes,
+                quote_eligible=lambda quote: bool(
+                    quote.contract_normalization_complete is True
+                    and _quote_is_valid_for_spread_sidecar(
+                        quote,
+                        observed_ms=decision_at_ms,
+                        max_age_ms=quote_max_age_ms,
+                    )
+                ),
             )
-        )
-        configured_symbols = {
-            str(symbol).strip().upper()
-            for symbol in self.config.symbols
-            if str(symbol).strip()
-        }
-        if not sampling_symbols or not set(sampling_symbols).issubset(configured_symbols):
-            return (
-                {},
-                configured_venues,
-                "spread_bbo_snapshot_universe_unavailable",
-                input_quote_count,
-                0,
-                {},
-                decision_at_ms,
-            )
-        if self._spread_sampling_selection_required and sampling_symbols != self._spread_sampling_symbols:
-            self._spread_sampling_symbols = sampling_symbols
-            self.stats.retain_symbols(set(sampling_symbols))
-        allowed_symbols = set(self._spread_sampling_symbols or sampling_symbols)
+            if not sampling_symbols:
+                return (
+                    {},
+                    configured_venues,
+                    "sidecar_snapshot_universe_unavailable",
+                    input_quote_count,
+                    0,
+                    {},
+                    decision_at_ms,
+                )
+            if sampling_symbols != self._spread_sampling_symbols:
+                self._spread_sampling_symbols = tuple(sampling_symbols)
+                self.stats.retain_symbols(set(sampling_symbols))
+        allowed_symbols = set(self._spread_sampling_symbols or self.config.symbols)
 
         degraded_venues = {
             str(venue).strip().lower()
@@ -500,14 +489,8 @@ class SpreadSidecarService:
             for venue, symbols in snapshot.degraded_symbols.items()
             if isinstance(symbols, list)
         }
-        merged_quotes, metadata_unavailable = self._metadata_cache.overlay_hot_quotes(
-            snapshot.quotes,
-            now_ms=decision_at_ms,
-        )
-        for venue, symbols in metadata_unavailable.items():
-            degraded_symbol_sets.setdefault(venue, set()).update(symbols)
         quotes: dict[str, QuoteSnapshot] = {}
-        for key, quote in merged_quotes.items():
+        for key, quote in snapshot.quotes.items():
             venue = str(quote.venue or "").strip().lower()
             symbol = str(quote.symbol or "").strip().upper()
             if symbol not in allowed_symbols:
@@ -548,9 +531,9 @@ class SpreadSidecarService:
             default=0,
         )
         source_mode = (
-            "direct_spread_bbo"
+            "sidecar_snapshot"
             if len(quotes) == input_quote_count
-            else "direct_spread_bbo_partial"
+            else "sidecar_snapshot_partial"
         )
         return (
             quotes,

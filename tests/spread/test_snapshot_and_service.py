@@ -30,11 +30,6 @@ from lightfee.spread.paper_runtime import (
     publish_paper_checkpoint,
 )
 from lightfee.spread.publisher import load_spread_snapshot, publish_spread_snapshot
-from lightfee.spread.quote_snapshot import (
-    SpreadQuoteSnapshot,
-    publish_spread_quote_snapshot,
-    spread_quote_snapshot_path,
-)
 from lightfee.spread.service import SpreadSidecarService
 
 
@@ -183,30 +178,6 @@ def _config(tmp_path, *, paper_enabled: bool = False) -> AppConfig:
     )
 
 
-def _publish_hot_bbo_snapshot(
-    config: AppConfig,
-    funding_snapshot: SidecarSnapshot,
-    *,
-    published_at_ms: int | None = None,
-) -> None:
-    published_ms = int(published_at_ms or funding_snapshot.published_at_ms)
-    publish_spread_quote_snapshot(
-        SpreadQuoteSnapshot(
-            published_at_ms=published_ms,
-            market_observed_at_ms=max(
-                int(quote.observed_at_ms) for quote in funding_snapshot.quotes.values()
-            ),
-            batch_started_at_ms=published_ms,
-            configured_venues=["cheap", "rich"],
-            degraded_venues=list(funding_snapshot.degraded_venues),
-            degraded_symbols={},
-            quotes=dict(funding_snapshot.quotes),
-            sampling_symbols=["BTCUSDT"],
-            source_mode="sidecar_market_fast_path",
-        ),
-        spread_quote_snapshot_path(config.runtime.sidecar_snapshot_path),
-    )
-
 
 def test_spread_snapshot_round_trip_keeps_signal_and_paper_status(tmp_path) -> None:
     path = tmp_path / "spread.json"
@@ -233,11 +204,10 @@ def test_spread_snapshot_round_trip_keeps_signal_and_paper_status(tmp_path) -> N
 
 
 @pytest.mark.asyncio
-async def test_spread_sidecar_joins_direct_bbo_to_primary_metadata(tmp_path) -> None:
+async def test_spread_sidecar_reads_funding_sidecar_snapshot_only(tmp_path) -> None:
     config = _config(tmp_path)
     funding_snapshot = _snapshot()
     publish_snapshot(funding_snapshot, config.runtime.sidecar_snapshot_path)
-    _publish_hot_bbo_snapshot(config, funding_snapshot)
     service = SpreadSidecarService(config)
     try:
         quotes, degraded, source, input_count, observed, symbols, decision = (
@@ -248,7 +218,7 @@ async def test_spread_sidecar_joins_direct_bbo_to_primary_metadata(tmp_path) -> 
 
     assert set(quotes) == {"cheap:BTCUSDT", "rich:BTCUSDT"}
     assert degraded == set()
-    assert source == "direct_spread_bbo"
+    assert source == "sidecar_snapshot"
     assert input_count == 2
     assert observed == 10_000
     assert symbols == {}
@@ -259,10 +229,9 @@ async def test_spread_sidecar_joins_direct_bbo_to_primary_metadata(tmp_path) -> 
 async def test_degraded_venue_only_removes_its_spread_quote(tmp_path) -> None:
     config = _config(tmp_path)
     publish_snapshot(
-        funding_snapshot := _snapshot(degraded_venues=["cheap"]),
+        _snapshot(degraded_venues=["cheap"]),
         config.runtime.sidecar_snapshot_path,
     )
-    _publish_hot_bbo_snapshot(config, funding_snapshot)
     service = SpreadSidecarService(config)
     try:
         quotes, degraded, source, input_count, *_rest = await service._fetch_quotes(
@@ -273,16 +242,15 @@ async def test_degraded_venue_only_removes_its_spread_quote(tmp_path) -> None:
 
     assert set(quotes) == {"rich:BTCUSDT"}
     assert degraded == {"cheap"}
-    assert source == "direct_spread_bbo_partial"
+    assert source == "sidecar_snapshot_partial"
     assert input_count == 2
 
 
 @pytest.mark.asyncio
-async def test_expired_bbo_snapshot_disables_only_spread_input(tmp_path) -> None:
+async def test_expired_funding_snapshot_disables_only_spread_input(tmp_path) -> None:
     config = _config(tmp_path)
     funding_snapshot = _snapshot(published_at_ms=1_000)
     publish_snapshot(funding_snapshot, config.runtime.sidecar_snapshot_path)
-    _publish_hot_bbo_snapshot(config, funding_snapshot)
     service = SpreadSidecarService(config)
     try:
         quotes, degraded, source, input_count, *_rest = await service._fetch_quotes(
@@ -293,7 +261,7 @@ async def test_expired_bbo_snapshot_disables_only_spread_input(tmp_path) -> None
 
     assert quotes == {}
     assert degraded == {"cheap", "rich"}
-    assert source == "spread_bbo_snapshot_stale"
+    assert source == "sidecar_snapshot_stale"
     assert input_count == 2
     assert load_snapshot(config.runtime.sidecar_snapshot_path) is not None
 
@@ -303,7 +271,6 @@ async def test_signal_ttl_does_not_expire_the_fresh_funding_snapshot(tmp_path) -
     config = _config(tmp_path)
     funding_snapshot = _snapshot(published_at_ms=10_000)
     publish_snapshot(funding_snapshot, config.runtime.sidecar_snapshot_path)
-    _publish_hot_bbo_snapshot(config, funding_snapshot)
     service = SpreadSidecarService(config)
     try:
         quotes, degraded, source, input_count, observed, symbols, decision = (
@@ -312,11 +279,11 @@ async def test_signal_ttl_does_not_expire_the_fresh_funding_snapshot(tmp_path) -
     finally:
         await service.close()
 
-    # The one-second signal TTL rejects individual BBOs, while the compact BBO
-    # generation and primary metadata remain inside their 60-second budgets.
+    # The one-second signal TTL rejects individual quotes, while the main
+    # sidecar generation remains inside its separate 60-second budget.
     assert quotes == {}
     assert degraded == set()
-    assert source == "direct_spread_bbo_partial"
+    assert source == "sidecar_snapshot_partial"
     assert input_count == 2
     assert observed == 0
     assert symbols == {"cheap": ["BTCUSDT"], "rich": ["BTCUSDT"]}
@@ -373,7 +340,6 @@ async def test_corrupt_paper_checkpoint_does_not_break_funding_snapshot(tmp_path
     config = _config(tmp_path, paper_enabled=True)
     funding_snapshot = _snapshot()
     publish_snapshot(funding_snapshot, config.runtime.sidecar_snapshot_path)
-    _publish_hot_bbo_snapshot(config, funding_snapshot)
     checkpoint = tmp_path / "spread-paper.jsonl.checkpoint.json"
     checkpoint.write_text("not-json", encoding="utf-8")
 
