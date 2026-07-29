@@ -4085,8 +4085,19 @@ class EntryDispatchRuntime:
 
         if not_ready_reasons:
             pair_id = self._candidate_pair_id(candidate)
+            first_l2_reason = str(
+                (l2_stale_decisions[0] if l2_stale_decisions else {}).get("l2_reason")
+                or "execution_l2_stale"
+            )
+            setattr(self.ctx, "_last_entry_dispatch_block_reason", first_l2_reason)
+            setattr(self.ctx, "_last_entry_dispatch_block_l2_reason", first_l2_reason)
             for payload in l2_stale_decisions:
                 payload = dict(payload)
+                payload["reason_bucket"] = str(
+                    payload.get("l2_reason")
+                    or payload.get("reason")
+                    or "execution_l2_stale"
+                )
                 payload["pair_id"] = pair_id
                 payload["ts_ms"] = now_ms
                 self.ctx.journal.append("runtime.snapshot_freshness_decision", payload)
@@ -4098,6 +4109,9 @@ class EntryDispatchRuntime:
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
                     "reasons": not_ready_reasons,
+                    "reason": first_l2_reason,
+                    "reason_bucket": first_l2_reason,
+                    "l2_reason": first_l2_reason,
                     "ts_ms": now_ms,
                 },
             )
@@ -4985,6 +4999,8 @@ class EntryDispatchRuntime:
         Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
         Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
         """
+        setattr(self.ctx, "_last_entry_dispatch_block_reason", "")
+        setattr(self.ctx, "_last_entry_dispatch_block_l2_reason", "")
         if self._selected_pre_submit_deadline_exceeded(
             candidate,
             selected_deadline_monotonic=selected_deadline_monotonic,

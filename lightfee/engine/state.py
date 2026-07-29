@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from lightfee.core.domain import OrderFill, PassiveOrderState, Side, Venue
+from lightfee.engine.business_contract import normalize_close_reconciliation_record
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -1303,7 +1304,7 @@ def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, dict):
-            normalized.append(dict(item))
+            normalized.append(normalize_close_reconciliation_record(item))
         else:
             normalized.append(_invalid_pending_close_reconciliation(item, "invalid_item"))
     return normalized
@@ -1862,6 +1863,7 @@ class EngineState:
 
     def enqueue_pending_close_reconciliation(self, item: dict[str, Any]) -> None:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)
+        item = normalize_close_reconciliation_record(item)
         position_id = str(item.get("position_id") or "")
         kind = str(item.get("kind") or "final")
 
@@ -1991,8 +1993,11 @@ class EngineState:
                 and str(existing.get("kind") or "final") == kind
             ):
                 _merge_existing(existing)
+                normalized_existing = normalize_close_reconciliation_record(existing)
+                existing.clear()
+                existing.update(normalized_existing)
                 return
-        self.pending_close_reconciliations.append(dict(item))
+        self.pending_close_reconciliations.append(normalize_close_reconciliation_record(item))
         if len(self.pending_close_reconciliations) > MAX_PENDING_CLOSE_RECONCILIATIONS:
             self.pending_close_reconciliations = self.pending_close_reconciliations[
                 -MAX_PENDING_CLOSE_RECONCILIATIONS:

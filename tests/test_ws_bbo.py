@@ -953,6 +953,11 @@ async def test_rest_top_book_refresher_async_path_uses_shared_async_client():
     assert result.outcome == "resolved"
     assert result.quote is not None
     assert result.quote.received_at_ms >= 1_000
+    assert result.queue_ms >= 0
+    assert result.http_ms >= 0
+    assert result.validate_ms >= 0
+    assert result.total_ms >= 0
+    assert result.generation == f"binance:BTCUSDT:{result.quote.received_at_ms}"
     assert len(requests) == 1
     assert refresher._async_client is async_client
 

@@ -214,6 +214,26 @@ def _open_interest_exception_phase_timings(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _safe_open_interest_observability_reason(
+    value: object,
+    *,
+    status: str,
+) -> str:
+    """Keep journal reason codes useful without persisting transport details.
+
+    Exchange clients may include a URL, request parameters, response excerpts,
+    or a provider exception message in their diagnostic reason.  The entry
+    journal is an operational record, so only the compact reason-code alphabet
+    is allowed across this boundary.  The status remains the reliable fallback
+    cause class when a provider supplied an unsafe free-form value.
+    """
+    reason = str(value or "").strip().lower()
+    safe_characters = set("abcdefghijklmnopqrstuvwxyz0123456789_.-")
+    if reason and len(reason) <= 160 and set(reason) <= safe_characters:
+        return reason
+    return normalize_open_interest_status(status or "unavailable")
+
+
 def _evidence_clock_or_zero(value: object) -> int:
     """Parse an evidence clock without letting malformed payloads crash a tick."""
     if isinstance(value, bool):
@@ -2691,20 +2711,51 @@ class MarketDataRuntime:
                     target["venue_symbol"] = str(
                         getattr(result, "venue_symbol", "") or ""
                     )
-                    target["url"] = str(getattr(result, "url", "") or "")
                     target["endpoint"] = str(
                         getattr(result, "endpoint", "") or "rest_topbook"
                     )
                     target["http_status"] = int(
                         getattr(result, "http_status", 0) or 0
                     )
-                    target["body_excerpt"] = str(
-                        getattr(result, "body_excerpt", "") or ""
+                    # This diagnostic path must never carry request URLs,
+                    # response bodies, signatures, or credentials.  Timing
+                    # and outcome are sufficient to diagnose a slow final
+                    # revalidation without duplicating sensitive transport
+                    # data into the durable journal.
+                    target["rest_queue_ms"] = int(
+                        getattr(result, "queue_ms", 0)
+                        or getattr(result, "rest_queue_ms", 0)
+                        or 0
+                    )
+                    target["rest_http_ms"] = int(
+                        getattr(result, "http_ms", 0)
+                        or getattr(result, "rest_http_ms", 0)
+                        or 0
+                    )
+                    target["rest_validate_ms"] = int(
+                        getattr(result, "validate_ms", 0)
+                        or getattr(result, "rest_validate_ms", 0)
+                        or 0
+                    )
+                    target["rest_total_ms"] = int(
+                        getattr(result, "total_ms", 0)
+                        or getattr(result, "rest_total_ms", 0)
+                        or 0
+                    )
+                    target["evidence_generation"] = str(
+                        getattr(result, "generation", "")
+                        or getattr(result, "evidence_generation", "")
+                        or ""
                     )
                     target["attempt_interval_outcome"] = str(
                         getattr(result, "attempt_interval_outcome", "") or ""
                     )
-                    target["rest_error"] = str(getattr(result, "error", "") or "")
+                    # Persist the normalized outcome rather than an exception
+                    # string/type.  The latter can be provider-controlled and
+                    # is neither a stable reason code nor safe diagnostics.
+                    target["rest_error_kind"] = (
+                        rest_outcome if getattr(result, "error", None) else ""
+                    )
                     if rest_outcome == "throttled":
                         stats["rest_throttled_count"] += 1
                 else:
@@ -2712,7 +2763,7 @@ class MarketDataRuntime:
                         "resolved" if refreshed is not None else "missing_quote"
                     )
                 if refresh_error:
-                    target["rest_error"] = refresh_error
+                    target["rest_error_kind"] = refresh_error.split(":", 1)[0]
                     target["rest_outcome"] = "http_error"
                     refreshed = None
                 validation_now_ms = max(
@@ -2939,7 +2990,7 @@ class MarketDataRuntime:
                 bucket = "rest_topbook_revalidate_failed"
                 reason_bucket = "rest_resolved_invalid_bid_ask"
                 reason_family = "rest_invalid_quote"
-            elif target.get("rest_error"):
+            elif target.get("rest_error_kind"):
                 outcome = "rest_timeout"
                 bucket = "rest_topbook_revalidate_failed"
                 reason_bucket = "rest_timeout_or_exception"
@@ -3017,13 +3068,16 @@ class MarketDataRuntime:
                 "last_error": str(stream_state.get("last_error") or ""),
                 "endpoint": str(target.get("endpoint") or "rest_topbook"),
                 "venue_symbol": str(target.get("venue_symbol") or ""),
-                "url": str(target.get("url") or ""),
                 "http_status": int(target.get("http_status") or 0),
-                "body_excerpt": str(target.get("body_excerpt") or ""),
                 "attempt_interval_outcome": str(
                     target.get("attempt_interval_outcome") or ""
                 ),
-                "rest_error": str(target.get("rest_error") or ""),
+                "rest_error_kind": str(target.get("rest_error_kind") or ""),
+                "queue_ms": int(target.get("rest_queue_ms") or 0),
+                "http_ms": int(target.get("rest_http_ms") or 0),
+                "validate_ms": int(target.get("rest_validate_ms") or 0),
+                "total_ms": int(target.get("rest_total_ms") or 0),
+                "generation": str(target.get("evidence_generation") or ""),
                 "ws_budget_excluded": bool(target.get("ws_budget_excluded")),
                 "candidate_scope": candidate_scope,
                 "evidence_role": evidence_role,
@@ -4148,9 +4202,13 @@ class MarketDataRuntime:
                 (result or {}).get("open_interest_evidence_status")
                 or "unavailable"
             )
-            reason = str(
+            raw_reason = str(
                 (result or {}).get("open_interest_evidence_reason")
                 or status
+            )
+            reason = _safe_open_interest_observability_reason(
+                raw_reason,
+                status=status,
             )
             open_interest_raw = (result or {}).get("open_interest_quote")
             try:
@@ -4197,6 +4255,40 @@ class MarketDataRuntime:
                 ),
                 "oi_http_ms": int((result or {}).get("oi_http_ms", 0) or 0),
                 "oi_parse_ms": int((result or {}).get("oi_parse_ms", 0) or 0),
+                "queue_ms": int(
+                    (result or {}).get("queue_ms")
+                    or (result or {}).get("oi_queue_ms", 0)
+                    or 0
+                ),
+                "http_ms": int(
+                    (result or {}).get("http_ms")
+                    or (result or {}).get("oi_http_ms", 0)
+                    or 0
+                ),
+                "validate_ms": int(
+                    (result or {}).get("validate_ms")
+                    or (result or {}).get("oi_validate_ms", 0)
+                    or 0
+                ),
+                "total_ms": int(
+                    (result or {}).get("total_ms")
+                    or (result or {}).get("oi_total_ms")
+                    or elapsed_ms
+                    or 0
+                ),
+                "generation": str(
+                    (result or {}).get("generation")
+                    or (result or {}).get("evidence_generation")
+                    or ""
+                ),
+                "evidence_age_ms": max(
+                    now_ms
+                    - int((result or {}).get("open_interest_observed_at_ms", 0) or 0),
+                    0,
+                )
+                if int((result or {}).get("open_interest_observed_at_ms", 0) or 0)
+                > 0
+                else None,
                 "oi_dns_timing_status": str(
                     (result or {}).get("oi_dns_timing_status", "unavailable")
                     or "unavailable"

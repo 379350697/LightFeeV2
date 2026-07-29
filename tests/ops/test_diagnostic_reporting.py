@@ -97,6 +97,11 @@ def test_agent_profile_keeps_context_safe_fields_only():
         "event_file_count": 1,
         "event_scan_truncated": False,
         "events_dropped_by_cap": 0,
+        "event_coverage": {
+            "complete": True,
+            "events_before_cap": 0,
+            "events_dropped_by_cap": 0,
+        },
         "since_deploy_time_filtered": True,
         "state_path_source": "explicit",
     }

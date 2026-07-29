@@ -197,6 +197,20 @@ backed-off with jitter, and candidate-scoped; shared host/IP processes must
 cooperate on the public request budget. Current recovery of quotes does not
 erase the historical rate-limit event.
 
+### CL-163 Final-Revalidation Evidence
+
+Final entry evidence remains fail-closed.  `missing_book`, true `stale`,
+`sequence_gap`, and true `clock_skew` are contract reasons, not a generic
+`entry_final_revalidation_failed` replacement.  Runtime refreshes its wall
+clock after awaited L2 work, so scheduler delay cannot manufacture clock skew.
+
+BBO/OI revalidation samples record only allowlisted queue, HTTP, validation,
+total, generation, evidence-age, outcome, and rejection fields.  Successful
+and failed samples never journal a request URL, query/body, signature,
+credential, or full sidecar snapshot.  The telemetry explains slow evidence;
+it does not relax a quote TTL, OI floor, liquidity floor, sequence rule, or
+final BBO requirement.  CL-163 is local verified; deployment pending.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |

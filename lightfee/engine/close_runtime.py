@@ -19,6 +19,8 @@ from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
     close_reconciliation_exchange_truth,
     close_reconciliation_exchange_truth_clean,
+    close_reconciliation_legacy_terminal_receipt,
+    close_reconciliation_exchange_truth_mentions_scope,
     close_reconciliation_evidence_fields,
 )
 from lightfee.engine.exit_shadow import (
@@ -706,6 +708,22 @@ class CloseRuntime:
     @classmethod
     def _has_statement_probe_candidates(cls, reconciliation: dict[str, Any]) -> bool:
         return bool(cls._statement_probe_candidates_from_reconciliation(reconciliation))
+
+    @staticmethod
+    def _is_terminal_flat_accounting_only_backfill(
+        reconciliation: dict[str, Any],
+    ) -> bool:
+        marker = str(
+            reconciliation.get("close_reconciliation_state")
+            or reconciliation.get("business_contract_action")
+            or reconciliation.get("terminality")
+            or reconciliation.get("action")
+            or ""
+        )
+        return (
+            reconciliation.get("accounting_only_backfill") is True
+            and marker == "terminal_flat_accounting_gap"
+        )
 
     @staticmethod
     def _append_journal(ctx: Any, event: str, payload: dict[str, Any]) -> None:
@@ -1764,8 +1782,15 @@ class CloseRuntime:
             )
             if exchange_truth is not None:
                 return exchange_truth
-            return None
-        return close_reconciliation_exchange_truth(reconciliation)
+            if close_reconciliation_exchange_truth_mentions_scope(
+                reconciliation,
+                current_truth,
+            ):
+                return None
+        exchange_truth = close_reconciliation_exchange_truth(reconciliation)
+        if exchange_truth is not None:
+            return exchange_truth
+        return close_reconciliation_legacy_terminal_receipt(reconciliation)
 
     async def _refresh_close_reconciliation_account_truth(
         self,
@@ -2229,6 +2254,7 @@ class CloseRuntime:
             reconciliation
             for reconciliation in pending_reconciliations
             if isinstance(reconciliation, dict)
+            and not self._is_terminal_flat_accounting_only_backfill(reconciliation)
             and not (
                 reconciliation.get("archived") is True
                 and str(reconciliation.get("archive_reason") or "")

@@ -175,6 +175,11 @@ def test_main_compact_json_outputs_field_focused_report(monkeypatch, capsys):
         "event_file_count": 1,
         "event_scan_truncated": False,
         "events_dropped_by_cap": 0,
+        "event_coverage": {
+            "complete": True,
+            "events_before_cap": 0,
+            "events_dropped_by_cap": 0,
+        },
         "since_deploy_time_filtered": True,
         "state_path_source": "explicit",
     }
@@ -14704,3 +14709,32 @@ def test_missing_exchange_body_in_events_reported():
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_incomplete_since_deploy_event_coverage_cannot_claim_no_issues():
+    import scripts.diagnose_live as dl
+
+    selected, coverage = dl._limit_since_deploy_events(
+        [
+            {"ts_ms": 1, "kind": "tick"},
+            {"ts_ms": 2, "kind": "tick"},
+            {"ts_ms": 3, "kind": "tick"},
+        ],
+        1,
+    )
+    assert len(selected) == 1
+    assert coverage["event_scan_truncated"] is True
+    conclusion = dl._build_conclusion(
+        {"ok": True, "critical_count": 0, "fingerprints": []},
+        {"state_mismatch": False, "local_open_exchange_flat": False, "details": []},
+        {"overall": "complete"},
+        [],
+        {"missing_l2_or_tick_count": 0, "stale_rebuild_count": 0, "sequence_gap_count": 0},
+        {"stale_or_degraded_count": 0},
+        {"available": True},
+        {"gate_passed": True, "blocking_reasons": []},
+        {"complete": False, **coverage},
+    )
+
+    assert conclusion["status"] == "healthy_with_incomplete_event_coverage"
+    assert conclusion["summary"] != "no issues detected"

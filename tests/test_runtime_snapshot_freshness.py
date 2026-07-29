@@ -1468,7 +1468,7 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
     tmp_path,
     monkeypatch,
 ):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
+    from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult, TopBookQuote
 
     now_ms = 100_000
     config = AppConfig(
@@ -1540,9 +1540,9 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
         def __init__(self) -> None:
             self.calls: list[tuple[str, str]] = []
 
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
+        def refresh_quote_result(self, venue: str, symbol: str, *, now_ms: int):
             self.calls.append((venue, symbol))
-            return TopBookQuote(
+            quote = TopBookQuote(
                 venue=venue,
                 symbol=symbol,
                 bid=100.0 if venue == "okx" else 100.2,
@@ -1552,6 +1552,27 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
                 observed_at_ms=now_ms - 25,
                 received_at_ms=now_ms - 25,
                 source=f"{venue}_rest_topbook",
+            )
+            return RestTopBookQuoteResult(
+                venue=venue,
+                symbol=symbol,
+                venue_symbol=symbol,
+                outcome="resolved",
+                quote=quote,
+                endpoint="rest_topbook",
+                # Transport-sensitive fields must not be copied into the
+                # durable final-revalidation journal on the resolved path.
+                url=f"https://example.invalid/{venue}/{symbol}?signature=secret",
+                body_excerpt='{"authorization":"secret"}',
+                bid=quote.bid,
+                ask=quote.ask,
+                observed_at_ms=quote.observed_at_ms,
+                received_at_ms=quote.received_at_ms,
+                queue_ms=7,
+                http_ms=11,
+                validate_ms=3,
+                total_ms=21,
+                generation=f"bbo-generation-{venue}",
             )
 
     refresher = RestOnlyRefresher()
@@ -1594,6 +1615,22 @@ async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_
         "bybit_rest_topbook",
         "okx_rest_topbook",
     }
+    assert {
+        (
+            payload["rest_queue_ms"],
+            payload["rest_http_ms"],
+            payload["rest_validate_ms"],
+            payload["rest_total_ms"],
+        )
+        for payload in resolved_payloads
+    } == {(7, 11, 3, 21)}
+    assert {payload["evidence_generation"] for payload in resolved_payloads} == {
+        "bbo-generation-okx",
+        "bbo-generation-bybit",
+    }
+    assert all("url" not in payload for payload in resolved_payloads)
+    assert all("body_excerpt" not in payload for payload in resolved_payloads)
+    assert all("authorization" not in payload for payload in resolved_payloads)
     assert runtime.ws_bbo_cache.get_quote("okx", "BTCUSDT").source == "okx_rest_topbook"
     assert runtime.ws_bbo_cache.get_quote("bybit", "BTCUSDT").source == "bybit_rest_topbook"
 
@@ -2026,6 +2063,11 @@ async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote
                 endpoint="rest_topbook",
                 url=f"https://example.invalid/{venue}/{symbol}",
                 attempt_interval_outcome="min_interval_not_elapsed",
+                queue_ms=7,
+                http_ms=11,
+                validate_ms=2,
+                total_ms=20,
+                generation="test-generation-7",
             )
 
     runtime.ws_bbo_rest_refresher = ThrottledRefresher()
@@ -2063,8 +2105,19 @@ async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote
         for payload in failures
     )
     assert "rest_invalid_quote" not in {payload["outcome"] for payload in failures}
-    assert all(payload["rest_error"] == "" for payload in failures)
+    assert all("rest_error" not in payload for payload in failures)
     assert all(payload["endpoint"] == "rest_topbook" for payload in failures)
+    assert {
+        (
+            payload["queue_ms"],
+            payload["http_ms"],
+            payload["validate_ms"],
+            payload["total_ms"],
+            payload["generation"],
+        )
+        for payload in failures
+    } == {(7, 11, 2, 20, "test-generation-7")}
+    assert all("url" not in payload and "body_excerpt" not in payload for payload in failures)
 
 
 @pytest.mark.asyncio
@@ -4320,6 +4373,14 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
                         source="test_targeted_refresh",
                     ),
                     "oi_targeted_refresh_elapsed_ms": 7,
+                    "queue_ms": 7,
+                    "http_ms": 11,
+                    "validate_ms": 3,
+                    "total_ms": 21,
+                    "generation": "oi-generation-7",
+                    "url": "https://secret.example/?signature=redacted",
+                    "body_excerpt": "secret-body",
+                    "authorization": "Bearer secret",
                 }
             return None
 
@@ -4399,9 +4460,21 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
     assert refreshed_quote.open_interest == 2_500_000.0
     assert refreshed_quote.open_interest_evidence_status == "observed"
     records = _read_journal_records(tmp_path / "events.jsonl")
-    assert "runtime.entry_oi_targeted_refresh_resolved" in [
-        record["kind"] for record in records
-    ]
+    resolved = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_oi_targeted_refresh_resolved"
+    )
+    assert (
+        resolved["queue_ms"],
+        resolved["http_ms"],
+        resolved["validate_ms"],
+        resolved["total_ms"],
+        resolved["generation"],
+    ) == (7, 11, 3, 21, "oi-generation-7")
+    assert all(
+        field not in resolved for field in ("url", "body_excerpt", "authorization")
+    )
     assert not any(
         record["payload"].get("reason") == "oi_evidence_unavailable"
         for record in records
@@ -5113,7 +5186,17 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
             return {
                 "open_interest_quote": 0.0,
                 "open_interest_evidence_status": "timeout",
-                "open_interest_evidence_reason": "timeout_waiting_for_oi",
+                "open_interest_evidence_reason": (
+                    "TimeoutError: https://secret.example/?signature=redacted"
+                ),
+                "queue_ms": 7,
+                "http_ms": 11,
+                "validate_ms": 3,
+                "total_ms": 21,
+                "generation": "oi-generation-7",
+                "url": "https://secret.example/?signature=redacted",
+                "body_excerpt": "secret-body",
+                "authorization": "Bearer secret",
             }
 
     runtime.entry_open_interest_refresher = TimeoutOiRefresher()
@@ -5177,9 +5260,23 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
     assert stats["failed_count"] == 1
     assert filtered == []
     records = _read_journal_records(tmp_path / "events.jsonl")
-    assert "runtime.entry_oi_targeted_refresh_failed" in [
-        record["kind"] for record in records
-    ]
+    failed = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_oi_targeted_refresh_failed"
+    )
+    assert failed["open_interest_evidence_reason"] == "timeout"
+    assert failed["blocking_reason"] == "timeout"
+    assert (
+        failed["queue_ms"],
+        failed["http_ms"],
+        failed["validate_ms"],
+        failed["total_ms"],
+        failed["generation"],
+    ) == (7, 11, 3, 21, "oi-generation-7")
+    assert all(
+        field not in failed for field in ("url", "body_excerpt", "authorization")
+    )
     decision = next(
         record["payload"]
         for record in records

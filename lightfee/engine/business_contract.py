@@ -465,7 +465,7 @@ def classify_close_reconciliation_state(
     current_exchange_truth_clean: bool,
 ) -> dict[str, Any]:
     """Classify pending-close reconciliation work with the shared risk contract."""
-    item = reconciliation if isinstance(reconciliation, dict) else {}
+    item = normalize_close_reconciliation_record(reconciliation)
     marker = str(
         item.get("close_reconciliation_state")
         or item.get("business_contract_action")
@@ -501,6 +501,7 @@ def classify_close_reconciliation_state(
         bool(item.get("pending_backfill"))
         or item.get("evidence_gap") is True
         or is_accepted_order_truth_gap
+        or marker == "terminal_flat_accounting_gap"
     )
 
     if marker == "catalog_diagnostic":
@@ -540,6 +541,37 @@ def classify_close_reconciliation_state(
         }
 
     return base
+
+
+def normalize_close_reconciliation_record(
+    record: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return a canonical, non-mutating close-accounting record.
+
+    A terminal-flat marker means trading exposure has already been resolved;
+    any remaining work is accounting-only.  Old durable rows were sometimes
+    missing ``pending_backfill`` even though producers emitted this marker, so
+    normalize both historic and newly-produced records before any contract
+    decision.  This helper deliberately performs no state or I/O work.
+    """
+    item = dict(record) if isinstance(record, dict) else {}
+    marker = str(
+        item.get("close_reconciliation_state")
+        or item.get("business_contract_action")
+        or item.get("terminality")
+        or item.get("action")
+        or ""
+    )
+    if not (
+        item.get("accounting_only_backfill") is True
+        or marker == "terminal_flat_accounting_gap"
+    ):
+        return item
+    item["pending_backfill"] = True
+    item["accounting_only_backfill"] = True
+    item["blocking_trading"] = False
+    item["close_reconciliation_state"] = "terminal_flat_accounting_gap"
+    return item
 
 
 def _close_reconciliation_scope(
@@ -736,6 +768,148 @@ def _truth_probe_evidence_has_error_for_scope(
     return False
 
 
+def _truth_records_mention_scope(
+    records: Any,
+    *,
+    symbol: str,
+    venues: set[str],
+) -> bool:
+    if not isinstance(records, list):
+        return False
+    symbol_u = str(symbol or "").upper()
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        record_symbol = str(raw.get("symbol") or "").upper()
+        record_venue = str(raw.get("venue") or "").lower()
+        if symbol_u and record_symbol and record_symbol != symbol_u:
+            continue
+        if venues and record_venue and record_venue not in venues:
+            continue
+        if record_symbol == symbol_u or record_venue in venues:
+            return True
+    return False
+
+
+def _truth_nested_evidence_mentions_scope(
+    evidence: Any,
+    *,
+    symbol: str,
+    venues: set[str],
+) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    symbol_u = str(symbol or "").upper()
+    for raw_venue, raw_symbols in evidence.items():
+        venue = _normalize_venue_text(raw_venue)
+        if venues and venue not in venues:
+            continue
+        if not isinstance(raw_symbols, dict):
+            return True
+        if not symbol_u:
+            return True
+        for key in ("*", symbol_u):
+            if key in raw_symbols:
+                return True
+    return False
+
+
+def _truth_fetch_status_mentions_scope(
+    fetch_status: Any,
+    *,
+    symbol: str,
+    venues: set[str],
+) -> bool:
+    if not isinstance(fetch_status, dict):
+        return False
+    symbol_u = str(symbol or "").upper()
+    for raw_venue, venue_status in fetch_status.items():
+        venue = _normalize_venue_text(raw_venue)
+        if venues and venue not in venues:
+            continue
+        if not isinstance(venue_status, dict):
+            return True
+        if not symbol_u:
+            return True
+        for key in (
+            "positions_succeeded",
+            "orders_succeeded",
+            "positions_failed",
+            "orders_failed",
+            "positions_unsupported_symbols",
+            "orders_unsupported_symbols",
+        ):
+            raw_values = venue_status.get(key)
+            values = {
+                str(item or "").upper()
+                for item in (raw_values or [])
+                if str(item or "")
+            }
+            if "*" in values or symbol_u in values:
+                return True
+    return False
+
+
+def close_reconciliation_exchange_truth_mentions_scope(
+    reconciliation: dict[str, Any] | None,
+    exchange_truth: dict[str, Any] | None,
+) -> bool:
+    """Whether an exchange-truth object says anything about this close scope."""
+    if not isinstance(reconciliation, dict) or not isinstance(exchange_truth, dict):
+        return False
+    symbol, venues = _close_reconciliation_scope(reconciliation)
+    if not venues:
+        return False
+    for key in ("positions", "open_orders", "open_order_truth", "orders"):
+        if _truth_records_mention_scope(
+            exchange_truth.get(key),
+            symbol=symbol,
+            venues=venues,
+        ):
+            return True
+    probe_evidence = exchange_truth.get("probe_evidence")
+    if isinstance(probe_evidence, list):
+        for raw in probe_evidence:
+            if not isinstance(raw, dict):
+                continue
+            venue = _normalize_venue_text(raw.get("venue"))
+            raw_symbol = str(raw.get("symbol") or "").upper()
+            if venue not in venues:
+                continue
+            if raw_symbol and raw_symbol not in {symbol, "*"}:
+                continue
+            classification = str(raw.get("classification") or "")
+            if classification in {
+                "position_truth",
+                "open_order_truth",
+                "position_probe_unfiltered_succeeded",
+                "open_order_probe_unfiltered_succeeded",
+            }:
+                return True
+            # A current scoped probe failure is equally material: it rules out
+            # a historical aggregate receipt as a fallback until a fresh clean
+            # proof exists.  Do not let an unavailable Bitget/OKX leg look
+            # like an unrelated recovery snapshot.
+            if raw.get("error") or classification.endswith(
+                ("_failed", "_error", "_timeout", "_unsupported")
+            ):
+                return True
+    for key in ("position_probe_evidence", "open_order_probe_evidence"):
+        if _truth_nested_evidence_mentions_scope(
+            exchange_truth.get(key),
+            symbol=symbol,
+            venues=venues,
+        ):
+            return True
+    if _truth_fetch_status_mentions_scope(
+        exchange_truth.get("fetch_status"),
+        symbol=symbol,
+        venues=venues,
+    ):
+        return True
+    return False
+
+
 def _recovery_ledger_flat_truth_covers_scope(
     truth: dict[str, Any],
     *,
@@ -894,6 +1068,67 @@ def _close_reconciliation_truth_covers_scope(
     )
 
 
+def _legacy_embedded_terminal_truth_covers_scope(truth: dict[str, Any]) -> bool:
+    """Accept the historical terminal receipt shape written before scoped probes.
+
+    This is deliberately limited to the durable embedded receipt, never a
+    current recovery response.  Current truth must still satisfy the scoped
+    position/open-order proof above; a scoped dirty current response therefore
+    wins over this compatibility fallback.
+    """
+
+    return (
+        truth.get("truth_available") is True
+        and truth.get("positions_flat") is True
+        and truth.get("open_orders_flat") is True
+    )
+
+
+def _is_terminal_flat_accounting_record(record: dict[str, Any] | None) -> bool:
+    """Whether a durable record may use the narrow legacy receipt bridge."""
+    item = normalize_close_reconciliation_record(record)
+    return (
+        item.get("accounting_only_backfill") is True
+        and str(item.get("close_reconciliation_state") or "")
+        == "terminal_flat_accounting_gap"
+    )
+
+
+_LEGACY_CLOSE_RECONCILIATION_TERMINAL_RECEIPT = (
+    "_business_contract_legacy_terminal_receipt"
+)
+
+
+def close_reconciliation_legacy_terminal_receipt(
+    reconciliation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return a tagged compatibility receipt for an old terminal-flat row.
+
+    Earlier durable records retained only aggregate flat fields, not the
+    per-venue probe detail required for a new current-truth decision.  The tag
+    is created only while processing that old durable receipt; it lets the
+    close retry path preserve V1 terminality without allowing an arbitrary
+    unscoped embedded payload to satisfy other business-contract consumers.
+    """
+
+    item = reconciliation if isinstance(reconciliation, dict) else {}
+    if not _is_terminal_flat_accounting_record(item):
+        return None
+    original_payload = item.get("original_payload")
+    if not isinstance(original_payload, dict):
+        original_payload = {}
+    embedded_truth = item.get("exchange_truth") or original_payload.get(
+        "exchange_truth"
+    )
+    if not isinstance(embedded_truth, dict):
+        return None
+    if not _legacy_embedded_terminal_truth_covers_scope(embedded_truth):
+        return None
+    receipt = dict(embedded_truth)
+    receipt[_LEGACY_CLOSE_RECONCILIATION_TERMINAL_RECEIPT] = True
+    return receipt
+
+
 def close_reconciliation_exchange_truth(
     reconciliation: dict[str, Any] | None,
     *,
@@ -907,15 +1142,23 @@ def close_reconciliation_exchange_truth(
         "exchange_truth"
     )
     if isinstance(current_exchange_truth, dict):
+        if (
+            current_exchange_truth.get(_LEGACY_CLOSE_RECONCILIATION_TERMINAL_RECEIPT)
+            and _is_terminal_flat_accounting_record(item)
+        ):
+            return current_exchange_truth
         if _close_reconciliation_truth_covers_scope(current_exchange_truth, item):
             return current_exchange_truth
         return None
 
-    if isinstance(embedded_truth, dict) and _close_reconciliation_truth_covers_scope(
-        embedded_truth,
-        item,
-    ):
-        return embedded_truth
+    if isinstance(embedded_truth, dict):
+        if _close_reconciliation_truth_covers_scope(embedded_truth, item):
+            return embedded_truth
+        if (
+            embedded_truth.get(_LEGACY_CLOSE_RECONCILIATION_TERMINAL_RECEIPT)
+            and _is_terminal_flat_accounting_record(item)
+        ):
+            return embedded_truth
     return None
 
 

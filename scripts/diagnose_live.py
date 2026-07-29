@@ -39,13 +39,16 @@ from lightfee.engine.exchange_truth import (
     request_venue_operation,
 )
 from lightfee.engine.business_contract import (
+    classify_close_reconciliation_state,
     classify_noise_visibility,
+    close_reconciliation_exchange_truth_clean,
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     diagnose_issue_counts,
     entry_market_evidence_contract,
     passive_close_final_truth_contract,
     passive_close_has_terminal_truth as contract_passive_close_has_terminal_truth,
+    normalize_close_reconciliation_record,
     quote_rewarm_handoff_contract,
     _payload_is_aster_reduce_only_no_order_reject,
 )
@@ -8516,6 +8519,30 @@ def _build_production_acceptance_gate(
         or len(pending_close_reconciliation_items)
         or 0
     )
+    def pending_close_reconciliation_contract(item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        if (
+            item.get("archived") is True
+            and str(item.get("archive_reason") or "")
+            == "terminal_flat_accounting_gap"
+        ):
+            return {
+                "state": "terminal_flat_accounting_gap",
+                "blocks_entry": False,
+            }
+        normalized = normalize_close_reconciliation_record(item)
+        return classify_close_reconciliation_state(
+            normalized,
+            current_exchange_truth_clean=(
+                close_reconciliation_exchange_truth_clean(normalized)
+                or (
+                    _exchange_truth_flat(exchange_truth)
+                    and _exchange_truth_no_open_orders(exchange_truth)
+                )
+            ),
+        )
+
     if "pending_close_reconciliation_blocking_count" in local_state:
         pending_close_reconciliation_blocking_count = int(
             local_state.get("pending_close_reconciliation_blocking_count") or 0
@@ -8524,17 +8551,7 @@ def _build_production_acceptance_gate(
         pending_close_reconciliation_blocking_count = sum(
             1
             for item in pending_close_reconciliation_items
-            if not (
-                isinstance(item, dict)
-                and item.get("archived") is True
-                and str(item.get("archive_reason") or "")
-                == "terminal_flat_accounting_gap"
-            )
-            and not (
-                isinstance(item, dict)
-                and item.get("accounting_only_backfill") is True
-                and item.get("blocking_trading") is False
-            )
+            if pending_close_reconciliation_contract(item).get("blocks_entry") is True
         )
     pending_close_reconciliation_accounting_only_count = sum(
         1
@@ -8554,22 +8571,8 @@ def _build_production_acceptance_gate(
         pending_close_reconciliation_terminal_flat_count = sum(
             1
             for item in pending_close_reconciliation_items
-            if (
-                isinstance(item, dict)
-                and (
-                    (
-                        item.get("archived") is True
-                        and str(item.get("archive_reason") or "")
-                        == "terminal_flat_accounting_gap"
-                    )
-                    or (
-                        item.get("accounting_only_backfill") is True
-                        and item.get("blocking_trading") is False
-                        and str(item.get("close_reconciliation_state") or "")
-                        == "terminal_flat_accounting_gap"
-                    )
-                )
-            )
+            if pending_close_reconciliation_contract(item).get("state")
+            == "terminal_flat_accounting_gap"
         )
     pending_close_reconciliation_symbols = list(
         local_state.get("pending_close_reconciliation_symbols") or []
@@ -9559,7 +9562,10 @@ def _build_conclusion(
     snapshot_evidence: dict[str, Any],
     exchange_truth: dict[str, Any],
     production_acceptance_gate: dict[str, Any] | None = None,
+    event_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    event_coverage = event_coverage if isinstance(event_coverage, dict) else {}
+    event_coverage_complete = bool(event_coverage.get("complete", True))
     gate_failed = (
         production_acceptance_gate is not None
         and production_acceptance_gate.get("gate_passed") is False
@@ -9588,8 +9594,12 @@ def _build_conclusion(
         and not state_consistency["state_mismatch"]
         and not current_order_errors
     ):
-        status = "healthy"
-        risk = "low"
+        status = (
+            "healthy"
+            if event_coverage_complete
+            else "healthy_with_incomplete_event_coverage"
+        )
+        risk = "low" if event_coverage_complete else "medium"
     elif health["critical_count"] > 0:
         status = "unhealthy"
         risk = "high"
@@ -9633,6 +9643,8 @@ def _build_conclusion(
         )
     if evidence_completeness["overall"] != "complete":
         summary_parts.append("evidence: {}".format(evidence_completeness["overall"]))
+    if not event_coverage_complete:
+        summary_parts.append("event coverage incomplete; logs cannot prove no anomaly")
     if gate_failed:
         summary_parts.append(
             "production acceptance gate failed: {}".format(
@@ -9665,7 +9677,11 @@ def _build_conclusion(
             "Hyperliquid USDC present but admission margin view reads zero"
         )
 
-    summary = "; ".join(summary_parts) if summary_parts else "no issues detected"
+    summary = (
+        "; ".join(summary_parts)
+        if summary_parts
+        else "no issues detected"
+    )
 
     next_actions: list[str] = []
     if state_consistency.get("local_open_exchange_flat"):
@@ -9690,6 +9706,8 @@ def _build_conclusion(
             next_actions.append("exchange truth not available — check network/credentials")
     if evidence_completeness["overall"] in ("partial", "missing"):
         next_actions.append("collect full exchange error bodies (raw_body, exchange_code)")
+    if not event_coverage_complete:
+        next_actions.append("increase event coverage before declaring the live path verified")
     if current_order_errors:
         top = _build_top_exchange_errors(current_order_errors)
         for t in top[:3]:
@@ -10138,9 +10156,18 @@ def run_diagnose(
     evidence_completeness = _build_evidence_completeness(
         order_errors, state_consistency, exchange_truth,
     )
+    event_coverage = {
+        "complete": not bool(event_scan_meta.get("event_scan_truncated")),
+        "event_scan_truncated": bool(event_scan_meta.get("event_scan_truncated")),
+        "events_before_cap": int(event_scan_meta.get("events_before_cap", 0) or 0),
+        "events_dropped_by_cap": int(
+            event_scan_meta.get("events_dropped_by_cap", 0) or 0
+        ),
+    }
     conclusion = _build_conclusion(
         health, state_consistency, evidence_completeness, order_errors,
         l2_evidence, snapshot_evidence, exchange_truth, production_acceptance_gate,
+        event_coverage,
     )
 
     event_counts: dict[str, int] = {}
@@ -10245,6 +10272,7 @@ def run_diagnose(
             "events_dropped_by_cap": int(
                 event_scan_meta.get("events_dropped_by_cap", 0) or 0
             ),
+            "event_coverage": event_coverage,
             "since_deploy_time_filtered": bool(
                 event_scan_meta.get("since_deploy_time_filtered")
             ),

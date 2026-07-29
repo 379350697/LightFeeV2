@@ -16,6 +16,8 @@ from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
     close_reconciliation_exchange_truth_clean,
+    close_reconciliation_exchange_truth_mentions_scope,
+    close_reconciliation_legacy_terminal_receipt,
     entry_admission_aggregation_key,
     entry_admission_blocks_candidate,
     entry_route_key,
@@ -1268,29 +1270,36 @@ class EntryGateRuntime:
                 return False, "pending_close_reconciliation_invalid"
             if (pc_long_s == long_v and pc_short_s == short_v) or \
                (pc_long_s == short_v and pc_short_s == long_v):
+                current_truth = getattr(
+                    self.ctx,
+                    "_last_recovery_exchange_truth",
+                    None,
+                )
+                # Legacy terminal rows are normalized on state load.  They may
+                # contain only the historic aggregate receipt, which is a
+                # compatibility input for an accounting-only row—not general
+                # current exchange truth.
                 if (
                     rec.get("accounting_only_backfill") is True
-                    and rec.get("blocking_trading") is False
-                    and close_reconciliation_exchange_truth_clean(
+                    and not close_reconciliation_exchange_truth_clean(
                         rec,
-                        current_exchange_truth=getattr(
-                            self.ctx,
-                            "_last_recovery_exchange_truth",
-                            None,
-                        ),
+                        current_exchange_truth=current_truth,
+                    )
+                    and not close_reconciliation_exchange_truth_mentions_scope(
+                        rec,
+                        current_truth,
                     )
                 ):
-                    continue
+                    current_truth = (
+                        close_reconciliation_legacy_terminal_receipt(rec)
+                        or current_truth
+                    )
                 contract = classify_close_reconciliation_state(
                     rec,
                     current_exchange_truth_clean=(
                         close_reconciliation_exchange_truth_clean(
                             rec,
-                            current_exchange_truth=getattr(
-                                self.ctx,
-                                "_last_recovery_exchange_truth",
-                                None,
-                            ),
+                            current_exchange_truth=current_truth,
                         )
                     ),
                 )

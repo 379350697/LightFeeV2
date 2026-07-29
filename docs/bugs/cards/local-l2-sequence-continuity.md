@@ -87,3 +87,16 @@ Last-good / quote fallback rules:
 8. If venue-scope admission cooldown is active, confirm degraded-venue candidates
    are pruned before Local-L2/ws-bbo budget allocation.
 9. Closure requires local harness plus cloud classification showing no unexplained entry-blocking Local-L2 samples.
+
+## CL-163 Evidence Boundary
+
+Aster continues to rebuild only from its documented Binance-compatible `pu/u`
+continuity rule.  The additional instrumentation is limited to subscription
+ACK, snapshot synchronization, buffered replay, rebuild reason, and
+venue-symbol backoff counters.  It does not widen acceptable sequence gaps or
+turn incomplete sequence evidence into readiness.
+
+The final entry gate preserves `missing_book`, true stale-book, sequence-gap,
+and true clock-skew causes.  The runtime obtains time after awaited L2 work to
+avoid falsely classifying scheduling delay as clock skew.  CL-163 is local
+verified; deployment pending.

@@ -860,6 +860,127 @@ async def test_terminal_flat_accounting_gap_archives_expired_candidates_after_fr
     ]
 
 
+@pytest.mark.asyncio
+async def test_accounting_only_backfill_skips_global_truth_refresh():
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth())
+    ctx.state.tick_count = 2
+    reconciliation = {
+        "position_id": "legacy-lab",
+        "symbol": "LABUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "next_attempt_ms": 1001,
+        "long_venue": Venue.BITGET.value,
+        "short_venue": Venue.OKX.value,
+        "accounting_only_backfill": True,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+        "long_legs": [{
+            "venue": Venue.BITGET.value,
+            "order_id": "late-statement",
+            "statement_probe_candidate": True,
+        }],
+        "short_legs": [],
+        "exchange_truth": _pair_scoped_flat_account_truth(
+            symbol="LABUSDT",
+            long_venue=Venue.BITGET.value,
+            short_venue=Venue.OKX.value,
+        ),
+    }
+    ctx.state.pending_close_reconciliations.append(reconciliation)
+
+    await CloseRuntime(ctx=ctx)._process_pending_close_reconciliations(now_ms=1000)
+
+    assert ctx.collector_calls == []
+    retained = ctx.state.pending_close_reconciliations[0]
+    assert retained["pending_backfill"] is True
+    assert retained["blocking_trading"] is False
+
+
+def test_current_pair_truth_falls_back_after_noncovering_recovery_truth():
+    ctx = SimpleNamespace(
+        _last_recovery_exchange_truth={
+            "positions": [{"venue": "binance", "symbol": "OTHERUSDT", "quantity": 0}],
+            "open_orders": [],
+        },
+        journal=None,
+    )
+    runtime = CloseRuntime(ctx=ctx)
+    scoped = _pair_scoped_flat_account_truth(
+        symbol="LABUSDT",
+        long_venue=Venue.BITGET.value,
+        short_venue=Venue.OKX.value,
+    )
+    runtime._close_reconciliation_exchange_truth = scoped
+
+    assert runtime._current_exchange_truth_for_close_reconciliation({
+        "symbol": "LABUSDT",
+        "long_venue": Venue.BITGET.value,
+        "short_venue": Venue.OKX.value,
+    }) == scoped
+
+
+def test_close_runtime_never_uses_legacy_receipt_for_nonaccounting_close_work():
+    runtime = CloseRuntime(ctx=SimpleNamespace(
+        _last_recovery_exchange_truth=None,
+        journal=None,
+    ))
+    reconciliation = {
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "long_venue": Venue.BITGET.value,
+        "short_venue": Venue.OKX.value,
+        "pending_backfill": True,
+        "evidence_gap": True,
+        "exchange_truth": {
+            "truth_available": True,
+            "positions_flat": True,
+            "open_orders_flat": True,
+        },
+    }
+
+    assert runtime._current_exchange_truth_for_close_reconciliation(
+        reconciliation
+    ) is None
+
+
+def test_close_runtime_scoped_probe_failure_blocks_legacy_receipt_fallback():
+    runtime = CloseRuntime(ctx=SimpleNamespace(
+        _last_recovery_exchange_truth={
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": [
+                {
+                    "venue": Venue.BITGET.value,
+                    "symbol": "LABUSDT",
+                    "endpoint": "fetch_all_positions",
+                    "classification": "position_probe_unfiltered_failed",
+                    "error": "timeout",
+                },
+            ],
+        },
+        journal=None,
+    ))
+    reconciliation = {
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "long_venue": Venue.BITGET.value,
+        "short_venue": Venue.OKX.value,
+        "accounting_only_backfill": True,
+        "pending_backfill": True,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "exchange_truth": {
+            "truth_available": True,
+            "positions_flat": True,
+            "open_orders_flat": True,
+        },
+    }
+
+    assert runtime._current_exchange_truth_for_close_reconciliation(
+        reconciliation
+    ) is None
+
+
 class _PendingCloseArchiveJournal:
     def __init__(self):
         self.records = []
@@ -1101,6 +1222,52 @@ def test_accounting_only_backfill_does_not_block_entry_gate():
 
     assert allowed is True
     assert reason == ""
+
+
+def test_accounting_only_backfill_still_blocks_on_current_scoped_dirty_truth():
+    class _Candidate:
+        symbol = "LABUSDT"
+        long_venue = Venue.BITGET.value
+        short_venue = Venue.OKX.value
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.state = EngineState()
+    ctx._last_recovery_exchange_truth = {
+        "positions": [{
+            "venue": Venue.BITGET.value,
+            "symbol": "LABUSDT",
+            "quantity": 1.0,
+        }],
+        "open_orders": [],
+    }
+    ctx.state.pending_close_reconciliations = [{
+        "position_id": "entry-lab",
+        "symbol": "LABUSDT",
+        "accounting_only_backfill": True,
+        "pending_backfill": True,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "position_snapshot": {
+            "long_venue": Venue.BITGET.value,
+            "short_venue": Venue.OKX.value,
+        },
+        "original_payload": {
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+            },
+        },
+    }]
+
+    allowed, reason = EntryGateRuntime(ctx)._gate_pending_close_reconciliation(
+        _Candidate()
+    )
+
+    assert allowed is False
+    assert reason == "pending_close_reconciliation_conflict"
 
 
 @pytest.mark.asyncio

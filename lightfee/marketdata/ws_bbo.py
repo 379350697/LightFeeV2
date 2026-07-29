@@ -54,6 +54,19 @@ class RestTopBookQuoteResult:
     exchange_event_at_ms: int = 0
     attempt_interval_outcome: str = ""
     error: str = ""
+    # Timings are transport facts for entry-evidence diagnostics.  They never
+    # contain request URLs, query parameters, bodies, auth, or raw responses.
+    queue_ms: int = 0
+    http_ms: int = 0
+    validate_ms: int = 0
+    total_ms: int = 0
+    generation: str = ""
+
+
+def _elapsed_ms(started_at: float) -> int:
+    """Return a non-negative monotonic elapsed duration in whole milliseconds."""
+
+    return max(int((time.monotonic() - started_at) * 1000), 0)
 
 
 class VenueBboCache:
@@ -327,6 +340,10 @@ class RestTopBookQuoteRefresher:
         *,
         now_ms: int,
     ) -> RestTopBookQuoteResult:
+        started_at = time.monotonic()
+        queue_ms = 0
+        http_ms = 0
+        validate_ms = 0
         metadata = self._quote_request_metadata(venue_key, symbol_key)
         rejected = self._begin_attempt(
             venue_key,
@@ -356,15 +373,19 @@ class RestTopBookQuoteRefresher:
                 raw = cached_info.payload
                 received_at_ms = cached_info.received_at_ms
             else:
+                queue_started_at = time.monotonic()
                 async with self._global_async_semaphore, venue_semaphore:
+                    queue_ms = _elapsed_ms(queue_started_at)
                     if info_coordinator is not None:
                         await info_coordinator.async_wait_until_ready(json_body)
+                    http_started_at = time.monotonic()
                     response = await client.request(
                         method,
                         url,
                         timeout=self._timeout_s,
                         **request_kwargs,
                     )
+                    http_ms = _elapsed_ms(http_started_at)
                 if info_coordinator is not None:
                     info_coordinator.record_http_response(
                         response.status_code,
@@ -380,24 +401,34 @@ class RestTopBookQuoteRefresher:
                         raw,
                         received_at_ms=received_at_ms,
                     )
+            validate_started_at = time.monotonic()
             quote = self._quote_from_raw(
                 venue_key,
                 symbol_key,
                 raw,
                 received_at_ms=received_at_ms,
             )
+            validate_ms = _elapsed_ms(validate_started_at)
         except Exception as exc:
             return self._error_result(
                 venue_key,
                 symbol_key,
                 metadata=metadata,
                 exc=exc,
+                queue_ms=queue_ms,
+                http_ms=http_ms,
+                validate_ms=validate_ms,
+                total_ms=_elapsed_ms(started_at),
             )
         return self._resolved_result(
             venue_key,
             symbol_key,
             metadata=metadata,
             quote=quote,
+            queue_ms=queue_ms,
+            http_ms=http_ms,
+            validate_ms=validate_ms,
+            total_ms=_elapsed_ms(started_at),
         )
 
     def refresh_quote(
@@ -483,6 +514,10 @@ class RestTopBookQuoteRefresher:
         *,
         metadata: dict[str, str],
         exc: Exception,
+        queue_ms: int = 0,
+        http_ms: int = 0,
+        validate_ms: int = 0,
+        total_ms: int = 0,
     ) -> RestTopBookQuoteResult:
         response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
         status = int(response.status_code if response is not None else 0)
@@ -501,6 +536,10 @@ class RestTopBookQuoteRefresher:
             body_excerpt=body,
             outcome=outcome,
             error=f"{type(exc).__name__}: {exc}"[:240],
+            queue_ms=max(int(queue_ms), 0),
+            http_ms=max(int(http_ms), 0),
+            validate_ms=max(int(validate_ms), 0),
+            total_ms=max(int(total_ms), 0),
         )
 
     @staticmethod
@@ -510,6 +549,10 @@ class RestTopBookQuoteRefresher:
         *,
         metadata: dict[str, str],
         quote: TopBookQuote | None,
+        queue_ms: int = 0,
+        http_ms: int = 0,
+        validate_ms: int = 0,
+        total_ms: int = 0,
     ) -> RestTopBookQuoteResult:
         if quote is None:
             return RestTopBookQuoteResult(
@@ -519,6 +562,10 @@ class RestTopBookQuoteRefresher:
                 endpoint=metadata.get("endpoint", ""),
                 url=metadata.get("url", ""),
                 outcome="invalid_quote",
+                queue_ms=max(int(queue_ms), 0),
+                http_ms=max(int(http_ms), 0),
+                validate_ms=max(int(validate_ms), 0),
+                total_ms=max(int(total_ms), 0),
             )
         return RestTopBookQuoteResult(
             venue=venue,
@@ -533,6 +580,13 @@ class RestTopBookQuoteRefresher:
             observed_at_ms=int(quote.observed_at_ms or 0),
             received_at_ms=int(quote.received_at_ms or 0),
             exchange_event_at_ms=int(quote.exchange_event_at_ms or 0),
+            queue_ms=max(int(queue_ms), 0),
+            http_ms=max(int(http_ms), 0),
+            validate_ms=max(int(validate_ms), 0),
+            total_ms=max(int(total_ms), 0),
+            generation=(
+                f"{venue}:{symbol}:{int(quote.received_at_ms or 0)}"
+            ),
         )
 
     def _quote_request_metadata(self, venue: str, symbol: str) -> dict[str, str]:

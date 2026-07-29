@@ -45,6 +45,27 @@ def _compact_scope(scope: dict[str, Any]) -> dict[str, Any]:
         "event_file_count": len(scope.get("event_files", []) or []),
         "event_scan_truncated": _as_bool(scope, "event_scan_truncated"),
         "events_dropped_by_cap": _as_int(scope, "events_dropped_by_cap"),
+        "event_coverage": {
+            "complete": _as_bool(
+                scope.get("event_coverage", {})
+                if isinstance(scope.get("event_coverage"), dict)
+                else {},
+                "complete",
+                default=not _as_bool(scope, "event_scan_truncated"),
+            ),
+            "events_before_cap": _as_int(
+                scope.get("event_coverage", {})
+                if isinstance(scope.get("event_coverage"), dict)
+                else {},
+                "events_before_cap",
+            ),
+            "events_dropped_by_cap": _as_int(
+                scope.get("event_coverage", {})
+                if isinstance(scope.get("event_coverage"), dict)
+                else {},
+                "events_dropped_by_cap",
+            ),
+        },
         "since_deploy_time_filtered": _as_bool(
             scope,
             "since_deploy_time_filtered",

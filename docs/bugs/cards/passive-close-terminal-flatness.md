@@ -205,6 +205,26 @@ phase (`long+buy`, `short+sell`).
 For new recurrences, start from `lightfee/engine/business_contract.py` before
 adding another passive-close or diagnose-local terminality predicate.
 
+### CL-163 Contract Boundary
+
+`normalize_close_reconciliation_record(...)` is the only normalization boundary
+for restored and newly produced terminal accounting records.  A row marked
+`accounting_only_backfill` or `terminal_flat_accounting_gap` must become
+`pending_backfill=true`, `blocking_trading=false`, and retain the terminal
+marker.  This is a pure copy transform: it does not perform I/O or mutate the
+caller.
+
+The entry gate, close runtime, loop control, and diagnose consumers must use
+the same contract classification.  Clean pair-scoped exchange position truth
+plus no open orders yields terminal-flat accounting work, not a trade blocker.
+Dirty or unavailable truth remains a blocker.  A stale recovery result that
+does not mention the pair must not shadow a newer pair-scoped fallback.
+
+Terminal accounting-only retries are a retained, low-frequency evidence path;
+they must not select all-account/all-venue recovery collection.  Archive
+retention preserves evidence and any later statement backfill; it is not a
+license to delete live history.  CL-163 is local verified; deployment pending.
+
 Diagnostic visibility is part of the same terminal-truth contract. Resolved
 close/order artifacts such as Binance close `-2022`, Binance close post-only
 `-5022`, Bybit duplicate `110072`, ACK-only, and zero-fill may be

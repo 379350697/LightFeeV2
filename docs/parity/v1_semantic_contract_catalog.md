@@ -276,7 +276,7 @@
 - **required state fields:** `local_l2_books: dict[Symbol, LocalBook]`, `active_book_budget`, `sequence_gaps: list`
 - **required journal/event kinds:** `local_l2_bootstrap`, `local_l2_sequence_gap`, `local_l2_checksum_failure`, `local_l2_stale_book`
 - **focused test path:** `tests/marketdata/test_local_l2_runtime_targets.py::test_bootstrap_and_resilience`
-- **deviation id:** —
+- **deviation id:** CL-163 diagnostic extension: preserve `missing_book`, true `stale`, `sequence_gap`, and true `clock_skew` through the final entry gate; time is read after awaits so scheduler delay is not a false clock skew. Aster keeps documented `pu/u` rebuild semantics and adds only ACK/snapshot/buffer/rebuild/backoff evidence.
 
 ---
 
@@ -343,7 +343,7 @@
 - **required state fields:** `CloseExecution.legs`, `.chunks`, `.dust`, `.pnl_attribution`
 - **required journal/event kinds:** `close_submitted`, `close_filled`, `close_partial`, `close_dust`, `close_final`, `close_pnl_attributed`
 - **focused test path:** `tests/engine/test_close_semantic_parity.py::test_close_execution_semantics`
-- **deviation id:** —
+- **deviation id:** CL-163 normalizes restored and new terminal accounting-only reconciliation records in the shared business contract. Clean pair-scoped position-flat plus no-open-order truth releases trading risk while retaining accounting backfill; unclean truth blocks. Terminal accounting retries avoid broad recovery collection and retain archival evidence.
 
 ---
 
@@ -445,7 +445,7 @@
 - **required state fields:** `JournalRecord.seq`, `.run_id`, `.ts`, `.kind`, `.payload`
 - **required journal/event kinds:** all event kinds listed in this catalog
 - **focused test path:** `tests/persistence/test_journal_event_semantics.py::test_journal_envelope_and_durability`
-- **deviation id:** —
+- **deviation id:** CL-163 adds allowlisted final BBO/OI timing and result fields (queue, HTTP, validation, total, generation, age, outcome, rejection) and a diagnose incomplete-event-coverage conclusion. URLs, query/body data, signatures, credentials, and full snapshots are excluded from this evidence shape.
 
 ---
 

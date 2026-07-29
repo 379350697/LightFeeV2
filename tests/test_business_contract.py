@@ -12,6 +12,7 @@ from lightfee.engine.business_contract import (
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
     entry_market_evidence_contract,
+    normalize_close_reconciliation_record,
     passive_close_final_truth_contract,
     quote_rewarm_handoff_contract,
 )
@@ -368,6 +369,33 @@ def test_close_reconciliation_state_releases_terminal_flat_accounting_gap():
     assert result["blocks_entry"] is False
     assert result["archive_reconciliation"] is True
     assert result["reason"] == "missing_short_close_trade_statement"
+
+
+def test_terminal_accounting_record_normalizes_and_requires_clean_scoped_truth():
+    legacy = {
+        "position_id": "legacy-lab",
+        "symbol": "LABUSDT",
+        "long_venue": "bitget",
+        "short_venue": "okx",
+        "accounting_only_backfill": True,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+    }
+
+    normalized = normalize_close_reconciliation_record(legacy)
+
+    assert normalized is not legacy
+    assert normalized["pending_backfill"] is True
+    assert normalized["blocking_trading"] is False
+    assert normalized["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert classify_close_reconciliation_state(
+        normalized,
+        current_exchange_truth_clean=True,
+    )["blocks_entry"] is False
+    assert classify_close_reconciliation_state(
+        normalized,
+        current_exchange_truth_clean=False,
+    )["blocks_entry"] is True
 
 
 def test_close_reconciliation_state_releases_accepted_order_truth_gap_when_flat():

@@ -2092,7 +2092,19 @@ class TestPlannerDispatchIntegration:
         async def passthrough(candidates, **_kwargs):
             return list(candidates)
 
-        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 5_000)
+        clock_calls: list[int] = []
+
+        def advancing_clock() -> int:
+            # L2 activation may await.  Final readiness must use a fresh wall
+            # clock rather than the 10s timestamp captured before activation.
+            value = 10_000 if not clock_calls else 17_000
+            clock_calls.append(value)
+            return value
+
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            advancing_clock,
+        )
         monkeypatch.setattr(runtime, "_ensure_l2_active_for_candidates", ensure_l2)
         monkeypatch.setattr(runtime, "_sync_local_l2_data", sync_l2)
         monkeypatch.setattr(
@@ -2132,8 +2144,9 @@ class TestPlannerDispatchIntegration:
             price_hints={},
         )
 
-        assert l2_activation_calls == [(["BTCUSDT"], 5_000, 1)]
-        assert l2_sync_calls == [5_000]
+        assert l2_activation_calls == [(["BTCUSDT"], 10_000, 1)]
+        assert l2_sync_calls == [17_000]
+        assert clock_calls[:3] == [10_000, 17_000, 17_000]
         assert quote_calls == []
         assert oi_calls == []
         assert runtime.state.last_scan["no_entry_reason"] == (
@@ -2147,6 +2160,45 @@ class TestPlannerDispatchIntegration:
         assert no_entry[-1]["selection_blockers"] == {
             "entry_waiting_for_finalization_window_too_early": 1
         }
+
+    def test_local_l2_missing_book_preserves_final_rejection_reason(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        monkeypatch.setattr(
+            dispatch,
+            "_local_l2_effective_enabled",
+            lambda: True,
+        )
+
+        blocked = dispatch._entry_local_l2_gate_blocked(
+            candidate=candidate,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            now_ms=17_000,
+        )
+
+        assert blocked is True
+        assert runtime._last_entry_dispatch_block_reason == "missing_book"
+        decisions = [
+            row["payload"]
+            for row in tmp_journal.read_all()
+            if row["kind"] == "runtime.execution_l2_stale"
+        ]
+        assert {payload["l2_reason"] for payload in decisions} == {"missing_book"}
+        final_block = next(
+            row["payload"]
+            for row in tmp_journal.read_all()
+            if row["kind"] == "runtime.entry_blocked_local_l2_not_ready"
+        )
+        assert final_block["reason"] == "missing_book"
 
     @pytest.mark.asyncio
     async def test_live_dispatch_rejects_final_cross_venue_price_normalization_mismatch(

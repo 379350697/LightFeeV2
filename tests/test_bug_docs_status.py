@@ -62,6 +62,20 @@ def test_recent_deployed_clusters_do_not_remain_deploy_pending():
         assert "Status: local verified; deploy pending" not in section
 
 
+def test_cl163_is_local_only_and_scopes_the_six_venue_conclusion():
+    bug_index = BUG_INDEX.read_text()
+    daily = (ROOT / "docs/bugs/daily/2026-07-29.md").read_text()
+
+    index_row = next(line for line in bug_index.splitlines() if "| CL-163 |" in line)
+    section_start = daily.index("## Cluster CL-163")
+    section = daily[section_start:]
+
+    assert "local verified; deployment pending" in index_row
+    assert "Status: local verified; deployment pending" in section
+    assert "Six-venue conclusion: Binance/Bybit/Aster/OKX/Bitget/Gate" in section
+    assert "deployed/cloud verified" not in section
+
+
 def test_bug_ledger_checker_json_reports_clean_governance():
     result = subprocess.run(
         [sys.executable, str(CHECK_SCRIPT), "--json"],

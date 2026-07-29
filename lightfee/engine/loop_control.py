@@ -127,15 +127,6 @@ def _pending_close_reconciliation_summary(raw: Any) -> dict[str, Any]:
         ):
             terminal_flat_count += 1
             continue
-        if (
-            item.get("accounting_only_backfill") is True
-            and item.get("blocking_trading") is False
-            and str(item.get("close_reconciliation_state") or "")
-            == "terminal_flat_accounting_gap"
-        ):
-            terminal_flat_count += 1
-            continue
-
         contract = classify_close_reconciliation_state(
             item,
             current_exchange_truth_clean=close_reconciliation_exchange_truth_clean(

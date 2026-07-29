@@ -6169,6 +6169,7 @@ class LiveRuntime:
                     now_ms,
                     tracked_opportunities=tracked,
                 )
+                now_ms = wall_clock_now_ms()
                 await self._sync_local_l2_data(now_ms, scan_promoted=True)
                 self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
 
@@ -6337,7 +6338,9 @@ class LiveRuntime:
                 self._invalidate_entry_account_truth_generation()
                 last_reason = "entries_dispatched"
             else:
-                last_reason = "entry_final_revalidation_failed"
+                last_reason = str(
+                    getattr(self, "_last_entry_dispatch_block_reason", "") or ""
+                ) or "entry_final_revalidation_failed"
             if len(self.state.pending_entries) > pending_before:
                 break
 
@@ -7000,7 +7003,7 @@ class LiveRuntime:
                 scan_promoted=scan_promoted,
             )
             if dispatched > 0:
-                self.local_l2_runtime.sync(now_ms)
+                self.local_l2_runtime.sync(self._entry_wall_clock_now_ms())
         except Exception as e:
             self.journal.append(
                 "runtime.local_l2_sync_error",
