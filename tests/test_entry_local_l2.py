@@ -2801,6 +2801,84 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert LocalL2BookKey("bybit", "NOOIUSDT") not in rt.local_l2_runtime.books
 
     @pytest.mark.asyncio
+    async def test_dynamic_l2_activation_starts_selected_primary_before_oi_refresh(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        """The primary's L2 lifecycle cannot wait for its final OI proof.
+
+        The ranked entry path starts L2, then concurrently performs targeted
+        quote/OI revalidation, and finally applies the OI + L2 entry gates.
+        Requiring OI before creating the primary's book permanently leaves the
+        final L2 gate at ``missing_book`` whenever the sidecar OI is stale.
+        """
+        from lightfee.core.domain import Venue
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+        from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
+
+        class Adapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                raise AssertionError("background bootstrap is stubbed in this test")
+
+        rt = runtime_with_l2
+        rt.journal.open()
+        rt._venue_adapters = {
+            Venue.BINANCE: Adapter(),
+            Venue.BYBIT: Adapter(),
+        }
+        bootstrap_calls: list[tuple[str, tuple[str, ...]]] = []
+        async def preserve_catalog(
+            _venue,
+            _adapter,
+            symbols,
+            *,
+            skip_event_kind,
+        ):
+            return list(symbols)
+
+        monkeypatch.setattr(rt, "_filter_symbols_supported_by_venue", preserve_catalog)
+        monkeypatch.setattr(
+            rt.l2_data_plane,
+            "start_background_bootstrap",
+            lambda **kwargs: bootstrap_calls.append(
+                (kwargs["venue"], tuple(kwargs["symbols"]))
+            ),
+        )
+        candidate = self._make_real_candidate(
+            symbol="NOOIUSDT",
+            pair_id="nooiusdt:binance->bybit",
+            first_funding_timestamp_ms=20_000,
+        )
+        tracked = [
+            TrackedOpportunity(
+                pair_id=candidate.pair_id,
+                symbol=candidate.symbol,
+                long_venue=candidate.long_venue,
+                short_venue=candidate.short_venue,
+                ranking_edge_bps=candidate.ranking_edge_bps,
+                class_=TrackedOpportunityClass.PRIMARY,
+            )
+        ]
+
+        try:
+            await rt._ensure_l2_active_for_candidates(
+                [candidate],
+                now_ms=10_000,
+                tracked_opportunities=tracked,
+            )
+        finally:
+            rt.journal.close()
+
+        assert set(bootstrap_calls) == {
+            ("binance", ("NOOIUSDT",)),
+            ("bybit", ("NOOIUSDT",)),
+        }
+        assert LocalL2BookKey("binance", "NOOIUSDT") in rt.local_l2_runtime.books
+        assert LocalL2BookKey("bybit", "NOOIUSDT") in rt.local_l2_runtime.books
+
+    @pytest.mark.asyncio
     async def test_dynamic_l2_activation_registers_ws_for_hot_ws_authoritative_books(
         self, runtime_with_l2, monkeypatch,
     ):

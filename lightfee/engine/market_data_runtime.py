@@ -1290,14 +1290,36 @@ class MarketDataRuntime:
                     return False
             return True
 
-        oi_valid_candidates: list[Any] = []
+        # The selected V1 primary must begin its L2 lifecycle before the
+        # candidate-scoped OI refresh finishes.  OI remains a mandatory final
+        # entry proof; using it as a prerequisite for the subscription creates
+        # a causal deadlock: the ranked flow activates L2, then refreshes OI,
+        # then requires a ready L2 book.  A primary whose sidecar OI is stale
+        # therefore never creates a book even when the targeted OI refresh
+        # succeeds a few milliseconds later.
+        #
+        # Keep the bounded OI-qualified prewarm pool for non-primary routes.
+        # This only promotes the normal selected primary, not arbitrary
+        # candidates without OI proof.
+        primary_pair_ids = {
+            str(getattr(opportunity, "pair_id", "") or "").strip().lower()
+            for opportunity in tracked_opportunities
+            if getattr(getattr(opportunity, "class_", None), "value", "")
+            == "primary_tracked"
+        }
+        activation_candidates: list[Any] = []
+        oi_valid_count = 0
         for candidate in candidates:
-            if not candidate_oi_allows_l2(candidate):
-                continue
-            oi_valid_candidates.append(candidate)
-            if len(oi_valid_candidates) >= 3:
-                break
-        candidates = oi_valid_candidates
+            pair_id = self._candidate_pair_id(candidate).strip().lower()
+            is_tracked_primary = bool(pair_id) and pair_id in primary_pair_ids
+            if not is_tracked_primary:
+                if not candidate_oi_allows_l2(candidate):
+                    continue
+                if oi_valid_count >= 3:
+                    continue
+                oi_valid_count += 1
+            activation_candidates.append(candidate)
+        candidates = activation_candidates
 
         def remember_key(venue, symbol, pool: L2PoolAssignment) -> LocalL2BookKey | None:
             ven_str = venue_name(venue)
