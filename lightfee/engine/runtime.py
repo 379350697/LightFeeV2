@@ -6125,6 +6125,53 @@ class LiveRuntime:
         dispatched = 0
         last_reason = "no_tradeable_candidate"
 
+        # V1 starts the bounded local-L2 lifecycle in its prewarm window, but
+        # does not turn that into an entry attempt until the narrower final
+        # entry window.  The ranked flow used to activate L2, revalidate BBO,
+        # and refresh OI once per candidate before checking that final window.
+        # Apart from doing needless live I/O for routes that cannot yet enter,
+        # that let the full discovery frontier monopolize the L2 data plane.
+        # Allocate the V1 primary/shadow scope once and only for candidates
+        # that are actually eligible for the L2 prewarm lifecycle.
+        if self._entry_local_l2_effective_enabled():
+            now_ms = wall_clock_now_ms()
+            prewarm_window_ms = max(
+                int(
+                    self.config.strategy.entry_local_l2_prewarm_window_secs
+                    or 0
+                ),
+                0,
+            ) * 1_000
+            prewarm_candidates: list = []
+            for candidate in candidates:
+                try:
+                    first_funding_timestamp_ms = int(
+                        getattr(candidate, "first_funding_timestamp_ms", 0)
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    first_funding_timestamp_ms = 0
+                remaining_ms = first_funding_timestamp_ms - now_ms
+                if remaining_ms <= 0:
+                    continue
+                if (
+                    prewarm_window_ms > 0
+                    and remaining_ms > prewarm_window_ms
+                ):
+                    continue
+                prewarm_candidates.append(candidate)
+            if prewarm_candidates:
+                tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
+                    prewarm_candidates
+                )
+                await self._ensure_l2_active_for_candidates(
+                    tracked_candidates,
+                    now_ms,
+                    tracked_opportunities=tracked,
+                )
+                await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
+
         for source_candidate in candidates:
             if remaining_slots <= 0 or not can_enter_new_positions(self.state):
                 break
@@ -6148,17 +6195,23 @@ class LiveRuntime:
             candidate = candidate_rows[0]
 
             now_ms = wall_clock_now_ms()
-            if self._entry_local_l2_effective_enabled():
-                tracked, _tracked_candidates = self._select_v1_entry_tracked_scope(
-                    [candidate]
+            try:
+                first_funding_timestamp_ms = int(
+                    getattr(candidate, "first_funding_timestamp_ms", 0) or 0
                 )
-                await self._ensure_l2_active_for_candidates(
-                    [candidate],
-                    now_ms,
-                    tracked_opportunities=tracked,
+            except (TypeError, ValueError):
+                first_funding_timestamp_ms = 0
+            finalization_blocker = self._entry_finalization_window_blocker(
+                first_funding_timestamp_ms,
+                now_ms,
+            )
+            if finalization_blocker:
+                selection_blockers[finalization_blocker] += 1
+                candidate_blockers[self._candidate_pair_id(candidate)] = (
+                    finalization_blocker
                 )
-                await self._sync_local_l2_data(now_ms, scan_promoted=True)
-                self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
+                last_reason = "candidate_final_selection_blocked"
+                continue
 
             quote_task = asyncio.create_task(
                 self._entry_quote_revalidate_for_candidates(

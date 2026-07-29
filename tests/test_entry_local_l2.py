@@ -5011,7 +5011,7 @@ class TestEntryReadinessProviderFactory:
                 max_concurrent_positions=1,
                 min_scan_minutes_before_funding=0,
                 max_scan_minutes_before_funding=10,
-                entry_window_secs=60,
+                entry_window_secs=300,
             ),
             persistence=PersistenceConfig(
                 event_log_path=str(tmp_path / "events.jsonl"),

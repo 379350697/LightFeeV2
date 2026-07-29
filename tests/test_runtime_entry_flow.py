@@ -2044,6 +2044,111 @@ class TestPlannerDispatchIntegration:
             ), now_ms=5_000)
 
     @pytest.mark.asyncio
+    async def test_ranked_flow_only_prewarms_l2_before_finalization(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        """V1 prewarm may start bounded L2, never quote/OI revalidation early."""
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        config.strategy.entry_window_secs = 300
+        config.strategy.entry_local_l2_prewarm_window_secs = 900
+        config.strategy.min_scan_minutes_before_funding = 3
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.last_scan = {}
+        candidate = self._candidate()
+
+        l2_activation_calls: list[tuple[list[str], int, int]] = []
+        l2_sync_calls: list[int] = []
+        quote_calls: list[str] = []
+        oi_calls: list[str] = []
+
+        async def ensure_l2(candidates, now_ms, *, tracked_opportunities=None):
+            l2_activation_calls.append(
+                (
+                    [row.symbol for row in candidates],
+                    now_ms,
+                    len(list(tracked_opportunities or [])),
+                )
+            )
+
+        async def sync_l2(now_ms, *, scan_promoted=False):
+            assert scan_promoted is True
+            l2_sync_calls.append(now_ms)
+
+        async def quote_truth(candidates, **_kwargs):
+            quote_calls.extend(row.symbol for row in candidates)
+            return {}, {"resolved_count": len(candidates)}
+
+        async def refresh_oi(candidates, **_kwargs):
+            oi_calls.extend(row.symbol for row in candidates)
+            return {"resolved_count": len(candidates)}
+
+        async def passthrough(candidates, **_kwargs):
+            return list(candidates)
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 5_000)
+        monkeypatch.setattr(runtime, "_ensure_l2_active_for_candidates", ensure_l2)
+        monkeypatch.setattr(runtime, "_sync_local_l2_data", sync_l2)
+        monkeypatch.setattr(
+            runtime,
+            "_refresh_entry_l2_session_readiness",
+            lambda _now_ms: None,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_supported_by_venue_catalog",
+            passthrough,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_admission",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_balance_admission",
+            passthrough,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_entry_quote_revalidate_for_candidates",
+            quote_truth,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_refresh_entry_candidate_open_interest_evidence",
+            refresh_oi,
+        )
+
+        await runtime._run_ranked_candidate_entry_flow(
+            [candidate],
+            snapshot=SimpleNamespace(quotes={}),
+            price_hints={},
+        )
+
+        assert l2_activation_calls == [(["BTCUSDT"], 5_000, 1)]
+        assert l2_sync_calls == [5_000]
+        assert quote_calls == []
+        assert oi_calls == []
+        assert runtime.state.last_scan["no_entry_reason"] == (
+            "candidate_final_selection_blocked"
+        )
+        no_entry = [
+            row["payload"]
+            for row in runtime.journal.read_all()
+            if row["kind"] == "scan.no_entry_ranked_candidates"
+        ]
+        assert no_entry[-1]["selection_blockers"] == {
+            "entry_waiting_for_finalization_window_too_early": 1
+        }
+
+    @pytest.mark.asyncio
     async def test_live_dispatch_rejects_final_cross_venue_price_normalization_mismatch(
         self, config, tmp_journal, monkeypatch
     ):
@@ -2837,6 +2942,8 @@ class TestPlannerDispatchIntegration:
         config.runtime.sidecar_snapshot_max_age_ms = 10_000
         config.runtime.max_market_age_ms = 10_000
         config.runtime.entry_account_truth_per_venue_timeout_ms = 1
+        config.strategy.entry_window_secs = 600
+        config.strategy.min_scan_minutes_before_funding = 0
         rank_one = self._candidate("BTCUSDT")
         rank_two = self._candidate("ETHUSDT")
         rank_two.long_venue = "aster"
@@ -2954,8 +3061,12 @@ class TestPlannerDispatchIntegration:
         runtime.state.lifecycle = EngineLifecycle.RUNNING
         runtime.state.risk_mode = GlobalRiskMode.RUNNING
         runtime.state.last_scan = {}
+        config.strategy.entry_window_secs = 600
+        config.strategy.min_scan_minutes_before_funding = 0
         rank_one = self._candidate("BTCUSDT")
         rank_two = self._candidate("ETHUSDT")
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
 
         restarted = EntryOpenInterestRefresher(targeted_budget_s=0.01)
         runtime.entry_open_interest_refresher = restarted
@@ -3147,6 +3258,8 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.runtime.sidecar_snapshot_max_age_ms = 10_000
         config.runtime.max_market_age_ms = 10_000
+        config.strategy.entry_window_secs = 600
+        config.strategy.min_scan_minutes_before_funding = 0
         runtime = LiveRuntime(
             config,
             venue_adapters={
