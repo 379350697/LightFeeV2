@@ -94,6 +94,22 @@ def test_generate_deploy_script_uses_ssh_port_2222(tmp_path, monkeypatch):
     assert "scp $SCP_OPTS" in script
 
 
+def test_deploy_sync_preserves_operator_backups_and_local_orchestration(tmp_path, monkeypatch):
+    _stub_manifest_generation(monkeypatch)
+
+    script = manifest.generate_deploy_script(
+        tmp_path,
+        "root@38.60.253.248",
+        "/opt/lightfee-v2",
+        ssh_port=2222,
+    )
+
+    assert manifest.should_exclude("config/live.toml.pre-before-release")
+    assert manifest.should_exclude(".dev-flow/runs/release/flow.md")
+    assert "--exclude 'config/live.toml.pre-*'" in script
+    assert "--exclude .dev-flow/" in script
+
+
 def test_generate_deploy_main_preserves_versioned_entrypoint(tmp_path, monkeypatch):
     _stub_manifest_generation(monkeypatch)
     entrypoint = tmp_path / "scripts" / "deploy.sh"
