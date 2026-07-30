@@ -265,6 +265,7 @@ def analyze_sidecar_snapshot(
     candidate_count = len(raw_candidates) if isinstance(raw_candidates, list) else 0
     blocked_candidate_count = 0
     declared_blocked_candidate_count = 0
+    waiting_for_funding_window_candidate_count = 0
     blocked_reason_counts: dict[str, int] = {}
     if isinstance(raw_candidates, list):
         for candidate in raw_candidates:
@@ -298,9 +299,30 @@ def analyze_sidecar_snapshot(
             if not reasons:
                 continue
             blocked_candidate_count += 1
-            for reason in set(reasons):
+            unique_reasons = set(reasons)
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("blocked") is True
+                and candidate.get("economics_complete") is True
+                and isinstance(candidate.get("economics_observed_at_ms"), int)
+                and not isinstance(candidate.get("economics_observed_at_ms"), bool)
+                and int(candidate["economics_observed_at_ms"]) > 0
+                and unique_reasons == {"outside_scan_window"}
+            ):
+                waiting_for_funding_window_candidate_count += 1
+            for reason in unique_reasons:
                 blocked_reason_counts[reason] = blocked_reason_counts.get(reason, 0) + 1
     unblocked_candidate_count = max(candidate_count - blocked_candidate_count, 0)
+    # V1 treats ``outside_scan_window`` as a normal temporal candidate state:
+    # a complete candidate has not entered the configured discovery horizon
+    # yet.  It is not evidence that the sidecar data plane is unhealthy.  A
+    # candidate with another reason remains a real admission/data failure;
+    # only a complete, timing-only candidate proves the runtime is simply
+    # waiting for the next valid scan window.
+    has_candidate_waiting_for_funding_window = (
+        directional_pair_count > 0
+        and waiting_for_funding_window_candidate_count > 0
+    )
     if (
         raw_schema_version not in {SNAPSHOT_SCHEMA_VERSION, 4}
         or missing_contract_fields
@@ -424,6 +446,7 @@ def analyze_sidecar_snapshot(
         directional_pair_count > 0
         and candidate_count > 0
         and unblocked_candidate_count == 0
+        and not has_candidate_waiting_for_funding_window
     ):
         fingerprints.append("funding_entry_readiness_no_unblocked_candidates")
 
@@ -469,7 +492,20 @@ def analyze_sidecar_snapshot(
             "declared_blocked_candidate_count": declared_blocked_candidate_count,
             "blocked_candidate_count": blocked_candidate_count,
             "unblocked_candidate_count": unblocked_candidate_count,
+            "waiting_for_funding_window_candidate_count": (
+                waiting_for_funding_window_candidate_count
+            ),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
+            "funding_entry_readiness_state": (
+                "ready"
+                if unblocked_candidate_count > 0 and not shared_contract_errors
+                else (
+                    "waiting_for_funding_window"
+                    if has_candidate_waiting_for_funding_window
+                    and not shared_contract_errors
+                    else "blocked"
+                )
+            ),
             "funding_entry_ready": (
                 unblocked_candidate_count > 0 and not shared_contract_errors
             ),

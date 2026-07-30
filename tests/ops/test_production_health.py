@@ -242,7 +242,10 @@ def test_snapshot_transport_green_is_not_funding_ready_when_all_candidates_block
             "long_funding_timestamp_ms": funding_timestamp_ms,
             "short_funding_timestamp_ms": funding_timestamp_ms,
             "blocked": True,
-            "blocked_reasons": ["long_contract_normalization_incomplete"],
+            "blocked_reasons": [
+                "long_contract_normalization_incomplete",
+                "outside_scan_window",
+            ],
             "economics_complete": False,
             "economics_incomplete_reason": "long_contract_normalization_incomplete",
         }
@@ -264,7 +267,40 @@ def test_snapshot_transport_green_is_not_funding_ready_when_all_candidates_block
     assert report.details["blocked_reason_counts"] == {
         "economics_observation_missing": 1,
         "long_contract_normalization_incomplete": 1,
+        "outside_scan_window": 1,
     }
+    assert report.details["funding_entry_readiness_state"] == "blocked"
+
+
+def test_snapshot_waiting_for_funding_window_is_healthy_not_entry_ready():
+    snapshot = _fresh_seven_venue_snapshot()
+    for quote in snapshot["quotes"].values():
+        _add_complete_contract_proof(quote)
+    candidate = _complete_unblocked_candidate()
+    candidate.update(
+        {
+            "blocked": True,
+            "blocked_reasons": ["outside_scan_window"],
+        }
+    )
+    snapshot["candidate_build_diagnostics"].update(
+        {
+            "directional_pair_count": 1,
+            "output_candidate_count": 1,
+        }
+    )
+    snapshot["candidates"] = [candidate]
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=1_778_787_000_000,
+        max_age_ms=10_000,
+    )
+
+    assert report.ok
+    assert "funding_entry_readiness_no_unblocked_candidates" not in report.fingerprints
+    assert report.details["funding_entry_ready"] is False
+    assert report.details["funding_entry_readiness_state"] == "waiting_for_funding_window"
 
 
 def test_snapshot_cannot_be_green_when_funding_coverage_is_unproved():
