@@ -105,8 +105,10 @@ def test_deploy_sync_preserves_operator_backups_and_local_orchestration(tmp_path
     )
 
     assert manifest.should_exclude("config/live.toml.pre-before-release")
+    assert manifest.should_exclude("config/live.toml.removed-fields-20260730T120000Z.bak")
     assert manifest.should_exclude(".dev-flow/runs/release/flow.md")
     assert "--exclude 'config/live.toml.pre-*'" in script
+    assert "--exclude 'config/live.toml.removed-fields-*'" in script
     assert "--exclude .dev-flow/" in script
 
 
@@ -176,6 +178,10 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
         'env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/diagnose_live.py --json --since-deploy'
         in script
     )
+    assert script.count(
+        'scripts/migrate_removed_config_fields.py --config'
+    ) == 2
+    assert 'scripts/migrate_removed_config_fields.py --config "$REMOTE_PATH/config/live.toml" --apply' in script
     assert script.count(
         "scripts/diagnose_live.py --json --since-deploy --require-gate-pass"
     ) == 2

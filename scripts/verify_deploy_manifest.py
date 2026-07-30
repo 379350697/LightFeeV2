@@ -71,6 +71,7 @@ EXCLUDE_PATTERNS = [
     "config/live.toml",       # local secrets
     "config/*.local.toml",    # local secrets
     "config/live.toml.pre-*", # remote operator rollback backups
+    "config/live.toml.removed-fields-*", # deploy migration backups
     "runtime/",               # runtime output
     "logs/",
     ".env",
@@ -482,6 +483,9 @@ if [[ "$LOCAL" == "$REMOTE_PATH" ]]; then
   echo "=== Retiring removed systemd units ==="
   retire_systemd_units
 
+  echo "=== Migrating retired config fields ==="
+  env PYTHONPATH="$REMOTE_PATH" "$REMOTE_PYTHON" scripts/migrate_removed_config_fields.py --config "$REMOTE_PATH/config/live.toml" --apply
+
   echo "=== Restarting production services ==="
   systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service
   sleep 12
@@ -519,6 +523,9 @@ ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightf
 
 echo "=== Retiring removed systemd units ==="
 retire_remote_systemd_units
+
+echo "=== Migrating retired config fields ==="
+ssh $SSH_OPTS {remote_host} "cd {remote_path} && env PYTHONPATH=$REMOTE_PATH $REMOTE_PYTHON scripts/migrate_removed_config_fields.py --config {remote_path}/config/live.toml --apply"
 
 echo "=== Restarting production services ==="
 ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl enable --now lightfee-trade-optimization-report.timer && systemctl enable lightfee-sidecar.service lightfee-spread-sidecar.service lightfee-live.service && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-spread-sidecar.service && systemctl restart lightfee-live.service"
