@@ -42,6 +42,7 @@ from lightfee.engine.recovery import (
     is_client_order_id_duplicate,
 )
 from lightfee.marketdata.open_interest import (
+    bounded_open_interest_cache_fallback_max_age_ms,
     open_interest_max_age_ms_for_evidence,
     open_interest_timestamps_are_fresh,
 )
@@ -4365,16 +4366,12 @@ class EntryDispatchRuntime:
         evidence = getattr(candidate, "entry_open_interest_evidence", None)
         if not isinstance(evidence, dict):
             return "entry_open_interest_evidence_unavailable", {}
-        max_age_ms = max(
-            int(
-                getattr(
-                    self.ctx.config.runtime,
-                    "sidecar_perp_liquidity_budget_ms",
-                    30_000,
-                )
-                or 0
-            ),
-            1,
+        max_age_ms = bounded_open_interest_cache_fallback_max_age_ms(
+            getattr(
+                self.ctx.config.runtime,
+                "slow_evidence_max_age_ms",
+                10 * 60_000,
+            )
         )
         symbol = str(getattr(candidate, "symbol", "") or "").upper()
         expected_venues = {

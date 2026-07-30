@@ -6131,16 +6131,6 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             "action_evidence_kind": kind,
         }
 
-    def default_action_evidence_kind(phase: str) -> str:
-        return {
-            "selected_pre_submit": "runtime.entry_selected_submit_deadline_exceeded",
-            "entry_selected_terminal": "pending_entry.long_lived_pending_entry",
-            "pending_entry": "pending_entry.long_lived_pending_entry",
-            "maker_resting": "passive_maintenance.cancel_issued",
-            "close_terminal": "runtime.passive_close_deadline_fallback_armed",
-            "recovery_terminal": "recovery.blocked",
-        }.get(phase, "")
-
     entry_terminal_kinds = {
         "entry.aborted",
         "entry.opened",
@@ -6306,7 +6296,6 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             artifact["recovery_terminal_at_ms"] = min(current or ts_ms, ts_ms)
 
         if kind == "pending_entry.long_lived_pending_entry":
-            note_observed_action(artifact, "entry_selected_terminal", kind)
             note_observed_action(artifact, "pending_entry", kind)
             note_observed_action(artifact, "maker_resting", kind)
         if kind == "runtime.entry_selected_submit_deadline_exceeded":
@@ -6357,7 +6346,11 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
     ) -> None:
         if start_ms <= 0:
             return
-        budget = budgets[phase]
+        budget = budgets.get(phase)
+        if budget is None:
+            # No business deadline exists for this telemetry-only transition.
+            # Diagnosis must not invent an SLA finding.
+            return
         age_ms = max(0, (end_ms or horizon_ms) - start_ms)
         status = classify_phase_age(age_ms, budget)
         observed_action = (
@@ -6376,17 +6369,6 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
         if handoff and not action_taken:
             action_taken = handoff["action_taken"]
             action_evidence_kind = handoff["action_evidence_kind"]
-        allow_configured_fallback = phase not in {"candidate_lease", "quote_rewarm"}
-        if (
-            not action_taken
-            and allow_configured_fallback
-            and status in {"hard_over_budget", "soft_over_budget"}
-        ):
-            action_taken = budget.action
-            if status == "soft_over_budget":
-                action_evidence_kind = f"runtime.{phase}_soft_budget_exceeded"
-            else:
-                action_evidence_kind = default_action_evidence_kind(phase)
         record = {
             "phase": phase,
             "artifact_id": str(artifact["artifact_id"]),
@@ -6399,6 +6381,15 @@ def _build_phase_duration_summary(events: list[dict[str, Any]]) -> dict[str, Any
             "configured_action": budget.action,
             "action_taken": action_taken,
             "action_evidence_kind": action_evidence_kind,
+            "action_evidence_status": (
+                "observed"
+                if action_taken
+                else (
+                    "not_observed"
+                    if status in {"hard_over_budget", "soft_over_budget"}
+                    else "not_required"
+                )
+            ),
             "truth_source": budget.truth_source,
         }
         records.append(record)

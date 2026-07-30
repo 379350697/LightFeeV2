@@ -15,11 +15,11 @@ from typing import Any
 
 
 OPEN_INTEREST_EVENT_FUTURE_SKEW_MS = 5_000
-ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS = 30 * 60 * 1_000
+ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS = 10 * 60 * 1_000
 
 
 def bounded_open_interest_cache_fallback_max_age_ms(value: object = None) -> int:
-    """Return the configured cache-fallback age bounded by the hard 30m cap."""
+    """Return the configured slow-evidence age bounded by the hard 10m cap."""
     try:
         parsed = int(value) if value is not None else 0
     except (TypeError, ValueError, OverflowError):
@@ -94,12 +94,15 @@ def open_interest_max_age_ms_for_evidence(
     # Cached fallback evidence is a bounded exception to the normal evidence
     # budget.  A producer-provided marker or a wider caller budget must not
     # extend its admissible freshness window.
-    return bounded_open_interest_cache_fallback_max_age_ms(
-        _open_interest_evidence_field(
-            source,
-            "open_interest_cache_fallback_max_age_ms",
-            ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
-        )
+    return min(
+        default_age,
+        bounded_open_interest_cache_fallback_max_age_ms(
+            _open_interest_evidence_field(
+                source,
+                "open_interest_cache_fallback_max_age_ms",
+                ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
+            )
+        ),
     )
 
 

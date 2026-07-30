@@ -85,11 +85,14 @@ class RuntimeConfig:
     # BBO/L2 lease cannot make routine multi-venue scans appear unavailable.
     sidecar_market_observation_max_age_ms: int = 30000
     sidecar_refresh_ms: int = 3000
-    sidecar_perp_liquidity_budget_ms: int = 30000
+    # The atomically persisted sidecar snapshot is the local source for OI
+    # and 24h-volume evidence.  This slow-data contract is intentionally
+    # independent from executable BBO/L2 leases.
+    slow_evidence_max_age_ms: int = 10 * 60 * 1000
+    # Targeted OI is a repair path only after local slow evidence is missing
+    # or older than the bound above; it is never a quote freshness lease.
     entry_open_interest_refresh_timeout_ms: int = 750
-    entry_open_interest_cache_fallback_max_age_ms: int = 30 * 60 * 1000
     sidecar_funding_timeout_s: float = 30.0
-    sidecar_liquidity_timeout_s: float = 10.0
     sidecar_hint_budget_ms: int = 500
     spread_sidecar_snapshot_path: str = "runtime/spread-opportunities-current.json"
     # Bounded signed-basis state survives a process restart.  A missing,
@@ -119,19 +122,16 @@ class RuntimeConfig:
     local_l2_depth_bridge_max_levels: int = 20
     local_l2_depth_bridge_publish_interval_ms: int = 500
     uncertain_order_cooldown_ms: int = 30000
-    transfer_outage_warn_ms: int = 120000
-    transfer_backup_source_after_ms: int = 180000
-    transfer_outage_grace_ms: int = 600000
     tick_failure_backoff_initial_ms: int = 1000
     tick_failure_backoff_max_ms: int = 30000
     ws_reconnect_initial_ms: int = 1000
-    ws_reconnect_max_ms: int = 30000
+    # V1 workers used 1s initial / 60s maximum exponential backoff.
+    ws_reconnect_max_ms: int = 60000
     ws_unhealthy_after_failures: int = 5
     journal_async_queue_capacity: int = 4096
     auto_trade_enabled: bool = True
     live_startup_phase_timeout_ms: int = 15000
     exchange_http_timeout_ms: int = 12000
-    transfer_status_cache_ms: int = 15000
     debug_journal_diagnostics_enabled: bool = False
     maker_event_lane_enabled: bool = True
     maker_event_lane_min_wake_interval_ms: int = 40
@@ -141,7 +141,6 @@ class RuntimeConfig:
 class StrategyConfig:
     entry_window_secs: int = 300
     entry_local_l2_prewarm_window_secs: int = 480
-    entry_min_first_funding_remaining_secs: int = 60
     # V1's compiled fallback was 30s, while its live funding profile used a
     # 300s settlement-observation hold.  The latter is the safe V2 strategy
     # default: normal close waits for capture; force-close remains separate.
@@ -158,8 +157,6 @@ class StrategyConfig:
     max_global_net_exposure_quote: float = 0.0
     max_concurrent_venue_pairs: int = 0
     max_strategy_bucket_exposure_quote: float = 0.0
-    entry_candidate_batch_quiet_window_secs: int = 0
-    entry_candidate_batch_freeze_minutes_before_funding: int = 0
     max_scan_minutes_before_funding: int = 25
     min_scan_minutes_before_funding: int = 5
     max_stagger_gap_minutes: int = 480
@@ -350,6 +347,8 @@ class StrategyConfig:
     shadow_promotion_score_delta_bps: float = 3.0
     maker_entry_max_reposts: int = 1
     maker_entry_reconcile_backoff_ms: int = 1000
+    # Executable Local-L2 book age for entry/reprice/close. This is not the
+    # ten-minute sidecar OI/24h-volume slow-evidence contract.
     max_liquidity_snapshot_age_ms: int = 5000
     entry_vwap_required: bool = False
     delever_vwap_required: bool = False
@@ -382,33 +381,26 @@ class StrategyConfig:
     maker_hedge_soft_deadline_ms: int = 800
     maker_hedge_deadline_ms: int = 800
     maker_min_notional_accumulation_attempts: int = 3
-    pending_entry_max_lifetime_ms: int = 30000
-    pending_entry_force_abort_after_zero_fill_ms: int = 12000
     pending_entry_force_fallback_when_tradeable: bool = False
     pending_entry_pre_submit_hedgeable_fill_guard_enabled: bool = True
     pending_entry_phase_zero_fill_budget: int = 2
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
-    # Legacy diagnostic compatibility only. Full-frontier revalidation must
-    # not use this as a candidate-discovery cutoff.
-    candidate_lease_ms: int = 60000
+    # Real submit-boundary safety deadline, not a generic lifecycle SLA.
     selected_submit_deadline_ms: int = 15000
-    maker_resting_soft_ms: int = 30000
-    maker_resting_hard_ms: int = 60000
-    entry_selected_warning_ms: int = 120000
-    entry_selected_terminal_sla_ms: int = 300000
-    close_terminal_soft_ms: int = 60000
-    close_terminal_hard_ms: int = 300000
-    recovery_terminal_hard_ms: int = 300000
     unpaired_live_position_auto_recovery_enabled: bool = False
     unpaired_live_position_max_notional_quote: float = 0.0
     pending_entry_zero_fill_terminal_cooldown_ms: int = 30000  # V1 default (CONTRACT RECOVERY-004)
-    # Entry book readiness uses entry_local_l2_book_stale_after_ms first, then
-    # local_l2_quiet_book_grace_ms/local_l2_max_age_ms when explicitly set,
-    # and finally a 300s fallback so quiet HOT books do not flap.
-    entry_local_l2_book_stale_after_ms: int = 0
-    local_l2_quiet_book_grace_ms: int = 0
-    local_l2_max_age_ms: int = 0
+    # V1 separates a continuously fresh executable local book from the
+    # readiness grace used while a candidate is warming.  The grace must
+    # never become a hidden 300s executable-book lease.
+    local_l2_max_age_ms: int = 1000
+    local_l2_quiet_book_grace_ms: int = 10000
+    # V1 keeps the slower OKX book in its venue-specific readiness contract.
+    # A session resolves this per leg, so one venue cannot widen the other.
+    local_l2_readiness_max_age_ms_overrides: dict[str, int] = field(
+        default_factory=lambda: {"okx": 65000}
+    )
     local_l2_bootstrap_batch_size: int = 4
     local_l2_bootstrap_jitter_ms: int = 250
     local_l2_bootstrap_retry_backoff_ms: int = 5000

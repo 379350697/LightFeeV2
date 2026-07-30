@@ -43,8 +43,14 @@ _REMOVED_PRODUCTION_FIELDS = {
     "runtime": frozenset(
         {
             "opportunity_input_mode",
+            "sidecar_perp_liquidity_budget_ms",
+            "sidecar_liquidity_timeout_s",
             "entry_open_interest_store_path",
             "entry_open_interest_background_refresh_ms",
+            "transfer_status_cache_ms",
+            "transfer_outage_warn_ms",
+            "transfer_backup_source_after_ms",
+            "transfer_outage_grace_ms",
             "fee_evidence_path",
             "fee_evidence_max_age_ms",
             "fee_evidence_integrity_key_env",
@@ -54,10 +60,24 @@ _REMOVED_PRODUCTION_FIELDS = {
             "spread_sidecar_source_mode",
             "spread_sidecar_direct_fetch_enabled",
             "entry_account_truth_probe_timeout_ms",
+            "entry_open_interest_cache_fallback_max_age_ms",
         }
     ),
     "strategy": frozenset(
         {
+            "entry_min_first_funding_remaining_secs",
+            "entry_candidate_batch_quiet_window_secs",
+            "entry_candidate_batch_freeze_minutes_before_funding",
+            "pending_entry_max_lifetime_ms",
+            "pending_entry_force_abort_after_zero_fill_ms",
+            "candidate_lease_ms",
+            "maker_resting_soft_ms",
+            "maker_resting_hard_ms",
+            "entry_selected_warning_ms",
+            "entry_selected_terminal_sla_ms",
+            "close_terminal_soft_ms",
+            "close_terminal_hard_ms",
+            "recovery_terminal_hard_ms",
             "funding_canary_enabled",
             "funding_canary_allowed_venues",
             "funding_canary_max_concurrent_positions",
@@ -74,6 +94,7 @@ _REMOVED_PRODUCTION_FIELDS = {
             "spread_allow_verified_maker_rebates",
             "spread_paper_oos_start_ms",
             "spread_paper_require_out_of_sample",
+            "entry_local_l2_book_stale_after_ms",
         }
     ),
     "persistence": frozenset({"spread_paper_rollback_anchor_path"}),

@@ -448,6 +448,18 @@ class TestEntryLocalL2Session:
         session.ensure_leg("bybit", "BTCUSDT").mark_ready(seen_at_ms=10000)
         assert session.both_legs_ready(now_ms=12000, stale_after_ms=5000)
 
+    def test_both_legs_ready_resolves_v1_readiness_age_per_venue(self):
+        session = EntryLocalL2Session(pair_id="p1")
+        session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=10_000)
+        session.ensure_leg("okx", "BTCUSDT").mark_ready(seen_at_ms=10_000)
+
+        def age_for_venue(venue: str) -> int:
+            return 1_000 if venue == "binance" else 65_000
+
+        assert not session.both_legs_ready(now_ms=12_000, stale_after_ms=age_for_venue)
+        assert session.ready_leg_count(now_ms=12_000, stale_after_ms=age_for_venue) == 1
+        assert session.stale_leg_count(now_ms=12_000, stale_after_ms=age_for_venue) == 1
+
     def test_both_legs_not_ready_when_one_faulted(self):
         session = EntryLocalL2Session(pair_id="p1")
         session.ensure_leg("binance", "BTCUSDT").mark_ready(seen_at_ms=10000)
@@ -2552,6 +2564,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
 
         rt = runtime_with_l2
         rt.config.strategy.local_l2_max_age_ms = 1000
+        rt.config.strategy.local_l2_quiet_book_grace_ms = 1000
+        rt.config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         c = self._make_real_candidate(first_funding_timestamp_ms=370000)
         pair_id = make_candidate_pair_id(c.symbol, c.long_venue, c.short_venue)
         rt._tracked_primary_pair_ids.add(pair_id)
@@ -2639,6 +2653,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         assert rt._entry_local_l2_selection_blocker(c, now_ms=12000) is None
 
         rt.config.strategy.local_l2_max_age_ms = 1000
+        rt.config.strategy.local_l2_quiet_book_grace_ms = 1000
+        rt.config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         rt._refresh_entry_l2_session_readiness(now_ms=12000)
         assert (
             rt._entry_local_l2_selection_blocker(c, now_ms=12000)
@@ -2734,6 +2750,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 max_concurrent_positions=2,
                 entry_window_secs=480,
                 local_l2_max_age_ms=1000,
+                local_l2_quiet_book_grace_ms=1000,
+                local_l2_readiness_max_age_ms_overrides={"okx": 1000},
             ),
             persistence=PersistenceConfig(
                 event_log_path=str(event_path),
@@ -2921,6 +2939,8 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
                 max_concurrent_positions=2,
                 entry_window_secs=480,
                 local_l2_max_age_ms=1000,
+                local_l2_quiet_book_grace_ms=1000,
+                local_l2_readiness_max_age_ms_overrides={"okx": 1000},
             ),
             persistence=PersistenceConfig(
                 event_log_path=str(event_path),

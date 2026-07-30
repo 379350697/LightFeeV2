@@ -565,10 +565,9 @@ def start_binance_private_ws(transport, symbols: list[str]) -> None:
     if symbol_map is None:
         symbol_map = {transport._venue_symbol(s): s for s in symbols}
 
-    # V1: reconnect parameters from runtime config
-    reconnect_initial_ms = 1_000
-    reconnect_max_ms = 60_000
-    unhealthy_after_failures = 5
+    reconnect_initial_ms, reconnect_max_ms, unhealthy_after_failures = (
+        transport.private_ws_reconnect_policy()
+    )
 
     task = asyncio.create_task(
         _binance_private_ws_loop(

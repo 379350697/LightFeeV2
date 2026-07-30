@@ -323,6 +323,9 @@ def start_hyperliquid_private_ws(transport, symbols: list[str]) -> None:
     symbol_map = getattr(transport, "_private_ws_symbol_map", None)
     if symbol_map is None:
         symbol_map = {transport._venue_symbol(s): s for s in symbols}
+    reconnect_initial_ms, reconnect_max_ms, unhealthy_after_failures = (
+        transport.private_ws_reconnect_policy()
+    )
 
     task = asyncio.create_task(
         _hyperliquid_private_ws_loop(
@@ -331,9 +334,9 @@ def start_hyperliquid_private_ws(transport, symbols: list[str]) -> None:
             account_address=account_address,
             symbol_map=symbol_map,
             private_state=private_state,
-            unhealthy_after_failures=5,
-            reconnect_initial_ms=1_000,
-            reconnect_max_ms=60_000,
+            unhealthy_after_failures=unhealthy_after_failures,
+            reconnect_initial_ms=reconnect_initial_ms,
+            reconnect_max_ms=reconnect_max_ms,
         )
     )
     private_state.push_worker(task)

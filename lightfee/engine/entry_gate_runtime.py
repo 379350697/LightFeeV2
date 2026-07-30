@@ -392,8 +392,10 @@ class EntryGateRuntime:
     def _payload_fingerprint(self, *args: Any, **kwargs: Any):
         return self.ctx._payload_fingerprint(*args, **kwargs)
 
-    def _entry_local_l2_stale_after_ms(self) -> int:
-        return self.ctx._entry_local_l2_stale_after_ms()
+    def _entry_local_l2_stale_after_ms(self, venue: str | None = None) -> int:
+        if venue is None:
+            return self.ctx._entry_local_l2_stale_after_ms()
+        return self.ctx._entry_local_l2_stale_after_ms(venue)
 
     async def _fetch_hyperliquid_entry_balance_snapshot(
         self,
@@ -3191,7 +3193,10 @@ class EntryGateRuntime:
         if session is None:
             return "entry_local_l2_waiting_for_dual_ready"
 
-        if not session.both_legs_ready(now_ms, stale_after_ms=self._entry_local_l2_stale_after_ms()):
+        if not session.both_legs_ready(
+            now_ms,
+            stale_after_ms=self._entry_local_l2_stale_after_ms,
+        ):
             return "entry_local_l2_waiting_for_dual_ready"
 
         return None

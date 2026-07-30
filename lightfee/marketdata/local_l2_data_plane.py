@@ -21,7 +21,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from lightfee.marketdata.l2 import (
     L2BookStatus,
@@ -143,7 +143,12 @@ class LocalL2DataPlane:
         self.max_concurrent_snapshots: int = 4
         self.bootstrap_timeout_ms: int = 15_000  # Overall bootstrap phase timeout
         self.hot_refresh_interval_ms: int = SNAPSHOT_INTERVAL_HOT_MS
-        self.hot_stale_after_ms: int = 300_000
+        # The HOT-book lifecycle has the same per-venue freshness owner as
+        # entry Local-L2 readiness. An integer remains accepted for focused
+        # tests and standalone uses; the live runtime installs a resolver so
+        # a venue-specific V1 grace (notably OKX) is not demoted by another
+        # venue's shorter bound.
+        self.hot_stale_after_ms: int | Callable[[str], int] = 300_000
         self.buffered_replay_failure_alert_threshold: int = 3
         self._buffered_replay_failure_counts: dict[str, int] = {}
         self._rebuild_attempt_ids: dict[str, int] = {}
@@ -627,6 +632,19 @@ class LocalL2DataPlane:
         if configured <= 0:
             return proactive
         return min(configured, proactive)
+
+    def _hot_stale_after_ms_for_venue(self, venue: str) -> int:
+        """Resolve the configured HOT-book freshness bound for one venue."""
+        configured = getattr(self, "hot_stale_after_ms", 0)
+        try:
+            value = (
+                configured(str(venue).strip().lower())
+                if callable(configured)
+                else configured
+            )
+            return max(int(value), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     def _hot_refresh_due(self, key: LocalL2BookKey, book, now_ms: int, stale_after_ms: int) -> bool:
         interval_ms = self._hot_proactive_refresh_interval_ms(stale_after_ms)
@@ -1297,7 +1315,7 @@ class LocalL2DataPlane:
             # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
                 policy = policy_for_venue(key.venue)
-                stale_after_ms = int(getattr(self, "hot_stale_after_ms", 0) or 0)
+                stale_after_ms = self._hot_stale_after_ms_for_venue(key.venue)
                 effective_freshness_ms = self._effective_hot_freshness_ms(key, book)
                 observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
                 clock_skew = observed_at_ms > now_ms + self.clock_skew_tolerance_ms
@@ -1382,7 +1400,7 @@ class LocalL2DataPlane:
             interval_ms = self._snapshot_interval_for_status(book.status)
             if book.status == L2BookStatus.HOT:
                 interval_ms = self._hot_proactive_refresh_interval_ms(
-                    int(getattr(self, "hot_stale_after_ms", 0) or 0)
+                    self._hot_stale_after_ms_for_venue(key.venue)
                 )
             if interval_ms > 0 and book.last_snapshot_ms > 0:
                 if (now_ms - book.last_snapshot_ms) < interval_ms:

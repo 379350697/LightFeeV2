@@ -5932,12 +5932,9 @@ class TestRealPathAbortCleanupDeadline:
         assert "entry.aborted" not in kinds
 
     @pytest.mark.asyncio
-    async def test_long_lived_selected_pending_entry_forces_abort_even_before_pending_hard_ceiling(self, tmp_path):
-        """Entry-selected lifetime is a separate SLA from PendingEntry.created_at_ms."""
-        runtime = _make_open_runtime(
-            tmp_path,
-            entry_selected_terminal_sla_ms=300_000,
-        )
+    async def test_selected_age_does_not_override_v1_pending_hard_ceiling(self, tmp_path):
+        """Selection time is telemetry; V1 pending lifetime owns terminalization."""
+        runtime = _make_open_runtime(tmp_path)
         maker = _FakeVenueAdapter(Venue.BYBIT)
         hedge = _FakeVenueAdapter(Venue.HYPERLIQUID)
         maker.position = None
@@ -5974,33 +5971,17 @@ class TestRealPathAbortCleanupDeadline:
             now_ms,
         )
 
-        assert handled is True
-        assert pending.pending_id not in runtime.state.pending_entries
+        assert handled is False
+        assert pending.pending_id in runtime.state.pending_entries
         records = runtime.journal.read_all()
-        long_lived = [
+        assert not [
             record for record in records
             if record["kind"] == "pending_entry.long_lived_pending_entry"
         ]
-        assert long_lived
-        assert long_lived[-1]["payload"]["entry_id"] == pending.pending_id
-        assert long_lived[-1]["payload"]["selected_lifetime_ms"] == 760_000
-        assert long_lived[-1]["payload"]["pending_lifetime_ms"] == 10_000
-        assert long_lived[-1]["payload"]["sla_ms"] == 300_000
-        assert maker._cancel_passive_order_calls == [
-            ("BRUSDT", "maker-long-lived", "maker-long-lived-cid")
-        ]
-        aborted = [
-            record for record in records
-            if record["kind"] == "entry.aborted"
-        ]
-        assert aborted[-1]["payload"]["reason"] == "long_lived_pending_entry"
+        assert not maker._cancel_passive_order_calls
 
     def test_recent_selected_pending_entry_keeps_existing_hedge_inflight_budget(self, tmp_path):
-        runtime = _make_open_runtime(
-            tmp_path,
-            entry_selected_terminal_sla_ms=300_000,
-            pending_entry_hard_ceiling_ms=120_000,
-        )
+        runtime = _make_open_runtime(tmp_path, pending_entry_hard_ceiling_ms=120_000)
         now_ms = 1_000_000
         pending = PendingEntry(
             pending_id="entry-recent-inflight",

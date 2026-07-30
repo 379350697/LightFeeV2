@@ -3752,7 +3752,9 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.strategy.local_l2_enabled = False
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         binance.submit_passive_order = AsyncMock(
@@ -3812,7 +3814,9 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.strategy.local_l2_enabled = False
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -3857,7 +3861,9 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         config.strategy.entry_final_gate_max_skew_ms = 100
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
@@ -3901,7 +3907,9 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = False
-        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        config.strategy.local_l2_max_age_ms = 1_000
+        config.strategy.local_l2_quiet_book_grace_ms = 1_000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1_000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         binance.available_margin_quote = 1_000.0
@@ -4007,7 +4015,9 @@ class TestPlannerDispatchIntegration:
         # readiness is exercised by the V1 lifecycle and composed-provider
         # tests; it is not the subject of this final-dispatch test.
         config.strategy.local_l2_enabled = False
-        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        config.strategy.local_l2_max_age_ms = 1_000
+        config.strategy.local_l2_quiet_book_grace_ms = 1_000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1_000}
         quantity_metadata = {
             "min_notional": 10.0,
             "min_quantity": 0.0001,
@@ -4593,7 +4603,9 @@ class TestPlannerDispatchIntegration:
         config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
         config.strategy.entry_quote_lease_ttl_ms = 1500
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -5939,7 +5951,9 @@ class TestPlannerDispatchIntegration:
         config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -5978,7 +5992,9 @@ class TestPlannerDispatchIntegration:
     async def test_stale_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
         config.strategy.local_l2_enabled = True
         config.strategy.max_liquidity_snapshot_age_ms = 5000
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -6000,7 +6016,9 @@ class TestPlannerDispatchIntegration:
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
         config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
+        config.strategy.local_l2_max_age_ms = 1000
+        config.strategy.local_l2_quiet_book_grace_ms = 1000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1000}
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
@@ -6505,7 +6523,9 @@ class TestPlannerDispatchIntegration:
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1_000
+        config.strategy.local_l2_max_age_ms = 1_000
+        config.strategy.local_l2_quiet_book_grace_ms = 1_000
+        config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 1_000}
         config.strategy.max_liquidity_snapshot_age_ms = 1_000
         config.strategy.min_entry_leg_notional_quote = 1.0
         config.strategy.maker_initial_slice_ratio = 0.2

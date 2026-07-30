@@ -18,7 +18,7 @@ def _candidate(first_ms: int):
     )
 
 
-def test_entry_horizon_blocks_under_60_seconds_by_default():
+def test_entry_horizon_blocks_inside_v1_min_scan_window_by_default():
     cfg = StrategyConfig()
     now_ms = 1_000_000
     candidate = _candidate(now_ms + 59_000)
@@ -34,7 +34,6 @@ def test_entry_horizon_blocks_under_60_seconds_by_default():
 def test_entry_horizon_allows_when_remaining_meets_existing_min_scan():
     cfg = StrategyConfig()
     cfg.min_scan_minutes_before_funding = 3
-    cfg.entry_min_first_funding_remaining_secs = 60
     now_ms = 1_000_000
     candidate = _candidate(now_ms + 180_000)
 
@@ -48,7 +47,6 @@ def test_entry_horizon_allows_when_remaining_meets_existing_min_scan():
 def test_entry_horizon_uses_v1_min_scan_only_when_min_scan_is_zero():
     cfg = StrategyConfig()
     cfg.min_scan_minutes_before_funding = 0
-    cfg.entry_min_first_funding_remaining_secs = 60
     now_ms = 1_000_000
     candidate = _candidate(now_ms + 59_999)
 

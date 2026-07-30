@@ -294,7 +294,9 @@ def _install_passive_repost_quote(runtime: LiveRuntime) -> None:
         quote_state["bid"],
         quote_state["ask"],
     )
-    runtime.config.strategy.entry_local_l2_book_stale_after_ms = 300_000
+    runtime.config.strategy.local_l2_max_age_ms = 300_000
+    runtime.config.strategy.local_l2_quiet_book_grace_ms = 300_000
+    runtime.config.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 300_000}
     _seed_passive_repost_quote(runtime)
 
     original_start = runtime.start

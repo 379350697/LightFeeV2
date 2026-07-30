@@ -697,6 +697,9 @@ def start_gate_private_ws(transport, symbols: list[str]) -> None:
     # shared, but activate each contract only after orders + positions ACK.
     symbol_map = _shared_gate_private_ws_symbol_map(transport, symbols)
     contract_multiplier_map = _shared_gate_contract_multiplier_map(transport, symbol_map)
+    reconnect_initial_ms, reconnect_max_ms, unhealthy_after_failures = (
+        transport.private_ws_reconnect_policy()
+    )
 
     task = asyncio.create_task(
         _gate_private_ws_loop(
@@ -707,9 +710,9 @@ def start_gate_private_ws(transport, symbols: list[str]) -> None:
             symbol_map=symbol_map,
             private_state=private_state,
             contract_multiplier_map=contract_multiplier_map,
-            unhealthy_after_failures=5,
-            reconnect_initial_ms=1_000,
-            reconnect_max_ms=60_000,
+            unhealthy_after_failures=unhealthy_after_failures,
+            reconnect_initial_ms=reconnect_initial_ms,
+            reconnect_max_ms=reconnect_max_ms,
         )
     )
     private_state.push_worker(task)

@@ -1461,6 +1461,11 @@ class VenueTransport(MarketDataClient):
         # explicitly instrument-scoped and must subscribe newly added symbols
         # in-band.  Account-wide venues use the shared map directly.
         self._private_ws_pending_symbol_updates: set[str] = set()
+        # RuntimeConfig owns reconnect policy.  Venue workers read this once
+        # at startup instead of carrying a second set of hard-coded defaults.
+        self._private_ws_reconnect_initial_ms = 1_000
+        self._private_ws_reconnect_max_ms = 60_000
+        self._private_ws_unhealthy_after_failures = 5
 
         if mode == "live":
             self._validate_live_credentials(credential)
@@ -1800,6 +1805,31 @@ class VenueTransport(MarketDataClient):
     def private_ws_state(self) -> PrivateWsState:
         """V1: the shared PrivateWsState for this venue transport."""
         return self._private_ws_state
+
+    def configure_private_ws_reconnect(
+        self,
+        *,
+        initial_ms: int,
+        max_ms: int,
+        unhealthy_after_failures: int,
+    ) -> None:
+        """Install the validated runtime reconnect policy before worker start."""
+
+        initial = max(1, int(initial_ms))
+        maximum = max(initial, int(max_ms))
+        unhealthy_after = max(1, int(unhealthy_after_failures))
+        self._private_ws_reconnect_initial_ms = initial
+        self._private_ws_reconnect_max_ms = maximum
+        self._private_ws_unhealthy_after_failures = unhealthy_after
+
+    def private_ws_reconnect_policy(self) -> tuple[int, int, int]:
+        """Return initial backoff, maximum backoff, and unhealthy threshold."""
+
+        return (
+            self._private_ws_reconnect_initial_ms,
+            self._private_ws_reconnect_max_ms,
+            self._private_ws_unhealthy_after_failures,
+        )
 
     # ------------------------------------------------------------------
     # Private WS lifecycle (called by runtime)

@@ -372,7 +372,10 @@ class LiveRuntime:
             l2_runtime=self.local_l2_runtime,
             journal=self.journal,
         )
-        self.l2_data_plane.hot_stale_after_ms = self._configured_entry_l2_stale_after_ms(config)
+        # The data plane must use the same per-venue V1 Local-L2 readiness
+        # contract as sessions/gates; a single 10s value would prematurely
+        # rebuild the OKX book before its 65s grace has elapsed.
+        self.l2_data_plane.hot_stale_after_ms = self._entry_local_l2_stale_after_ms
 
         from lightfee.marketdata.ws_bbo import VenueBboCache, VenueBboDataPlane
         self.ws_bbo_cache = VenueBboCache()
@@ -4488,7 +4491,7 @@ class LiveRuntime:
             }
             primary_excluded_pair_ids.difference_update(executing_pair_ids)
             lease_ttl_ms = self._effective_local_l2_scan_assignment_lease_ttl_ms()
-            stale_after_ms = self._configured_entry_l2_stale_after_ms(self.config)
+            stale_after_ms = self._entry_local_l2_stale_after_ms
             for candidate in source_candidates:
                 pair_id = self._candidate_pair_id(candidate)
                 if pair_id in executing_pair_ids:
@@ -4609,7 +4612,7 @@ class LiveRuntime:
                         local_l2_tracking_book_ready(
                             self.local_l2_runtime.get_book(venue, best_shadow.symbol),
                             now_ms=now_ms,
-                            stale_after_ms=stale_after_ms,
+                            stale_after_ms=self._entry_local_l2_stale_after_ms(venue),
                         )
                         for venue in (
                             best_shadow.long_venue,
@@ -8641,12 +8644,12 @@ class LiveRuntime:
             if hedge_reason:
                 return f"passive_repost_hedge_{hedge_reason}", evidence
         elif self._entry_readiness_provider_uses_local_l2():
-            stale_after_ms = self._entry_local_l2_stale_after_ms()
             evidence["source"] = "local_l2"
             evidence["domain"] = "local_l2_book"
             from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
             def _local_l2_quote(venue: str, role: str) -> tuple[str, dict[str, Any]]:
+                stale_after_ms = self._entry_local_l2_stale_after_ms(venue)
                 book = self.local_l2_runtime.get_book(venue, symbol)
                 if book is None:
                     return "missing_bbo", {f"{role}_venue": venue}
@@ -10060,66 +10063,35 @@ class LiveRuntime:
         strategy = self.config.strategy
         hard_ceiling_ms = strategy.pending_entry_hard_ceiling_ms
         force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
-        selected_terminal_sla_ms = int(strategy.entry_selected_terminal_sla_ms or 0)
 
         lifetime_ms = pending.compute_lifetime_ms(now_ms)
-        selected_at_ms = self._pending_entry_selected_at_ms(pending)
-        selected_lifetime_ms = (
-            max(0, now_ms - selected_at_ms) if selected_at_ms > 0 else lifetime_ms
-        )
 
         hard_ceiling_reached = lifetime_ms >= hard_ceiling_ms
-        selected_sla_reached = (
-            selected_terminal_sla_ms > 0
-            and selected_at_ms > 0
-            and selected_lifetime_ms >= selected_terminal_sla_ms
-        )
         force_terminal_reached = (
             lifetime_ms >= force_terminal_after_ms
             and (not pending.has_any_fill() or pending.missing_hedge_quantity() <= 1e-9)
         )
 
         has_inflight = pending.hedge_inflight is not None
-        if has_inflight and not hard_ceiling_reached and not selected_sla_reached:
+        if has_inflight and not hard_ceiling_reached:
             # V1: inflight hedge blocks terminalization until hard ceiling
             return None
 
-        if not hard_ceiling_reached and not force_terminal_reached and not selected_sla_reached:
+        if not hard_ceiling_reached and not force_terminal_reached:
             return None
 
         final_reason = (
             "pending_entry_max_lifetime_exhausted"
             if hard_ceiling_reached
-            else (
-                "long_lived_pending_entry"
-                if selected_sla_reached
-                else "pending_entry_zero_fill_lifetime_exhausted"
-            )
+            else "pending_entry_zero_fill_lifetime_exhausted"
         )
 
         return {
             "hard_ceiling_reached": hard_ceiling_reached,
-            "selected_sla_reached": selected_sla_reached,
             "force_terminal_reached": force_terminal_reached,
             "final_reason": final_reason,
             "lifetime_ms": lifetime_ms,
-            "selected_at_ms": selected_at_ms,
-            "selected_lifetime_ms": selected_lifetime_ms,
-            "selected_terminal_sla_ms": selected_terminal_sla_ms,
         }
-
-    @staticmethod
-    def _pending_entry_selected_at_ms(pending) -> int:
-        metadata = getattr(pending, "metadata", None)
-        if isinstance(metadata, dict):
-            for key in ("entry_selected_at_ms", "selected_at_ms"):
-                try:
-                    value = int(metadata.get(key) or 0)
-                except (TypeError, ValueError):
-                    value = 0
-                if value > 0:
-                    return value
-        return int(getattr(pending, "created_at_ms", 0) or 0)
 
     async def _force_terminalize_pending_entry_if_budget_exhausted(
         self, pending, entry_id: str, now_ms: int
@@ -10139,28 +10111,9 @@ class LiveRuntime:
             return False
 
         hard_ceiling_reached = bool(budget.get("hard_ceiling_reached"))
-        selected_sla_reached = bool(budget.get("selected_sla_reached"))
         force_terminal_reached = bool(budget.get("force_terminal_reached"))
         final_reason = str(budget["final_reason"])
-        terminal_deadline_reached = hard_ceiling_reached or selected_sla_reached
-
-        if selected_sla_reached:
-            self.journal.append(
-                "pending_entry.long_lived_pending_entry",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "reason": final_reason,
-                    "selected_at_ms": int(budget.get("selected_at_ms") or 0),
-                    "selected_lifetime_ms": int(
-                        budget.get("selected_lifetime_ms") or 0
-                    ),
-                    "pending_lifetime_ms": int(budget.get("lifetime_ms") or 0),
-                    "sla_ms": int(budget.get("selected_terminal_sla_ms") or 0),
-                    "hard_ceiling_reached": hard_ceiling_reached,
-                    "force_terminal_reached": force_terminal_reached,
-                },
-            )
+        terminal_deadline_reached = hard_ceiling_reached
 
         if hard_ceiling_reached and pending.repair_state:
             self.journal.append(
@@ -14314,6 +14267,17 @@ class LiveRuntime:
                 continue
 
             if venue not in self._private_ws_started:
+                configure_reconnect = getattr(
+                    transport, "configure_private_ws_reconnect", None
+                )
+                if callable(configure_reconnect):
+                    configure_reconnect(
+                        initial_ms=self.config.runtime.ws_reconnect_initial_ms,
+                        max_ms=self.config.runtime.ws_reconnect_max_ms,
+                        unhealthy_after_failures=(
+                            self.config.runtime.ws_unhealthy_after_failures
+                        ),
+                    )
                 transport.start_private_ws(sorted(symbols))
                 self._private_ws_started.add(venue)
                 self._private_ws_symbols[venue] = set(symbols)
@@ -14600,7 +14564,7 @@ class LiveRuntime:
     ) -> tuple[bool, str, dict]:
         venue_str = venue.value if hasattr(venue, "value") else str(venue)
         side_str = side.value if hasattr(side, "value") else str(side)
-        stale_after_ms = self._entry_local_l2_stale_after_ms()
+        stale_after_ms = self._entry_local_l2_stale_after_ms(venue_str)
         payload = {
             "venue": venue_str,
             "symbol": symbol,
@@ -14833,19 +14797,39 @@ class LiveRuntime:
     def _gate_entry_sizing(self, *args, **kwargs):
         return self.entry_gate_runtime._gate_entry_sizing(*args, **kwargs)
 
-    def _entry_local_l2_stale_after_ms(self) -> int:
-        return self._configured_entry_l2_stale_after_ms(self.config)
+    def _entry_local_l2_stale_after_ms(self, venue: str | None = None) -> int:
+        return self._configured_entry_l2_stale_after_ms(self.config, venue)
 
     @staticmethod
-    def _configured_entry_l2_stale_after_ms(config) -> int:
-        for value in (
-            config.strategy.entry_local_l2_book_stale_after_ms,
-            config.strategy.local_l2_quiet_book_grace_ms,
-            config.strategy.local_l2_max_age_ms,
-        ):
-            if value > 0:
-                return value
-        return 300_000
+    def _configured_entry_l2_stale_after_ms(
+        config,
+        venue: str | None = None,
+    ) -> int:
+        """Return V1 local-L2 readiness age for exactly one venue.
+
+        ``local_l2_max_age_ms`` is the normal local-book freshness bound;
+        the quiet grace prevents a warming session from flapping.  V1 allowed
+        a venue override (OKX), which must be resolved per leg instead of
+        widening both legs of a cross-venue opportunity.
+        """
+        strategy = config.strategy
+        try:
+            local_max_age_ms = max(int(strategy.local_l2_max_age_ms), 1)
+        except (TypeError, ValueError, OverflowError):
+            local_max_age_ms = 1_000
+        try:
+            quiet_grace_ms = max(int(strategy.local_l2_quiet_book_grace_ms), 1)
+        except (TypeError, ValueError, OverflowError):
+            quiet_grace_ms = 10_000
+        overrides = getattr(strategy, "local_l2_readiness_max_age_ms_overrides", {})
+        override_ms = 0
+        if venue and isinstance(overrides, dict):
+            raw_override = overrides.get(str(venue).strip().lower())
+            try:
+                override_ms = max(int(raw_override), 0)
+            except (TypeError, ValueError, OverflowError):
+                override_ms = 0
+        return max(override_ms or local_max_age_ms, quiet_grace_ms)
 
     def _snapshot_domain_budget_ms(self, domain: str, row=None):
         return self.market_data_runtime._snapshot_domain_budget_ms(domain, row)
@@ -15085,19 +15069,24 @@ class LiveRuntime:
             return
         from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
 
-        stale_after_ms = self._entry_local_l2_stale_after_ms()
         for pair_id, session in list(self.entry_l2_sessions.sessions.items()):
             for leg in session.legs.values():
                 book = self.local_l2_runtime.get_book(leg.venue, leg.symbol)
                 diag = dict(
                     apply_book_readiness_to_leg(
-                        leg, book, now_ms=now_ms, stale_after_ms=stale_after_ms,
+                        leg,
+                        book,
+                        now_ms=now_ms,
+                        stale_after_ms=self._entry_local_l2_stale_after_ms(leg.venue),
                     )
                 )
                 diag["pair_id"] = pair_id
                 diag["leg_state"] = leg.state.value if hasattr(leg.state, "value") else str(leg.state)
                 self._entry_l2_last_leg_diagnostics[(pair_id, leg.venue)] = diag
-            session.refresh_state(now_ms, stale_after_ms=stale_after_ms)
+            session.refresh_state(
+                now_ms,
+                stale_after_ms=self._entry_local_l2_stale_after_ms,
+            )
 
         self._maybe_emit_entry_l2_readiness_diagnostics(now_ms)
 

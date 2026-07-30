@@ -62,24 +62,32 @@ def validate_config(config: AppConfig) -> list[str]:
             "runtime.sidecar_market_observation_max_age_ms must be > 0, "
             f"got: {config.runtime.sidecar_market_observation_max_age_ms}"
         )
+    if not _is_positive_int(config.runtime.slow_evidence_max_age_ms):
+        issues.append("runtime.slow_evidence_max_age_ms must be a positive integer")
+    elif int(config.runtime.slow_evidence_max_age_ms) > ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS:
+        issues.append(
+            "runtime.slow_evidence_max_age_ms must be <= "
+            f"{ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS}"
+        )
     if not _is_positive_int(config.runtime.entry_open_interest_refresh_timeout_ms):
         issues.append(
             "runtime.entry_open_interest_refresh_timeout_ms must be a positive integer"
         )
-    if not _is_positive_int(
-        config.runtime.entry_open_interest_cache_fallback_max_age_ms
-    ):
-        issues.append(
-            "runtime.entry_open_interest_cache_fallback_max_age_ms must be a "
-            "positive integer"
-        )
+    if not _is_positive_int(config.runtime.ws_reconnect_initial_ms):
+        issues.append("runtime.ws_reconnect_initial_ms must be a positive integer")
+    if not _is_positive_int(config.runtime.ws_reconnect_max_ms):
+        issues.append("runtime.ws_reconnect_max_ms must be a positive integer")
     elif (
-        int(config.runtime.entry_open_interest_cache_fallback_max_age_ms)
-        > ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS
+        _is_positive_int(config.runtime.ws_reconnect_initial_ms)
+        and int(config.runtime.ws_reconnect_max_ms)
+        < int(config.runtime.ws_reconnect_initial_ms)
     ):
         issues.append(
-            "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= "
-            f"{ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS}"
+            "runtime.ws_reconnect_max_ms must be >= runtime.ws_reconnect_initial_ms"
+        )
+    if not _is_positive_int(config.runtime.ws_unhealthy_after_failures):
+        issues.append(
+            "runtime.ws_unhealthy_after_failures must be a positive integer"
         )
     if config.runtime.live_scan_last_good_max_age_ms <= 0:
         issues.append(
@@ -133,9 +141,6 @@ def validate_config(config: AppConfig) -> list[str]:
     ):
         if not _is_positive_int(getattr(config.strategy, field_name)):
             issues.append(f"strategy.{field_name} must be a positive integer")
-
-    if config.strategy.entry_min_first_funding_remaining_secs < 0:
-        issues.append("strategy.entry_min_first_funding_remaining_secs must be >= 0")
 
     if config.strategy.entry_notional_cap_quote <= 0:
         issues.append("strategy.entry_notional_cap_quote must be > 0")
@@ -494,6 +499,29 @@ def validate_config(config: AppConfig) -> list[str]:
         issues.append(
             "strategy.local_l2_scan_assignment_lease_enabled must be a boolean"
         )
+
+    for field_name in ("local_l2_max_age_ms", "local_l2_quiet_book_grace_ms"):
+        if not _is_positive_int(getattr(config.strategy, field_name)):
+            issues.append(f"strategy.{field_name} must be a positive integer")
+    overrides = config.strategy.local_l2_readiness_max_age_ms_overrides
+    if not isinstance(overrides, dict):
+        issues.append(
+            "strategy.local_l2_readiness_max_age_ms_overrides must be a venue-to-positive-integer mapping"
+        )
+    else:
+        known_venues = {venue.value for venue in Venue}
+        for venue, max_age_ms in overrides.items():
+            venue_name = str(venue).strip().lower()
+            if not venue_name or venue_name not in known_venues:
+                issues.append(
+                    "strategy.local_l2_readiness_max_age_ms_overrides has unknown venue: "
+                    f"{venue}"
+                )
+            if not _is_positive_int(max_age_ms):
+                issues.append(
+                    "strategy.local_l2_readiness_max_age_ms_overrides["
+                    f"{venue}] must be a positive integer"
+                )
 
     for field_name in (
         "shadow_entry_opportunity_count",

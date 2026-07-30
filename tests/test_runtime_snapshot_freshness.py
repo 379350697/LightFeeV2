@@ -2420,7 +2420,7 @@ def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
-            sidecar_perp_liquidity_budget_ms=30_000,
+            slow_evidence_max_age_ms=30_000,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),
@@ -2444,7 +2444,7 @@ def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
         )
         quote.open_interest_evidence_reason = "targeted_refresh_cache_fallback"
         quote.open_interest_cache_fallback = True
-        quote.open_interest_cache_fallback_max_age_ms = 30 * 60_000
+        quote.open_interest_cache_fallback_max_age_ms = 10 * 60_000
         quote.open_interest_cache_fallback_age_ms = 40_001
         market_quotes[f"{venue}:{candidate.symbol}"] = quote
 
@@ -2461,7 +2461,7 @@ def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
     assert evidence["long"]["open_interest_cache_fallback_age_ms"] == 40_001
     assert (
         evidence["long"]["open_interest_cache_fallback_max_age_ms"]
-        == 30 * 60_000
+        == 10 * 60_000
     )
     assert evidence["short"]["open_interest_cache_fallback"] is True
     assert "cache_fallback" in evidence["short"]["open_interest_evidence_reason"]
@@ -2470,7 +2470,7 @@ def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
         repriced[0],
         now_ms=100_001,
     )
-    assert reason == ""
+    assert reason == "entry_open_interest_evidence_stale"
 
 
 def test_frontier_reprice_is_stable_immutable_and_uses_configured_size(tmp_path):
@@ -3892,7 +3892,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
             sidecar_snapshot_max_age_ms=600000,
             max_market_age_ms=600000,
             max_order_quote_age_ms=600000,
-            sidecar_perp_liquidity_budget_ms=3000,
+            slow_evidence_max_age_ms=3000,
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
@@ -5009,10 +5009,10 @@ def test_entry_open_interest_refresher_uses_targeted_public_budget():
 
 
 @pytest.mark.asyncio
-async def test_entry_oi_refresher_uses_valid_30m_cache_fallback_after_timeout():
+async def test_entry_oi_refresher_uses_valid_10m_cache_fallback_after_timeout():
     refresher = EntryOpenInterestRefresher(targeted_budget_s=1.0)
     now_ms = 1_900_000
-    observed_at_ms = now_ms - (29 * 60_000)
+    observed_at_ms = now_ms - (9 * 60_000)
     cached = _targeted_observed_oi_result(
         "binance",
         "BTCUSDT",
@@ -5037,14 +5037,14 @@ async def test_entry_oi_refresher_uses_valid_30m_cache_fallback_after_timeout():
     assert payload["open_interest_evidence_status"] == "observed"
     assert payload["open_interest_source"] == "test_cached_oi"
     assert payload["open_interest_cache_fallback"] is True
-    assert payload["open_interest_cache_fallback_age_ms"] == 29 * 60_000
-    assert payload["open_interest_cache_fallback_max_age_ms"] == 30 * 60_000
+    assert payload["open_interest_cache_fallback_age_ms"] == 9 * 60_000
+    assert payload["open_interest_cache_fallback_max_age_ms"] == 10 * 60_000
     assert "cache_fallback" in payload["open_interest_evidence_reason"]
     assert (
         refresher.cached_open_interest(
             "binance",
             "BTCUSDT",
-            now_ms=observed_at_ms + (30 * 60_000) + 1,
+            now_ms=observed_at_ms + (10 * 60_000) + 1,
         )
         is None
     )
@@ -5122,6 +5122,21 @@ async def test_entry_oi_cache_fallback_honors_smaller_runtime_max_age():
     assert payload is not None
     assert payload["open_interest_cache_fallback_max_age_ms"] == 60_000
     await refresher.close()
+
+
+def test_entry_oi_cache_fallback_marker_cannot_widen_total_runtime_bound():
+    cached = {
+        "open_interest_cache_fallback": True,
+        "open_interest_cache_fallback_max_age_ms": 10 * 60_000,
+    }
+
+    assert (
+        open_interest_max_age_ms_for_evidence(
+            cached,
+            default_max_age_ms=60_000,
+        )
+        == 60_000
+    )
 
 
 
@@ -5578,7 +5593,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
             sidecar_snapshot_max_age_ms=600000,
             max_market_age_ms=600000,
             max_order_quote_age_ms=600000,
-            sidecar_perp_liquidity_budget_ms=30000,
+            slow_evidence_max_age_ms=30_000,
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
@@ -5669,7 +5684,7 @@ async def test_runtime_does_not_skip_fresh_quote_and_l2_for_20s_perp_liquidity_a
             sidecar_snapshot_max_age_ms=600000,
             max_market_age_ms=600000,
             max_order_quote_age_ms=600000,
-            sidecar_perp_liquidity_budget_ms=3000,
+            slow_evidence_max_age_ms=3000,
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
@@ -5813,7 +5828,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             sidecar_snapshot_max_age_ms=600000,
             max_market_age_ms=600000,
             max_order_quote_age_ms=600000,
-            sidecar_perp_liquidity_budget_ms=3000,
+            slow_evidence_max_age_ms=3000,
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
@@ -5987,7 +6002,7 @@ async def test_runtime_retains_target_proven_candidate_when_broad_market_observe
             max_market_age_ms=5_000,
             max_order_quote_age_ms=5_000,
             live_scan_last_good_max_age_ms=600_000,
-            sidecar_perp_liquidity_budget_ms=5_000,
+            slow_evidence_max_age_ms=5_000,
             live_scan_recovery_success_count=1,
         ),
         strategy=_entry_flow_strategy_config(
@@ -6159,7 +6174,7 @@ def test_broad_market_observed_retention_does_not_relax_target_quote_budget(
             mode="live",
             max_market_age_ms=5_000,
             max_order_quote_age_ms=5_000,
-            sidecar_perp_liquidity_budget_ms=5_000,
+            slow_evidence_max_age_ms=5_000,
         ),
         strategy=StrategyConfig(
             funding_new_entries_enabled=True,
@@ -6242,7 +6257,7 @@ def test_broad_market_observed_retention_does_not_relax_target_oi_proof(
             mode="live",
             max_market_age_ms=5_000,
             max_order_quote_age_ms=5_000,
-            sidecar_perp_liquidity_budget_ms=5_000,
+            slow_evidence_max_age_ms=5_000,
         ),
         strategy=StrategyConfig(
             funding_new_entries_enabled=True,
@@ -6329,7 +6344,7 @@ def test_broad_market_observed_retention_does_not_relax_target_liquidity_budget(
             mode="live",
             max_market_age_ms=5_000,
             max_order_quote_age_ms=5_000,
-            sidecar_perp_liquidity_budget_ms=5_000,
+            slow_evidence_max_age_ms=5_000,
         ),
         strategy=StrategyConfig(
             funding_new_entries_enabled=True,
@@ -6394,7 +6409,7 @@ def test_broad_market_observed_retention_does_not_relax_target_liquidity_budget(
     assert decision["venue"] == "okx"
     assert decision["decision"] == "skip_entry"
     assert decision["age_ms"] == 60_000
-    assert decision["budget_ms"] >= 30_000
+    assert decision["budget_ms"] == 5_000
 
 
 def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch):

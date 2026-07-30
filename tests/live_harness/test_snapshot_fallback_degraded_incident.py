@@ -159,7 +159,7 @@ def _runtime(tmp_path) -> LiveRuntime:
             max_order_quote_age_ms=5000,
             live_scan_last_good_max_age_ms=600000,
             live_scan_recovery_success_count=1,
-            sidecar_perp_liquidity_budget_ms=30000,
+            slow_evidence_max_age_ms=30_000,
         ),
         strategy=StrategyConfig(
             local_l2_enabled=False,

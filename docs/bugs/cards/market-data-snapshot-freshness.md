@@ -147,31 +147,18 @@ promotion time. Those events must carry `evidence_role=prewarm_only` and
 `candidate_scope=prewarm_extra`. Prewarm failures are diagnostic refresh
 evidence, not current entry blockers; only `entry_execution` evidence from the
 V1 primary+shadow scope can increment current unresolved entry blockers.
-Targeted entry OI may persist last-good observations, but only as proof-valid
-direct `observed` evidence. Durable fallback must lazy-load the exact
-venue/symbol key, revalidate source/sample/raw-value proof and timestamps, keep
-the existing 30 minute hard cap, and preserve the original observation fields.
-Foreground targeted OI lookup order is hot proof-valid memory, exact proof-valid
-durable evidence, then exchange refresh; missing, stale, or invalid durable rows
-fall through to the real exchange attempt.
-The hot runtime cache remains LRU-bounded at 256 entries; the full durable store
-must not be hydrated into memory. Prewarm OI work is lower priority than entry
-execution, bounded independently, cancellable by foreground refresh, and paced
-by a 15 minute cadence. That cadence is fed by the complete current
-`l2_tracking_tradeable` frontier, not by optional quote prewarm extras; its
-four-target setting is concurrency only. Due cycles force real refresh for every
-required resolved-frontier target, including targets whose quote snapshot already
-has fresh OI; hot or durable evidence cannot satisfy due prewarm. Due cycles must
-run durable expiry cleanup exactly once, including empty frontiers, before marking the cycle
-started. Not-due cycles must perform no cleanup or refresh, and cleanup
-failures must be logged without blocking OI refresh.
-Prewarm OI may use global low-priority capacity across different venues, but a
-single venue must have at most one active or gate-waiting transport request at a
-time; distinct same-venue direct prewarm attempts are deferred before occupying
-a global prewarm slot. SQLite durable replacement is strictly ordered by
-observed timestamp;
-equal observed timestamps must not overwrite a row even with newer receipt time
-or a different sample.
+The atomically persisted sidecar discovery snapshot is the current local store
+for OI and 24-hour-volume evidence. Its slow-data evidence age is explicitly
+bounded at ten minutes (`slow_evidence_max_age_ms`), independent of the strict
+selected-pair BBO/Local-L2 lease. A valid local receipt suppresses targeted OI
+HTTP; missing or over-ten-minute evidence triggers the bounded 750 ms repair
+path. Cache fallback cannot exceed the same ten-minute cap.
+
+There is no separate production SQLite OI evidence store in the current source.
+Do not claim a durable-store lookup, 15-minute OI prewarm cadence, or cleanup
+guarantee unless that component is actually reintroduced with its own evidence
+and tests. Slow-data persistence never relaxes quote, BBO, Local-L2, funding,
+account-truth, or final execution admission.
 
 Deploy diagnostics must keep readiness separate from execution failure. Quote
 stale, confirmed OI below floor, OI unavailable, structural OI suppression, and
@@ -269,6 +256,20 @@ pair-level no-entry summary. `candidate_market_evidence_unavailable` or
 `candidate_final_selection_blocked` is allowed only when no more specific
 contract reason was established. See CL-165 in the daily ledger; local proof
 is complete, deployment and controlled live lifecycle proof are pending.
+
+### CL-168 Single-Owner Local-L2 and OI Time Contracts
+
+Local-L2 session readiness is V1's per-leg contract: 1-second normal book age,
+10-second quiet-book readiness grace, and an OKX-only 65-second exception. It
+is not an executable quote lease. HOT-book stale/rebuild and proactive refresh
+resolve that same per-venue bound, so the data plane cannot demote OKX using a
+shorter venue's grace. Final entry/maker/close liquidity keeps its separate
+strict 5-second bound. Retained untracked books use a 60-second
+scan-idle cleanup interval only. Persisted OI and 24h-volume use one total
+slow-evidence age; cache-fallback metadata may narrow, never widen, that
+bound. A lifecycle budget is diagnostic until a journal event or explicit
+quote-rewarm contract proves its action; missing proof is
+`action_evidence_status=not_observed`.
 
 ## Attempts Ledger
 

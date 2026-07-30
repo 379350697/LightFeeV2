@@ -9966,7 +9966,7 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
 
     assert phase_summary["over_budget_count"] >= 5
     assert phase_summary["hard_over_budget_count"] >= 5
-    assert phase_summary["blank_action_count"] == 0
+    assert phase_summary["blank_action_count"] == 2
     assert phase_summary["terminalized_candidate_lease_count"] == 0
     assert phase_summary["terminalized_quote_rewarm_count"] == 1
     assert phase_summary["budget_defaults_ms"]["selected_pre_submit"]["hard_ms"] == 15000
@@ -9990,6 +9990,7 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
     )
     assert samples_by_phase["candidate_lease"]["action_taken"] == ""
     assert samples_by_phase["candidate_lease"]["action_evidence_kind"] == ""
+    assert samples_by_phase["candidate_lease"]["action_evidence_status"] == "not_observed"
     assert samples_by_phase["selected_pre_submit"] == {
         "phase": "selected_pre_submit",
         "artifact_id": "entry-no-submit",
@@ -10000,18 +10001,12 @@ def test_entry_outcome_summary_exposes_phase_duration_budget_overruns():
         "hard_ms": 15000,
         "status": "hard_over_budget",
         "configured_action": "cancel_selection_and_rescan",
-        "action_taken": "cancel_selection_and_rescan",
-        "action_evidence_kind": "runtime.entry_selected_submit_deadline_exceeded",
+        "action_taken": "",
+        "action_evidence_kind": "",
+        "action_evidence_status": "not_observed",
         "truth_source": "execution.entry_selected_without_submit_or_order_id",
     }
-    assert samples_by_phase["entry_selected_terminal"]["status"] == "hard_over_budget"
-    assert samples_by_phase["entry_selected_terminal"]["hard_ms"] == 300000
-    assert samples_by_phase["entry_selected_terminal"]["action_taken"] == (
-        "cancel_or_abort_entry_and_reconcile"
-    )
-    assert samples_by_phase["entry_selected_terminal"]["action_evidence_kind"] == (
-        "pending_entry.long_lived_pending_entry"
-    )
+    assert "entry_selected_terminal" not in samples_by_phase
     assert samples_by_phase["pending_entry"]["truth_source"] == (
         "pending_entry_terminality_from_order_fill_position_truth"
     )
@@ -10231,7 +10226,7 @@ def test_phase_duration_summary_ignores_candidate_without_stable_artifact_id():
     assert phase_summary["samples"] == []
 
 
-def test_phase_duration_summary_gives_soft_over_budget_selected_terminal_action():
+def test_phase_duration_summary_never_fabricates_selected_terminal_action():
     from scripts.diagnose_live import _build_entry_outcome_summary
 
     events = [
@@ -10253,14 +10248,12 @@ def test_phase_duration_summary_gives_soft_over_budget_selected_terminal_action(
         sample["phase"]: sample for sample in phase_summary["samples"]
     }
 
-    assert samples_by_phase["entry_selected_terminal"]["status"] == "soft_over_budget"
-    assert samples_by_phase["entry_selected_terminal"]["action_taken"] == (
-        "cancel_or_abort_entry_and_reconcile"
-    )
-    assert samples_by_phase["entry_selected_terminal"]["action_evidence_kind"] == (
-        "runtime.entry_selected_terminal_soft_budget_exceeded"
-    )
-    assert phase_summary["blank_action_count"] == 0
+    selected = samples_by_phase["selected_pre_submit"]
+    assert selected["status"] == "hard_over_budget"
+    assert selected["action_taken"] == ""
+    assert selected["action_evidence_kind"] == ""
+    assert selected["action_evidence_status"] == "not_observed"
+    assert phase_summary["blank_action_count"] == 1
 
 
 def test_run_diagnose_exposes_phase_duration_summary_at_root(monkeypatch):

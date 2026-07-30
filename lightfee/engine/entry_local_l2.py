@@ -16,7 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
+
+
+LocalL2StaleAfter = int | Callable[[str], int]
 
 
 # ---------------------------------------------------------------------------
@@ -167,21 +170,43 @@ class EntryLocalL2Session:
             leg.mark_arming(arming_reason)
         return leg
 
-    def both_legs_ready(self, now_ms: int, stale_after_ms: int) -> bool:
+    @staticmethod
+    def _stale_after_ms_for_leg(
+        stale_after_ms: LocalL2StaleAfter,
+        leg: EntryLocalL2LegSession,
+    ) -> int:
+        value = stale_after_ms(leg.venue) if callable(stale_after_ms) else stale_after_ms
+        try:
+            return max(int(value), 1)
+        except (TypeError, ValueError, OverflowError):
+            return 1
+
+    def both_legs_ready(self, now_ms: int, stale_after_ms: LocalL2StaleAfter) -> bool:
         if len(self.legs) < 2:
             return False
-        return all(leg.is_ready(now_ms, stale_after_ms) for leg in self.legs.values())
+        return all(
+            leg.is_ready(now_ms, self._stale_after_ms_for_leg(stale_after_ms, leg))
+            for leg in self.legs.values()
+        )
 
-    def ready_leg_count(self, now_ms: int, stale_after_ms: int) -> int:
-        return sum(1 for leg in self.legs.values() if leg.is_ready(now_ms, stale_after_ms))
+    def ready_leg_count(self, now_ms: int, stale_after_ms: LocalL2StaleAfter) -> int:
+        return sum(
+            1
+            for leg in self.legs.values()
+            if leg.is_ready(now_ms, self._stale_after_ms_for_leg(stale_after_ms, leg))
+        )
 
     def faulted_leg_count(self) -> int:
         return sum(1 for leg in self.legs.values() if leg.state == EntryLocalL2LegState.FAULTED)
 
-    def stale_leg_count(self, now_ms: int, stale_after_ms: int) -> int:
-        return sum(1 for leg in self.legs.values() if leg.is_stale(now_ms, stale_after_ms))
+    def stale_leg_count(self, now_ms: int, stale_after_ms: LocalL2StaleAfter) -> int:
+        return sum(
+            1
+            for leg in self.legs.values()
+            if leg.is_stale(now_ms, self._stale_after_ms_for_leg(stale_after_ms, leg))
+        )
 
-    def refresh_state(self, now_ms: int, stale_after_ms: int) -> None:
+    def refresh_state(self, now_ms: int, stale_after_ms: LocalL2StaleAfter) -> None:
         """Recompute session state from leg states."""
         if self.state == EntryLocalL2SessionState.CLOSED:
             return
@@ -193,7 +218,7 @@ class EntryLocalL2Session:
         else:
             self.state = EntryLocalL2SessionState.ARMING
 
-    def diagnostics_snapshot(self, now_ms: int, stale_after_ms: int) -> dict:
+    def diagnostics_snapshot(self, now_ms: int, stale_after_ms: LocalL2StaleAfter) -> dict:
         return {
             "pair_id": self.pair_id,
             "state": self.state.value,

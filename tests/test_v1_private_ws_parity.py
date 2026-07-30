@@ -752,6 +752,9 @@ class _FakeTransport:
     def private_ws_state(self):
         return self._private_ws_state
 
+    def private_ws_reconnect_policy(self) -> tuple[int, int, int]:
+        return (1_000, 60_000, 5)
+
     def start_private_ws(self, symbols):
         self._private_ws_symbol_map = {
             self._venue_symbol(symbol): symbol
@@ -3357,6 +3360,18 @@ class _LifecycleTransport:
         self.starts: list[list[str]] = []
         self.stops = 0
         self.updates: list[list[str]] = []
+        self.reconnect_policies: list[tuple[int, int, int]] = []
+
+    def configure_private_ws_reconnect(
+        self,
+        *,
+        initial_ms: int,
+        max_ms: int,
+        unhealthy_after_failures: int,
+    ) -> None:
+        self.reconnect_policies.append(
+            (initial_ms, max_ms, unhealthy_after_failures)
+        )
 
     def start_private_ws(self, symbols: list[str]) -> None:
         self.starts.append(list(symbols))
@@ -3427,8 +3442,36 @@ class TestRuntimePrivateWsLifecycle:
         assert transport.updates == [["BTCUSDT"]]
         assert runtime._private_ws_symbols[Venue.BINANCE] == {"ETHUSDT", "BTCUSDT"}
 
+    def test_runtime_installs_one_v1_reconnect_policy_before_start(self):
+        transport = _LifecycleTransport()
+        runtime, _ = self._runtime_with_transport(transport)
+        runtime.config.runtime.ws_reconnect_initial_ms = 250
+        runtime.config.runtime.ws_reconnect_max_ms = 9_000
+        runtime.config.runtime.ws_unhealthy_after_failures = 3
+        runtime._current_tracked_private_symbols = lambda: {
+            Venue.BINANCE: {"ETHUSDT"}
+        }
+
+        runtime._ensure_private_ws_started(1)
+
+        assert transport.reconnect_policies == [(250, 9_000, 3)]
+        assert transport.starts == [["ETHUSDT"]]
+
 
 class TestPrivateWsSymbolUpdateQueue:
+    def test_transport_reconnect_policy_comes_from_runtime_owner(self):
+        from lightfee.venues.specs import get_spec
+        from lightfee.venues.transport import VenueTransport
+
+        transport = VenueTransport(get_spec(Venue.BINANCE), mode="paper")
+        transport.configure_private_ws_reconnect(
+            initial_ms=250,
+            max_ms=9_000,
+            unhealthy_after_failures=3,
+        )
+
+        assert transport.private_ws_reconnect_policy() == (250, 9_000, 3)
+
     def test_okx_additions_are_queued_for_in_band_subscription(self):
         from lightfee.venues.specs import get_spec
         from lightfee.venues.transport import VenueTransport

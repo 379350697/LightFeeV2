@@ -528,6 +528,44 @@ class TestMarketSnapshotDiagnostics:
         assert book.best_bid() == 110.0
 
     @pytest.mark.asyncio
+    async def test_sync_snapshots_resolves_hot_staleness_per_venue(self):
+        """V1's OKX 65s grace must survive the data-plane HOT lifecycle."""
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            async def fetch_l2_snapshot(
+                self,
+                symbol: str,
+                depth: int = 50,
+            ) -> LocalL2Update:
+                raise AssertionError("a still-fresh HOT book must not be rebuilt")
+
+        rt = LocalL2Runtime()
+        journal = type("Journal", (), {"append": lambda self, kind, payload: None})()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.hot_stale_after_ms = lambda venue: 65_000 if venue == "okx" else 10_000
+
+        book = rt.ensure_book("okx", "BTCUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=7,
+            now_ms=1_000,
+        )
+        book.transition_to_bootstrapping(1_000)
+        book.transition_to_hot()
+
+        dispatched = await dp.sync_snapshots(
+            {Venue.OKX: Adapter()},
+            now_ms=12_000,
+            scan_promoted=True,
+        )
+
+        assert dispatched == 0
+        assert book.status == L2BookStatus.HOT
+
+    @pytest.mark.asyncio
     async def test_sync_snapshots_skips_dropped_stale_hot_book(self):
         from lightfee.core.domain import Venue
 

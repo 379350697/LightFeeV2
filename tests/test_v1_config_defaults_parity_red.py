@@ -8,6 +8,7 @@ and catches any regression that would re-introduce misalignment.
 """
 
 from lightfee.config.schema import StrategyConfig
+from lightfee.engine.runtime import LiveRuntime
 
 
 class TestV1ConfigDefaultsParity:
@@ -55,12 +56,20 @@ class TestV1ConfigDefaultsParity:
             f"pending_entry_zero_fill_terminal_cooldown_ms={cfg.pending_entry_zero_fill_terminal_cooldown_ms}, expected 30000 (V1 default)"
         )
 
-    def test_local_l2_entry_book_stale_window_falls_back_to_runtime_default(self):
-        """Production entry-L2 uses a 300s fallback unless explicitly configured."""
+    def test_local_l2_entry_book_readiness_uses_v1_defaults(self):
+        """V1 keeps freshness and quiet-book readiness explicit and per venue."""
         cfg = StrategyConfig()
-        assert cfg.entry_local_l2_book_stale_after_ms == 0
-        assert cfg.local_l2_quiet_book_grace_ms == 0
-        assert cfg.local_l2_max_age_ms == 0
+        assert not hasattr(cfg, "entry_local_l2_book_stale_after_ms")
+        assert cfg.local_l2_max_age_ms == 1000
+        assert cfg.local_l2_quiet_book_grace_ms == 10000
+        assert cfg.local_l2_readiness_max_age_ms_overrides == {"okx": 65000}
+
+    def test_local_l2_readiness_resolves_v1_quiet_and_okx_contract_per_leg(self):
+        cfg = StrategyConfig()
+        config = type("Config", (), {"strategy": cfg})()
+
+        assert LiveRuntime._configured_entry_l2_stale_after_ms(config, "binance") == 10_000
+        assert LiveRuntime._configured_entry_l2_stale_after_ms(config, "okx") == 65_000
 
     def test_pending_entry_hard_ceiling_defaults(self):
         """V1 reliability-contract defaults for pending entry terminalization."""
@@ -69,18 +78,14 @@ class TestV1ConfigDefaultsParity:
         assert cfg.pending_entry_force_terminal_after_ms == 60000
         assert cfg.pending_entry_hard_ceiling_ms == 120000
 
-    def test_lightweight_lifecycle_sla_defaults(self):
-        """Lightweight lifecycle budgets keep long artifacts bounded."""
+    def test_v1_pending_entry_and_submit_deadlines_are_the_only_controls(self):
+        """No V2-only lifecycle SLA config may masquerade as runtime control."""
         cfg = StrategyConfig()
-        assert cfg.candidate_lease_ms == 60000
         assert cfg.selected_submit_deadline_ms == 15000
-        assert cfg.maker_resting_soft_ms == 30000
-        assert cfg.maker_resting_hard_ms == 60000
-        assert cfg.entry_selected_warning_ms == 120000
-        assert cfg.entry_selected_terminal_sla_ms == 300000
-        assert cfg.close_terminal_soft_ms == 60000
-        assert cfg.close_terminal_hard_ms == 300000
-        assert cfg.recovery_terminal_hard_ms == 300000
+        assert cfg.pending_entry_force_terminal_after_ms == 60000
+        assert cfg.pending_entry_hard_ceiling_ms == 120000
+        assert not hasattr(cfg, "candidate_lease_ms")
+        assert not hasattr(cfg, "entry_selected_terminal_sla_ms")
 
     def test_local_l2_resource_budget_defaults(self):
         """V1 local-L2 book budget defaults."""

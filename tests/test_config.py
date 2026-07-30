@@ -20,16 +20,12 @@ from lightfee.core.errors import ConfigError
 
 EXPECTED_PUBLIC_ENTRY_OPEN_INTEREST_RUNTIME_FIELDS = {
     "entry_open_interest_refresh_timeout_ms",
-    "entry_open_interest_cache_fallback_max_age_ms",
 }
 
 
-def test_strategy_config_defaults_first_funding_horizon_floor_to_60s():
-    from lightfee.config.schema import StrategyConfig
-
-    cfg = StrategyConfig()
-
-    assert cfg.entry_min_first_funding_remaining_secs == 60
+def test_strategy_config_has_no_pseudo_first_funding_floor():
+    """V1 uses min_scan_minutes_before_funding as the sole horizon input."""
+    assert not hasattr(StrategyConfig(), "entry_min_first_funding_remaining_secs")
 
 
 def test_strategy_config_forecast_default_is_reachable_in_a_seven_day_8h_window():
@@ -57,8 +53,14 @@ def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
     [
         ("runtime", "fee_evidence_path"),
         ("runtime", "funding_fee_evidence_path"),
+        ("runtime", "sidecar_perp_liquidity_budget_ms"),
+        ("runtime", "sidecar_liquidity_timeout_s"),
+        ("runtime", "entry_open_interest_cache_fallback_max_age_ms"),
         ("strategy", "funding_canary_enabled"),
         ("strategy", "funding_canary_max_entry_notional_quote"),
+        ("strategy", "entry_min_first_funding_remaining_secs"),
+        ("strategy", "pending_entry_max_lifetime_ms"),
+        ("strategy", "entry_local_l2_book_stale_after_ms"),
     ],
 )
 def test_removed_live_evidence_and_canary_fields_fail_config_loading(
@@ -78,8 +80,8 @@ def test_removed_live_evidence_and_canary_fields_fail_config_loading(
 def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
     cfg = AppConfig()
 
+    assert cfg.runtime.slow_evidence_max_age_ms == 10 * 60_000
     assert cfg.runtime.entry_open_interest_refresh_timeout_ms == 750
-    assert cfg.runtime.entry_open_interest_cache_fallback_max_age_ms == 30 * 60_000
     assert {
         name
         for name in cfg.runtime.__dataclass_fields__
@@ -95,20 +97,52 @@ def test_runtime_config_validates_entry_open_interest_controls(tmp_path):
     )
 
     cfg.runtime.entry_open_interest_refresh_timeout_ms = 750
-    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = 30 * 60_000 + 1
+    cfg.runtime.slow_evidence_max_age_ms = 10 * 60_000 + 1
     assert (
-        "runtime.entry_open_interest_cache_fallback_max_age_ms must be <= 1800000"
-        in validate_config(cfg)
-    )
-
-    cfg.runtime.entry_open_interest_cache_fallback_max_age_ms = -1
-    assert (
-        "runtime.entry_open_interest_cache_fallback_max_age_ms must be a positive integer"
+        "runtime.slow_evidence_max_age_ms must be <= 600000"
         in validate_config(cfg)
     )
 
     assert not hasattr(cfg.runtime, "entry_open_interest_store_path")
     assert not hasattr(cfg.runtime, "entry_open_interest_background_refresh_ms")
+    assert not hasattr(cfg.runtime, "entry_open_interest_cache_fallback_max_age_ms")
+
+
+def test_strategy_config_validates_local_l2_readiness_contract():
+    cfg = AppConfig()
+    assert cfg.strategy.local_l2_max_age_ms == 1_000
+    assert cfg.strategy.local_l2_quiet_book_grace_ms == 10_000
+    assert cfg.strategy.local_l2_readiness_max_age_ms_overrides == {"okx": 65_000}
+
+    cfg.strategy.local_l2_readiness_max_age_ms_overrides = {"unknown": 1_000}
+    assert any("unknown venue" in issue for issue in validate_config(cfg))
+
+    cfg.strategy.local_l2_readiness_max_age_ms_overrides = {"okx": 0}
+    assert any("[okx] must be a positive integer" in issue for issue in validate_config(cfg))
+
+
+def test_runtime_config_validates_private_ws_reconnect_policy():
+    cfg = AppConfig()
+    assert cfg.runtime.ws_reconnect_initial_ms == 1_000
+    assert cfg.runtime.ws_reconnect_max_ms == 60_000
+    assert cfg.runtime.ws_unhealthy_after_failures == 5
+
+    cfg.runtime.ws_reconnect_initial_ms = 0
+    assert "runtime.ws_reconnect_initial_ms must be a positive integer" in validate_config(cfg)
+
+    cfg.runtime.ws_reconnect_initial_ms = 1_000
+    cfg.runtime.ws_reconnect_max_ms = 999
+    assert (
+        "runtime.ws_reconnect_max_ms must be >= runtime.ws_reconnect_initial_ms"
+        in validate_config(cfg)
+    )
+
+    cfg.runtime.ws_reconnect_max_ms = 60_000
+    cfg.runtime.ws_unhealthy_after_failures = 0
+    assert (
+        "runtime.ws_unhealthy_after_failures must be a positive integer"
+        in validate_config(cfg)
+    )
 
 
 def test_runtime_config_validates_entry_account_truth_per_venue_timeout():
@@ -333,18 +367,6 @@ def test_live_config_does_not_accept_truthy_risk_monitor_value():
     issues = validate_config(cfg)
 
     assert "strategy.risk_monitor_enabled must be true in live mode" in issues
-
-
-def test_strategy_config_rejects_negative_first_funding_horizon():
-    from lightfee.config.schema import AppConfig
-    from lightfee.config.validation import validate_config
-
-    cfg = AppConfig()
-    cfg.strategy.entry_min_first_funding_remaining_secs = -1
-
-    issues = validate_config(cfg)
-
-    assert any("entry_min_first_funding_remaining_secs" in issue for issue in issues)
 
 
 def test_strategy_config_requires_positive_maker_reconcile_backoff():

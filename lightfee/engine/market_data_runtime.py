@@ -861,8 +861,10 @@ class MarketDataRuntime:
     def _local_l2_effective_enabled(self) -> bool:
         return self.ctx._entry_local_l2_effective_enabled()
 
-    def _entry_local_l2_stale_after_ms(self) -> int:
-        return self.ctx._entry_local_l2_stale_after_ms()
+    def _entry_local_l2_stale_after_ms(self, venue: str | None = None) -> int:
+        if venue is None:
+            return self.ctx._entry_local_l2_stale_after_ms()
+        return self.ctx._entry_local_l2_stale_after_ms(venue)
 
     async def _filter_symbols_supported_by_venue(
         self,
@@ -1239,17 +1241,7 @@ class MarketDataRuntime:
             symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
             if not symbol:
                 return False
-            max_age_ms = max(
-                int(
-                    getattr(
-                        self.ctx.config.runtime,
-                        "sidecar_perp_liquidity_budget_ms",
-                        30_000,
-                    )
-                    or 0
-                ),
-                1,
-            )
+            max_age_ms = self._slow_evidence_max_age_ms()
             expected_venues = {
                 "long": str(getattr(candidate, "long_venue", "") or "").strip().lower(),
                 "short": str(getattr(candidate, "short_venue", "") or "").strip().lower(),
@@ -1372,7 +1364,6 @@ class MarketDataRuntime:
         registered_total = 0
         registered_venues: set[str] = set()
         connect_ws_streams_needed = False
-        stale_after_ms = self._entry_local_l2_stale_after_ms()
         from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
 
         def hot_book_needs_ws_lifecycle_attention(venue: str, symbol: str) -> bool:
@@ -1472,7 +1463,10 @@ class MarketDataRuntime:
                         ven_str, sym, desired_pool, now_ms=now_ms,
                     )
                     if book.status == L2BookStatus.HOT:
-                        stale = book.is_stale(stale_after_ms, now_ms)
+                        stale = book.is_stale(
+                            self._entry_local_l2_stale_after_ms(ven_str),
+                            now_ms,
+                        )
                         crossed = book.has_crossed_book()
                         if not stale and not crossed:
                             if hot_book_needs_ws_lifecycle_attention(ven_str, str(sym)):
@@ -1521,7 +1515,7 @@ class MarketDataRuntime:
             self.ctx.l2_data_plane.prune_untracked_books(
                 tracked_keys,
                 now_ms,
-                retained_max_age_ms=max(stale_after_ms, 300_000),
+                retained_max_age_ms=60_000,
             )
             return
 
@@ -1632,7 +1626,7 @@ class MarketDataRuntime:
         self.ctx.l2_data_plane.prune_untracked_books(
             tracked_keys,
             now_ms,
-            retained_max_age_ms=max(stale_after_ms, 300_000),
+            retained_max_age_ms=60_000,
         )
 
     async def _ensure_entry_bbo_active_for_candidates(
@@ -3187,7 +3181,10 @@ class MarketDataRuntime:
         ]
         # Session snapshot
         self.ctx.state.local_l2_session_snapshot = [
-            s.diagnostics_snapshot(now_ms=wall_clock_now_ms(), stale_after_ms=5000)
+            s.diagnostics_snapshot(
+                now_ms=wall_clock_now_ms(),
+                stale_after_ms=self._entry_local_l2_stale_after_ms,
+            )
             for s in self.ctx.entry_l2_sessions.sessions.values()
         ]
         self._publish_local_l2_depth_bridge(now_ms)
@@ -3241,40 +3238,7 @@ class MarketDataRuntime:
     def _snapshot_domain_budget_ms(self, domain: str, row=None) -> int:
         domain_s = str(domain or "").lower()
         if domain_s == "liquidity":
-            configured_ms = int(
-                getattr(
-                    self.ctx.config.runtime,
-                    "sidecar_perp_liquidity_budget_ms",
-                    self.ctx.config.strategy.max_liquidity_snapshot_age_ms,
-                )
-                or 0
-            )
-            refresh_ms = self.ctx.config.runtime.sidecar_refresh_ms
-            timeout_ms = int(
-                float(
-                    getattr(
-                        self.ctx.config.runtime,
-                        "sidecar_liquidity_timeout_s",
-                        10.0,
-                    )
-                    or 0.0
-                )
-                * 1000.0
-            )
-            publish_interval_ms = (
-                int(getattr(row, "publish_interval_ms", 0) or 0)
-                if row is not None else 0
-            )
-            return int(
-                max(
-                    configured_ms,
-                    int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0),
-                    refresh_ms * 3 if refresh_ms > 0 else 0,
-                    refresh_ms + timeout_ms * 2 if timeout_ms > 0 else 0,
-                    publish_interval_ms * 2 if publish_interval_ms > 0 else 0,
-                    30_000,
-                )
-            )
+            return self._slow_evidence_max_age_ms()
         if domain_s == "quote":
             return int(
                 self.ctx.config.runtime.max_order_quote_age_ms
@@ -3839,11 +3803,12 @@ class MarketDataRuntime:
     def _entry_open_interest_refresh_timeout_s(self) -> float:
         return self._entry_open_interest_refresh_timeout_ms() / 1_000.0
 
-    def _entry_open_interest_cache_fallback_max_age_ms(self) -> int:
+    def _slow_evidence_max_age_ms(self) -> int:
+        """Bound persisted OI/24h-volume evidence without affecting BBO/L2."""
         return bounded_open_interest_cache_fallback_max_age_ms(
             getattr(
                 self.ctx.config.runtime,
-                "entry_open_interest_cache_fallback_max_age_ms",
+                "slow_evidence_max_age_ms",
                 ENTRY_OPEN_INTEREST_CACHE_FALLBACK_MAX_AGE_MS,
             )
         )
@@ -3880,10 +3845,6 @@ class MarketDataRuntime:
             return stats
         if getattr(self.ctx.state, "last_scan", None) is None:
             self.ctx.state.last_scan = {}
-        oi_cache_fallback_max_age_ms = (
-            self._entry_open_interest_cache_fallback_max_age_ms()
-        )
-
         if evidence_role == "prewarm_only":
             raise ValueError("entry OI prewarm was removed; refresh candidates on demand")
         if not candidates:
@@ -3914,17 +3875,12 @@ class MarketDataRuntime:
             tuple[str, str],
             dict[str, set[str]],
         ] = {}
-        oi_max_age_ms = max(
-            int(
-                getattr(
-                    self.ctx.config.runtime,
-                    "sidecar_perp_liquidity_budget_ms",
-                    30_000,
-                )
-                or 0
-            ),
-            1,
-        )
+        # The persisted sidecar snapshot is the local slow-evidence source.
+        # Do not start a second public HTTP request while this proof is valid.
+        oi_max_age_ms = self._slow_evidence_max_age_ms()
+        # There is one OI age contract.  Cache fallback retains its source
+        # marker for diagnosis, but it cannot outlive this total bound.
+        oi_cache_fallback_max_age_ms = oi_max_age_ms
         oi_refresh_timeout_ms = self._entry_open_interest_refresh_timeout_ms()
         oi_refresh_timeout_s = oi_refresh_timeout_ms / 1_000.0
         for candidate in list(candidates or []):
