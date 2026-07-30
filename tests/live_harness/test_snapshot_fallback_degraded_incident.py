@@ -154,6 +154,7 @@ def _runtime(tmp_path) -> LiveRuntime:
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
             sidecar_snapshot_max_age_ms=600000,
+            sidecar_market_observation_max_age_ms=5000,
             max_market_age_ms=5000,
             max_order_quote_age_ms=5000,
             live_scan_last_good_max_age_ms=600000,
@@ -211,7 +212,7 @@ def _payload(records: list[dict], kind: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_blocking(
+async def test_stale_broad_market_is_candidate_scoped_and_non_blocking(
     tmp_path, monkeypatch,
 ):
     # This is a fail-closed incident test, not a live REST integration test.
@@ -224,6 +225,7 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     candidate = _candidate("RIVERUSDT")
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
+        candidate_build_observed_at_ms=69000,
         market_observed_at_ms=10000,
         acquisition_mode="last_good_sidecar",
         degraded_domains=["market_observed_stale"],
@@ -236,8 +238,8 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
 
     runtime, records = await _run_tick(tmp_path, monkeypatch, snapshot)
 
-    fallback = _payload(records, "runtime.snapshot_fallback_last_good")
-    scope = fallback["candidate_freshness_scope"]
+    degraded = _payload(records, "runtime.snapshot_degraded")
+    scope = degraded["candidate_freshness_scope"]
     market_scope = next(
         sample for sample in scope
         if sample["candidate_symbol"] == "RIVERUSDT"
@@ -249,9 +251,9 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     assert market_scope["fallback_duration_ms"] == 55000
     assert market_scope["blocked"] is False
     assert market_scope["block_reason"] == ""
-    # Fallback health is non-blocking, but a real first leg still requires
-    # revalidated quote truth.  This fixture intentionally keeps a last-good
-    # snapshot, so entry must fail closed before dispatch.
+    # Broad producer health is non-blocking, but a real first leg still
+    # requires revalidated quote truth. This fixture intentionally keeps a
+    # last-good source, so entry must fail closed before dispatch.
     assert len(runtime.entry_executor.contexts) == 0
     quote_blocks = [
         record for record in records

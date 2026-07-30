@@ -41,10 +41,12 @@ def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
     cfg = StrategyConfig()
 
     assert cfg.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
-    assert cfg.entry_local_l2_primary_count == 3
+    assert cfg.entry_local_l2_primary_count == 6
     assert cfg.shadow_entry_opportunity_count == 2
     assert cfg.primary_min_hold_ms == 15_000
     assert cfg.shadow_promotion_score_delta_bps == 3.0
+    assert cfg.post_funding_hold_secs == 300
+    assert cfg.local_l2_scan_assignment_lease_enabled is False
     assert cfg.entry_quote_prewarm_extra_candidate_count == 0
     assert cfg.maker_initial_slice_ratio == 0.25
     assert cfg.maker_entry_max_reposts == 1
@@ -951,13 +953,27 @@ class TestConfigValidation:
         config = AppConfig(symbols=["BTCUSDT"])
         config.runtime.live_scan_last_good_max_age_ms = 0
         config.runtime.live_startup_phase_timeout_ms = 0
+        config.runtime.sidecar_snapshot_publish_warn_ms = 0
+        config.runtime.sidecar_market_observation_max_age_ms = 0
         config.runtime.max_market_age_ms = 0
         config.runtime.max_order_quote_age_ms = 0
         issues = validate_config(config)
         assert any("live_scan_last_good_max_age_ms" in i for i in issues)
         assert any("live_startup_phase_timeout_ms" in i for i in issues)
+        assert any("sidecar_snapshot_publish_warn_ms" in i for i in issues)
+        assert any("sidecar_market_observation_max_age_ms" in i for i in issues)
         assert any("max_market_age_ms" in i for i in issues)
         assert any("max_order_quote_age_ms" in i for i in issues)
+
+    def test_snapshot_publish_warning_cannot_exceed_availability_bound(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.runtime.sidecar_snapshot_max_age_ms = 30_000
+        config.runtime.sidecar_snapshot_publish_warn_ms = 30_001
+
+        assert (
+            "runtime.sidecar_snapshot_publish_warn_ms must be <= "
+            "runtime.sidecar_snapshot_max_age_ms"
+        ) in validate_config(config)
 
     def test_entry_readiness_provider_must_be_known(self):
         config = AppConfig(symbols=["BTCUSDT"])
@@ -1100,6 +1116,25 @@ class TestConfigValidation:
 
         assert any(
             "entry_local_l2_primary_count" in issue
+            for issue in validate_config(config)
+        )
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ("post_funding_hold_secs", "local_l2_scan_assignment_lease_ttl_secs"),
+    )
+    def test_v1_duration_knobs_require_nonnegative_integers(self, field_name):
+        config = AppConfig(symbols=["BTCUSDT"])
+        setattr(config.strategy, field_name, -1)
+
+        assert any(field_name in issue for issue in validate_config(config))
+
+    def test_local_l2_assignment_lease_enabled_requires_boolean(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.local_l2_scan_assignment_lease_enabled = "true"
+
+        assert any(
+            "local_l2_scan_assignment_lease_enabled" in issue
             for issue in validate_config(config)
         )
 

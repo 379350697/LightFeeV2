@@ -485,6 +485,18 @@ class TestForceCloseDue:
 
 
 class TestPassiveCloseFallbackDue:
+    def test_force_close_deadline_overrides_post_funding_capture_hold(self):
+        pos = _make_position(
+            matched_quantity=0.01,
+            funding_timestamp_ms=1_000_000,
+        )
+        cfg = _config(
+            settlement_force_close_delay_secs=120,
+            post_funding_hold_secs=300,
+        )
+
+        assert passive_close_fallback_due(pos, cfg, 1_120_001) is True
+
     def test_settlement_half_base_ignores_malformed_funding_timestamps(self):
         pos = _make_position(
             matched_quantity=0.01,

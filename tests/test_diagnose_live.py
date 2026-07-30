@@ -356,7 +356,7 @@ def test_run_diagnose_reports_spread_sidecar_snapshot_source():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_fresh():
+def test_spread_sidecar_summary_recovers_main_snapshot_within_availability_budget():
     from lightfee.sidecar.publisher import publish_snapshot
     from lightfee.sidecar.snapshot import SidecarSnapshot
     from lightfee.spread.models import SpreadSnapshot
@@ -398,12 +398,15 @@ def test_spread_sidecar_summary_marks_stale_source_recovered_when_main_snapshot_
             os.path.join(d, "spread-opportunities-current.json"),
         )
 
-        summary = diagnose_live._build_spread_sidecar_summary(d, now_ms=10_500)
+        # The full-universe sidecar normally publishes every 9--15 seconds.
+        # The diagnosis availability contract must match runtime: this is
+        # recoverable until the 30-second publication boundary, not 10 seconds.
+        summary = diagnose_live._build_spread_sidecar_summary(d, now_ms=25_000)
 
         assert summary["spread_sidecar_source"] == "sidecar_snapshot_stale"
         assert summary["spread_sidecar_source_state"] == "transient_stale_recovered"
         assert summary["spread_sidecar_current_degraded"] is False
-        assert summary["main_sidecar_snapshot_age_ms"] == 500
+        assert summary["main_sidecar_snapshot_age_ms"] == 15_000
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

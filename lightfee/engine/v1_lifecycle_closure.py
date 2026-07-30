@@ -1272,6 +1272,7 @@ _EVENT_KIND_PHASES = {
     "runtime.quote_stale": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.ws_bbo_dynamic_ws_started": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.snapshot_fallback_last_good": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
+    "runtime.snapshot_publish_slow": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.candidate_symbol_skipped": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.candidate_lease_expired": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.candidates_tradeable": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,

@@ -13,11 +13,11 @@ from lightfee.config.schema import StrategyConfig
 class TestV1ConfigDefaultsParity:
     """Assert V2 default values match V1 reliability-contract defaults."""
 
-    def test_entry_local_l2_primary_count_is_three_for_on_demand_finalists(self):
-        """The composed entry mode limits on-demand L2 activation to three finalists."""
+    def test_entry_local_l2_primary_count_matches_v1_live_primary_window(self):
+        """V1 live funding profile keeps six primary routes plus two shadows."""
         cfg = StrategyConfig()
-        assert cfg.entry_local_l2_primary_count == 3, (
-            f"entry_local_l2_primary_count={cfg.entry_local_l2_primary_count}, expected 3"
+        assert cfg.entry_local_l2_primary_count == 6, (
+            f"entry_local_l2_primary_count={cfg.entry_local_l2_primary_count}, expected 6"
         )
 
     def test_local_l2_short_prewarm_disabled_by_default(self):

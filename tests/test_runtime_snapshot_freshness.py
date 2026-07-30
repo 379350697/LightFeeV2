@@ -3229,12 +3229,13 @@ def test_runtime_snapshot_health_payload_reports_rolling_latency_quantiles(
 
 
 @pytest.mark.asyncio
-async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
+async def test_runtime_passes_independent_broad_market_budget_to_freshness(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
             sidecar_snapshot_max_age_ms=10000,
+            sidecar_market_observation_max_age_ms=27_000,
             live_scan_last_good_max_age_ms=600000,
             max_market_age_ms=4000,
         ),
@@ -3273,7 +3274,62 @@ async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path,
         runtime.journal.close()
 
     assert observed["last_good_max_age_ms"] == 600000
-    assert observed["market_max_age_ms"] == 4000
+    assert observed["market_max_age_ms"] == 27_000
+
+
+@pytest.mark.asyncio
+async def test_runtime_slow_publication_warns_without_last_good_or_entry_block(
+    tmp_path, monkeypatch,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=30_000,
+            sidecar_snapshot_publish_warn_ms=10_000,
+            sidecar_market_observation_max_age_ms=30_000,
+            live_scan_recovery_success_count=1,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = _candidate_lease_snapshot(_freshness_candidate(), now_ms=0)
+    snapshot.published_at_ms = 0
+    snapshot.ready_at_ms = 1
+    snapshot.market_observed_at_ms = 1
+    snapshot.candidate_build_observed_at_ms = 1
+
+    _install_single_snapshot_fixture(monkeypatch, snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 15_000)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    records = _read_journal_records(tmp_path / "events.jsonl")
+    warning = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_publish_slow"
+    )
+    assert runtime.state.last_scan["snapshot_freshness"] == "fresh"
+    assert runtime.state.last_scan["snapshot_publication_slow"] is True
+    assert runtime.state.last_scan["snapshot_publication_age_ms"] == 14_999
+    assert warning["blocking"] is False
+    assert warning["snapshot_publish_warn_ms"] == 10_000
+    assert warning["snapshot_availability_max_age_ms"] == 30_000
+    assert not any(
+        record["kind"] in {
+            "runtime.snapshot_stale",
+            "runtime.snapshot_fallback_last_good",
+        }
+        for record in records
+    )
 
 
 @pytest.mark.asyncio
@@ -5821,6 +5877,7 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
             sidecar_snapshot_max_age_ms=600000,
+            sidecar_market_observation_max_age_ms=5000,
             max_market_age_ms=5000,
             max_order_quote_age_ms=5000,
             live_scan_last_good_max_age_ms=600000,
@@ -5859,6 +5916,7 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     bybit_quote.source = "sidecar_quote"
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
+        candidate_build_observed_at_ms=69000,
         market_observed_at_ms=10000,
         acquisition_mode="last_good_sidecar",
         degraded_domains=["market_observed_stale"],
@@ -5887,13 +5945,13 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     assert len(executor.contexts) == 1
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
     assert runtime.state.last_scan["no_entry_reason"] is None
-    fallback = next(
+    degraded = next(
         record["payload"]
         for record in records
-        if record["kind"] == "runtime.snapshot_fallback_last_good"
+        if record["kind"] == "runtime.snapshot_degraded"
     )
     market_scope = next(
-        sample for sample in fallback["candidate_freshness_scope"]
+        sample for sample in degraded["candidate_freshness_scope"]
         if sample["candidate_symbol"] == "BTCUSDT"
         and sample["domain"] == "market_observed"
     )
@@ -5917,7 +5975,7 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
 
 
 @pytest.mark.asyncio
-async def test_runtime_retains_target_proven_candidate_when_broad_market_observed_stale_without_last_good_window(
+async def test_runtime_retains_target_proven_candidate_when_broad_market_observed_stale_even_with_last_good_window(
     tmp_path, monkeypatch,
 ):
     config = AppConfig(
@@ -5925,9 +5983,10 @@ async def test_runtime_retains_target_proven_candidate_when_broad_market_observe
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
             sidecar_snapshot_max_age_ms=600_000,
+            sidecar_market_observation_max_age_ms=5_000,
             max_market_age_ms=5_000,
             max_order_quote_age_ms=5_000,
-            live_scan_last_good_max_age_ms=5_000,
+            live_scan_last_good_max_age_ms=600_000,
             sidecar_perp_liquidity_budget_ms=5_000,
             live_scan_recovery_success_count=1,
         ),

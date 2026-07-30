@@ -979,7 +979,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             pair_id="btcusdt:binance->bybit",
             first_funding_timestamp_ms=20_000,
         )
-        assert runtime_with_l2._record_entry_primary_backfill_failure(
+        assert runtime_with_l2._record_entry_execution_queue_failure(
             candidate,
             reason="entry_final_revalidation_failed",
             now_ms=now_ms,
@@ -1039,7 +1039,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             if opportunity.class_ == TrackedOpportunityClass.PRIMARY
         }
 
-        assert runtime_with_l2._record_entry_primary_backfill_failure(
+        assert runtime_with_l2._record_entry_execution_queue_failure(
             candidates[0],
             reason="entry_open_interest_revalidation_failed",
             now_ms=now_ms,
@@ -1059,7 +1059,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             TrackedOpportunityClass.PRIMARY
         )
         assert classes[failed_pair_id] == TrackedOpportunityClass.SHADOW
-        assert not runtime_with_l2._record_entry_primary_backfill_failure(
+        assert not runtime_with_l2._record_entry_execution_queue_failure(
             candidates[1],
             reason="entry_local_l2_waiting_for_primary_tracking",
             now_ms=now_ms,
@@ -1230,6 +1230,161 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             "oldusdt:binance->bybit": TrackedOpportunityClass.PRIMARY,
         }
 
+    def test_v1_primary_lease_is_disabled_without_explicit_enablement(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 200_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        strategy = runtime_with_l2.config.strategy
+        strategy.entry_local_l2_primary_count = 1
+        strategy.shadow_entry_opportunity_count = 0
+        strategy.local_l2_scan_assignment_lease_enabled = False
+        strategy.local_l2_scan_assignment_lease_ttl_secs = 90
+        old_primary = self._make_real_candidate(
+            symbol="OLDUSDT",
+            pair_id="oldusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        higher_ranked = self._make_real_candidate(
+            symbol="NEWUSDT",
+            pair_id="newusdt:binance->bybit",
+            ranking_edge_bps=30.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            old_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 90_001,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [higher_ranked, old_primary]
+        )
+
+        assert runtime_with_l2._effective_local_l2_scan_assignment_lease_ttl_ms() is None
+        assert tracked[0].pair_id == "oldusdt:binance->bybit"
+
+    def test_v1_enabled_primary_lease_releases_only_unready_primary(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 200_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        strategy = runtime_with_l2.config.strategy
+        strategy.entry_local_l2_primary_count = 1
+        strategy.shadow_entry_opportunity_count = 0
+        strategy.local_l2_scan_assignment_lease_enabled = True
+        strategy.local_l2_scan_assignment_lease_ttl_secs = 90
+        old_primary = self._make_real_candidate(
+            symbol="OLDUSDT",
+            pair_id="oldusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        replacement = self._make_real_candidate(
+            symbol="NEWUSDT",
+            pair_id="newusdt:binance->bybit",
+            ranking_edge_bps=30.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            old_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 90_001,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [replacement, old_primary]
+        )
+
+        assert runtime_with_l2._effective_local_l2_scan_assignment_lease_ttl_ms() == 90_000
+        assert tracked[0].pair_id == "newusdt:binance->bybit"
+
+    def test_v1_enabled_primary_lease_does_not_empty_the_only_route(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 200_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        strategy = runtime_with_l2.config.strategy
+        strategy.entry_local_l2_primary_count = 1
+        strategy.shadow_entry_opportunity_count = 0
+        strategy.local_l2_scan_assignment_lease_enabled = True
+        strategy.local_l2_scan_assignment_lease_ttl_secs = 90
+        only_primary = self._make_real_candidate(
+            symbol="ONLYUSDT",
+            pair_id="onlyusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            only_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 90_001,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope([only_primary])
+
+        assert tracked[0].pair_id == "onlyusdt:binance->bybit"
+
+    def test_evidence_rotation_is_not_a_wall_clock_l2_lease(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        strategy = runtime_with_l2.config.strategy
+        strategy.entry_local_l2_primary_count = 1
+        strategy.shadow_entry_opportunity_count = 0
+        strategy.local_l2_scan_assignment_lease_enabled = True
+        strategy.local_l2_scan_assignment_lease_ttl_secs = 90
+        candidates = [
+            self._make_real_candidate(
+                symbol=f"QUEUE{index}USDT",
+                pair_id=f"queue{index}usdt:binance->bybit",
+                ranking_edge_bps=100.0 - index,
+            )
+            for index in range(2)
+        ]
+
+        assert runtime_with_l2._record_entry_execution_queue_failure(
+            candidates[0],
+            reason="entry_quote_revalidation_failed",
+            now_ms=now_ms,
+        )
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms + 91_000
+        )
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+
+        failure = runtime_with_l2._entry_execution_queue_failures[
+            "queue0usdt:binance->bybit"
+        ]
+        assert failure["scope"] == "entry_execution_queue_round"
+        assert "expires_at_ms" not in failure
+        assert tracked[0].pair_id == "queue1usdt:binance->bybit"
+
+        assert runtime_with_l2._clear_entry_execution_queue_failure(candidates[0])
+        restored, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+        assert restored[0].pair_id == "queue0usdt:binance->bybit"
+
     def test_tracked_scope_uses_the_composed_entry_l2_contract(
         self,
         runtime_with_l2,
@@ -1310,7 +1465,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         first, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
         assert first[0].pair_id == "ws0usdt:binance->bybit"
         assert first[0].class_ == TrackedOpportunityClass.PRIMARY
-        assert runtime_with_l2._record_entry_primary_backfill_failure(
+        assert runtime_with_l2._record_entry_execution_queue_failure(
             candidates[0],
             reason="entry_quote_revalidation_failed",
             now_ms=now_ms,
@@ -1341,7 +1496,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             )
             for index in range(3)
         ]
-        assert runtime_with_l2._record_entry_primary_backfill_failure(
+        assert runtime_with_l2._record_entry_execution_queue_failure(
             candidates[0],
             reason="entry_quote_revalidation_failed",
             now_ms=now_ms,

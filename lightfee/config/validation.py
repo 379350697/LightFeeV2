@@ -44,6 +44,24 @@ def validate_config(config: AppConfig) -> list[str]:
             f"runtime.sidecar_snapshot_max_age_ms must be > 0, "
             f"got: {config.runtime.sidecar_snapshot_max_age_ms}"
         )
+    if config.runtime.sidecar_snapshot_publish_warn_ms <= 0:
+        issues.append(
+            "runtime.sidecar_snapshot_publish_warn_ms must be > 0, "
+            f"got: {config.runtime.sidecar_snapshot_publish_warn_ms}"
+        )
+    elif (
+        config.runtime.sidecar_snapshot_publish_warn_ms
+        > config.runtime.sidecar_snapshot_max_age_ms
+    ):
+        issues.append(
+            "runtime.sidecar_snapshot_publish_warn_ms must be <= "
+            "runtime.sidecar_snapshot_max_age_ms"
+        )
+    if config.runtime.sidecar_market_observation_max_age_ms <= 0:
+        issues.append(
+            "runtime.sidecar_market_observation_max_age_ms must be > 0, "
+            f"got: {config.runtime.sidecar_market_observation_max_age_ms}"
+        )
     if not _is_positive_int(config.runtime.entry_open_interest_refresh_timeout_ms):
         issues.append(
             "runtime.entry_open_interest_refresh_timeout_ms must be a positive integer"
@@ -464,6 +482,17 @@ def validate_config(config: AppConfig) -> list[str]:
     ):
         issues.append(
             "strategy.entry_local_l2_primary_count must be a non-negative integer"
+        )
+
+    for field_name in (
+        "post_funding_hold_secs",
+        "local_l2_scan_assignment_lease_ttl_secs",
+    ):
+        if not _is_nonnegative_int(getattr(config.strategy, field_name)):
+            issues.append(f"strategy.{field_name} must be a non-negative integer")
+    if not isinstance(config.strategy.local_l2_scan_assignment_lease_enabled, bool):
+        issues.append(
+            "strategy.local_l2_scan_assignment_lease_enabled must be a boolean"
         )
 
     for field_name in (

@@ -396,15 +396,14 @@ class LiveRuntime:
         self.entry_dispatch_runtime = EntryDispatchRuntime(self)
         self._refresh_runtime_market_data_config_state()
         self._tracked_primary_pair_ids: set[str] = set()  # V1: primary_opportunities
-        # Pair-scoped evidence/final-revalidation failures temporarily release
-        # scarce primary L2 ownership.  The complete frontier remains intact,
-        # so a repaired route can clear its failure while tracked as shadow or
-        # while receiving public quote/OI evidence outside the L2 window.
-        self._entry_primary_backfill_failures: dict[str, dict[str, object]] = {}
+        # Terminal evidence failures rotate one route behind the remaining
+        # frontier for the current fair-queue round.  This is deliberately
+        # separate from the V1 Local-L2 primary assignment lease.
+        self._entry_execution_queue_failures: dict[str, dict[str, object]] = {}
         # Stable per-round queue state: a terminally rejected active route is
         # moved behind every not-yet-tested route.  This is deliberately
-        # independent from the short failure TTL, otherwise a large frontier
-        # can starve below-rank opportunities when early failures expire.
+        # independent from Local-L2 resource ownership, so evidence outcomes
+        # cannot silently become a wall-clock L2 blacklist.
         self._entry_execution_queue_attempted_pair_ids: set[str] = set()
         self._entry_l2_last_leg_diagnostics: dict[tuple[str, str], dict] = {}
         self._last_entry_l2_readiness_diag_fingerprint: str = ""
@@ -2454,6 +2453,12 @@ class LiveRuntime:
                 journal=self.journal,
                 config_overrides={
                     "runtime_mode": self.config.runtime.mode,
+                    "max_zero_fill_cycles": (
+                        self.config.strategy.maker_phase_max_zero_fill_cycles
+                    ),
+                    "maker_cycle_retry_delays_ms": list(
+                        self.config.strategy.maker_cycle_retry_delays_ms or []
+                    ),
                     "maker_hedge_deadline_ms": self.config.strategy.maker_hedge_deadline_ms,
                 },
             )
@@ -4296,60 +4301,55 @@ class LiveRuntime:
     async def _ensure_entry_bbo_active_for_candidates(self, candidates, now_ms: int):
         return await self.market_data_runtime._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
 
-    def _entry_primary_backfill_failure_ttl_ms(self) -> int:
-        return max(
-            int(
-                getattr(
-                    self.config.strategy,
-                    "local_l2_scan_assignment_lease_ttl_secs",
-                    90,
-                )
-                or 0
-            )
-            * 1_000,
-            1_000,
-        )
+    def _effective_local_l2_scan_assignment_lease_ttl_ms(self) -> int | None:
+        """Return V1's opt-in lease for an unready Local-L2 primary only."""
+        strategy = self.config.strategy
+        if not bool(strategy.local_l2_scan_assignment_lease_enabled):
+            return None
+        try:
+            ttl_secs = int(strategy.local_l2_scan_assignment_lease_ttl_secs or 0)
+        except (TypeError, ValueError):
+            return None
+        return ttl_secs * 1_000 if ttl_secs > 0 else None
 
-    def _record_entry_primary_backfill_failure(
+    def _record_entry_execution_queue_failure(
         self,
         candidate,
         *,
         reason: str,
         now_ms: int,
     ) -> bool:
-        """Release one failed route from primary ownership for one lease."""
+        """Rotate a terminally rejected route for the current fair-queue round."""
         if reason == "entry_local_l2_waiting_for_primary_tracking":
             return False
         pair_id = self._candidate_pair_id(candidate)
         if not pair_id:
             return False
-        previous = self._entry_primary_backfill_failures.get(pair_id)
+        previous = self._entry_execution_queue_failures.get(pair_id)
         normalized_reason = str(reason or "entry_pair_evidence_failed")
         if self._entry_execution_queue_terminal_failure(normalized_reason):
             self._entry_execution_queue_attempted_pair_ids.add(pair_id)
         if (
             previous is not None
             and str(previous.get("reason", "")) == normalized_reason
-            and int(previous.get("expires_at_ms", 0) or 0) > int(now_ms)
         ):
             return False
         failure = {
             "reason": normalized_reason,
             "failed_at_ms": int(now_ms),
-            "expires_at_ms": int(now_ms)
-            + self._entry_primary_backfill_failure_ttl_ms(),
+            "scope": "entry_execution_queue_round",
         }
-        self._entry_primary_backfill_failures[pair_id] = failure
+        self._entry_execution_queue_failures[pair_id] = failure
         return previous != failure
 
-    def _clear_entry_primary_backfill_failure(
+    def _clear_entry_execution_queue_failure(
         self,
         candidate,
         *,
         expected_reasons: set[str] | None = None,
     ) -> bool:
         pair_id = self._candidate_pair_id(candidate)
-        failure = self._entry_primary_backfill_failures.get(pair_id)
+        failure = self._entry_execution_queue_failures.get(pair_id)
         if failure is None:
             return False
         if (
@@ -4357,7 +4357,7 @@ class LiveRuntime:
             and str(failure.get("reason", "")) not in expected_reasons
         ):
             return False
-        cleared = self._entry_primary_backfill_failures.pop(pair_id, None) is not None
+        cleared = self._entry_execution_queue_failures.pop(pair_id, None) is not None
         if cleared:
             self._entry_execution_queue_attempted_pair_ids.discard(pair_id)
         return cleared
@@ -4372,6 +4372,13 @@ class LiveRuntime:
             "entry_economics_revalidation_failed",
             "entry_final_reprice_failed",
             "entry_final_revalidation_failed",
+        }:
+            return True
+        if normalized in {
+            "candidate_quote_revalidation_failed",
+            "candidate_open_interest_revalidation_failed",
+            "candidate_final_reprice_unavailable",
+            "candidate_final_revalidation_failed",
         }:
             return True
         return normalized in {
@@ -4402,7 +4409,7 @@ class LiveRuntime:
         ):
             self._entry_execution_queue_attempted_pair_ids.clear()
             for pair_id in present_pair_ids:
-                self._entry_primary_backfill_failures.pop(pair_id, None)
+                self._entry_execution_queue_failures.pop(pair_id, None)
         return sorted(
             source_candidates,
             key=lambda candidate: (
@@ -4430,18 +4437,10 @@ class LiveRuntime:
         shadow_count = max(self.config.strategy.shadow_entry_opportunity_count, 0)
         primary_excluded_pair_ids: set[str] = set()
         now_ms = wall_clock_now_ms()
-        # A final quote/OI/economics failure belongs to the active execution
-        # queue regardless of whether its readiness source is local L2 or
-        # WS-BBO.  Keep the complete discovery frontier intact, but let the
-        # next queue allocation replace a failed primary with a lower route.
-        # Previously this exclusion was accidentally limited to local L2,
-        # leaving WS-BBO primaries pinned until their lease expired.
-        self._entry_primary_backfill_failures = {
-            pair_id: failure
-            for pair_id, failure in self._entry_primary_backfill_failures.items()
-            if int(failure.get("expires_at_ms", 0) or 0) > now_ms
-        }
-        primary_excluded_pair_ids.update(self._entry_primary_backfill_failures)
+        # Quote/OI/economics outcomes may rotate one route for the current
+        # execution queue round, but are not Local-L2 leases.  A successful
+        # evidence pass or the end of the round clears this scoped exclusion.
+        primary_excluded_pair_ids.update(self._entry_execution_queue_failures)
         # This is entry-scope ownership, so it must consume the same composed
         # contract as the final gate and Local-L2 data-plane facade.  The
         # similarly named compatibility predicate is reserved for non-entry
@@ -4488,18 +4487,7 @@ class LiveRuntime:
                 )
             }
             primary_excluded_pair_ids.difference_update(executing_pair_ids)
-            lease_ttl_ms = max(
-                int(
-                    getattr(
-                        self.config.strategy,
-                        "local_l2_scan_assignment_lease_ttl_secs",
-                        90,
-                    )
-                    or 0
-                )
-                * 1_000,
-                0,
-            )
+            lease_ttl_ms = self._effective_local_l2_scan_assignment_lease_ttl_ms()
             stale_after_ms = self._configured_entry_l2_stale_after_ms(self.config)
             for candidate in source_candidates:
                 pair_id = self._candidate_pair_id(candidate)
@@ -4513,14 +4501,28 @@ class LiveRuntime:
                     continue
                 session.refresh_state(now_ms, stale_after_ms)
                 lease_expired_without_readiness = (
-                    lease_ttl_ms > 0
+                    lease_ttl_ms is not None
                     and session.primary_assigned_at_ms > 0
                     and now_ms - session.primary_assigned_at_ms > lease_ttl_ms
                     and not session.both_legs_ready(now_ms, stale_after_ms)
                 )
+                # V1 only relinquishes an expired, unready primary when a
+                # distinct eligible route can actually use the resource.
+                # Otherwise retaining it avoids turning a temporary slow
+                # subscription into an empty primary window.
+                lease_replacement_available = any(
+                    (other_pair_id := self._candidate_pair_id(other))
+                    and other_pair_id != pair_id
+                    and other_pair_id not in primary_excluded_pair_ids
+                    and other_pair_id not in executing_pair_ids
+                    for other in source_candidates
+                )
                 if (
                     session.state == EntryLocalL2SessionState.FAULTED
-                    or lease_expired_without_readiness
+                    or (
+                        lease_expired_without_readiness
+                        and lease_replacement_available
+                    )
                 ):
                     primary_excluded_pair_ids.add(pair_id)
         tracked = select_tracked_opportunities(
@@ -5726,7 +5728,6 @@ class LiveRuntime:
         self.state.local_l2_session_snapshot = []
         self.local_l2_runtime.books.clear()
         self.local_l2_runtime.assignments.clear()
-        self.local_l2_runtime.leases.clear()
         self.local_l2_runtime.pending_events.clear()
         self.local_l2_runtime._refresh_metrics(wall_clock_now_ms())
         self.entry_l2_sessions.sessions.clear()
@@ -6212,9 +6213,6 @@ class LiveRuntime:
         """Allow only publish-fresh snapshots stale from broad market evidence."""
         if snapshot is None:
             return ""
-        acquisition_mode = str(getattr(snapshot, "acquisition_mode", "") or "")
-        if acquisition_mode in {"last_good_sidecar", "unavailable"}:
-            return ""
         try:
             publication_at_ms = int(
                 getattr(snapshot, "ready_at_ms", 0)
@@ -6238,10 +6236,15 @@ class LiveRuntime:
             return ""
         market_age_ms = int(now_ms) - market_observed_at_ms
         market_max_age_ms = int(
-            self.config.runtime.max_market_age_ms or max_age_ms
+            self.config.runtime.sidecar_market_observation_max_age_ms
+            or max_age_ms
         )
         if market_age_ms <= market_max_age_ms:
             return ""
+        # ``acquisition_mode`` is whole-snapshot provenance. It can describe
+        # an unrelated venue/symbol fallback while this pair still has current
+        # per-leg evidence. The candidate freshness and final BBO/L2/OI gates
+        # below own that scoped decision; broad provenance must not erase it.
         return "market_observed_stale_candidate_target_revalidation_required"
 
     @staticmethod
@@ -6378,6 +6381,9 @@ class LiveRuntime:
         price_hints: dict[str, float],
     ) -> None:
         """Check ranked candidates one at a time without a frontier deadline."""
+        # A terminal evidence failure only yields its turn in this fair queue.
+        # It never creates a time-based Local-L2 ownership exclusion.
+        candidates = self._ordered_entry_execution_queue(candidates)
         max_slots = max(self.config.strategy.max_concurrent_positions, 1)
         remaining_slots = max(max_slots - len(self.state.open_positions), 0)
         selection_blockers: Counter[str] = Counter()
@@ -6389,6 +6395,7 @@ class LiveRuntime:
         prewarm_candidate_count = 0
         tracked_candidate_count = 0
         bbo_prewarm_active = False
+        fresh_evidence_pair_ids: set[str] = set()
 
         # V1 starts the bounded local-L2 lifecycle in its prewarm window, but
         # does not turn that into an entry attempt until the narrower final
@@ -6647,6 +6654,10 @@ class LiveRuntime:
                 )
                 continue
             quote_overlay, _quote_stats = quote_result
+            # Fresh two-leg BBO/OI evidence repairs a prior terminal outcome
+            # immediately; Local-L2 readiness remains governed separately.
+            fresh_evidence_pair_ids.add(self._candidate_pair_id(candidate))
+            self._clear_entry_execution_queue_failure(candidate)
             candidate_rows = self._filter_candidates_by_snapshot_freshness(
                 [candidate],
                 snapshot=snapshot,
@@ -6801,6 +6812,21 @@ class LiveRuntime:
             if len(self.state.pending_entries) > pending_before:
                 break
 
+        # Feed terminal evidence outcomes back into the *next* queue round.
+        # The selection scope consumes this only as a fair rotation; it is
+        # intentionally not connected to the V1 90s Local-L2 lease.
+        for candidate in candidates:
+            pair_id = self._candidate_pair_id(candidate)
+            reason = candidate_blockers.get(pair_id)
+            if reason and self._entry_execution_queue_terminal_failure(reason):
+                self._record_entry_execution_queue_failure(
+                    candidate,
+                    reason=reason,
+                    now_ms=wall_clock_now_ms(),
+                )
+            elif pair_id in fresh_evidence_pair_ids:
+                self._clear_entry_execution_queue_failure(candidate)
+
         self.state.last_scan["tradeable_count"] = len(candidates)
         self.state.last_scan["ranked_candidate_checked_count"] = checked
         self.state.last_scan["selected_candidate_count"] = dispatched
@@ -6856,7 +6882,9 @@ class LiveRuntime:
             now_ms=now_ms,
             last_good=self._last_good_snapshot,
             last_good_max_age_ms=last_good_max_age,
-            market_max_age_ms=self.config.runtime.max_market_age_ms,
+            market_max_age_ms=(
+                self.config.runtime.sidecar_market_observation_max_age_ms
+            ),
             usable_payload=usable_entry_snapshot,
         )
         freshness = freshness_decision.freshness
@@ -6999,9 +7027,30 @@ class LiveRuntime:
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
 
+        snapshot_published_at_ms = self.market_data_runtime._snapshot_publication_at_ms(
+            snapshot
+        )
+        snapshot_publish_age_ms = (
+            max(now_ms - snapshot_published_at_ms, 0)
+            if snapshot_published_at_ms > 0
+            else None
+        )
+        snapshot_publish_warn_ms = int(
+            self.config.runtime.sidecar_snapshot_publish_warn_ms
+        )
+        snapshot_publish_slow = bool(
+            snapshot_publish_age_ms is not None
+            and snapshot_publish_age_ms > snapshot_publish_warn_ms
+            and snapshot_publish_age_ms <= max_age
+            and freshness in {SnapshotFreshness.FRESH, SnapshotFreshness.DEGRADED}
+        )
         self.state.last_scan = {
             "ts_ms": now_ms,
             "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
+            "snapshot_publication_age_ms": snapshot_publish_age_ms,
+            "snapshot_publication_warn_ms": snapshot_publish_warn_ms,
+            "snapshot_publication_availability_max_age_ms": max_age,
+            "snapshot_publication_slow": snapshot_publish_slow,
             "candidate_count": len(snapshot.candidates) if snapshot is not None else 0,
             "tradeable_count": 0,
             "selected_candidate_count": 0,
@@ -7046,6 +7095,28 @@ class LiveRuntime:
         self.state.last_scan["snapshot_freshness_skipped_untracked_count"] = (
             self.state.last_scan["snapshot_freshness_all_candidate_count"]
         )
+        if snapshot_publish_slow:
+            self._append_runtime_diagnostic_event(
+                "runtime.snapshot_publish_slow",
+                {
+                    "ts_ms": now_ms,
+                    "owner": "sidecar",
+                    "classification": "producer_slo_warning",
+                    "blocking": False,
+                    "snapshot_publish_age_ms": snapshot_publish_age_ms,
+                    "snapshot_publish_warn_ms": snapshot_publish_warn_ms,
+                    "snapshot_availability_max_age_ms": max_age,
+                    "snapshot_freshness": (
+                        freshness.value
+                        if hasattr(freshness, "value")
+                        else str(freshness)
+                    ),
+                    "candidate_count": len(snapshot.candidates),
+                },
+                now_ms=now_ms,
+                key_parts=("global_sidecar_publication",),
+                interval_ms=max(snapshot_publish_warn_ms, 30_000),
+            )
         self._schedule_current_state_snapshot_export(self._export_state, now_ms)
         if freshness == SnapshotFreshness.LAST_GOOD_FALLBACK:
             self.journal.append(

@@ -18,55 +18,11 @@ from lightfee.marketdata.l2 import (
 )
 from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
 from lightfee.marketdata.local_l2_runtime import (
-    AssignmentLease,
     LocalL2Runtime,
     LocalL2RuntimeMetrics,
     RuntimeFaultKind,
 )
 from lightfee.persistence.journal import Journal
-
-
-class TestAssignmentLease:
-    def test_lease_not_expired_when_fresh(self):
-        lease = AssignmentLease(
-            venue="binance", symbol="BTCUSDT",
-            pool=L2PoolAssignment.HOT_EXEC,
-            granted_at_ms=10000, ttl_ms=90000,
-        )
-        assert not lease.is_expired(now_ms=50000)
-
-    def test_lease_expired_after_ttl(self):
-        lease = AssignmentLease(
-            venue="binance", symbol="BTCUSDT",
-            pool=L2PoolAssignment.HOT_EXEC,
-            granted_at_ms=10000, ttl_ms=1000,
-        )
-        assert lease.is_expired(now_ms=12000)
-
-    def test_lease_never_expires_when_ttl_zero(self):
-        lease = AssignmentLease(
-            venue="binance", symbol="BTCUSDT",
-            pool=L2PoolAssignment.HOT_EXEC,
-            granted_at_ms=10000, ttl_ms=0,
-        )
-        assert not lease.is_expired(now_ms=999999)
-
-    def test_lease_remaining_ms(self):
-        lease = AssignmentLease(
-            venue="binance", symbol="BTCUSDT",
-            pool=L2PoolAssignment.HOT_EXEC,
-            granted_at_ms=10000, ttl_ms=30000,
-        )
-        assert lease.remaining_ms(now_ms=20000) == 20000
-        assert lease.remaining_ms(now_ms=45000) == 0
-
-    def test_lease_key(self):
-        lease = AssignmentLease(
-            venue="binance", symbol="BTCUSDT",
-            pool=L2PoolAssignment.HOT_EXEC,
-            granted_at_ms=10000, ttl_ms=90000,
-        )
-        assert lease.key() == LocalL2BookKey(venue="binance", symbol="BTCUSDT")
 
 
 class TestLocalL2RuntimeBooks:
@@ -101,50 +57,26 @@ class TestLocalL2RuntimeAssignments:
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000)
         assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.HOT_EXEC
 
-    def test_assign_creates_lease_for_hot_exec(self):
+    def test_assign_updates_book_pool_for_hot_exec(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000)
-        key = LocalL2BookKey(venue="binance", symbol="BTCUSDT")
-        assert key in rt.leases
+        assert rt.get_book("binance", "BTCUSDT").pool == L2PoolAssignment.HOT_EXEC
 
-    def test_assign_no_lease_for_dropped(self):
+    def test_assign_dropped_updates_book_pool(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.DROPPED, now_ms=10000)
-        key = LocalL2BookKey(venue="binance", symbol="BTCUSDT")
-        assert key not in rt.leases
+        assert rt.get_book("binance", "BTCUSDT").pool == L2PoolAssignment.DROPPED
 
-    def test_preserve_lease(self):
+    def test_assignment_does_not_expire_without_a_scheduler_change(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
-        rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000, priority=1)
-        assert rt.preserve_lease("binance", "BTCUSDT", now_ms=50000)
-        assert rt.metrics.assignment_lease_preserved_total == 1
-
-    def test_preserve_lease_noop_for_nonexistent(self):
-        rt = LocalL2Runtime()
-        assert not rt.preserve_lease("binance", "BTCUSDT", now_ms=50000)
-        assert rt.metrics.assignment_lease_preserved_total == 0
-
-    def test_expire_stale_leases(self):
-        rt = LocalL2Runtime(default_lease_ttl_ms=1000)
-        rt.ensure_book("binance", "BTCUSDT")
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000)
-        expired = rt.expire_stale_leases(now_ms=12000)
-        assert len(expired) == 1
-        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.DROPPED
-        assert rt.metrics.assignment_lease_expired_total == 1
 
-    def test_expire_stale_leases_only_expired(self):
-        rt = LocalL2Runtime(default_lease_ttl_ms=1000)
-        rt.ensure_book("binance", "BTCUSDT")
-        rt.ensure_book("binance", "ETHUSDT")
-        rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000)
-        rt.assign("binance", "ETHUSDT", L2PoolAssignment.HOT_EXEC, now_ms=50000)
-        expired = rt.expire_stale_leases(now_ms=12000)
-        assert len(expired) == 1  # only first expired
-        assert rt.get_assignment("binance", "ETHUSDT") == L2PoolAssignment.HOT_EXEC
+        rt.sync(now_ms=999_999)
+
+        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.HOT_EXEC
 
     def test_hot_exec_symbols(self):
         rt = LocalL2Runtime()
@@ -329,12 +261,12 @@ class TestLocalL2RuntimeFaults:
 
 
 class TestLocalL2RuntimeSync:
-    def test_sync_expires_leases(self):
-        rt = LocalL2Runtime(default_lease_ttl_ms=100)
+    def test_sync_keeps_assignment_until_scheduler_replaces_it(self):
+        rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=10000)
-        events = rt.sync(now_ms=20000)  # 10s later, lease expired
-        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.DROPPED
+        rt.sync(now_ms=20000)
+        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.HOT_EXEC
 
     def test_sync_refreshes_metrics(self):
         rt = LocalL2Runtime()

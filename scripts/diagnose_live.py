@@ -9758,7 +9758,7 @@ def _build_spread_sidecar_summary(
     runtime_dir: str,
     *,
     now_ms: int = 0,
-    sidecar_snapshot_max_age_ms: int = 10_000,
+    sidecar_snapshot_max_age_ms: int = 30_000,
 ) -> dict[str, Any]:
     path = Path(runtime_dir) / "spread-opportunities-current.json"
     try:

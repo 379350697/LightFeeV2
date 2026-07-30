@@ -205,6 +205,7 @@ class TestPassiveCloseConfig:
         assert config.progress_poll_interval_ms == 10
         assert config.progress_retry_window_ms == 3_000
         assert config.small_fill_buffer_ms == 2_000
+        assert config.maker_cycle_retry_delays_ms == [500, 1_000, 1_000]
 
     def test_custom_config(self):
         config = PassiveCloseConfig(

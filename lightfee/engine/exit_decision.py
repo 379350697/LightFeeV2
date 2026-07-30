@@ -298,10 +298,10 @@ def passive_close_fallback_due(
     if base_ms <= 0:
         return False
 
-    force_ms = max(
-        int(config.settlement_force_close_delay_secs or 0) * 1000,
-        int(config.post_funding_hold_secs or 0) * 1000,
-    )
+    # V1 keeps the post-funding hold on the *normal capture* path.  A
+    # settlement force-close is an independent safety deadline and must be
+    # able to override that hold when explicitly configured sooner.
+    force_ms = max(int(config.settlement_force_close_delay_secs or 0), 0) * 1000
     return now_ms >= base_ms + force_ms
 
 

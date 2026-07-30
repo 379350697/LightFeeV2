@@ -651,6 +651,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.perp_liquidity_stale_advisory",
         "runtime.ws_bbo_dynamic_ws_started",
         "runtime.snapshot_fallback_last_good",
+        "runtime.snapshot_publish_slow",
         "runtime.candidate_symbol_skipped",
         "runtime.candidates_tradeable",
         "runtime.tradeable_candidates_catalog_filtered",

@@ -957,7 +957,7 @@ class SnapshotFreshness(Enum):
     V1 semantics:
       - FRESH: usable directly
       - LAST_GOOD_FALLBACK: current stale/missing but recent valid snapshot exists
-      - STALE: current exists but exceeds max_age_ms (warning)
+      - STALE: publication or broad-market observation exceeded its budget
       - MISSING: no snapshot available at all (blocks trading)
       - DEGRADED: one or more health domains degraded but snapshot is otherwise usable
     """
@@ -1781,10 +1781,13 @@ def decide_snapshot_freshness(
     if market_age_ms < 0 or snapshot.candidate_build_observed_at_ms > now_ms:
         return SnapshotFreshnessDecision(SnapshotFreshness.STALE, snapshot)
     if market_age_ms > market_limit_ms:
-        if _within_last_good_window(snapshot):
-            return SnapshotFreshnessDecision(SnapshotFreshness.LAST_GOOD_FALLBACK, snapshot)
-        if _within_last_good_window(last_good):
-            return SnapshotFreshnessDecision(SnapshotFreshness.LAST_GOOD_FALLBACK, last_good)
+        # A broad-universe collection timestamp is producer-health evidence,
+        # not a substitute for a selected pair's quote. Do not exchange a
+        # current, publish-fresh snapshot for a long-lived global last-good
+        # snapshot here: runtime may retain this snapshot only for targeted
+        # candidate revalidation, where both final legs must still prove fresh
+        # BBO/L2/OI evidence. Publish stale/missing recovery above retains the
+        # V1 last-good behavior.
         return SnapshotFreshnessDecision(SnapshotFreshness.STALE, snapshot)
 
     if not usable_payload(snapshot):
@@ -1811,8 +1814,10 @@ def evaluate_snapshot_freshness(
 
     Priority order:
     1. MISSING — no snapshot at all
-    2. LAST_GOOD_FALLBACK — current is stale/missing but a recent valid one exists
-    3. STALE — current snapshot exceeds max_age_ms
+    2. LAST_GOOD_FALLBACK — current publication is stale/missing but a recent
+       valid one exists
+    3. STALE — current publication or broad-market observation exceeds its
+       respective budget
     4. DEGRADED — snapshot exists within max_age but has degraded venues/domains
     5. FRESH — snapshot exists within max_age and has no degradations
     """

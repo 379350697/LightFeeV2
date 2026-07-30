@@ -1,4 +1,4 @@
-"""Local-L2 runtime service — assignment, lease, budget, events, metrics.
+"""Local-L2 runtime service — assignment, budget, events, metrics.
 
 Rust V1 reference: src/execution_core/local_l2_runtime.rs
                       src/execution_core/local_l2_runtime_decision.rs
@@ -6,7 +6,7 @@ Rust V1 reference: src/execution_core/local_l2_runtime.rs
 
 Responsibilities:
   - Manage LocalL2Book collection with assignment pools
-  - Assignment lease preserve/expire semantics
+  - Scheduler-owned pool assignments
   - Pending events queue with bounded drain
   - Runtime fault handling: rate-limited, transport failure, checksum/sequence/age
   - Metrics counters matching Rust V1 naming
@@ -31,34 +31,6 @@ from lightfee.marketdata.l2 import (
     LocalL2UpdateResult,
     raw_checksum_levels_valid,
 )
-
-
-# ---------------------------------------------------------------------------
-# Assignment lease
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AssignmentLease:
-    venue: str
-    symbol: str
-    pool: L2PoolAssignment
-    granted_at_ms: int
-    ttl_ms: int
-    priority: int = 0  # lower = higher priority
-
-    def is_expired(self, now_ms: int) -> bool:
-        if self.ttl_ms <= 0:
-            return False
-        return (now_ms - self.granted_at_ms) > self.ttl_ms
-
-    def remaining_ms(self, now_ms: int) -> int:
-        if self.ttl_ms <= 0:
-            return 0
-        return max(0, self.ttl_ms - (now_ms - self.granted_at_ms))
-
-    def key(self) -> LocalL2BookKey:
-        return LocalL2BookKey(venue=self.venue, symbol=self.symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +76,6 @@ class LocalL2RuntimeMetrics:
     runtime_transport_failure_total: int = 0
     data_integrity_rebuild_total: int = 0
     assignment_empty_total: int = 0
-    assignment_lease_preserved_total: int = 0
-    assignment_lease_expired_total: int = 0
     maker_event_lane_wake_total: int = 0
     active_books: int = 0
     retained_books: int = 0
@@ -126,13 +96,11 @@ class LocalL2RuntimeMetrics:
 class LocalL2Runtime:
     books: dict[LocalL2BookKey, LocalL2Book] = field(default_factory=dict)
     assignments: dict[LocalL2BookKey, L2PoolAssignment] = field(default_factory=dict)
-    leases: dict[LocalL2BookKey, AssignmentLease] = field(default_factory=dict)
     pending_events: deque[LocalL2Event] = field(default_factory=deque)
     metrics: LocalL2RuntimeMetrics = field(default_factory=LocalL2RuntimeMetrics)
 
     # Config
     max_events: int = 512
-    default_lease_ttl_ms: int = 90_000  # matches Rust local_l2_scan_assignment_lease_ttl_secs
     max_hot_exec: int = 16
     max_warm: int = 32
     resume_timeout_ms: int = 60_000
@@ -382,7 +350,6 @@ class LocalL2Runtime:
         key = LocalL2BookKey(venue=venue, symbol=symbol)
         self.books.pop(key, None)
         self.assignments.pop(key, None)
-        self.leases.pop(key, None)
 
     def prune_untracked_books(
         self,
@@ -453,44 +420,17 @@ class LocalL2Runtime:
         self, venue: str, symbol: str, pool: L2PoolAssignment,
         now_ms: int = 0, priority: int = 0,
     ) -> None:
-        """Assign a symbol to a pool with an optional lease."""
+        """Assign a symbol to a pool until the scheduler changes its scope.
+
+        V1's opt-in 90-second lease belongs to unready *primary candidates*
+        in the entry selector. A Local-L2 book must not independently expire,
+        since that would silently override the scheduler's current assignment.
+        """
         key = LocalL2BookKey(venue=venue, symbol=symbol)
         self.assignments[key] = pool
-        if pool in (L2PoolAssignment.HOT_EXEC, L2PoolAssignment.WARM):
-            self.leases[key] = AssignmentLease(
-                venue=venue, symbol=symbol,
-                pool=pool,
-                granted_at_ms=now_ms,
-                ttl_ms=self.default_lease_ttl_ms,
-                priority=priority,
-            )
         book = self.books.get(key)
         if book is not None:
             book.pool = pool
-
-    def preserve_lease(self, venue: str, symbol: str, now_ms: int) -> bool:
-        """Extend an existing assignment lease. Returns True if lease existed."""
-        key = LocalL2BookKey(venue=venue, symbol=symbol)
-        lease = self.leases.get(key)
-        if lease is None:
-            return False
-        lease.granted_at_ms = now_ms
-        self.metrics.assignment_lease_preserved_total += 1
-        return True
-
-    def expire_stale_leases(self, now_ms: int) -> list[LocalL2BookKey]:
-        """Remove expired leases, downgrade assignments to DROPPED."""
-        expired: list[LocalL2BookKey] = []
-        for key, lease in list(self.leases.items()):
-            if lease.is_expired(now_ms):
-                self.assignments[key] = L2PoolAssignment.DROPPED
-                book = self.books.get(key)
-                if book is not None:
-                    book.pool = L2PoolAssignment.DROPPED
-                del self.leases[key]
-                expired.append(key)
-                self.metrics.assignment_lease_expired_total += 1
-        return expired
 
     def get_assignment(self, venue: str, symbol: str) -> L2PoolAssignment:
         return self.assignments.get(
@@ -582,13 +522,10 @@ class LocalL2Runtime:
     # ------------------------------------------------------------------
 
     def sync(self, now_ms: int) -> list[LocalL2Event]:
-        """Periodic sync: expire leases, refresh metrics, drain relevant events.
+        """Periodic sync: refresh metrics and drain relevant events.
 
         Returns events that may wake the maker-event lane.
         """
-        # Expire stale leases
-        self.expire_stale_leases(now_ms)
-
         # Resume waiting: check if any books can resume
         for key, book in list(self.books.items()):
             if book.status == L2BookStatus.RESUME_WAITING:
@@ -647,7 +584,6 @@ class LocalL2Runtime:
         return {
             "book_count": len(self.books),
             "assignment_count": len(self.assignments),
-            "lease_count": len(self.leases),
             "pending_event_count": len(self.pending_events),
             "active_books": self.metrics.active_books,
             "retained_books": self.metrics.retained_books,

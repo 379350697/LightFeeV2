@@ -3283,7 +3283,7 @@ class MarketDataRuntime:
             )
         if domain_s == "market":
             return int(
-                self.ctx.config.runtime.max_market_age_ms
+                self.ctx.config.runtime.sidecar_market_observation_max_age_ms
                 or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "funding":
@@ -3400,7 +3400,7 @@ class MarketDataRuntime:
             if market_observed_at_ms > 0 else 0
         )
         market_budget_ms = int(
-            self.ctx.config.runtime.max_market_age_ms
+            self.ctx.config.runtime.sidecar_market_observation_max_age_ms
             or self._snapshot_domain_budget_ms("market")
         )
         self._record_snapshot_scoped_status(
@@ -5046,7 +5046,8 @@ class MarketDataRuntime:
             else self.ctx.config.runtime.sidecar_snapshot_max_age_ms
         )
         market_max_age_ms = int(
-            self.ctx.config.runtime.max_market_age_ms or snapshot_max_age_ms
+            self.ctx.config.runtime.sidecar_market_observation_max_age_ms
+            or snapshot_max_age_ms
         )
         stale_overages: list[int] = []
         published_at_ms = self._snapshot_publication_at_ms(snapshot)
@@ -5495,7 +5496,10 @@ class MarketDataRuntime:
         market_observed_age_ms = (
             now_ms - market_observed_at_ms if market_observed_at_ms > 0 else 0
         )
-        market_max_age_ms = int(self.ctx.config.runtime.max_market_age_ms or max_age_ms)
+        market_max_age_ms = int(
+            self.ctx.config.runtime.sidecar_market_observation_max_age_ms
+            or max_age_ms
+        )
         degraded_domains = [str(v) for v in getattr(snapshot, "degraded_domains", []) or []]
         degraded_venues = [str(v) for v in getattr(snapshot, "degraded_venues", []) or []]
         degraded_symbols = getattr(snapshot, "degraded_symbols", {}) or {}

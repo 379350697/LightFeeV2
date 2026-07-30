@@ -3,7 +3,11 @@ symbols = ["BTCUSDT", "ETHUSDT"]
 [runtime]
 mode = "live"
 sidecar_snapshot_path = "runtime/opportunity-input-snapshot.json"
-sidecar_snapshot_max_age_ms = 10000
+sidecar_snapshot_max_age_ms = 30000
+# Alert when broad-snapshot publication is slow; this does not block entry.
+sidecar_snapshot_publish_warn_ms = 10000
+# Broad multi-venue discovery, not final executable BBO/L2 evidence.
+sidecar_market_observation_max_age_ms = 30000
 sidecar_refresh_ms = 3000
 sidecar_perp_liquidity_budget_ms = 30000
 entry_open_interest_refresh_timeout_ms = 750
@@ -44,8 +48,9 @@ auto_trade_enabled = true
 [strategy]
 entry_window_secs = 480
 entry_local_l2_prewarm_window_secs = 480
-entry_local_l2_primary_count = 3
+entry_local_l2_primary_count = 6
 entry_min_first_funding_remaining_secs = 60
+post_funding_hold_secs = 300
 entry_notional_cap_quote = 1000.0
 live_entry_notional_cap_quote = 50.0
 min_entry_leg_notional_quote = 8.0
@@ -56,6 +61,10 @@ max_concurrent_positions_per_venue_pair = 2
 shadow_entry_opportunity_count = 2
 primary_min_hold_ms = 15000
 shadow_promotion_score_delta_bps = 3.0
+# V1 live profile: only an unready Local-L2 primary may yield after this
+# explicit lease. It never applies to BBO/OI/economics revalidation failures.
+local_l2_scan_assignment_lease_enabled = true
+local_l2_scan_assignment_lease_ttl_secs = 90
 maker_entry_max_reposts = 1
 maker_initial_slice_ratio = 0.25
 max_single_venue_exposure_quote = 200.0

@@ -153,6 +153,48 @@ class TestSnapshotFreshnessStates:
         freshness = evaluate_snapshot_freshness(snapshot, max_age_ms=10000, now_ms=now_ms)
         assert freshness == SnapshotFreshness.FRESH
 
+    @pytest.mark.parametrize("publish_age_ms", (9_000, 15_000))
+    def test_normal_slow_publication_remains_available_below_30_second_bound(
+        self, publish_age_ms
+    ):
+        """The 10-second producer SLO is not a last-good/entry boundary."""
+        now_ms = int(time.time() * 1000)
+        snapshot = _usable_snapshot(
+            published_at_ms=now_ms - publish_age_ms,
+            market_observed_at_ms=now_ms - publish_age_ms,
+        )
+
+        decision = decide_snapshot_freshness(
+            snapshot,
+            max_age_ms=30_000,
+            market_max_age_ms=30_000,
+            now_ms=now_ms,
+            last_good_max_age_ms=600_000,
+        )
+
+        assert decision.freshness == SnapshotFreshness.FRESH
+        assert decision.snapshot is snapshot
+
+    def test_publication_enters_v1_last_good_only_after_30_second_availability_bound(
+        self,
+    ):
+        now_ms = int(time.time() * 1000)
+        snapshot = _usable_snapshot(
+            published_at_ms=now_ms - 30_001,
+            market_observed_at_ms=now_ms - 30_001,
+        )
+
+        decision = decide_snapshot_freshness(
+            snapshot,
+            max_age_ms=30_000,
+            market_max_age_ms=30_000,
+            now_ms=now_ms,
+            last_good_max_age_ms=600_000,
+        )
+
+        assert decision.freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+        assert decision.snapshot is snapshot
+
     def test_stale_snapshot(self):
         now_ms = int(time.time() * 1000)
         snapshot = SidecarSnapshot(published_at_ms=now_ms - 30000)
@@ -199,8 +241,8 @@ class TestSnapshotFreshnessStates:
         )
         assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
 
-    def test_stale_market_observation_enters_last_good_fallback(self):
-        """V1: fresh file publish with stale market observation is last-good, not fresh."""
+    def test_stale_market_observation_is_not_global_last_good_fallback(self):
+        """A slow broad scan must not replace current candidates with global last-good."""
         now_ms = int(time.time() * 1000)
         snapshot = _usable_snapshot(
             published_at_ms=now_ms - 1000,
@@ -212,7 +254,7 @@ class TestSnapshotFreshnessStates:
             now_ms=now_ms,
             last_good_max_age_ms=600000,
         )
-        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+        assert freshness == SnapshotFreshness.STALE
 
     def test_market_max_age_can_be_stricter_than_snapshot_publish_age(self):
         now_ms = int(time.time() * 1000)
@@ -227,7 +269,7 @@ class TestSnapshotFreshnessStates:
             last_good_max_age_ms=600000,
             market_max_age_ms=5000,
         )
-        assert freshness == SnapshotFreshness.LAST_GOOD_FALLBACK
+        assert freshness == SnapshotFreshness.STALE
 
     def test_degraded_snapshot_with_degraded_venues(self):
         now_ms = int(time.time() * 1000)

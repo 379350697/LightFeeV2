@@ -189,6 +189,20 @@ with acquire-to-publish and cache-age evidence per venue. This preserves the
 fail-closed rule for either candidate leg while avoiding an over-broad timing
 gate.
 
+The atomically published sidecar discovery snapshot has a 30-second
+availability budget (`sidecar_snapshot_max_age_ms`). A 10-second
+`sidecar_snapshot_publish_warn_ms` is only a producer SLO: it records the
+nonblocking, rate-limited `runtime.snapshot_publish_slow` diagnostic and never
+causes last-good selection or an entry decision. The broad discovery watermark
+has its own `sidecar_market_observation_max_age_ms` budget (30 seconds by
+default). It measures health of the full-universe, multi-venue collection and is neither a
+final quote lease nor an instruction to replace a publish-fresh snapshot with
+a global last-good snapshot. `max_market_age_ms` remains the strict selected
+pair BBO/Local-L2 budget. When broad discovery is late, runtime records a
+targeted-revalidation requirement and admits only candidates whose own
+funding, BBO/Local-L2, OI/liquidity, account truth, and final execution gates
+all pass. Publication stale/missing recovery retains the V1 last-good rule.
+
 The sidecar records optional stage evidence in
 `candidate_build_diagnostics`: refresh start, per-venue quote observation,
 OI completion/receipt, candidate-build start/completion, entry publication /

@@ -72,7 +72,18 @@ class RuntimeConfig:
     # V1 daily_universe: generated symbol universe (CONFIG-002)
     daily_universe: DailyUniverseConfig = field(default_factory=DailyUniverseConfig)
     sidecar_snapshot_path: str = "runtime/opportunity-input-snapshot.json"
-    sidecar_snapshot_max_age_ms: int = 10000
+    # Full-universe collection regularly takes longer than one refresh tick.
+    # This is the availability bound for the atomically published discovery
+    # snapshot, not a selected pair's executable quote lease.
+    sidecar_snapshot_max_age_ms: int = 30000
+    # A slow publication is operationally important before it becomes
+    # unavailable. This emits diagnostics only and must never alter entry
+    # admission or substitute last-good state.
+    sidecar_snapshot_publish_warn_ms: int = 10000
+    # Broad-universe public discovery is not executable quote evidence. Its
+    # observation watermark gets an independent budget so a strict two-leg
+    # BBO/L2 lease cannot make routine multi-venue scans appear unavailable.
+    sidecar_market_observation_max_age_ms: int = 30000
     sidecar_refresh_ms: int = 3000
     sidecar_perp_liquidity_budget_ms: int = 30000
     entry_open_interest_refresh_timeout_ms: int = 750
@@ -131,7 +142,10 @@ class StrategyConfig:
     entry_window_secs: int = 300
     entry_local_l2_prewarm_window_secs: int = 480
     entry_min_first_funding_remaining_secs: int = 60
-    post_funding_hold_secs: int = 0
+    # V1's compiled fallback was 30s, while its live funding profile used a
+    # 300s settlement-observation hold.  The latter is the safe V2 strategy
+    # default: normal close waits for capture; force-close remains separate.
+    post_funding_hold_secs: int = 300
     entry_notional_cap_quote: float = 1000.0
     live_entry_notional_cap_quote: float = 50.0
     min_entry_leg_notional_quote: float = 8.0
@@ -326,7 +340,9 @@ class StrategyConfig:
     entry_sizing_mode: str = "fixed_notional"
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
-    entry_local_l2_primary_count: int = 3
+    # V1's live primary window was six routes, with two warm shadows below.
+    # Reducing this to three starves otherwise eligible funding windows.
+    entry_local_l2_primary_count: int = 6
     # V1 keeps a two-route shadow basket so a fresh, warm shadow can replace
     # a held primary without creating its own session lifecycle.
     shadow_entry_opportunity_count: int = 2

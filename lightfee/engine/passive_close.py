@@ -247,7 +247,11 @@ class PassiveCloseConfig:
     small_fill_buffer_notional_quote: float = PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE
     small_fill_buffer_max_wait_ms: int = PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS
     maker_min_notional_accumulation_attempts: int = 5
-    maker_cycle_retry_delays_ms: list[int] = field(default_factory=lambda: [500, 2_000, 5_000, 15_000])
+    # V1 phase retry cadence: retry the same maker leg three times before
+    # changing phase.  These are not generic exponential-backoff values.
+    maker_cycle_retry_delays_ms: list[int] = field(
+        default_factory=lambda: [500, 1_000, 1_000]
+    )
     max_slippage_bps: Optional[float] = None
     default_tick_size: float = 0.01
     close_chunk_max_notional_quote: float = 0.0
@@ -368,7 +372,10 @@ class PassiveCloseExecutor:
             small_fill_buffer_notional_quote=overrides.get("small_fill_buffer_notional_quote", PASSIVE_CLOSE_SMALL_FILL_BUFFER_NOTIONAL_QUOTE),
             small_fill_buffer_max_wait_ms=overrides.get("small_fill_buffer_max_wait_ms", PASSIVE_CLOSE_SMALL_FILL_BUFFER_MAX_WAIT_MS),
             maker_min_notional_accumulation_attempts=overrides.get("maker_min_notional_accumulation_attempts", 5),
-            maker_cycle_retry_delays_ms=overrides.get("maker_cycle_retry_delays_ms", [500, 2_000, 5_000, 15_000]),
+            maker_cycle_retry_delays_ms=list(
+                overrides.get("maker_cycle_retry_delays_ms", [500, 1_000, 1_000])
+                or []
+            ),
             max_slippage_bps=overrides.get("max_slippage_bps"),
             default_tick_size=overrides.get("default_tick_size", 0.01),
             close_chunk_max_notional_quote=overrides.get("close_chunk_max_notional_quote", 0.0),
@@ -2435,19 +2442,6 @@ class PassiveCloseExecutor:
                 alternate,
             ),
         ]
-        if (
-            int(pending.phase_state.zero_fill_cycles_in_phase or 0) > 0
-            and readiness[1].status == "ready"
-        ):
-            readiness[0] = replace(
-                readiness[0],
-                status="blocked",
-                reasons=tuple(
-                    dict.fromkeys(
-                        [*readiness[0].reasons, "recent_maker_zero_fill"]
-                    )
-                ),
-            )
         self._journal.append(
             "runtime.passive_close_readiness_rewarm_attempted",
             {
@@ -9379,10 +9373,15 @@ class PassiveCloseExecutor:
         return payload
 
     def _maker_cycle_retry_delay(self, zero_fill_cycles: int) -> int:
-        """V1 maker_cycle_retry_delay_ms: exponential backoff for zero-fill cycles."""
-        delays = self._config.maker_cycle_retry_delays_ms
-        idx = min(zero_fill_cycles, len(delays) - 1)
-        return delays[idx] if idx >= 0 else delays[-1]
+        """Return V1's delay for a completed zero-fill maker cycle."""
+        delays = list(self._config.maker_cycle_retry_delays_ms or [])
+        if not delays:
+            return 0
+        idx = min(max(int(zero_fill_cycles) - 1, 0), len(delays) - 1)
+        try:
+            return max(int(delays[idx]), 0)
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _is_non_retryable_hedge_error(error_str: str) -> bool:

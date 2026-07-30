@@ -434,25 +434,14 @@ class TestRuntimeTargetsAndBudget:
         promoted = promote_warm_to_hot(books, max_hot=2)
         assert promoted == 2  # Only 2 promoted, max_hot=2
 
-    def test_assignment_lease_preserve(self):
+    def test_assignment_stays_active_without_candidate_lease_expiry(self):
         rt = LocalL2Runtime()
         rt.ensure_book("binance", "BTCUSDT")
         rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=1000)
 
-        assert rt.preserve_lease("binance", "BTCUSDT", now_ms=5000) is True
-        assert rt.metrics.assignment_lease_preserved_total == 1
+        rt.sync(now_ms=3_000)
 
-    def test_assignment_lease_expiry(self):
-        rt = LocalL2Runtime()
-        rt.default_lease_ttl_ms = 1000
-        rt.ensure_book("binance", "BTCUSDT")
-        rt.assign("binance", "BTCUSDT", L2PoolAssignment.HOT_EXEC, now_ms=1000)
-
-        # Advance past TTL
-        expired = rt.expire_stale_leases(now_ms=3000)
-        assert len(expired) == 1
-        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.DROPPED
-        assert rt.metrics.assignment_lease_expired_total == 1
+        assert rt.get_assignment("binance", "BTCUSDT") == L2PoolAssignment.HOT_EXEC
 
     def test_metrics_refresh_counts_books_by_status(self):
         rt = LocalL2Runtime()

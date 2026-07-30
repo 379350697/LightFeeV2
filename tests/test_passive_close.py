@@ -236,7 +236,7 @@ async def test_passive_close_readiness_selects_ready_leg_when_preferred_would_ta
 
 
 @pytest.mark.asyncio
-async def test_passive_close_readiness_blocks_recent_zero_fill_leg_and_switches():
+async def test_passive_close_readiness_retries_same_leg_after_zero_fill():
     journal = _open_journal()
     try:
         binance = PassiveCloseReadinessAdapter()
@@ -278,9 +278,9 @@ async def test_passive_close_readiness_blocks_recent_zero_fill_leg_and_switches(
         )
 
         assert resolved is False
-        assert binance.submit_calls == []
-        assert len(bybit.submit_calls) == 1
-        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.SHORT
+        assert len(binance.submit_calls) == 1
+        assert bybit.submit_calls == []
+        assert pending.phase_state.active_maker_leg == ActiveMakerLeg.LONG
         ready = [
             record["payload"]
             for record in journal.read_all()
@@ -289,9 +289,23 @@ async def test_passive_close_readiness_blocks_recent_zero_fill_leg_and_switches(
         assert ready
         readiness = ready[-1]["readiness"]
         long_readiness = next(item for item in readiness if item["maker_leg"] == "long")
-        assert long_readiness["status"] == "blocked"
-        assert "recent_maker_zero_fill" in long_readiness["reasons"]
-        assert ready[-1]["maker_leg"] == "short"
+        assert long_readiness["status"] == "ready"
+        assert "recent_maker_zero_fill" not in long_readiness["reasons"]
+        assert ready[-1]["maker_leg"] == "long"
+    finally:
+        journal.close()
+
+
+def test_passive_close_zero_fill_retry_delay_uses_v1_completed_cycle_index():
+    journal = _open_journal()
+    try:
+        executor = PassiveCloseExecutor({}, journal)
+
+        assert [executor._maker_cycle_retry_delay(cycle) for cycle in (1, 2, 3)] == [
+            500,
+            1_000,
+            1_000,
+        ]
     finally:
         journal.close()
 
