@@ -160,6 +160,19 @@ guarantee unless that component is actually reintroduced with its own evidence
 and tests. Slow-data persistence never relaxes quote, BBO, Local-L2, funding,
 account-truth, or final execution admission.
 
+Funding settlement cadence is a separate, venue-derived slow fact. For a venue
+that does not publish an explicit interval in its bulk ticker, the sidecar
+stores only validated `(interval_ms, source, observed_at_ms)` proof in an
+atomically replaced sibling cache file. A restart restores the original
+observation clock; it must never re-label a prior snapshot's interval as fresh
+merely because the process restarted. Valid cache evidence avoids historical
+funding-rate probes during ordinary scans. Missing or expired cache proof warms
+through a rotating, bounded history batch, rather than probing every listed
+contract in one discovery cycle. Until venue-derived proof exists, the symbol
+remains interval-unknown and cannot enter: persistence reduces public HTTP
+pressure without inventing a universal Binance/Aster funding cadence or
+loosening the final funding gate.
+
 Deploy diagnostics must keep readiness separate from execution failure. Quote
 stale, confirmed OI below floor, OI unavailable, structural OI suppression, and
 prewarm-pending samples belong in `market_data_readiness_summary` with their
@@ -301,6 +314,7 @@ quote-rewarm contract proves its action; missing proof is
 | 2026-07-25 | Post-deploy snapshot/OI/quote deadline recurrence and Hyperliquid `429` | local verified; deploy pending | CL-159 now records per-venue collection-to-publication timing and rolling latency quantiles while retaining candidate-leg final revalidation. Hyperliquid `POST /info` callers share config-rooted pacing, public-metadata cache, and 429 exponential cooldown; strict read-only is unchanged. No TTL, OI, liquidity, or quote threshold changed. See [daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates](../daily/2026-07-25.md#issue-cl-159-b-intermittent-market-evidence-deadlines-remove-candidates). |
 | 2026-07-26 | Durable targeted entry OI evidence and prewarm bounds | local green; deploy pending | CL-160 adds a proof-valid SQLite last-good store for targeted entry OI, foreground hot-proof -> exact durable <=30m -> exchange lookup order, a 256-entry LRU hot cache, low-priority cancellable 15 minute prewarm that force-refreshes the full required frontier, same-venue prewarm serialization, and strict observed-time durable replacement. No OI floor, TTL, liquidity, ranking, sizing, order, close, recovery, or deployment behavior changed. See [daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds](../daily/2026-07-26.md#cluster-cl-160---durable-entry-oi-evidence-store-and-prewarm-bounds). |
 | 2026-07-29 | Spread BBO topology reversion | local verified; deployment pending | CL-164 restores the three-process topology: funding sidecar is the only public discovery owner; spread-sidecar reads its snapshot; the dedicated BBO app/unit/compact cache are removed. Whole-snapshot liveness remains separate from strict individual quote TTL, and singleton/deployment reject a residual fourth BBO process. |
+| 2026-07-31 | Binance/Aster funding-interval cold-cache fan-out | local verified; deployment pending | CL-169 persists only validated funding-cadence proof with its original receipt clock, removes legacy restart-snapshot false freshness, and bounds cold/expired history repair to a rotating batch. The change does not assume a universal venue interval or relax the funding admission gate. |
 
 ## Regression Harness
 

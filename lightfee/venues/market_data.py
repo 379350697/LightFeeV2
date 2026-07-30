@@ -17,7 +17,7 @@ import random
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -130,27 +130,6 @@ class FundingTicker:
     min_quantity_base: float = 0.0
     min_notional_quote: float = 0.0
     min_notional_evidence_complete: bool = False
-
-
-@dataclass(frozen=True)
-class PerpLiquidity:
-    venue: str
-    symbol: str
-    volume_24h_quote: float | None
-    open_interest_quote: float | None
-    observed_at_ms: int
-    open_interest_evidence_status: str = "unavailable"
-    open_interest_evidence_reason: str = ""
-    open_interest_observed_at_ms: int = 0
-    open_interest_event_at_ms: int = 0
-    open_interest_received_at_ms: int = 0
-    open_interest_source: str = ""
-    open_interest_sample_id: str = ""
-    open_interest_venue_symbol: str = ""
-    raw_open_interest: float | None = None
-    raw_open_interest_unit: str = ""
-    open_interest_contract_multiplier: float | None = None
-    open_interest_conversion_mark_price: float | None = None
 
 
 _PUBLIC_REQUEST_PHASE_COLLECTOR: contextvars.ContextVar[
@@ -637,6 +616,14 @@ _OKX_FUNDING_RATE_FALLBACK_MAX_SYMBOLS = 64
 _OKX_MARKET_TICKERS_ATTEMPT_TIMEOUT_S = 3.0
 _FUNDING_INTERVAL_HISTORY_SEMAPHORE = 8
 _FUNDING_INTERVAL_HISTORY_BUDGET_S = 3.0
+# Funding cadence is slow contract evidence, not a per-scan input.  On a cold
+# cache we still have to ask the venue for symbols without an explicit
+# interval, but doing that for every listed contract on every three-second
+# scan self-inflicts the very rate-limit/timeout condition it is meant to
+# diagnose.  A bounded, rotating batch eventually fills the persistent cache;
+# normal scans then make no history requests at all.
+_FUNDING_INTERVAL_HISTORY_REFRESH_CAP = 48
+_FUNDING_INTERVAL_HISTORY_REFRESH_INTERVAL_MS = 30_000
 
 # V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
 _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
@@ -742,6 +729,8 @@ class MarketDataClient:
         # evidence is deliberately time-bounded because venues can temporarily
         # alter settlement cadence.
         self._funding_interval_by_key: dict[str, tuple[int, str, int]] = {}
+        self._funding_interval_history_refresh_cursor = 0
+        self._funding_interval_history_last_refresh_at_ms = 0
         # Gate BBO sizes are contract lots.  This symbol-level cache stays
         # separate from the shorter-lived funding cache so funding reuse can
         # never erase quantity conversion evidence.
@@ -1351,20 +1340,56 @@ class MarketDataClient:
             return 0
         return max(int(interval_ms or 0), 0)
 
-    def prime_funding_schedule(self, tickers: Iterable[FundingTicker]) -> None:
-        """Restore previously measured settlement cadence without HTTP I/O."""
-        for ticker in tickers:
-            key = f"{str(ticker.venue).lower()}:{str(ticker.symbol).upper()}"
-            interval = max(int(ticker.funding_interval_ms or 0), 0)
-            if interval > 0:
-                self._funding_interval_by_key[key] = (
-                    interval,
-                    "validated_v3_restart_snapshot",
-                    _now_ms(),
-                )
-            next_timestamp_ms = max(int(ticker.funding_timestamp_ms or 0), 0)
-            if next_timestamp_ms > 0:
-                self._funding_schedule_next_by_key[key] = next_timestamp_ms
+    def prime_funding_interval_evidence(
+        self,
+        evidence_by_key: dict[str, tuple[int, str, int]],
+    ) -> None:
+        """Restore persisted, exchange-derived funding cadence evidence.
+
+        The cache deliberately retains the original evidence timestamp.  A
+        restart is not fresh exchange evidence and must not extend the normal
+        cadence validity window.
+        """
+        venue_prefix = f"{self._spec.venue_id.value}:"
+        for raw_key, raw_evidence in evidence_by_key.items():
+            key = str(raw_key or "").strip()
+            if not key.startswith(venue_prefix):
+                continue
+            symbol = key.removeprefix(venue_prefix).strip().upper()
+            if not symbol or not isinstance(raw_evidence, tuple) or len(raw_evidence) != 3:
+                continue
+            interval_ms, source, observed_at_ms = raw_evidence
+            if (
+                isinstance(interval_ms, bool)
+                or not isinstance(interval_ms, int)
+                or not 60_000 <= interval_ms <= 7 * 24 * 60 * 60 * 1_000
+                or not isinstance(source, str)
+                or not source.strip()
+                or isinstance(observed_at_ms, bool)
+                or not isinstance(observed_at_ms, int)
+                or observed_at_ms <= 0
+            ):
+                continue
+            canonical_key = f"{venue_prefix}{symbol}"
+            self._funding_interval_by_key[canonical_key] = (
+                interval_ms,
+                source.strip(),
+                observed_at_ms,
+            )
+
+    def funding_interval_evidence(
+        self,
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, tuple[int, str, int]]:
+        """Return still-valid cadence evidence for durable sidecar storage."""
+        if now_ms is None:
+            now_ms = _now_ms()
+        return {
+            key: evidence
+            for key, evidence in self._funding_interval_by_key.items()
+            if self._funding_interval_evidence_fresh(key, int(now_ms))
+        }
 
     def _funding_interval_evidence_fresh(self, key: str, now_ms: int) -> bool:
         evidence = self._funding_interval_by_key.get(key)
@@ -1393,6 +1418,25 @@ class MarketDataClient:
         ]
         if not missing:
             return evidence
+        now_ms = _now_ms()
+        last_refresh_at_ms = int(
+            getattr(self, "_funding_interval_history_last_refresh_at_ms", 0) or 0
+        )
+        if 0 <= now_ms - last_refresh_at_ms < _FUNDING_INTERVAL_HISTORY_REFRESH_INTERVAL_MS:
+            return evidence
+        # Keep the cursor on the client rather than using set/dict iteration:
+        # otherwise the first response-timeout window repeatedly starves the
+        # same tail of the venue universe after every refresh.
+        missing = sorted(dict.fromkeys(missing))
+        cursor = int(getattr(self, "_funding_interval_history_refresh_cursor", 0) or 0)
+        start = cursor % len(missing)
+        cap = min(_FUNDING_INTERVAL_HISTORY_REFRESH_CAP, len(missing))
+        selected = [
+            missing[(start + offset) % len(missing)]
+            for offset in range(cap)
+        ]
+        self._funding_interval_history_refresh_cursor = (start + cap) % len(missing)
+        self._funding_interval_history_last_refresh_at_ms = now_ms
         semaphore = asyncio.Semaphore(_FUNDING_INTERVAL_HISTORY_SEMAPHORE)
 
         async def _one(venue_symbol: str) -> None:
@@ -1423,7 +1467,7 @@ class MarketDataClient:
                         observed_at_ms,
                     )
 
-        tasks = [asyncio.create_task(_one(symbol)) for symbol in missing]
+        tasks = [asyncio.create_task(_one(symbol)) for symbol in selected]
         try:
             await asyncio.wait_for(
                 asyncio.gather(*tasks),
@@ -4520,76 +4564,6 @@ class MarketDataClient:
                 min_notional_evidence_complete=metadata_complete,
             )
         return result
-
-    # -- Perp liquidity (volume + OI snapshot) -----------------------------
-
-    async def fetch_perp_liquidity(self, symbols: list[str]) -> dict[str, PerpLiquidity]:
-        """Fetch perp liquidity snapshot for symbols."""
-        tickers = await self.fetch_funding_tickers(symbols)
-        result: dict[str, PerpLiquidity] = {}
-        for key, ft in tickers.items():
-            result[key] = PerpLiquidity(
-                venue=ft.venue,
-                symbol=ft.symbol,
-                volume_24h_quote=(
-                    float(ft.volume_24h_quote)
-                    if isinstance(ft.volume_24h_quote, (int, float))
-                    and not isinstance(ft.volume_24h_quote, bool)
-                    and math.isfinite(float(ft.volume_24h_quote))
-                    and float(ft.volume_24h_quote) >= 0.0
-                    else None
-                ),
-                # Unknown OI is not zero liquidity.  Only an exchange-observed
-                # finite value is carried to the audit evidence plane.
-                open_interest_quote=(
-                    float(ft.open_interest_quote)
-                    if isinstance(ft.open_interest_quote, (int, float))
-                    and not isinstance(ft.open_interest_quote, bool)
-                    and math.isfinite(float(ft.open_interest_quote))
-                    and float(ft.open_interest_quote) >= 0.0
-                    else None
-                ),
-                observed_at_ms=int(
-                    getattr(ft, "market_received_at_ms", 0) or 0
-                ),
-                open_interest_evidence_status=str(
-                    getattr(ft, "open_interest_evidence_status", "unavailable")
-                    or "unavailable"
-                ),
-                open_interest_evidence_reason=str(
-                    getattr(ft, "open_interest_evidence_reason", "") or ""
-                ),
-                open_interest_observed_at_ms=int(
-                    getattr(ft, "open_interest_observed_at_ms", 0) or 0
-                ),
-                open_interest_event_at_ms=int(
-                    getattr(ft, "open_interest_event_at_ms", 0) or 0
-                ),
-                open_interest_received_at_ms=int(
-                    getattr(ft, "open_interest_received_at_ms", 0) or 0
-                ),
-                open_interest_source=str(
-                    getattr(ft, "open_interest_source", "") or ""
-                ),
-                open_interest_sample_id=str(
-                    getattr(ft, "open_interest_sample_id", "") or ""
-                ),
-                open_interest_venue_symbol=str(
-                    getattr(ft, "open_interest_venue_symbol", "") or ""
-                ),
-                raw_open_interest=getattr(ft, "raw_open_interest", None),
-                raw_open_interest_unit=str(
-                    getattr(ft, "raw_open_interest_unit", "") or ""
-                ),
-                open_interest_contract_multiplier=getattr(
-                    ft, "open_interest_contract_multiplier", None
-                ),
-                open_interest_conversion_mark_price=getattr(
-                    ft, "open_interest_conversion_mark_price", None
-                ),
-            )
-        return result
-
 
 # ---------------------------------------------------------------------------
 # Transport error (lightweight, no dependency on the full transport module)

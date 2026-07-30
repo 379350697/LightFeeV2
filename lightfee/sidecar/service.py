@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import json
 import logging
+import os
 import time
 from math import ceil, isfinite
 from pathlib import Path
@@ -39,6 +41,7 @@ DEFAULT_FUNDING_TIMEOUT_S = (
 )
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 SIDECAR_PUBLIC_HTTP_MAX_CONNECTIONS = 32
+FUNDING_INTERVAL_CACHE_SCHEMA_VERSION = 1
 
 logger = logging.getLogger("lightfee.sidecar.service")
 
@@ -102,6 +105,10 @@ class SidecarService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.snapshot_path = config.runtime.sidecar_snapshot_path
+        snapshot_file = Path(self.snapshot_path)
+        self._funding_interval_cache_path = snapshot_file.with_name(
+            f"{snapshot_file.name}.funding-intervals.v1.json"
+        )
         self._venue_configs_by_name = _canonical_venue_configs(config.venues)
         forecast_path = Path(self.snapshot_path).with_name(
             f"{Path(self.snapshot_path).name}.funding-forecast-calibration.json"
@@ -160,7 +167,6 @@ class SidecarService:
             for quote in prior_snapshot.quotes.values():
                 quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
             for venue_name, source in self._exchange_sources.items():
-                source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
                 source.prime_slow_liquidity(quotes_by_venue.get(str(venue_name).lower(), []))
             restored = _restorable_prior_last_good_quotes(
                 prior_snapshot,
@@ -174,6 +180,14 @@ class SidecarService:
                 key: int(quote.observed_at_ms) for key, quote in restored.items()
             }
             self._last_good_at_ms = max(self._last_good_at_ms_by_key.values(), default=0)
+        persisted_interval_evidence = _load_funding_interval_evidence_cache(
+            self._funding_interval_cache_path,
+            configured_venues=set(self._venue_configs_by_name),
+        )
+        for venue_name, source in self._exchange_sources.items():
+            source.prime_funding_interval_evidence(
+                persisted_interval_evidence.get(venue_name, {})
+            )
 
     async def close(self) -> None:
         entry_fetch_tasks = list(
@@ -742,7 +756,69 @@ class SidecarService:
         # no candidate-only manifest, page set, or background audit projection
         # participates in entry.
         await asyncio.to_thread(publish_snapshot, snapshot, self.snapshot_path)
+        self._persist_funding_interval_evidence(updated_at_ms=published_ms)
         return snapshot
+
+    def _persist_funding_interval_evidence(self, *, updated_at_ms: int | None = None) -> None:
+        """Persist only validated slow cadence facts outside the hot snapshot.
+
+        A cache-write failure cannot prevent publication of fresh market data;
+        it merely means the next restart will perform a bounded re-warm.
+        """
+        cache_path = getattr(self, "_funding_interval_cache_path", None)
+        sources = getattr(self, "_exchange_sources", None)
+        if not isinstance(cache_path, Path) or not isinstance(sources, dict):
+            return
+        venues: dict[str, dict[str, dict[str, object]]] = {}
+        for venue_name, source in sources.items():
+            export = getattr(source, "funding_interval_evidence", None)
+            if not callable(export):
+                continue
+            entries: dict[str, dict[str, object]] = {}
+            evidence_by_key = (
+                export(now_ms=updated_at_ms)
+                if updated_at_ms is not None
+                else export()
+            )
+            for key, evidence in evidence_by_key.items():
+                if not isinstance(evidence, tuple) or len(evidence) != 3:
+                    continue
+                interval_ms, source_name, observed_at_ms = evidence
+                prefix = f"{str(venue_name).lower()}:"
+                if not str(key).startswith(prefix):
+                    continue
+                symbol = str(key).removeprefix(prefix).strip().upper()
+                if not symbol:
+                    continue
+                entries[symbol] = {
+                    "interval_ms": interval_ms,
+                    "source": source_name,
+                    "observed_at_ms": observed_at_ms,
+                }
+            if entries:
+                venues[str(venue_name).lower()] = entries
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            temporary_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": FUNDING_INTERVAL_CACHE_SCHEMA_VERSION,
+                        "updated_at_ms": (
+                            int(updated_at_ms)
+                            if updated_at_ms is not None
+                            else int(time.time() * 1_000)
+                        ),
+                        "venues": venues,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, cache_path)
+        except OSError as exc:
+            logger.warning("sidecar funding-interval cache persist failed: %s", type(exc).__name__)
 
     async def refresh_entry_from_latest_cache(self) -> SidecarSnapshot:
         """Republish the current sidecar view without starting public HTTP work."""
@@ -1180,6 +1256,52 @@ def _resolve_acquisition_mode(
 
 def _canonical_symbol_set(symbols: list[str]) -> set[str]:
     return {str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()}
+
+
+def _load_funding_interval_evidence_cache(
+    path: Path,
+    *,
+    configured_venues: set[str],
+) -> dict[str, dict[str, tuple[int, str, int]]]:
+    """Load validated slow cadence evidence; malformed cache is non-fatal."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != FUNDING_INTERVAL_CACHE_SCHEMA_VERSION
+        or not isinstance(payload.get("venues"), dict)
+    ):
+        return {}
+    restored: dict[str, dict[str, tuple[int, str, int]]] = {}
+    for raw_venue, raw_entries in payload["venues"].items():
+        venue = str(raw_venue or "").strip().lower()
+        if venue not in configured_venues or not isinstance(raw_entries, dict):
+            continue
+        entries: dict[str, tuple[int, str, int]] = {}
+        for raw_symbol, raw_evidence in raw_entries.items():
+            symbol = str(raw_symbol or "").strip().upper()
+            if not symbol or not isinstance(raw_evidence, dict):
+                continue
+            interval_ms = raw_evidence.get("interval_ms")
+            source = raw_evidence.get("source")
+            observed_at_ms = raw_evidence.get("observed_at_ms")
+            if (
+                isinstance(interval_ms, bool)
+                or not isinstance(interval_ms, int)
+                or not 60_000 <= interval_ms <= 7 * 24 * 60 * 60 * 1_000
+                or not isinstance(source, str)
+                or not source.strip()
+                or isinstance(observed_at_ms, bool)
+                or not isinstance(observed_at_ms, int)
+                or observed_at_ms <= 0
+            ):
+                continue
+            entries[f"{venue}:{symbol}"] = (interval_ms, source.strip(), observed_at_ms)
+        if entries:
+            restored[venue] = entries
+    return restored
 
 
 def _restorable_prior_last_good_quotes(

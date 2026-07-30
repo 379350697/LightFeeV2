@@ -17,6 +17,7 @@ from lightfee.sidecar.service import (
     SidecarService,
     _canonical_venue_configs,
     _canonicalize_venue_quotes,
+    _load_funding_interval_evidence_cache,
     _liquidity_lifecycle_from_quotes,
     _market_failure_reasons,
     _quote_cache_contract_eligible,
@@ -166,6 +167,76 @@ def test_funding_sidecar_exposes_only_the_single_snapshot_data_plane(tmp_path) -
     assert not hasattr(service, "refresh_in_process_entry")
     assert not hasattr(service, "in_process_entry")
     assert not hasattr(service, "embedded_spread_bbo_enabled")
+
+
+def test_funding_interval_cache_round_trip_is_venue_and_symbol_scoped(tmp_path) -> None:
+    cache_path = tmp_path / "sidecar.json.funding-intervals.v1.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "venues": {
+                    "binance": {
+                        "btcusdt": {
+                            "interval_ms": 28_800_000,
+                            "source": "venue_funding_history",
+                            "observed_at_ms": 1_000,
+                        },
+                        "bad": {
+                            "interval_ms": 0,
+                            "source": "bad",
+                            "observed_at_ms": 1_000,
+                        },
+                    },
+                    "unknown": {
+                        "BTCUSDT": {
+                            "interval_ms": 28_800_000,
+                            "source": "ignored",
+                            "observed_at_ms": 1_000,
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = _load_funding_interval_evidence_cache(
+        cache_path,
+        configured_venues={"binance"},
+    )
+
+    assert restored == {
+        "binance": {
+            "binance:BTCUSDT": (28_800_000, "venue_funding_history", 1_000)
+        }
+    }
+
+
+def test_funding_interval_cache_persist_is_non_snapshot_sidecar_state(tmp_path) -> None:
+    class Source:
+        def funding_interval_evidence(self):
+            return {
+                "binance:BTCUSDT": (
+                    28_800_000,
+                    "venue_funding_history",
+                    1_000,
+                )
+            }
+
+    service = object.__new__(SidecarService)
+    service._funding_interval_cache_path = tmp_path / "intervals.json"
+    service._exchange_sources = {"binance": Source()}
+
+    service._persist_funding_interval_evidence()
+
+    payload = json.loads(service._funding_interval_cache_path.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["venues"]["binance"]["BTCUSDT"] == {
+        "interval_ms": 28_800_000,
+        "source": "venue_funding_history",
+        "observed_at_ms": 1_000,
+    }
 
 
 def test_liquidity_lifecycle_explains_source_quote_excluded_from_data_plane() -> None:
@@ -581,6 +652,12 @@ def test_service_restart_primes_first_outage_fallback(monkeypatch, tmp_path) -> 
     assert list(service._inject_last_good(
         "binance", ["BTCUSDT"], now_ms=1_500
     )) == ["binance:BTCUSDT"]
+    # A legacy snapshot has no cadence-proof source or source timestamp.  It
+    # must not become fresh interval evidence merely because the process
+    # restarted; only the dedicated durable evidence cache may do that.
+    assert service._exchange_sources["binance"].funding_interval_evidence(
+        now_ms=1_500
+    ) == {}
 
 
 def test_sidecar_has_no_post_publish_frontier_oracle() -> None:

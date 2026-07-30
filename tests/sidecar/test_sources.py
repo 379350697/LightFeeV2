@@ -1,4 +1,4 @@
-"""Tests for ExchangeSource and LiquiditySource backing by MarketDataClient."""
+"""Tests for ExchangeSource backing the sole sidecar public-data owner."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import pytest
 from lightfee.core.domain import Venue
 from lightfee.sidecar.snapshot import QuoteSnapshot, funding_rate_sample_id
 from lightfee.sidecar.sources.exchange import ExchangeSource
-from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.venues.market_data import FundingTicker
 from lightfee.venues.specs import binance_spec, okx_spec
 
@@ -237,29 +236,6 @@ class TestExchangeSource:
         assert quotes["binance:BTCUSDT"].bid == 0.0
         assert quotes["binance:BTCUSDT"].ask == 0.0
         assert quotes["binance:BTCUSDT"].source == "sidecar_bbo_unavailable"
-
-
-class TestLiquiditySource:
-    """LiquiditySource wraps MarketDataClient's fetch_perp_liquidity."""
-
-    def test_construct(self):
-        src = LiquiditySource.for_venue(Venue.OKX)
-        assert src.venue == "okx"
-
-    def test_accepts_shared_public_rate_limiter(self):
-        from lightfee.venues.transport import EndpointRateLimiter
-
-        limiter = EndpointRateLimiter(1000, 8000, 50)
-        src = LiquiditySource(okx_spec(), rate_limiter=limiter)
-
-        assert src._client._rate_limiter is limiter
-
-    def test_close(self):
-        async def _run():
-            src = LiquiditySource(okx_spec())
-            await src.close()
-
-        asyncio.run(_run())
 
 
 class TestSidecarServiceRateLimitWiring:

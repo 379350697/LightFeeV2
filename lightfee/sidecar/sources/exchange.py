@@ -189,19 +189,20 @@ class ExchangeSource:
             oi_refresh_elapsed_ms=cached.oi_refresh_elapsed_ms,
         )
 
-    def prime_funding_schedule(self, quotes: list[QuoteSnapshot]) -> None:
-        """Restore observed funding cadence from a prior published snapshot."""
-        self._client.prime_funding_schedule(
-            FundingTicker(
-                venue=quote.venue,
-                symbol=quote.symbol,
-                bid=quote.bid,
-                ask=quote.ask,
-                funding_timestamp_ms=quote.funding_timestamp_ms,
-                funding_interval_ms=quote.funding_interval_ms,
-            )
-            for quote in quotes
-        )
+    def prime_funding_interval_evidence(
+        self,
+        evidence_by_key: dict[str, tuple[int, str, int]],
+    ) -> None:
+        """Restore durable cadence evidence without public HTTP I/O."""
+        self._client.prime_funding_interval_evidence(evidence_by_key)
+
+    def funding_interval_evidence(
+        self,
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, tuple[int, str, int]]:
+        """Expose validated cadence evidence for the sidecar-owned cache."""
+        return self._client.funding_interval_evidence(now_ms=now_ms)
 
     def prime_slow_liquidity(self, quotes: list[QuoteSnapshot]) -> None:
         """Hydrate the local slow-evidence cache from the persisted snapshot."""

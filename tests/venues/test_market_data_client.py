@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 
 import pytest
 
@@ -12,7 +13,6 @@ from lightfee.venues.market_data import (
     BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
     FundingTicker,
     MarketDataClient,
-    PerpLiquidity,
     PublicTransportError,
     PublicTransportErrorCategory,
     _safe_float,
@@ -823,46 +823,6 @@ class TestFundingTickerEnrichment:
         assert ticker.quantity_precision == 0
         assert ticker.contract_normalization_complete is True
         assert ticker.venue_status == "active"
-
-
-class TestPerpLiquidityType:
-    """PerpLiquidity dataclass."""
-
-    def test_construct(self):
-        pl = PerpLiquidity(
-            venue="binance", symbol="BTCUSDT",
-            volume_24h_quote=1_000_000.0,
-            open_interest_quote=500_000.0,
-            observed_at_ms=1700000000000,
-        )
-        assert pl.volume_24h_quote == 1_000_000.0
-
-    def test_frozen(self):
-        pl = PerpLiquidity(venue="x", symbol="y", volume_24h_quote=1, open_interest_quote=2, observed_at_ms=0)
-        with pytest.raises(Exception):
-            pl.volume_24h_quote = 3  # type: ignore
-
-    @pytest.mark.asyncio
-    async def test_fetch_perp_liquidity_preserves_market_receive_time(self, monkeypatch):
-        client = MarketDataClient(binance_spec())
-        ticker = FundingTicker(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=99.0,
-            ask=101.0,
-            volume_24h_quote=1_000_000.0,
-            open_interest_quote=500_000.0,
-            market_received_at_ms=1_700_000_000_123,
-        )
-
-        async def _fetch_funding_tickers(_symbols):
-            return {"binance:BTCUSDT": ticker}
-
-        monkeypatch.setattr(client, "fetch_funding_tickers", _fetch_funding_tickers)
-
-        result = await client.fetch_perp_liquidity(["BTCUSDT"])
-
-        assert result["binance:BTCUSDT"].observed_at_ms == 1_700_000_000_123
 
 
 class TestVenueSpecSidecarEndpoints:
@@ -3173,6 +3133,55 @@ class TestProductionSidecarParserRegressions:
         )
 
         assert funding_history_symbols == ["BTCUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_binance_interval_history_refresh_rotates_a_bounded_cold_cache(self, monkeypatch):
+        queried: list[str] = []
+
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                assert path == "/fapi/v1/fundingRate"
+                queried.append(str((params or {}).get("symbol")))
+                return [
+                    {"fundingTime": "4099978400000"},
+                    {"fundingTime": "4100007200000"},
+                ]
+
+        monkeypatch.setattr(
+            "lightfee.venues.market_data._FUNDING_INTERVAL_HISTORY_REFRESH_CAP",
+            2,
+        )
+        client = FakeBinanceClient(binance_spec())
+        universe = {"AAAUSDT": "AAAUSDT", "BBBUSDT": "BBBUSDT", "CCCUSDT": "CCCUSDT"}
+
+        await client._fetch_binance_style_funding_intervals(universe, observed_at_ms=1_000)
+        client._funding_interval_history_last_refresh_at_ms = 0
+        await client._fetch_binance_style_funding_intervals(universe, observed_at_ms=1_000)
+
+        assert queried == ["AAAUSDT", "BBBUSDT", "CCCUSDT", "AAAUSDT"]
+
+    def test_persisted_funding_interval_evidence_keeps_its_original_clock(self):
+        client = MarketDataClient(binance_spec())
+        observed_at_ms = int(time.time() * 1_000)
+
+        client.prime_funding_interval_evidence(
+            {
+                "binance:BTCUSDT": (
+                    28_800_000,
+                    "venue_funding_history",
+                    observed_at_ms,
+                ),
+                "okx:ETHUSDT": (28_800_000, "wrong_venue", observed_at_ms),
+            }
+        )
+
+        assert client.funding_interval_evidence() == {
+            "binance:BTCUSDT": (
+                28_800_000,
+                "venue_funding_history",
+                observed_at_ms,
+            )
+        }
 
     @pytest.mark.asyncio
     async def test_okx_contract_counts_are_converted_to_base_and_interval_is_proved(self):
