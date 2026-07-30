@@ -41,11 +41,6 @@ from lightfee.engine.recovery import (
     has_pending_entry_for_symbol,
     is_client_order_id_duplicate,
 )
-from lightfee.marketdata.open_interest import (
-    bounded_open_interest_cache_fallback_max_age_ms,
-    open_interest_max_age_ms_for_evidence,
-    open_interest_timestamps_are_fresh,
-)
 from lightfee.engine.runtime_context import EntryDispatchRuntimeContext
 from lightfee.engine.task_cancellation import (
     DEFAULT_TASK_CANCEL_DRAIN_S,
@@ -4356,132 +4351,6 @@ class EntryDispatchRuntime:
         value = self.ctx.config.strategy.selected_submit_deadline_ms
         return value if value > 0 else 0
 
-    def _entry_open_interest_submit_reason(
-        self,
-        candidate,
-        *,
-        now_ms: int,
-    ) -> tuple[str, dict[str, Any]]:
-        """Revalidate the exact two-leg OI receipt bound at final submit."""
-        evidence = getattr(candidate, "entry_open_interest_evidence", None)
-        if not isinstance(evidence, dict):
-            return "entry_open_interest_evidence_unavailable", {}
-        max_age_ms = bounded_open_interest_cache_fallback_max_age_ms(
-            getattr(
-                self.ctx.config.runtime,
-                "slow_evidence_max_age_ms",
-                10 * 60_000,
-            )
-        )
-        symbol = str(getattr(candidate, "symbol", "") or "").upper()
-        expected_venues = {
-            "long": str(getattr(candidate, "long_venue", "") or "").lower(),
-            "short": str(getattr(candidate, "short_venue", "") or "").lower(),
-        }
-        for leg, expected_venue in expected_venues.items():
-            row = evidence.get(leg)
-            if not isinstance(row, dict):
-                return "entry_open_interest_evidence_unavailable", {"leg": leg}
-            if (
-                str(row.get("venue") or "").lower() != expected_venue
-                or str(row.get("canonical_symbol") or "").upper() != symbol
-            ):
-                return "entry_open_interest_identity_mismatch", {"leg": leg, **row}
-            if str(row.get("status") or "").lower() != "observed":
-                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
-            try:
-                observed_at_ms = int(row.get("observed_at_ms") or 0)
-                event_at_ms = int(row.get("event_at_ms") or 0)
-                received_at_ms = int(row.get("received_at_ms") or 0)
-                value_quote = float(row.get("value_quote"))
-            except (TypeError, ValueError, OverflowError):
-                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
-            if (
-                observed_at_ms <= 0
-                or received_at_ms < observed_at_ms
-                or event_at_ms < 0
-                or not math.isfinite(value_quote)
-                or value_quote < 0.0
-            ):
-                return "entry_open_interest_evidence_unavailable", {"leg": leg, **row}
-            open_interest_floor = float(
-                self.ctx.config.strategy.entry_open_interest_floor_quote(
-                    expected_venue
-                )
-            )
-            if value_quote + 1e-9 < open_interest_floor:
-                return "entry_open_interest_below_floor", {
-                    "leg": leg,
-                    "value_quote": value_quote,
-                    "floor_quote": open_interest_floor,
-                    **row,
-                }
-            if not open_interest_timestamps_are_fresh(
-                observed_at_ms=observed_at_ms,
-                received_at_ms=received_at_ms,
-                event_at_ms=event_at_ms,
-                now_ms=now_ms,
-                max_age_ms=open_interest_max_age_ms_for_evidence(
-                    row,
-                    default_max_age_ms=max_age_ms,
-                ),
-            ):
-                return "entry_open_interest_evidence_stale", {
-                    "leg": leg,
-                    "age_ms": now_ms - observed_at_ms,
-                    "event_age_ms": (
-                        now_ms - event_at_ms if event_at_ms > 0 else None
-                    ),
-                    "max_age_ms": max_age_ms,
-                    **row,
-                }
-        return "", evidence
-
-    def _entry_open_interest_submit_blocked(self, candidate, *, now_ms: int) -> bool:
-        reason, evidence = self._entry_open_interest_submit_reason(
-            candidate,
-            now_ms=now_ms,
-        )
-        if not reason:
-            return False
-        pair_id = self._candidate_pair_id(candidate)
-        receipt = getattr(candidate, "entry_open_interest_evidence", None)
-        receipt = receipt if isinstance(receipt, dict) else {}
-        long_receipt = receipt.get("long")
-        short_receipt = receipt.get("short")
-        long_receipt = long_receipt if isinstance(long_receipt, dict) else {}
-        short_receipt = short_receipt if isinstance(short_receipt, dict) else {}
-        evidence_revision_id = str(
-            getattr(candidate, "evidence_candidate_revision_id", "")
-            or receipt.get("candidate_revision_id")
-            or ""
-        )
-        self.ctx.journal.append(
-            "runtime.entry_open_interest_submit_blocked",
-            {
-                "candidate_pair_id": pair_id,
-                "pair_id": pair_id,
-                "symbol": str(getattr(candidate, "symbol", "") or ""),
-                "blocking_stage": "executor_submit",
-                "blocking_domain": "open_interest",
-                "blocking_status": "rejected",
-                "blocking_reason": reason,
-                "reason": reason,
-                "evidence": evidence,
-                "candidate_revision_id": str(
-                    getattr(candidate, "candidate_revision_id", "") or ""
-                ),
-                "evidence_candidate_revision_id": evidence_revision_id,
-                "opportunity_lease_id": str(
-                    getattr(candidate, "opportunity_lease_id", "") or ""
-                ),
-                "long_sample_id": str(long_receipt.get("sample_id") or ""),
-                "short_sample_id": str(short_receipt.get("sample_id") or ""),
-                "ts_ms": now_ms,
-            },
-        )
-        return True
-
     def _selected_pre_submit_deadline_exceeded(
         self,
         candidate,
@@ -5968,15 +5837,6 @@ class EntryDispatchRuntime:
                 )
                 return False
         now_ms = submit_now_ms
-        if (
-            self.ctx.config.runtime.mode == "live"
-            and self._entry_open_interest_submit_blocked(
-            candidate,
-            now_ms=now_ms,
-            )
-        ):
-            return False
-
         ctx = self._build_entry_context(
             candidate=candidate,
             entry_id=entry_id,

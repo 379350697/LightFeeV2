@@ -14,6 +14,7 @@ from lightfee.core.domain import EntryLeverageEvidence, Venue
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.entry_readiness import QuoteLease
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
@@ -151,6 +152,111 @@ def test_full_pairing_reaches_real_opportunity_after_high_surface_blockers() -> 
         "expected_edge_below_floor",
         "worst_case_edge_below_floor",
     ]
+
+
+def test_live_sidecar_is_the_only_slow_liquidity_gate() -> None:
+    now_ms = 1_000
+
+    def quote(venue: str, funding_rate_bps: float, open_interest: float) -> QuoteSnapshot:
+        return QuoteSnapshot(
+            venue=venue,
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=100.1,
+            bid_size=10.0,
+            ask_size=10.0,
+            funding_rate_bps=funding_rate_bps,
+            funding_rate_observed_at_ms=now_ms,
+            funding_rate_event_at_ms=now_ms,
+            funding_rate_received_at_ms=now_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=(
+                f"funding:{venue}:BTCUSDT:{now_ms}:{funding_rate_bps:.17g}:100000"
+            ),
+            funding_timestamp_ms=100_000,
+            funding_interval_ms=28_800_000,
+            observed_at_ms=now_ms,
+            volume_24h_quote=100.0,
+            open_interest=open_interest,
+            open_interest_evidence_status="observed",
+            open_interest_observed_at_ms=now_ms,
+            open_interest_event_at_ms=now_ms,
+            open_interest_received_at_ms=now_ms,
+            open_interest_source="test_fixture",
+            open_interest_venue_symbol="BTCUSDT",
+            open_interest_sample_id=open_interest_sample_id(
+                venue=venue,
+                canonical_symbol="BTCUSDT",
+                venue_symbol="BTCUSDT",
+                observed_at_ms=now_ms,
+                source="test_fixture",
+                raw_value=open_interest,
+                value_quote=open_interest,
+            ),
+            underlying="BTC",
+            quote_currency="USDT",
+            contract_type="linear",
+            contract_multiplier=1.0,
+            mark_index_source="venue_mark_index",
+            price_precision=2,
+            quantity_precision=3,
+            price_tick=0.01,
+            quantity_step_base=0.001,
+            min_quantity_base=0.001,
+            min_notional_quote=1.0,
+            min_notional_evidence_complete=True,
+            venue_status="active",
+            contract_normalization_complete=True,
+        )
+
+    strategy = StrategyConfig(
+        min_scan_minutes_before_funding=0,
+        max_scan_minutes_before_funding=0,
+        entry_window_secs=0,
+        min_expected_edge_bps=-100.0,
+        min_worst_case_edge_bps=-100.0,
+        entry_volume_floor_default_quote=1_000.0,
+        entry_open_interest_floor_default_quote=1_000.0,
+    )
+    candidates = build_same_symbol_pairs(
+        {
+            "cheap:BTCUSDT": quote("cheap", 0.0, 900.0),
+            "rich:BTCUSDT": quote("rich", 10.0, 2_000.0),
+        },
+        ["BTCUSDT"],
+        strategy=strategy,
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
+        passive_execution_enabled=True,
+        slow_liquidity_screening_enabled=True,
+        observed_at_ms=now_ms,
+    )
+
+    directed = {candidate.pair_id: candidate for candidate in candidates}
+    for candidate in directed.values():
+        assert candidate.blocked is True
+        assert candidate.economics_complete is False
+        assert "perp_open_interest_below_floor:cheap" in candidate.blocked_reasons
+        assert "perp_volume_below_floor:cheap" in candidate.advisories
+        assert candidate.entry_liquidity_source_at_entry == "sidecar_perp_liquidity"
+
+    unavailable_cheap = quote("cheap", 0.0, 2_000.0)
+    unavailable_cheap.open_interest_evidence_status = "unavailable"
+    unavailable = build_same_symbol_pairs(
+        {
+            "cheap:BTCUSDT": unavailable_cheap,
+            "rich:BTCUSDT": quote("rich", 10.0, 2_000.0),
+        },
+        ["BTCUSDT"],
+        strategy=strategy,
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
+        passive_execution_enabled=True,
+        slow_liquidity_screening_enabled=True,
+        observed_at_ms=now_ms,
+    )
+    assert all(
+        "perp_liquidity_unavailable:cheap" in candidate.blocked_reasons
+        for candidate in unavailable
+    )
 
 
 def test_full_pairing_decides_seven_venue_universe_under_500ms() -> None:

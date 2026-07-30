@@ -1350,8 +1350,8 @@ class TestRefreshPublicationSemantics:
         assert load_snapshot(svc.snapshot_path) is not None
 
 
-def test_liquidity_lifecycle_keeps_deferred_oi_separate_from_proof_failure():
-    """The audit must not call a deliberate OI handoff a missing proof."""
+def test_liquidity_lifecycle_keeps_sidecar_pending_oi_separate_from_proof_failure():
+    """A cold sidecar cache is not a broad data-plane outage."""
     from lightfee.sidecar.service import _liquidity_lifecycle_from_quotes
 
     deferred = QuoteSnapshot(
@@ -1361,7 +1361,7 @@ def test_liquidity_lifecycle_keeps_deferred_oi_separate_from_proof_failure():
         ask=101.0,
         volume_24h_quote=10_000_000.0,
         open_interest_evidence_status="unavailable",
-        open_interest_evidence_reason="entry_targeted_revalidation_required",
+        open_interest_evidence_reason="sidecar_slow_liquidity_pending",
     )
     actual_gap = QuoteSnapshot(
         venue="binance",

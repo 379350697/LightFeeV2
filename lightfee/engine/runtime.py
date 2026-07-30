@@ -6382,6 +6382,7 @@ class LiveRuntime:
         *,
         snapshot,
         price_hints: dict[str, float],
+        strategy_blocked_reason_counts: Counter[str] | None = None,
     ) -> None:
         """Check ranked candidates one at a time without a frontier deadline."""
         # A terminal evidence failure only yields its turn in this fair queue.
@@ -6608,18 +6609,8 @@ class LiveRuntime:
                 ),
                 name=f"entry-quote:{self._candidate_pair_id(candidate)}",
             )
-            oi_task = asyncio.create_task(
-                self._refresh_entry_candidate_open_interest_evidence(
-                    [candidate],
-                    snapshot=snapshot,
-                    now_ms=wall_clock_now_ms(),
-                    candidate_scope="ranked_candidate",
-                ),
-                name=f"entry-oi:{self._candidate_pair_id(candidate)}",
-            )
-            quote_result, oi_result = await asyncio.gather(
+            (quote_result,) = await asyncio.gather(
                 quote_task,
-                oi_task,
                 return_exceptions=True,
             )
             if isinstance(quote_result, BaseException):
@@ -6639,26 +6630,10 @@ class LiveRuntime:
                     },
                 )
                 continue
-            if isinstance(oi_result, BaseException):
-                last_reason = self._record_ranked_candidate_blocker(
-                    candidate_blockers,
-                    self._candidate_pair_id(candidate),
-                    "candidate_open_interest_revalidation_failed",
-                    selection_blockers=selection_blockers,
-                )
-                self.journal.append(
-                    "runtime.entry_candidate_revalidation_failed",
-                    {
-                        "pair_id": self._candidate_pair_id(candidate),
-                        "domain": "open_interest",
-                        "error": f"{type(oi_result).__name__}: {oi_result}"[:240],
-                        "ts_ms": wall_clock_now_ms(),
-                    },
-                )
-                continue
             quote_overlay, _quote_stats = quote_result
-            # Fresh two-leg BBO/OI evidence repairs a prior terminal outcome
-            # immediately; Local-L2 readiness remains governed separately.
+            # Fresh two-leg BBO evidence repairs a prior terminal outcome
+            # immediately; slow OI/volume was decided by the sidecar
+            # shortlist and is deliberately not re-fetched here.
             fresh_evidence_pair_ids.add(self._candidate_pair_id(candidate))
             self._clear_entry_execution_queue_failure(candidate)
             candidate_rows = self._filter_candidates_by_snapshot_freshness(
@@ -6839,6 +6814,17 @@ class LiveRuntime:
         self.state.last_scan["entry_v1_tracked_candidate_count"] = tracked_candidate_count
         self.state.last_scan["entry_bbo_prewarm_active"] = bbo_prewarm_active
         self.state.last_scan["ranked_candidate_blockers"] = dict(candidate_blockers)
+        # Discovery is the authoritative strategy-rejection pass for this
+        # scan.  Preserve its exact aggregate alongside the ranked-flow
+        # outcome instead of requiring an offline replay of the snapshot.
+        strategy_rejection_counts = {
+            str(reason): int(count)
+            for reason, count in (strategy_blocked_reason_counts or {}).items()
+            if str(reason) and int(count) > 0
+        }
+        self.state.last_scan["strategy_blocked_reason_counts"] = (
+            strategy_rejection_counts
+        )
         if dispatched == 0:
             self.state.last_scan["no_entry_reason"] = last_reason
             self.journal.append(
@@ -6846,6 +6832,7 @@ class LiveRuntime:
                 {
                     "reason": last_reason,
                     "strategy_tradeable_count": len(candidates),
+                    "strategy_blocked_reason_counts": strategy_rejection_counts,
                     "checked_candidate_count": checked,
                     "selection_blockers": dict(selection_blockers),
                     "admission_blockers": dict(admission_blockers),
@@ -7276,8 +7263,16 @@ class LiveRuntime:
             strategy_tradeable_count = len(tradeable)
             tradeable = self._entry_consumer_frontier(tradeable)
             raw_candidate_count = len(getattr(snapshot, "candidates", []) or [])
+            strategy_rejection_counts = {
+                str(reason): int(count)
+                for reason, count in strategy_blocked_reason_counts.items()
+                if str(reason) and int(count) > 0
+            }
             self.state.last_scan["raw_candidate_count"] = raw_candidate_count
             self.state.last_scan["strategy_tradeable_count"] = strategy_tradeable_count
+            self.state.last_scan["strategy_blocked_reason_counts"] = (
+                strategy_rejection_counts
+            )
             self.journal.append(
                 "scan.strategy_shortlist_ready",
                 {
@@ -7285,6 +7280,7 @@ class LiveRuntime:
                     "raw_candidate_count": raw_candidate_count,
                     "candidate_count": strategy_tradeable_count,
                     "strategy_tradeable_count": strategy_tradeable_count,
+                    "strategy_blocked_reason_counts": strategy_rejection_counts,
                     "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
                     "best_pair_id": tradeable[0].pair_id if tradeable else None,
                     "ts_ms": now_ms,
@@ -7294,6 +7290,7 @@ class LiveRuntime:
                 tradeable,
                 snapshot=snapshot,
                 price_hints=price_hints,
+                strategy_blocked_reason_counts=strategy_blocked_reason_counts,
             )
             return
     # ------------------------------------------------------------------
@@ -15015,8 +15012,8 @@ class LiveRuntime:
     def _snapshot_freshness_observability(self, *, snapshot, candidates: list, now_ms: int):
         return self.market_data_runtime._snapshot_freshness_observability(snapshot=snapshot, candidates=candidates, now_ms=now_ms)
 
-    def _candidate_snapshot_freshness_decisions(self, candidate, *, snapshot, now_ms: int, record_liquidity_qualification: bool=False, entry_quote_truth_overlay: dict[tuple[str, str], Any] | None=None):
-        return self.market_data_runtime._candidate_snapshot_freshness_decisions(candidate, snapshot=snapshot, now_ms=now_ms, record_liquidity_qualification=record_liquidity_qualification, entry_quote_truth_overlay=entry_quote_truth_overlay)
+    def _candidate_snapshot_freshness_decisions(self, candidate, *, snapshot, now_ms: int, entry_quote_truth_overlay: dict[tuple[str, str], Any] | None=None):
+        return self.market_data_runtime._candidate_snapshot_freshness_decisions(candidate, snapshot=snapshot, now_ms=now_ms, entry_quote_truth_overlay=entry_quote_truth_overlay)
 
     @staticmethod
     def _snapshot_quote_evidence(*, quote, observed_at_ms: int, age_ms: int, budget_ms: int):

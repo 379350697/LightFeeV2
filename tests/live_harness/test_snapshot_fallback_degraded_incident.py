@@ -332,7 +332,7 @@ async def test_degraded_other_symbol_does_not_reject_selected_candidate(
 
 
 @pytest.mark.asyncio
-async def test_degraded_selected_required_liquidity_rejects_candidate_and_enters_no_entry(
+async def test_runtime_does_not_reapply_sidecar_slow_liquidity_gate(
     tmp_path, monkeypatch,
 ):
     candidate = _candidate(
@@ -379,19 +379,10 @@ async def test_degraded_selected_required_liquidity_rejects_candidate_and_enters
     )
     assert mon_scope["candidate_pair_id"] == "monusdt:okx->bybit"
     assert mon_scope["source_age_ms"] == 69000
-    assert mon_scope["blocked"] is True
-    assert mon_scope["block_reason"] == "perp_liquidity_stale_blocking"
-
-    no_entry = _payload(records, "scan.no_entry_ranked_candidates")
-    # Final entry diagnostics retain the contract reason from the failing
-    # market-evidence domain; they must not collapse it into a generic
-    # "unavailable" bucket after the root cause was already established.
-    assert no_entry["reason"] == "perp_liquidity_stale_blocking"
-    assert no_entry["candidate_blockers"] == [
-        {
-            "pair_id": "monusdt:okx->bybit",
-            "reason": "perp_liquidity_stale_blocking",
-        }
-    ]
-    assert no_entry["checked_candidate_count"] == 1
-    assert runtime.entry_executor.contexts == []
+    assert mon_scope["blocked"] is False
+    assert mon_scope["block_reason"] == ""
+    assert not any(
+        event["kind"] == "scan.no_entry_ranked_candidates"
+        and event["payload"].get("reason") == "perp_liquidity_stale_blocking"
+        for event in records
+    )

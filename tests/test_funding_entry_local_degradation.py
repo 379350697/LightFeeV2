@@ -7,9 +7,9 @@ import time
 import pytest
 
 from lightfee.config.schema import AppConfig, RuntimeConfig, StrategyConfig, VenueConfig
+from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.sidecar.service import SidecarService
 from lightfee.sidecar.snapshot import (
-    ENTRY_TARGETED_OI_REVALIDATION_REASON,
     QuoteSnapshot,
     funding_rate_sample_id,
 )
@@ -41,8 +41,26 @@ def _quote(*, venue: str, funding_rate_bps: float, now_ms: int) -> QuoteSnapshot
         funding_timestamp_ms=funding_timestamp_ms,
         funding_interval_ms=28_800_000,
         volume_24h_quote=10_000_000.0,
-        open_interest_evidence_status="unavailable",
-        open_interest_evidence_reason=ENTRY_TARGETED_OI_REVALIDATION_REASON,
+        open_interest=2_000_000.0,
+        open_interest_observed_at_ms=now_ms,
+        open_interest_event_at_ms=now_ms,
+        open_interest_received_at_ms=now_ms,
+        open_interest_source="fixture",
+        open_interest_sample_id=open_interest_sample_id(
+            venue=venue,
+            canonical_symbol="BTCUSDT",
+            venue_symbol="BTCUSDT",
+            observed_at_ms=now_ms,
+            source="fixture",
+            raw_value=2_000_000.0,
+            value_quote=2_000_000.0,
+        ),
+        open_interest_venue_symbol="BTCUSDT",
+        open_interest_evidence_status="observed",
+        raw_open_interest=2_000_000.0,
+        raw_open_interest_unit="quote",
+        open_interest_contract_multiplier=1.0,
+        open_interest_conversion_mark_price=1.0,
         underlying="BTC",
         quote_currency="USDT",
         contract_type="linear",

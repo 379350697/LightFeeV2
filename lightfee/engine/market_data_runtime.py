@@ -31,6 +31,10 @@ from lightfee.marketdata.open_interest import (
 from lightfee.sidecar.snapshot import funding_rate_evidence_reason
 
 ENTRY_OPEN_INTEREST_HOT_CACHE_MAX_ENTRIES = 256
+# V1 keeps funding observations independently from executable quotes: a rate
+# remains usable for ten minutes only while its next settlement is future.
+# Do not inherit the sidecar publication/BBO lease here.
+FUNDING_RATE_EVIDENCE_MAX_AGE_MS = 10 * 60 * 1_000
 
 
 def _mark_entry_evidence_domain_state(
@@ -3251,7 +3255,7 @@ class MarketDataRuntime:
                 or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
             )
         if domain_s == "funding":
-            return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
+            return FUNDING_RATE_EVIDENCE_MAX_AGE_MS
         return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
 
     @staticmethod
@@ -3489,20 +3493,15 @@ class MarketDataRuntime:
         *,
         snapshot,
         now_ms: int,
-        record_liquidity_qualification: bool = False,
         entry_quote_truth_overlay: dict[tuple[str, str], Any] | None = None,
     ) -> list[dict]:
         if snapshot is None:
             return []
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
         funding_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "funding")
-        liquidity_rows = self._snapshot_lifecycle_rows_by_venue(snapshot, "liquidity")
         fallback_source = self._snapshot_fallback_source(snapshot)
         decisions: list[dict] = []
         symbol = str(getattr(candidate, "symbol", "") or "").upper()
-        requires_sidecar_liquidity = (
-            self._candidate_requires_sidecar_perp_liquidity(candidate)
-        )
 
         for venue_attr in ("long_venue", "short_venue"):
             venue = str(getattr(candidate, venue_attr, "") or "").lower()
@@ -3718,65 +3717,6 @@ class MarketDataRuntime:
                         )
                     )
                     decisions.append(payload)
-
-            liquidity = liquidity_rows.get(venue)
-            liq_budget_ms = self._snapshot_domain_budget_ms("liquidity", liquidity)
-            liq_observed_at_ms = (
-                int(getattr(liquidity, "observed_at_ms", 0) or 0)
-                if liquidity is not None else 0
-            )
-            liq_coverage_usable = (
-                int(getattr(liquidity, "coverage_usable", 0) or 0)
-                if liquidity is not None else 0
-            )
-            liq_degraded_reason = (
-                str(getattr(liquidity, "degraded_reason", "") or "")
-                if liquidity is not None else ""
-            )
-            liq_degraded_blocks_symbol = (
-                self._liquidity_degraded_reason_blocks_symbol(
-                    liq_degraded_reason, symbol
-                )
-            )
-            liq_age_ms = (
-                max(now_ms - liq_observed_at_ms, 0)
-                if liq_observed_at_ms > 0 else 0
-            )
-            liq_stale_or_missing = (
-                liquidity is None
-                or liq_observed_at_ms <= 0
-                or liq_age_ms > liq_budget_ms
-                or liq_coverage_usable <= 0
-                or liq_degraded_blocks_symbol
-            )
-            if liq_stale_or_missing:
-                reason = (
-                    "perp_liquidity_stale_blocking"
-                    if requires_sidecar_liquidity
-                    else "perp_liquidity_stale_advisory"
-                )
-                decisions.append(
-                    self._liquidity_lifecycle_payload(
-                        row=liquidity,
-                        venue=venue,
-                        symbol=symbol,
-                        now_ms=now_ms,
-                        decision="skip_entry" if requires_sidecar_liquidity else "continue",
-                        reason=reason,
-                        fallback_source=fallback_source,
-                    )
-                )
-
-        decisions.extend(
-            self._entry_liquidity_qualification_decisions(
-                candidate,
-                snapshot=snapshot,
-                quote_lookup=quote_lookup,
-                now_ms=now_ms,
-                fallback_source=fallback_source,
-                record_result=record_liquidity_qualification,
-            )
-        )
 
         return decisions
 
@@ -5318,9 +5258,6 @@ class MarketDataRuntime:
                 candidate,
                 snapshot=snapshot,
                 now_ms=now_ms,
-                record_liquidity_qualification=(
-                    record_result and mutate_liquidity_state
-                ),
                 entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             if not decisions:

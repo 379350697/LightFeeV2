@@ -1200,7 +1200,10 @@ class MarketDataClient:
                 include_open_interest=include_open_interest,
             )
         elif venue_id == Venue.OKX:
-            tickers = await self._fetch_okx_style(symbols)
+            tickers = await self._fetch_okx_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         elif venue_id == Venue.BYBIT:
             tickers = await self._fetch_bybit_style(symbols)
         elif venue_id == Venue.BITGET:
@@ -3149,7 +3152,12 @@ class MarketDataClient:
             return False
         return True
 
-    async def _fetch_okx_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_okx_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         canonical_by_venue_symbol: dict[str, set[str]] = {}
@@ -3441,7 +3449,7 @@ class MarketDataClient:
             venue_sym: "not_refreshed" if spec.open_interest_path else "unsupported"
             for venue_sym in venue_sym_to_canon
         }
-        if spec.open_interest_path:
+        if spec.open_interest_path and include_open_interest:
             try:
                 oi_raw, oi_received_at_ms = await self._cached_public_get_with_received_at(
                     spec.open_interest_path,

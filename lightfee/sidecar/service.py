@@ -26,8 +26,8 @@ from lightfee.sidecar.snapshot import (
     QuoteSnapshot,
     SidecarSnapshot,
     TransferLifecycle,
-    entry_targeted_oi_revalidation_required,
     funding_rate_evidence_reason,
+    slow_liquidity_evidence_pending,
 )
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.strategy.funding_forecast_calibrator import FundingForecastCalibrator
@@ -161,6 +161,7 @@ class SidecarService:
                 quotes_by_venue.setdefault(str(quote.venue).lower(), []).append(quote)
             for venue_name, source in self._exchange_sources.items():
                 source.prime_funding_schedule(quotes_by_venue.get(str(venue_name).lower(), []))
+                source.prime_slow_liquidity(quotes_by_venue.get(str(venue_name).lower(), []))
             restored = _restorable_prior_last_good_quotes(
                 prior_snapshot,
                 configured_venues=set(self._venue_configs_by_name),
@@ -1073,6 +1074,12 @@ class SidecarService:
                 for venue_name, venue in venue_configs.items()
             },
             passive_execution_enabled=(str(config.runtime.mode or "").lower() == "live"),
+            slow_liquidity_screening_enabled=(
+                str(config.runtime.mode or "").lower() == "live"
+            ),
+            slow_evidence_max_age_ms=int(
+                config.runtime.slow_evidence_max_age_ms
+            ),
         )
 
     def _ensure_candidate_service(self) -> FundingCandidateService:
@@ -1428,20 +1435,6 @@ def _latest_quote_evidence_timestamp(
     return max(timestamps.values(), default=int(fallback_ms))
 
 
-def _quote_requires_entry_targeted_oi_revalidation(quote: QuoteSnapshot) -> bool:
-    """Return whether OI is deliberately deferred to live admission.
-
-    This is the shared marker for both compact entry publication and the
-    full-audit path.  It is never a substitute for the runtime's strict OI
-    fetch before an order is admitted.
-    """
-    return entry_targeted_oi_revalidation_required(
-        evidence_status=quote.open_interest_evidence_status,
-        evidence_reason=quote.open_interest_evidence_reason,
-        volume_24h_quote=quote.volume_24h_quote,
-    )
-
-
 def _liquidity_lifecycle_from_quotes(
     *,
     configured_venues: list[str],
@@ -1462,9 +1455,13 @@ def _liquidity_lifecycle_from_quotes(
             if str(quote.venue or "").lower() == venue_key
         ]
         usable = sum(_quote_has_strict_liquidity_evidence(q) for q in venue_quotes)
-        deferred_oi = sum(
-            _quote_requires_entry_targeted_oi_revalidation(q)
-            for q in venue_quotes
+        pending = sum(
+            slow_liquidity_evidence_pending(
+                evidence_status=quote.open_interest_evidence_status,
+                evidence_reason=quote.open_interest_evidence_reason,
+                volume_24h_quote=quote.volume_24h_quote,
+            )
+            for quote in venue_quotes
         )
         listed = set(listed_symbols_by_venue.get(venue_key, set()))
         listed.update(str(q.symbol or "").upper() for q in venue_quotes)
@@ -1475,11 +1472,7 @@ def _liquidity_lifecycle_from_quotes(
             if str(q.symbol or "").strip()
         }
         unavailable_quote_symbols = (listed | failed) - quoted_symbols
-        # An explicit deferred marker carries valid volume evidence and is
-        # revalidated by the runtime for the candidate that reaches admission.
-        # It must not be reported as a global strict-proof failure, while all
-        # other missing proof remains fail-closed and visible to the audit.
-        proof_missing = max(len(venue_quotes) - usable - deferred_oi, 0)
+        proof_missing = max(len(venue_quotes) - usable - pending, 0)
         reasons: list[str] = []
         error = transport_errors.get(venue_key)
         if error is not None:

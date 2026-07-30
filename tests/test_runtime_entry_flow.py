@@ -2160,6 +2160,10 @@ class TestPlannerDispatchIntegration:
             [candidate],
             snapshot=SimpleNamespace(quotes={}),
             price_hints={},
+            strategy_blocked_reason_counts=Counter({
+                "outside_scan_window": 3,
+                "expected_edge_below_floor": 2,
+            }),
         )
 
         assert l2_activation_calls == [(["BTCUSDT"], 10_000, 1)]
@@ -2181,6 +2185,16 @@ class TestPlannerDispatchIntegration:
         assert no_entry[-1]["selection_blockers"] == {
             "entry_waiting_for_finalization_window_too_early": 1
         }
+        expected_strategy_rejections = {
+            "outside_scan_window": 3,
+            "expected_edge_below_floor": 2,
+        }
+        assert runtime.state.last_scan["strategy_blocked_reason_counts"] == (
+            expected_strategy_rejections
+        )
+        assert no_entry[-1]["strategy_blocked_reason_counts"] == (
+            expected_strategy_rejections
+        )
 
     @pytest.mark.asyncio
     async def test_ranked_final_flow_keeps_prewarmed_bbo_scope_and_exact_blocker(
@@ -3324,9 +3338,18 @@ class TestPlannerDispatchIntegration:
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
         _install_single_snapshot_fixture(monkeypatch, snapshot)
+        def discover_with_strategy_rejections(
+            candidates, _strategy, _now_ms, **kwargs
+        ):
+            kwargs["blocked_reason_counts"].update({
+                "outside_scan_window": 4,
+                "expected_edge_below_floor": 3,
+            })
+            return list(candidates)
+
         monkeypatch.setattr(
             "lightfee.engine.runtime.discover_tradeable_candidates",
-            lambda candidates, _strategy, _now_ms, **_kwargs: list(candidates),
+            discover_with_strategy_rejections,
         )
         monkeypatch.setattr(
             runtime,
@@ -3363,13 +3386,26 @@ class TestPlannerDispatchIntegration:
             "entry_account_truth_timeout_before_dispatch"
         )
         assert runtime.state.last_scan["dispatched_candidate_count"] == 1
+        expected_strategy_rejections = {
+            "outside_scan_window": 4,
+            "expected_edge_below_floor": 3,
+        }
+        assert runtime.state.last_scan["strategy_blocked_reason_counts"] == (
+            expected_strategy_rejections
+        )
+        shortlist_events = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"] == "scan.strategy_shortlist_ready"
+        ]
+        assert shortlist_events[-1]["strategy_blocked_reason_counts"] == (
+            expected_strategy_rejections
+        )
 
     @pytest.mark.asyncio
-    async def test_restart_first_oi_failure_skips_only_rank_one_candidate(
+    async def test_ranked_flow_does_not_refresh_oi_after_sidecar_screening(
         self, config, tmp_journal, monkeypatch,
     ):
-        from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
-
         config.runtime.mode = "live"
         runtime = LiveRuntime(config, venue_adapters={})
         runtime.journal = tmp_journal
@@ -3383,12 +3419,6 @@ class TestPlannerDispatchIntegration:
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 7_001)
 
-        restarted = EntryOpenInterestRefresher(targeted_budget_s=0.01)
-        runtime.entry_open_interest_refresher = restarted
-        assert restarted.cached_open_interest(
-            "binance", "BTCUSDT", now_ms=7_001
-        ) is None
-
         async def passthrough(candidates, **_kwargs):
             return list(candidates)
 
@@ -3400,9 +3430,7 @@ class TestPlannerDispatchIntegration:
         async def refresh_oi(candidates, **_kwargs):
             symbol = candidates[0].symbol
             oi_symbols.append(symbol)
-            if symbol == "BTCUSDT":
-                raise asyncio.TimeoutError("restart on-demand OI unavailable")
-            return {"resolved_count": 1, "timeout_count": 0}
+            raise AssertionError(f"late OI refresh must not run: {symbol}")
 
         async def account_ready(_candidate):
             return True, False, ""
@@ -3475,31 +3503,21 @@ class TestPlannerDispatchIntegration:
         )
         monkeypatch.setattr(runtime, "_dispatch_entry", dispatch)
 
-        try:
-            await runtime._run_ranked_candidate_entry_flow(
-                [rank_one, rank_two],
-                snapshot=SimpleNamespace(quotes={}),
-                price_hints={},
-            )
-        finally:
-            await restarted.close()
+        await runtime._run_ranked_candidate_entry_flow(
+            [rank_one, rank_two],
+            snapshot=SimpleNamespace(quotes={}),
+            price_hints={},
+        )
 
-        assert oi_symbols == ["BTCUSDT", "ETHUSDT"]
-        assert dispatched_symbols == ["ETHUSDT"]
+        assert oi_symbols == []
+        assert dispatched_symbols == ["BTCUSDT", "ETHUSDT"]
         assert runtime.state.last_scan["ranked_candidate_checked_count"] == 2
         failures = [
             record["payload"]
             for record in runtime.journal.read_all()
             if record["kind"] == "runtime.entry_candidate_revalidation_failed"
         ]
-        assert failures == [
-            {
-                "pair_id": runtime._candidate_pair_id(rank_one),
-                "domain": "open_interest",
-                "error": "TimeoutError: restart on-demand OI unavailable",
-                "ts_ms": failures[0]["ts_ms"],
-            }
-        ]
+        assert failures == []
 
     @pytest.mark.asyncio
     async def test_entry_account_truth_live_artifact_refreshes_global_recovery(

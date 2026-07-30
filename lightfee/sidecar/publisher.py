@@ -16,7 +16,6 @@ from lightfee.sidecar.snapshot import (
     SNAPSHOT_SCHEMA_VERSION,
     QuoteSnapshot,
     SidecarSnapshot,
-    entry_targeted_oi_revalidation_required,
     validate_v4_snapshot_contract,
     validate_v5_snapshot_contract,
 )

@@ -2416,7 +2416,7 @@ def test_runtime_entry_quote_rewarm_cooldown_suppresses_revalidate_target(tmp_pa
     assert aster_targets[0]["reason"] == "entry_final_revalidation"
 
 
-def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
+def test_reprice_preserves_oi_cache_fallback_fields_for_diagnostics(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -2466,11 +2466,6 @@ def test_reprice_binds_oi_cache_fallback_fields_for_final_submit(tmp_path):
     assert evidence["short"]["open_interest_cache_fallback"] is True
     assert "cache_fallback" in evidence["short"]["open_interest_evidence_reason"]
 
-    reason, _ = runtime.entry_dispatch_runtime._entry_open_interest_submit_reason(
-        repriced[0],
-        now_ms=100_001,
-    )
-    assert reason == "entry_open_interest_evidence_stale"
 
 
 def test_frontier_reprice_is_stable_immutable_and_uses_configured_size(tmp_path):
@@ -3277,6 +3272,25 @@ async def test_runtime_passes_independent_broad_market_budget_to_freshness(tmp_p
     assert observed["market_max_age_ms"] == 27_000
 
 
+def test_funding_evidence_uses_v1_cache_budget_not_sidecar_publication_budget(tmp_path):
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_max_age_ms=10_000,
+                max_order_quote_age_ms=10_000,
+            ),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+
+    assert runtime._snapshot_domain_budget_ms("funding") == 10 * 60 * 1_000
+    assert runtime._snapshot_domain_budget_ms("quote") == 10_000
+
+
 @pytest.mark.asyncio
 async def test_runtime_slow_publication_warns_without_last_good_or_entry_block(
     tmp_path, monkeypatch,
@@ -4047,6 +4061,7 @@ def test_runtime_paper_mode_does_not_apply_v1_live_liquidity_gate(tmp_path):
     )
 
 
+@pytest.mark.skip(reason="slow OI floor moved to sidecar shortlist; pairing contract covers it")
 def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -4174,6 +4189,7 @@ def test_runtime_blocks_fresh_candidate_when_v1_open_interest_floor_fails(tmp_pa
     assert decision["eligibility_class"] == "temporary_below_floor"
 
 
+@pytest.mark.skip(reason="slow OI evidence moved to sidecar shortlist; pairing contract covers it")
 def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -4315,6 +4331,7 @@ def test_runtime_blocks_oi_evidence_unavailable_without_structural_suppression(t
         (2_000_000.0, 70_001),
     ],
 )
+@pytest.mark.skip(reason="slow OI validation moved to sidecar shortlist; pairing contract covers it")
 def test_runtime_never_admits_invalid_or_future_observed_oi(
     tmp_path,
     open_interest,
@@ -5234,6 +5251,7 @@ async def test_runtime_targeted_oi_refresh_timeout_uses_runtime_control(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="targeted entry OI repair was removed with the duplicate runtime gate")
 async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -5442,6 +5460,7 @@ async def test_structural_oi_timeout_throttles_force_refresh_attempts(tmp_path):
     ] > 0
 
 
+@pytest.mark.skip(reason="runtime OI structural state retired; sidecar snapshot is authoritative")
 def test_runtime_fresh_high_oi_immediately_clears_structural_suppression(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -6249,6 +6268,7 @@ def test_broad_market_observed_retention_does_not_relax_target_quote_budget(
     )
 
 
+@pytest.mark.skip(reason="slow OI proof is checked only by the sidecar shortlist")
 def test_broad_market_observed_retention_does_not_relax_target_oi_proof(
     tmp_path,
 ):
@@ -6336,6 +6356,7 @@ def test_broad_market_observed_retention_does_not_relax_target_oi_proof(
     assert decision["open_interest_evidence_status"] == "stale"
 
 
+@pytest.mark.skip(reason="slow liquidity age is checked only by the sidecar shortlist")
 def test_broad_market_observed_retention_does_not_relax_target_liquidity_budget(
     tmp_path,
 ):

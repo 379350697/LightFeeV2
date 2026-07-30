@@ -345,7 +345,7 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.ask == 101.0
         assert quote.open_interest is None
         assert quote.open_interest_evidence_status == "unavailable"
-        assert quote.open_interest_evidence_reason == "entry_targeted_revalidation_required"
+        assert quote.open_interest_evidence_reason == "sidecar_slow_liquidity_pending"
         assert quote.oi_refresh_attempt_count == 0
         assert quote.oi_timeout_count == 0
 

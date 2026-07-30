@@ -6,6 +6,11 @@ from math import isfinite
 
 from lightfee.config.schema import StrategyConfig
 from lightfee.engine.entry_local_l2 import make_candidate_pair_id
+from lightfee.marketdata.open_interest import (
+    bounded_open_interest_cache_fallback_max_age_ms,
+    normalize_open_interest_status,
+    open_interest_timestamps_are_fresh,
+)
 from lightfee.sidecar.snapshot import (
     CandidateInput,
     QuoteSnapshot,
@@ -21,6 +26,69 @@ from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
 _INTERVAL_ALIGNED_THRESHOLD_MS = 60_000
+
+
+def _sidecar_perp_liquidity_reasons(
+    quote: QuoteSnapshot,
+    *,
+    config: StrategyConfig,
+    now_ms: int,
+    max_age_ms: int,
+) -> tuple[list[str], list[str]]:
+    """Apply V1's slow liquidity policy once, while building the shortlist.
+
+    The runtime must not refetch or re-threshold OI after this boundary.  The
+    sidecar's bounded cache is therefore the sole source for this slow
+    screening decision; executable BBO/L2 remains a separate final gate.
+    """
+    venue = str(quote.venue or "").strip().lower()
+    if not venue:
+        return ["perp_liquidity_unavailable"], []
+    volume_floor = float(config.entry_volume_floor_quote(venue))
+    oi_floor = float(config.entry_open_interest_floor_quote(venue))
+    advisories: list[str] = []
+    if volume_floor > 0.0:
+        try:
+            volume = float(quote.volume_24h_quote)
+        except (TypeError, ValueError, OverflowError):
+            volume = 0.0
+        if not isfinite(volume) or volume < volume_floor:
+            # V1 records low 24h volume but does not turn it into an entry
+            # blocker.  Keep that distinction at the one slow-data boundary.
+            advisories.append(f"perp_volume_below_floor:{venue}")
+
+    if oi_floor <= 0.0:
+        return [], advisories
+    try:
+        value = float(quote.open_interest)
+        observed_at_ms = int(quote.open_interest_observed_at_ms or 0)
+        event_at_ms = int(quote.open_interest_event_at_ms or 0)
+        received_at_ms = int(quote.open_interest_received_at_ms or 0)
+    except (TypeError, ValueError, OverflowError):
+        return [f"perp_liquidity_unavailable:{venue}"], advisories
+    proof_valid = (
+        normalize_open_interest_status(quote.open_interest_evidence_status)
+        == "observed"
+        and isfinite(value)
+        and value >= 0.0
+        and bool(str(quote.open_interest_source or "").strip())
+        and bool(str(quote.open_interest_sample_id or "").strip())
+        and bool(str(quote.open_interest_venue_symbol or "").strip())
+        and open_interest_timestamps_are_fresh(
+            observed_at_ms=observed_at_ms,
+            event_at_ms=event_at_ms,
+            received_at_ms=received_at_ms,
+            now_ms=now_ms,
+            max_age_ms=bounded_open_interest_cache_fallback_max_age_ms(
+                max_age_ms
+            ),
+        )
+    )
+    if not proof_valid:
+        return [f"perp_liquidity_unavailable:{venue}"], advisories
+    if value + 1e-9 < oi_floor:
+        return [f"perp_open_interest_below_floor:{venue}"], advisories
+    return [], advisories
 
 
 def _record_rejection(counts: dict[str, int] | None, reason: str) -> None:
@@ -45,12 +113,20 @@ class FundingCandidateService:
         venue_maker_fee_bps: dict[str, float],
         venue_notional_caps: dict[str, float],
         passive_execution_enabled: bool,
+        slow_liquidity_screening_enabled: bool = False,
+        slow_evidence_max_age_ms: int = 10 * 60_000,
     ) -> None:
         self._strategy = strategy
         self._fee_by_venue = _normalise_venue_bps(venue_fee_bps)
         self._maker_fee_by_venue = _normalise_venue_bps(venue_maker_fee_bps)
         self._caps_by_venue = _normalise_venue_bps(venue_notional_caps)
         self._passive_execution_enabled = passive_execution_enabled is True
+        self._slow_liquidity_screening_enabled = (
+            slow_liquidity_screening_enabled is True
+        )
+        self._slow_evidence_max_age_ms = (
+            bounded_open_interest_cache_fallback_max_age_ms(slow_evidence_max_age_ms)
+        )
         self._allocator = StrategyRiskAllocator()
 
     def build(
@@ -70,6 +146,8 @@ class FundingCandidateService:
             caps_by_venue=self._caps_by_venue,
             allocator=self._allocator,
             passive_execution_enabled=self._passive_execution_enabled,
+            slow_liquidity_screening_enabled=self._slow_liquidity_screening_enabled,
+            slow_evidence_max_age_ms=self._slow_evidence_max_age_ms,
             observed_at_ms=observed_at_ms,
             diagnostics=diagnostics,
         )
@@ -84,6 +162,8 @@ def build_same_symbol_pairs(
     venue_maker_fee_bps: dict[str, float] | None = None,
     venue_notional_caps: dict[str, float] | None = None,
     passive_execution_enabled: bool = False,
+    slow_liquidity_screening_enabled: bool = False,
+    slow_evidence_max_age_ms: int = 10 * 60_000,
     observed_at_ms: int = 0,
     diagnostics: dict[str, object] | None = None,
 ) -> list[CandidateInput]:
@@ -104,6 +184,8 @@ def build_same_symbol_pairs(
         caps_by_venue=_normalise_venue_bps(venue_notional_caps or {}),
         allocator=StrategyRiskAllocator(),
         passive_execution_enabled=passive_execution_enabled is True,
+        slow_liquidity_screening_enabled=slow_liquidity_screening_enabled is True,
+        slow_evidence_max_age_ms=slow_evidence_max_age_ms,
         observed_at_ms=observed_at_ms,
         diagnostics=diagnostics,
     )
@@ -119,6 +201,8 @@ def _build_same_symbol_pairs(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
+    slow_liquidity_screening_enabled: bool,
+    slow_evidence_max_age_ms: int,
     observed_at_ms: int,
     diagnostics: dict[str, object] | None,
 ) -> list[CandidateInput]:
@@ -243,6 +327,8 @@ def _build_same_symbol_pairs(
                     caps_by_venue=caps_by_venue,
                     allocator=allocator,
                     passive_execution_enabled=passive_execution_enabled,
+                    slow_liquidity_screening_enabled=slow_liquidity_screening_enabled,
+                    slow_evidence_max_age_ms=slow_evidence_max_age_ms,
                     observed_at_ms=observed_at_ms,
                     rejection_counts=rejection_counts,
                 )
@@ -321,6 +407,8 @@ def _candidate_for_pair(
     caps_by_venue: dict[str, float],
     allocator: StrategyRiskAllocator,
     passive_execution_enabled: bool,
+    slow_liquidity_screening_enabled: bool,
+    slow_evidence_max_age_ms: int,
     observed_at_ms: int,
     rejection_counts: dict[str, int] | None = None,
 ) -> CandidateInput | None:
@@ -569,6 +657,20 @@ def _candidate_for_pair(
         health_buffer_ratio=float(config.funding_risk_health_buffer_ratio or 0.0),
     )
     candidate_block_reasons = list(contract_block_reasons)
+    liquidity_advisories: list[str] = []
+    if slow_liquidity_screening_enabled and config.execution_liquidity_enabled:
+        # V1 evaluates the slow perp-liquidity guard before a candidate may
+        # enter its live admission lifecycle.  V2 now does it at sidecar
+        # screening, once, using the bounded local evidence cache.
+        for quote in (long_q, short_q):
+            blockers, advisories = _sidecar_perp_liquidity_reasons(
+                quote,
+                config=config,
+                now_ms=now_ms,
+                max_age_ms=slow_evidence_max_age_ms,
+            )
+            candidate_block_reasons.extend(blockers)
+            liquidity_advisories.extend(advisories)
     if economics_mode == "enhanced_live" and not forecast_ready:
         candidate_block_reasons.append("funding_forecast_not_ready")
     if economics_mode == "enhanced_live" and not forecast_distribution_stable:
@@ -764,6 +866,15 @@ def _candidate_for_pair(
         first_funding_leg=first_leg,
         entry_maker_leg=entry_maker_leg if passive_execution_enabled else "",
         exit_maker_leg=exit_maker_leg if passive_execution_enabled else "",
+        entry_liquidity_source_at_entry=(
+            "sidecar_perp_liquidity"
+            if slow_liquidity_screening_enabled and config.execution_liquidity_enabled
+            else None
+        ),
+        long_volume_24h_quote=float(long_q.volume_24h_quote or 0.0),
+        short_volume_24h_quote=float(short_q.volume_24h_quote or 0.0),
+        long_open_interest_quote_at_entry=float(long_q.open_interest or 0.0),
+        short_open_interest_quote_at_entry=float(short_q.open_interest or 0.0),
         direction_consistent=gate_funding > 0.0 and short_mid >= long_mid,
         interval_aligned=interval_aligned,
         opportunity_type=opportunity_type,
@@ -819,7 +930,7 @@ def _candidate_for_pair(
                 economics_mode != "enhanced_live"
                 or (forecast_ready and forecast_distribution_stable)
             )
-            and not contract_block_reasons
+            and not candidate_block_reasons
         ),
         calculation_version=expected.calculation_version,
         model_epoch=calculation_version,
@@ -846,6 +957,7 @@ def _candidate_for_pair(
             f"forecast_stability={forecast_stability_reason}",
             f"forecast_median_drift_bps={forecast_median_drift_bps:.6f}",
             f"forecast_p90_drift_bps={forecast_p90_drift_bps:.6f}",
+            *liquidity_advisories,
             *[f"contract_validation_blocked:{reason}" for reason in contract_block_reasons],
             *([] if allocation.evidence_complete else ["sizing_missing_margin_fallback"]),
         ],
