@@ -4415,7 +4415,11 @@ class LiveRuntime:
         """Allocate the primary+shadow L2 window from the full frontier."""
         from lightfee.engine.entry_local_l2 import (
             EntryLocalL2SessionState,
+            TrackedOpportunityClass,
+            local_l2_tracking_book_ready,
+            primary_hold_window_allows_replacement,
             select_tracked_opportunities,
+            shadow_promotion_is_eligible,
         )
 
         source_candidates = list(candidates or [])
@@ -4438,7 +4442,11 @@ class LiveRuntime:
             if int(failure.get("expires_at_ms", 0) or 0) > now_ms
         }
         primary_excluded_pair_ids.update(self._entry_primary_backfill_failures)
-        if self._local_l2_effective_enabled():
+        # This is entry-scope ownership, so it must consume the same composed
+        # contract as the final gate and Local-L2 data-plane facade.  The
+        # similarly named compatibility predicate is reserved for non-entry
+        # lifecycle paths (for example post-fill recovery).
+        if self._entry_local_l2_effective_enabled():
             finalization_ready_pair_ids: set[str] = set()
             timestamped_pair_ids: set[str] = set()
             for candidate in source_candidates:
@@ -4521,6 +4529,162 @@ class LiveRuntime:
             shadow_count,
             primary_excluded_pair_ids=primary_excluded_pair_ids,
         )
+        # V1 keeps a selected primary through its minimum hold window, then
+        # may replace the lowest-ranked primary with the best *directly ready*
+        # shadow.  The old V2 helper was never called and expected shadows to
+        # own sessions, which is the opposite of V1 ownership.  Keep this
+        # decision next to the one scope allocator so the pair classes, L2
+        # owner set, warm-pool scope, and final gate consume one result.
+        if self._entry_local_l2_effective_enabled() and tracked:
+            tracked_lookup = {
+                opportunity.pair_id: opportunity for opportunity in tracked
+            }
+            ranked_pair_ids = [opportunity.pair_id for opportunity in tracked]
+            previous_primary_ids = {
+                pair_id
+                for pair_id in self._tracked_primary_pair_ids
+                if (
+                    pair_id in tracked_lookup
+                    and pair_id not in primary_excluded_pair_ids
+                )
+            }
+            primary_symbols = {
+                str(tracked_lookup[pair_id].symbol or "").upper()
+                for pair_id in previous_primary_ids
+            }
+            next_primary_ids = set(previous_primary_ids)
+            for pair_id in ranked_pair_ids:
+                if len(next_primary_ids) >= primary_count:
+                    break
+                opportunity = tracked_lookup[pair_id]
+                symbol_key = str(opportunity.symbol or "").upper()
+                if (
+                    pair_id in primary_excluded_pair_ids
+                    or pair_id in next_primary_ids
+                    or not symbol_key
+                    or symbol_key in primary_symbols
+                ):
+                    continue
+                next_primary_ids.add(pair_id)
+                primary_symbols.add(symbol_key)
+
+            if next_primary_ids and shadow_count > 0:
+                best_shadow = next(
+                    (
+                        tracked_lookup[pair_id]
+                        for pair_id in ranked_pair_ids
+                        if (
+                            pair_id not in next_primary_ids
+                            and pair_id not in primary_excluded_pair_ids
+                        )
+                    ),
+                    None,
+                )
+                worst_primary = next(
+                    (
+                        tracked_lookup[pair_id]
+                        for pair_id in reversed(ranked_pair_ids)
+                        if pair_id in next_primary_ids
+                    ),
+                    None,
+                )
+                if best_shadow is not None and worst_primary is not None:
+                    primary_session = self.entry_l2_sessions.sessions.get(
+                        worst_primary.pair_id
+                    )
+                    primary_assigned_at_ms = (
+                        primary_session.primary_assigned_at_ms
+                        if primary_session is not None
+                        else 0
+                    )
+                    shadow_symbol_conflicts = any(
+                        pair_id != worst_primary.pair_id
+                        and str(tracked_lookup[pair_id].symbol or "").upper()
+                        == str(best_shadow.symbol or "").upper()
+                        for pair_id in next_primary_ids
+                    )
+                    shadow_ready = not shadow_symbol_conflicts and all(
+                        local_l2_tracking_book_ready(
+                            self.local_l2_runtime.get_book(venue, best_shadow.symbol),
+                            now_ms=now_ms,
+                            stale_after_ms=stale_after_ms,
+                        )
+                        for venue in (
+                            best_shadow.long_venue,
+                            best_shadow.short_venue,
+                        )
+                    )
+                    primary_executing = self._tracked_pair_is_executing(
+                        worst_primary.pair_id
+                    )
+                    primary_min_hold_ms = max(
+                        int(self.config.strategy.primary_min_hold_ms or 0),
+                        0,
+                    )
+                    score_delta_bps = float(
+                        self.config.strategy.shadow_promotion_score_delta_bps
+                        or 0.0
+                    )
+                    hold_allows = primary_hold_window_allows_replacement(
+                        primary_assigned_at_ms,
+                        now_ms,
+                        primary_min_hold_ms,
+                    )
+                    if shadow_promotion_is_eligible(
+                        primary=worst_primary,
+                        shadow=best_shadow,
+                        primary_assigned_at_ms=primary_assigned_at_ms,
+                        now_ms=now_ms,
+                        primary_min_hold_ms=primary_min_hold_ms,
+                        shadow_promotion_score_delta_bps=score_delta_bps,
+                        primary_executing=primary_executing,
+                        shadow_ready=shadow_ready,
+                    ):
+                        next_primary_ids.remove(worst_primary.pair_id)
+                        next_primary_ids.add(best_shadow.pair_id)
+                        self.journal.append(
+                            "runtime.entry_local_l2_primary_changed",
+                            {
+                                "promoted_pair_id": best_shadow.pair_id,
+                                "demoted_pair_id": worst_primary.pair_id,
+                                "reason": "shadow_promotion",
+                                "ts_ms": now_ms,
+                            },
+                        )
+                    elif (
+                        best_shadow.ranking_edge_bps - worst_primary.ranking_edge_bps
+                        >= score_delta_bps
+                        and not hold_allows
+                    ):
+                        self.journal.append(
+                            "runtime.entry_local_l2_shadow_blocked",
+                            {
+                                "shadow_pair_id": best_shadow.pair_id,
+                                "primary_pair_id": worst_primary.pair_id,
+                                "reason": "primary_hold_window",
+                                "ts_ms": now_ms,
+                            },
+                        )
+
+            next_shadow_ids: set[str] = set()
+            for pair_id in ranked_pair_ids:
+                if len(next_shadow_ids) >= shadow_count:
+                    break
+                if pair_id in next_primary_ids:
+                    continue
+                next_shadow_ids.add(pair_id)
+            tracked = [
+                opportunity
+                for opportunity in tracked
+                if opportunity.pair_id in next_primary_ids
+                or opportunity.pair_id in next_shadow_ids
+            ]
+            for opportunity in tracked:
+                opportunity.class_ = (
+                    TrackedOpportunityClass.PRIMARY
+                    if opportunity.pair_id in next_primary_ids
+                    else TrackedOpportunityClass.SHADOW
+                )
         tracked_pair_ids = {opportunity.pair_id for opportunity in tracked}
         tracked_candidates = [
             candidate
@@ -6108,6 +6272,104 @@ class LiveRuntime:
             logger.exception("sidecar snapshot tick read failed")
             return None
 
+    def _ranked_candidate_stage_blocker_reason(
+        self,
+        candidate,
+        *,
+        fallback: str,
+    ) -> str:
+        """Return the recorded pre-selection reason for one ranked candidate.
+
+        Catalog, admission, and balance filters already produce a precise
+        per-pair sample.  The ranked loop must preserve that established
+        contract instead of flattening it into ``candidate_admission_blocked``.
+        """
+        pair_id = self._candidate_pair_id(candidate)
+        for attribute in (
+            "_last_candidate_catalog_filter_samples",
+            "_last_entry_admission_filter_samples",
+        ):
+            for sample in getattr(self, attribute, []) or []:
+                sample_pair_id = str(
+                    sample.get("candidate_pair_id")
+                    or sample.get("pair_id")
+                    or ""
+                )
+                reason = str(sample.get("reason") or "")
+                if sample_pair_id == pair_id and reason:
+                    return reason
+        for attribute in (
+            "_last_candidate_catalog_filter_blockers",
+            "_last_entry_admission_filter_blockers",
+        ):
+            blockers = Counter(getattr(self, attribute, Counter()) or {})
+            if blockers:
+                return str(
+                    max(
+                        blockers.items(),
+                        key=lambda item: (int(item[1]), str(item[0])),
+                    )[0]
+                )
+        return fallback
+
+    @staticmethod
+    def _record_ranked_candidate_blocker(
+        candidate_blockers: dict[str, str],
+        candidate_pair_id: str,
+        reason: str,
+        *,
+        selection_blockers: Counter[str] | None = None,
+        admission_blockers: Counter[str] | None = None,
+    ) -> str:
+        """Record the terminal per-pair reason in one ranked-flow contract."""
+        normalized_reason = str(reason or "candidate_final_revalidation_failed")
+        candidate_blockers[str(candidate_pair_id)] = normalized_reason
+        if selection_blockers is not None:
+            selection_blockers[normalized_reason] += 1
+        if admission_blockers is not None:
+            admission_blockers[normalized_reason] += 1
+        return normalized_reason
+
+    async def _prewarm_entry_bbo_scope(
+        self,
+        candidates: list,
+        now_ms: int,
+    ) -> bool:
+        """Bound ranked BBO prewarm so symbol support I/O cannot stall entry."""
+        if not candidates:
+            return True
+        try:
+            await asyncio.wait_for(
+                self._ensure_entry_bbo_active_for_candidates(candidates, now_ms),
+                timeout=0.100,
+            )
+            return True
+        except asyncio.TimeoutError:
+            reason = "entry_bbo_prewarm_activation_timeout"
+        except Exception as exc:
+            reason = "entry_bbo_prewarm_activation_failed"
+            self.journal.append(
+                "runtime.entry_bbo_prewarm_failed",
+                {
+                    "reason": reason,
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "candidate_count": len(candidates),
+                    "activation_budget_ms": 100,
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
+            return False
+        self.journal.append(
+            "runtime.entry_bbo_prewarm_failed",
+            {
+                "reason": reason,
+                "candidate_count": len(candidates),
+                "activation_budget_ms": 100,
+                "ts_ms": wall_clock_now_ms(),
+            },
+        )
+        return False
+
     async def _run_ranked_candidate_entry_flow(
         self,
         candidates: list,
@@ -6124,6 +6386,9 @@ class LiveRuntime:
         checked = 0
         dispatched = 0
         last_reason = "no_tradeable_candidate"
+        prewarm_candidate_count = 0
+        tracked_candidate_count = 0
+        bbo_prewarm_active = False
 
         # V1 starts the bounded local-L2 lifecycle in its prewarm window, but
         # does not turn that into an entry attempt until the narrower final
@@ -6133,7 +6398,10 @@ class LiveRuntime:
         # that let the full discovery frontier monopolize the L2 data plane.
         # Allocate the V1 primary/shadow scope once and only for candidates
         # that are actually eligible for the L2 prewarm lifecycle.
-        if self._entry_local_l2_effective_enabled():
+        if (
+            self._entry_local_l2_effective_enabled()
+            or self._entry_effective_readiness_provider_uses_ws_bbo()
+        ):
             now_ms = wall_clock_now_ms()
             prewarm_window_ms = max(
                 int(
@@ -6160,18 +6428,108 @@ class LiveRuntime:
                 ):
                     continue
                 prewarm_candidates.append(candidate)
+            prewarm_candidate_count = len(prewarm_candidates)
+            # This is the V1 Local-L2 lifecycle handoff: allocation alone is
+            # not ownership.  When Local-L2 is enabled, only selected primary
+            # opportunities own sessions before L2 warming; shadows remain
+            # warm pool candidates.  That gives every final primary an owner
+            # without making rank churn grow the session lifecycle.  BBO uses
+            # the same scoped candidates without Local-L2 sessions in BBO-only
+            # configurations.
+            tracked: list = []
+            tracked_candidates: list = []
+            if not self._entry_local_l2_effective_enabled():
+                # BBO-only scope reuse deliberately has no V1 Local-L2 owner
+                # state.  Do not let a previous Local-L2 pass leak its
+                # primary ids into a provider that does not consume them.
+                self._tracked_primary_pair_ids = set()
             if prewarm_candidates:
                 tracked, tracked_candidates = self._select_v1_entry_tracked_scope(
                     prewarm_candidates
                 )
-                await self._ensure_l2_active_for_candidates(
-                    tracked_candidates,
-                    now_ms,
-                    tracked_opportunities=tracked,
+                from lightfee.engine.entry_local_l2 import TrackedOpportunityClass
+
+                if self._entry_local_l2_effective_enabled():
+                    primary_opportunities = [
+                        opportunity
+                        for opportunity in tracked
+                        if opportunity.class_ == TrackedOpportunityClass.PRIMARY
+                    ]
+                    self._tracked_primary_pair_ids = {
+                        str(opportunity.pair_id)
+                        for opportunity in primary_opportunities
+                    }
+                    # V1 keeps session state only for primaries.  Shadows are
+                    # warmed in the Local-L2 pool without session ownership;
+                    # giving every shadow a session made the lifecycle grow
+                    # with rank churn and changed its owner.
+                    for opportunity in primary_opportunities:
+                        self.entry_l2_sessions.track_opportunity(opportunity, now_ms)
+                        self.entry_l2_sessions.mark_sticky_prewarm(
+                            opportunity.pair_id
+                        )
+                tracked_candidate_count = len(tracked_candidates)
+                if self._entry_effective_readiness_provider_uses_ws_bbo():
+                    # Use the same V1 primary/shadow frontier as Local-L2.
+                    # This is prewarm-only ownership: the final provider still
+                    # requires a fresh two-leg quote before it can allow entry.
+                    bbo_prewarm_active = await self._prewarm_entry_bbo_scope(
+                        tracked_candidates,
+                        now_ms,
+                    )
+                    self._append_runtime_diagnostic_event(
+                        "runtime.entry_bbo_prewarm_scope",
+                        {
+                            **self._entry_effective_readiness_provider_diagnostics(),
+                            "candidate_scope": "v1_primary_shadow",
+                            "evidence_role": "prewarm_only",
+                            "prewarm_candidate_count": prewarm_candidate_count,
+                            "tracked_candidate_count": tracked_candidate_count,
+                            "tracked_opportunity_count": len(tracked),
+                            "budgeted_key_count": len(
+                                self._entry_bbo_subscription_budgeted_keys
+                            ),
+                            "budget_excluded_key_count": len(
+                                self._entry_bbo_subscription_budget_excluded_keys
+                            ),
+                            "ts_ms": wall_clock_now_ms(),
+                        },
+                        now_ms=wall_clock_now_ms(),
+                        key_parts=(
+                            "v1_primary_shadow",
+                            tracked_candidate_count,
+                            len(self._entry_bbo_subscription_budgeted_keys),
+                            len(self._entry_bbo_subscription_budget_excluded_keys),
+                        ),
+                        interval_ms=30_000,
+                    )
+                if self._entry_local_l2_effective_enabled():
+                    await self._ensure_l2_active_for_candidates(
+                        tracked_candidates,
+                        now_ms,
+                        tracked_opportunities=tracked,
+                    )
+                    now_ms = wall_clock_now_ms()
+                    await self._sync_local_l2_data(now_ms, scan_promoted=True)
+                    self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
+            elif self._entry_local_l2_effective_enabled():
+                # No candidate remains inside V1's prewarm lifecycle, so no
+                # primary may retain entry ownership into the next pass.
+                self._tracked_primary_pair_ids = set()
+            if self._entry_local_l2_effective_enabled():
+                # V1 ``close_missing`` closes then removes sessions outside
+                # the active/sticky primary scope.  Do this even when the
+                # current prewarm window is empty so stale sessions cannot
+                # accumulate indefinitely.
+                self.entry_l2_sessions.close_missing(
+                    self._tracked_primary_pair_ids
                 )
-                now_ms = wall_clock_now_ms()
-                await self._sync_local_l2_data(now_ms, scan_promoted=True)
-                self._refresh_entry_l2_session_readiness(wall_clock_now_ms())
+                active_session_pair_ids = set(self.entry_l2_sessions.sessions)
+                self._entry_l2_last_leg_diagnostics = {
+                    key: value
+                    for key, value in self._entry_l2_last_leg_diagnostics.items()
+                    if key[0] in active_session_pair_ids
+                }
 
         for source_candidate in candidates:
             if remaining_slots <= 0 or not can_enter_new_positions(self.state):
@@ -6191,7 +6549,15 @@ class LiveRuntime:
                 stage="ranked_candidate",
             )
             if not candidate_rows:
-                last_reason = "candidate_admission_blocked"
+                last_reason = self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(source_candidate),
+                    self._ranked_candidate_stage_blocker_reason(
+                        source_candidate,
+                        fallback="candidate_admission_blocked",
+                    ),
+                    admission_blockers=admission_blockers,
+                )
                 continue
             candidate = candidate_rows[0]
 
@@ -6207,11 +6573,16 @@ class LiveRuntime:
                 now_ms,
             )
             if finalization_blocker:
-                selection_blockers[finalization_blocker] += 1
-                candidate_blockers[self._candidate_pair_id(candidate)] = (
-                    finalization_blocker
+                self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(candidate),
+                    finalization_blocker,
+                    selection_blockers=selection_blockers,
                 )
-                last_reason = "candidate_final_selection_blocked"
+                # This is a normal V1 timing decision, but it is still the
+                # actual no-entry reason for this candidate.  Do not hide it
+                # behind a generic final-selection label.
+                last_reason = str(finalization_blocker)
                 continue
 
             quote_task = asyncio.create_task(
@@ -6220,7 +6591,10 @@ class LiveRuntime:
                     snapshot=snapshot,
                     now_ms=wall_clock_now_ms(),
                     candidate_scope="ranked_candidate",
-                    activation_candidates=[candidate],
+                    # The V1 primary/shadow scope was already activated in
+                    # prewarm.  Do not reconcile the BBO stream set down to a
+                    # single final candidate and cold-start its peers again.
+                    activation_candidates=[] if bbo_prewarm_active else [candidate],
                 ),
                 name=f"entry-quote:{self._candidate_pair_id(candidate)}",
             )
@@ -6239,7 +6613,12 @@ class LiveRuntime:
                 return_exceptions=True,
             )
             if isinstance(quote_result, BaseException):
-                last_reason = "candidate_quote_revalidation_failed"
+                last_reason = self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(candidate),
+                    "candidate_quote_revalidation_failed",
+                    selection_blockers=selection_blockers,
+                )
                 self.journal.append(
                     "runtime.entry_candidate_revalidation_failed",
                     {
@@ -6251,7 +6630,12 @@ class LiveRuntime:
                 )
                 continue
             if isinstance(oi_result, BaseException):
-                last_reason = "candidate_open_interest_revalidation_failed"
+                last_reason = self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(candidate),
+                    "candidate_open_interest_revalidation_failed",
+                    selection_blockers=selection_blockers,
+                )
                 self.journal.append(
                     "runtime.entry_candidate_revalidation_failed",
                     {
@@ -6272,10 +6656,30 @@ class LiveRuntime:
                 budgets={},
                 publish_intervals={},
                 entry_quote_truth_overlay=quote_overlay,
-                record_result=False,
+                record_result=True,
             )
             if not candidate_rows:
-                last_reason = "candidate_market_evidence_unavailable"
+                final_snapshot_blockers = Counter(
+                    getattr(self, "_last_snapshot_freshness_filter_blockers", Counter())
+                )
+                if final_snapshot_blockers:
+                    selection_blockers.update(final_snapshot_blockers)
+                    blocker_reason = max(
+                        final_snapshot_blockers.items(),
+                        key=lambda item: (int(item[1]), str(item[0])),
+                    )[0]
+                    last_reason = self._record_ranked_candidate_blocker(
+                        candidate_blockers,
+                        self._candidate_pair_id(candidate),
+                        str(blocker_reason),
+                    )
+                else:
+                    last_reason = self._record_ranked_candidate_blocker(
+                        candidate_blockers,
+                        self._candidate_pair_id(candidate),
+                        "candidate_market_evidence_unavailable",
+                        selection_blockers=selection_blockers,
+                    )
                 continue
 
             market_quotes = self._entry_quote_truth_market_quotes(
@@ -6286,8 +6690,41 @@ class LiveRuntime:
                 candidate_rows,
                 market_quotes=market_quotes,
                 now_ms=wall_clock_now_ms(),
-                record_result=False,
+                record_result=True,
             )
+            if not candidate_rows:
+                final_reprice_blockers = Counter(
+                    {
+                        str(reason): int(count)
+                        for reason, count in dict(
+                            self.state.last_scan.get(
+                                "entry_reprice_blocker_counts",
+                                {},
+                            )
+                            or {}
+                        ).items()
+                        if int(count) > 0
+                    }
+                )
+                if final_reprice_blockers:
+                    selection_blockers.update(final_reprice_blockers)
+                    blocker_reason = max(
+                        final_reprice_blockers.items(),
+                        key=lambda item: (int(item[1]), str(item[0])),
+                    )[0]
+                    last_reason = self._record_ranked_candidate_blocker(
+                        candidate_blockers,
+                        self._candidate_pair_id(candidate),
+                        str(blocker_reason),
+                    )
+                else:
+                    last_reason = self._record_ranked_candidate_blocker(
+                        candidate_blockers,
+                        self._candidate_pair_id(candidate),
+                        "candidate_final_reprice_unavailable",
+                        selection_blockers=selection_blockers,
+                    )
+                continue
             finalists = self._select_entry_candidates(
                 candidate_rows,
                 now_ms=wall_clock_now_ms(),
@@ -6298,14 +6735,28 @@ class LiveRuntime:
                 admission_blocker_counts=admission_blockers,
             )
             if not finalists:
-                last_reason = "candidate_final_selection_blocked"
+                # Selection records the exact gate reason in the shared
+                # per-pair map (Local-L2, BBO lease, lifecycle, etc.).  Keep
+                # that contract result in the scan summary instead of
+                # collapsing it to a generic final-selection failure.
+                last_reason = str(
+                    candidate_blockers.get(
+                        self._candidate_pair_id(candidate),
+                        "candidate_final_selection_blocked",
+                    )
+                )
                 continue
             candidate = finalists[0]
             account_ready, global_recovery_block, account_reason = (
                 await self._entry_account_truth_dispatch_readiness(candidate)
             )
             if not account_ready:
-                last_reason = account_reason or "candidate_account_truth_unavailable"
+                last_reason = self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(candidate),
+                    account_reason or "candidate_account_truth_unavailable",
+                    selection_blockers=selection_blockers,
+                )
                 if global_recovery_block:
                     break
                 continue
@@ -6338,9 +6789,15 @@ class LiveRuntime:
                 self._invalidate_entry_account_truth_generation()
                 last_reason = "entries_dispatched"
             else:
-                last_reason = str(
-                    getattr(self, "_last_entry_dispatch_block_reason", "") or ""
-                ) or "entry_final_revalidation_failed"
+                last_reason = self._record_ranked_candidate_blocker(
+                    candidate_blockers,
+                    self._candidate_pair_id(candidate),
+                    str(
+                        getattr(self, "_last_entry_dispatch_block_reason", "")
+                        or ""
+                    ) or "entry_final_revalidation_failed",
+                    selection_blockers=selection_blockers,
+                )
             if len(self.state.pending_entries) > pending_before:
                 break
 
@@ -6349,6 +6806,10 @@ class LiveRuntime:
         self.state.last_scan["selected_candidate_count"] = dispatched
         self.state.last_scan["dispatched_candidate_count"] = dispatched
         self.state.last_scan["remaining_slots"] = remaining_slots
+        self.state.last_scan["entry_prewarm_candidate_count"] = prewarm_candidate_count
+        self.state.last_scan["entry_v1_tracked_candidate_count"] = tracked_candidate_count
+        self.state.last_scan["entry_bbo_prewarm_active"] = bbo_prewarm_active
+        self.state.last_scan["ranked_candidate_blockers"] = dict(candidate_blockers)
         if dispatched == 0:
             self.state.last_scan["no_entry_reason"] = last_reason
             self.journal.append(
@@ -6359,6 +6820,13 @@ class LiveRuntime:
                     "checked_candidate_count": checked,
                     "selection_blockers": dict(selection_blockers),
                     "admission_blockers": dict(admission_blockers),
+                    "candidate_blockers": [
+                        {"pair_id": pair_id, "reason": reason}
+                        for pair_id, reason in sorted(candidate_blockers.items())[:32]
+                    ],
+                    "prewarm_candidate_count": prewarm_candidate_count,
+                    "v1_tracked_candidate_count": tracked_candidate_count,
+                    "bbo_prewarm_active": bbo_prewarm_active,
                     "ts_ms": wall_clock_now_ms(),
                 },
             )
@@ -14877,101 +15345,6 @@ class LiveRuntime:
 
     def _has_pending_residual_pair(self, *args, **kwargs):
         return self.entry_gate_runtime._has_pending_residual_pair(*args, **kwargs)
-
-    def _apply_shadow_promotion_if_eligible(
-        self, tracked: list, now_ms: int,
-    ) -> None:
-        """V1: shadow_promotion swap — best shadow replaces worst primary.
-
-        Rejects promotion when primary is executing, shadow not ready,
-        score delta insufficient, or hold window not elapsed.
-        Logs primary_hold_blocked when score qualifies but hold blocks.
-        (execution_core/engine.rs:2643-2719)
-        """
-        if not tracked:
-            return
-
-        from lightfee.engine.entry_local_l2 import (
-            TrackedOpportunityClass,
-            primary_hold_window_allows_replacement,
-            shadow_promotion_is_eligible,
-        )
-
-        tracked_lookup = {t.pair_id: t for t in tracked}
-        primaries = [t for t in tracked if t.class_ == TrackedOpportunityClass.PRIMARY]
-        shadows = [t for t in tracked if t.class_ == TrackedOpportunityClass.SHADOW]
-
-        if not primaries or not shadows:
-            return
-
-        score_delta_bps = getattr(
-            self.config.strategy,
-            "shadow_promotion_score_delta_bps",
-            5.0,
-        )
-        primary_min_hold_ms = getattr(
-            self.config.strategy, "primary_min_hold_ms", 30_000,
-        )
-
-        best_shadow = max(shadows, key=lambda t: t.ranking_edge_bps)
-        worst_primary = min(primaries, key=lambda t: t.ranking_edge_bps)
-
-        primary_session = self.entry_l2_sessions.sessions.get(worst_primary.pair_id)
-        primary_assigned_at = (
-            primary_session.primary_assigned_at_ms if primary_session else 0
-        )
-
-        shadow_session = self.entry_l2_sessions.sessions.get(best_shadow.pair_id)
-        shadow_ready = (
-            shadow_session.state.value == "ready" if shadow_session else False
-        )
-        primary_executing = self._tracked_pair_is_executing(worst_primary.pair_id)
-
-        hold_allows = primary_hold_window_allows_replacement(
-            primary_assigned_at, now_ms, primary_min_hold_ms)
-
-        eligible = shadow_promotion_is_eligible(
-            primary=worst_primary,
-            shadow=best_shadow,
-            primary_assigned_at_ms=primary_assigned_at,
-            now_ms=now_ms,
-            primary_min_hold_ms=primary_min_hold_ms,
-            shadow_promotion_score_delta_bps=score_delta_bps,
-            primary_executing=primary_executing,
-            shadow_ready=shadow_ready,
-        )
-
-        if eligible:
-            if worst_primary.pair_id in self._tracked_primary_pair_ids:
-                self._tracked_primary_pair_ids.discard(worst_primary.pair_id)
-            self._tracked_primary_pair_ids.add(best_shadow.pair_id)
-            best_shadow.class_ = TrackedOpportunityClass.PRIMARY
-            worst_primary.class_ = TrackedOpportunityClass.SHADOW
-            if shadow_session:
-                shadow_session.shadow_promoted_at_ms = now_ms
-                if shadow_session.primary_assigned_at_ms <= 0:
-                    shadow_session.primary_assigned_at_ms = now_ms
-            self.journal.append(
-                "runtime.entry_local_l2_primary_changed",
-                {
-                    "promoted_pair_id": best_shadow.pair_id,
-                    "demoted_pair_id": worst_primary.pair_id,
-                    "reason": "shadow_promotion",
-                    "ts_ms": now_ms,
-                },
-            )
-        else:
-            score_delta = best_shadow.ranking_edge_bps - worst_primary.ranking_edge_bps
-            if score_delta >= score_delta_bps and not hold_allows:
-                self.journal.append(
-                    "runtime.entry_local_l2_shadow_blocked",
-                    {
-                        "shadow_pair_id": best_shadow.pair_id,
-                        "primary_pair_id": worst_primary.pair_id,
-                        "reason": "primary_hold_window",
-                        "ts_ms": now_ms,
-                    },
-                )
 
     def _tracked_pair_is_executing(self, pair_id: str) -> bool:
         """Check if a tracked pair has a pending entry currently executing.

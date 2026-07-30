@@ -95,13 +95,35 @@
 
 ---
 
-## C-R4: Shadow promotion guard → real promotion flow ✓ 已闭环
+## C-R4: Primary hold and shadow promotion → selector-owned V1 flow（CL-165 本地根修已验证）
 
-**修改点**:
-- `lightfee/engine/runtime.py`: `_apply_shadow_promotion_if_eligible()` — 在 `_refresh_entry_l2_session_readiness()` 后、`_select_entry_candidates()` 前插入 shadow promotion 逻辑
-- `lightfee/engine/runtime.py`: `_tracked_pair_is_executing()` — 检查 tracked pair 是否有正在执行的 pending entry
+The earlier description was stale: `_apply_shadow_promotion_if_eligible()` was
+not on the ranked-selector production path and required a shadow Local-L2
+session, which violates V1's shadow ownership model. It could not preserve
+primary ownership through rank churn.
 
-**生产路径**: `_select_and_dispatch_entries()` → `select_tracked_opportunities()` → `_sync_local_l2_data(scan_promoted=True)` → `_refresh_entry_l2_session_readiness()` → **新增**: `_apply_shadow_promotion_if_eligible(tracked, now_ms)` → best_shadow 替换 worst_primary，更新 `_tracked_primary_pair_ids`，journal 记录
+**修正后的实现**:
+- `lightfee/engine/runtime.py`: `_select_v1_entry_tracked_scope()` is the sole
+  ranked-frontier decision. It keeps an in-scope, non-transiently-failed
+  primary through V1's hold window, fills empty primary slots, and then
+  evaluates the best shadow against the worst primary using V1 execution,
+  hold, and score-delta rules.
+- `lightfee/engine/entry_local_l2.py`:
+  `local_l2_tracking_book_ready()` applies the same HOT/WARM, fresh,
+  uncrossed book contract directly to shadows without creating a session;
+  `primary_hold_window_allows_replacement()` follows V1 by allowing the
+  unassigned (`0`) initial-assignment case.
+- `lightfee/config/schema.py` and validation: two shadows, a 15-second hold,
+  and a 3.0-bps delta are explicit validated V1 defaults, rather than implicit
+  `getattr` fallbacks or a disabled shadow frontier.
+
+**生产路径**: ranked candidate flow preserves the previous primary set →
+`_select_v1_entry_tracked_scope()` makes the complete ownership decision →
+primaries receive Local-L2 session handoff and shadows receive only bounded
+warm-pool coverage → composed Local-L2 + WS-BBO readiness revalidates the
+selected candidate. This keeps all strict quote, Local-L2, OI, funding,
+account-truth, and final-window gates unchanged. Deployment and controlled
+live proof remain pending.
 
 ---
 

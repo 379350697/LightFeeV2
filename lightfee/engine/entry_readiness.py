@@ -537,6 +537,23 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         pair_id = self._runtime._candidate_pair_id(candidate)
         long_venue = str(getattr(candidate, "long_venue", ""))
         short_venue = str(getattr(candidate, "short_venue", ""))
+        # Subscription coverage is quote-readiness evidence, not a separate
+        # entry-gate policy.  Keeping it here means every caller of the
+        # provider receives the same budget/subscription verdict and evidence.
+        subscription_blocker = getattr(
+            self._runtime,
+            "_entry_ws_bbo_subscription_blocker",
+            None,
+        )
+        if callable(subscription_blocker):
+            reason, evidence = subscription_blocker(candidate)
+            if reason:
+                return EntryReadinessDecision.block(
+                    str(reason),
+                    symbol=symbol,
+                    pair_id=pair_id,
+                    evidence=dict(evidence or {}),
+                )
         cache = getattr(self._runtime, "ws_bbo_cache", None)
         long_quote = cache.get_quote(long_venue, symbol) if cache is not None else None
         short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
@@ -751,6 +768,93 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         return data_plane.stream_state(venue, symbol)
 
 
+class OnDemandEntryReadinessProvider(WsBboQuoteLeaseEntryReadinessProvider):
+    """One composed final-entry contract for Local-L2 and WS-BBO evidence.
+
+    V1's local-book lifecycle determines whether an executable pair is ready;
+    the V2 WS BBO lease independently confirms fresh top-of-book evidence.  A
+    previous factory selected only the latter, while dispatch still enforced
+    Local-L2.  That split let a candidate appear selectable and fail later at
+    dispatch.  The composed provider preserves both fail-closed checks and
+    gives selection one canonical decision/evidence payload.
+    """
+
+    # ``provider_name`` identifies the persisted quote-lease implementation;
+    # decisions expose ``contract_provider`` as their owner so callers cannot
+    # mistake one component for the whole entry policy.
+    provider_name = WsBboQuoteLeaseEntryReadinessProvider.provider_name
+    contract_provider = ENTRY_READINESS_PROVIDER_ON_DEMAND
+
+    def __init__(self, runtime: Any) -> None:
+        super().__init__(runtime)
+        self._local_l2 = LocalL2EntryReadinessProvider(runtime)
+
+    def decide(
+        self,
+        candidate: Any,
+        now_ms: int,
+        *,
+        market_quotes: Any = None,
+    ) -> EntryReadinessDecision:
+        symbol = str(getattr(candidate, "symbol", ""))
+        pair_id = self._runtime._candidate_pair_id(candidate)
+        components: dict[str, dict[str, Any]] = {}
+        local_l2_enabled = getattr(
+            self._runtime,
+            "_entry_local_l2_effective_enabled",
+            None,
+        )
+        if callable(local_l2_enabled) and local_l2_enabled():
+            local_l2 = self._local_l2.decide(candidate, now_ms)
+            components["local_l2"] = dict(local_l2.evidence or {})
+            if not local_l2.allowed:
+                return EntryReadinessDecision.block(
+                    local_l2.reason or "entry_local_l2_not_ready",
+                    symbol=symbol,
+                    pair_id=pair_id,
+                    evidence={
+                        "provider": self.contract_provider,
+                        "contract_provider": self.contract_provider,
+                        "quote_lease_provider": self.provider_name,
+                        "blocking_component": "local_l2",
+                        "components": components,
+                    },
+                )
+
+        ws_bbo = super().decide(
+            candidate,
+            now_ms,
+            market_quotes=market_quotes,
+        )
+        components["ws_bbo_quote_lease"] = dict(ws_bbo.evidence or {})
+        # Preserve the established quote-evidence fields at the top level for
+        # event consumers, while adding the composed-contract provenance.
+        evidence = dict(ws_bbo.evidence or {})
+        evidence.update(
+            {
+                "provider": self.contract_provider,
+                "contract_provider": self.contract_provider,
+                "quote_lease_provider": self.provider_name,
+                "blocking_component": (
+                    "" if ws_bbo.allowed else "ws_bbo_quote_lease"
+                ),
+                "components": components,
+            }
+        )
+        if not ws_bbo.allowed:
+            return EntryReadinessDecision.block(
+                ws_bbo.reason or "entry_readiness_provider_denied",
+                symbol=symbol,
+                pair_id=pair_id,
+                evidence=evidence,
+            )
+        return EntryReadinessDecision.allow(
+            symbol=symbol,
+            pair_id=pair_id,
+            evidence=evidence,
+        )
+
+
 def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
     resolution = resolve_entry_readiness_provider(
         runtime.config.strategy.entry_readiness_provider,
@@ -764,7 +868,7 @@ def build_entry_readiness_provider(runtime: Any) -> EntryReadinessProvider:
         ),
     )
     if resolution.effective == ENTRY_READINESS_PROVIDER_ON_DEMAND:
-        return WsBboQuoteLeaseEntryReadinessProvider(runtime)
+        return OnDemandEntryReadinessProvider(runtime)
     raise ValueError(
         "unknown entry_readiness_provider "
         f"{resolution.raw!r}; expected one of {list(ENTRY_READINESS_PROVIDERS)}"

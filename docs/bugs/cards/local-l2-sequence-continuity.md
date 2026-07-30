@@ -100,3 +100,32 @@ The final entry gate preserves `missing_book`, true stale-book, sequence-gap,
 and true clock-skew causes.  The runtime obtains time after awaited L2 work to
 avoid falsely classifying scheduling delay as clock skew.  CL-163 is local
 verified; deployment pending.
+
+## CL-165 Ownership Boundary
+
+V1 primary/shadow selection is not sufficient by itself: when Local-L2 is
+enabled, each selected **primary** must be handed into
+`EntryLocalL2SessionRuntime` and the primary pair set before Local-L2 warming.
+Shadows stay in the bounded warm pool without session ownership. Every pass
+applies V1 `close_missing(active_primaries)` and retains at most 64 sticky
+pairs through brief rank churn. A fresh primary without this handoff is an
+implementation defect, not a reason to weaken Local-L2; after the handoff, an
+unavailable book correctly reports `entry_local_l2_waiting_for_dual_ready`.
+
+The ownership decision itself is stateful and lives in the ranked-scope
+selector: an in-scope primary is retained for V1's configured hold window,
+then the best shadow can replace the worst eligible primary only when its
+direct Local-L2 HOT/WARM book evidence is fresh and valid and its score clears
+the configured delta. Shadows must use the same book-readiness predicate as a
+primary, but must not own a Local-L2 session. An unassigned timestamp is an
+initial-assignment condition, not a permanent promotion block. The policy is
+explicit in `StrategyConfig` (two shadows, 15 seconds, 3.0 bps by V1 default)
+and rejects invalid values during config validation.
+
+The on-demand readiness decision consumes this Local-L2 lifecycle together
+with WS-BBO lease/subscription evidence. BBO activation is scoped to the same
+bounded V1 primary+shadow frontier, capped at 100 ms, and is not re-reconciled
+to one final candidate after successful prewarm. A prewarm timeout is explicit
+and falls back to the existing bounded final activation. Sequence, stale-book,
+missing-book, and clock-skew rules remain fail-closed. CL-165 is local
+verified; deployment and controlled live proof remain pending.

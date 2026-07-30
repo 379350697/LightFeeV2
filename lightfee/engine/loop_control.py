@@ -12,6 +12,7 @@ from typing import Any, Optional
 from lightfee.config.schema import AppConfig
 from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
+    close_reconciliation_current_truth_status,
     close_reconciliation_exchange_truth_clean,
 )
 from lightfee.engine.state import EngineState, normalize_pending_close_reconciliations
@@ -129,8 +130,10 @@ def _pending_close_reconciliation_summary(raw: Any) -> dict[str, Any]:
             continue
         contract = classify_close_reconciliation_state(
             item,
-            current_exchange_truth_clean=close_reconciliation_exchange_truth_clean(
-                item
+            current_exchange_truth_clean=(
+                True
+                if close_reconciliation_exchange_truth_clean(item)
+                else close_reconciliation_current_truth_status(item, None)
             ),
         )
         state = str(contract.get("state") or "")

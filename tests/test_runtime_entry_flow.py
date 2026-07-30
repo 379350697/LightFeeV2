@@ -2065,6 +2065,7 @@ class TestPlannerDispatchIntegration:
 
         l2_activation_calls: list[tuple[list[str], int, int]] = []
         l2_sync_calls: list[int] = []
+        bbo_activation_calls: list[tuple[list[str], set[str], bool]] = []
         quote_calls: list[str] = []
         oi_calls: list[str] = []
 
@@ -2080,6 +2081,18 @@ class TestPlannerDispatchIntegration:
         async def sync_l2(now_ms, *, scan_promoted=False):
             assert scan_promoted is True
             l2_sync_calls.append(now_ms)
+
+        async def ensure_bbo(candidates, now_ms):
+            bbo_activation_calls.append(
+                (
+                    [row.symbol for row in candidates],
+                    set(runtime._tracked_primary_pair_ids),
+                    runtime.entry_l2_sessions.sessions.get(
+                        runtime._candidate_pair_id(candidate)
+                    )
+                    is not None,
+                )
+            )
 
         async def quote_truth(candidates, **_kwargs):
             quote_calls.extend(row.symbol for row in candidates)
@@ -2107,6 +2120,11 @@ class TestPlannerDispatchIntegration:
         )
         monkeypatch.setattr(runtime, "_ensure_l2_active_for_candidates", ensure_l2)
         monkeypatch.setattr(runtime, "_sync_local_l2_data", sync_l2)
+        monkeypatch.setattr(
+            runtime,
+            "_ensure_entry_bbo_active_for_candidates",
+            ensure_bbo,
+        )
         monkeypatch.setattr(
             runtime,
             "_refresh_entry_l2_session_readiness",
@@ -2146,11 +2164,14 @@ class TestPlannerDispatchIntegration:
 
         assert l2_activation_calls == [(["BTCUSDT"], 10_000, 1)]
         assert l2_sync_calls == [17_000]
+        assert bbo_activation_calls == [
+            (["BTCUSDT"], {runtime._candidate_pair_id(candidate)}, True)
+        ]
         assert clock_calls[:3] == [10_000, 17_000, 17_000]
         assert quote_calls == []
         assert oi_calls == []
         assert runtime.state.last_scan["no_entry_reason"] == (
-            "candidate_final_selection_blocked"
+            "entry_waiting_for_finalization_window_too_early"
         )
         no_entry = [
             row["payload"]
@@ -2160,6 +2181,248 @@ class TestPlannerDispatchIntegration:
         assert no_entry[-1]["selection_blockers"] == {
             "entry_waiting_for_finalization_window_too_early": 1
         }
+
+    @pytest.mark.asyncio
+    async def test_ranked_final_flow_keeps_prewarmed_bbo_scope_and_exact_blocker(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        """A final candidate must not shrink the V1 warm scope or erase cause."""
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_window_secs = 300
+        config.strategy.min_scan_minutes_before_funding = 3
+        config.strategy.entry_local_l2_prewarm_window_secs = 900
+        config.strategy.entry_local_l2_primary_count = 2
+        config.strategy.shadow_entry_opportunity_count = 0
+        config.strategy.max_concurrent_positions = 2
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.last_scan = {}
+        first = self._candidate("BTCUSDT")
+        second = self._candidate("ETHUSDT")
+        first.first_funding_timestamp_ms = 305_000
+        second.first_funding_timestamp_ms = 305_000
+
+        bbo_scopes: list[list[str]] = []
+        final_activation_scopes: list[list[str] | None] = []
+
+        async def ensure_bbo(candidates, _now_ms):
+            bbo_scopes.append([candidate.symbol for candidate in candidates])
+
+        async def quote_truth(candidates, **kwargs):
+            activation = kwargs.get("activation_candidates")
+            final_activation_scopes.append(
+                None if activation is None else [candidate.symbol for candidate in activation]
+            )
+            return {}, {"resolved_count": len(candidates)}
+
+        async def refresh_oi(candidates, **_kwargs):
+            return {"resolved_count": len(candidates)}
+
+        async def passthrough(candidates, **_kwargs):
+            return list(candidates)
+
+        def blocked_by_final_liquidity(candidates, **_kwargs):
+            runtime._last_snapshot_freshness_filter_blockers = Counter(
+                {"perp_liquidity_stale_blocking": len(candidates)}
+            )
+            return []
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 10_000)
+        monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", ensure_bbo)
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_supported_by_venue_catalog",
+            passthrough,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_admission",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_balance_admission",
+            passthrough,
+        )
+        monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", quote_truth)
+        monkeypatch.setattr(
+            runtime,
+            "_refresh_entry_candidate_open_interest_evidence",
+            refresh_oi,
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_snapshot_freshness",
+            blocked_by_final_liquidity,
+        )
+
+        await runtime._run_ranked_candidate_entry_flow(
+            [first, second],
+            snapshot=SimpleNamespace(quotes={}),
+            price_hints={},
+        )
+
+        assert bbo_scopes == [["BTCUSDT", "ETHUSDT"]]
+        assert runtime.entry_l2_sessions.sessions == {}
+        # Final revalidation consumes the already-warmed V1 frontier rather
+        # than re-reconciling the data plane down to one candidate per loop.
+        assert final_activation_scopes == [[], []]
+        assert runtime.state.last_scan["no_entry_reason"] == (
+            "perp_liquidity_stale_blocking"
+        )
+        assert runtime.state.last_scan["ranked_candidate_blockers"] == {
+            runtime._candidate_pair_id(first): "perp_liquidity_stale_blocking",
+            runtime._candidate_pair_id(second): "perp_liquidity_stale_blocking",
+        }
+        no_entry = [
+            row["payload"]
+            for row in runtime.journal.read_all()
+            if row["kind"] == "scan.no_entry_ranked_candidates"
+        ][-1]
+        assert no_entry["reason"] == "perp_liquidity_stale_blocking"
+        assert no_entry["selection_blockers"] == {
+            "perp_liquidity_stale_blocking": 2
+        }
+
+    @pytest.mark.asyncio
+    async def test_ranked_bbo_prewarm_timeout_falls_back_to_bounded_final_activation(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        """Slow symbol-support activation cannot consume the ranked loop."""
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_window_secs = 300
+        config.strategy.min_scan_minutes_before_funding = 0
+        config.strategy.entry_local_l2_prewarm_window_secs = 900
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.last_scan = {}
+        candidate = self._candidate("BTCUSDT")
+        candidate.first_funding_timestamp_ms = 305_000
+
+        activation_calls: list[list[str]] = []
+        final_activation_scopes: list[list[str] | None] = []
+
+        async def slow_activation(candidates, _now_ms):
+            activation_calls.append([row.symbol for row in candidates])
+            await asyncio.Event().wait()
+
+        async def passthrough(candidates, **_kwargs):
+            return list(candidates)
+
+        async def quote_truth(candidates, **kwargs):
+            activation = kwargs.get("activation_candidates")
+            final_activation_scopes.append(
+                None if activation is None else [row.symbol for row in activation]
+            )
+            return {}, {"resolved_count": len(candidates)}
+
+        async def refresh_oi(candidates, **_kwargs):
+            return {"resolved_count": len(candidates)}
+
+        def block_final_evidence(_candidates, **_kwargs):
+            runtime._last_snapshot_freshness_filter_blockers = Counter(
+                {"perp_liquidity_stale_blocking": 1}
+            )
+            return []
+
+        monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 10_000)
+        monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", slow_activation)
+        monkeypatch.setattr(runtime, "_filter_candidates_supported_by_venue_catalog", passthrough)
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_by_entry_admission",
+            lambda candidates, **_kwargs: list(candidates),
+        )
+        monkeypatch.setattr(runtime, "_filter_candidates_by_entry_balance_admission", passthrough)
+        monkeypatch.setattr(runtime, "_entry_quote_revalidate_for_candidates", quote_truth)
+        monkeypatch.setattr(runtime, "_refresh_entry_candidate_open_interest_evidence", refresh_oi)
+        monkeypatch.setattr(runtime, "_filter_candidates_by_snapshot_freshness", block_final_evidence)
+
+        await runtime._run_ranked_candidate_entry_flow(
+            [candidate],
+            snapshot=SimpleNamespace(quotes={}),
+            price_hints={},
+        )
+
+        assert activation_calls == [["BTCUSDT"]]
+        assert final_activation_scopes == [["BTCUSDT"]]
+        assert runtime.state.last_scan["entry_bbo_prewarm_active"] is False
+        failure = [
+            row["payload"]
+            for row in runtime.journal.read_all()
+            if row["kind"] == "runtime.entry_bbo_prewarm_failed"
+        ][-1]
+        assert failure["reason"] == "entry_bbo_prewarm_activation_timeout"
+        assert failure["activation_budget_ms"] == 100
+
+    @pytest.mark.asyncio
+    async def test_ranked_catalog_rejection_preserves_pair_specific_reason(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        """A catalog failure must not be flattened to generic admission."""
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.last_scan = {}
+        candidate = self._candidate("DELISTEDUSDT")
+
+        async def catalog_reject(rows):
+            assert rows == [candidate]
+            runtime._last_candidate_catalog_filter_blockers = Counter(
+                {"unsupported_symbol": 1}
+            )
+            runtime._last_candidate_catalog_filter_samples = [
+                {
+                    "candidate_pair_id": runtime._candidate_pair_id(candidate),
+                    "reason": "unsupported_symbol",
+                }
+            ]
+            return []
+
+        monkeypatch.setattr(
+            runtime,
+            "_filter_candidates_supported_by_venue_catalog",
+            catalog_reject,
+        )
+
+        await runtime._run_ranked_candidate_entry_flow(
+            [candidate],
+            snapshot=SimpleNamespace(quotes={}),
+            price_hints={},
+        )
+
+        pair_id = runtime._candidate_pair_id(candidate)
+        assert runtime.state.last_scan["no_entry_reason"] == "unsupported_symbol"
+        assert runtime.state.last_scan["ranked_candidate_blockers"] == {
+            pair_id: "unsupported_symbol"
+        }
+        no_entry = [
+            row["payload"]
+            for row in runtime.journal.read_all()
+            if row["kind"] == "scan.no_entry_ranked_candidates"
+        ][-1]
+        assert no_entry["admission_blockers"] == {"unsupported_symbol": 1}
+        assert no_entry["candidate_blockers"] == [
+            {"pair_id": pair_id, "reason": "unsupported_symbol"}
+        ]
 
     def test_local_l2_missing_book_preserves_final_rejection_reason(
         self,
@@ -3488,7 +3751,7 @@ class TestPlannerDispatchIntegration:
     ):
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
@@ -3548,7 +3811,7 @@ class TestPlannerDispatchIntegration:
     async def test_fresh_bbo_allows_post_only_maker_submit(self, config, tmp_journal):
         from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_local_l2_book_stale_after_ms = 1000
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
@@ -3740,7 +4003,10 @@ class TestPlannerDispatchIntegration:
         """Sizing evidence may never survive a weaker post-set confirmation."""
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        # This fixture isolates post-sizing leverage confirmation.  Local-L2
+        # readiness is exercised by the V1 lifecycle and composed-provider
+        # tests; it is not the subject of this final-dispatch test.
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_local_l2_book_stale_after_ms = 1_000
         quantity_metadata = {
             "min_notional": 10.0,
@@ -4759,7 +5025,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         runtime = LiveRuntime(config)
@@ -4810,7 +5076,7 @@ class TestPlannerDispatchIntegration:
 
         config.runtime.mode = "live"
         config.strategy.funding_new_entries_enabled = True
-        config.strategy.local_l2_enabled = True
+        config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
         config.strategy.entry_final_gate_max_skew_ms = 100
@@ -5097,6 +5363,7 @@ class TestPlannerDispatchIntegration:
         runtime.journal = tmp_journal
         runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
         candidate = self._candidate()
+        candidate.first_funding_timestamp_ms = 305_000
         candidate.entry_maker_leg = "long"
         candidate.entry_target_quantity = 1.0
         candidate.entry_max_executable_quantity = 1.0
@@ -5139,6 +5406,22 @@ class TestPlannerDispatchIntegration:
         short_book.bids = [PriceLevel(price=102.0, quantity=0.001)]
         short_book.asks = [PriceLevel(price=103.0, quantity=1.0)]
         short_book.observed_at_ms = 5000
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+
+        tracked = TrackedOpportunity(
+            pair_id=runtime._candidate_pair_id(candidate),
+            symbol=candidate.symbol,
+            long_venue=candidate.long_venue,
+            short_venue=candidate.short_venue,
+            ranking_edge_bps=candidate.ranking_edge_bps,
+            class_=TrackedOpportunityClass.PRIMARY,
+        )
+        runtime._tracked_primary_pair_ids = {tracked.pair_id}
+        runtime.entry_l2_sessions.track_opportunity(tracked, 5000)
+        runtime._refresh_entry_l2_session_readiness(5000)
         readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
         assert readiness.allowed
 

@@ -258,8 +258,10 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
         if record["kind"] == "runtime.entry_quote_revalidate_failed"
     ]
     assert quote_blocks
-    assert quote_blocks[-1]["payload"]["reason"] == "last_good_sidecar"
-    assert quote_blocks[-1]["payload"]["source"] == "entry_quote_truth"
+    assert quote_blocks[-1]["payload"]["reason"] == (
+        "last_good_sidecar_revalidate_required"
+    )
+    assert quote_blocks[-1]["payload"]["source"] == "sidecar_quote"
 
 
 @pytest.mark.asyncio
@@ -322,7 +324,9 @@ async def test_degraded_other_symbol_does_not_reject_selected_candidate(
         if record["kind"] == "scan.no_entry_ranked_candidates"
     ]
     assert diagnostics
-    assert diagnostics[0]["payload"]["reason"] == "candidate_final_selection_blocked"
+    assert diagnostics[0]["payload"]["reason"] == (
+        "entry_ws_bbo_quote_lease_missing_quote"
+    )
 
 
 @pytest.mark.asyncio
@@ -377,6 +381,15 @@ async def test_degraded_selected_required_liquidity_rejects_candidate_and_enters
     assert mon_scope["block_reason"] == "perp_liquidity_stale_blocking"
 
     no_entry = _payload(records, "scan.no_entry_ranked_candidates")
-    assert no_entry["reason"] == "candidate_market_evidence_unavailable"
+    # Final entry diagnostics retain the contract reason from the failing
+    # market-evidence domain; they must not collapse it into a generic
+    # "unavailable" bucket after the root cause was already established.
+    assert no_entry["reason"] == "perp_liquidity_stale_blocking"
+    assert no_entry["candidate_blockers"] == [
+        {
+            "pair_id": "monusdt:okx->bybit",
+            "reason": "perp_liquidity_stale_blocking",
+        }
+    ]
     assert no_entry["checked_candidate_count"] == 1
     assert runtime.entry_executor.contexts == []

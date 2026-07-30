@@ -15,6 +15,7 @@ from lightfee.core.domain import AccountBalanceSnapshot, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
+    close_reconciliation_current_truth_status,
     close_reconciliation_exchange_truth_clean,
     close_reconciliation_exchange_truth_mentions_scope,
     close_reconciliation_legacy_terminal_receipt,
@@ -1296,19 +1297,17 @@ class EntryGateRuntime:
                     )
                 contract = classify_close_reconciliation_state(
                     rec,
-                    current_exchange_truth_clean=(
-                        close_reconciliation_exchange_truth_clean(
-                            rec,
-                            current_exchange_truth=current_truth,
-                        )
+                    current_exchange_truth_clean=close_reconciliation_current_truth_status(
+                        rec,
+                        current_truth,
                     ),
                 )
                 if contract.get("blocks_entry") is False:
-                    rec["archived"] = True
-                    rec["archive_reason"] = str(contract.get("state") or "")
-                    rec["business_contract_action"] = str(
-                        contract.get("state") or ""
-                    )
+                    # Admission consumes the shared contract but must not
+                    # transition durable close work.  CloseRuntime owns the
+                    # journalled accounting retry/retention/archive lifecycle;
+                    # otherwise an entry check could silently skip the seven-
+                    # day accounting backfill queue.
                     continue
                 return False, "pending_close_reconciliation_conflict"
         return True, ""
@@ -2961,19 +2960,15 @@ class EntryGateRuntime:
                     else None
                 )
             if not blocker:
-                blocker, readiness_evidence = (
-                    self._entry_ws_bbo_subscription_blocker(candidate)
+                readiness = self.ctx.entry_readiness_provider.decide(
+                    candidate,
+                    now_ms,
+                    market_quotes=market_quotes,
                 )
-                if not blocker:
-                    readiness = self.ctx.entry_readiness_provider.decide(
-                        candidate,
-                        now_ms,
-                        market_quotes=market_quotes,
-                    )
-                    readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
-                    blocker = None if readiness.allowed else (
-                        readiness.reason or "entry_readiness_provider_denied"
-                    )
+                readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
+                blocker = None if readiness.allowed else (
+                    readiness.reason or "entry_readiness_provider_denied"
+                )
             if blocker:
                 blocker_str = str(blocker)
                 ws_bbo_blocker = blocker_str.startswith("entry_ws_bbo_quote_lease_")
@@ -3015,7 +3010,28 @@ class EntryGateRuntime:
                                 "blocker_family": "exchange_admission",
                             })
                         elif ws_bbo_blocker:
-                            readiness_evidence.setdefault("provider", "ws_bbo_quote_lease")
+                            # The composed on-demand contract owns the entry
+                            # decision; WS-BBO remains the evidence component.
+                            # Keep both identities explicit instead of
+                            # overwriting the contract owner in diagnostics.
+                            provider_name = str(
+                                readiness_evidence.get("contract_provider")
+                                or self._entry_readiness_provider_name()
+                            )
+                            quote_lease_provider = str(
+                                readiness_evidence.get("quote_lease_provider")
+                                or readiness_evidence.get("provider")
+                                or "ws_bbo_quote_lease"
+                            )
+                            readiness_evidence["provider"] = provider_name
+                            readiness_evidence.setdefault(
+                                "contract_provider",
+                                provider_name,
+                            )
+                            readiness_evidence.setdefault(
+                                "quote_lease_provider",
+                                quote_lease_provider,
+                            )
                             readiness_evidence.setdefault("source", "ws_bbo_quote_lease")
                             domain = (
                                 "ws_bbo_subscription"
@@ -3031,7 +3047,8 @@ class EntryGateRuntime:
                                 self._ws_bbo_selection_blocker_family(blocker_str),
                             )
                             diagnostic_payload.update({
-                                "provider": "ws_bbo_quote_lease",
+                                "provider": provider_name,
+                                "quote_lease_provider": quote_lease_provider,
                                 "source": "ws_bbo_quote_lease",
                                 "domain": readiness_evidence["domain"],
                                 "blocker_family": readiness_evidence["blocker_family"],

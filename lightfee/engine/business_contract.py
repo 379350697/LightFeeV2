@@ -462,9 +462,15 @@ def close_reconciliation_evidence_contract(
 def classify_close_reconciliation_state(
     reconciliation: dict[str, Any] | None,
     *,
-    current_exchange_truth_clean: bool,
+    current_exchange_truth_clean: bool | None,
 ) -> dict[str, Any]:
-    """Classify pending-close reconciliation work with the shared risk contract."""
+    """Classify pending-close reconciliation work with the shared risk contract.
+
+    ``None`` means that no *current, scoped* exchange truth was supplied.  It
+    is materially different from ``False``: the latter is a current dirty or
+    unavailable probe for this pair and must fail closed, while the former
+    must not revive a durable terminal accounting-only row into trading work.
+    """
     item = normalize_close_reconciliation_record(reconciliation)
     marker = str(
         item.get("close_reconciliation_state")
@@ -513,7 +519,7 @@ def classify_close_reconciliation_state(
             "reason": reason or "catalog_diagnostic",
         }
 
-    if has_accounting_gap and bool(current_exchange_truth_clean):
+    if has_accounting_gap and current_exchange_truth_clean is True:
         return {
             **base,
             "state": "terminal_flat_accounting_gap",
@@ -522,16 +528,24 @@ def classify_close_reconciliation_state(
             "reason": reason or "terminal_flat_accounting_gap",
         }
 
-    if has_accounting_gap and not current_exchange_truth_clean:
+    if (
+        has_accounting_gap
+        and current_exchange_truth_clean is None
+        and marker == "terminal_flat_accounting_gap"
+    ):
+        # A terminal accounting row was produced only after close truth had
+        # been established.  Do not turn it back into exposure work solely
+        # because an observer has no new scoped probe.  It remains in the
+        # low-frequency accounting queue rather than being archived early.
         return {
             **base,
-            "state": "truth_unavailable",
-            "blocks_entry": True,
+            "state": "terminal_flat_accounting_gap",
+            "blocks_entry": False,
             "archive_reconciliation": False,
-            "reason": reason or "exchange_truth_not_clean",
+            "reason": reason or "terminal_flat_accounting_gap",
         }
 
-    if marker == "terminal_flat_accounting_gap":
+    if has_accounting_gap and current_exchange_truth_clean is not True:
         return {
             **base,
             "state": "truth_unavailable",
@@ -541,6 +555,31 @@ def classify_close_reconciliation_state(
         }
 
     return base
+
+
+def _has_legacy_terminal_flat_backfill_receipt(item: dict[str, Any]) -> bool:
+    """Identify the sole pre-marker receipt shape eligible for migration.
+
+    V1-compatible passive-close rows written before the terminal accounting
+    marker contain a durable final-gate receipt in ``original_payload``.  The
+    aggregate fields alone are not enough: only the named final-gate source is
+    a close-terminal proof.  In particular, this must not promote a generic
+    account snapshot, a recovery response, or an arbitrary historical payload
+    into a non-blocking accounting record.
+    """
+    original_payload = item.get("original_payload")
+    if not isinstance(original_payload, dict):
+        return False
+    receipt = original_payload.get("exchange_truth")
+    if not isinstance(receipt, dict):
+        return False
+    return (
+        receipt.get("truth_available") is True
+        and receipt.get("positions_flat") is True
+        and receipt.get("open_orders_flat") is True
+        and str(receipt.get("source") or "")
+        == "passive_close_final_exchange_truth_gate"
+    )
 
 
 def normalize_close_reconciliation_record(
@@ -565,6 +604,7 @@ def normalize_close_reconciliation_record(
     if not (
         item.get("accounting_only_backfill") is True
         or marker == "terminal_flat_accounting_gap"
+        or _has_legacy_terminal_flat_backfill_receipt(item)
     ):
         return item
     item["pending_backfill"] = True
@@ -1023,6 +1063,16 @@ def _close_reconciliation_truth_covers_scope(
     reconciliation: dict[str, Any],
 ) -> bool:
     symbol, venues = _close_reconciliation_scope(reconciliation)
+    # Recovery-ledger truth carries ``positions`` / ``open_orders`` plus the
+    # per-venue probe evidence.  Receipt normalization also adds aggregate
+    # ``positions_flat`` flags, which would otherwise make this look like the
+    # older passive-close shape and incorrectly reject a valid recovery probe.
+    if _recovery_ledger_flat_truth_covers_scope(
+        truth,
+        symbol=symbol,
+        venues=venues,
+    ):
+        return True
     if passive_close_has_terminal_truth({"exchange_truth": truth}):
         positions = truth.get("positions")
         open_order_truth = truth.get("open_order_truth")
@@ -1054,12 +1104,6 @@ def _close_reconciliation_truth_covers_scope(
             },
         ):
             return False
-        return True
-    if _recovery_ledger_flat_truth_covers_scope(
-        truth,
-        symbol=symbol,
-        venues=venues,
-    ):
         return True
     return _account_level_flat_truth_covers_scope(
         truth,
@@ -1171,6 +1215,32 @@ def close_reconciliation_exchange_truth_clean(
         reconciliation,
         current_exchange_truth=current_exchange_truth,
     ) is not None
+
+
+def close_reconciliation_current_truth_status(
+    reconciliation: dict[str, Any] | None,
+    current_exchange_truth: dict[str, Any] | None,
+) -> bool | None:
+    """Return clean, dirty, or unknown for the pair's current truth.
+
+    A global recovery response that does not cover this pair is ``None``;
+    treating it as ``False`` was the source of terminal accounting rows being
+    reclassified as entry blockers.  A scoped current response that is dirty,
+    incomplete, or failed is ``False`` and continues to fail closed.
+    """
+    if not isinstance(current_exchange_truth, dict):
+        return None
+    if close_reconciliation_exchange_truth_clean(
+        reconciliation,
+        current_exchange_truth=current_exchange_truth,
+    ):
+        return True
+    if close_reconciliation_exchange_truth_mentions_scope(
+        reconciliation,
+        current_exchange_truth,
+    ):
+        return False
+    return None
 
 
 def quote_rewarm_handoff_contract(

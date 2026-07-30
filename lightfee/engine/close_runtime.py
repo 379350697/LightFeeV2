@@ -17,6 +17,7 @@ from lightfee.core.domain import OrderFillProbeStatus, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
+    close_reconciliation_current_truth_status,
     close_reconciliation_exchange_truth,
     close_reconciliation_exchange_truth_clean,
     close_reconciliation_legacy_terminal_receipt,
@@ -1482,10 +1483,27 @@ class CloseRuntime:
         *,
         now_ms: int,
         state: str = "terminal_flat_accounting_gap",
+        retained_terminal_exchange_truth: dict[str, Any] | None = None,
     ) -> bool:
-        exchange_truth, truth_hash = self._close_reconciliation_archive_exchange_truth(
-            now_ms=now_ms
-        )
+        if retained_terminal_exchange_truth is None:
+            exchange_truth, truth_hash = (
+                self._close_reconciliation_archive_exchange_truth(now_ms=now_ms)
+            )
+        else:
+            # A terminal accounting-only record has already passed a scoped
+            # close truth gate.  Its seven-day retention receipt must not
+            # require an unrelated fresh all-account scan: terminal rows are
+            # deliberately excluded from that expensive recovery path.
+            if (
+                state != "terminal_flat_accounting_gap"
+                or reconciliation.get("accounting_only_backfill") is not True
+            ):
+                return False
+            exchange_truth = close_reconciliation_exchange_truth(
+                reconciliation,
+                current_exchange_truth=retained_terminal_exchange_truth,
+            )
+            truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
         if not isinstance(exchange_truth, dict) or not truth_hash:
             return False
 
@@ -1632,9 +1650,9 @@ class CloseRuntime:
             return False
         contract = classify_close_reconciliation_state(
             reconciliation,
-            current_exchange_truth_clean=close_reconciliation_exchange_truth_clean(
+            current_exchange_truth_clean=close_reconciliation_current_truth_status(
                 reconciliation,
-                current_exchange_truth=exchange_truth,
+                exchange_truth,
             ),
         )
         if contract.get("archive_reconciliation") is not True:
@@ -1705,14 +1723,24 @@ class CloseRuntime:
                     "blocking_trading": False,
                     "archive_reason": "terminal_flat_accounting_retention_elapsed",
                     "retention_until_ms": retention_until_ms,
+                    "exchange_truth_scope": "retained_terminal_pair",
                     "unresolved_statement_probe_candidates": candidates,
                 },
                 now_ms=now_ms,
                 state=state,
+                retained_terminal_exchange_truth=exchange_truth,
             )
-        archive_exchange_truth, truth_hash = (
-            self._close_reconciliation_archive_exchange_truth(now_ms=now_ms)
+        retained_terminal_accounting = (
+            reconciliation.get("accounting_only_backfill") is True
+            and state == "terminal_flat_accounting_gap"
         )
+        if retained_terminal_accounting:
+            archive_exchange_truth = exchange_truth
+            truth_hash = self._close_reconciliation_truth_hash(archive_exchange_truth)
+        else:
+            archive_exchange_truth, truth_hash = (
+                self._close_reconciliation_archive_exchange_truth(now_ms=now_ms)
+            )
         if not isinstance(archive_exchange_truth, dict) or not truth_hash:
             return False
         payload = {
@@ -1733,6 +1761,8 @@ class CloseRuntime:
             "archive_reconciliation": True,
             "exchange_truth_hash": truth_hash,
         }
+        if retained_terminal_accounting:
+            payload["exchange_truth_scope"] = "retained_terminal_pair"
         archive_appended, archive_key = self._append_pending_close_archive_event(
             payload,
             exchange_truth=archive_exchange_truth,
@@ -2420,11 +2450,9 @@ class CloseRuntime:
                     truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
                     contract = classify_close_reconciliation_state(
                         payload,
-                        current_exchange_truth_clean=(
-                            close_reconciliation_exchange_truth_clean(
-                                reconciliation,
-                                current_exchange_truth=exchange_truth,
-                            )
+                        current_exchange_truth_clean=close_reconciliation_current_truth_status(
+                            reconciliation,
+                            exchange_truth,
                         ),
                     )
                     self._annotate_terminal_flat_accounting_gap_payload(
@@ -2557,15 +2585,13 @@ class CloseRuntime:
                     if contract is None:
                         contract = classify_close_reconciliation_state(
                             reconciliation,
-                            current_exchange_truth_clean=(
-                                close_reconciliation_exchange_truth_clean(
-                                    reconciliation,
-                                    current_exchange_truth=getattr(
-                                        self.ctx,
-                                        "_last_recovery_exchange_truth",
-                                        None,
-                                    ),
-                                )
+                            current_exchange_truth_clean=close_reconciliation_current_truth_status(
+                                reconciliation,
+                                getattr(
+                                    self.ctx,
+                                    "_last_recovery_exchange_truth",
+                                    None,
+                                ),
                             ),
                         )
                     reconciliation["close_reconciliation_state"] = str(
@@ -2707,11 +2733,9 @@ class CloseRuntime:
                     truth_hash = self._close_reconciliation_truth_hash(exchange_truth)
                     contract = classify_close_reconciliation_state(
                         payload,
-                        current_exchange_truth_clean=(
-                            close_reconciliation_exchange_truth_clean(
-                                payload,
-                                current_exchange_truth=exchange_truth,
-                            )
+                        current_exchange_truth_clean=close_reconciliation_current_truth_status(
+                            reconciliation,
+                            exchange_truth,
                         ),
                     )
                     self._annotate_terminal_flat_accounting_gap_payload(
@@ -2955,9 +2979,13 @@ class CloseRuntime:
         state.set_pending_funding_settlement_reconciliations(
             [task for task in retained if task is not None]
         )
+        exchange_truth = await self._collect_terminal_account_truth_for_funding_receipt(
+            now_ms=int(now_ms)
+        )
         self._apply_pending_funding_settlement_worker_results(
             {"now_ms": int(now_ms), "due_tasks": due_tasks},
             reconciled,
+            exchange_truth,
         )
         self._retire_terminal_pending_funding_settlement_tasks(now_ms=now_ms)
 
@@ -3113,6 +3141,29 @@ class CloseRuntime:
 
         state.set_pending_funding_settlement_reconciliations(retained)
 
+    async def _collect_terminal_account_truth_for_funding_receipt(
+        self,
+        *,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        """Collect one fresh, scope-verifiable truth snapshot for a receipt.
+
+        Both the synchronous maintenance path and the detached live worker
+        use this helper.  Accounting must never gain a different terminal
+        proof merely because it ran on a different scheduler.
+        """
+        collector = getattr(self.ctx, "_collect_recovery_ledger_account_truth", None)
+        if not callable(collector):
+            return None
+        try:
+            exchange_truth = await asyncio.wait_for(
+                collector(int(now_ms)),
+                timeout=self._FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S,
+            )
+        except Exception:
+            return None
+        return _terminal_account_truth_for_funding_receipt(exchange_truth)
+
     async def _run_pending_funding_settlement_reconciliation_work(
         self,
         work: dict[str, Any],
@@ -3136,17 +3187,9 @@ class CloseRuntime:
         # A funding receipt is accounting evidence, not proof that both venue
         # legs and their open orders are flat.  Capture that proof separately,
         # after reconciliation and without ever delaying the close path.
-        collector = getattr(self.ctx, "_collect_recovery_ledger_account_truth", None)
-        if not callable(collector):
-            return reconciled, None
-        try:
-            exchange_truth = await asyncio.wait_for(
-                collector(int(work["now_ms"])),
-                timeout=self._FUNDING_SETTLEMENT_RECONCILIATION_TIMEOUT_S,
-            )
-        except Exception:
-            return reconciled, None
-        return reconciled, _terminal_account_truth_for_funding_receipt(exchange_truth)
+        return reconciled, await self._collect_terminal_account_truth_for_funding_receipt(
+            now_ms=int(work["now_ms"])
+        )
 
     @staticmethod
     def _funding_settlement_claim_keys_for_task(

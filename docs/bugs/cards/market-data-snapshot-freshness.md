@@ -218,6 +218,44 @@ credential, or full sidecar snapshot.  The telemetry explains slow evidence;
 it does not relax a quote TTL, OI floor, liquidity floor, sequence rule, or
 final BBO requirement.  CL-163 is local verified; deployment pending.
 
+### CL-165 Unified Entry Readiness and BBO Ownership
+
+The V1 primary+shadow scope is the bounded near-entry market-data frontier.
+When Local-L2 is enabled, runtime publishes the primary pair set and installs
+only those selected primaries in the Local-L2 session runtime before warming.
+Shadows remain warm-pool candidates, not session owners. Each pass applies
+V1-style `close_missing(active_primaries)` and keeps the bounded 64-pair sticky
+prewarm set, so rank churn does not create unbounded session state. BBO uses
+the same bounded frontier without creating Local-L2 sessions when Local-L2 is
+disabled. A selected primary therefore cannot pass one readiness path and
+first discover missing Local-L2 ownership at dispatch.
+
+For the configured on-demand path, one composed readiness decision evaluates
+Local-L2 first (when enabled) and then the WS-BBO lease, including
+subscription/budget coverage. The decision must retain `blocking_component`,
+`contract_provider`, `quote_lease_provider`, and bounded per-component
+evidence. Entry-scope selection, Local-L2 activation, and the final gate use
+the same effective-provider predicate; the legacy compatibility predicate is
+reserved for non-entry lifecycle behavior. Dispatch may repeat the existing
+final checks only as a race-safety recheck; it must not introduce a separate
+admission policy.
+
+BBO prewarm receives the V1 primary+shadow scope, not a full discovery
+frontier and not a one-candidate final replacement. Once prewarmed, final
+revalidation must not reconcile the stream set down to a single candidate.
+Prewarm activation has a 100 ms budget; timeout or activation error is
+journaled and the final candidate takes its existing bounded activation path.
+A subscription/ACK is never executable evidence: both legs still need a fresh
+valid BBO lease, and Local-L2/OI/funding/account-truth/final-window requirements
+remain unchanged.
+
+Every catalog, admission, final filter/reprice, quote/OI exception, account,
+and dispatch rejection must record its exact contract reason in the bounded
+pair-level no-entry summary. `candidate_market_evidence_unavailable` or
+`candidate_final_selection_blocked` is allowed only when no more specific
+contract reason was established. See CL-165 in the daily ledger; local proof
+is complete, deployment and controlled live lifecycle proof are pending.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |

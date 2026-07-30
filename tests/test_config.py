@@ -42,7 +42,9 @@ def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
 
     assert cfg.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
     assert cfg.entry_local_l2_primary_count == 3
-    assert cfg.shadow_entry_opportunity_count == 0
+    assert cfg.shadow_entry_opportunity_count == 2
+    assert cfg.primary_min_hold_ms == 15_000
+    assert cfg.shadow_promotion_score_delta_bps == 3.0
     assert cfg.entry_quote_prewarm_extra_candidate_count == 0
     assert cfg.maker_initial_slice_ratio == 0.25
     assert cfg.maker_entry_max_reposts == 1
@@ -970,8 +972,12 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
-    def test_shadow_entry_opportunity_count_default_is_zero(self):
-        assert StrategyConfig().shadow_entry_opportunity_count == 0
+    def test_v1_shadow_promotion_defaults_are_explicit(self):
+        config = StrategyConfig()
+
+        assert config.shadow_entry_opportunity_count == 2
+        assert config.primary_min_hold_ms == 15_000
+        assert config.shadow_promotion_score_delta_bps == 3.0
 
     def test_accepts_sidecar_backed_opportunity_input_mode(self):
         config = AppConfig(symbols=["BTCUSDT"])
@@ -1052,6 +1058,7 @@ class TestConfigValidation:
         "field_name",
         (
             "shadow_entry_opportunity_count",
+            "primary_min_hold_ms",
             "entry_quote_prewarm_extra_candidate_count",
             "entry_local_l2_prewarm_window_secs",
             "local_l2_short_prewarm_max_pairs",
@@ -1063,6 +1070,28 @@ class TestConfigValidation:
         setattr(config.strategy, field_name, -1)
 
         assert any(field_name in issue for issue in validate_config(config))
+
+    @pytest.mark.parametrize("value", (True, "2", 0.5, float("nan")))
+    def test_shadow_entry_scope_requires_a_nonnegative_integer(self, value):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.shadow_entry_opportunity_count = value
+
+        assert any(
+            "shadow_entry_opportunity_count" in issue
+            for issue in validate_config(config)
+        )
+
+    @pytest.mark.parametrize("value", (True, float("nan"), -0.1))
+    def test_shadow_promotion_score_delta_requires_finite_nonnegative_number(
+        self, value
+    ):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.shadow_promotion_score_delta_bps = value
+
+        assert any(
+            "shadow_promotion_score_delta_bps" in issue
+            for issue in validate_config(config)
+        )
 
     @pytest.mark.parametrize("value", (True, "3", -1))
     def test_entry_local_l2_primary_count_requires_nonnegative_integer(self, value):

@@ -398,6 +398,55 @@ def test_terminal_accounting_record_normalizes_and_requires_clean_scoped_truth()
     )["blocks_entry"] is True
 
 
+def test_terminal_accounting_normalizer_migrates_only_known_pre_marker_receipt():
+    legacy = {
+        "position_id": "legacy-final-gate",
+        "symbol": "LABUSDT",
+        "long_venue": "bitget",
+        "short_venue": "okx",
+        "original_payload": {
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+                "source": "passive_close_final_exchange_truth_gate",
+            },
+        },
+    }
+
+    normalized = normalize_close_reconciliation_record(legacy)
+
+    assert normalized is not legacy
+    assert "pending_backfill" not in legacy
+    assert normalized["pending_backfill"] is True
+    assert normalized["accounting_only_backfill"] is True
+    assert normalized["blocking_trading"] is False
+    assert normalized["close_reconciliation_state"] == "terminal_flat_accounting_gap"
+    assert classify_close_reconciliation_state(
+        normalized,
+        current_exchange_truth_clean=None,
+    )["blocks_entry"] is False
+
+
+def test_terminal_accounting_normalizer_rejects_untrusted_aggregate_receipt():
+    legacy = {
+        "position_id": "legacy-untrusted",
+        "symbol": "LABUSDT",
+        "long_venue": "bitget",
+        "short_venue": "okx",
+        "original_payload": {
+            "exchange_truth": {
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+                "source": "recovery_account_snapshot",
+            },
+        },
+    }
+
+    assert normalize_close_reconciliation_record(legacy) == legacy
+
+
 def test_close_reconciliation_state_releases_accepted_order_truth_gap_when_flat():
     result = classify_close_reconciliation_state(
         {

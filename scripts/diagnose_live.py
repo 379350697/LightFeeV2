@@ -41,6 +41,7 @@ from lightfee.engine.exchange_truth import (
 from lightfee.engine.business_contract import (
     classify_close_reconciliation_state,
     classify_noise_visibility,
+    close_reconciliation_current_truth_status,
     close_reconciliation_exchange_truth_clean,
     close_reconciliation_evidence_contract,
     close_order_error_resolution_contract,
@@ -8532,15 +8533,17 @@ def _build_production_acceptance_gate(
                 "blocks_entry": False,
             }
         normalized = normalize_close_reconciliation_record(item)
+        current_truth_status = close_reconciliation_current_truth_status(
+            normalized,
+            exchange_truth,
+        )
+        if current_truth_status is None and close_reconciliation_exchange_truth_clean(
+            normalized
+        ):
+            current_truth_status = True
         return classify_close_reconciliation_state(
             normalized,
-            current_exchange_truth_clean=(
-                close_reconciliation_exchange_truth_clean(normalized)
-                or (
-                    _exchange_truth_flat(exchange_truth)
-                    and _exchange_truth_no_open_orders(exchange_truth)
-                )
-            ),
+            current_exchange_truth_clean=current_truth_status,
         )
 
     if "pending_close_reconciliation_blocking_count" in local_state:

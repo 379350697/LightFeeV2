@@ -327,7 +327,11 @@ class StrategyConfig:
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
     entry_local_l2_primary_count: int = 3
-    shadow_entry_opportunity_count: int = 0
+    # V1 keeps a two-route shadow basket so a fresh, warm shadow can replace
+    # a held primary without creating its own session lifecycle.
+    shadow_entry_opportunity_count: int = 2
+    primary_min_hold_ms: int = 15_000
+    shadow_promotion_score_delta_bps: float = 3.0
     maker_entry_max_reposts: int = 1
     maker_entry_reconcile_backoff_ms: int = 1000
     max_liquidity_snapshot_age_ms: int = 5000

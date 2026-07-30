@@ -861,6 +861,128 @@ async def test_terminal_flat_accounting_gap_archives_expired_candidates_after_fr
 
 
 @pytest.mark.asyncio
+async def test_terminal_accounting_backfill_archives_after_retention_without_global_truth_refresh():
+    """A persisted terminal accounting row must not need a global re-probe to retire."""
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth(nonflat=True))
+    ctx.state.tick_count = 2
+    reconciliation = _pending_close_missing_order_identity_record()
+    reconciliation.update({
+        "pending_backfill": True,
+        "evidence_gap": True,
+        "accounting_only_backfill": True,
+        "blocking_trading": False,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "missing_leg": "long",
+        "last_evidence_gap_reason": "missing_long_close_trade_statement",
+        "long_legs": [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "late-statement-order",
+            "client_order_id": "late-statement-client",
+            "statement_probe_candidate": True,
+        }],
+        "exchange_truth": _pair_scoped_flat_account_truth(
+            symbol="ARCHIVEUSDT",
+            long_venue=Venue.BINANCE.value,
+            short_venue=Venue.OKX.value,
+        ),
+    })
+    ctx.state.pending_close_reconciliations.append(reconciliation)
+    runtime = CloseRuntime(ctx=ctx)
+    now_ms = 1_000 + runtime._TERMINAL_FLAT_ACCOUNTING_BACKFILL_RETENTION_MS
+
+    await runtime._process_pending_close_reconciliations(now_ms=now_ms)
+
+    assert ctx.collector_calls == []
+    assert ctx.state.pending_close_reconciliations == []
+    archived = [
+        record["payload"]
+        for record in ctx.journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["archive_reason"] == (
+        "terminal_flat_accounting_retention_elapsed"
+    )
+    assert archived[0]["exchange_truth_hash"]
+    assert archived[0]["exchange_truth_scope"] == "retained_terminal_pair"
+    assert archived[0]["exchange_truth"]["positions"] == [
+        {"venue": Venue.BINANCE.value, "symbol": "ARCHIVEUSDT", "quantity": 0.0},
+        {"venue": Venue.OKX.value, "symbol": "ARCHIVEUSDT", "quantity": 0.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_accounting_without_statement_candidates_archives_without_global_truth_refresh():
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth(nonflat=True))
+    ctx.state.tick_count = 2
+    reconciliation = _pending_close_missing_order_identity_record()
+    reconciliation.update({
+        "pending_backfill": True,
+        "evidence_gap": True,
+        "accounting_only_backfill": True,
+        "blocking_trading": False,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "last_evidence_gap_reason": "missing_order_identity",
+        "exchange_truth": _pair_scoped_flat_account_truth(
+            symbol="ARCHIVEUSDT",
+            long_venue=Venue.BINANCE.value,
+            short_venue=Venue.OKX.value,
+        ),
+    })
+    ctx.state.pending_close_reconciliations.append(reconciliation)
+
+    await CloseRuntime(ctx=ctx)._process_pending_close_reconciliations(now_ms=3_000)
+
+    assert ctx.collector_calls == []
+    assert ctx.state.pending_close_reconciliations == []
+    archived = [
+        record["payload"]
+        for record in ctx.journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+    assert len(archived) == 1
+    assert archived[0]["exchange_truth_scope"] == "retained_terminal_pair"
+
+
+@pytest.mark.asyncio
+async def test_terminal_accounting_retention_never_archives_over_current_scoped_dirty_truth():
+    ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth())
+    ctx.state.tick_count = 2
+    current_truth = _pair_scoped_flat_account_truth(
+        symbol="ARCHIVEUSDT",
+        long_venue=Venue.BINANCE.value,
+        short_venue=Venue.OKX.value,
+    )
+    current_truth["positions"][0]["quantity"] = 1.0
+    ctx._last_recovery_exchange_truth = current_truth
+    reconciliation = _pending_close_missing_order_identity_record()
+    reconciliation.update({
+        "pending_backfill": True,
+        "evidence_gap": True,
+        "accounting_only_backfill": True,
+        "blocking_trading": False,
+        "close_reconciliation_state": "terminal_flat_accounting_gap",
+        "last_evidence_gap_reason": "missing_order_identity",
+        "exchange_truth": _pair_scoped_flat_account_truth(
+            symbol="ARCHIVEUSDT",
+            long_venue=Venue.BINANCE.value,
+            short_venue=Venue.OKX.value,
+        ),
+    })
+    ctx.state.pending_close_reconciliations.append(reconciliation)
+
+    await CloseRuntime(ctx=ctx)._process_pending_close_reconciliations(now_ms=3_000)
+
+    assert ctx.collector_calls == []
+    assert len(ctx.state.pending_close_reconciliations) == 1
+    assert not [
+        record
+        for record in ctx.journal.read_all()
+        if record["kind"] == "reconciliation.pending_close_backfill_archived"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_accounting_only_backfill_skips_global_truth_refresh():
     ctx = _PendingCloseArchiveCtx(_pending_close_archive_account_truth())
     ctx.state.tick_count = 2

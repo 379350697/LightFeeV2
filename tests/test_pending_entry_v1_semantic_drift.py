@@ -2620,7 +2620,7 @@ def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_jou
     assert reversed_reason == "pending_close_reconciliation_conflict"
 
 
-def test_pending_close_reconciliation_gate_releases_terminal_flat_accounting_gap(
+def test_pending_close_reconciliation_gate_releases_terminal_flat_accounting_gap_without_archiving(
     config,
     tmp_journal,
 ):
@@ -2668,14 +2668,10 @@ def test_pending_close_reconciliation_gate_releases_terminal_flat_accounting_gap
 
     assert allowed is True
     assert reason == ""
-    assert runtime.state.pending_close_reconciliations[0]["archived"] is True
-    assert (
-        runtime.state.pending_close_reconciliations[0]["archive_reason"]
-        == "terminal_flat_accounting_gap"
-    )
+    assert "archived" not in runtime.state.pending_close_reconciliations[0]
 
 
-def test_pending_close_reconciliation_gate_uses_current_flat_truth_when_payload_lacks_truth(
+def test_pending_close_reconciliation_gate_uses_current_flat_truth_without_archiving(
     config,
     tmp_journal,
 ):
@@ -2719,14 +2715,10 @@ def test_pending_close_reconciliation_gate_uses_current_flat_truth_when_payload_
 
     assert allowed is True
     assert reason == ""
-    assert runtime.state.pending_close_reconciliations[0]["archived"] is True
-    assert (
-        runtime.state.pending_close_reconciliations[0]["archive_reason"]
-        == "terminal_flat_accounting_gap"
-    )
+    assert "archived" not in runtime.state.pending_close_reconciliations[0]
 
 
-def test_pending_close_reconciliation_gate_uses_account_level_flat_truth(
+def test_pending_close_reconciliation_gate_uses_account_level_flat_truth_without_archiving(
     config,
     tmp_journal,
 ):
@@ -2768,14 +2760,10 @@ def test_pending_close_reconciliation_gate_uses_account_level_flat_truth(
 
     assert allowed is True
     assert reason == ""
-    assert runtime.state.pending_close_reconciliations[0]["archived"] is True
-    assert (
-        runtime.state.pending_close_reconciliations[0]["archive_reason"]
-        == "terminal_flat_accounting_gap"
-    )
+    assert "archived" not in runtime.state.pending_close_reconciliations[0]
 
 
-def test_pending_close_reconciliation_gate_blocks_terminal_marker_without_truth(
+def test_pending_close_reconciliation_gate_releases_terminal_marker_without_new_truth(
     config,
     tmp_journal,
 ):
@@ -2813,8 +2801,9 @@ def test_pending_close_reconciliation_gate_blocks_terminal_marker_without_truth(
         SimpleNamespace(symbol="HUSDT", long_venue="binance", short_venue="bybit")
     )
 
-    assert allowed is False
-    assert reason == "pending_close_reconciliation_conflict"
+    assert allowed is True
+    assert reason == ""
+    assert runtime.state.pending_close_reconciliations[0]["blocking_trading"] is False
     assert "archived" not in runtime.state.pending_close_reconciliations[0]
 
 

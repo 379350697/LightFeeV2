@@ -134,9 +134,38 @@ class EntryLocalL2Session:
         return self.legs.get(venue)
 
     def ensure_leg(self, venue: str, symbol: str) -> EntryLocalL2LegSession:
-        if venue not in self.legs:
-            self.legs[venue] = EntryLocalL2LegSession(venue=venue, symbol=symbol)
-        return self.legs[venue]
+        leg = self.legs.get(venue)
+        if leg is None:
+            leg = EntryLocalL2LegSession(venue=venue, symbol=symbol)
+            self.legs[venue] = leg
+            return leg
+
+        # V1 ``ensure_candidate`` always refreshes the symbol binding and
+        # converts a retained faulted leg back to arming when its primary
+        # candidate returns.  The next local-book observation must establish
+        # readiness again; preserving the old fault would make a recovered
+        # sticky session permanently fail closed.
+        leg.symbol = symbol
+        if leg.state == EntryLocalL2LegState.FAULTED:
+            if leg.fault == EntryLocalL2LegFault.STALE_BOOK:
+                arming_reason = SessionArmingReason.STALE_BOOK_RECOVERY
+            elif leg.fault in {
+                EntryLocalL2LegFault.GATE_OBU_GAP,
+                EntryLocalL2LegFault.OKX_PREV_SEQ_MISMATCH,
+                EntryLocalL2LegFault.OKX_CHECKSUM_MISMATCH,
+            }:
+                arming_reason = SessionArmingReason.SEQUENCE_GAP
+            elif leg.fault in {
+                EntryLocalL2LegFault.HYPERLIQUID_DISCONNECT,
+                EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+            }:
+                arming_reason = SessionArmingReason.TRANSPORT_FAULT_RECOVERY
+            elif leg.fault == EntryLocalL2LegFault.CROSSED_OR_LOCKED_BOOK:
+                arming_reason = SessionArmingReason.BOOK_STATUS_TRANSITION
+            else:
+                arming_reason = SessionArmingReason.FIRST_SESSION
+            leg.mark_arming(arming_reason)
+        return leg
 
     def both_legs_ready(self, now_ms: int, stale_after_ms: int) -> bool:
         if len(self.legs) < 2:
@@ -383,6 +412,34 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
     return diag
 
 
+def local_l2_tracking_book_ready(book, now_ms: int, stale_after_ms: int) -> bool:
+    """Return V1 shadow-tracking readiness without creating a pair session.
+
+    V1 evaluates a shadow directly from an assigned ``HOT_EXEC`` or ``WARM``
+    book; shadow candidates never own an ``EntryLocalL2Session``.  Reuse the
+    exact one-leg readiness transition on a disposable leg so primary-session
+    and shadow-promotion decisions cannot drift on status, staleness, crossed
+    book, or empty-side handling.
+    """
+    if book is None:
+        return False
+    pool = getattr(getattr(book, "pool", None), "value", getattr(book, "pool", ""))
+    if str(pool) not in {"hot_exec", "warm"}:
+        return False
+    probe = EntryLocalL2LegSession(
+        venue=str(getattr(book, "venue", "") or ""),
+        symbol=str(getattr(book, "symbol", "") or ""),
+    )
+    return bool(
+        apply_book_readiness_to_leg(
+            probe,
+            book,
+            now_ms=now_ms,
+            stale_after_ms=stale_after_ms,
+        ).get("ready")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session runtime
 # ---------------------------------------------------------------------------
@@ -403,6 +460,12 @@ class EntryLocalL2SessionRuntime:
     ) -> EntryLocalL2Session:
         """Create or update session legs for a tracked opportunity."""
         session = self.get_or_create_session(opp.pair_id)
+        # V1 ``ensure_candidate`` revives a previously closed retained
+        # session when the pair returns to the primary scope.  Without this,
+        # a bounded sticky prewarm cache can keep a pair permanently closed
+        # after a brief rank churn.
+        if session.state == EntryLocalL2SessionState.CLOSED:
+            session.state = EntryLocalL2SessionState.ARMING
         session.ensure_leg(opp.long_venue, opp.symbol)
         session.ensure_leg(opp.short_venue, opp.symbol)
         if (
@@ -416,6 +479,33 @@ class EntryLocalL2SessionRuntime:
         session = self.sessions.get(pair_id)
         if session is not None:
             session.state = EntryLocalL2SessionState.CLOSED
+
+    def mark_sticky_prewarm(self, pair_id: str) -> None:
+        """Retain a bounded V1 primary prewarm cache across rank churn."""
+        self.sticky_pair_ids.add(str(pair_id))
+        # V1 uses a fixed 64-pair cap.  Sorting makes the deterministic Python
+        # set eviction independent of hash iteration order.
+        while len(self.sticky_pair_ids) > 64:
+            self.sticky_pair_ids.discard(sorted(self.sticky_pair_ids)[0])
+
+    def close_missing(self, active_pair_ids: set[str]) -> None:
+        """Close and reclaim sessions outside the V1 active/sticky scope."""
+        active_pair_ids = {str(pair_id) for pair_id in active_pair_ids}
+        for pair_id, session in self.sessions.items():
+            if (
+                pair_id not in active_pair_ids
+                and pair_id not in self.sticky_pair_ids
+            ):
+                session.state = EntryLocalL2SessionState.CLOSED
+        self.sessions = {
+            pair_id: session
+            for pair_id, session in self.sessions.items()
+            if (
+                pair_id in active_pair_ids
+                or pair_id in self.sticky_pair_ids
+                or session.state != EntryLocalL2SessionState.CLOSED
+            )
+        }
 
     def remove_session(self, pair_id: str) -> None:
         self.sessions.pop(pair_id, None)
@@ -513,13 +603,15 @@ def primary_hold_window_allows_replacement(
 ) -> bool:
     """V1 primary_hold_window_allows_replacement (entry_local_l2.rs:93-97).
 
-    When primary_assigned_at_ms is 0 (never assigned), the primary doesn't
-    exist to be replaced — prevent promotion.
+    ``0`` is V2's persisted representation of V1's missing assignment time.
+    V1 permits replacement in that case: there is no established hold to
+    preserve.  A selected primary will receive its real assignment timestamp
+    as soon as the runtime gives it session ownership.
     """
     if primary_min_hold_ms <= 0:
         return True
     if primary_assigned_at_ms <= 0:
-        return False  # V1: never assigned → no primary to replace
+        return True
     return (now_ms - primary_assigned_at_ms) >= primary_min_hold_ms
 
 

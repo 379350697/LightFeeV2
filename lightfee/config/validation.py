@@ -240,8 +240,6 @@ def validate_config(config: AppConfig) -> list[str]:
             "strategy.funding_forecast_min_samples must be > 0 when funding_economics_mode is enhanced_live"
         )
 
-    if config.strategy.shadow_entry_opportunity_count < 0:
-        issues.append("strategy.shadow_entry_opportunity_count must be >= 0")
     if config.strategy.maker_entry_reconcile_backoff_ms <= 0:
         issues.append("strategy.maker_entry_reconcile_backoff_ms must be > 0")
     if config.strategy.maker_hedge_soft_deadline_ms <= 0:
@@ -470,6 +468,7 @@ def validate_config(config: AppConfig) -> list[str]:
 
     for field_name in (
         "shadow_entry_opportunity_count",
+        "primary_min_hold_ms",
         "entry_quote_prewarm_extra_candidate_count",
         "entry_local_l2_prewarm_window_secs",
         "local_l2_short_prewarm_max_pairs",
@@ -477,6 +476,13 @@ def validate_config(config: AppConfig) -> list[str]:
     ):
         if not _is_nonnegative_int(getattr(config.strategy, field_name)):
             issues.append(f"strategy.{field_name} must be a non-negative integer")
+    if not _is_finite_nonnegative(
+        config.strategy.shadow_promotion_score_delta_bps
+    ):
+        issues.append(
+            "strategy.shadow_promotion_score_delta_bps must be a finite "
+            "non-negative number"
+        )
 
     # V1 local-L2 resource budget validation
     if config.strategy.local_l2_global_max_books <= 0:
@@ -567,12 +573,9 @@ def _is_positive_int(value: object) -> bool:
 
 def _is_nonnegative_int(value: object) -> bool:
     """Reject booleans, fractions and non-finite sample-count policy values."""
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return False
+    numeric = float(value)
     return math.isfinite(numeric) and numeric >= 0.0 and numeric.is_integer()
 
 

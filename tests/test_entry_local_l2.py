@@ -315,6 +315,22 @@ class TestApplyBookReadinessToLeg:
         book.fault_reason = fault_reason
         return book
 
+    def test_shadow_tracking_uses_the_same_ready_book_contract(self):
+        from lightfee.engine.entry_local_l2 import local_l2_tracking_book_ready
+        from lightfee.marketdata.l2 import L2PoolAssignment
+
+        book = self._book()
+        book.pool = L2PoolAssignment.WARM
+
+        assert local_l2_tracking_book_ready(
+            book, now_ms=10_000, stale_after_ms=5_000
+        )
+
+        book.pool = L2PoolAssignment.RETAINED
+        assert not local_l2_tracking_book_ready(
+            book, now_ms=10_000, stale_after_ms=5_000
+        )
+
     def test_missing_book_keeps_leg_arming_with_stable_reason(self):
         from lightfee.engine.entry_local_l2 import apply_book_readiness_to_leg
 
@@ -572,6 +588,63 @@ class TestSessionRuntime:
         rt.remove_session("p1")
         assert "p1" not in rt.sessions
 
+    def test_close_missing_reclaims_non_sticky_sessions_and_preserves_sticky(self):
+        """V1 close_missing closes/removes stale scope but keeps bounded prewarm."""
+        rt = EntryLocalL2SessionRuntime()
+        rt.get_or_create_session("active")
+        rt.get_or_create_session("stale")
+        rt.get_or_create_session("sticky")
+        rt.mark_sticky_prewarm("sticky")
+
+        rt.close_missing({"active"})
+
+        assert set(rt.sessions) == {"active", "sticky"}
+        assert rt.sessions["active"].state != EntryLocalL2SessionState.CLOSED
+        assert rt.sessions["sticky"].state != EntryLocalL2SessionState.CLOSED
+
+    def test_track_opportunity_revives_a_closed_sticky_session(self):
+        rt = EntryLocalL2SessionRuntime()
+        opp = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+        rt.track_opportunity(opp, now_ms=10_000)
+        rt.close_session("p1")
+
+        session = rt.track_opportunity(opp, now_ms=20_000)
+
+        assert session.state == EntryLocalL2SessionState.ARMING
+        assert session.primary_assigned_at_ms == 10_000
+
+    def test_track_opportunity_rearms_a_faulted_leg_like_v1_ensure_candidate(self):
+        rt = EntryLocalL2SessionRuntime()
+        original = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+        session = rt.track_opportunity(original, now_ms=10_000)
+        binance_leg = session.legs["binance"]
+        binance_leg.mark_faulted(
+            EntryLocalL2LegFault.OKX_PREV_SEQ_MISMATCH,
+            "previous sequence mismatch",
+            seen_at_ms=11_000,
+        )
+        returned = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT-NEW",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=16.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+
+        rt.track_opportunity(returned, now_ms=20_000)
+
+        assert binance_leg.symbol == "BTCUSDT-NEW"
+        assert binance_leg.state == EntryLocalL2LegState.ARMING
+        assert binance_leg.fault is None
+        assert binance_leg.fault_detail == ""
+        assert binance_leg.arming_reason == SessionArmingReason.SEQUENCE_GAP
+
 
 # ---------------------------------------------------------------------------
 # Promotion / demotion logic
@@ -585,8 +658,8 @@ class TestHoldWindow:
         )
 
     def test_blocks_when_never_assigned(self):
-        """V1: primary never assigned (0 sentinel) → no primary to replace."""
-        assert not primary_hold_window_allows_replacement(
+        """V1: absent assignment time means no hold has begun."""
+        assert primary_hold_window_allows_replacement(
             primary_assigned_at_ms=0, now_ms=11000, primary_min_hold_ms=90000,
         )
 
@@ -991,6 +1064,223 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             reason="entry_local_l2_waiting_for_primary_tracking",
             now_ms=now_ms,
         )
+
+    @staticmethod
+    def _hold_primary(runtime, candidate, now_ms: int, assigned_at_ms: int):
+        opportunity = TrackedOpportunity(
+            pair_id=runtime._candidate_pair_id(candidate),
+            symbol=candidate.symbol,
+            long_venue=candidate.long_venue,
+            short_venue=candidate.short_venue,
+            ranking_edge_bps=candidate.ranking_edge_bps,
+            class_=TrackedOpportunityClass.PRIMARY,
+        )
+        session = runtime.entry_l2_sessions.track_opportunity(opportunity, now_ms)
+        session.primary_assigned_at_ms = assigned_at_ms
+        runtime._tracked_primary_pair_ids = {opportunity.pair_id}
+        return opportunity
+
+    @staticmethod
+    def _install_warm_ready_shadow_books(runtime, candidate, now_ms: int):
+        from lightfee.marketdata.l2 import (
+            L2BookStatus,
+            L2PoolAssignment,
+            PriceLevel,
+        )
+
+        for venue in (candidate.long_venue, candidate.short_venue):
+            book = runtime.local_l2_runtime.ensure_book(venue, candidate.symbol)
+            book.status = L2BookStatus.HOT
+            book.pool = L2PoolAssignment.WARM
+            book.bids = [PriceLevel(price=100.0, quantity=10.0)]
+            book.asks = [PriceLevel(price=101.0, quantity=10.0)]
+            book.observed_at_ms = now_ms
+
+    def test_v1_primary_hold_keeps_previous_primary_despite_rank_churn(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 20_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 1
+        runtime_with_l2.config.strategy.primary_min_hold_ms = 15_000
+        runtime_with_l2.config.strategy.shadow_promotion_score_delta_bps = 3.0
+        monkeypatch.setattr(runtime_with_l2.journal, "append", lambda *_args, **_kwargs: 0)
+        old_primary = self._make_real_candidate(
+            symbol="OLDUSDT",
+            pair_id="oldusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        better_shadow = self._make_real_candidate(
+            symbol="NEWUSDT",
+            pair_id="newusdt:binance->bybit",
+            ranking_edge_bps=30.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            old_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 1_000,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [better_shadow, old_primary]
+        )
+        classes = {opportunity.pair_id: opportunity.class_ for opportunity in tracked}
+
+        assert classes == {
+            "newusdt:binance->bybit": TrackedOpportunityClass.SHADOW,
+            "oldusdt:binance->bybit": TrackedOpportunityClass.PRIMARY,
+        }
+
+    def test_v1_ready_warm_shadow_promotes_without_owning_a_session(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 20_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 1
+        runtime_with_l2.config.strategy.primary_min_hold_ms = 15_000
+        runtime_with_l2.config.strategy.shadow_promotion_score_delta_bps = 3.0
+        monkeypatch.setattr(runtime_with_l2.journal, "append", lambda *_args, **_kwargs: 0)
+        old_primary = self._make_real_candidate(
+            symbol="OLDUSDT",
+            pair_id="oldusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        better_shadow = self._make_real_candidate(
+            symbol="NEWUSDT",
+            pair_id="newusdt:binance->bybit",
+            ranking_edge_bps=30.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            old_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 15_000,
+        )
+        self._install_warm_ready_shadow_books(
+            runtime_with_l2, better_shadow, now_ms
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [better_shadow, old_primary]
+        )
+        classes = {opportunity.pair_id: opportunity.class_ for opportunity in tracked}
+
+        assert classes == {
+            "newusdt:binance->bybit": TrackedOpportunityClass.PRIMARY,
+            "oldusdt:binance->bybit": TrackedOpportunityClass.SHADOW,
+        }
+        assert set(runtime_with_l2.entry_l2_sessions.sessions) == {
+            "oldusdt:binance->bybit"
+        }
+
+    def test_v1_cold_shadow_cannot_replace_a_held_primary(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        now_ms = 20_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms
+        )
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 1
+        runtime_with_l2.config.strategy.primary_min_hold_ms = 15_000
+        runtime_with_l2.config.strategy.shadow_promotion_score_delta_bps = 3.0
+        old_primary = self._make_real_candidate(
+            symbol="OLDUSDT",
+            pair_id="oldusdt:binance->bybit",
+            ranking_edge_bps=10.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        cold_shadow = self._make_real_candidate(
+            symbol="NEWUSDT",
+            pair_id="newusdt:binance->bybit",
+            ranking_edge_bps=30.0,
+            first_funding_timestamp_ms=now_ms + 60_000,
+        )
+        self._hold_primary(
+            runtime_with_l2,
+            old_primary,
+            now_ms,
+            assigned_at_ms=now_ms - 15_000,
+        )
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(
+            [cold_shadow, old_primary]
+        )
+        classes = {opportunity.pair_id: opportunity.class_ for opportunity in tracked}
+
+        assert classes == {
+            "newusdt:binance->bybit": TrackedOpportunityClass.SHADOW,
+            "oldusdt:binance->bybit": TrackedOpportunityClass.PRIMARY,
+        }
+
+    def test_tracked_scope_uses_the_composed_entry_l2_contract(
+        self,
+        runtime_with_l2,
+        monkeypatch,
+    ):
+        """Explicit on-demand config must not bypass V1 primary backfill."""
+        now_ms = 10_000
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.wall_clock_now_ms",
+            lambda: now_ms,
+        )
+        strategy = runtime_with_l2.config.strategy
+        strategy._entry_readiness_provider_configured = True
+        strategy._entry_readiness_provider_raw = "ws_bbo_l2_on_demand"
+        strategy.entry_readiness_provider = "ws_bbo_l2_on_demand"
+        runtime_with_l2.config.strategy.entry_local_l2_primary_count = 1
+        runtime_with_l2.config.strategy.shadow_entry_opportunity_count = 0
+        candidates = [
+            self._make_real_candidate(
+                symbol="TOPUSDT",
+                pair_id="topusdt:binance->bybit",
+                ranking_edge_bps=20.0,
+            ),
+            self._make_real_candidate(
+                symbol="NEXTUSDT",
+                pair_id="nextusdt:binance->bybit",
+                ranking_edge_bps=10.0,
+            ),
+        ]
+        top = runtime_with_l2.entry_l2_sessions.track_opportunity(
+            TrackedOpportunity(
+                pair_id="topusdt:binance->bybit",
+                symbol="TOPUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                ranking_edge_bps=20.0,
+                class_=TrackedOpportunityClass.PRIMARY,
+            ),
+            now_ms,
+        )
+        for leg in top.legs.values():
+            leg.mark_faulted(EntryLocalL2LegFault.STALE_BOOK)
+        top.refresh_state(now_ms, runtime_with_l2._entry_local_l2_stale_after_ms())
+
+        assert runtime_with_l2._entry_local_l2_effective_enabled() is True
+        assert runtime_with_l2._local_l2_effective_enabled() is False
+
+        tracked, _ = runtime_with_l2._select_v1_entry_tracked_scope(candidates)
+
+        assert tracked[0].pair_id == "nextusdt:binance->bybit"
+        assert tracked[0].class_ == TrackedOpportunityClass.PRIMARY
 
     def test_runtime_ws_bbo_primary_failure_backfills_lower_route(
         self,
@@ -2366,13 +2656,16 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             r["payload"] for r in records
             if r["kind"] == "scan.no_entry_ranked_candidates"
         )
-        assert no_entry["reason"] == "candidate_final_selection_blocked"
+        assert no_entry["reason"] == "entry_local_l2_waiting_for_dual_ready"
         assert no_entry["strategy_tradeable_count"] == 1
         assert no_entry["checked_candidate_count"] == 1
-        assert no_entry["selection_blockers"] == {}
-        assert no_entry["admission_blockers"] == {
-            "entry_local_l2_waiting_for_primary_tracking": 1
+        # The ranked flow now installs V1 primary ownership before warming the
+        # data planes.  With no HOT books the remaining, truthful blocker is
+        # dual readiness—not the old artificial "not tracked" admission.
+        assert no_entry["selection_blockers"] == {
+            "entry_local_l2_waiting_for_dual_ready": 1
         }
+        assert no_entry["admission_blockers"] == {}
         assert rt.state.last_scan is not None
         assert rt.state.last_scan["selected_candidate_count"] == 0
         assert rt.state.last_scan["dispatched_candidate_count"] == 0
@@ -2381,7 +2674,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             if r["kind"] == "runtime.entry_blocked_local_l2_selection"
         )
         assert blocked["pair_id"] == "btcusdt:binance->bybit"
-        assert blocked["reason"] == "entry_local_l2_waiting_for_primary_tracking"
+        assert blocked["reason"] == "entry_local_l2_waiting_for_dual_ready"
 
     @pytest.mark.asyncio
     async def test_scan_no_entry_reason_uses_v1_finalization_window_before_local_l2(
@@ -2539,7 +2832,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         )
         assert no_entry["strategy_tradeable_count"] == 1
         assert no_entry["checked_candidate_count"] == 1
-        assert no_entry["reason"] == "candidate_final_selection_blocked"
+        assert no_entry["reason"] == "entry_waiting_for_finalization_window_too_early"
         assert no_entry["selection_blockers"] == {
             "entry_waiting_for_finalization_window_too_early": 1
         }
@@ -3541,6 +3834,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "rest_top_book"
@@ -3603,6 +3897,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "rest_top_book"
@@ -3655,6 +3950,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "quote_lease"
@@ -3724,6 +4020,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_top_book"
@@ -3792,6 +4089,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_top_book"
@@ -3845,6 +4143,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -3898,6 +4197,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -3958,7 +4258,8 @@ class TestEntryReadinessProviderFactory:
         ][-1]
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert payload["entry_readiness_provider_raw"] == "ws_bbo_quote_lease"
         assert payload["entry_readiness_provider_effective"] == "ws_bbo_l2_on_demand"
         assert payload["entry_readiness_provider_migrated"] is True
@@ -3983,6 +4284,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4087,6 +4389,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4180,6 +4483,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4273,6 +4577,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4356,6 +4661,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4426,7 +4732,8 @@ class TestEntryReadinessProviderFactory:
         ][-1]
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert payload["domain"] == "ws_bbo_cache"
         assert evidence["rest_refresh"]["long"]["attempted"] is True
         assert evidence["rest_refresh"]["long"]["outcome"] == "no_quote"
@@ -4443,6 +4750,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4502,7 +4810,8 @@ class TestEntryReadinessProviderFactory:
         ][-1]
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert payload["domain"] == "ws_bbo_cache"
         assert evidence["rest_refresh"]["short"]["attempted"] is True
         assert evidence["rest_refresh"]["short"]["outcome"] == "no_quote"
@@ -4518,6 +4827,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4590,6 +4900,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4631,14 +4942,16 @@ class TestEntryReadinessProviderFactory:
         ][-1]
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert payload["domain"] == "ws_bbo_subscription"
-        assert evidence["provider"] == "ws_bbo_quote_lease"
+        assert evidence["provider"] == "ws_bbo_l2_on_demand"
+        assert evidence["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert evidence["source"] == "ws_bbo_quote_lease"
         assert evidence["domain"] == "ws_bbo_subscription"
         assert evidence["long_stream_state"]["last_error"] == "ConnectionError: test-stream-down"
 
-    def test_ws_bbo_quote_lease_blocks_untracked_candidate_before_provider_missing_quote(
+    def test_composed_provider_blocks_untracked_candidate_before_bbo_quote_check(
         self,
         tmp_path,
     ):
@@ -4670,6 +4983,7 @@ class TestEntryReadinessProviderFactory:
 
         rt.entry_readiness_provider.decide = capture_decide
         selection: Counter = Counter()
+        admission: Counter = Counter()
         blockers: dict[str, str] = {}
 
         try:
@@ -4679,18 +4993,20 @@ class TestEntryReadinessProviderFactory:
                 remaining_slots=1,
                 selection_blocker_counts=selection,
                 candidate_blockers=blockers,
+                admission_blocker_counts=admission,
             )
         finally:
             rt.journal.close()
 
         assert selected == []
-        assert provider_calls == []
-        assert selection == Counter({
-            "entry_ws_bbo_quote_lease_waiting_for_subscription": 1,
+        assert provider_calls == [(candidate, now_ms)]
+        assert selection == Counter()
+        assert admission == Counter({
+            "entry_local_l2_waiting_for_primary_tracking": 1,
         })
         assert blockers == {
             "bananausdt:bybit->hyperliquid": (
-                "entry_ws_bbo_quote_lease_waiting_for_subscription"
+                "entry_local_l2_waiting_for_primary_tracking"
             ),
         }
         records = [
@@ -4700,21 +5016,13 @@ class TestEntryReadinessProviderFactory:
         ]
         payload = [
             r["payload"] for r in records
-            if r["kind"] == "runtime.entry_blocked_ws_bbo_selection"
+            if r["kind"] == "runtime.entry_blocked_local_l2_selection"
         ][-1]
-        assert payload["reason"] == "entry_ws_bbo_quote_lease_waiting_for_subscription"
-        assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
-        assert payload["domain"] == "ws_bbo_subscription"
+        assert payload["reason"] == "entry_local_l2_waiting_for_primary_tracking"
         evidence = payload["readiness_evidence"]
-        assert evidence["provider"] == "ws_bbo_quote_lease"
-        assert evidence["source"] == "ws_bbo_quote_lease"
-        assert evidence["domain"] == "ws_bbo_subscription"
-        assert evidence["blocker_family"] == "subscription"
-        assert evidence["missing_long_subscription"] is True
-        assert evidence["missing_short_subscription"] is True
-        assert evidence["long_stream_state"]["tracked"] is False
-        assert evidence["short_stream_state"]["tracked"] is False
+        assert evidence["provider"] == "ws_bbo_l2_on_demand"
+        assert evidence["blocking_component"] == "local_l2"
+        assert evidence["components"]["local_l2"]["provider"] == "local_l2"
 
     @pytest.mark.asyncio
     async def test_ws_bbo_provider_activation_does_not_create_local_l2_books(
@@ -4727,6 +5035,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4771,6 +5080,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4826,6 +5136,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4880,6 +5191,7 @@ class TestEntryReadinessProviderFactory:
         now_ms = 1778985600000
         config = TestPrimaryTrackingAdmission._make_config(
             mode="live",
+            local_l2_enabled=False,
             journal_path=str(tmp_path / "events.jsonl"),
         )
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -4945,7 +5257,8 @@ class TestEntryReadinessProviderFactory:
         ][-1]
         evidence = payload["readiness_evidence"]
         assert payload["source"] == "ws_bbo_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
+        assert payload["provider"] == "ws_bbo_l2_on_demand"
+        assert payload["quote_lease_provider"] == "ws_bbo_quote_lease"
         assert payload["domain"] == "ws_bbo_subscription"
         assert evidence["coverage_reason"] == "subscription_budget_exhausted"
         assert evidence["blocker_family"] == "subscription_budget"
