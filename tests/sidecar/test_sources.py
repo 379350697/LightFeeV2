@@ -8,7 +8,19 @@ import time
 import pytest
 
 from lightfee.core.domain import Venue
-from lightfee.sidecar.snapshot import QuoteSnapshot, funding_rate_sample_id
+from lightfee.marketdata.open_interest import (
+    observed_open_interest_proof_reason,
+    open_interest_sample_id,
+)
+from lightfee.sidecar.publisher import publish_snapshot
+from lightfee.sidecar.snapshot import (
+    FundingLifecycle,
+    LiquidityLifecycle,
+    MarketLifecycle,
+    QuoteSnapshot,
+    SidecarSnapshot,
+    funding_rate_sample_id,
+)
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.venues.market_data import FundingTicker
 from lightfee.venues.specs import binance_spec, okx_spec
@@ -62,6 +74,137 @@ class TestExchangeSource:
         src = ExchangeSource.for_venue(Venue.BINANCE)
         assert src.venue == "binance"
         # No credential validation should occur
+
+    def test_prime_slow_liquidity_preserves_observed_oi_provenance(self, tmp_path):
+        """Restart hydration must not turn a valid OI cache entry invalid."""
+        observed_at_ms = 1_000
+        sample_id = open_interest_sample_id(
+            venue="binance",
+            canonical_symbol="BTCUSDT",
+            venue_symbol="BTCUSDT",
+            observed_at_ms=observed_at_ms,
+            source="binance_open_interest",
+            raw_value=2.5,
+            value_quote=250.0,
+        )
+        persisted = QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            volume_24h_quote=1_000.0,
+            open_interest=250.0,
+            open_interest_evidence_status="observed",
+            open_interest_observed_at_ms=observed_at_ms,
+            open_interest_event_at_ms=observed_at_ms,
+            open_interest_received_at_ms=observed_at_ms,
+            open_interest_source="binance_open_interest",
+            open_interest_sample_id=sample_id,
+            open_interest_venue_symbol="BTCUSDT",
+            raw_open_interest=2.5,
+            raw_open_interest_unit="base",
+            open_interest_conversion_mark_price=100.0,
+        )
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+
+        src.prime_slow_liquidity([persisted])
+
+        restored = src._slow_liquidity_tickers["binance:BTCUSDT"]
+        resumed = src._with_cached_slow_liquidity(
+            FundingTicker(
+                venue="binance",
+                symbol="BTCUSDT",
+                bid=100.0,
+                ask=101.0,
+                market_received_at_ms=observed_at_ms,
+                funding_rate_bps=1.0,
+                funding_timestamp_ms=2_000,
+                funding_interval_ms=28_800_000,
+                open_interest_evidence_status="unavailable",
+            ),
+            restored,
+        )
+        resumed_quote = ExchangeSource._from_funding_ticker(resumed)
+        assert restored.open_interest_evidence_status == "observed"
+        assert restored.raw_open_interest == 2.5
+        assert restored.raw_open_interest_unit == "base"
+        assert restored.open_interest_conversion_mark_price == 100.0
+        assert (
+            observed_open_interest_proof_reason(
+                venue=resumed_quote.venue,
+                canonical_symbol=resumed_quote.symbol,
+                venue_symbol=resumed_quote.open_interest_venue_symbol,
+                value_quote=resumed_quote.open_interest,
+                raw_value=resumed_quote.raw_open_interest,
+                raw_unit=resumed_quote.raw_open_interest_unit,
+                contract_multiplier=resumed_quote.open_interest_contract_multiplier,
+                conversion_mark_price=resumed_quote.open_interest_conversion_mark_price,
+                observed_at_ms=resumed_quote.open_interest_observed_at_ms,
+                event_at_ms=resumed_quote.open_interest_event_at_ms,
+                received_at_ms=resumed_quote.open_interest_received_at_ms,
+                source=resumed_quote.open_interest_source,
+                sample_id=resumed_quote.open_interest_sample_id,
+            )
+            == ""
+        )
+        # Exercise the actual restart failure boundary.  The publisher must
+        # accept the next V5 snapshot built from the restored slow cache.
+        lifecycle = {
+            "venue": "binance",
+            "observed_at_ms": observed_at_ms,
+            "symbol_count": 1,
+            "coverage_usable": 1,
+        }
+        publish_snapshot(
+            SidecarSnapshot(
+                published_at_ms=observed_at_ms,
+                market_observed_at_ms=observed_at_ms,
+                candidate_build_observed_at_ms=observed_at_ms,
+                candidate_build_diagnostics={
+                    "input_quote_count": 1,
+                    "requested_symbol_count": 1,
+                    "requested_symbols": ["BTCUSDT"],
+                    "requested_venues": ["binance"],
+                    "directional_pair_count": 0,
+                    "output_candidate_count": 0,
+                    "future_input_quote_count": 0,
+                    "rejection_counts": {},
+                },
+                source_mode="direct_market",
+                acquisition_mode="fresh_sidecar",
+                funding_lifecycle=[FundingLifecycle(**lifecycle)],
+                market_lifecycle=[MarketLifecycle(**lifecycle)],
+                liquidity_lifecycle=[LiquidityLifecycle(**lifecycle)],
+                quotes={"binance:BTCUSDT": resumed_quote},
+            ),
+            tmp_path / "resumed-v5-snapshot.json",
+        )
+
+    def test_prime_slow_liquidity_downgrades_incomplete_observed_proof(self):
+        """Legacy partial cache evidence is pair-scoped unavailable, not global poison."""
+        persisted = QuoteSnapshot(
+            venue="binance",
+            symbol="BTCUSDT",
+            bid=100.0,
+            ask=101.0,
+            volume_24h_quote=1_000.0,
+            open_interest=250.0,
+            open_interest_evidence_status="observed",
+            open_interest_observed_at_ms=1_000,
+        )
+        src = object.__new__(ExchangeSource)
+        src.venue = "binance"
+
+        src.prime_slow_liquidity([persisted])
+
+        restored = src._slow_liquidity_tickers["binance:BTCUSDT"]
+        assert restored.open_interest_evidence_status == "unavailable"
+        assert restored.open_interest_quote is None
+        assert restored.raw_open_interest is None
+        assert restored.open_interest_evidence_reason.startswith(
+            "persisted_slow_liquidity_proof_invalid:"
+        )
 
     def test_accepts_shared_public_rate_limiter(self):
         from lightfee.venues.transport import EndpointRateLimiter

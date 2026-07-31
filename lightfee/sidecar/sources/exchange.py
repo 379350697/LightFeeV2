@@ -8,6 +8,10 @@ import time
 from typing import Optional
 
 from lightfee.core.domain import Venue
+from lightfee.marketdata.open_interest import (
+    normalize_open_interest_status,
+    observed_open_interest_proof_reason,
+)
 from lightfee.sidecar.snapshot import (
     SLOW_LIQUIDITY_EVIDENCE_PENDING_REASON,
     QuoteSnapshot,
@@ -205,7 +209,15 @@ class ExchangeSource:
         return self._client.funding_interval_evidence(now_ms=now_ms)
 
     def prime_slow_liquidity(self, quotes: list[QuoteSnapshot]) -> None:
-        """Hydrate the local slow-evidence cache from the persisted snapshot."""
+        """Hydrate the local slow-evidence cache from the persisted snapshot.
+
+        This is a provenance-preserving transfer, not a fresh observation.  In
+        particular, an ``observed`` OI value is only restored with its entire
+        raw/unit/conversion/identity proof.  Restoring its status and scalar
+        while dropping those fields creates an internally contradictory quote:
+        it is correctly rejected by the V5 publisher, but would otherwise
+        prevent every new global snapshot from being published after restart.
+        """
         restored: dict[str, FundingTicker] = {}
         for quote in quotes:
             symbol = str(getattr(quote, "symbol", "") or "").upper()
@@ -216,17 +228,102 @@ class ExchangeSource:
                 symbol=symbol,
                 bid=0.0,
                 ask=0.0,
-                volume_24h_quote=float(getattr(quote, "volume_24h_quote", 0.0) or 0.0),
-                open_interest_quote=float(getattr(quote, "open_interest", 0.0) or 0.0),
-                open_interest_evidence_status=str(getattr(quote, "open_interest_evidence_status", "") or ""),
-                open_interest_evidence_reason=str(getattr(quote, "open_interest_evidence_reason", "") or ""),
-                open_interest_observed_at_ms=int(getattr(quote, "open_interest_observed_at_ms", 0) or 0),
-                open_interest_event_at_ms=int(getattr(quote, "open_interest_event_at_ms", 0) or 0),
-                open_interest_received_at_ms=int(getattr(quote, "open_interest_received_at_ms", 0) or 0),
-                open_interest_source=str(getattr(quote, "open_interest_source", "") or ""),
-                open_interest_sample_id=str(getattr(quote, "open_interest_sample_id", "") or ""),
-                open_interest_venue_symbol=str(getattr(quote, "open_interest_venue_symbol", "") or ""),
+                volume_24h_quote=float(
+                    getattr(quote, "volume_24h_quote", 0.0) or 0.0
+                ),
+                open_interest_quote=getattr(quote, "open_interest", None),
+                open_interest_evidence_status=normalize_open_interest_status(
+                    getattr(quote, "open_interest_evidence_status", "unavailable")
+                ),
+                open_interest_evidence_reason=str(
+                    getattr(quote, "open_interest_evidence_reason", "") or ""
+                ),
+                open_interest_observed_at_ms=int(
+                    getattr(quote, "open_interest_observed_at_ms", 0) or 0
+                ),
+                open_interest_event_at_ms=int(
+                    getattr(quote, "open_interest_event_at_ms", 0) or 0
+                ),
+                open_interest_received_at_ms=int(
+                    getattr(quote, "open_interest_received_at_ms", 0) or 0
+                ),
+                open_interest_source=str(
+                    getattr(quote, "open_interest_source", "") or ""
+                ),
+                open_interest_sample_id=str(
+                    getattr(quote, "open_interest_sample_id", "") or ""
+                ),
+                open_interest_venue_symbol=str(
+                    getattr(quote, "open_interest_venue_symbol", "") or ""
+                ),
+                raw_open_interest=getattr(quote, "raw_open_interest", None),
+                raw_open_interest_unit=str(
+                    getattr(quote, "raw_open_interest_unit", "") or ""
+                ),
+                open_interest_contract_multiplier=getattr(
+                    quote, "open_interest_contract_multiplier", None
+                ),
+                open_interest_conversion_mark_price=getattr(
+                    quote, "open_interest_conversion_mark_price", None
+                ),
             )
+            if ticker.open_interest_evidence_status == "observed":
+                proof_reason = observed_open_interest_proof_reason(
+                    venue=self.venue,
+                    canonical_symbol=symbol,
+                    venue_symbol=ticker.open_interest_venue_symbol,
+                    value_quote=ticker.open_interest_quote,
+                    raw_value=ticker.raw_open_interest,
+                    raw_unit=ticker.raw_open_interest_unit,
+                    contract_multiplier=ticker.open_interest_contract_multiplier,
+                    conversion_mark_price=ticker.open_interest_conversion_mark_price,
+                    observed_at_ms=ticker.open_interest_observed_at_ms,
+                    event_at_ms=ticker.open_interest_event_at_ms,
+                    received_at_ms=ticker.open_interest_received_at_ms,
+                    source=ticker.open_interest_source,
+                    sample_id=ticker.open_interest_sample_id,
+                )
+                if proof_reason:
+                    # A legacy or corrupted cache must never manufacture an
+                    # observed value.  It remains pair-scoped unavailable and
+                    # can be refreshed asynchronously; it cannot poison the
+                    # global snapshot publication path.
+                    ticker = replace(
+                        ticker,
+                        open_interest_quote=None,
+                        open_interest_evidence_status="unavailable",
+                        open_interest_evidence_reason=(
+                            "persisted_slow_liquidity_proof_invalid:" + proof_reason
+                        ),
+                        open_interest_observed_at_ms=0,
+                        open_interest_event_at_ms=0,
+                        open_interest_received_at_ms=0,
+                        open_interest_source="",
+                        open_interest_sample_id="",
+                        open_interest_venue_symbol="",
+                        raw_open_interest=None,
+                        raw_open_interest_unit="",
+                        open_interest_contract_multiplier=None,
+                        open_interest_conversion_mark_price=None,
+                    )
+            else:
+                # V5 explicitly forbids a numeric OI value without observed
+                # proof.  Normalize legacy partial rows before they reach the
+                # publisher instead of allowing a global publication failure.
+                ticker = replace(
+                    ticker,
+                    open_interest_quote=None,
+                    open_interest_observed_at_ms=0,
+                    open_interest_event_at_ms=0,
+                    open_interest_received_at_ms=0,
+                    open_interest_source="",
+                    open_interest_sample_id="",
+                    open_interest_venue_symbol="",
+                    raw_open_interest=None,
+                    raw_open_interest_unit="",
+                    open_interest_contract_multiplier=None,
+                    open_interest_conversion_mark_price=None,
+                )
             restored[f"{self.venue}:{symbol}"] = ticker
         self._slow_liquidity_tickers = restored
 

@@ -120,9 +120,26 @@ async def _run(
         while not stop_event.is_set():
             cache_only_refresh = cache_only_next
             refresh_started_at_s = loop.time()
-            completed_refresh = await refresh_once_until_stop(
-                cache_only=cache_only_refresh
-            )
+            try:
+                completed_refresh = await refresh_once_until_stop(
+                    cache_only=cache_only_refresh
+                )
+            except Exception:
+                # Keep the last atomically published snapshot intact and let
+                # its normal freshness gate fail closed.  A malformed record
+                # must be rejected by the V5 publisher, but one rejected
+                # refresh must not kill the sidecar process and prevent its
+                # next scheduled repair attempt.
+                logger.exception(
+                    "sidecar refresh failed; retaining last atomic snapshot",
+                    extra={
+                        "refresh_kind": (
+                            "cache_only" if cache_only_refresh else "full"
+                        ),
+                        "action": "retry_on_next_scheduled_refresh",
+                    },
+                )
+                completed_refresh = True
             cache_only_next = False
             if stop_event.is_set():
                 break

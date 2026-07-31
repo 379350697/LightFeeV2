@@ -117,6 +117,44 @@ async def test_run_schedules_full_refresh_from_its_start_time():
 
 
 @pytest.mark.asyncio
+async def test_run_retains_process_after_rejected_refresh_and_retries():
+    """A strict publish rejection must not become a systemd restart loop."""
+    captured = {}
+
+    class FakeService:
+        def __init__(self):
+            self.refresh_count = 0
+            self.closed = False
+
+        async def refresh_once(self):
+            self.refresh_count += 1
+            if self.refresh_count == 1:
+                raise ValueError("refusing to publish invalid V5 snapshot")
+            captured["stop_event"].set()
+
+        async def close(self):
+            self.closed = True
+
+    def install_handlers(stop_event):
+        captured["stop_event"] = stop_event
+        return lambda: None
+
+    service = FakeService()
+    await asyncio.wait_for(
+        sidecar_app._run(
+            service,
+            once=False,
+            refresh_interval_s=0.01,
+            install_shutdown_handlers=install_handlers,
+        ),
+        timeout=1.0,
+    )
+
+    assert service.refresh_count == 2
+    assert service.closed is True
+
+
+@pytest.mark.asyncio
 async def test_cache_only_republish_does_not_postpone_full_refresh_deadline():
     captured = {}
 
