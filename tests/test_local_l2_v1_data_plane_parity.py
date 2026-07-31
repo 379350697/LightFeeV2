@@ -186,7 +186,7 @@ def test_aster_pre_snapshot_buffer_overflow_drops_oldest_without_rebuild(tmp_pat
         journal.close()
 
 
-def test_aster_buffered_replay_accepts_previous_link_anchor(tmp_path):
+def test_aster_buffered_replay_rejects_previous_link_without_range_overlap(tmp_path):
     dp, runtime, journal = _make_data_plane(tmp_path)
     try:
         book = runtime.ensure_book("aster", "IRYSUSDT")
@@ -215,9 +215,9 @@ def test_aster_buffered_replay_accepts_previous_link_anchor(tmp_path):
 
         replay = dp._replay_buffered_updates("aster", "IRYSUSDT")
 
-        assert replay.ok is True
-        assert replay.replayed == 1
-        assert runtime.get_book("aster", "IRYSUSDT").sequence == 105
+        assert replay.ok is False
+        assert "snapshot_boundary" in runtime.get_book("aster", "IRYSUSDT").fault_reason
+        assert runtime.get_book("aster", "IRYSUSDT").status == L2BookStatus.REBUILDING
     finally:
         journal.close()
 
@@ -506,8 +506,8 @@ def test_gate_ws_uses_v1_obu_subscription_and_range_parser(tmp_path):
         assert update is not None
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.first_sequence == 100
-        assert update.previous_sequence == 100
-        assert update.previous_sequence_present is True
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
         assert update.sequence == 101
     finally:
         journal.close()

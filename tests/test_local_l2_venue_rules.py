@@ -459,6 +459,24 @@ class TestParseGateL2Update:
         assert update.update_kind.value == "delta"
         assert update.sequence == 1680000001000
 
+    def test_parse_range_delta_does_not_treat_u_as_previous_link(self):
+        from lightfee.marketdata.local_l2_venues import parse_gate_l2_update
+        payload = {
+            "event": "update",
+            "t": 1680000001000,
+            "contract": "ETH_USDT",
+            "U": 1680000000990,
+            "u": 1680000001000,
+            "bids": [{"p": "2000.00", "s": 5.0}],
+            "asks": [],
+        }
+        update = parse_gate_l2_update(payload)
+        assert update.update_kind.value == "delta"
+        assert update.first_sequence == 1680000000990
+        assert update.sequence == 1680000001000
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
+
     def test_array_level_format(self):
         from lightfee.marketdata.local_l2_venues import parse_gate_l2_update
         payload = {

@@ -378,7 +378,8 @@ def parse_gate_l2_update(
       {"id": 123, "t": 1234567890, "contract": "BTC_USDT",
        "bids": [{"p": "50000", "s": 1.0}], "asks": [{"p": "50100", "s": 1.5}]}
 
-    Gate uses timestamp-based sequence (SequenceMode.TIMESTAMP).
+    Gate uses timestamp-based `U/u` ranges. `U` is a range start, not a
+    Binance-style previous-link field.
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel
 
@@ -410,8 +411,8 @@ def parse_gate_l2_update(
         bids=bids, asks=asks,
         first_sequence=first_sequence,
         sequence=seq,
-        previous_sequence=first_sequence,
-        previous_sequence_present=first_sequence > 0,
+        previous_sequence=0,
+        previous_sequence_present=False,
         event_time_ms=int(data.get("t", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )

@@ -159,6 +159,7 @@ class LocalL2DataPlane:
         self.freshness_state_event_rate_limit_ms: int = 300_000
         self.snapshot_ok_event_rate_limit_ms: int = 300_000
         self.clock_skew_tolerance_ms: int = 5_000
+        self.bootstrap_rebase_wait_ms: int = 250
 
     # ------------------------------------------------------------------
     # Bootstrap: initial snapshot population for target books
@@ -270,7 +271,18 @@ class LocalL2DataPlane:
             # WS deltas. OKX stays on the V1 buffered replay classifier.
             replay = _BufferedReplayResult()
             if policy.replay_rest_snapshot_with_ws_deltas:
-                replay = self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
+                gate_rebase_replay = await self._gate_immediate_rebase_replay_if_needed(
+                    venue=venue,
+                    symbol=symbol,
+                    adapter=adapter,
+                    depth=depth,
+                    now_ms=now_ms,
+                )
+                replay = (
+                    gate_rebase_replay
+                    if gate_rebase_replay is not None
+                    else self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
+                )
             if replay.replayed > 0:
                 self._journal.append(
                     "runtime.local_l2_buffered_replay",
@@ -309,6 +321,12 @@ class LocalL2DataPlane:
                 L2BookStatus.DEGRADED,
             ):
                 book.transition_to_hot()
+            if book is not None and venue in {"binance", "aster"}:
+                book.pending_snapshot_bridge = (
+                    replay.replayed == 0
+                    and book.sequence > 0
+                    and book.status == L2BookStatus.HOT
+                )
 
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
@@ -713,6 +731,213 @@ class LocalL2DataPlane:
             return 0
         return max(0, now_ms - first_observed)
 
+    def _generation_filtered_buffer(
+        self,
+        venue: str,
+        symbol: str,
+        generation: int,
+    ) -> tuple[deque[_BufferedUpdate], list[_BufferedUpdate]]:
+        buf = self._pre_snapshot_buffers.get(f"{venue}:{symbol}") or deque()
+        filtered = [b for b in list(buf) if b.generation == generation]
+        return buf, filtered
+
+    @staticmethod
+    def _buffer_after_snapshot(
+        filtered: list[_BufferedUpdate],
+        snapshot_sequence: int,
+    ) -> list[_BufferedUpdate]:
+        return [
+            b for b in filtered
+            if int(getattr(b.update, "sequence", 0) or 0) > snapshot_sequence
+        ]
+
+    def _buffer_has_snapshot_boundary_overlap(
+        self,
+        filtered: list[_BufferedUpdate],
+        snapshot_sequence: int,
+    ) -> bool:
+        expected = snapshot_sequence + 1
+        return any(
+            self._range_contains_expected(b.update, expected)
+            for b in self._buffer_after_snapshot(filtered, snapshot_sequence)
+        )
+
+    def _gate_rebase_buffer_evidence(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        branch: str,
+        generation: int,
+        initial_snapshot_seq: int,
+        rebase_snapshot_seq: int,
+        buf: deque[_BufferedUpdate],
+        filtered: list[_BufferedUpdate],
+        now_ms: int,
+        rebase_wait_ms: int,
+    ) -> dict:
+        current_after_rebase = self._buffer_after_snapshot(filtered, rebase_snapshot_seq)
+        first_current = filtered[0].update if filtered else None
+        last_current = filtered[-1].update if filtered else None
+        first_live = current_after_rebase[0].update if current_after_rebase else None
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "reason": "gate_immediate_snapshot_rebase",
+            "branch": branch,
+            "stream_generation": generation,
+            "rebase_attempt": 1,
+            "snapshot_fetch_count": 2,
+            "initial_snapshot_seq": initial_snapshot_seq,
+            "rebase_snapshot_seq": rebase_snapshot_seq,
+            "initial_expected_sequence": initial_snapshot_seq + 1,
+            "rebase_expected_sequence": rebase_snapshot_seq + 1,
+            "buffered_count": len(buf),
+            "buffer_current_generation_count": len(filtered),
+            "buffer_age_ms": self._buffer_age_ms(buf, now_ms),
+            "first_buffered_sequence": int(getattr(buf[0].update, "sequence", 0) or 0) if buf else 0,
+            "last_buffered_sequence": int(getattr(buf[-1].update, "sequence", 0) or 0) if buf else 0,
+            "current_first_buffered_U": int(getattr(first_current, "first_sequence", 0) or 0) if first_current else 0,
+            "current_first_buffered_u": int(getattr(first_current, "sequence", 0) or 0) if first_current else 0,
+            "current_last_buffered_U": int(getattr(last_current, "first_sequence", 0) or 0) if last_current else 0,
+            "current_last_buffered_u": int(getattr(last_current, "sequence", 0) or 0) if last_current else 0,
+            "first_live_buffered_U": int(getattr(first_live, "first_sequence", 0) or 0) if first_live else 0,
+            "first_live_buffered_u": int(getattr(first_live, "sequence", 0) or 0) if first_live else 0,
+            "rebase_wait_ms": rebase_wait_ms,
+            "generation_isolation": "current_generation_only",
+        }
+
+    async def _gate_immediate_rebase_replay_if_needed(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        adapter,
+        depth: int,
+        now_ms: int,
+    ) -> _BufferedReplayResult | None:
+        if venue != "gate":
+            return None
+        book = self._runtime.get_book(venue, symbol)
+        if book is None:
+            return None
+        initial_snapshot_seq = int(getattr(book, "sequence", 0) or 0)
+        if initial_snapshot_seq <= 0:
+            return None
+        generation = self._current_stream_generation(venue, symbol)
+        _buf, filtered = self._generation_filtered_buffer(venue, symbol, generation)
+        current_after_initial = self._buffer_after_snapshot(filtered, initial_snapshot_seq)
+        if not current_after_initial:
+            return None
+        if self._buffer_has_snapshot_boundary_overlap(filtered, initial_snapshot_seq):
+            return None
+
+        rebase_wait_ms = min(
+            max(int(getattr(self, "bootstrap_rebase_wait_ms", 250) or 0), 0),
+            250,
+        )
+        if rebase_wait_ms > 0:
+            await asyncio.sleep(rebase_wait_ms / 1_000.0)
+
+        rebase_update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+        apply_result = self._runtime.record_update_result(rebase_update, now_ms)
+        rebase_snapshot_seq = int(getattr(rebase_update, "sequence", 0) or 0)
+        buf, filtered = self._generation_filtered_buffer(venue, symbol, generation)
+        if not apply_result.applied or apply_result.rebuild_required:
+            evidence = self._gate_rebase_buffer_evidence(
+                venue=venue,
+                symbol=symbol,
+                branch="second_snapshot_apply_failed",
+                generation=generation,
+                initial_snapshot_seq=initial_snapshot_seq,
+                rebase_snapshot_seq=rebase_snapshot_seq,
+                buf=buf,
+                filtered=filtered,
+                now_ms=now_ms,
+                rebase_wait_ms=rebase_wait_ms,
+            )
+            evidence["error"] = apply_result.fault_reason or "snapshot_apply_failed"
+            self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
+            return _BufferedReplayResult(ok=False, failure_evidence=evidence)
+
+        if self._buffer_after_snapshot(filtered, rebase_snapshot_seq) and not (
+            self._buffer_has_snapshot_boundary_overlap(filtered, rebase_snapshot_seq)
+        ):
+            evidence = self._gate_rebase_buffer_evidence(
+                venue=venue,
+                symbol=symbol,
+                branch="second_snapshot_no_overlap",
+                generation=generation,
+                initial_snapshot_seq=initial_snapshot_seq,
+                rebase_snapshot_seq=rebase_snapshot_seq,
+                buf=buf,
+                filtered=filtered,
+                now_ms=now_ms,
+                rebase_wait_ms=rebase_wait_ms,
+            )
+            self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
+            expected = rebase_snapshot_seq + 1
+            failure_update = self._buffer_after_snapshot(filtered, rebase_snapshot_seq)[0].update
+            return self._mark_rebuilding_from_buffered_replay_failure(
+                venue=venue,
+                symbol=symbol,
+                book=self._runtime.get_book(venue, symbol),
+                reason=(
+                    "buffered_replay_snapshot_boundary: "
+                    f"expected {expected} got {self._range_first_sequence(failure_update)}"
+                ),
+                now_ms=now_ms,
+                snapshot_last_update_id=rebase_snapshot_seq,
+                expected_previous_sequence=rebase_snapshot_seq,
+                buf=buf,
+                filtered=filtered,
+                failure_update=failure_update,
+                replayed=0,
+                replay_index=-1,
+            )
+
+        evidence = self._gate_rebase_buffer_evidence(
+            venue=venue,
+            symbol=symbol,
+            branch=(
+                "second_snapshot_overlap"
+                if self._buffer_after_snapshot(filtered, rebase_snapshot_seq)
+                else "second_snapshot_covers_buffer"
+            ),
+            generation=generation,
+            initial_snapshot_seq=initial_snapshot_seq,
+            rebase_snapshot_seq=rebase_snapshot_seq,
+            buf=buf,
+            filtered=filtered,
+            now_ms=now_ms,
+            rebase_wait_ms=rebase_wait_ms,
+        )
+        self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
+        return self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
+
+    @staticmethod
+    def _range_first_sequence(update: LocalL2Update) -> int:
+        first_sequence = int(getattr(update, "first_sequence", 0) or 0)
+        if first_sequence > 0:
+            return first_sequence
+        if update.venue != "gate":
+            previous_sequence = int(getattr(update, "previous_sequence", 0) or 0)
+            if previous_sequence > 0:
+                return previous_sequence + 1
+        return int(getattr(update, "sequence", 0) or 0)
+
+    @classmethod
+    def _range_contains_expected(
+        cls,
+        update: LocalL2Update,
+        expected_sequence: int,
+    ) -> bool:
+        if expected_sequence <= 0:
+            return True
+        first_sequence = cls._range_first_sequence(update)
+        final_sequence = int(getattr(update, "sequence", 0) or 0)
+        return first_sequence <= expected_sequence <= final_sequence
+
     def _buffered_replay_failure_evidence(
         self,
         *,
@@ -744,6 +969,16 @@ class LocalL2DataPlane:
         previous_present = bool(
             getattr(failure_update, "previous_sequence_present", False)
         ) if failure_update else False
+        if venue == "gate":
+            continuity_contract = "range_only_U_u_contains_expected"
+            continuity_action = "range_gap_rebuild"
+            strict_continuity_rule = "range_must_contain_expected_sequence"
+            semantic_action = "range_only_rebuild"
+        else:
+            continuity_contract = "previous_link_pu_equals_previous_u"
+            continuity_action = "strict_previous_link_rebuild"
+            strict_continuity_rule = "pu_must_equal_previous_u"
+            semantic_action = "strict_rebuild"
         return {
             "venue": venue,
             "symbol": symbol,
@@ -776,8 +1011,10 @@ class LocalL2DataPlane:
             "policy_bridge_mode": policy.bridge_mode.value,
             "policy_buffer_cap": policy.pre_snapshot_buffer_cap,
             "reason_class": "buffered_replay_failed",
-            "strict_continuity_rule": "pu_must_equal_previous_u",
-            "semantic_action": "strict_rebuild",
+            "continuity_contract": continuity_contract,
+            "continuity_action": continuity_action,
+            "strict_continuity_rule": strict_continuity_rule,
+            "semantic_action": semantic_action,
             "root_bug_suspected": False,
             "replay_failure_count_for_symbol": failure_count,
             "replay_failure_alert_threshold": threshold,
@@ -864,6 +1101,8 @@ class LocalL2DataPlane:
             book = self._runtime.get_book(update.venue, update.symbol)
             if result.applied and not result.rebuild_required and book is not None:
                 book.transition_to_hot()
+                if update.venue in {"binance", "aster"}:
+                    book.pending_snapshot_bridge = update.sequence > 0
                 self.note_ws_book_confirmation(
                     update.venue,
                     update.symbol,
@@ -872,8 +1111,19 @@ class LocalL2DataPlane:
             return result.events
 
         if book is not None and book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+            bridge_previous_sequence = int(getattr(book, "sequence", 0) or 0)
+            apply_snapshot_bridge_anchor = (
+                update.venue in {"binance", "aster"}
+                and bool(getattr(book, "pending_snapshot_bridge", False))
+                and bridge_previous_sequence > 0
+                and self._range_contains_expected(update, bridge_previous_sequence + 1)
+                and (update.previous_sequence_present or update.previous_sequence > 0)
+                and update.previous_sequence != bridge_previous_sequence
+            )
             if self._range_update_requires_rebuild(book, update, now_ms):
                 return []
+            if apply_snapshot_bridge_anchor:
+                update = replace(update, previous_sequence=bridge_previous_sequence)
 
         # Buffer delta updates during bootstrap/rebuild gap
         # V1: handle_binance_local_l2_ws_message_for_instance lines 4423-4435
@@ -899,6 +1149,15 @@ class LocalL2DataPlane:
             if not replay.ok:
                 return []
 
+        if update.venue == "gate" and (
+            update.previous_sequence != 0 or update.previous_sequence_present
+        ):
+            update = replace(
+                update,
+                previous_sequence=0,
+                previous_sequence_present=False,
+            )
+
         result = self._runtime.record_update_result(update, now_ms)
         if result.applied and not result.rebuild_required:
             self.note_ws_delta(
@@ -922,25 +1181,24 @@ class LocalL2DataPlane:
             return True
 
         expected = book.sequence + 1
-        first_sequence = update.first_sequence
-        if first_sequence <= 0:
-            if update.previous_sequence > 0:
-                first_sequence = update.previous_sequence + 1
-            else:
-                first_sequence = update.sequence
+        first_sequence = self._range_first_sequence(update)
 
-        if update.previous_sequence_present or update.previous_sequence > 0:
-            if update.previous_sequence != book.sequence:
+        if update.venue == "gate":
+            if not self._range_contains_expected(update, expected):
                 self._mark_rebuilding_from_stream_gap(
                     book,
                     update,
                     now_ms,
-                    f"previous_link_mismatch: expected {book.sequence} got {update.previous_sequence}",
+                    f"sequence_ahead: expected {expected} got {first_sequence}",
                 )
                 return True
             return False
 
-        if first_sequence > expected:
+        if getattr(book, "pending_snapshot_bridge", False):
+            if self._range_contains_expected(update, expected):
+                book.pending_snapshot_bridge = False
+                return False
+            book.pending_snapshot_bridge = False
             self._mark_rebuilding_from_stream_gap(
                 book,
                 update,
@@ -949,7 +1207,37 @@ class LocalL2DataPlane:
             )
             return True
 
-        return False
+        has_previous_link = (
+            (update.previous_sequence_present or update.previous_sequence > 0)
+            and update.previous_sequence > 0
+        )
+        if has_previous_link:
+            if update.previous_sequence != book.sequence:
+                self._mark_rebuilding_from_stream_gap(
+                    book,
+                    update,
+                    now_ms,
+                    f"previous_link_mismatch: expected {book.sequence} got {update.previous_sequence}",
+                )
+                return True
+            book.pending_snapshot_bridge = False
+            if not self._range_contains_expected(update, expected):
+                self._mark_rebuilding_from_stream_gap(
+                    book,
+                    update,
+                    now_ms,
+                    f"sequence_ahead: expected {expected} got {first_sequence}",
+                )
+                return True
+            return False
+
+        self._mark_rebuilding_from_stream_gap(
+            book,
+            update,
+            now_ms,
+            f"missing_previous_link: expected {book.sequence}",
+        )
+        return True
 
     def _mark_rebuilding_from_stream_gap(
         self,
@@ -981,6 +1269,7 @@ class LocalL2DataPlane:
 
         book.sequence = 0
         book.last_update_id = 0
+        book.pending_snapshot_bridge = False
         book.fault_reason = reason
         book.transition_to_rebuilding(now_ms)
         status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
@@ -1143,21 +1432,12 @@ class LocalL2DataPlane:
         expected = previous_sequence + 1
         start_index = None
         for i, bu in enumerate(filtered):
-            first_id = (
-                bu.update.first_sequence
-                if bu.update.first_sequence > 0
-                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
-                else bu.update.sequence
-            )
             previous_link_matches_anchor = (
-                (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
+                policy.venue not in {"binance", "aster", "gate"}
+                and (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
                 and bu.update.previous_sequence == previous_sequence
             )
-            if (
-                first_id <= previous_sequence <= bu.update.sequence
-                or first_id <= expected <= bu.update.sequence
-                or previous_link_matches_anchor
-            ):
+            if self._range_contains_expected(bu.update, expected) or previous_link_matches_anchor:
                 start_index = i
                 break
 
@@ -1189,6 +1469,64 @@ class LocalL2DataPlane:
                 (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
                 and bu.update.previous_sequence > 0
             )
+            expected = previous_sequence + 1
+            if policy.venue in {"binance", "aster"} and not is_first_replay:
+                if not has_previous_link:
+                    reason = f"buffered_replay_missing_previous_link: expected {previous_sequence}"
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
+                    )
+                if bu.update.previous_sequence != previous_sequence:
+                    reason = (
+                        f"buffered_replay_previous_link_mismatch: expected {previous_sequence} "
+                        f"got {bu.update.previous_sequence}"
+                    )
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
+                    )
+            if policy.venue in {"binance", "aster", "gate"}:
+                first_sequence = self._range_first_sequence(bu.update)
+                if not self._range_contains_expected(bu.update, expected):
+                    reason = (
+                        f"buffered_replay_snapshot_boundary: expected {expected} "
+                        f"got {first_sequence}"
+                    )
+                    return self._mark_rebuilding_from_buffered_replay_failure(
+                        venue=venue,
+                        symbol=symbol,
+                        book=book,
+                        reason=reason,
+                        now_ms=replay_now_ms,
+                        snapshot_last_update_id=snapshot_last_update_id,
+                        expected_previous_sequence=previous_sequence,
+                        buf=buf,
+                        filtered=filtered,
+                        failure_update=bu.update,
+                        replayed=replayed,
+                        replay_index=i,
+                    )
 
             # V1/Binance semantics split the initial REST-to-WS bridge from the
             # subsequent WS chain. The first replayed event is admitted by its
@@ -1196,6 +1534,7 @@ class LocalL2DataPlane:
             if (
                 has_previous_link
                 and bu.update.previous_sequence != previous_sequence
+                and policy.venue != "gate"
                 and (
                     not is_first_replay
                     or policy.venue not in {"binance", "aster"}
@@ -1239,6 +1578,14 @@ class LocalL2DataPlane:
                 replay_update = replace(
                     bu.update,
                     previous_sequence=previous_sequence,
+                )
+            elif policy.venue == "gate" and (
+                bu.update.previous_sequence != 0 or bu.update.previous_sequence_present
+            ):
+                replay_update = replace(
+                    bu.update,
+                    previous_sequence=0,
+                    previous_sequence_present=False,
                 )
 
             try:
@@ -1306,19 +1653,18 @@ class LocalL2DataPlane:
         scan_promoted=True (post-shortlist) allows refreshing books promoted by the
         scan phase; False (pre-scan) refreshes execution-owned books only.
         """
-        dispatched = 0
+        from lightfee.core.domain import Venue
 
+        snapshot_candidates: list[tuple[int, str, str, object, int]] = []
         for key, book in list(self._runtime.books.items()):
-            if dispatched >= self.max_concurrent_snapshots:
-                break
-
             if book.pool == L2PoolAssignment.DROPPED:
                 continue
+
+            policy = policy_for_venue(key.venue)
 
             # V1: HOT books rely on WS deltas, but stale HOT books must be
             # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
-                policy = policy_for_venue(key.venue)
                 stale_after_ms = self._hot_stale_after_ms_for_venue(key.venue)
                 effective_freshness_ms = self._effective_hot_freshness_ms(key, book)
                 observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
@@ -1393,7 +1739,7 @@ class LocalL2DataPlane:
                     if policy.bridge_mode is BridgeMode.STREAM_ONLY:
                         continue
 
-            if policy_for_venue(key.venue).bridge_mode is BridgeMode.STREAM_ONLY:
+            if policy.bridge_mode is BridgeMode.STREAM_ONLY:
                 continue
 
             # V1 dual-phase gating: pre-scan only refreshes execution-owned books
@@ -1406,11 +1752,21 @@ class LocalL2DataPlane:
                 interval_ms = self._hot_proactive_refresh_interval_ms(
                     self._hot_stale_after_ms_for_venue(key.venue)
                 )
-            if interval_ms > 0 and book.last_snapshot_ms > 0:
-                if (now_ms - book.last_snapshot_ms) < interval_ms:
+            ss = self._snap_states.get(key)
+            if ss is not None and ss.snapshot_in_flight:
+                continue
+            state = self._freshness_states.get(key)
+            last_snapshot_ms = int(getattr(book, "last_snapshot_ms", 0) or 0)
+            if book.status == L2BookStatus.HOT:
+                last_snapshot_ms = max(
+                    last_snapshot_ms,
+                    int(getattr(ss, "last_snapshot_ms", 0) or 0) if ss is not None else 0,
+                    int(getattr(state, "last_rest_refresh_ms", 0) or 0) if state is not None else 0,
+                )
+            if interval_ms > 0 and last_snapshot_ms > 0:
+                if (now_ms - last_snapshot_ms) < interval_ms:
                     continue
 
-            from lightfee.core.domain import Venue
             ven = Venue.from_str(key.venue)
             adapter = adapters.get(ven)
             if adapter is None:
@@ -1418,20 +1774,44 @@ class LocalL2DataPlane:
             if not hasattr(adapter, 'fetch_l2_snapshot'):
                 continue
 
-            success = await self.bootstrap_book(
-                venue=key.venue,
-                symbol=key.symbol,
+            deadline_ms = 0
+            if interval_ms > 0 and last_snapshot_ms > 0:
+                deadline_ms = last_snapshot_ms + interval_ms
+            snapshot_candidates.append(
+                (deadline_ms, key.venue, key.symbol, adapter, book.max_depth)
+            )
+
+        limit = max(0, int(self.max_concurrent_snapshots or 0))
+        if limit <= 0 or not snapshot_candidates:
+            return 0
+
+        snapshot_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        selected_candidates = snapshot_candidates[:limit]
+
+        async def _bootstrap_candidate(candidate: tuple[int, str, str, object, int]) -> bool:
+            _deadline_ms, venue, symbol, adapter, depth = candidate
+            return await self.bootstrap_book(
+                venue=venue,
+                symbol=symbol,
                 adapter=adapter,
-                depth=book.max_depth,
+                depth=depth,
                 now_ms=now_ms,
             )
-            if success:
-                dispatched += 1
 
-        if dispatched > 0:
+        results = await asyncio.gather(
+            *(_bootstrap_candidate(candidate) for candidate in selected_candidates),
+            return_exceptions=True,
+        )
+        dispatched = sum(1 for result in results if result is True)
+
+        if selected_candidates:
             self._journal.append(
                 "runtime.local_l2_snapshots_synced",
-                {"dispatched": dispatched, "ts_ms": now_ms},
+                {
+                    "dispatched": dispatched,
+                    "attempted": len(selected_candidates),
+                    "ts_ms": now_ms,
+                },
             )
 
         return dispatched

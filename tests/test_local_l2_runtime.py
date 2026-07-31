@@ -109,6 +109,28 @@ class TestLocalL2RuntimeAssignments:
         assert rt.get_book("binance", "ETHUSDT") is not None
 
 
+class TestLocalL2ReceiveClock:
+    def test_record_update_uses_local_receive_time_for_freshness(self):
+        rt = LocalL2Runtime()
+
+        result = rt.record_update_result(
+            LocalL2Update(
+                venue="binance",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[PriceLevel(101.0, 1.0)],
+                sequence=1,
+                event_time_ms=60_000,
+                received_at_ms=2_000,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            ),
+            now_ms=1_000,
+        )
+
+        assert result.applied is True
+        assert rt.get_book("binance", "BTCUSDT").observed_at_ms == 2_000
+
+
 class TestLocalL2RuntimeEvents:
     def test_drain_events_all(self):
         rt = LocalL2Runtime()
@@ -366,6 +388,17 @@ class MockL2Adapter:
             received_at_ms=1000,
             update_kind=LocalL2UpdateKind.SNAPSHOT,
         )
+
+
+class SequenceMockL2Adapter(MockL2Adapter):
+    def __init__(self, venue_name: str, sequences: list[int]):
+        super().__init__(venue_name=venue_name, sequence=sequences[0])
+        self.sequences = list(sequences)
+
+    async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+        index = min(self.call_count, len(self.sequences) - 1)
+        self.sequence = self.sequences[index]
+        return await super().fetch_l2_snapshot(symbol, depth)
 
 
 class TestDataPlaneBootstrap:
@@ -937,6 +970,386 @@ class TestBinanceAsterV1BufferCapParity:
         assert "snapshot_boundary" in rt.get_book("binance", "GAPUSDT").fault_reason
         assert rt.get_book("binance", "GAPUSDT").status == L2BookStatus.REBUILDING
 
+    @pytest.mark.asyncio
+    async def test_binance_first_bridge_requires_range_overlap_even_when_pu_matches(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "ANCHORUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="ANCHORUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=106,
+                sequence=110,
+                previous_sequence=100,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "ANCHORUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert "snapshot_boundary" in rt.get_book("binance", "ANCHORUSDT").fault_reason
+        assert rt.get_book("binance", "ANCHORUSDT").status == L2BookStatus.REBUILDING
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("venue", ("binance", "aster"))
+    @pytest.mark.parametrize("terminal_gap", ("missing", "mismatch"))
+    async def test_no_buffer_first_hot_bridge_is_accepted_once_for_binance_aster(
+        self,
+        venue,
+        terminal_gap,
+    ):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book(venue, "NOBUFUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        ok = await dp.bootstrap_book(
+            venue,
+            "NOBUFUSDT",
+            MockL2Adapter(venue, sequence=100),
+            now_ms=2000,
+        )
+        assert ok is True
+        book = rt.get_book(venue, "NOBUFUSDT")
+        assert book.status == L2BookStatus.HOT
+        assert book.pending_snapshot_bridge is True
+
+        first_update = LocalL2Update(
+            venue=venue,
+            symbol="NOBUFUSDT",
+            bids=[PriceLevel(49910.0, 10.0)],
+            asks=[PriceLevel(50110.0, 10.0)],
+            first_sequence=99,
+            sequence=101,
+            previous_sequence=94,
+            previous_sequence_present=True,
+            update_kind=LocalL2UpdateKind.DELTA,
+        )
+        first_events = dp.ingest_external_update(first_update, now_ms=2100)
+
+        assert first_events
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 101
+        assert book.pending_snapshot_bridge is False
+        assert first_update.previous_sequence == 94
+        assert first_update.previous_sequence_present is True
+
+        second_events = dp.ingest_external_update(
+            LocalL2Update(
+                venue=venue,
+                symbol="NOBUFUSDT",
+                bids=[PriceLevel(49920.0, 10.0)],
+                asks=[PriceLevel(50120.0, 10.0)],
+                first_sequence=102,
+                sequence=102,
+                previous_sequence=101,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2200,
+        )
+
+        assert second_events
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 102
+
+        terminal_previous_sequence = 0 if terminal_gap == "missing" else 99
+        terminal_previous_sequence_present = terminal_gap == "mismatch"
+        third_events = dp.ingest_external_update(
+            LocalL2Update(
+                venue=venue,
+                symbol="NOBUFUSDT",
+                bids=[PriceLevel(49930.0, 10.0)],
+                asks=[PriceLevel(50130.0, 10.0)],
+                first_sequence=103,
+                sequence=103,
+                previous_sequence=terminal_previous_sequence,
+                previous_sequence_present=terminal_previous_sequence_present,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2300,
+        )
+
+        assert third_events == []
+        assert book.status == L2BookStatus.REBUILDING
+        if terminal_gap == "missing":
+            assert "missing_previous_link" in book.fault_reason
+        else:
+            assert "previous_link_mismatch" in book.fault_reason
+
+    @pytest.mark.asyncio
+    async def test_gate_buffered_replay_uses_range_only(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "BTCUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="BTCUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=101,
+                sequence=101,
+                previous_sequence=999,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "BTCUSDT",
+            MockL2Adapter("gate", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is True
+        assert rt.get_book("gate", "BTCUSDT").status == L2BookStatus.HOT
+        assert rt.get_book("gate", "BTCUSDT").sequence == 101
+
+    @pytest.mark.asyncio
+    async def test_gate_buffered_replay_missing_overlap_keeps_rebuilding(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "GAPUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="GAPUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=105,
+                sequence=110,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "GAPUSDT",
+            MockL2Adapter("gate", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert "snapshot_boundary" in rt.get_book("gate", "GAPUSDT").fault_reason
+        assert rt.get_book("gate", "GAPUSDT").status == L2BookStatus.REBUILDING
+
+    @pytest.mark.asyncio
+    async def test_gate_no_buffer_immediate_rebase_is_range_only_and_bounded(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASEUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASEUSDT",
+            MockL2Adapter("gate", sequence=100),
+            now_ms=2000,
+        )
+        assert ok is True
+        assert book.status == L2BookStatus.HOT
+
+        events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=100,
+                sequence=101,
+                previous_sequence=999,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2100,
+        )
+        assert events
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 101
+
+        gap_events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEUSDT",
+                bids=[PriceLevel(49920.0, 10.0)],
+                asks=[PriceLevel(50120.0, 10.0)],
+                first_sequence=103,
+                sequence=104,
+                previous_sequence=101,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2200,
+        )
+        assert gap_events == []
+        assert book.status == L2BookStatus.REBUILDING
+        assert "sequence_ahead" in book.fault_reason
+
+    @pytest.mark.asyncio
+    async def test_gate_bootstrap_rebase_replays_same_generation_overlap(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASEOKUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.bootstrap_rebase_wait_ms = 0
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEOKUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=105,
+                sequence=106,
+                previous_sequence=999,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+        adapter = SequenceMockL2Adapter("gate", [100, 104])
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASEOKUSDT",
+            adapter,
+            now_ms=2000,
+        )
+
+        assert ok is True
+        assert adapter.call_count == 2
+        assert rt.get_book("gate", "REBASEOKUSDT").status == L2BookStatus.HOT
+        assert rt.get_book("gate", "REBASEOKUSDT").sequence == 106
+        rebase = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_rebase"
+        ][-1]
+        assert rebase["branch"] == "second_snapshot_overlap"
+        assert rebase["rebase_wait_ms"] <= 250
+        assert rebase["first_live_buffered_U"] == 105
+        assert rebase["generation_isolation"] == "current_generation_only"
+
+    @pytest.mark.asyncio
+    async def test_gate_bootstrap_rebase_second_no_overlap_fails_after_two_fetches(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASEGAPUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.bootstrap_rebase_wait_ms = 0
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEGAPUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=110,
+                sequence=111,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+        adapter = SequenceMockL2Adapter("gate", [100, 104])
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASEGAPUSDT",
+            adapter,
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert adapter.call_count == 2
+        assert rt.get_book("gate", "REBASEGAPUSDT").status == L2BookStatus.REBUILDING
+        rebase = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_rebase"
+        ][-1]
+        assert rebase["branch"] == "second_snapshot_no_overlap"
+        assert rebase["rebase_wait_ms"] <= 250
+        failure = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_buffered_replay_rebuild"
+        ][-1]
+        assert failure["continuity_contract"] == "range_only_U_u_contains_expected"
+        assert failure["continuity_action"] == "range_gap_rebuild"
+        assert failure["strict_continuity_rule"] == "range_must_contain_expected_sequence"
+
+    @pytest.mark.asyncio
+    async def test_gate_bootstrap_rebase_filters_old_stream_generation(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASEGENUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.bootstrap_rebase_wait_ms = 0
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEGENUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=105,
+                sequence=106,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+        dp._advance_stream_generation("gate", "REBASEGENUSDT")
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEGENUSDT",
+                bids=[PriceLevel(49920.0, 10.0)],
+                asks=[PriceLevel(50120.0, 10.0)],
+                first_sequence=110,
+                sequence=111,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1200,
+        )
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASEGENUSDT",
+            SequenceMockL2Adapter("gate", [100, 104]),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        rebase = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_rebase"
+        ][-1]
+        assert rebase["branch"] == "second_snapshot_no_overlap"
+        assert rebase["buffered_count"] == 2
+        assert rebase["buffer_current_generation_count"] == 1
+        assert rebase["current_first_buffered_U"] == 110
+
     def test_binance_pre_snapshot_buffer_uses_v1_capacity(self):
         """V1 BINANCE_LOCAL_L2_PRE_SNAPSHOT_BUFFER_CAP = 4096, not 512."""
         rt = LocalL2Runtime()
@@ -1105,6 +1518,64 @@ class TestBinanceAsterV1BufferCapParity:
         assert payloads[0]["severity"] == "info"
         assert payloads[2]["severity"] == "warning"
         assert all(p["root_bug_suspected"] is False for p in payloads)
+
+    def test_gate_hot_range_gap_rebuilds_without_previous_link(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "HOTGAPUSDT")
+        book.status = L2BookStatus.HOT
+        book.sequence = 100
+        book.last_update_id = 100
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="HOTGAPUSDT",
+                bids=[PriceLevel(100.0, 2.0)],
+                asks=[],
+                first_sequence=102,
+                sequence=103,
+                previous_sequence=0,
+                previous_sequence_present=False,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2000,
+        )
+
+        assert events == []
+        assert book.status == L2BookStatus.REBUILDING
+        assert "sequence_ahead" in book.fault_reason
+
+    def test_gate_hot_overlapping_range_applies_without_previous_link(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "HOTOKUSDT")
+        book.status = L2BookStatus.HOT
+        book.sequence = 100
+        book.last_update_id = 100
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        events = dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="HOTOKUSDT",
+                bids=[PriceLevel(100.0, 2.0)],
+                asks=[],
+                first_sequence=101,
+                sequence=101,
+                previous_sequence=0,
+                previous_sequence_present=False,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2000,
+        )
+
+        assert events
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 101
 
 
 # ---------------------------------------------------------------------------

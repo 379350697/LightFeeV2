@@ -325,12 +325,11 @@ class LocalL2Runtime:
     ):
         """Apply and produce result with events.
 
-        V1: observed_at_ms uses the exchange server timestamp from the REST/WS
-        response (e.g. Binance E field), not local wall clock.  This ensures
-        staleness checks compare exchange-observed time, not local processing time.
+        observed_at_ms uses the local receipt timestamp. Exchange event
+        timestamps can move backward/forward relative to the process clock and
+        must not make HOT freshness look newer than locally observed evidence.
         """
-        # Prefer exchange server timestamp over local clock (V1 parity)
-        effective_ms = update.event_time_ms if update.event_time_ms > 0 else now_ms
+        effective_ms = update.received_at_ms if update.received_at_ms > 0 else now_ms
         if update.update_kind == LocalL2UpdateKind.SNAPSHOT:
             return book.apply_snapshot(
                 update.bids, update.asks,

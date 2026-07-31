@@ -516,6 +516,8 @@ class TestGateL2WsClientParsing:
         assert update is not None
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.sequence == 123457
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
         assert len(update.asks) == 1
         assert update.asks[0].quantity == 0  # deletion
         _close_data_plane(dp, _)

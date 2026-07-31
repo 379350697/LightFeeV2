@@ -614,6 +614,44 @@ class TestMarketSnapshotDiagnostics:
             if record[0] == "runtime.local_l2_hot_stale_rebuild"
         ]
 
+    @pytest.mark.asyncio
+    async def test_sync_snapshots_bounds_attempts_and_orders_by_deadline(self):
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            def __init__(self):
+                self.calls: list[str] = []
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+                self.calls.append(symbol)
+                raise RuntimeError("synthetic failure")
+
+        rt = LocalL2Runtime()
+        journal = type("Journal", (), {"append": lambda self, kind, payload: None})()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.max_concurrent_snapshots = 2
+
+        for symbol, last_snapshot_ms in (
+            ("SLOWUSDT", 900),
+            ("FIRSTUSDT", 100),
+            ("SECONDUSDT", 500),
+        ):
+            book = rt.ensure_book("binance", symbol)
+            book.pool = L2PoolAssignment.HOT_EXEC
+            book.status = L2BookStatus.REBUILDING
+            book.last_snapshot_ms = last_snapshot_ms
+            book.max_depth = 50
+
+        adapter = Adapter()
+        dispatched = await dp.sync_snapshots(
+            {Venue.BINANCE: adapter},
+            now_ms=10_000,
+            scan_promoted=True,
+        )
+
+        assert dispatched == 0
+        assert adapter.calls == ["FIRSTUSDT", "SECONDUSDT"]
+
     def test_sequence_gap_rebuild_evidence_uses_pre_transition_status(self):
         class Journal:
             def __init__(self):
