@@ -2620,6 +2620,94 @@ def test_frontier_reprice_preserves_original_minimum_failure_reason(
     }
 
 
+def test_frontier_reprice_edge_floor_event_has_recalculable_economics(
+    tmp_path,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            local_l2_enabled=True,
+            min_expected_edge_bps=1_000.0,
+            min_worst_case_edge_bps=-1_000.0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.last_scan = {}
+    candidate = _freshness_candidate("REPRICEEDGEUSDT")
+    candidate.entry_target_quantity = 0.47
+    candidate.candidate_revision_id = "revision-reprice-edge"
+    _install_l2_books(runtime, candidate, observed_at_ms=10_000)
+    quotes = {
+        (venue, candidate.symbol): SimpleNamespace(
+            venue=venue,
+            symbol=candidate.symbol,
+            bid=100.0,
+            ask=101.0,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=10_000,
+            quantity_step_base=0.1,
+            min_quantity_base=0.1,
+            min_notional_quote=1.0,
+        )
+        for venue in (candidate.long_venue, candidate.short_venue)
+    }
+
+    runtime.journal.open()
+    try:
+        repriced = runtime._reprice_entry_candidates_for_selection(
+            [candidate], market_quotes=quotes, now_ms=10_010
+        )
+    finally:
+        runtime.journal.close()
+    assert repriced == []
+
+    payload = [
+        row["payload"]
+        for row in runtime.journal.read_all()
+        if row["kind"] == "runtime.funding_entry_reprice_blocked"
+    ][-1]
+    expected = (
+        payload["gross_signal_edge_bps"]
+        + payload["funding_edge_bps"]
+        + payload["entry_cross_bps"]
+        + payload["expected_exit_cross_bps"]
+        - payload["entry_fee_bps"]
+        - payload["exit_fee_bps"]
+        - payload["entry_slippage_bps"]
+        - payload["exit_slippage_bps"]
+        - payload["adverse_selection_bps"]
+        - payload["capital_buffer_bps"]
+        - payload["venue_risk_haircut_bps"]
+        + payload["transfer_or_inventory_bias_bps"]
+    )
+    worst = (
+        expected
+        - payload["funding_edge_bps"]
+        + payload["worst_case_funding_edge_bps"]
+        - payload["execution_buffer_bps"]
+    )
+    assert payload["blocking_reason"] == "final_expected_edge_below_floor"
+    assert payload["candidate_revision_id"] == "revision-reprice-edge"
+    assert payload["source"] == "selection_final_reprice"
+    assert payload["requested_base_quantity"] == pytest.approx(0.47)
+    assert payload["aligned_base_quantity"] == pytest.approx(0.4)
+    assert payload["final_base_quantity"] == pytest.approx(0.4)
+    assert payload["long_ask"] == pytest.approx(101.0)
+    assert payload["short_bid"] == pytest.approx(100.0)
+    assert payload["long_buy_vwap"] == pytest.approx(101.0)
+    assert payload["short_sell_vwap"] == pytest.approx(100.0)
+    assert payload["l2_vwap_complete"] is True
+    assert payload["final_expected_net_edge_bps"] == pytest.approx(expected)
+    assert payload["final_worst_case_edge_bps"] == pytest.approx(worst)
+    assert payload["min_expected_edge_bps"] == pytest.approx(1_000.0)
+    assert payload["min_worst_case_edge_bps"] == pytest.approx(-1_000.0)
+
+
 def test_fresh_bbo_overlay_preserves_snapshot_quantity_contract(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),

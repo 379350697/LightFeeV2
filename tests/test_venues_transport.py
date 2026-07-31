@@ -8003,6 +8003,45 @@ class TestBitgetL2Guard:
         assert exc.value.category == TransportErrorCategory.REQUEST_REJECTED
 
 
+class TestGateL2Bootstrap:
+    @pytest.mark.asyncio
+    async def test_gate_snapshot_requests_sequence_id_for_ws_bridge(self):
+        observed_request: httpx.Request | None = None
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal observed_request
+            observed_request = request
+            return httpx.Response(
+                200,
+                json={
+                    "id": 2_945_150_123,
+                    "current": 1_785_526_000.0,
+                    "update": 1_785_526_000.0,
+                    "asks": [{"p": "0.04", "s": 100}],
+                    "bids": [{"p": "0.039", "s": 100}],
+                },
+            )
+
+        transport = VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            update = await transport.fetch_l2_snapshot("COTIUSDT", depth=50)
+        finally:
+            await transport.close()
+
+        assert observed_request is not None
+        assert observed_request.url.path == "/api/v4/futures/usdt/order_book"
+        assert observed_request.url.params["contract"] == "COTI_USDT"
+        assert observed_request.url.params["limit"] == "50"
+        assert observed_request.url.params["with_id"] == "true"
+        assert update.symbol == "COTIUSDT"
+        assert update.sequence == 2_945_150_123
+
+
 # ---------------------------------------------------------------------------
 # BinanceAdapter symbol catalog guard
 # ---------------------------------------------------------------------------

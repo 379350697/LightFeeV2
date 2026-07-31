@@ -378,7 +378,7 @@ def parse_gate_l2_update(
       {"id": 123, "t": 1234567890, "contract": "BTC_USDT",
        "bids": [{"p": "50000", "s": 1.0}], "asks": [{"p": "50100", "s": 1.5}]}
 
-    Gate uses timestamp-based `U/u` ranges. `U` is a range start, not a
+    Gate uses update-ID `U/u` ranges. `U` is a range start, not a
     Binance-style previous-link field.
     """
     from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel

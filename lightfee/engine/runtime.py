@@ -15755,9 +15755,20 @@ class LiveRuntime:
             if not decision.allowed:
                 reason = decision.reason or "final_economics_rejected"
                 blocker_counts[reason] += 1
-                blocker_samples.append(
-                    self._entry_reprice_blocker_sample(candidate, reason)
+                sample = self._entry_reprice_blocker_sample(candidate, reason)
+                sample.update(
+                    self.entry_dispatch_runtime._final_entry_revalidation_evidence(
+                        candidate=candidate,
+                        quote_lease=quote_lease,
+                        required_quantity=final_quantity,
+                        final_economics=decision,
+                        source="selection_final_reprice",
+                    )
                 )
+                # Preserve the pre-alignment request independently from the
+                # final executable quantity written onto the copied candidate.
+                sample["requested_base_quantity"] = requested_quantity
+                blocker_samples.append(sample)
                 continue
             final_quantity, quantity_blocker = _align_and_check_pair_minimum(
                 _cap_to_live_notional(

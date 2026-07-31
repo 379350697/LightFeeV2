@@ -3386,6 +3386,10 @@ class VenueTransport(MarketDataClient):
                     elif spec.venue_id == Venue.GATE:
                         params["contract"] = venue_sym
                         params["limit"] = str(depth)
+                        # Gate only includes the order-book sequence `id` when
+                        # explicitly requested.  Local-L2 bootstrap must bind
+                        # the REST snapshot to the WS U/u update domain.
+                        params["with_id"] = "true"
 
                     raw = await self._request("GET", spec.l2_snapshot_path, params=params)
 
