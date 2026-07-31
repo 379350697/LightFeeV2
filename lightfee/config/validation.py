@@ -478,6 +478,12 @@ def validate_config(config: AppConfig) -> list[str]:
         and ws_bbo_per_venue_budget <= 0
     ):
         issues.append("strategy.entry_ws_bbo_per_venue_budget must be > 0")
+    for field_name in (
+        "entry_quote_lease_max_skew_ms",
+        "entry_final_gate_max_skew_ms",
+    ):
+        if not _is_nonnegative_int(getattr(config.strategy, field_name)):
+            issues.append(f"strategy.{field_name} must be a non-negative integer")
 
     primary_count = config.strategy.entry_local_l2_primary_count
     if (

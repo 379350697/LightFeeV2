@@ -127,6 +127,101 @@ def test_final_quote_lease_rejects_a_future_market_timestamp() -> None:
     assert evidence["long_timestamp_after_now"] is True
 
 
+def test_final_quote_lease_failure_reasons_are_structured_and_stable() -> None:
+    runtime = object.__new__(EntryDispatchRuntime)
+    runtime.ctx = SimpleNamespace(
+        config=SimpleNamespace(
+            strategy=SimpleNamespace(entry_final_gate_max_skew_ms=100),
+        ),
+        _candidate_pair_id=lambda _candidate: "BTCUSDT:binance:bybit",
+        _entry_quote_lease_max_age_ms=lambda: 500,
+    )
+    base_candidate = SimpleNamespace(
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="bybit",
+        entry_target_quantity=2.0,
+        entry_notional_quote=200.0,
+        candidate_revision_id="",
+    )
+    now_ms = 1_000
+
+    assert (
+        runtime._final_quote_lease_reason(base_candidate, None, now_ms)
+        == "missing_final_quote_lease"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(pair_id="BTCUSDT:binance:okx", expires_at_ms=2_000),
+            now_ms,
+        )
+        == "final_quote_lease_pair_mismatch"
+    )
+    revision_candidate = SimpleNamespace(**vars(base_candidate))
+    revision_candidate.candidate_revision_id = "candidate-revision-a"
+    assert (
+        runtime._final_quote_lease_reason(
+            revision_candidate,
+            _lease(candidate_revision_id="candidate-revision-b", expires_at_ms=2_000),
+            now_ms,
+        )
+        == "final_quote_lease_candidate_revision_mismatch"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(expires_at_ms=now_ms),
+            now_ms,
+        )
+        == "expired_final_quote_lease"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(long_observed_at_ms=400, short_observed_at_ms=1_000, expires_at_ms=2_000),
+            now_ms,
+        )
+        == "stale_final_quote_lease"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(long_observed_at_ms=1_000, short_observed_at_ms=850, expires_at_ms=2_000),
+            now_ms,
+        )
+        == "final_quote_lease_skew_exceeded"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(
+                long_bid=100.0,
+                long_ask=100.0,
+                long_observed_at_ms=1_000,
+                short_observed_at_ms=1_000,
+                expires_at_ms=2_000,
+            ),
+            now_ms,
+        )
+        == "invalid_final_quote_lease"
+    )
+    assert (
+        runtime._final_quote_lease_reason(
+            base_candidate,
+            _lease(
+                long_ask_size=1.0,
+                short_bid_size=1.0,
+                long_observed_at_ms=1_000,
+                short_observed_at_ms=1_000,
+                expires_at_ms=2_000,
+            ),
+            now_ms,
+        )
+        == "final_quote_lease_insufficient_bbo_capacity"
+    )
+
+
 def test_truthy_quote_refresh_decision_cannot_bypass_the_stale_lease_gate() -> None:
     runtime = object.__new__(EntryDispatchRuntime)
     runtime.ctx = SimpleNamespace(

@@ -11,7 +11,7 @@ import math
 import re
 import time
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from math import gcd
 from typing import Any
@@ -87,6 +87,13 @@ def _entry_leverage_evidence_payload(
         "source": evidence.source,
         "observed_at_ms": evidence.observed_at_ms,
     }
+
+
+@dataclass(frozen=True, slots=True)
+class FinalQuoteLeaseResult:
+    lease: QuoteLease | None = None
+    reason: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 def _l2_vwap_and_sweep_limit_for_base_quantity(
@@ -1482,6 +1489,18 @@ class EntryDispatchRuntime:
         except (TypeError, ValueError):
             target_leverage = 0
         if target_leverage <= 0:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="entry_leverage_unavailable",
+                blocked_reasons=["entry_leverage_unavailable"],
+                source="entry_leverage_inspection",
+                decision="skip_before_first_leg",
+                extra={
+                    "configured_target_leverage": target_leverage,
+                    "evidence_gap": True,
+                },
+            )
             return False, {}
 
         symbol = str(getattr(candidate, "symbol", "") or "")
@@ -1531,6 +1550,8 @@ class EntryDispatchRuntime:
         results = await asyncio.gather(*[_call(venue, inspect) for venue, inspect in tasks])
         ok = True
         evidence_by_venue: dict[Venue, EntryLeverageEvidence] = {}
+        failed_venues: list[str] = []
+        reason_by_venue: dict[str, str] = {}
         for venue, evidence, exc in results:
             if exc is None:
                 if evidence is not None:
@@ -1559,6 +1580,8 @@ class EntryDispatchRuntime:
                 "official_doc_url": "",
                 "evidence_gap": True,
             }
+            failed_venues.append(venue.value)
+            reason_by_venue[venue.value] = reason
             self._record_symbol_admission_block(
                 venue=venue,
                 symbol=symbol,
@@ -1586,6 +1609,20 @@ class EntryDispatchRuntime:
                 },
             )
         if not ok:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="entry_leverage_unavailable",
+                blocked_reasons=["entry_leverage_unavailable"],
+                source="entry_leverage_inspection",
+                decision="skip_before_first_leg",
+                extra={
+                    "failed_venues": failed_venues,
+                    "reason_by_venue": reason_by_venue,
+                    "target_leverage": target_leverage,
+                    "entry_notional_quote": notional_quote,
+                },
+            )
             self.ctx.journal.append(
                 "runtime.entry_blocked_gate",
                 {
@@ -1734,6 +1771,15 @@ class EntryDispatchRuntime:
                             "ts_ms": now_ms,
                         },
                     )
+                    self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        now_ms,
+                        reason=reason,
+                        blocked_reasons=[reason],
+                        source=source,
+                        decision="skip_before_first_leg",
+                        extra=extra_payload,
+                    )
                     return False
                 self.ctx.journal.append(
                     "runtime.entry_admission_precheck_rejected",
@@ -1746,6 +1792,18 @@ class EntryDispatchRuntime:
                         "pair_id": pair_id,
                         "raw_error": error_text[:500],
                         "ts_ms": now_ms,
+                    },
+                )
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason="entry_admission_precheck_rejected",
+                    blocked_reasons=["entry_admission_precheck_rejected"],
+                    source="entry_admission_precheck",
+                    decision="skip_before_first_leg",
+                    extra={
+                        "venue": venue.value,
+                        "raw_error": error_text[:500],
                     },
                 )
                 return False
@@ -1761,6 +1819,18 @@ class EntryDispatchRuntime:
                         "pair_id": pair_id,
                         "raw_error": str(exc)[:500],
                         "ts_ms": now_ms,
+                    },
+                )
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason="entry_admission_precheck_uncertain",
+                    blocked_reasons=["entry_admission_precheck_uncertain"],
+                    source="entry_admission_precheck",
+                    decision="skip_before_first_leg",
+                    extra={
+                        "venue": venue.value,
+                        "raw_error": str(exc)[:500],
                     },
                 )
                 return False
@@ -2554,6 +2624,27 @@ class EntryDispatchRuntime:
                 return str(binder(candidate) or "").strip()
         return ""
 
+    def _entry_quote_lease_max_skew_ms(self) -> int:
+        strategy = self.ctx.config.strategy
+        value = getattr(strategy, "entry_quote_lease_max_skew_ms", None)
+        if value is None:
+            value = getattr(strategy, "entry_final_gate_max_skew_ms", 0)
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(parsed, 0)
+
+    def _entry_final_gate_max_skew_ms(self) -> int:
+        try:
+            parsed = int(
+                getattr(self.ctx.config.strategy, "entry_final_gate_max_skew_ms", 0)
+                or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return max(parsed, 0)
+
     @staticmethod
     def _quote_lease_candidate_revision_mismatch(
         candidate_revision_id: str,
@@ -2683,24 +2774,17 @@ class EntryDispatchRuntime:
             ):
                 return blocked("stale_quote_lease", lease)
 
-        max_skew_ms = max(
-            int(
-                getattr(
-                    self.ctx.config.strategy,
-                    "entry_final_gate_max_skew_ms",
-                    0,
-                )
-                or 0
-            ),
-            0,
-        )
+        max_skew_ms = self._entry_quote_lease_max_skew_ms()
         quote_skew_ms = abs(
             int(evidence["long_observed_at_ms"] or 0)
             - int(evidence["short_observed_at_ms"] or 0)
         )
         evidence["quote_observation_skew_ms"] = quote_skew_ms
         evidence["quote_observation_max_skew_ms"] = max_skew_ms
-        if quote_skew_ms > max_skew_ms:
+        if quote_skew_ms > max_skew_ms and self._local_l2_effective_enabled():
+            evidence["quote_lease_skew_deferred"] = True
+            evidence["quote_lease_skew_deferred_to"] = "local_l2_final_gate"
+        elif quote_skew_ms > max_skew_ms:
             return blocked("quote_lease_skew_exceeded", lease)
 
         if (
@@ -2758,17 +2842,7 @@ class EntryDispatchRuntime:
                 or now_ms - observed_at_ms > max_age_ms
             ):
                 return "stale_final_quote_lease"
-        max_skew_ms = max(
-            int(
-                getattr(
-                    self.ctx.config.strategy,
-                    "entry_final_gate_max_skew_ms",
-                    0,
-                )
-                or 0
-            ),
-            0,
-        )
+        max_skew_ms = self._entry_final_gate_max_skew_ms()
         if abs(lease.long_observed_at_ms - lease.short_observed_at_ms) > max_skew_ms:
             return "final_quote_lease_skew_exceeded"
         if (
@@ -2875,7 +2949,7 @@ class EntryDispatchRuntime:
                 "right_observed_at_ms": short_observed_at_ms,
                 "ts_ms": now_ms,
             }
-        max_skew_ms = max(self.ctx.config.strategy.entry_final_gate_max_skew_ms, 0)
+        max_skew_ms = self._entry_final_gate_max_skew_ms()
         skew_ms = abs(long_observed_at_ms - short_observed_at_ms)
         if skew_ms <= max_skew_ms:
             return None
@@ -3152,6 +3226,22 @@ class EntryDispatchRuntime:
         decision: str,
         extra: dict | None = None,
     ) -> None:
+        raw_reason = str(reason or "")
+        normalized_reason = raw_reason or "entry_dispatch_reason_invariant_missing"
+        pair_id = self._candidate_pair_id(candidate)
+        if not raw_reason:
+            self.ctx.journal.append(
+                "entry.dispatch_reason_invariant_violation",
+                {
+                    "reason": normalized_reason,
+                    "source": source,
+                    "decision": decision,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "ts_ms": now_ms,
+                },
+            )
+        setattr(self.ctx, "_last_entry_dispatch_block_reason", normalized_reason)
         entry_id = str(
             getattr(candidate, "entry_id", "")
             or getattr(candidate, "internal_entry_id", "")
@@ -3159,7 +3249,9 @@ class EntryDispatchRuntime:
             or getattr(candidate, "position_id", "")
             or ""
         )
-        pair_id = self._candidate_pair_id(candidate)
+        normalized_blocked_reasons = [item for item in blocked_reasons if item]
+        if not normalized_blocked_reasons:
+            normalized_blocked_reasons = [normalized_reason]
         payload = {
             "entry_id": entry_id,
             "symbol": getattr(candidate, "symbol", ""),
@@ -3167,8 +3259,8 @@ class EntryDispatchRuntime:
             "short_venue": getattr(candidate, "short_venue", ""),
             "candidate_pair_id": pair_id,
             "pair_id": pair_id,
-            "reason": reason,
-            "blocked_reasons": [item for item in blocked_reasons if item],
+            "reason": normalized_reason,
+            "blocked_reasons": normalized_blocked_reasons,
             "source": source,
             "decision": decision,
             "ts_ms": now_ms,
@@ -3241,9 +3333,28 @@ class EntryDispatchRuntime:
         # A readiness provider may have supplied a REST/BBO lease. It is only
         # an eligibility check; live economics must still prefer the freshest
         # local depth snapshot for the requested common base quantity.
-        final_l2_quote_lease = self._local_l2_final_quote_lease(candidate, now_ms)
-        if final_l2_quote_lease is not None:
-            quote_lease = final_l2_quote_lease
+        final_l2_quote_result = self._local_l2_final_quote_result(candidate, now_ms)
+        if final_l2_quote_result.lease is not None:
+            quote_lease = final_l2_quote_result.lease
+        elif final_l2_quote_result.reason:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=final_l2_quote_result.reason,
+                blocked_reasons=[final_l2_quote_result.reason],
+                source="final_quote_lease",
+                decision="skip_dispatch",
+                extra=final_l2_quote_result.evidence,
+            )
+            self.ctx.journal.append(
+                "runtime.entry_blocked_final_quote_lease",
+                {
+                    **final_l2_quote_result.evidence,
+                    "reason": final_l2_quote_result.reason,
+                    "ts_ms": now_ms,
+                },
+            )
+            return None
         if quote_lease is not None:
             price_hint = self._quote_lease_reference_price(quote_lease)
             long_order_price_hint = float(
@@ -3296,42 +3407,279 @@ class EntryDispatchRuntime:
             return None
         return price_hint, long_order_price_hint, short_order_price_hint, quote_lease
 
-    def _local_l2_final_quote_lease(
+    def _local_l2_final_quote_result(
         self,
         candidate,
         now_ms: int,
         *,
         target_quantity: float | None = None,
-    ) -> QuoteLease | None:
-        """Build final executable BBO evidence from two fresh local L2 books."""
+    ) -> FinalQuoteLeaseResult:
+        """Build final executable BBO/L2 evidence or the exact block reason."""
+        pair_id = self._candidate_pair_id(candidate)
+        evidence: dict[str, Any] = {
+            "pair_id": pair_id,
+            "candidate_pair_id": pair_id,
+            "symbol": str(getattr(candidate, "symbol", "") or "").upper(),
+            "long_venue": str(getattr(candidate, "long_venue", "") or "").lower(),
+            "short_venue": str(getattr(candidate, "short_venue", "") or "").lower(),
+            "source": "local_l2_final_quote",
+            "domain": "final_quote_lease",
+            "candidate_revision_id": str(
+                getattr(candidate, "candidate_revision_id", "") or ""
+            ),
+        }
+
+        def fail(reason: str, **extra: Any) -> FinalQuoteLeaseResult:
+            payload = dict(evidence)
+            payload.update(extra)
+            payload["reason"] = reason
+            try:
+                payload["blocker_family"] = self._quote_lease_blocker_family(reason)
+            except AttributeError:
+                payload["blocker_family"] = "final_quote"
+            return FinalQuoteLeaseResult(reason=reason, evidence=payload)
+
         if (
             self.ctx.config.runtime.mode != "live"
             or not self._local_l2_effective_enabled()
         ):
-            return None
+            return FinalQuoteLeaseResult(evidence=evidence)
 
-        symbol = str(getattr(candidate, "symbol", "") or "").upper()
-        long_venue = str(getattr(candidate, "long_venue", "") or "").lower()
-        short_venue = str(getattr(candidate, "short_venue", "") or "").lower()
+        symbol = evidence["symbol"]
+        long_venue = evidence["long_venue"]
+        short_venue = evidence["short_venue"]
         if not symbol or not long_venue or not short_venue:
-            return None
-        max_age_ms = max(self.ctx.config.strategy.max_liquidity_snapshot_age_ms, 0)
-        snapshots = self._local_l2_execution_snapshots(
-            symbol=symbol,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            now_ms=now_ms,
-            max_age_ms=max_age_ms,
+            return fail("final_quote_invalid_identity")
+        max_age_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.strategy,
+                    "max_liquidity_snapshot_age_ms",
+                    0,
+                )
+                or 0
+            ),
+            0,
         )
-        if snapshots is None:
-            return None
-        long_snapshot, short_snapshot = snapshots
+        evidence["max_age_ms"] = max_age_ms
+        if max_age_ms <= 0:
+            return fail("final_quote_invalid_max_age")
+        long_book = self.ctx.local_l2_runtime.get_book(long_venue, symbol)
+        short_book = self.ctx.local_l2_runtime.get_book(short_venue, symbol)
+        evidence.update(
+            {
+                "long_book_present": long_book is not None,
+                "short_book_present": short_book is not None,
+            }
+        )
+        if long_book is None or short_book is None:
+            missing_legs = []
+            if long_book is None:
+                missing_legs.append("long")
+            if short_book is None:
+                missing_legs.append("short")
+            return fail("final_quote_missing_book", missing_legs=missing_legs)
+
+        def _book_evidence(leg: str, book: Any) -> None:
+            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+            status = getattr(
+                getattr(book, "status", ""),
+                "value",
+                getattr(book, "status", ""),
+            )
+            evidence.update(
+                {
+                    f"{leg}_book_status": str(status),
+                    f"{leg}_observed_at_ms": observed_at_ms,
+                    f"{leg}_age_ms": (
+                        max(now_ms - observed_at_ms, 0)
+                        if observed_at_ms > 0
+                        else None
+                    ),
+                    f"{leg}_sequence": int(getattr(book, "sequence", 0) or 0),
+                    f"{leg}_last_update_id": int(
+                        getattr(book, "last_update_id", 0) or 0
+                    ),
+                }
+            )
+
+        _book_evidence("long", long_book)
+        _book_evidence("short", short_book)
+        not_hot_legs = [
+            leg
+            for leg in ("long", "short")
+            if evidence[f"{leg}_book_status"] != "hot"
+        ]
+        if not_hot_legs:
+            return fail("final_quote_book_not_hot", not_ready_legs=not_hot_legs)
+        future_legs = [
+            leg
+            for leg in ("long", "short")
+            if int(evidence[f"{leg}_observed_at_ms"] or 0) > now_ms
+        ]
+        if future_legs:
+            return fail(
+                "final_quote_book_timestamp_after_now",
+                clock_skew=True,
+                future_legs=future_legs,
+            )
+        stale_legs = [
+            leg
+            for leg in ("long", "short")
+            if (
+                int(evidence[f"{leg}_observed_at_ms"] or 0) <= 0
+                or evidence[f"{leg}_age_ms"] is None
+                or int(evidence[f"{leg}_age_ms"] or 0) > max_age_ms
+            )
+        ]
+        if stale_legs:
+            return fail("final_quote_book_stale", stale_legs=stale_legs)
+
+        def raw_top(
+            leg: str,
+            book: Any,
+        ) -> tuple[float, float, float, float] | FinalQuoteLeaseResult | None:
+            bids = getattr(book, "bids", None)
+            asks = getattr(book, "asks", None)
+            if (
+                not isinstance(bids, list)
+                or not isinstance(asks, list)
+                or not bids
+                or not asks
+            ):
+                return None
+            bid = bids[0]
+            ask = asks[0]
+            try:
+                bid_price = float(getattr(bid, "price", 0.0) or 0.0)
+                ask_price = float(getattr(ask, "price", 0.0) or 0.0)
+                bid_quantity = float(getattr(bid, "quantity", 0.0) or 0.0)
+                ask_quantity = float(getattr(ask, "quantity", 0.0) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return fail("final_quote_invalid_price", invalid_legs=[leg])
+            return bid_price, ask_price, bid_quantity, ask_quantity
+
+        long_top = raw_top("long", long_book)
+        short_top = raw_top("short", short_book)
+        if isinstance(long_top, FinalQuoteLeaseResult):
+            return long_top
+        if isinstance(short_top, FinalQuoteLeaseResult):
+            return short_top
+        if long_top is None or short_top is None:
+            missing_depth_legs = []
+            if long_top is None:
+                missing_depth_legs.append("long")
+            if short_top is None:
+                missing_depth_legs.append("short")
+            return fail(
+                "final_quote_invalid_depth",
+                missing_depth_legs=missing_depth_legs,
+            )
+        (
+            long_bid_price,
+            long_ask_price,
+            long_bid_quantity,
+            long_ask_quantity,
+        ) = long_top
+        (
+            short_bid_price,
+            short_ask_price,
+            short_bid_quantity,
+            short_ask_quantity,
+        ) = short_top
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (
+                long_bid_price,
+                long_ask_price,
+                short_bid_price,
+                short_ask_price,
+            )
+        ):
+            return fail("final_quote_invalid_price")
+        if long_bid_price >= long_ask_price or short_bid_price >= short_ask_price:
+            return fail("final_quote_crossed_book")
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (
+                long_bid_quantity,
+                long_ask_quantity,
+                short_bid_quantity,
+                short_ask_quantity,
+            )
+        ):
+            return fail("final_quote_invalid_depth")
+
+        long_snapshot = execution_liquidity_from_local_l2(
+            long_book,
+            max_age_ms=max_age_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        short_snapshot = execution_liquidity_from_local_l2(
+            short_book,
+            max_age_ms=max_age_ms,
+            now_ms=now_ms,
+            require_ready=True,
+        )
+        evidence.update(
+            {
+                "long_liquidity_source": long_snapshot.source,
+                "short_liquidity_source": short_snapshot.source,
+                "long_liquidity_reason": long_snapshot.fallback_reason,
+                "short_liquidity_reason": short_snapshot.fallback_reason,
+            }
+        )
+        if not long_snapshot.book_ready or not short_snapshot.book_ready:
+            reasons = {
+                leg: snapshot.fallback_reason
+                for leg, snapshot in (
+                    ("long", long_snapshot),
+                    ("short", short_snapshot),
+                )
+                if not snapshot.book_ready
+            }
+            if any(
+                "book_invalid_for_execution_liquidity" in reason
+                for reason in reasons.values()
+            ):
+                return fail("final_quote_invalid_book", invalid_legs=list(reasons))
+            return fail("final_quote_book_not_hot", not_ready_legs=list(reasons))
+
         long_observed_at_ms = long_snapshot.observed_at_ms
         short_observed_at_ms = short_snapshot.observed_at_ms
-        long_bid = long_snapshot.bids[0].price
-        long_ask = long_snapshot.asks[0].price
-        short_bid = short_snapshot.bids[0].price
-        short_ask = short_snapshot.asks[0].price
+        if (
+            not long_snapshot.bids
+            or not long_snapshot.asks
+            or not short_snapshot.bids
+            or not short_snapshot.asks
+        ):
+            return fail("final_quote_invalid_depth")
+        long_bid = float(long_snapshot.bids[0].price)
+        long_ask = float(long_snapshot.asks[0].price)
+        short_bid = float(short_snapshot.bids[0].price)
+        short_ask = float(short_snapshot.asks[0].price)
+        evidence.update(
+            {
+                "long_bid": long_bid,
+                "long_ask": long_ask,
+                "short_bid": short_bid,
+                "short_ask": short_ask,
+            }
+        )
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (long_bid, long_ask, short_bid, short_ask)
+        ):
+            return fail("final_quote_invalid_price")
+        if long_bid >= long_ask or short_bid >= short_ask:
+            return fail("final_quote_crossed_book")
+        final_gate_max_skew_ms = self._entry_final_gate_max_skew_ms()
+        final_l2_skew_ms = abs(long_observed_at_ms - short_observed_at_ms)
+        evidence["final_l2_observation_skew_ms"] = final_l2_skew_ms
+        evidence["final_l2_observation_max_skew_ms"] = final_gate_max_skew_ms
+        if final_l2_skew_ms > final_gate_max_skew_ms:
+            return fail("execution_skew")
 
         def top_level_quantity(level: object) -> float:
             raw_quantity = getattr(level, "quantity", None)
@@ -3345,15 +3693,71 @@ class EntryDispatchRuntime:
                 return 0.0
             return max(quantity, 0.0)
 
-        requested_quantity = max(
-            float(
+        try:
+            requested_quantity = float(
                 target_quantity
                 if target_quantity is not None
                 else getattr(candidate, "entry_target_quantity", 0.0)
+            ) or 0.0
+        except (TypeError, ValueError, OverflowError):
+            requested_quantity = 0.0
+        requested_quantity = max(requested_quantity, 0.0)
+        exact_quantity_required = target_quantity is not None
+        long_l2_capacity = _l2_base_capacity(long_snapshot.asks)
+        short_l2_capacity = _l2_base_capacity(short_snapshot.bids)
+        evidence["requested_base_quantity"] = requested_quantity
+        evidence["exact_quantity_required"] = exact_quantity_required
+        if requested_quantity <= 0.0:
+            if exact_quantity_required:
+                return fail("final_quote_invalid_quantity")
+            evidence.update(
+                {
+                    "long_buy_vwap": 0.0,
+                    "short_sell_vwap": 0.0,
+                    "long_buy_sweep_limit": 0.0,
+                    "short_sell_sweep_limit": 0.0,
+                    "long_l2_filled_base_quantity": 0.0,
+                    "short_l2_filled_base_quantity": 0.0,
+                    "long_l2_capacity_quantity": long_l2_capacity,
+                    "short_l2_capacity_quantity": short_l2_capacity,
+                    "l2_vwap_quantity": 0.0,
+                    "l2_vwap_complete": False,
+                    "route_has_complete_depth": False,
+                    "early_eligibility_without_quantity": True,
+                }
             )
-            or 0.0,
-            0.0,
-        )
+            lease = QuoteLease(
+                pair_id=self._candidate_pair_id(candidate),
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+                long_bid=long_bid,
+                long_ask=long_ask,
+                short_bid=short_bid,
+                short_ask=short_ask,
+                long_observed_at_ms=long_observed_at_ms,
+                short_observed_at_ms=short_observed_at_ms,
+                created_at_ms=now_ms,
+                expires_at_ms=now_ms + max_age_ms,
+                long_bid_size=top_level_quantity(long_snapshot.bids[0]),
+                long_ask_size=top_level_quantity(long_snapshot.asks[0]),
+                short_bid_size=top_level_quantity(short_snapshot.bids[0]),
+                short_ask_size=top_level_quantity(short_snapshot.asks[0]),
+                provider="local_l2_final_vwap",
+                candidate_revision_id=str(
+                    getattr(candidate, "candidate_revision_id", "") or ""
+                ),
+                long_buy_vwap=0.0,
+                short_sell_vwap=0.0,
+                long_buy_sweep_limit=0.0,
+                short_sell_sweep_limit=0.0,
+                long_l2_capacity_quantity=long_l2_capacity,
+                short_l2_capacity_quantity=short_l2_capacity,
+                l2_vwap_quantity=0.0,
+                l2_vwap_complete=False,
+            )
+            evidence["lease_provider"] = lease.provider
+            return FinalQuoteLeaseResult(lease=lease, evidence=evidence)
         (
             long_buy_vwap,
             long_vwap_filled,
@@ -3373,7 +3777,53 @@ class EntryDispatchRuntime:
             and long_vwap_filled + 1e-12 >= requested_quantity
             and short_vwap_filled + 1e-12 >= requested_quantity
         )
-        return QuoteLease(
+        planned_maker_leg = str(
+            getattr(candidate, "entry_maker_leg", "") or ""
+        ).lower()
+        long_maker_route_complete = (
+            planned_maker_leg in {"long", "short"}
+            and long_bid_quantity + 1e-12 >= requested_quantity
+            and short_l2_capacity + 1e-12 >= requested_quantity
+            and short_sell_vwap > 0.0
+        )
+        short_maker_route_complete = (
+            planned_maker_leg in {"long", "short"}
+            and short_ask_quantity + 1e-12 >= requested_quantity
+            and long_l2_capacity + 1e-12 >= requested_quantity
+            and long_buy_vwap > 0.0
+        )
+        route_has_complete_depth = (
+            l2_vwap_complete
+            or long_maker_route_complete
+            or short_maker_route_complete
+        )
+        evidence.update(
+            {
+                "long_buy_vwap": long_buy_vwap,
+                "short_sell_vwap": short_sell_vwap,
+                "long_buy_sweep_limit": long_buy_sweep_limit,
+                "short_sell_sweep_limit": short_sell_sweep_limit,
+                "long_l2_filled_base_quantity": long_vwap_filled,
+                "short_l2_filled_base_quantity": short_vwap_filled,
+                "long_l2_capacity_quantity": long_l2_capacity,
+                "short_l2_capacity_quantity": short_l2_capacity,
+                "l2_vwap_quantity": requested_quantity,
+                "l2_vwap_complete": l2_vwap_complete,
+                "planned_entry_maker_leg": planned_maker_leg,
+                "long_maker_route_complete": long_maker_route_complete,
+                "short_maker_route_complete": short_maker_route_complete,
+                "route_has_complete_depth": route_has_complete_depth,
+            }
+        )
+        if (
+            long_buy_vwap <= 0.0
+            or short_sell_vwap <= 0.0
+            or long_buy_sweep_limit <= 0.0
+            or short_sell_sweep_limit <= 0.0
+            or not route_has_complete_depth
+        ):
+            return fail("final_quote_insufficient_l2_depth")
+        lease = QuoteLease(
             pair_id=self._candidate_pair_id(candidate),
             symbol=symbol,
             long_venue=long_venue,
@@ -3398,15 +3848,26 @@ class EntryDispatchRuntime:
             short_sell_vwap=short_sell_vwap,
             long_buy_sweep_limit=long_buy_sweep_limit,
             short_sell_sweep_limit=short_sell_sweep_limit,
-            long_l2_capacity_quantity=_l2_base_capacity(
-                long_snapshot.asks
-            ),
-            short_l2_capacity_quantity=_l2_base_capacity(
-                short_snapshot.bids
-            ),
+            long_l2_capacity_quantity=long_l2_capacity,
+            short_l2_capacity_quantity=short_l2_capacity,
             l2_vwap_quantity=requested_quantity,
             l2_vwap_complete=l2_vwap_complete,
         )
+        evidence["lease_provider"] = lease.provider
+        return FinalQuoteLeaseResult(lease=lease, evidence=evidence)
+
+    def _local_l2_final_quote_lease(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        target_quantity: float | None = None,
+    ) -> QuoteLease | None:
+        return self._local_l2_final_quote_result(
+            candidate,
+            now_ms,
+            target_quantity=target_quantity,
+        ).lease
 
     def _capture_entry_execution_benchmark_receipt(
         self,
@@ -3489,6 +3950,122 @@ class EntryDispatchRuntime:
                 "available_base_quantity": short_capacity,
                 "observed_at_ms": short_observed_at_ms,
                 "age_ms": captured_at_ms - short_observed_at_ms,
+            },
+        }
+
+    def _final_entry_revalidation_evidence(
+        self,
+        *,
+        candidate,
+        quote_lease: QuoteLease | None,
+        required_quantity: float,
+        final_economics,
+        source: str,
+    ) -> dict[str, Any]:
+        edge = final_economics.edge
+        strategy = self.ctx.config.strategy
+
+        def safe_float(value: object) -> float:
+            try:
+                parsed = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return parsed if math.isfinite(parsed) else 0.0
+
+        candidate_quantity = max(
+            safe_float(getattr(candidate, "entry_target_quantity", 0.0)),
+            0.0,
+        )
+        lease_quantity = max(
+            safe_float(getattr(quote_lease, "l2_vwap_quantity", 0.0)),
+            0.0,
+        )
+        final_quantity = max(safe_float(required_quantity), 0.0)
+        min_expected_edge_bps = safe_float(
+            getattr(strategy, "min_expected_edge_bps", 0.0)
+        )
+        min_worst_case_edge_bps = safe_float(
+            getattr(strategy, "min_worst_case_edge_bps", 0.0)
+        )
+        worst_case_funding_edge_bps = (
+            safe_float(getattr(candidate, "forecast_worst_funding_edge_bps", 0.0))
+            if str(getattr(candidate, "calculation_version", "") or "")
+            == "enhanced_live"
+            else safe_float(edge.funding_edge_bps)
+        )
+        return {
+            "source": source,
+            "candidate_revision_id": str(
+                getattr(candidate, "candidate_revision_id", "") or ""
+            ),
+            "calculation_version": edge.calculation_version,
+            "model_epoch": edge.model_epoch,
+            "economics_observed_at_ms": edge.observed_at_ms,
+            "economics_complete": edge.economics_complete,
+            "requested_base_quantity": candidate_quantity,
+            "aligned_base_quantity": lease_quantity,
+            "final_base_quantity": final_quantity,
+            "quote_lease_provider": str(
+                getattr(quote_lease, "provider", "") or ""
+            ),
+            "quote_lease_candidate_revision_id": str(
+                getattr(quote_lease, "candidate_revision_id", "") or ""
+            ),
+            "long_bid": safe_float(getattr(quote_lease, "long_bid", 0.0)),
+            "long_ask": safe_float(getattr(quote_lease, "long_ask", 0.0)),
+            "short_bid": safe_float(getattr(quote_lease, "short_bid", 0.0)),
+            "short_ask": safe_float(getattr(quote_lease, "short_ask", 0.0)),
+            "long_observed_at_ms": int(
+                getattr(quote_lease, "long_observed_at_ms", 0) or 0
+            ),
+            "short_observed_at_ms": int(
+                getattr(quote_lease, "short_observed_at_ms", 0) or 0
+            ),
+            "long_buy_vwap": safe_float(getattr(quote_lease, "long_buy_vwap", 0.0)),
+            "short_sell_vwap": safe_float(
+                getattr(quote_lease, "short_sell_vwap", 0.0)
+            ),
+            "final_long_entry_price": safe_float(final_economics.long_entry_price),
+            "final_short_entry_price": safe_float(final_economics.short_entry_price),
+            "long_l2_capacity_quantity": safe_float(
+                getattr(quote_lease, "long_l2_capacity_quantity", 0.0)
+            ),
+            "short_l2_capacity_quantity": safe_float(
+                getattr(quote_lease, "short_l2_capacity_quantity", 0.0)
+            ),
+            "l2_vwap_complete": (
+                getattr(quote_lease, "l2_vwap_complete", False) is True
+            ),
+            "l2_entry_slippage_bps": final_economics.l2_entry_slippage_bps,
+            "gross_signal_edge_bps": edge.gross_signal_edge_bps,
+            "funding_edge_bps": edge.funding_edge_bps,
+            "worst_case_funding_edge_bps": worst_case_funding_edge_bps,
+            "entry_cross_bps": edge.entry_cross_bps,
+            "expected_exit_cross_bps": edge.expected_exit_cross_bps,
+            "entry_fee_bps": edge.entry_fee_bps,
+            "exit_fee_bps": edge.exit_fee_bps,
+            "entry_slippage_bps": edge.entry_slippage_bps,
+            "exit_slippage_bps": edge.exit_slippage_bps,
+            "adverse_selection_bps": edge.adverse_selection_bps,
+            "capital_buffer_bps": edge.capital_buffer_bps,
+            "execution_buffer_bps": edge.execution_buffer_bps,
+            "venue_risk_haircut_bps": edge.venue_risk_haircut_bps,
+            "transfer_or_inventory_bias_bps": edge.transfer_or_inventory_bias_bps,
+            "final_expected_net_edge_bps": edge.expected_net_edge_bps,
+            "final_worst_case_edge_bps": edge.worst_case_edge_bps,
+            "expected_net_edge_bps": edge.expected_net_edge_bps,
+            "worst_case_edge_bps": edge.worst_case_edge_bps,
+            "min_expected_edge_bps": min_expected_edge_bps,
+            "min_worst_case_edge_bps": min_worst_case_edge_bps,
+            "expected_edge_floor_delta_bps": (
+                edge.expected_net_edge_bps - min_expected_edge_bps
+            ),
+            "worst_edge_floor_delta_bps": (
+                edge.worst_case_edge_bps - min_worst_case_edge_bps
+            ),
+            "threshold_metadata": {
+                "min_expected_edge_bps": min_expected_edge_bps,
+                "min_worst_case_edge_bps": min_worst_case_edge_bps,
             },
         }
 
@@ -3695,22 +4272,13 @@ class EntryDispatchRuntime:
                 blocked_reasons=[final_economics.reason],
                 source=source,
                 decision="skip_before_first_leg",
-                extra={
-                    "expected_net_edge_bps": final_economics.edge.expected_net_edge_bps,
-                    "worst_case_edge_bps": final_economics.edge.worst_case_edge_bps,
-                    "calculation_version": final_economics.edge.calculation_version,
-                    "model_epoch": final_economics.edge.model_epoch,
-                    "economics_complete": final_economics.edge.economics_complete,
-                    "long_ask": final_economics.long_entry_price,
-                    "short_bid": final_economics.short_entry_price,
-                    "l2_entry_slippage_bps": final_economics.l2_entry_slippage_bps,
-                    "l2_vwap_complete": (
-                        getattr(quote_lease, "l2_vwap_complete", False) is True
-                    ),
-                    "l2_vwap_quantity": float(
-                        getattr(quote_lease, "l2_vwap_quantity", 0.0) or 0.0
-                    ),
-                },
+                extra=self._final_entry_revalidation_evidence(
+                    candidate=candidate,
+                    quote_lease=quote_lease,
+                    required_quantity=required_quantity,
+                    final_economics=final_economics,
+                    source=source,
+                ),
             )
             return False
 
@@ -3787,17 +4355,27 @@ class EntryDispatchRuntime:
             getattr(candidate, "entry_max_executable_quantity", 0.0) or 0.0
         )
         if entry_capacity > 0.0 and raw_quantity - entry_capacity > 1e-9:
+            payload = {
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "requested_quantity": raw_quantity,
+                "entry_max_executable_quantity": entry_capacity,
+                "reason": "common_base_capacity_exceeded",
+                "ts_ms": now_ms,
+            }
             self.ctx.journal.append(
                 "runtime.entry_skipped_allocator_capacity_exceeded",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "requested_quantity": raw_quantity,
-                    "entry_max_executable_quantity": entry_capacity,
-                    "reason": "common_base_capacity_exceeded",
-                    "ts_ms": now_ms,
-                },
+                payload,
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="common_base_capacity_exceeded",
+                blocked_reasons=["common_base_capacity_exceeded"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
+                extra=payload,
             )
             return None
         quantity = raw_quantity
@@ -3809,30 +4387,50 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
         )
         if okx_base_step is None:
+            payload = {
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "raw_quantity": raw_quantity,
+                "reason": "okx_ct_val_lot_sz_unconfirmed",
+                "ts_ms": now_ms,
+            }
             self.ctx.journal.append(
                 "runtime.entry_skipped_okx_contract_metadata_missing",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "raw_quantity": raw_quantity,
-                    "reason": "okx_ct_val_lot_sz_unconfirmed",
-                    "ts_ms": now_ms,
-                },
+                payload,
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="okx_ct_val_lot_sz_unconfirmed",
+                blocked_reasons=["okx_ct_val_lot_sz_unconfirmed"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
+                extra=payload,
             )
             return None
         if quantity <= 0:
+            payload = {
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "okx_base_quantity_step": okx_base_step,
+                "raw_quantity": raw_quantity,
+                "reason": "quantity_below_okx_contract_step",
+                "ts_ms": now_ms,
+            }
             self.ctx.journal.append(
                 "runtime.entry_skipped_okx_contract_step",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "okx_base_quantity_step": okx_base_step,
-                    "raw_quantity": raw_quantity,
-                    "reason": "quantity_below_okx_contract_step",
-                    "ts_ms": now_ms,
-                },
+                payload,
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="quantity_below_okx_contract_step",
+                blocked_reasons=["quantity_below_okx_contract_step"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
+                extra=payload,
             )
             return None
 
@@ -3868,19 +4466,29 @@ class EntryDispatchRuntime:
                 missing_fields[short_venue.value] = (
                     short_missing_quantity_fields or ["quantity_step"]
                 )
+            payload = {
+                "symbol": candidate.symbol,
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "missing_venues": missing_venues,
+                "missing_fields": missing_fields,
+                "raw_quantity": raw_quantity,
+                "common_quantity": quantity,
+                "reason": "quantity_metadata_missing",
+                "ts_ms": now_ms,
+            }
             self.ctx.journal.append(
                 "runtime.entry_skipped_quantity_metadata_missing",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "missing_venues": missing_venues,
-                    "missing_fields": missing_fields,
-                    "raw_quantity": raw_quantity,
-                    "common_quantity": quantity,
-                    "reason": "quantity_metadata_missing",
-                    "ts_ms": now_ms,
-                },
+                payload,
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="quantity_metadata_missing",
+                blocked_reasons=["quantity_metadata_missing"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
+                extra=payload,
             )
             return None
         long_quantity_metadata = await self._entry_venue_quantity_metadata_evidence(
@@ -3928,6 +4536,14 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="common_base_quantity_grid_invalid",
+                blocked_reasons=["common_base_quantity_grid_invalid"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
+            )
             return None
         quantity = _align_base_quantity_down(quantity, common_base_quantity_step)
         if quantity <= 0.0:
@@ -3952,6 +4568,14 @@ class EntryDispatchRuntime:
                     "reason": "quantity_below_common_base_quantity_step",
                     "ts_ms": now_ms,
                 },
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="quantity_below_common_base_quantity_step",
+                blocked_reasons=["quantity_below_common_base_quantity_step"],
+                source="entry_quantity_resolution",
+                decision="skip_before_first_leg",
             )
             return None
         return (
@@ -4085,8 +4709,19 @@ class EntryDispatchRuntime:
                 (l2_stale_decisions[0] if l2_stale_decisions else {}).get("l2_reason")
                 or "execution_l2_stale"
             )
-            setattr(self.ctx, "_last_entry_dispatch_block_reason", first_l2_reason)
             setattr(self.ctx, "_last_entry_dispatch_block_l2_reason", first_l2_reason)
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=first_l2_reason,
+                blocked_reasons=[first_l2_reason],
+                source="entry_local_l2_readiness",
+                decision="skip_dispatch",
+                extra={
+                    "l2_stale_decisions": l2_stale_decisions,
+                    "not_ready_reasons": not_ready_reasons,
+                },
+            )
             for payload in l2_stale_decisions:
                 payload = dict(payload)
                 payload["reason_bucket"] = str(
@@ -4120,6 +4755,15 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
         )
         if skew_blocker is not None:
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=str(skew_blocker.get("reason") or "execution_skew"),
+                blocked_reasons=[str(skew_blocker.get("reason") or "execution_skew")],
+                source="entry_final_gate",
+                decision="skip_dispatch",
+                extra=dict(skew_blocker),
+            )
             self.ctx.journal.append("runtime.entry_blocked_final_gate", skew_blocker)
             self.ctx.journal.append(
                 "review.candidate_rejected",
@@ -4365,6 +5009,21 @@ class EntryDispatchRuntime:
             return False
         deadline_ms = self._selected_submit_deadline_ms()
         candidate_pair_id = self._candidate_pair_id(candidate)
+        deadline_ts_ms = int(selected_at_ms) + deadline_ms
+        self._emit_entry_dispatch_viability_blocked(
+            candidate,
+            deadline_ts_ms,
+            reason="selected_submit_deadline_exceeded",
+            blocked_reasons=["selected_submit_deadline_exceeded"],
+            source="selected_submit_deadline",
+            decision="skip_before_first_leg",
+            extra={
+                "deadline_ms": deadline_ms,
+                "blocking_stage": stage,
+                "blocking_domain": "entry_dispatch",
+                "blocking_status": "timeout",
+            },
+        )
         self.ctx.journal.append(
             "runtime.entry_selected_submit_deadline_exceeded",
             {
@@ -4377,7 +5036,7 @@ class EntryDispatchRuntime:
                 "blocking_status": "timeout",
                 "blocking_reason": "selected_submit_deadline_exceeded",
                 "reason": "selected_submit_deadline_exceeded",
-                "ts_ms": int(selected_at_ms) + deadline_ms,
+                "ts_ms": deadline_ts_ms,
             },
         )
         self.ctx.journal.append(
@@ -4390,7 +5049,7 @@ class EntryDispatchRuntime:
                 "short_venue": str(getattr(candidate, "short_venue", "") or ""),
                 "rejected_stage": stage,
                 "rejected_reason": "selected_submit_deadline_exceeded",
-                "ts_ms": int(selected_at_ms) + deadline_ms,
+                "ts_ms": deadline_ts_ms,
             },
         )
         return True
@@ -4677,6 +5336,16 @@ class EntryDispatchRuntime:
                     - 0.05
                 )
                 if leverage_budget_s <= 0.0:
+                    self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        executor_submit_now_ms,
+                        reason="entry_leverage_prepare_deadline_exceeded",
+                        blocked_reasons=[
+                            "entry_leverage_prepare_deadline_exceeded"
+                        ],
+                        source="entry_leverage_prepare",
+                        decision="skip_before_first_leg",
+                    )
                     return False
             else:
                 leverage_budget_s = None
@@ -4714,6 +5383,15 @@ class EntryDispatchRuntime:
                 )
                 return False
             if not leverage_ready:
+                if not str(getattr(self.ctx, "_last_entry_dispatch_block_reason", "") or ""):
+                    self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        executor_submit_now_ms,
+                        reason="entry_leverage_prepare_failed",
+                        blocked_reasons=["entry_leverage_prepare_failed"],
+                        source="entry_leverage_prepare",
+                        decision="skip_before_first_leg",
+                    )
                 return False
             result = await self._execute_entry_with_selected_deadline(
                 ctx=ctx,
@@ -4723,6 +5401,16 @@ class EntryDispatchRuntime:
                 selected_deadline_monotonic=selected_deadline_monotonic,
             )
             if result is None:
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    int(selected_at_ms or executor_submit_now_ms)
+                    + self._selected_submit_deadline_ms(),
+                    reason="no_submit_or_order_evidence",
+                    blocked_reasons=["no_submit_or_order_evidence"],
+                    source="selected_submit_deadline",
+                    decision="skip_before_first_leg",
+                    extra={"entry_id": ctx.entry_id},
+                )
                 return False
             self.ctx.journal.append(
                 "runtime.entry_dispatched",
@@ -4773,6 +5461,15 @@ class EntryDispatchRuntime:
                             "symbol": ctx.symbol,
                             "reason": "terminal_entry_residual_unregistered",
                         },
+                    )
+                    self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        now_ms,
+                        reason="terminal_entry_residual_unregistered",
+                        blocked_reasons=["terminal_entry_residual_unregistered"],
+                        source="entry_residual_queue",
+                        decision="skip_after_first_leg",
+                        extra={"entry_id": ctx.entry_id},
                     )
                     return False
                 queue_residual(
@@ -4958,13 +5655,62 @@ class EntryDispatchRuntime:
             long_quantity_metadata,
             short_quantity_metadata,
         ) = quantity_resolution
+        try:
+            original_entry_target_quantity = float(
+                getattr(candidate, "entry_target_quantity", 0.0) or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            original_entry_target_quantity = 0.0
+        quantity = max(float(quantity or 0.0), 0.0)
+        if (
+            self.ctx.config.runtime.mode == "live"
+            and original_entry_target_quantity <= 0.0
+            and quantity > 0.0
+        ):
+            setattr(candidate, "entry_target_quantity", quantity)
+            try:
+                previous_max_executable_quantity = float(
+                    getattr(candidate, "entry_max_executable_quantity", 0.0)
+                    or 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                previous_max_executable_quantity = 0.0
+            if previous_max_executable_quantity <= 0.0:
+                setattr(candidate, "entry_max_executable_quantity", quantity)
+            setattr(
+                candidate,
+                "entry_requested_target_quantity_before_resolution",
+                original_entry_target_quantity,
+            )
+            self.ctx.journal.append(
+                "runtime.entry_legacy_target_quantity_resolved",
+                {
+                    "symbol": str(getattr(candidate, "symbol", "") or ""),
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "candidate_pair_id": self._candidate_pair_id(candidate),
+                    "pair_id": self._candidate_pair_id(candidate),
+                    "requested_entry_target_quantity": (
+                        original_entry_target_quantity
+                    ),
+                    "raw_quantity": raw_quantity,
+                    "aligned_common_quantity": quantity,
+                    "previous_entry_max_executable_quantity": (
+                        previous_max_executable_quantity
+                    ),
+                    "entry_notional_quote": float(
+                        getattr(candidate, "entry_notional_quote", 0.0) or 0.0
+                    ),
+                    "ts_ms": now_ms,
+                },
+            )
         # Private margin and portfolio limits are live-entry checks only.
         # Recovery, passive close and residual repair do not pass through
         # this branch.  The retired expected-shortfall model deliberately has
         # no influence on size or admission here.
         live_candidate = (
             self.ctx.config.runtime.mode == "live"
-            and float(getattr(candidate, "entry_target_quantity", 0.0) or 0.0) > 0.0
+            and quantity > 0.0
         )
         leverage_evidence_for_sizing: dict[Venue, EntryLeverageEvidence] = {}
         if live_candidate:
@@ -5021,6 +5767,15 @@ class EntryDispatchRuntime:
             ):
                 return False
             if not leverage_ready:
+                if not str(getattr(self.ctx, "_last_entry_dispatch_block_reason", "") or ""):
+                    self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        now_ms,
+                        reason="entry_leverage_unavailable",
+                        blocked_reasons=["entry_leverage_unavailable"],
+                        source="entry_leverage_inspection",
+                        decision="skip_before_first_leg",
+                    )
                 return False
             margin_resolution = await self._resolve_live_margin_quantity(
                 candidate=candidate,
@@ -5139,6 +5894,16 @@ class EntryDispatchRuntime:
         for gate_name, gate_fn in gate_checks:
             allowed, reason = gate_fn(candidate, now_ms) if gate_name in ("venue_cooldown", "zero_fill_cooldown") else gate_fn(candidate)
             if not allowed:
+                block_reason = reason or gate_name
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason=block_reason,
+                    blocked_reasons=[block_reason],
+                    source="dispatch_runtime_gate",
+                    decision="skip_before_first_leg",
+                    extra={"gate": gate_name},
+                )
                 self.ctx.journal.append(
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
@@ -5259,27 +6024,37 @@ class EntryDispatchRuntime:
                 ),
             )
         except ValueError:
+            payload = {
+                "symbol": candidate.symbol,
+                "maker_venue": (
+                    long_venue.value
+                    if maker_leg == Side.BUY
+                    else short_venue.value
+                ),
+                "hedge_venue": (
+                    short_venue.value
+                    if maker_leg == Side.BUY
+                    else long_venue.value
+                ),
+                "maker_min_notional_quote": maker_min_notional,
+                "hedge_min_notional_quote": hedge_min_notional,
+                "hedge_min_quantity": hedge_min_quantity,
+                "common_base_quantity_step": common_base_quantity_step,
+                "reason": "min_hedgeable_chunk_invalid",
+                "ts_ms": now_ms,
+            }
             self.ctx.journal.append(
                 "runtime.entry_skipped_planner_metadata_invalid",
-                {
-                    "symbol": candidate.symbol,
-                    "maker_venue": (
-                        long_venue.value
-                        if maker_leg == Side.BUY
-                        else short_venue.value
-                    ),
-                    "hedge_venue": (
-                        short_venue.value
-                        if maker_leg == Side.BUY
-                        else long_venue.value
-                    ),
-                    "maker_min_notional_quote": maker_min_notional,
-                    "hedge_min_notional_quote": hedge_min_notional,
-                    "hedge_min_quantity": hedge_min_quantity,
-                    "common_base_quantity_step": common_base_quantity_step,
-                    "reason": "min_hedgeable_chunk_invalid",
-                    "ts_ms": now_ms,
-                },
+                payload,
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="min_hedgeable_chunk_invalid",
+                blocked_reasons=["min_hedgeable_chunk_invalid"],
+                source="entry_execution_planner",
+                decision="skip_before_first_leg",
+                extra=payload,
             )
             return False
 
@@ -5295,13 +6070,23 @@ class EntryDispatchRuntime:
         )
 
         if route == ExecutionRoute.REJECTED:
+            plan_reason = str(plan.reason or "planner_rejected_entry")
             self.ctx.journal.append(
                 "runtime.entry_skipped_planner_rejected",
                 {
                     "symbol": candidate.symbol,
                     "target_quantity": quantity,
-                    "reason": plan.reason or "planner rejected entry",
+                    "reason": plan_reason,
                 },
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=plan_reason,
+                blocked_reasons=[plan_reason],
+                source="entry_execution_planner",
+                decision="skip_before_first_leg",
+                extra={"target_quantity": quantity},
             )
             return False
 
@@ -5331,24 +6116,30 @@ class EntryDispatchRuntime:
         # levels. A passive route deliberately retains V1 post-only pricing.
         local_l2_execution = self._local_l2_effective_enabled()
         if live_candidate and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            execution_quote_lease = (
-                self._local_l2_final_quote_lease(
+            final_quote_result = FinalQuoteLeaseResult(quote_lease)
+            if local_l2_execution:
+                final_quote_result = self._local_l2_final_quote_result(
                     candidate,
                     now_ms,
                     target_quantity=effective_quantity,
                 )
-                if local_l2_execution
-                else quote_lease
-            )
+            execution_quote_lease = final_quote_result.lease
             if execution_quote_lease is None:
+                reason = (
+                    final_quote_result.reason
+                    or "final_execution_quote_unavailable"
+                )
                 self._emit_entry_dispatch_viability_blocked(
                     candidate,
                     now_ms,
-                    reason="final_execution_quote_unavailable",
-                    blocked_reasons=["final_execution_quote_unavailable"],
+                    reason=reason,
+                    blocked_reasons=[reason],
                     source="final_submit_economics",
                     decision="skip_before_first_leg",
-                    extra={"effective_quantity": effective_quantity},
+                    extra={
+                        **final_quote_result.evidence,
+                        "effective_quantity": effective_quantity,
+                    },
                 )
                 return False
             if local_l2_execution:
@@ -5548,6 +6339,18 @@ class EntryDispatchRuntime:
             )
         if not hedgeability_decision.can_submit:
             payload = hedgeability_decision.payload or {}
+            hedgeability_reason = str(
+                payload.get("reason") or "pre_submit_hedgeability_guard_failed"
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=hedgeability_reason,
+                blocked_reasons=[hedgeability_reason],
+                source="pre_submit_hedgeability_guard",
+                decision="skip_before_first_leg",
+                extra=dict(payload),
+            )
             self.ctx.journal.append(
                 "review.candidate_rejected",
                 {
@@ -5555,7 +6358,7 @@ class EntryDispatchRuntime:
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
                     "rejected_stage": "pre_submit_hedgeability_guard",
-                    "rejected_reason": payload.get("reason", ""),
+                    "rejected_reason": hedgeability_reason,
                     "ranking_edge_bps": candidate.ranking_edge_bps,
                     "expected_edge_bps": candidate.expected_edge_bps,
                     "funding_edge_bps": candidate.funding_edge_bps,
@@ -5565,24 +6368,44 @@ class EntryDispatchRuntime:
             return False
 
         if is_client_order_id_duplicate(maker_cid, self.ctx._recovery_dedup_index):
+            reason = "duplicate_maker_client_order_id"
             self.ctx.journal.append(
                 "runtime.entry_skipped_duplicate_client_order_id",
                 {
                     "entry_id": entry_id,
                     "client_order_id": maker_cid,
-                    "reason": "duplicate maker clientOrderId in recovery dedup index",
+                    "reason": reason,
                 },
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=reason,
+                blocked_reasons=[reason],
+                source="entry_recovery_dedup",
+                decision="skip_before_first_leg",
+                extra={"entry_id": entry_id, "client_order_id": maker_cid},
             )
             return False
 
         if is_client_order_id_duplicate(hedge_cid, self.ctx._recovery_dedup_index):
+            reason = "duplicate_hedge_client_order_id"
             self.ctx.journal.append(
                 "runtime.entry_skipped_duplicate_client_order_id",
                 {
                     "entry_id": entry_id,
                     "client_order_id": hedge_cid,
-                    "reason": "duplicate hedge clientOrderId in recovery dedup index",
+                    "reason": reason,
                 },
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=reason,
+                blocked_reasons=[reason],
+                source="entry_recovery_dedup",
+                decision="skip_before_first_leg",
+                extra={"entry_id": entry_id, "client_order_id": hedge_cid},
             )
             return False
 
@@ -5591,14 +6414,23 @@ class EntryDispatchRuntime:
             self.ctx.state, candidate.symbol,
             long_venue.value, short_venue.value,
         ):
+            reason = "existing_pending_entry_for_symbol_pair"
             self.ctx.journal.append(
                 "runtime.entry_skipped_existing_pending",
                 {
                     "symbol": candidate.symbol,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "reason": "pending entry already exists for this symbol pair",
+                    "reason": reason,
                 },
+            )
+            self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=reason,
+                blocked_reasons=[reason],
+                source="entry_recovery_dedup",
+                decision="skip_before_first_leg",
             )
             return False
 
@@ -5623,6 +6455,15 @@ class EntryDispatchRuntime:
         ):
             return False
         if not admission_ready:
+            if not str(getattr(self.ctx, "_last_entry_dispatch_block_reason", "") or ""):
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason="entry_admission_precheck_failed",
+                    blocked_reasons=["entry_admission_precheck_failed"],
+                    source="entry_admission_precheck",
+                    decision="skip_before_first_leg",
+                )
             return False
 
         maker_bbo_evidence: dict = {}
@@ -5645,6 +6486,15 @@ class EntryDispatchRuntime:
                     "reason": bbo_reason,
                     "ts_ms": now_ms,
                 }
+                self._emit_entry_dispatch_viability_blocked(
+                    candidate,
+                    now_ms,
+                    reason=bbo_reason,
+                    blocked_reasons=[bbo_reason],
+                    source="post_only_bbo_gate",
+                    decision="skip_before_first_leg",
+                    extra=payload,
+                )
                 self.ctx.journal.append("runtime.entry_blocked_post_only_bbo", payload)
                 self.ctx.journal.append(
                     "review.candidate_rejected",

@@ -421,6 +421,7 @@ class StrategyConfig:
     entry_quote_lease_ttl_ms: int = 1500
     entry_quote_prewarm_extra_candidate_count: int = 0
     entry_ws_bbo_per_venue_budget: int = 10
+    entry_quote_lease_max_skew_ms: int = 250
     entry_volume_floor_default_quote: float = V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
     entry_volume_floor_quote_by_venue: dict[str, float] = field(
         default_factory=_v1_entry_volume_floor_quote_by_venue

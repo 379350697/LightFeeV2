@@ -1077,6 +1077,26 @@ class TestConfigValidation:
     def test_ws_bbo_per_venue_budget_default_is_ten(self):
         assert StrategyConfig().entry_ws_bbo_per_venue_budget == 10
 
+    def test_entry_quote_lease_max_skew_default_and_validation(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+
+        assert StrategyConfig().entry_quote_lease_max_skew_ms == 250
+
+        config.strategy.entry_quote_lease_max_skew_ms = -1
+        issues = validate_config(config)
+
+        assert any("entry_quote_lease_max_skew_ms" in issue for issue in issues)
+
+    def test_entry_quote_lease_and_final_gate_skew_thresholds_are_independent(self):
+        config = AppConfig(symbols=["BTCUSDT"])
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_max_skew_ms = 1000
+        config.strategy.entry_final_gate_max_skew_ms = 25
+
+        issues = validate_config(config)
+
+        assert issues == []
+
     def test_entry_quote_prewarm_extra_candidate_count_default_is_zero(self):
         assert StrategyConfig().entry_quote_prewarm_extra_candidate_count == 0
 

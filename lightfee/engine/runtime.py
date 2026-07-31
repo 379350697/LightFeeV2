@@ -388,6 +388,10 @@ class LiveRuntime:
         self._entry_bbo_subscription_budget_excluded_keys: set[tuple[str, str]] = set()
         self._entry_bbo_subscription_per_venue_budget: int = 0
         self._entry_bbo_sticky_warm_until_ms: dict[tuple[str, str], int] = {}
+        self._entry_bbo_prewarm_generation: int = 0
+        self._entry_bbo_prewarm_latest_scope: tuple[int, list, int] | None = None
+        self._entry_bbo_prewarm_task: asyncio.Task | None = None
+        self._entry_bbo_prewarm_status: str = "idle"
 
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
@@ -6037,6 +6041,8 @@ class LiveRuntime:
                     raise
                 return stop_fn()
 
+        await self._shutdown_entry_bbo_prewarm()
+
         await _await_shutdown_task(
             "close_network",
             "funding_settlement_reconciliation_worker",
@@ -6341,40 +6347,98 @@ class LiveRuntime:
         candidates: list,
         now_ms: int,
     ) -> bool:
-        """Bound ranked BBO prewarm so symbol support I/O cannot stall entry."""
+        """Schedule ranked BBO prewarm without putting symbol I/O on the entry path."""
         if not candidates:
             return True
-        try:
-            await asyncio.wait_for(
-                self._ensure_entry_bbo_active_for_candidates(candidates, now_ms),
-                timeout=0.100,
-            )
-            return True
-        except asyncio.TimeoutError:
-            reason = "entry_bbo_prewarm_activation_timeout"
-        except Exception as exc:
-            reason = "entry_bbo_prewarm_activation_failed"
-            self.journal.append(
-                "runtime.entry_bbo_prewarm_failed",
-                {
-                    "reason": reason,
-                    "error": f"{type(exc).__name__}: {exc}"[:240],
-                    "candidate_count": len(candidates),
-                    "activation_budget_ms": 100,
-                    "ts_ms": wall_clock_now_ms(),
-                },
-            )
-            return False
+        self._entry_bbo_prewarm_generation += 1
+        generation = self._entry_bbo_prewarm_generation
+        self._entry_bbo_prewarm_latest_scope = (generation, list(candidates), int(now_ms))
+        self._entry_bbo_prewarm_status = "started"
         self.journal.append(
-            "runtime.entry_bbo_prewarm_failed",
+            "runtime.entry_bbo_prewarm_started",
             {
-                "reason": reason,
+                "reason": "entry_bbo_prewarm_started",
                 "candidate_count": len(candidates),
-                "activation_budget_ms": 100,
+                "prewarm_generation": generation,
                 "ts_ms": wall_clock_now_ms(),
             },
         )
-        return False
+        task = self._entry_bbo_prewarm_task
+        if task is None or task.done():
+            self._entry_bbo_prewarm_task = asyncio.create_task(
+                self._drain_entry_bbo_prewarm_scope(),
+                name="entry-bbo-prewarm",
+            )
+            await asyncio.sleep(0)
+        return True
+
+    async def _drain_entry_bbo_prewarm_scope(self) -> None:
+        while True:
+            scope = self._entry_bbo_prewarm_latest_scope
+            if scope is None:
+                return
+            generation, candidates, scheduled_now_ms = scope
+            self._entry_bbo_prewarm_latest_scope = None
+            try:
+                await self._ensure_entry_bbo_active_for_candidates(
+                    candidates,
+                    scheduled_now_ms,
+                )
+                self._entry_bbo_prewarm_status = "ready"
+                self.journal.append(
+                    "runtime.entry_bbo_prewarm_ready",
+                    {
+                        "reason": "entry_bbo_prewarm_ready",
+                        "candidate_count": len(candidates),
+                        "prewarm_generation": generation,
+                        "scheduled_now_ms": scheduled_now_ms,
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._entry_bbo_prewarm_status = "degraded"
+                degraded_payload = {
+                    "reason": "entry_bbo_prewarm_activation_failed",
+                    "error": f"{type(exc).__name__}: {exc}"[:240],
+                    "candidate_count": len(candidates),
+                    "prewarm_generation": generation,
+                    "scheduled_now_ms": scheduled_now_ms,
+                    "ts_ms": wall_clock_now_ms(),
+                }
+                self.journal.append(
+                    "runtime.entry_bbo_prewarm_degraded",
+                    degraded_payload,
+                )
+                self.journal.append(
+                    "runtime.entry_bbo_prewarm_failed",
+                    degraded_payload,
+                )
+            if self._entry_bbo_prewarm_latest_scope is None:
+                return
+
+    async def _shutdown_entry_bbo_prewarm(self) -> None:
+        self._entry_bbo_prewarm_latest_scope = None
+        task = self._entry_bbo_prewarm_task
+        was_cancelled = False
+        if task is not None and not task.done():
+            task.cancel()
+            was_cancelled = True
+            with suppress(asyncio.CancelledError):
+                await task
+        self._entry_bbo_prewarm_task = None
+        self._entry_bbo_prewarm_status = "idle"
+        if was_cancelled:
+            self.journal.append(
+                "runtime.entry_bbo_prewarm_shutdown",
+                {
+                    "reason": "entry_bbo_prewarm_shutdown_cleanup",
+                    "status": "cancelled",
+                    "prewarm_generation": self._entry_bbo_prewarm_generation,
+                    "ts_ms": wall_clock_now_ms(),
+                },
+            )
 
     async def _run_ranked_candidate_entry_flow(
         self,
@@ -6778,13 +6842,25 @@ class LiveRuntime:
                 self._invalidate_entry_account_truth_generation()
                 last_reason = "entries_dispatched"
             else:
+                dispatch_block_reason = str(
+                    getattr(self, "_last_entry_dispatch_block_reason", "") or ""
+                )
+                if not dispatch_block_reason:
+                    dispatch_block_reason = "entry_dispatch_reason_invariant_missing"
+                    self.journal.append(
+                        "entry.dispatch_reason_invariant_violation",
+                        {
+                            "pair_id": self._candidate_pair_id(candidate),
+                            "reason": dispatch_block_reason,
+                            "source": "ranked_candidate_dispatch",
+                            "decision": "skip_entry",
+                            "ts_ms": wall_clock_now_ms(),
+                        },
+                    )
                 last_reason = self._record_ranked_candidate_blocker(
                     candidate_blockers,
                     self._candidate_pair_id(candidate),
-                    str(
-                        getattr(self, "_last_entry_dispatch_block_reason", "")
-                        or ""
-                    ) or "entry_final_revalidation_failed",
+                    dispatch_block_reason,
                     selection_blockers=selection_blockers,
                 )
             if len(self.state.pending_entries) > pending_before:
@@ -8615,6 +8691,9 @@ class LiveRuntime:
 
         if self._entry_readiness_provider_uses_ws_bbo():
             stale_after_ms = self._entry_quote_lease_max_age_ms()
+            max_skew_ms = (
+                self.entry_dispatch_runtime._entry_quote_lease_max_skew_ms()
+            )
             evidence["source"] = "ws_bbo_quote_lease"
             evidence["domain"] = "ws_bbo_cache"
 
@@ -8641,6 +8720,7 @@ class LiveRuntime:
             if hedge_reason:
                 return f"passive_repost_hedge_{hedge_reason}", evidence
         elif self._entry_readiness_provider_uses_local_l2():
+            max_skew_ms = self.entry_dispatch_runtime._entry_final_gate_max_skew_ms()
             evidence["source"] = "local_l2"
             evidence["domain"] = "local_l2_book"
             from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
@@ -8690,17 +8770,6 @@ class LiveRuntime:
         else:
             return "", evidence
 
-        max_skew_ms = max(
-            int(
-                getattr(
-                    self.config.strategy,
-                    "entry_final_gate_max_skew_ms",
-                    0,
-                )
-                or 0
-            ),
-            0,
-        )
         maker_observed_at_ms = int(evidence.get("maker_observed_at_ms", 0) or 0)
         hedge_observed_at_ms = int(evidence.get("hedge_observed_at_ms", 0) or 0)
         quote_skew_ms = abs(maker_observed_at_ms - hedge_observed_at_ms)
