@@ -156,6 +156,52 @@ def test_binance_later_buffered_event_still_requires_previous_u(tmp_path):
         journal.close()
 
 
+@pytest.mark.parametrize("venue", ["binance", "aster"])
+def test_later_buffered_event_accepts_exact_pu_when_u_range_advances(
+    tmp_path, venue,
+):
+    """After the snapshot bridge, pu—not U—is the WS continuity contract."""
+    dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        symbol = "BANKUSDT"
+        book = runtime.ensure_book(venue, symbol)
+        book.status = L2BookStatus.BOOTSTRAPPING
+
+        for first_sequence, sequence, previous_sequence in (
+            (95, 105, 94),
+            (112, 120, 105),
+        ):
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue=venue,
+                    symbol=symbol,
+                    bids=[PriceLevel(0.42, 200.0)],
+                    asks=[PriceLevel(0.43, 200.0)],
+                    first_sequence=first_sequence,
+                    sequence=sequence,
+                    previous_sequence=previous_sequence,
+                    previous_sequence_present=True,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=sequence,
+            )
+        book.apply_snapshot(
+            [PriceLevel(0.41, 100.0)],
+            [PriceLevel(0.44, 100.0)],
+            sequence=100,
+            now_ms=90,
+        )
+
+        replay = dp._replay_buffered_updates(venue, symbol)
+
+        assert replay.ok is True
+        assert replay.replayed == 2
+        assert runtime.get_book(venue, symbol).sequence == 120
+        assert runtime.get_book(venue, symbol).status != L2BookStatus.REBUILDING
+    finally:
+        journal.close()
+
+
 def test_aster_pre_snapshot_buffer_overflow_drops_oldest_without_rebuild(tmp_path):
     dp, runtime, journal = _make_data_plane(tmp_path)
     try:

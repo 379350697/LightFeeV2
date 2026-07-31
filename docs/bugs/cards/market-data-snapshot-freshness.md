@@ -284,6 +284,17 @@ bound. A lifecycle budget is diagnostic until a journal event or explicit
 quote-rewarm contract proves its action; missing proof is
 `action_evidence_status=not_observed`.
 
+### CL-173 Selection Economics Evidence Without a Final L2 Lease
+
+A selection-stage `final_expected_edge_below_floor` may be proven from the
+already-fetched executable BBO before a final Local-L2 quote lease exists. In
+that case the event must retain both legs' real BBO, observation times,
+candidate revision, and requested/aligned/final quantities under the explicit
+`selection_market_quote_bbo` source. L2 VWAP, capacity, and completeness must
+remain unavailable/false rather than zero-valued fields being mistaken for
+observed depth. This selection evidence never substitutes for the fail-closed
+Local-L2 lease required by final dispatch.
+
 ## Attempts Ledger
 
 | Date | Shape | Status | Notes |

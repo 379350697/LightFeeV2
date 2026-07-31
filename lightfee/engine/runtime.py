@@ -15756,10 +15756,38 @@ class LiveRuntime:
                 reason = decision.reason or "final_economics_rejected"
                 blocker_counts[reason] += 1
                 sample = self._entry_reprice_blocker_sample(candidate, reason)
+                evidence_quote = quote_lease
+                if evidence_quote is None:
+                    # Selection repricing can prove that the best executable
+                    # BBO is already below the economic floor before a final
+                    # Local-L2 lease exists.  Preserve that real quote evidence
+                    # without claiming that it is an L2 VWAP lease.
+                    evidence_quote = SimpleNamespace(
+                        provider="selection_market_quote_bbo",
+                        candidate_revision_id=str(
+                            getattr(candidate, "candidate_revision_id", "") or ""
+                        ),
+                        long_bid=long_bid,
+                        long_ask=long_ask,
+                        short_bid=short_bid,
+                        short_ask=short_ask,
+                        long_observed_at_ms=int(
+                            getattr(long_quote, "observed_at_ms", 0) or 0
+                        ),
+                        short_observed_at_ms=int(
+                            getattr(short_quote, "observed_at_ms", 0) or 0
+                        ),
+                        long_buy_vwap=0.0,
+                        short_sell_vwap=0.0,
+                        long_l2_capacity_quantity=0.0,
+                        short_l2_capacity_quantity=0.0,
+                        l2_vwap_quantity=0.0,
+                        l2_vwap_complete=False,
+                    )
                 sample.update(
                     self.entry_dispatch_runtime._final_entry_revalidation_evidence(
                         candidate=candidate,
-                        quote_lease=quote_lease,
+                        quote_lease=evidence_quote,
                         required_quantity=final_quantity,
                         final_economics=decision,
                         source="selection_final_reprice",
@@ -15768,6 +15796,24 @@ class LiveRuntime:
                 # Preserve the pre-alignment request independently from the
                 # final executable quantity written onto the copied candidate.
                 sample["requested_base_quantity"] = requested_quantity
+                sample["aligned_base_quantity"] = final_quantity
+                sample["price_evidence_source"] = str(
+                    getattr(evidence_quote, "provider", "") or ""
+                )
+                sample["selection_bbo_evidence_complete"] = all(
+                    price > 0.0
+                    for price in (long_bid, long_ask, short_bid, short_ask)
+                )
+                sample["final_execution_quote_available"] = quote_lease is not None
+                sample["final_l2_evidence_required_at_stage"] = require_l2_vwap
+                sample["final_l2_evidence_available"] = bool(
+                    quote_lease is not None
+                    and getattr(quote_lease, "l2_vwap_complete", False) is True
+                )
+                sample["evidence_complete_for_stage"] = bool(
+                    sample["selection_bbo_evidence_complete"]
+                    and final_quantity > 0.0
+                )
                 blocker_samples.append(sample)
                 continue
             final_quantity, quantity_blocker = _align_and_check_pair_minimum(

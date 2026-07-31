@@ -1221,14 +1221,10 @@ class LocalL2DataPlane:
                 )
                 return True
             book.pending_snapshot_bridge = False
-            if not self._range_contains_expected(update, expected):
-                self._mark_rebuilding_from_stream_gap(
-                    book,
-                    update,
-                    now_ms,
-                    f"sequence_ahead: expected {expected} got {first_sequence}",
-                )
-                return True
+            # Binance/Aster use U..u only for the REST-snapshot bridge. Once
+            # established, pu is the authoritative WS-to-WS continuity link;
+            # U may legitimately advance beyond previous_u + 1 while pu still
+            # equals the previous accepted u.
             return False
 
         self._mark_rebuilding_from_stream_gap(
@@ -1506,7 +1502,9 @@ class LocalL2DataPlane:
                         replayed=replayed,
                         replay_index=i,
                     )
-            if policy.venue in {"binance", "aster", "gate"}:
+            if policy.venue == "gate" or (
+                policy.venue in {"binance", "aster"} and is_first_replay
+            ):
                 first_sequence = self._range_first_sequence(bu.update)
                 if not self._range_contains_expected(bu.update, expected):
                     reason = (

@@ -18,7 +18,9 @@ Never relax official continuity to make books ready. A local book may be trusted
 Classify as official when:
 
 - Binance/Aster `pu` does not match previous `u` after snapshot bridge evidence.
-- Binance/Aster update range proves a real skipped update.
+- Binance/Aster first bridge does not cover the REST snapshot boundary in its
+  `U/u` range. After that bridge, `U > previous_u + 1` alone is not a gap when
+  `pu == previous_u`.
 - REST snapshot boundary is not bridged by buffered updates.
 - OKX `prevSeqId/seqId` proves previous-link mismatch or sequence reset.
 - OKX checksum mismatch is present while checksum is still meaningful for the wire channel.
@@ -38,7 +40,10 @@ Last-good / quote fallback rules:
 
 ## V1 / Exchange Semantics
 
-- Binance/Aster: V1 and exchange docs require `pu == previous u`; mismatch means reinitialize local book.
+- Binance/Aster: the first event bridges the REST snapshot by `U/u`; every
+  established WS event then requires `pu == previous u`. A mismatch means
+  reinitialize the local book; repeating the bridge range test after exact
+  `pu` continuity is semantic drift.
 - Aster public Local-L2 semantics remain Binance-compatible FAPI. This does not
   imply Aster private account/order APIs are Binance-HMAC compatible; private
   Aster V3 account/order/open-order paths use a separate Web3 signer client.
@@ -67,6 +72,7 @@ Last-good / quote fallback rules:
 | 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT`; post-fix `HEIUSDT` snapshot errors | `0fd9a74`; no Local-L2 code change selected | no dirty trading state; final affected-symbol probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 | 2026-06-08 | production issue 11 snapshot/OI degraded evidence | working tree | local RED/GREEN and full pytest green; deploy pending | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
+| 2026-08-01 | Binance `BANKUSDT` exact-`pu` / advanced-`U` false gaps | corrective fix after `0606ab47` | local regression green; deployment proof pending | [daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps](../daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps) |
 
 ## Regression Harness
 

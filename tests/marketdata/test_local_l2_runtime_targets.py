@@ -750,6 +750,54 @@ class TestMarketSnapshotDiagnostics:
         assert payload["status_before"] == "hot"
         assert payload["status_after"] == "rebuilding"
 
+    @pytest.mark.parametrize("venue", ["binance", "aster"])
+    def test_hot_exact_pu_accepts_update_when_u_range_advances(self, venue):
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        book = rt.ensure_book(venue, "BANKUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.apply_snapshot(
+            [PriceLevel(0.071, 100.0)],
+            [PriceLevel(0.072, 100.0)],
+            sequence=11_184_227_751_505,
+            now_ms=1000,
+        )
+        book.transition_to_bootstrapping(1000)
+        book.transition_to_hot()
+        book.pending_snapshot_bridge = False
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue=venue,
+                symbol="BANKUSDT",
+                bids=[PriceLevel(0.070, 1.0)],
+                asks=[],
+                first_sequence=11_184_227_752_536,
+                sequence=11_184_227_761_349,
+                previous_sequence=11_184_227_751_505,
+                previous_sequence_present=True,
+                event_time_ms=2000,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2000,
+        )
+
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 11_184_227_761_349
+        assert not [
+            payload
+            for kind, payload in journal.records
+            if kind == "runtime.local_l2_sequence_gap_rebuild"
+        ]
+
     def test_degraded_transition_preserves_error(self):
         book = LocalL2Book(venue="binance", symbol="BTCUSDT")
         book.transition_to_degraded("connection timeout")

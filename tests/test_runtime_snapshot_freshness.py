@@ -2708,6 +2708,90 @@ def test_frontier_reprice_edge_floor_event_has_recalculable_economics(
     assert payload["min_worst_case_edge_bps"] == pytest.approx(-1_000.0)
 
 
+def test_frontier_reprice_edge_floor_preserves_bbo_when_l2_lease_unavailable(
+    tmp_path,
+):
+    config = AppConfig(
+        runtime=RuntimeConfig(mode="live"),
+        strategy=StrategyConfig(
+            local_l2_enabled=True,
+            min_expected_edge_bps=1_000.0,
+            min_worst_case_edge_bps=-1_000.0,
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.last_scan = {}
+    candidate = _freshness_candidate("REPRICEBBOUSDT")
+    candidate.entry_target_quantity = 0.47
+    candidate.candidate_revision_id = "revision-reprice-bbo"
+    quotes = {
+        (candidate.long_venue, candidate.symbol): SimpleNamespace(
+            venue=candidate.long_venue,
+            symbol=candidate.symbol,
+            bid=100.0,
+            ask=101.0,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=10_000,
+            quantity_step_base=0.1,
+            min_quantity_base=0.1,
+            min_notional_quote=1.0,
+        ),
+        (candidate.short_venue, candidate.symbol): SimpleNamespace(
+            venue=candidate.short_venue,
+            symbol=candidate.symbol,
+            bid=102.0,
+            ask=103.0,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=10_005,
+            quantity_step_base=0.1,
+            min_quantity_base=0.1,
+            min_notional_quote=1.0,
+        ),
+    }
+
+    runtime.journal.open()
+    try:
+        repriced = runtime._reprice_entry_candidates_for_selection(
+            [candidate], market_quotes=quotes, now_ms=10_010
+        )
+    finally:
+        runtime.journal.close()
+    assert repriced == []
+
+    payload = [
+        row["payload"]
+        for row in runtime.journal.read_all()
+        if row["kind"] == "runtime.funding_entry_reprice_blocked"
+    ][-1]
+    assert payload["blocking_reason"] == "final_expected_edge_below_floor"
+    assert payload["candidate_revision_id"] == "revision-reprice-bbo"
+    assert payload["requested_base_quantity"] == pytest.approx(0.47)
+    assert payload["aligned_base_quantity"] == pytest.approx(0.4)
+    assert payload["final_base_quantity"] == pytest.approx(0.4)
+    assert payload["long_bid"] == pytest.approx(100.0)
+    assert payload["long_ask"] == pytest.approx(101.0)
+    assert payload["short_bid"] == pytest.approx(102.0)
+    assert payload["short_ask"] == pytest.approx(103.0)
+    assert payload["final_long_entry_price"] == pytest.approx(101.0)
+    assert payload["final_short_entry_price"] == pytest.approx(102.0)
+    assert payload["price_evidence_source"] == "selection_market_quote_bbo"
+    assert payload["quote_lease_provider"] == "selection_market_quote_bbo"
+    assert payload["selection_bbo_evidence_complete"] is True
+    assert payload["final_execution_quote_available"] is False
+    assert payload["final_l2_evidence_required_at_stage"] is False
+    assert payload["final_l2_evidence_available"] is False
+    assert payload["l2_vwap_complete"] is False
+    assert payload["long_buy_vwap"] == 0.0
+    assert payload["short_sell_vwap"] == 0.0
+    assert payload["evidence_complete_for_stage"] is True
+
+
 def test_fresh_bbo_overlay_preserves_snapshot_quantity_contract(tmp_path):
     config = AppConfig(
         runtime=RuntimeConfig(mode="paper"),
