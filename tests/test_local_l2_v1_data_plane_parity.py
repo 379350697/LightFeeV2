@@ -75,6 +75,87 @@ def test_binance_buffered_replay_uses_first_update_range(tmp_path):
         journal.close()
 
 
+def test_binance_first_buffered_bridge_ignores_pu_before_snapshot(tmp_path):
+    """The first diff event bridges by U/u; its pu links WS events, not REST."""
+    dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        book = runtime.ensure_book("binance", "ERAUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="ERAUSDT",
+                bids=[PriceLevel(0.42, 200.0)],
+                asks=[PriceLevel(0.43, 200.0)],
+                first_sequence=95,
+                sequence=105,
+                previous_sequence=94,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1000,
+        )
+        book.apply_snapshot(
+            [PriceLevel(0.41, 100.0)],
+            [PriceLevel(0.44, 100.0)],
+            sequence=100,
+            now_ms=900,
+        )
+
+        replay = dp._replay_buffered_updates("binance", "ERAUSDT")
+
+        assert replay.ok is True
+        assert replay.replayed == 1
+        assert runtime.get_book("binance", "ERAUSDT").sequence == 105
+    finally:
+        journal.close()
+
+
+def test_binance_later_buffered_event_still_requires_previous_u(tmp_path):
+    dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        book = runtime.ensure_book("binance", "ERAUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+
+        for first_sequence, sequence, previous_sequence in (
+            (95, 105, 94),
+            (106, 110, 103),
+        ):
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="binance",
+                    symbol="ERAUSDT",
+                    bids=[PriceLevel(0.42, 200.0)],
+                    asks=[PriceLevel(0.43, 200.0)],
+                    first_sequence=first_sequence,
+                    sequence=sequence,
+                    previous_sequence=previous_sequence,
+                    previous_sequence_present=True,
+                    update_kind=LocalL2UpdateKind.DELTA,
+                ),
+                now_ms=sequence,
+            )
+        book.apply_snapshot(
+            [PriceLevel(0.41, 100.0)],
+            [PriceLevel(0.44, 100.0)],
+            sequence=100,
+            now_ms=90,
+        )
+
+        replay = dp._replay_buffered_updates("binance", "ERAUSDT")
+
+        assert replay.ok is False
+        assert replay.replayed == 1
+        assert (
+            "previous_link_mismatch: expected 105 got 103"
+            in replay.failure_evidence["reason"]
+        )
+        assert runtime.get_book("binance", "ERAUSDT").status == L2BookStatus.REBUILDING
+    finally:
+        journal.close()
+
+
 def test_aster_pre_snapshot_buffer_overflow_drops_oldest_without_rebuild(tmp_path):
     dp, runtime, journal = _make_data_plane(tmp_path)
     try:
@@ -120,6 +201,42 @@ def test_aster_buffered_replay_accepts_previous_link_anchor(tmp_path):
                 first_sequence=105,
                 sequence=105,
                 previous_sequence=100,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1000,
+        )
+        book.apply_snapshot(
+            [PriceLevel(0.039, 1.0)],
+            [PriceLevel(0.051, 1.0)],
+            sequence=100,
+            now_ms=900,
+        )
+
+        replay = dp._replay_buffered_updates("aster", "IRYSUSDT")
+
+        assert replay.ok is True
+        assert replay.replayed == 1
+        assert runtime.get_book("aster", "IRYSUSDT").sequence == 105
+    finally:
+        journal.close()
+
+
+def test_aster_first_buffered_bridge_ignores_pu_before_snapshot(tmp_path):
+    dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        book = runtime.ensure_book("aster", "IRYSUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="aster",
+                symbol="IRYSUSDT",
+                bids=[PriceLevel(0.04, 660.0)],
+                asks=[PriceLevel(0.05, 660.0)],
+                first_sequence=95,
+                sequence=105,
+                previous_sequence=94,
                 previous_sequence_present=True,
                 update_kind=LocalL2UpdateKind.DELTA,
             ),

@@ -60,6 +60,19 @@ def official_sequence_rebuild_reason(payload: dict[str, Any]) -> str:
     if snapshot_last_update_id is None:
         snapshot_last_update_id = _int_payload(payload, "snapshot_lastUpdateId")
 
+    replay_index = _int_payload(payload, "replay_index")
+    replayed = _int_payload(payload, "replayed")
+    is_initial_snapshot_bridge = (
+        replay_index == 0
+        and replayed in {None, 0}
+        and snapshot_last_update_id is not None
+        and raw_U <= snapshot_last_update_id + 1 <= raw_u
+    )
+    if is_initial_snapshot_bridge:
+        # The first buffered event bridges REST by U/u. Its pu links it to the
+        # preceding WebSocket event, not to the independently sampled REST ID.
+        return ""
+
     if raw_pu != expected_previous:
         if snapshot_last_update_id is not None and expected_previous < snapshot_last_update_id:
             return ""

@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, TYPE_CHECKING
 
 from lightfee.marketdata.l2 import (
@@ -1184,20 +1184,28 @@ class LocalL2DataPlane:
         for i, bu in enumerate(filtered[start_index:], start=start_index):
             if bu.update.sequence <= previous_sequence:
                 continue
+            is_first_replay = i == start_index
             has_previous_link = (
                 (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
                 and bu.update.previous_sequence > 0
             )
 
-            # Binance/Aster strict continuity: for every replayed event, pu must
-            # equal the previous accepted u. Range overlap can bridge a snapshot,
-            # but it must never excuse a broken previous-link chain.
-            if has_previous_link and bu.update.previous_sequence != previous_sequence:
+            # V1/Binance semantics split the initial REST-to-WS bridge from the
+            # subsequent WS chain. The first replayed event is admitted by its
+            # U..u range; only later events require pu == the previous accepted u.
+            if (
+                has_previous_link
+                and bu.update.previous_sequence != previous_sequence
+                and (
+                    not is_first_replay
+                    or policy.venue not in {"binance", "aster"}
+                )
+            ):
                 reason = (
                     f"buffered_replay_previous_link_mismatch: expected {previous_sequence} "
                     f"got {bu.update.previous_sequence}"
                 )
-                if i == start_index and expected < bu.update.previous_sequence + 1:
+                if is_first_replay and expected < bu.update.previous_sequence + 1:
                     reason = (
                         f"buffered_replay_snapshot_boundary: expected {expected} "
                         f"got {bu.update.previous_sequence + 1}"
@@ -1217,29 +1225,25 @@ class LocalL2DataPlane:
                     replay_index=i,
                 )
 
-            if i == start_index and has_previous_link and expected < bu.update.previous_sequence + 1:
-                # First replay: gap between snapshot and first buffered
-                reason = (
-                    f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}"
-                )
-                return self._mark_rebuilding_from_buffered_replay_failure(
-                    venue=venue,
-                    symbol=symbol,
-                    book=book,
-                    reason=reason,
-                    now_ms=replay_now_ms,
-                    snapshot_last_update_id=snapshot_last_update_id,
-                    expected_previous_sequence=previous_sequence,
-                    buf=buf,
-                    filtered=filtered,
-                    failure_update=bu.update,
-                    replayed=replayed,
-                    replay_index=i,
+            replay_update = bu.update
+            if (
+                is_first_replay
+                and policy.venue in {"binance", "aster"}
+                and has_previous_link
+                and bu.update.previous_sequence != previous_sequence
+            ):
+                # LocalL2Book applies deltas against a previous-sequence anchor.
+                # For the first valid U..u bridge that anchor is the REST
+                # snapshot; retain the raw pu on bu.update for diagnostics and
+                # use a non-mutating replay copy for application.
+                replay_update = replace(
+                    bu.update,
+                    previous_sequence=previous_sequence,
                 )
 
             try:
                 replay_result = self._runtime.record_update_result(
-                    bu.update, bu.observed_at_ms,
+                    replay_update, bu.observed_at_ms,
                 )
                 if replay_result.rebuild_required:
                     reason = (

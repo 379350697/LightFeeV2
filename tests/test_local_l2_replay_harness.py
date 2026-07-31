@@ -62,6 +62,23 @@ def test_binance_previous_link_mismatch_fixture_matches_production_error():
     assert fixture["expected"]["observed_previous"] == second["pu"]
 
 
+def test_binance_first_snapshot_bridge_is_not_official_previous_link_failure():
+    payload = {
+        "venue": "binance",
+        "symbol": "ERAUSDT",
+        "previous_sequence_present": True,
+        "snapshot_last_update_id": 100,
+        "expected_previous_sequence": 100,
+        "raw_U": 95,
+        "raw_u": 105,
+        "raw_pu": 94,
+        "replayed": 0,
+        "replay_index": 0,
+    }
+
+    assert official_sequence_rebuild_reason(payload) == ""
+
+
 def test_local_l2_incident_replay_gate_uses_closed_classification_set():
     assert ALLOWED_INCIDENT_CLASSIFICATIONS == {
         "V1 parity drift",
