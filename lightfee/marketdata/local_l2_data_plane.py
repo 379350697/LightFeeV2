@@ -164,6 +164,18 @@ class LocalL2DataPlane:
         self.snapshot_ok_event_rate_limit_ms: int = 300_000
         self.clock_skew_tolerance_ms: int = 5_000
         self.bootstrap_rebase_wait_ms: int = 250
+        self._snapshot_request_semaphore: asyncio.Semaphore | None = None
+
+    async def _fetch_l2_snapshot(self, adapter, *, symbol: str, depth: int):
+        """Apply the process-wide REST snapshot concurrency budget."""
+        semaphore = self._snapshot_request_semaphore
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(
+                max(1, int(self.max_concurrent_snapshots or 0))
+            )
+            self._snapshot_request_semaphore = semaphore
+        async with semaphore:
+            return await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
 
     # ------------------------------------------------------------------
     # Bootstrap: initial snapshot population for target books
@@ -216,7 +228,11 @@ class LocalL2DataPlane:
         ss.stream_generation = request_generation
         ss.request_started_ms = request_started_ms
         try:
-            update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+            update = await self._fetch_l2_snapshot(
+                adapter,
+                symbol=symbol,
+                depth=depth,
+            )
             if not self._snapshot_attempt_is_current(
                 venue=venue,
                 symbol=symbol,
@@ -1245,7 +1261,11 @@ class LocalL2DataPlane:
             self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
             return _BufferedReplayResult(ok=False, failure_evidence=evidence)
 
-        rebase_update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+        rebase_update = await self._fetch_l2_snapshot(
+            adapter,
+            symbol=symbol,
+            depth=depth,
+        )
         if expected_generation is not None and not self._snapshot_attempt_is_current(
             venue=venue,
             symbol=symbol,

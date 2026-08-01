@@ -13,6 +13,7 @@ Validates:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import pytest
 
@@ -466,6 +467,57 @@ class TestRuntimeTargetsAndBudget:
 # ---------------------------------------------------------------------------
 
 
+class _ControlledSnapshotAdapter:
+    def __init__(self, *, fail_symbols: set[str] | None = None) -> None:
+        self.fail_symbols = fail_symbols or set()
+        self.calls: list[str] = []
+        self.active = 0
+        self.max_active = 0
+        self.started: asyncio.Queue[str] = asyncio.Queue()
+        self.release = asyncio.Event()
+
+    async def fetch_l2_snapshot(
+        self,
+        symbol: str,
+        depth: int = 50,
+    ) -> LocalL2Update:
+        self.calls.append(symbol)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.started.put_nowait(symbol)
+        try:
+            await self.release.wait()
+            if symbol in self.fail_symbols:
+                raise RuntimeError(f"synthetic snapshot failure for {symbol}")
+            return LocalL2Update(
+                venue="binance",
+                symbol=symbol,
+                bids=[PriceLevel(110.0, 1.0)],
+                asks=[PriceLevel(111.0, 1.0)],
+                sequence=100 + len(self.calls),
+                event_time_ms=9_000,
+                update_kind=LocalL2UpdateKind.SNAPSHOT,
+            )
+        finally:
+            self.active -= 1
+
+
+def _snapshot_budget_data_plane(*symbols: str) -> LocalL2DataPlane:
+    class Journal:
+        def append(self, kind, payload):
+            return None
+
+    runtime = LocalL2Runtime()
+    data_plane = LocalL2DataPlane(l2_runtime=runtime, journal=Journal())
+    for index, symbol in enumerate(symbols, start=1):
+        book = runtime.ensure_book("binance", symbol)
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.status = L2BookStatus.REBUILDING
+        book.last_snapshot_ms = index * 1_000
+        book.max_depth = 50
+    return data_plane
+
+
 class TestMarketSnapshotDiagnostics:
     """Market snapshot must preserve missing, stale, partial, degraded semantics."""
 
@@ -739,6 +791,125 @@ class TestMarketSnapshotDiagnostics:
         assert not [
             payload for payload in lifecycle if payload["status"] == "degraded"
         ]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sync_snapshots_share_process_wide_budget(self):
+        """Different sync entry calls share max_concurrent_snapshots."""
+        from lightfee.core.domain import Venue
+
+        adapter = _ControlledSnapshotAdapter()
+        dp = _snapshot_budget_data_plane("AAAUSDT", "BBBUSDT")
+        dp.max_concurrent_snapshots = 1
+
+        first = asyncio.create_task(
+            dp.sync_snapshots(
+                {Venue.BINANCE: adapter},
+                now_ms=10_000,
+                scan_promoted=True,
+            )
+        )
+        assert await adapter.started.get() == "AAAUSDT"
+        second = asyncio.create_task(
+            dp.sync_snapshots(
+                {Venue.BINANCE: adapter},
+                now_ms=10_000,
+                scan_promoted=True,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert adapter.calls == ["AAAUSDT"]
+        assert adapter.max_active == 1
+        adapter.release.set()
+        assert sorted(await asyncio.gather(first, second)) == [1, 1]
+        assert adapter.calls == ["AAAUSDT", "BBBUSDT"]
+        assert adapter.max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_background_bootstrap_and_sync_share_snapshot_budget(self):
+        """Background bootstrap cannot bypass the sync snapshot budget."""
+        from lightfee.core.domain import Venue
+
+        adapter = _ControlledSnapshotAdapter()
+        dp = _snapshot_budget_data_plane("AAAUSDT", "BBBUSDT")
+        dp.max_concurrent_snapshots = 1
+        dp.start_background_bootstrap(
+            "binance",
+            ["AAAUSDT"],
+            adapter,
+            batch_size=1,
+            jitter_ms=0,
+        )
+        try:
+            assert await adapter.started.get() == "AAAUSDT"
+            sync_task = asyncio.create_task(
+                dp.sync_snapshots(
+                    {Venue.BINANCE: adapter},
+                    now_ms=10_000,
+                    scan_promoted=True,
+                )
+            )
+            await asyncio.sleep(0)
+
+            assert adapter.calls == ["AAAUSDT"]
+            assert adapter.max_active == 1
+            adapter.release.set()
+            await asyncio.gather(sync_task, dp._bootstrap_tasks["binance"])
+            assert sync_task.result() == 1
+            assert adapter.calls == ["AAAUSDT", "BBBUSDT"]
+            assert adapter.max_active == 1
+        finally:
+            dp.cancel_all_bootstrap_tasks()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_snapshot_releases_process_wide_budget(self):
+        adapter = _ControlledSnapshotAdapter()
+        dp = _snapshot_budget_data_plane("AAAUSDT", "BBBUSDT")
+        dp.max_concurrent_snapshots = 1
+
+        first = asyncio.create_task(
+            dp.bootstrap_book("binance", "AAAUSDT", adapter, now_ms=10_000)
+        )
+        assert await adapter.started.get() == "AAAUSDT"
+        second = asyncio.create_task(
+            dp.bootstrap_book("binance", "BBBUSDT", adapter, now_ms=10_000)
+        )
+        await asyncio.sleep(0)
+        assert adapter.calls == ["AAAUSDT"]
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert await asyncio.wait_for(adapter.started.get(), timeout=1) == "BBBUSDT"
+        adapter.release.set()
+
+        assert await second is True
+        assert adapter.active == 0
+        assert adapter.max_active == 1
+
+    @pytest.mark.asyncio
+    async def test_snapshot_adapter_exception_releases_process_wide_budget(self):
+        adapter = _ControlledSnapshotAdapter(fail_symbols={"AAAUSDT"})
+        dp = _snapshot_budget_data_plane("AAAUSDT", "BBBUSDT")
+        dp.max_concurrent_snapshots = 1
+
+        first = asyncio.create_task(
+            dp.bootstrap_book("binance", "AAAUSDT", adapter, now_ms=10_000)
+        )
+        assert await adapter.started.get() == "AAAUSDT"
+        second = asyncio.create_task(
+            dp.bootstrap_book("binance", "BBBUSDT", adapter, now_ms=10_000)
+        )
+        await asyncio.sleep(0)
+        assert adapter.calls == ["AAAUSDT"]
+
+        adapter.release.set()
+        assert await first is False
+        assert await asyncio.wait_for(adapter.started.get(), timeout=1) == "BBBUSDT"
+
+        assert await second is True
+        assert adapter.active == 0
+        assert adapter.max_active == 1
 
     def test_hot_refresh_lifecycle_separates_concurrent_observation_lead(self):
         class Journal:

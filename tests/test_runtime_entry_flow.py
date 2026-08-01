@@ -3097,6 +3097,147 @@ class TestPlannerDispatchIntegration:
     @pytest.mark.parametrize(
         ("case_name", "expected_reason"),
         [
+            ("bootstrapping", "book_bootstrapping"),
+            ("rebuilding", "book_rebuilding"),
+            ("degraded", "book_degraded"),
+            ("stale", "stale_book"),
+            ("future", "clock_skew"),
+            ("missing_timestamp", "book_timestamp_missing"),
+            ("invalid_depth", "invalid_depth"),
+        ],
+    )
+    def test_local_l2_not_ready_uses_stable_dispatch_reason_codes(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+        case_name,
+        expected_reason,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.max_liquidity_snapshot_age_ms = 1_000
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        monkeypatch.setattr(dispatch, "_local_l2_effective_enabled", lambda: True)
+        now_ms = 5_000
+        long_book = self._install_hot_book(
+            runtime,
+            "binance",
+            "BTCUSDT",
+            bid=50_000.0,
+            ask=50_010.0,
+            observed_at_ms=now_ms,
+        )
+        self._install_hot_book(
+            runtime,
+            "okx",
+            "BTCUSDT",
+            bid=49_990.0,
+            ask=50_000.0,
+            observed_at_ms=now_ms,
+        )
+        if case_name == "bootstrapping":
+            long_book.status = L2BookStatus.BOOTSTRAPPING
+        elif case_name == "rebuilding":
+            long_book.status = L2BookStatus.REBUILDING
+        elif case_name == "degraded":
+            long_book.status = L2BookStatus.DEGRADED
+        elif case_name == "stale":
+            long_book.observed_at_ms = now_ms - 1_001
+        elif case_name == "future":
+            long_book.observed_at_ms = now_ms + 1
+        elif case_name == "missing_timestamp":
+            long_book.observed_at_ms = 0
+        elif case_name == "invalid_depth":
+            long_book.bids = []
+
+        blocked = dispatch._entry_local_l2_gate_blocked(
+            candidate=candidate,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            now_ms=now_ms,
+        )
+
+        assert isinstance(blocked, EntryDispatchResult)
+        assert blocked.reason == expected_reason
+        assert blocked.evidence["blocked_reasons"] == [expected_reason]
+        assert blocked.evidence["l2_reason_codes"] == [expected_reason]
+        assert "age=" not in blocked.reason
+        decision = blocked.evidence["l2_stale_decisions"][0]
+        assert decision["role"] == "long"
+        assert decision["l2_reason"] == expected_reason
+        assert decision["l2_reason_detail"]
+        final_block = next(
+            row["payload"]
+            for row in tmp_journal.read_all()
+            if row["kind"] == "runtime.entry_blocked_local_l2_not_ready"
+        )
+        assert final_block["reason"] == expected_reason
+        assert final_block["l2_reason_codes"] == [expected_reason]
+
+    def test_local_l2_not_ready_preserves_both_leg_reason_codes(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.max_liquidity_snapshot_age_ms = 1_000
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        monkeypatch.setattr(dispatch, "_local_l2_effective_enabled", lambda: True)
+        now_ms = 5_000
+        long_book = self._install_hot_book(
+            runtime,
+            "binance",
+            "BTCUSDT",
+            bid=50_000.0,
+            ask=50_010.0,
+            observed_at_ms=now_ms,
+        )
+        short_book = self._install_hot_book(
+            runtime,
+            "okx",
+            "BTCUSDT",
+            bid=49_990.0,
+            ask=50_000.0,
+            observed_at_ms=now_ms - 1_001,
+        )
+        long_book.status = L2BookStatus.REBUILDING
+        assert short_book.status == L2BookStatus.HOT
+
+        blocked = dispatch._entry_local_l2_gate_blocked(
+            candidate=candidate,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            now_ms=now_ms,
+        )
+
+        assert isinstance(blocked, EntryDispatchResult)
+        assert blocked.reason == "book_rebuilding"
+        assert blocked.evidence["blocked_reasons"] == [
+            "book_rebuilding",
+            "stale_book",
+        ]
+        assert blocked.evidence["l2_reason_codes"] == [
+            "book_rebuilding",
+            "stale_book",
+        ]
+        assert [
+            (payload["role"], payload["l2_reason"])
+            for payload in blocked.evidence["l2_stale_decisions"]
+        ] == [
+            ("long", "book_rebuilding"),
+            ("short", "stale_book"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("case_name", "expected_reason"),
+        [
             ("invalid_identity", "final_quote_invalid_identity"),
             ("missing_book", "final_quote_missing_book"),
             ("not_hot", "final_quote_book_not_hot"),
@@ -7233,12 +7374,13 @@ class TestPlannerDispatchIntegration:
         assert evidence["quote_observation_skew_ms"] == 150
         assert evidence["quote_observation_max_skew_ms"] == 100
 
-    def test_local_l2_dispatch_defers_ws_bbo_skew_to_final_l2(
+    def test_local_l2_dispatch_defers_ws_bbo_freshness_and_skew_to_final_l2(
         self,
         config,
         tmp_journal,
     ):
         config.runtime.mode = "live"
+        config.runtime.max_market_age_ms = 100
         config.strategy.funding_new_entries_enabled = True
         config.strategy.local_l2_enabled = True
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
@@ -7325,6 +7467,11 @@ class TestPlannerDispatchIntegration:
         resolution = dispatch._entry_price_resolution(candidate, now_ms, 50_000.0)
 
         assert reason == ""
+        assert evidence["long_age_ms"] == 150
+        assert evidence["quote_lease_freshness_deferred"] is True
+        assert evidence["quote_lease_freshness_deferred_to"] == (
+            "local_l2_final_gate"
+        )
         assert evidence["quote_observation_skew_ms"] == 150
         assert evidence["quote_lease_skew_deferred"] is True
         assert evidence["quote_lease_skew_deferred_to"] == "local_l2_final_gate"
@@ -7334,7 +7481,8 @@ class TestPlannerDispatchIntegration:
             record
             for record in tmp_journal.read_all()
             if record["kind"] == "entry.dispatch_viability_blocked"
-            and record["payload"].get("reason") == "quote_lease_skew_exceeded"
+            and record["payload"].get("reason")
+            in {"stale_quote_lease", "quote_lease_skew_exceeded"}
         ]
 
     def test_ws_bbo_execution_and_final_lease_block_candidate_revision_mismatch(

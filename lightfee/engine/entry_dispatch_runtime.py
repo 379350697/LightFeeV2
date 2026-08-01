@@ -2818,11 +2818,12 @@ class EntryDispatchRuntime:
             evidence[f"{leg}_age_ms"] = age_ms
             quote_age_ms[leg] = age_ms
         evidence["quote_age_ms"] = quote_age_ms
+        quote_freshness_invalid = False
         for leg in ("long", "short"):
             observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
             if observed_at_ms > now_ms:
                 evidence[f"{leg}_timestamp_after_now"] = True
-                return blocked("stale_quote_lease", lease)
+                quote_freshness_invalid = True
             age_ms = evidence[f"{leg}_age_ms"]
             if (
                 observed_at_ms <= 0
@@ -2830,7 +2831,13 @@ class EntryDispatchRuntime:
                 or age_ms is None
                 or age_ms > max_age_ms
             ):
-                return blocked("stale_quote_lease", lease)
+                quote_freshness_invalid = True
+        local_l2_execution = self._local_l2_effective_enabled()
+        if quote_freshness_invalid and local_l2_execution:
+            evidence["quote_lease_freshness_deferred"] = True
+            evidence["quote_lease_freshness_deferred_to"] = "local_l2_final_gate"
+        elif quote_freshness_invalid:
+            return blocked("stale_quote_lease", lease)
 
         max_skew_ms = self._entry_quote_lease_max_skew_ms()
         quote_skew_ms = abs(
@@ -2839,7 +2846,7 @@ class EntryDispatchRuntime:
         )
         evidence["quote_observation_skew_ms"] = quote_skew_ms
         evidence["quote_observation_max_skew_ms"] = max_skew_ms
-        if quote_skew_ms > max_skew_ms and self._local_l2_effective_enabled():
+        if quote_skew_ms > max_skew_ms and local_l2_execution:
             evidence["quote_lease_skew_deferred"] = True
             evidence["quote_lease_skew_deferred_to"] = "local_l2_final_gate"
         elif quote_skew_ms > max_skew_ms:
@@ -5056,6 +5063,27 @@ class EntryDispatchRuntime:
 
         from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
 
+        def stable_not_ready_reason(book) -> str:
+            """Return the dispatch-level reason code without embedding evidence."""
+            status = str(
+                getattr(
+                    getattr(book, "status", ""),
+                    "value",
+                    getattr(book, "status", ""),
+                )
+                or ""
+            )
+            if status != "hot":
+                return f"book_{status}" if status else "book_not_hot"
+            observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+            if observed_at_ms > now_ms:
+                return "clock_skew"
+            if observed_at_ms <= 0:
+                return "book_timestamp_missing"
+            if book.is_stale(max_age_ms, now_ms):
+                return "stale_book"
+            return "invalid_depth"
+
         long_book = self.ctx.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
         short_book = self.ctx.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
         long_leg_evidence = self._local_l2_book_causal_evidence(
@@ -5102,6 +5130,7 @@ class EntryDispatchRuntime:
             )
             long_age_ms = long_book.age_ms(now_ms)
             if not liq.book_ready:
+                l2_reason = stable_not_ready_reason(long_book)
                 not_ready_reasons.append(
                     f"long leg not ready: {long_venue.value}:{candidate.symbol} "
                     f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
@@ -5118,7 +5147,8 @@ class EntryDispatchRuntime:
                     "decision": "skip_entry",
                     "fallback_source": "none",
                     "reason": "execution_l2_stale",
-                    "l2_reason": liq.fallback_reason or "book_not_ready",
+                    "l2_reason": l2_reason,
+                    "l2_reason_detail": liq.fallback_reason or "book_not_ready",
                     "book_status": long_book.status.value,
                     "blocking": True,
                 })
@@ -5149,6 +5179,7 @@ class EntryDispatchRuntime:
             )
             short_age_ms = short_book.age_ms(now_ms)
             if not liq.book_ready:
+                l2_reason = stable_not_ready_reason(short_book)
                 not_ready_reasons.append(
                     f"short leg not ready: {short_venue.value}:{candidate.symbol} "
                     f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
@@ -5165,7 +5196,8 @@ class EntryDispatchRuntime:
                     "decision": "skip_entry",
                     "fallback_source": "none",
                     "reason": "execution_l2_stale",
-                    "l2_reason": liq.fallback_reason or "book_not_ready",
+                    "l2_reason": l2_reason,
+                    "l2_reason_detail": liq.fallback_reason or "book_not_ready",
                     "book_status": short_book.status.value,
                     "blocking": True,
                 })
@@ -5185,18 +5217,22 @@ class EntryDispatchRuntime:
                 for key, value in leg_evidence_by_role[role].items():
                     decision_payload.setdefault(key, value)
             pair_id = self._candidate_pair_id(candidate)
-            first_l2_reason = str(
-                (l2_stale_decisions[0] if l2_stale_decisions else {}).get("l2_reason")
-                or "execution_l2_stale"
+            l2_reason_codes = list(
+                dict.fromkeys(
+                    str(payload.get("l2_reason") or "execution_l2_stale")
+                    for payload in l2_stale_decisions
+                )
             )
+            first_l2_reason = l2_reason_codes[0]
             result = self._emit_entry_dispatch_viability_blocked(
                 candidate,
                 now_ms,
                 reason=first_l2_reason,
-                blocked_reasons=[first_l2_reason],
+                blocked_reasons=l2_reason_codes,
                 source="entry_local_l2_readiness",
                 decision="skip_dispatch",
                 extra={
+                    "l2_reason_codes": l2_reason_codes,
                     "l2_stale_decisions": l2_stale_decisions,
                     "not_ready_reasons": not_ready_reasons,
                     "long_leg_l2_causal_evidence": long_leg_evidence,
@@ -5228,6 +5264,7 @@ class EntryDispatchRuntime:
                     "reason": first_l2_reason,
                     "reason_bucket": first_l2_reason,
                     "l2_reason": first_l2_reason,
+                    "l2_reason_codes": l2_reason_codes,
                     "long_leg_l2_causal_evidence": long_leg_evidence,
                     "short_leg_l2_causal_evidence": short_leg_evidence,
                     "both_leg_l2_causal_evidence": [
