@@ -22,6 +22,9 @@ Classify as official when:
   `U/u` range. After that bridge, `U > previous_u + 1` alone is not a gap when
   `pu == previous_u`.
 - REST snapshot boundary is not bridged by buffered updates.
+- REST snapshot, Gate rebase snapshot, or replay application attempts are not
+  bound to the request-time stream generation and snapshot attempt. A stale
+  response must be discarded before it can mutate the local book.
 - OKX `prevSeqId/seqId` proves previous-link mismatch or sequence reset.
 - OKX checksum mismatch is present while checksum is still meaningful for the wire channel.
 
@@ -72,7 +75,7 @@ Last-good / quote fallback rules:
 | 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT`; post-fix `HEIUSDT` snapshot errors | `0fd9a74`; no Local-L2 code change selected | no dirty trading state; final affected-symbol probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 | 2026-06-08 | production issue 11 snapshot/OI degraded evidence | working tree | local RED/GREEN and full pytest green; deploy pending | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
-| 2026-08-01 | Binance `BANKUSDT` exact-`pu` / advanced-`U` false gaps | corrective fix after `0606ab47` | local regression green; deployment proof pending | [daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps](../daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps) |
+| 2026-08-01 | Binance `BANKUSDT` exact-`pu` / advanced-`U` false gaps plus completion-audit generation/HOT/dispatch evidence gaps | corrective fix after `0606ab47` and audit remediation | local regression green; deployment proof pending | [daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps](../daily/2026-08-01.md#cluster-cl-172---post-bridge-binanceaster-range-check-reintroduced-false-gaps) |
 
 ## Regression Harness
 

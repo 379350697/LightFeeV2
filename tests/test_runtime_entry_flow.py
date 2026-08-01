@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -37,7 +38,7 @@ from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchResult, EntryDispatchRuntime
 from lightfee.engine.state import (
     ActiveMakerLeg,
     OpenPosition,
@@ -52,13 +53,13 @@ from lightfee.engine.exit_shadow import (
     ExitShadowSnapshot,
     evaluate_exit_shadow_strategies,
 )
-from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+from lightfee.marketdata.l2 import L2BookStatus, LocalL2BookKey, PriceLevel
 from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.marketdata.ws_bbo import TopBookQuote, VenueBboCache
 from lightfee.persistence.journal import Journal
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from lightfee.core.contracts import VenueAdapter
@@ -2735,7 +2736,7 @@ class TestPlannerDispatchIntegration:
             return True, False, ""
 
         async def dispatch_blocked(candidate, now_ms, **_kwargs):
-            runtime.entry_dispatch_runtime._emit_entry_dispatch_viability_blocked(
+            return runtime.entry_dispatch_runtime._emit_entry_dispatch_viability_blocked(
                 candidate,
                 now_ms,
                 reason="invalid_final_quote_lease",
@@ -2743,7 +2744,6 @@ class TestPlannerDispatchIntegration:
                 source="final_quote_lease",
                 decision="skip_before_first_leg",
             )
-            return False
 
         monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 10_000)
         monkeypatch.setattr(
@@ -2791,7 +2791,6 @@ class TestPlannerDispatchIntegration:
         )
 
         pair_id = runtime._candidate_pair_id(candidate)
-        assert runtime._last_entry_dispatch_block_reason == "invalid_final_quote_lease"
         assert runtime.state.last_scan["no_entry_reason"] == "invalid_final_quote_lease"
         assert runtime.state.last_scan["ranked_candidate_blockers"] == {
             pair_id: "invalid_final_quote_lease"
@@ -2939,7 +2938,6 @@ class TestPlannerDispatchIntegration:
         )
 
         pair_id = runtime._candidate_pair_id(candidate)
-        assert runtime._last_entry_dispatch_block_reason == "entry_leverage_unavailable"
         assert runtime.state.last_scan["no_entry_reason"] == "entry_leverage_unavailable"
         assert runtime.state.last_scan["ranked_candidate_blockers"] == {
             pair_id: "entry_leverage_unavailable"
@@ -3070,20 +3068,31 @@ class TestPlannerDispatchIntegration:
             now_ms=17_000,
         )
 
-        assert blocked is True
-        assert runtime._last_entry_dispatch_block_reason == "missing_book"
+        assert isinstance(blocked, EntryDispatchResult)
+        result = blocked
+        assert result.reason == "missing_book"
+        assert result.stage == "entry_local_l2_readiness"
+        assert result.evidence["long_leg_l2_causal_evidence"]["book_present"] is False
+        assert result.evidence["short_leg_l2_causal_evidence"]["book_present"] is False
         decisions = [
             row["payload"]
             for row in tmp_journal.read_all()
             if row["kind"] == "runtime.execution_l2_stale"
         ]
         assert {payload["l2_reason"] for payload in decisions} == {"missing_book"}
+        assert {
+            payload["book_present"] for payload in decisions
+        } == {False}
+        assert {
+            payload["generation"] for payload in decisions
+        } == {0}
         final_block = next(
             row["payload"]
             for row in tmp_journal.read_all()
             if row["kind"] == "runtime.entry_blocked_local_l2_not_ready"
         )
         assert final_block["reason"] == "missing_book"
+        assert len(final_block["both_leg_l2_causal_evidence"]) == 2
 
     @pytest.mark.parametrize(
         ("case_name", "expected_reason"),
@@ -3213,6 +3222,78 @@ class TestPlannerDispatchIntegration:
         assert exact_zero.reason == "final_quote_invalid_quantity"
         assert exact_depth.lease is None
         assert exact_depth.reason == "final_quote_insufficient_l2_depth"
+
+    @pytest.mark.asyncio
+    async def test_local_l2_final_quote_recheck_only_uses_in_flight_recovery(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry_dispatch_runtime import FinalQuoteLeaseResult
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = True
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        pair_id = runtime._candidate_pair_id(candidate)
+        runtime.l2_data_plane._snap_states[
+            LocalL2BookKey("binance", "BTCUSDT")
+        ] = SimpleNamespace(
+            snapshot_in_flight=True,
+            snapshot_attempt_id=7,
+            stream_generation=3,
+            last_snapshot_ms=0,
+        )
+        refreshed_lease = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_observed_at_ms=5000,
+            short_observed_at_ms=5000,
+            created_at_ms=5000,
+            expires_at_ms=6500,
+            provider="local_l2_final_vwap",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+
+        monkeypatch.setattr(
+            dispatch,
+            "_local_l2_final_quote_result",
+            lambda *_args, **_kwargs: FinalQuoteLeaseResult(
+                lease=refreshed_lease,
+                evidence={},
+            ),
+        )
+
+        result = await dispatch._maybe_recheck_local_l2_final_quote_result(
+            candidate,
+            5000,
+            target_quantity=1.0,
+            result=FinalQuoteLeaseResult(
+                reason="final_quote_book_stale",
+                evidence={"reason": "final_quote_book_stale"},
+            ),
+            selected_deadline_monotonic=asyncio.get_running_loop().time() + 0.2,
+        )
+
+        assert result.lease is refreshed_lease
+        recheck = [
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_local_l2_final_quote_recheck"
+        ][-1]
+        assert recheck["initial_reason"] == "final_quote_book_stale"
+        assert recheck["recheck_success"] is True
+        assert recheck["long_snapshot_in_flight"] is True
 
     @pytest.mark.asyncio
     async def test_live_legacy_target_zero_standard_entry_reruns_final_l2_with_resolved_quantity(
@@ -6030,6 +6111,7 @@ class TestPlannerDispatchIntegration:
         config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_quote_lease_max_skew_ms = 2000
         runtime = LiveRuntime(config)
         runtime.journal = tmp_journal
         candidate = self._candidate()
@@ -6081,7 +6163,7 @@ class TestPlannerDispatchIntegration:
         config.strategy.local_l2_enabled = False
         config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
         config.strategy.entry_quote_lease_ttl_ms = 1500
-        config.strategy.entry_quote_lease_max_skew_ms = 100
+        config.strategy.entry_quote_lease_max_skew_ms = 200
         config.strategy.entry_final_gate_max_skew_ms = 1000
         runtime = LiveRuntime(config)
         runtime.journal = tmp_journal
@@ -6121,6 +6203,7 @@ class TestPlannerDispatchIntegration:
         assert lease.long_ask_size == pytest.approx(2.5)
         assert lease.short_bid_size == pytest.approx(3.5)
         assert lease.short_ask_size == pytest.approx(4.75)
+        config.strategy.entry_quote_lease_max_skew_ms = 100
 
         reason, _lease, evidence = runtime._entry_quote_lease_execution_check(
             candidate,
@@ -6134,6 +6217,964 @@ class TestPlannerDispatchIntegration:
         assert evidence["long_ask_size"] == pytest.approx(2.5)
         assert evidence["short_bid_size"] == pytest.approx(3.5)
         assert evidence["short_ask_size"] == pytest.approx(4.75)
+
+    def test_ws_bbo_on_demand_skew_refreshes_once_before_blocking(self):
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        candidate = self._candidate()
+        pair_id = "BTCUSDT:binance:okx"
+
+        def lease(long_observed_at_ms: int, short_observed_at_ms: int) -> QuoteLease:
+            return QuoteLease(
+                pair_id=pair_id,
+                symbol="BTCUSDT",
+                long_venue="binance",
+                short_venue="okx",
+                long_bid=50000.0,
+                long_ask=50010.0,
+                short_bid=49990.0,
+                short_ask=50000.0,
+                long_bid_size=10.0,
+                long_ask_size=10.0,
+                short_bid_size=10.0,
+                short_ask_size=10.0,
+                long_observed_at_ms=long_observed_at_ms,
+                short_observed_at_ms=short_observed_at_ms,
+                created_at_ms=short_observed_at_ms,
+                expires_at_ms=5000,
+                provider="ws_bbo_quote_lease",
+                candidate_revision_id=candidate.candidate_revision_id,
+            )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.current = lease(1000, 1150)
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return self.current
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                self.current = lease(1200, 1200)
+                return SimpleNamespace(allowed=True)
+
+        provider = RefreshingProvider()
+        runtime = object.__new__(EntryDispatchRuntime)
+        runtime.ctx = SimpleNamespace(
+            config=SimpleNamespace(
+                runtime=SimpleNamespace(mode="live"),
+                strategy=SimpleNamespace(
+                    entry_quote_lease_max_skew_ms=100,
+                    entry_final_gate_max_skew_ms=100,
+                ),
+            ),
+            entry_readiness_provider=provider,
+            _candidate_pair_id=lambda _candidate: pair_id,
+            _entry_effective_readiness_provider_name=lambda: "ws_bbo_l2_on_demand",
+            _entry_readiness_provider_name=lambda: "ws_bbo_l2_on_demand",
+            _entry_effective_readiness_provider_uses_quote_lease=lambda: True,
+            _entry_readiness_provider_uses_quote_lease=lambda: True,
+            _entry_quote_lease_max_age_ms=lambda: 1500,
+            _entry_local_l2_effective_enabled=lambda: False,
+            _local_l2_effective_enabled=lambda: False,
+            _quote_lease_blocker_family=lambda reason: "skew"
+            if reason == "quote_lease_skew_exceeded"
+            else "other",
+        )
+
+        reason, checked_lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            1200,
+            enforce_side_capacity=False,
+        )
+        assert reason == "quote_lease_skew_exceeded"
+        refreshed_reason, refreshed_lease, refreshed_evidence = (
+            runtime._refresh_entry_quote_lease_for_execution(
+                candidate,
+                1200,
+                reason,
+                checked_lease,
+                evidence,
+                enforce_side_capacity=False,
+            )
+        )
+
+        assert refreshed_reason == ""
+        assert refreshed_lease is provider.current
+        assert provider.calls == 1
+        assert refreshed_evidence["execution_refresh_attempted"] is True
+        assert refreshed_evidence["execution_refresh_mode"] == "bounded_dual_recheck"
+
+    def test_pure_ws_bbo_quote_lease_skew_refreshes_once_before_blocking(self):
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        candidate = self._candidate()
+        pair_id = "BTCUSDT:binance:okx"
+
+        def lease(long_observed_at_ms: int, short_observed_at_ms: int) -> QuoteLease:
+            return QuoteLease(
+                pair_id=pair_id,
+                symbol="BTCUSDT",
+                long_venue="binance",
+                short_venue="okx",
+                long_bid=50000.0,
+                long_ask=50010.0,
+                short_bid=49990.0,
+                short_ask=50000.0,
+                long_bid_size=10.0,
+                long_ask_size=10.0,
+                short_bid_size=10.0,
+                short_ask_size=10.0,
+                long_observed_at_ms=long_observed_at_ms,
+                short_observed_at_ms=short_observed_at_ms,
+                created_at_ms=short_observed_at_ms,
+                expires_at_ms=5000,
+                provider="ws_bbo_quote_lease",
+                candidate_revision_id=candidate.candidate_revision_id,
+            )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.current = lease(1000, 1150)
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return self.current
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                self.current = lease(1200, 1200)
+                return SimpleNamespace(allowed=True)
+
+        provider = RefreshingProvider()
+        runtime = object.__new__(EntryDispatchRuntime)
+        runtime.ctx = SimpleNamespace(
+            config=SimpleNamespace(
+                runtime=SimpleNamespace(mode="live"),
+                strategy=SimpleNamespace(
+                    entry_quote_lease_max_skew_ms=100,
+                    entry_final_gate_max_skew_ms=100,
+                ),
+            ),
+            entry_readiness_provider=provider,
+            _candidate_pair_id=lambda _candidate: pair_id,
+            _entry_effective_readiness_provider_name=lambda: "ws_bbo_quote_lease",
+            _entry_readiness_provider_name=lambda: "ws_bbo_quote_lease",
+            _entry_effective_readiness_provider_uses_quote_lease=lambda: True,
+            _entry_readiness_provider_uses_quote_lease=lambda: True,
+            _entry_quote_lease_max_age_ms=lambda: 1500,
+            _entry_local_l2_effective_enabled=lambda: False,
+            _local_l2_effective_enabled=lambda: False,
+            _quote_lease_blocker_family=lambda reason: "skew"
+            if reason == "quote_lease_skew_exceeded"
+            else "other",
+        )
+
+        reason, checked_lease, evidence = runtime._entry_quote_lease_execution_check(
+            candidate,
+            1200,
+            enforce_side_capacity=False,
+        )
+        refreshed_reason, refreshed_lease, refreshed_evidence = (
+            runtime._refresh_entry_quote_lease_for_execution(
+                candidate,
+                1200,
+                reason,
+                checked_lease,
+                evidence,
+                enforce_side_capacity=False,
+            )
+        )
+
+        assert reason == "quote_lease_skew_exceeded"
+        assert refreshed_reason == ""
+        assert refreshed_lease is provider.current
+        assert provider.calls == 1
+        assert refreshed_evidence["execution_refresh_mode"] == "bounded_dual_recheck"
+
+    def test_real_ws_bbo_quote_lease_skew_refreshes_both_legs_once(
+        self,
+        config,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.ws_bbo_data_plane = SimpleNamespace(
+            stream_state=lambda venue, symbol: {
+                "venue": venue,
+                "symbol": symbol.upper(),
+                "tracked": True,
+            }
+        )
+        candidate = self._candidate()
+        for venue, observed_at_ms, bid, ask in (
+            ("binance", 1000, 50000.0, 50010.0),
+            ("okx", 1150, 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=observed_at_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        class Refresher:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                self.calls.append((venue, symbol, now_ms))
+                if venue == "binance":
+                    return TopBookQuote(
+                        venue=venue,
+                        symbol=symbol,
+                        bid=50005.0,
+                        ask=50008.0,
+                        bid_size=20.0,
+                        ask_size=20.0,
+                        observed_at_ms=now_ms,
+                        received_at_ms=now_ms,
+                        source=f"{venue}_rest",
+                    )
+                return TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=49995.0,
+                    ask=50000.0,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=now_ms,
+                    received_at_ms=now_ms,
+                    source=f"{venue}_rest",
+                )
+
+        refresher = Refresher()
+        runtime.ws_bbo_rest_refresher = refresher
+
+        decision = runtime.entry_readiness_provider.decide(candidate, 1200)
+        lease = runtime.entry_readiness_provider.get_lease(
+            runtime._candidate_pair_id(candidate)
+        )
+
+        assert decision.allowed is True
+        assert refresher.calls == [
+            ("binance", "BTCUSDT", 1200),
+            ("okx", "BTCUSDT", 1200),
+        ]
+        assert lease.long_observed_at_ms == 1200
+        assert lease.short_observed_at_ms == 1200
+        assert lease.long_ask == pytest.approx(50008.0)
+        assert lease.short_bid == pytest.approx(49995.0)
+        skew_refresh = decision.evidence["rest_refresh"]["skew_refresh"]
+        assert skew_refresh["before_skew_ms"] == 150
+        assert skew_refresh["after_skew_ms"] == 0
+        assert skew_refresh["refreshed_both_legs"] is True
+
+    def test_real_ws_bbo_quote_lease_still_skewed_after_refresh_fails(
+        self,
+        config,
+    ):
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.ws_bbo_data_plane = SimpleNamespace(
+            stream_state=lambda venue, symbol: {
+                "venue": venue,
+                "symbol": symbol.upper(),
+                "tracked": True,
+            }
+        )
+        candidate = self._candidate()
+        for venue, observed_at_ms, bid, ask in (
+            ("binance", 1000, 50000.0, 50010.0),
+            ("okx", 1150, 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=observed_at_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        class StillSkewedRefresher:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                self.calls.append((venue, symbol, now_ms))
+                observed_at_ms = 1200 if venue == "binance" else 1350
+                return TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=50005.0 if venue == "binance" else 49995.0,
+                    ask=50008.0 if venue == "binance" else 50000.0,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=observed_at_ms,
+                    source=f"{venue}_rest",
+                )
+
+        refresher = StillSkewedRefresher()
+        runtime.ws_bbo_rest_refresher = refresher
+        pair_id = runtime._candidate_pair_id(candidate)
+        runtime.entry_readiness_provider._leases[pair_id] = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_bid_size=20.0,
+            long_ask_size=20.0,
+            short_bid_size=20.0,
+            short_ask_size=20.0,
+            long_observed_at_ms=1300,
+            short_observed_at_ms=1300,
+            created_at_ms=1300,
+            expires_at_ms=3000,
+            provider="ws_bbo_quote_lease",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+
+        decision = runtime.entry_readiness_provider.decide(candidate, 1400)
+        lease = runtime.entry_readiness_provider.get_lease(pair_id)
+
+        assert decision.allowed is False
+        assert decision.reason == "entry_ws_bbo_quote_lease_skew_exceeded"
+        assert lease is None
+        assert refresher.calls == [
+            ("binance", "BTCUSDT", 1400),
+            ("okx", "BTCUSDT", 1400),
+        ]
+        assert decision.evidence["blocker_family"] == "quote_skew_exceeded"
+        assert decision.evidence["quote_lease_reason"] == "quote_lease_skew_exceeded"
+        assert decision.evidence["quote_observation_skew_ms"] == 150
+        assert decision.evidence["quote_observation_max_skew_ms"] == 100
+        assert (
+            decision.evidence["rest_refresh"]["skew_refresh"]["after_skew_ms"]
+            == 150
+        )
+
+    @pytest.mark.asyncio
+    async def test_still_skewed_real_ws_bbo_blocks_before_dispatch_second_refresh(
+        self,
+        config,
+        tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 1500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        config.strategy.min_scan_minutes_before_funding = 0
+        config.strategy.entry_window_secs = 1000
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        runtime.ws_bbo_data_plane = SimpleNamespace(
+            stream_state=lambda venue, symbol: {
+                "venue": venue,
+                "symbol": symbol.upper(),
+                "tracked": True,
+            }
+        )
+        candidate = self._candidate()
+        for venue, observed_at_ms, bid, ask in (
+            ("binance", 1000, 50000.0, 50010.0),
+            ("okx", 1150, 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=observed_at_ms,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        class StillSkewedRefresher:
+            def __init__(self):
+                self.calls = []
+
+            def refresh_quote(self, venue, symbol, *, now_ms):
+                self.calls.append((venue, symbol, now_ms))
+                observed_at_ms = 1200 if venue == "binance" else 1350
+                return TopBookQuote(
+                    venue=venue,
+                    symbol=symbol,
+                    bid=50005.0 if venue == "binance" else 49995.0,
+                    ask=50008.0 if venue == "binance" else 50000.0,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=observed_at_ms,
+                    received_at_ms=observed_at_ms,
+                    source=f"{venue}_rest",
+                )
+
+        refresher = StillSkewedRefresher()
+        runtime.ws_bbo_rest_refresher = refresher
+        blockers = {}
+        counts = Counter()
+
+        selected = runtime._select_entry_candidates(
+            [candidate],
+            now_ms=1400,
+            remaining_slots=1,
+            selection_blocker_counts=counts,
+            candidate_blockers=blockers,
+        )
+        for selected_candidate in selected:
+            await runtime._dispatch_entry(
+                selected_candidate,
+                1400,
+                price_hint=50_000.0,
+            )
+
+        pair_id = runtime._candidate_pair_id(candidate)
+        assert selected == []
+        assert runtime.entry_executor.ctx is None
+        assert refresher.calls == [
+            ("binance", "BTCUSDT", 1400),
+            ("okx", "BTCUSDT", 1400),
+        ]
+        assert counts["entry_ws_bbo_quote_lease_skew_exceeded"] == 1
+        assert blockers[pair_id] == "entry_ws_bbo_quote_lease_skew_exceeded"
+        payload = next(
+            record["payload"]
+            for record in tmp_journal.read_all()
+            if record["kind"] == "runtime.entry_blocked_ws_bbo_selection"
+        )
+        assert payload["reason"] == "entry_ws_bbo_quote_lease_skew_exceeded"
+        evidence = payload["readiness_evidence"]
+        assert evidence["quote_observation_skew_ms"] == 150
+        assert evidence["rest_refresh"]["skew_refresh"]["after_skew_ms"] == 150
+
+    @pytest.mark.asyncio
+    async def test_submit_time_ws_bbo_refresh_rebinds_prices_before_executor(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.funding_new_entries_enabled = True
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 100
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        config.strategy.min_expected_edge_bps = -1000.0
+        config.strategy.min_worst_case_edge_bps = -1000.0
+        config.strategy.max_concurrent_positions = 8
+        config.strategy.max_single_venue_exposure_quote = 10_000.0
+        config.strategy.max_symbol_exposure_quote = 10_000.0
+        config.strategy.funding_max_venue_pair_exposure_quote = 10_000.0
+        config.strategy.funding_max_global_gross_exposure_quote = 10_000.0
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        binance.available_margin_quote = 10_000.0
+        okx.available_margin_quote = 10_000.0
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+        )
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        monkeypatch.setattr(runtime, "_entry_wall_clock_now_ms", lambda: 5_200)
+        candidate = self._candidate()
+        pair_id = runtime._candidate_pair_id(candidate)
+        old_lease = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_bid_size=20.0,
+            long_ask_size=20.0,
+            short_bid_size=20.0,
+            short_ask_size=20.0,
+            long_observed_at_ms=5_000,
+            short_observed_at_ms=5_000,
+            created_at_ms=5_000,
+            expires_at_ms=7_000,
+            provider="ws_bbo_quote_lease",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+        refreshed_lease = replace(
+            old_lease,
+            long_bid=50005.0,
+            long_ask=50008.0,
+            short_bid=49995.0,
+            short_ask=50000.0,
+            long_observed_at_ms=5_200,
+            short_observed_at_ms=5_200,
+            created_at_ms=5_200,
+            expires_at_ms=5_300,
+        )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.current = old_lease
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return self.current
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                self.current = refreshed_lease
+                for venue, bid, ask in (
+                    ("binance", 50005.0, 50008.0),
+                    ("okx", 49995.0, 50000.0),
+                ):
+                    runtime.ws_bbo_cache.update_quote(
+                        TopBookQuote(
+                            venue=venue,
+                            symbol="BTCUSDT",
+                            bid=bid,
+                            ask=ask,
+                            bid_size=20.0,
+                            ask_size=20.0,
+                            observed_at_ms=_now_ms,
+                            received_at_ms=_now_ms,
+                            source=f"{venue}_bbo_ws",
+                        )
+                    )
+                return SimpleNamespace(allowed=True)
+
+        provider = RefreshingProvider()
+        runtime.entry_readiness_provider = provider
+        for venue, bid, ask in (
+            ("binance", 50000.0, 50010.0),
+            ("okx", 49990.0, 50000.0),
+        ):
+            runtime.ws_bbo_cache.update_quote(
+                TopBookQuote(
+                    venue=venue,
+                    symbol="BTCUSDT",
+                    bid=bid,
+                    ask=ask,
+                    bid_size=20.0,
+                    ask_size=20.0,
+                    observed_at_ms=5_000,
+                    received_at_ms=5_000,
+                    source=f"{venue}_bbo_ws",
+                )
+            )
+
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5_000,
+            price_hint=50_000.0,
+        )
+
+        assert dispatched is True, runtime._last_entry_dispatch_block_reason
+        assert provider.calls == 1
+        assert runtime.entry_executor.ctx is not None
+        assert runtime.entry_executor.ctx.long_price_hint == pytest.approx(50005.0)
+        assert runtime.entry_executor.ctx.short_price_hint == pytest.approx(49995.0)
+        assert (
+            candidate.entry_notional_quote / candidate.entry_target_quantity
+            == pytest.approx((50005.0 + 49995.0) / 2.0)
+        )
+        assert not [
+            record
+            for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+            and record["payload"].get("reason") == "stale_quote_lease"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_executor_ws_bbo_final_refresh_rebinds_context_before_submit(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        pair_id = runtime._candidate_pair_id(candidate)
+        stale_context_lease = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_bid_size=20.0,
+            long_ask_size=20.0,
+            short_bid_size=20.0,
+            short_ask_size=20.0,
+            long_observed_at_ms=5_000,
+            short_observed_at_ms=5_200,
+            created_at_ms=5_000,
+            expires_at_ms=5_500,
+            provider="ws_bbo_quote_lease",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+        refreshed_lease = replace(
+            stale_context_lease,
+            long_bid=50005.0,
+            long_ask=50008.0,
+            short_bid=49995.0,
+            short_ask=50000.0,
+            long_observed_at_ms=5_200,
+            short_observed_at_ms=5_200,
+            created_at_ms=5_200,
+        )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return refreshed_lease
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                return SimpleNamespace(allowed=True)
+
+        provider = RefreshingProvider()
+        runtime.entry_readiness_provider = provider
+        monkeypatch.setattr(runtime, "_entry_wall_clock_now_ms", lambda: 5_200)
+
+        async def leverage_ready(**_kwargs):
+            return True, {}
+
+        monkeypatch.setattr(
+            dispatch,
+            "_prepare_live_entry_leverage_for_candidate",
+            leverage_ready,
+        )
+        ctx = EntryContext(
+            entry_id="entry-rebind-test",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_price_hint=50010.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            planned_route=ExecutionRoute.FALLBACK_TO_STANDARD,
+        )
+
+        submitted = await dispatch._execute_entry_context(
+            ctx=ctx,
+            candidate=candidate,
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            effective_quantity=0.01,
+            price_hint=50_000.0,
+            maker_venue=Venue.BINANCE,
+            maker_leg=Side.BUY,
+            maker_bbo_evidence={},
+            now_ms=5_000,
+            quote_lease=stale_context_lease,
+            requires_final_quote_lease=True,
+            selected_deadline_monotonic=None,
+            selected_at_ms=5_000,
+            leverage_evidence_for_sizing={},
+        )
+
+        assert submitted is True
+        assert provider.calls == 1
+        assert ctx.long_price_hint == pytest.approx(50008.0)
+        assert ctx.short_price_hint == pytest.approx(49995.0)
+
+    @pytest.mark.asyncio
+    async def test_executor_ws_bbo_provider_refresh_rebinds_context_before_submit(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        pair_id = runtime._candidate_pair_id(candidate)
+        stale_provider_lease = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_bid_size=20.0,
+            long_ask_size=20.0,
+            short_bid_size=20.0,
+            short_ask_size=20.0,
+            long_observed_at_ms=5_000,
+            short_observed_at_ms=5_200,
+            created_at_ms=5_000,
+            expires_at_ms=5_500,
+            provider="ws_bbo_quote_lease",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+        refreshed_lease = replace(
+            stale_provider_lease,
+            long_bid=50005.0,
+            long_ask=50008.0,
+            short_bid=49995.0,
+            short_ask=50000.0,
+            long_observed_at_ms=5_200,
+            short_observed_at_ms=5_200,
+            created_at_ms=5_200,
+        )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.current = stale_provider_lease
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return self.current
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                self.current = refreshed_lease
+                return SimpleNamespace(allowed=True)
+
+        provider = RefreshingProvider()
+        runtime.entry_readiness_provider = provider
+        monkeypatch.setattr(runtime, "_entry_wall_clock_now_ms", lambda: 5_200)
+
+        async def leverage_ready(**_kwargs):
+            return True, {}
+
+        monkeypatch.setattr(
+            dispatch,
+            "_prepare_live_entry_leverage_for_candidate",
+            leverage_ready,
+        )
+        ctx = EntryContext(
+            entry_id="entry-provider-rebind-test",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_price_hint=50010.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            planned_route=ExecutionRoute.FALLBACK_TO_STANDARD,
+        )
+
+        submitted = await dispatch._execute_entry_context(
+            ctx=ctx,
+            candidate=candidate,
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            effective_quantity=0.01,
+            price_hint=50_000.0,
+            maker_venue=Venue.BINANCE,
+            maker_leg=Side.BUY,
+            maker_bbo_evidence={},
+            now_ms=5_000,
+            quote_lease=stale_provider_lease,
+            requires_final_quote_lease=True,
+            selected_deadline_monotonic=None,
+            selected_at_ms=5_000,
+            leverage_evidence_for_sizing={},
+        )
+
+        assert submitted is True
+        assert provider.calls == 1
+        assert ctx.long_price_hint == pytest.approx(50008.0)
+        assert ctx.short_price_hint == pytest.approx(49995.0)
+        assert not [
+            record for record in tmp_journal.read_all()
+            if record["kind"] == "entry.dispatch_viability_blocked"
+            and record["payload"].get("source") == "executor_submit_quote_lease"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_executor_ws_bbo_rechecks_after_leverage_delay_and_rebinds(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.entry_readiness import QuoteLease
+
+        config.runtime.mode = "live"
+        config.strategy.local_l2_enabled = False
+        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        config.strategy.entry_quote_lease_ttl_ms = 500
+        config.strategy.entry_quote_lease_max_skew_ms = 100
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.entry_executor = self._capturing_executor()
+        dispatch = runtime.entry_dispatch_runtime
+        candidate = self._candidate()
+        pair_id = runtime._candidate_pair_id(candidate)
+        clock = {"now_ms": 5200}
+        initial_lease = QuoteLease(
+            pair_id=pair_id,
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="okx",
+            long_bid=50000.0,
+            long_ask=50010.0,
+            short_bid=49990.0,
+            short_ask=50000.0,
+            long_bid_size=20.0,
+            long_ask_size=20.0,
+            short_bid_size=20.0,
+            short_ask_size=20.0,
+            long_observed_at_ms=5200,
+            short_observed_at_ms=5200,
+            created_at_ms=5200,
+            expires_at_ms=5500,
+            provider="ws_bbo_quote_lease",
+            candidate_revision_id=candidate.candidate_revision_id,
+        )
+        refreshed_lease = replace(
+            initial_lease,
+            long_bid=50005.0,
+            long_ask=50008.0,
+            short_bid=49995.0,
+            short_ask=50000.0,
+            long_observed_at_ms=5601,
+            short_observed_at_ms=5601,
+            created_at_ms=5601,
+            expires_at_ms=6500,
+        )
+
+        class RefreshingProvider:
+            def __init__(self):
+                self.current = initial_lease
+                self.calls = 0
+
+            def get_lease(self, _pair_id):
+                return self.current
+
+            def decide(self, _candidate, _now_ms):
+                self.calls += 1
+                self.current = refreshed_lease
+                return SimpleNamespace(allowed=True)
+
+        runtime.entry_readiness_provider = RefreshingProvider()
+        monkeypatch.setattr(
+            runtime,
+            "_entry_wall_clock_now_ms",
+            lambda: clock["now_ms"],
+        )
+
+        async def leverage_ready(**_kwargs):
+            clock["now_ms"] = 5601
+            return True, {}
+
+        monkeypatch.setattr(
+            dispatch,
+            "_prepare_live_entry_leverage_for_candidate",
+            leverage_ready,
+        )
+        ctx = EntryContext(
+            entry_id="entry-post-leverage-rebind-test",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_price_hint=50010.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            planned_route=ExecutionRoute.FALLBACK_TO_STANDARD,
+        )
+
+        submitted = await dispatch._execute_entry_context(
+            ctx=ctx,
+            candidate=candidate,
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            effective_quantity=0.01,
+            price_hint=50_000.0,
+            maker_venue=Venue.BINANCE,
+            maker_leg=Side.BUY,
+            maker_bbo_evidence={},
+            now_ms=5200,
+            quote_lease=initial_lease,
+            requires_final_quote_lease=True,
+            selected_deadline_monotonic=None,
+            selected_at_ms=5200,
+            leverage_evidence_for_sizing={},
+        )
+
+        rebind_events = [
+            record for record in tmp_journal.read_all()
+            if record["kind"] == "execution.entry_submit_quote_lease_rebound"
+        ]
+        assert submitted is True
+        assert runtime.entry_readiness_provider.calls == 1
+        assert ctx.long_price_hint == pytest.approx(50008.0)
+        assert ctx.short_price_hint == pytest.approx(49995.0)
+        assert rebind_events[-1]["payload"]["stage"] == (
+            "executor_post_leverage_provider"
+        )
+        assert rebind_events[-1]["payload"]["lease_expires_at_ms"] == 6500
+        assert rebind_events[-1]["payload"]["ts_ms"] == 5601
 
     def test_ws_bbo_quote_skew_uses_legacy_final_gate_fallback_for_old_config(self):
         from lightfee.engine.entry_readiness import QuoteLease
@@ -7005,7 +8046,7 @@ class TestPlannerDispatchIntegration:
         assert readiness.allowed
 
         def expire_during_pre_submit_window(_ctx):
-            clock["now_ms"] = 6_500
+            clock["now_ms"] = 6_501
             return None
 
         monkeypatch.setattr(
@@ -7032,8 +8073,10 @@ class TestPlannerDispatchIntegration:
         assert blocked[-1]["reason"] in {
             "expired_quote_lease",
             "expired_final_quote_lease",
+            "stale_quote_lease",
         }
         assert blocked[-1]["source"] == "executor_submit_quote_lease"
+        assert blocked[-1]["execution_refresh_attempted"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("legacy_provider", (None, "local_l2"))

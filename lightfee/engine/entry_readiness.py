@@ -179,7 +179,7 @@ class RestTopBookEntryReadinessProvider:
         candidate: Any,
         now_ms: int,
         market_quotes: Any,
-    ) -> EntryReadinessDecision | tuple[str, str, Any, Any]:
+    ) -> EntryReadinessDecision | tuple[str, str, Any, Any] | tuple[str, str, Any, Any, dict[str, Any]]:
         if self._runtime.config.runtime.mode != "live":
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._runtime._candidate_pair_id(candidate)
@@ -311,10 +311,17 @@ class QuoteLeaseEntryReadinessProvider(RestTopBookEntryReadinessProvider):
         validation = self._validate_quotes(candidate, now_ms, market_quotes)
         if isinstance(validation, EntryReadinessDecision):
             return validation
-        symbol, pair_id, long_quote, short_quote = validation
+        extra_evidence: dict[str, Any] = {}
+        if len(validation) == 5:
+            symbol, pair_id, long_quote, short_quote, raw_extra_evidence = validation
+            if isinstance(raw_extra_evidence, dict):
+                extra_evidence = dict(raw_extra_evidence)
+        else:
+            symbol, pair_id, long_quote, short_quote = validation
         lease = self._make_lease(candidate, symbol, pair_id, long_quote, short_quote, now_ms)
         self._leases[pair_id] = lease
         evidence = self._quote_evidence(symbol, pair_id, long_quote, short_quote, now_ms)
+        evidence.update(extra_evidence)
         evidence["lease"] = {
             "created_at_ms": lease.created_at_ms,
             "expires_at_ms": lease.expires_at_ms,
@@ -373,7 +380,7 @@ class WsTopBookEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         candidate: Any,
         now_ms: int,
         market_quotes: Any,
-    ) -> EntryReadinessDecision | tuple[str, str, Any, Any]:
+    ) -> EntryReadinessDecision | tuple[str, str, Any, Any] | tuple[str, str, Any, Any, dict[str, Any]]:
         if self._runtime.config.runtime.mode != "live":
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._runtime._candidate_pair_id(candidate)
@@ -523,7 +530,7 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         candidate: Any,
         now_ms: int,
         market_quotes: Any,
-    ) -> EntryReadinessDecision | tuple[str, str, Any, Any]:
+    ) -> EntryReadinessDecision | tuple[str, str, Any, Any] | tuple[str, str, Any, Any, dict[str, Any]]:
         if self._runtime.config.runtime.mode != "live":
             symbol = str(getattr(candidate, "symbol", ""))
             pair_id = self._runtime._candidate_pair_id(candidate)
@@ -620,6 +627,118 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
                 pair_id=pair_id,
                 evidence=evidence,
             )
+        if not self._local_l2_effective_enabled():
+            quote_skew_ms = self._quote_observation_skew_ms(
+                long_quote,
+                short_quote,
+            )
+            max_skew_ms = self._quote_lease_max_skew_ms()
+            if max_skew_ms > 0 and quote_skew_ms > max_skew_ms:
+                before_skew_ms = quote_skew_ms
+                long_quote, long_skew_refresh = self._quote_with_rest_refresh(
+                    long_venue,
+                    symbol,
+                    long_quote,
+                    "ask",
+                    now_ms,
+                    long_stream_state,
+                    force=True,
+                    refresh_reason="quote_lease_skew_exceeded",
+                )
+                short_quote, short_skew_refresh = self._quote_with_rest_refresh(
+                    short_venue,
+                    symbol,
+                    short_quote,
+                    "bid",
+                    now_ms,
+                    short_stream_state,
+                    force=True,
+                    refresh_reason="quote_lease_skew_exceeded",
+                )
+                after_skew_ms = self._quote_observation_skew_ms(
+                    long_quote,
+                    short_quote,
+                )
+                rest_refresh_evidence["skew_refresh"] = {
+                    "attempted": True,
+                    "reason": "quote_lease_skew_exceeded",
+                    "source": "rest_top_book_refresh",
+                    "before_skew_ms": before_skew_ms,
+                    "after_skew_ms": after_skew_ms,
+                    "max_skew_ms": max_skew_ms,
+                    "long": dict(long_skew_refresh or {}),
+                    "short": dict(short_skew_refresh or {}),
+                    "refreshed_both_legs": bool(
+                        long_skew_refresh
+                        and short_skew_refresh
+                        and long_skew_refresh.get("outcome")
+                        in {"cache_updated", "refreshed"}
+                        and short_skew_refresh.get("outcome")
+                        in {"cache_updated", "refreshed"}
+                    ),
+                }
+
+                long_quote_error = self._quote_error(long_quote, "ask", now_ms)
+                short_quote_error = self._quote_error(short_quote, "bid", now_ms)
+                quote_error = long_quote_error or short_quote_error
+                if quote_error:
+                    reason, evidence = quote_error
+                    evidence.update(
+                        {"provider": self.provider_name, "source": "ws_bbo_cache"}
+                    )
+                    evidence.setdefault(
+                        "quote_age_ms",
+                        {
+                            "long": self._quote_base_evidence(
+                                long_quote,
+                                now_ms,
+                            )["age_ms"],
+                            "short": self._quote_base_evidence(
+                                short_quote,
+                                now_ms,
+                            )["age_ms"],
+                        },
+                    )
+                    evidence["rest_refresh"] = rest_refresh_evidence
+                    return EntryReadinessDecision.block(
+                        reason,
+                        symbol=symbol,
+                        pair_id=pair_id,
+                        evidence=evidence,
+                    )
+                if after_skew_ms > max_skew_ms:
+                    self._leases.pop(pair_id, None)
+                    evidence = self._quote_evidence(
+                        symbol,
+                        pair_id,
+                        long_quote,
+                        short_quote,
+                        now_ms,
+                    )
+                    evidence.update({
+                        "provider": self.provider_name,
+                        "source": "ws_bbo_cache",
+                        "blocker_family": "quote_skew_exceeded",
+                        "quote_lease_reason": "quote_lease_skew_exceeded",
+                        "quote_observation_skew_ms": after_skew_ms,
+                        "quote_observation_max_skew_ms": max_skew_ms,
+                        "quote_observation_skew_before_refresh_ms": before_skew_ms,
+                        "rest_refresh": rest_refresh_evidence,
+                    })
+                    return EntryReadinessDecision.block(
+                        self._reason("skew_exceeded"),
+                        symbol=symbol,
+                        pair_id=pair_id,
+                        evidence=evidence,
+                    )
+        if rest_refresh_evidence:
+            return (
+                symbol,
+                pair_id,
+                long_quote,
+                short_quote,
+                {"rest_refresh": rest_refresh_evidence},
+            )
         return symbol, pair_id, long_quote, short_quote
 
     def _quote_error(
@@ -656,12 +775,19 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
         executable_side: str,
         now_ms: int,
         stream_state: dict[str, Any],
+        *,
+        force: bool = False,
+        refresh_reason: str = "",
     ) -> tuple[Any, dict[str, Any] | None]:
         venue_key = str(venue or "").strip().lower()
         symbol_key = str(symbol or "").strip().upper()
         if not bool(stream_state.get("tracked")):
             return quote, None
-        if not self._quote_needs_rest_refresh(quote, executable_side, now_ms):
+        if not force and not self._quote_needs_rest_refresh(
+            quote,
+            executable_side,
+            now_ms,
+        ):
             return quote, None
 
         evidence: dict[str, Any] = {
@@ -670,7 +796,10 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
             "venue": venue_key,
             "symbol": symbol_key,
             "quote_present_before_refresh": quote is not None,
+            "forced": bool(force),
         }
+        if refresh_reason:
+            evidence["reason"] = str(refresh_reason)
 
         refresher = self._rest_top_book_refresher()
         refresh_quote = getattr(refresher, "refresh_quote", None)
@@ -746,6 +875,33 @@ class WsBboQuoteLeaseEntryReadinessProvider(QuoteLeaseEntryReadinessProvider):
 
     def _quote_lease_age_budget_ms(self) -> int:
         return self._runtime.config.strategy.entry_quote_lease_ttl_ms
+
+    @staticmethod
+    def _quote_observation_skew_ms(long_quote: Any, short_quote: Any) -> int:
+        return abs(
+            int(getattr(long_quote, "observed_at_ms", 0) or 0)
+            - int(getattr(short_quote, "observed_at_ms", 0) or 0)
+        )
+
+    def _quote_lease_max_skew_ms(self) -> int:
+        strategy = getattr(self._runtime.config, "strategy", None)
+        value = getattr(strategy, "entry_quote_lease_max_skew_ms", None)
+        if value is None:
+            value = getattr(strategy, "entry_final_gate_max_skew_ms", 0)
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _local_l2_effective_enabled(self) -> bool:
+        for name in (
+            "_entry_local_l2_effective_enabled",
+            "_local_l2_effective_enabled",
+        ):
+            enabled = getattr(self._runtime, name, None)
+            if callable(enabled):
+                return bool(enabled())
+        return False
 
     def _rest_top_book_refresher(self) -> Any:
         refresher = getattr(self._runtime, "ws_bbo_rest_refresher", None)

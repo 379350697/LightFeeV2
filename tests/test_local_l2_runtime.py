@@ -938,6 +938,108 @@ class TestBinanceAsterV1BufferCapParity:
         ]
 
     @pytest.mark.asyncio
+    async def test_snapshot_response_stale_generation_is_discarded_before_apply(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "STALEGENUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        class GenerationFlipAdapter(MockL2Adapter):
+            async def fetch_l2_snapshot(
+                self,
+                symbol: str,
+                depth: int = 50,
+            ) -> LocalL2Update:
+                update = await super().fetch_l2_snapshot(symbol, depth)
+                dp._advance_stream_generation("binance", "STALEGENUSDT")
+                return update
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "STALEGENUSDT",
+            GenerationFlipAdapter("binance", sequence=100),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert book.status == L2BookStatus.BOOTSTRAPPING
+        assert book.sequence == 0
+        stale = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_stale_response_discarded"
+        ][-1]
+        assert stale["reason"] == "snapshot_response_stale_generation"
+        assert stale["response_discarded"] is True
+        assert stale["stream_generation"] != stale["current_stream_generation"]
+
+    @pytest.mark.asyncio
+    async def test_binance_stale_rest_snapshot_event_carries_causal_evidence(
+        self,
+        monkeypatch,
+    ):
+        async def no_sleep(_delay):
+            return None
+
+        monkeypatch.setattr(
+            "lightfee.marketdata.local_l2_data_plane.asyncio.sleep",
+            no_sleep,
+        )
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "STALESNAPUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.sequence = 120
+        book.last_update_id = 120
+        book.observed_at_ms = 1_500
+        book.last_snapshot_ms = 1_000
+        book.last_delta_ms = 1_500
+        book.fault_reason = "sequence_gap: previous_link"
+        book.last_error = "previous_link"
+        book.generation = 7
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp._rebuild_attempt_ids["binance:STALESNAPUSDT"] = 3
+        freshness = dp._freshness_state("binance", "STALESNAPUSDT")
+        freshness.last_ws_delta_ms = 1_600
+        freshness.last_ws_keepalive_ms = 1_700
+        freshness.last_book_confirmation_ms = 1_800
+        freshness.last_subscription_confirmed_ms = 1_400
+        freshness.last_rest_refresh_ms = 1_300
+
+        ok = await dp.bootstrap_book(
+            "binance",
+            "STALESNAPUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2_000,
+        )
+
+        assert ok is False
+        stale = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_stale"
+        ][-1]
+        assert stale["snapshot_seq"] == 100
+        assert stale["book_seq"] == 120
+        assert stale["last_rebuild_attempt_id"] == 3
+        assert stale["fault_reason"] == "sequence_gap: previous_link"
+        assert stale["book_last_error"] == "previous_link"
+        assert stale["snapshot_in_flight"] is True
+        assert stale["snapshot_state"] == "in_flight"
+        assert stale["snapshot_received_at_ms"] == 1000
+        assert stale["rest_snapshot_received_at_ms"] == 1000
+        assert stale["last_ws_delta_ms"] == 1600
+        assert stale["last_ws_keepalive_ms"] == 1700
+        assert stale["last_book_confirmation_ms"] == 1800
+        assert stale["last_rest_refresh_ms"] == 1300
+        assert stale["age_ms"] == 500
+        assert stale["snapshot_received_age_ms"] == 1000
+        assert stale["book_generation"] == 7
+        assert stale["snapshot_attempt_id"] == 1
+        assert stale["current_stream_generation"] == stale["stream_generation"]
+        assert stale["policy_rest_snapshot_sequence_comparable"] is True
+
+    @pytest.mark.asyncio
     async def test_binance_buffered_replay_invalid_bridge_keeps_rebuilding(self):
         rt = LocalL2Runtime()
         book = rt.ensure_book("binance", "GAPUSDT")
@@ -1297,6 +1399,99 @@ class TestBinanceAsterV1BufferCapParity:
         assert failure["continuity_contract"] == "range_only_U_u_contains_expected"
         assert failure["continuity_action"] == "range_gap_rebuild"
         assert failure["strict_continuity_rule"] == "range_must_contain_expected_sequence"
+
+    @pytest.mark.asyncio
+    async def test_gate_rebase_stale_generation_response_is_not_applied(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASESTALEUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.bootstrap_rebase_wait_ms = 0
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASESTALEUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=105,
+                sequence=106,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+
+        class StaleRebaseAdapter(SequenceMockL2Adapter):
+            async def fetch_l2_snapshot(
+                self,
+                symbol: str,
+                depth: int = 50,
+            ) -> LocalL2Update:
+                update = await super().fetch_l2_snapshot(symbol, depth)
+                if self.call_count == 2:
+                    dp._advance_stream_generation("gate", "REBASESTALEUSDT")
+                return update
+
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASESTALEUSDT",
+            StaleRebaseAdapter("gate", [100, 104]),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert book.sequence == 100
+        stale = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_stale_response_discarded"
+        ][-1]
+        assert stale["reason"] == "gate_rebase_snapshot_response_stale_generation"
+        assert stale["response_discarded"] is True
+        assert stale["stream_generation"] != stale["current_stream_generation"]
+
+    @pytest.mark.asyncio
+    async def test_gate_rebase_stale_second_snapshot_sequence_is_not_applied(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("gate", "REBASEOLDUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+        dp.bootstrap_rebase_wait_ms = 0
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="gate",
+                symbol="REBASEOLDUSDT",
+                bids=[PriceLevel(49910.0, 10.0)],
+                asks=[PriceLevel(50110.0, 10.0)],
+                first_sequence=125,
+                sequence=126,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1100,
+        )
+        ok = await dp.bootstrap_book(
+            "gate",
+            "REBASEOLDUSDT",
+            SequenceMockL2Adapter("gate", [120, 110]),
+            now_ms=2000,
+        )
+
+        assert ok is False
+        assert book.sequence == 120
+        assert book.last_update_id == 120
+        assert book.status == L2BookStatus.REBUILDING
+        stale = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_snapshot_stale_response_discarded"
+        ][-1]
+        assert stale["reason"] == "gate_rebase_snapshot_stale_sequence"
+        assert stale["branch"] == "second_snapshot_stale_sequence"
+        assert stale["snapshot_seq"] == 110
+        assert stale["book_seq"] == 120
+        assert stale["response_discarded"] is True
+        assert stale["sequence_monotonic_bound"] is True
 
     @pytest.mark.asyncio
     async def test_gate_bootstrap_rebase_filters_old_stream_generation(self):
@@ -1797,6 +1992,26 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
             payload for kind, payload in journal.records
             if kind == "runtime.local_l2_hot_stale_rebuild"
         ]
+        lifecycle = [
+            payload for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_refresh_lifecycle"
+        ]
+        assert lifecycle
+        assert {payload["status"] for payload in lifecycle} >= {
+            "queued",
+            "started",
+            "ready",
+        }
+        assert all("deadline_ms" in payload for payload in lifecycle)
+        assert all("deadline_missed" in payload for payload in lifecycle)
+        assert any(payload["queued"] is True for payload in lifecycle)
+        assert any(payload["started"] is True for payload in lifecycle)
+        assert any(payload["completed"] is True for payload in lifecycle)
+        assert all(
+            payload["attempted_count"] <= dp.max_concurrent_snapshots
+            for payload in lifecycle
+        )
+        assert all(payload["reason"] == "rest_refresh_late" for payload in lifecycle)
 
     @pytest.mark.asyncio
     async def test_missing_ws_subscription_is_the_rebuild_reason_after_30_minutes(self):

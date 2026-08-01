@@ -80,6 +80,9 @@ class _BookSnapshotState:
     max_consecutive_failures: int = 5
     last_error: str = ""
     snapshot_in_flight: bool = False
+    snapshot_attempt_id: int = 0
+    stream_generation: int = 0
+    request_started_ms: int = 0
 
 
 @dataclass
@@ -152,6 +155,7 @@ class LocalL2DataPlane:
         self.buffered_replay_failure_alert_threshold: int = 3
         self._buffered_replay_failure_counts: dict[str, int] = {}
         self._rebuild_attempt_ids: dict[str, int] = {}
+        self._snapshot_attempt_ids: dict[str, int] = {}
         self._freshness_states: dict[LocalL2BookKey, _BookFreshnessState] = {}
         self._state_event_last_ms: dict[tuple[str, str, str, str], int] = {}
         self._state_event_suppressed: dict[tuple[str, str, str, str], int] = {}
@@ -196,9 +200,36 @@ class LocalL2DataPlane:
         if ss.consecutive_failures >= ss.max_consecutive_failures:
             return False
 
+        request_generation = self._current_stream_generation(venue, symbol)
+        snapshot_attempt_id = self._next_snapshot_attempt_id(venue, symbol)
+        request_started_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
         ss.snapshot_in_flight = True
+        ss.snapshot_attempt_id = snapshot_attempt_id
+        ss.stream_generation = request_generation
+        ss.request_started_ms = request_started_ms
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+            if not self._snapshot_attempt_is_current(
+                venue=venue,
+                symbol=symbol,
+                request_generation=request_generation,
+                snapshot_attempt_id=snapshot_attempt_id,
+            ):
+                evidence = self._snapshot_attempt_stale_evidence(
+                    venue=venue,
+                    symbol=symbol,
+                    reason="snapshot_response_stale_generation",
+                    request_generation=request_generation,
+                    snapshot_attempt_id=snapshot_attempt_id,
+                    request_started_ms=request_started_ms,
+                    now_ms=now_ms,
+                )
+                ss.last_error = evidence["reason"]
+                self._journal.append(
+                    "runtime.local_l2_snapshot_stale_response_discarded",
+                    evidence,
+                )
+                return False
 
             policy = policy_for_venue(venue)
             book = self._runtime.get_book(venue, symbol)
@@ -219,10 +250,18 @@ class LocalL2DataPlane:
                 if update.sequence < book.last_update_id:
                     self._journal.append(
                         "runtime.local_l2_snapshot_stale",
-                        {"venue": venue, "symbol": symbol,
-                         "snapshot_seq": update.sequence, "book_seq": book.last_update_id,
-                         "policy_bridge_mode": policy.bridge_mode.value,
-                         "reason_class": "stale_snapshot"},
+                        self._snapshot_sequence_stale_evidence(
+                            venue=venue,
+                            symbol=symbol,
+                            update=update,
+                            book=book,
+                            policy=policy,
+                            ss=ss,
+                            request_generation=request_generation,
+                            snapshot_attempt_id=snapshot_attempt_id,
+                            request_started_ms=request_started_ms,
+                            now_ms=now_ms,
+                        ),
                     )
                     # Small delay to avoid tight loop re-fetching the same stale snapshot
                     await asyncio.sleep(0.25)
@@ -239,6 +278,8 @@ class LocalL2DataPlane:
                         "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
                         {"venue": venue, "symbol": symbol,
                          "snapshot_seq": update.sequence, "book_seq": getattr(book, "last_update_id", 0) if book else 0,
+                         "stream_generation": request_generation,
+                         "snapshot_attempt_id": snapshot_attempt_id,
                          "policy": policy.bridge_mode.value},
                         now_ms,
                         reason=policy.bridge_mode.value,
@@ -262,6 +303,8 @@ class LocalL2DataPlane:
                         "symbol": symbol,
                         "error": ss.last_error,
                         "category": "snapshot_apply_failed",
+                        "stream_generation": request_generation,
+                        "snapshot_attempt_id": snapshot_attempt_id,
                     },
                 )
                 return False
@@ -277,16 +320,30 @@ class LocalL2DataPlane:
                     adapter=adapter,
                     depth=depth,
                     now_ms=now_ms,
+                    expected_generation=request_generation,
+                    snapshot_attempt_id=snapshot_attempt_id,
                 )
                 replay = (
                     gate_rebase_replay
                     if gate_rebase_replay is not None
-                    else self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
+                    else self._replay_buffered_updates(
+                        venue,
+                        symbol,
+                        now_ms=now_ms,
+                        expected_generation=request_generation,
+                        snapshot_attempt_id=snapshot_attempt_id,
+                    )
                 )
             if replay.replayed > 0:
                 self._journal.append(
                     "runtime.local_l2_buffered_replay",
-                    {"venue": venue, "symbol": symbol, "replayed": replay.replayed},
+                    {
+                        "venue": venue,
+                        "symbol": symbol,
+                        "replayed": replay.replayed,
+                        "stream_generation": request_generation,
+                        "snapshot_attempt_id": snapshot_attempt_id,
+                    },
                 )
             if not replay.ok:
                 book = self._runtime.get_book(venue, symbol)
@@ -308,6 +365,8 @@ class LocalL2DataPlane:
                         "symbol": symbol,
                         "error": ss.last_error,
                         "category": "buffered_replay_failed",
+                        "stream_generation": request_generation,
+                        "snapshot_attempt_id": snapshot_attempt_id,
                         **replay.failure_evidence,
                     },
                 )
@@ -335,7 +394,12 @@ class LocalL2DataPlane:
             self._buffered_replay_failure_counts.pop(f"{venue}:{symbol}", None)
             self._append_rate_limited_state_event(
                 "runtime.local_l2_snapshot_ok",
-                {"venue": venue, "symbol": symbol},
+                {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "stream_generation": request_generation,
+                    "snapshot_attempt_id": snapshot_attempt_id,
+                },
                 now_ms,
                 reason="ok",
                 interval_ms=self.snapshot_ok_event_rate_limit_ms,
@@ -363,7 +427,14 @@ class LocalL2DataPlane:
             )
             self._journal.append(
                 "runtime.local_l2_snapshot_error",
-                {"venue": venue, "symbol": symbol, "error": str(e), "category": str(e.category)},
+                {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "error": str(e),
+                    "category": str(e.category),
+                    "stream_generation": request_generation,
+                    "snapshot_attempt_id": snapshot_attempt_id,
+                },
             )
             return False
         except Exception as e:
@@ -385,7 +456,13 @@ class LocalL2DataPlane:
             )
             self._journal.append(
                 "runtime.local_l2_snapshot_error",
-                {"venue": venue, "symbol": symbol, "error": str(e)},
+                {
+                    "venue": venue,
+                    "symbol": symbol,
+                    "error": str(e),
+                    "stream_generation": request_generation,
+                    "snapshot_attempt_id": snapshot_attempt_id,
+                },
             )
             return False
         finally:
@@ -451,6 +528,213 @@ class LocalL2DataPlane:
         attempt = self._rebuild_attempt_ids.get(key, 0) + 1
         self._rebuild_attempt_ids[key] = attempt
         return attempt
+
+    def _next_snapshot_attempt_id(self, venue: str, symbol: str) -> int:
+        key = f"{venue}:{symbol}"
+        attempt = self._snapshot_attempt_ids.get(key, 0) + 1
+        self._snapshot_attempt_ids[key] = attempt
+        return attempt
+
+    def _snapshot_attempt_stale_evidence(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        reason: str,
+        request_generation: int,
+        snapshot_attempt_id: int,
+        request_started_ms: int,
+        now_ms: int,
+    ) -> dict:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        ss = self._snap_states.get(key)
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "reason": reason,
+            "stream_generation": request_generation,
+            "current_stream_generation": self._current_stream_generation(
+                venue, symbol,
+            ),
+            "snapshot_attempt_id": snapshot_attempt_id,
+            "active_snapshot_attempt_id": int(
+                getattr(ss, "snapshot_attempt_id", 0) or 0
+            ) if ss is not None else 0,
+            "request_started_ms": request_started_ms,
+            "ts_ms": now_ms,
+            "response_discarded": True,
+            "generation_bound": True,
+            "attempt_bound": True,
+        }
+
+    def _snapshot_sequence_stale_evidence(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        update,
+        book,
+        policy,
+        ss: _BookSnapshotState,
+        request_generation: int,
+        snapshot_attempt_id: int,
+        request_started_ms: int,
+        now_ms: int,
+    ) -> dict:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        freshness = self._freshness_states.get(key)
+        ws_client = self._ws_clients.get(key)
+        event_now_ms = now_ms if now_ms > 0 else int(time.time() * 1000)
+        book_observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
+        snapshot_received_at_ms = int(getattr(update, "received_at_ms", 0) or 0)
+        effective_freshness_ms = self._effective_hot_freshness_ms(key, book)
+        book_age_ms = (
+            int(book.age_ms(event_now_ms))
+            if hasattr(book, "age_ms")
+            else max(event_now_ms - book_observed_at_ms, 0)
+            if book_observed_at_ms > 0
+            else 0
+        )
+        snapshot_age_ms = (
+            max(event_now_ms - snapshot_received_at_ms, 0)
+            if snapshot_received_at_ms > 0
+            else 0
+        )
+        effective_age_ms = (
+            max(event_now_ms - effective_freshness_ms, 0)
+            if effective_freshness_ms > 0
+            else 0
+        )
+        last_rebuild_attempt_id = int(
+            self._rebuild_attempt_ids.get(f"{venue}:{symbol}", 0) or 0
+        )
+        return {
+            "venue": venue,
+            "symbol": symbol,
+            "reason": "stale_snapshot",
+            "reason_class": "stale_snapshot",
+            "snapshot_seq": int(getattr(update, "sequence", 0) or 0),
+            "snapshot_first_seq": int(
+                getattr(update, "first_sequence", 0) or 0
+            ),
+            "snapshot_previous_seq": int(
+                getattr(update, "previous_sequence", 0) or 0
+            ),
+            "book_seq": int(getattr(book, "last_update_id", 0) or 0),
+            "book_sequence": int(getattr(book, "sequence", 0) or 0),
+            "book_last_update_id": int(getattr(book, "last_update_id", 0) or 0),
+            "book_status": self._status_value(getattr(book, "status", "")),
+            "pool": self._status_value(getattr(book, "pool", "")),
+            "book_generation": int(getattr(book, "generation", 0) or 0),
+            "stream_generation": request_generation,
+            "current_stream_generation": self._current_stream_generation(
+                venue, symbol
+            ),
+            "snapshot_stream_generation": int(
+                getattr(ss, "stream_generation", 0) or 0
+            ),
+            "snapshot_attempt_id": snapshot_attempt_id,
+            "active_snapshot_attempt_id": int(
+                getattr(ss, "snapshot_attempt_id", 0) or 0
+            ),
+            "snapshot_state_present": True,
+            "snapshot_state": (
+                "in_flight"
+                if bool(getattr(ss, "snapshot_in_flight", False))
+                else "idle"
+            ),
+            "snapshot_in_flight": bool(
+                getattr(ss, "snapshot_in_flight", False)
+            ),
+            "snapshot_request_started_ms": request_started_ms,
+            "request_started_ms": request_started_ms,
+            "snapshot_last_snapshot_ms": int(
+                getattr(ss, "last_snapshot_ms", 0) or 0
+            ),
+            "snapshot_consecutive_failures": int(
+                getattr(ss, "consecutive_failures", 0) or 0
+            ),
+            "snapshot_max_consecutive_failures": int(
+                getattr(ss, "max_consecutive_failures", 0) or 0
+            ),
+            "snapshot_cooldown_ms": int(
+                getattr(ss, "snapshot_cooldown_ms", 0) or 0
+            ),
+            "snapshot_last_error": str(getattr(ss, "last_error", "") or ""),
+            "last_rebuild_attempt_id": last_rebuild_attempt_id,
+            "rebuild_attempt_id": last_rebuild_attempt_id,
+            "fault_reason": str(getattr(book, "fault_reason", "") or ""),
+            "book_fault_reason": str(getattr(book, "fault_reason", "") or ""),
+            "last_fault_reason": str(getattr(book, "fault_reason", "") or ""),
+            "book_last_error": str(getattr(book, "last_error", "") or ""),
+            "last_error": str(getattr(book, "last_error", "") or ""),
+            "snapshot_event_time_ms": int(
+                getattr(update, "event_time_ms", 0) or 0
+            ),
+            "snapshot_received_at_ms": snapshot_received_at_ms,
+            "rest_snapshot_event_time_ms": int(
+                getattr(update, "event_time_ms", 0) or 0
+            ),
+            "rest_snapshot_received_at_ms": snapshot_received_at_ms,
+            "snapshot_received_age_ms": snapshot_age_ms,
+            "book_observed_at_ms": book_observed_at_ms,
+            "book_last_snapshot_ms": int(
+                getattr(book, "last_snapshot_ms", 0) or 0
+            ),
+            "book_last_delta_ms": int(getattr(book, "last_delta_ms", 0) or 0),
+            "age_ms": book_age_ms,
+            "book_age_ms": book_age_ms,
+            "effective_freshness_ms": effective_freshness_ms,
+            "effective_age_ms": effective_age_ms,
+            "freshness_state_present": freshness is not None,
+            "last_ws_delta_ms": int(
+                getattr(freshness, "last_ws_delta_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "last_ws_keepalive_ms": int(
+                getattr(freshness, "last_ws_keepalive_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "last_book_confirmation_ms": int(
+                getattr(freshness, "last_book_confirmation_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "last_subscription_confirmed_ms": int(
+                getattr(freshness, "last_subscription_confirmed_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "last_rest_refresh_ms": int(
+                getattr(freshness, "last_rest_refresh_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "ws_registered": ws_client is not None,
+            "ws_connected": bool(
+                ws_client is not None
+                and getattr(ws_client, "is_connected", False)
+            ),
+            "policy_bridge_mode": policy.bridge_mode.value,
+            "policy_rest_snapshot_sequence_comparable": bool(
+                policy.rest_snapshot_sequence_comparable
+            ),
+            "policy_replay_rest_snapshot_with_ws_deltas": bool(
+                policy.replay_rest_snapshot_with_ws_deltas
+            ),
+            "generation_bound": True,
+            "attempt_bound": True,
+            "ts_ms": event_now_ms,
+        }
+
+    def _snapshot_attempt_is_current(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        request_generation: int,
+        snapshot_attempt_id: int,
+    ) -> bool:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        ss = self._snap_states.get(key)
+        return (
+            self._current_stream_generation(venue, symbol) == request_generation
+            and ss is not None
+            and int(getattr(ss, "snapshot_attempt_id", 0) or 0)
+            == int(snapshot_attempt_id or 0)
+        )
 
     @staticmethod
     def _status_value(status) -> str:
@@ -722,6 +1006,80 @@ class LocalL2DataPlane:
 
         return "unknown"
 
+    def _append_hot_refresh_lifecycle(
+        self,
+        *,
+        venue: str,
+        symbol: str,
+        now_ms: int,
+        status: str,
+        reason: str,
+        deadline_ms: int = 0,
+        queue_position: int = 0,
+        attempted_count: int = 0,
+        success: bool | None = None,
+        error: str = "",
+    ) -> None:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        book = self._runtime.get_book(venue, symbol)
+        ss = self._snap_states.get(key)
+        freshness = self._freshness_states.get(key)
+        deadline_value = int(deadline_ms or 0)
+        deadline_missed = deadline_value > 0 and now_ms > deadline_value
+        payload = {
+            "venue": venue,
+            "symbol": symbol,
+            "status": status,
+            "phase": status,
+            "reason": reason,
+            "deadline_ms": deadline_value,
+            "deadline_missed": deadline_missed,
+            "deadline_lag_ms": max(now_ms - deadline_value, 0)
+            if deadline_missed
+            else 0,
+            "queued": status == "queued",
+            "started": status == "started",
+            "completed": status in {"ready", "degraded", "completed"},
+            "missed": deadline_missed,
+            "queue_position": int(queue_position or 0),
+            "attempted_count": int(attempted_count or 0),
+            "max_concurrent_snapshots": int(self.max_concurrent_snapshots or 0),
+            "snapshot_in_flight": bool(
+                getattr(ss, "snapshot_in_flight", False)
+            ) if ss is not None else False,
+            "stream_generation": self._current_stream_generation(venue, symbol),
+            "snapshot_attempt_id": int(
+                getattr(ss, "snapshot_attempt_id", 0) or 0
+            ) if ss is not None else 0,
+            "last_snapshot_ms": int(
+                getattr(ss, "last_snapshot_ms", 0) or 0
+            ) if ss is not None else 0,
+            "last_rest_refresh_ms": int(
+                getattr(freshness, "last_rest_refresh_ms", 0) or 0
+            ) if freshness is not None else 0,
+            "ts_ms": now_ms,
+        }
+        if book is not None:
+            payload.update(
+                {
+                    "book_status": self._status_value(book.status),
+                    "pool": self._status_value(book.pool),
+                    "observed_at_ms": int(
+                        getattr(book, "observed_at_ms", 0) or 0
+                    ),
+                    "age_ms": book.age_ms(now_ms),
+                    "sequence": int(getattr(book, "sequence", 0) or 0),
+                    "last_update_id": int(
+                        getattr(book, "last_update_id", 0) or 0
+                    ),
+                }
+            )
+        if success is not None:
+            payload["success"] = bool(success)
+        if error:
+            payload["error"] = str(error)
+        self._journal.append("runtime.local_l2_hot_refresh_lifecycle", payload)
+
     @staticmethod
     def _buffer_age_ms(buf: deque[_BufferedUpdate], now_ms: int) -> int:
         if not buf:
@@ -775,6 +1133,7 @@ class LocalL2DataPlane:
         filtered: list[_BufferedUpdate],
         now_ms: int,
         rebase_wait_ms: int,
+        snapshot_attempt_id: int = 0,
     ) -> dict:
         current_after_rebase = self._buffer_after_snapshot(filtered, rebase_snapshot_seq)
         first_current = filtered[0].update if filtered else None
@@ -786,6 +1145,8 @@ class LocalL2DataPlane:
             "reason": "gate_immediate_snapshot_rebase",
             "branch": branch,
             "stream_generation": generation,
+            "current_stream_generation": self._current_stream_generation(venue, symbol),
+            "snapshot_attempt_id": snapshot_attempt_id,
             "rebase_attempt": 1,
             "snapshot_fetch_count": 2,
             "initial_snapshot_seq": initial_snapshot_seq,
@@ -805,6 +1166,7 @@ class LocalL2DataPlane:
             "first_live_buffered_u": int(getattr(first_live, "sequence", 0) or 0) if first_live else 0,
             "rebase_wait_ms": rebase_wait_ms,
             "generation_isolation": "current_generation_only",
+            "request_generation_bound": snapshot_attempt_id > 0,
         }
 
     async def _gate_immediate_rebase_replay_if_needed(
@@ -815,6 +1177,8 @@ class LocalL2DataPlane:
         adapter,
         depth: int,
         now_ms: int,
+        expected_generation: int | None = None,
+        snapshot_attempt_id: int = 0,
     ) -> _BufferedReplayResult | None:
         if venue != "gate":
             return None
@@ -824,7 +1188,11 @@ class LocalL2DataPlane:
         initial_snapshot_seq = int(getattr(book, "sequence", 0) or 0)
         if initial_snapshot_seq <= 0:
             return None
-        generation = self._current_stream_generation(venue, symbol)
+        generation = (
+            self._current_stream_generation(venue, symbol)
+            if expected_generation is None
+            else int(expected_generation)
+        )
         _buf, filtered = self._generation_filtered_buffer(venue, symbol, generation)
         current_after_initial = self._buffer_after_snapshot(filtered, initial_snapshot_seq)
         if not current_after_initial:
@@ -839,16 +1207,120 @@ class LocalL2DataPlane:
         if rebase_wait_ms > 0:
             await asyncio.sleep(rebase_wait_ms / 1_000.0)
 
+        if expected_generation is not None and not self._snapshot_attempt_is_current(
+            venue=venue,
+            symbol=symbol,
+            request_generation=generation,
+            snapshot_attempt_id=snapshot_attempt_id,
+        ):
+            buf, filtered = self._generation_filtered_buffer(venue, symbol, generation)
+            evidence = self._gate_rebase_buffer_evidence(
+                venue=venue,
+                symbol=symbol,
+                branch="rebase_request_stale_generation",
+                generation=generation,
+                snapshot_attempt_id=snapshot_attempt_id,
+                initial_snapshot_seq=initial_snapshot_seq,
+                rebase_snapshot_seq=0,
+                buf=buf,
+                filtered=filtered,
+                now_ms=now_ms,
+                rebase_wait_ms=rebase_wait_ms,
+            )
+            evidence["response_discarded"] = True
+            self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
+            return _BufferedReplayResult(ok=False, failure_evidence=evidence)
+
         rebase_update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
-        apply_result = self._runtime.record_update_result(rebase_update, now_ms)
+        if expected_generation is not None and not self._snapshot_attempt_is_current(
+            venue=venue,
+            symbol=symbol,
+            request_generation=generation,
+            snapshot_attempt_id=snapshot_attempt_id,
+        ):
+            evidence = self._snapshot_attempt_stale_evidence(
+                venue=venue,
+                symbol=symbol,
+                reason="gate_rebase_snapshot_response_stale_generation",
+                request_generation=generation,
+                snapshot_attempt_id=snapshot_attempt_id,
+                request_started_ms=now_ms,
+                now_ms=now_ms,
+            )
+            self._journal.append(
+                "runtime.local_l2_snapshot_stale_response_discarded",
+                evidence,
+            )
+            return _BufferedReplayResult(ok=False, failure_evidence=evidence)
+
         rebase_snapshot_seq = int(getattr(rebase_update, "sequence", 0) or 0)
         buf, filtered = self._generation_filtered_buffer(venue, symbol, generation)
+        book = self._runtime.get_book(venue, symbol)
+        current_book_seq = max(
+            int(getattr(book, "sequence", 0) or 0) if book is not None else 0,
+            int(getattr(book, "last_update_id", 0) or 0) if book is not None else 0,
+            initial_snapshot_seq,
+        )
+        if (
+            policy_for_venue(venue).rest_snapshot_sequence_comparable
+            and rebase_snapshot_seq > 0
+            and current_book_seq > 0
+            and rebase_snapshot_seq < current_book_seq
+        ):
+            reason = "gate_rebase_snapshot_stale_sequence"
+            evidence = self._gate_rebase_buffer_evidence(
+                venue=venue,
+                symbol=symbol,
+                branch="second_snapshot_stale_sequence",
+                generation=generation,
+                snapshot_attempt_id=snapshot_attempt_id,
+                initial_snapshot_seq=initial_snapshot_seq,
+                rebase_snapshot_seq=rebase_snapshot_seq,
+                buf=buf,
+                filtered=filtered,
+                now_ms=now_ms,
+                rebase_wait_ms=rebase_wait_ms,
+            )
+            evidence.update(
+                {
+                    "reason": reason,
+                    "snapshot_seq": rebase_snapshot_seq,
+                    "book_seq": current_book_seq,
+                    "book_sequence": int(
+                        getattr(book, "sequence", 0) or 0
+                    ) if book is not None else 0,
+                    "book_last_update_id": int(
+                        getattr(book, "last_update_id", 0) or 0
+                    ) if book is not None else 0,
+                    "response_discarded": True,
+                    "sequence_monotonic_bound": True,
+                    "snapshot_sequence_comparable": True,
+                }
+            )
+            if book is not None:
+                book.fault_reason = reason
+                book.transition_to_rebuilding(now_ms)
+                self._runtime.handle_runtime_failure(
+                    venue,
+                    symbol,
+                    RuntimeFaultKind.SEQUENCE_GAP,
+                    reason,
+                    now_ms,
+                )
+            self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
+            self._journal.append(
+                "runtime.local_l2_snapshot_stale_response_discarded",
+                evidence,
+            )
+            return _BufferedReplayResult(ok=False, failure_evidence=evidence)
+        apply_result = self._runtime.record_update_result(rebase_update, now_ms)
         if not apply_result.applied or apply_result.rebuild_required:
             evidence = self._gate_rebase_buffer_evidence(
                 venue=venue,
                 symbol=symbol,
                 branch="second_snapshot_apply_failed",
                 generation=generation,
+                snapshot_attempt_id=snapshot_attempt_id,
                 initial_snapshot_seq=initial_snapshot_seq,
                 rebase_snapshot_seq=rebase_snapshot_seq,
                 buf=buf,
@@ -868,6 +1340,7 @@ class LocalL2DataPlane:
                 symbol=symbol,
                 branch="second_snapshot_no_overlap",
                 generation=generation,
+                snapshot_attempt_id=snapshot_attempt_id,
                 initial_snapshot_seq=initial_snapshot_seq,
                 rebase_snapshot_seq=rebase_snapshot_seq,
                 buf=buf,
@@ -905,6 +1378,7 @@ class LocalL2DataPlane:
                 else "second_snapshot_covers_buffer"
             ),
             generation=generation,
+            snapshot_attempt_id=snapshot_attempt_id,
             initial_snapshot_seq=initial_snapshot_seq,
             rebase_snapshot_seq=rebase_snapshot_seq,
             buf=buf,
@@ -913,7 +1387,13 @@ class LocalL2DataPlane:
             rebase_wait_ms=rebase_wait_ms,
         )
         self._journal.append("runtime.local_l2_snapshot_rebase", evidence)
-        return self._replay_buffered_updates(venue, symbol, now_ms=now_ms)
+        return self._replay_buffered_updates(
+            venue,
+            symbol,
+            now_ms=now_ms,
+            expected_generation=generation,
+            snapshot_attempt_id=snapshot_attempt_id,
+        )
 
     @staticmethod
     def _range_first_sequence(update: LocalL2Update) -> int:
@@ -1307,7 +1787,13 @@ class LocalL2DataPlane:
         )
 
     def _replay_buffered_updates(
-        self, venue: str, symbol: str, now_ms: int | None = None,
+        self,
+        venue: str,
+        symbol: str,
+        now_ms: int | None = None,
+        *,
+        expected_generation: int | None = None,
+        snapshot_attempt_id: int = 0,
     ) -> _BufferedReplayResult:
         """Replay buffered WS updates accumulated during bootstrap gap.
 
@@ -1319,6 +1805,25 @@ class LocalL2DataPlane:
           book out of HOT
         """
         key = f"{venue}:{symbol}"
+        current_generation = self._current_stream_generation(venue, symbol)
+        if (
+            expected_generation is not None
+            and current_generation != int(expected_generation)
+        ):
+            return _BufferedReplayResult(
+                ok=False,
+                failure_evidence={
+                    "venue": venue,
+                    "symbol": symbol,
+                    "reason": "buffered_replay_stale_generation_discarded",
+                    "stream_generation": int(expected_generation),
+                    "current_stream_generation": current_generation,
+                    "snapshot_attempt_id": snapshot_attempt_id,
+                    "response_discarded": True,
+                    "generation_bound": True,
+                },
+            )
+
         buf = self._pre_snapshot_buffers.pop(key, None)
         if not buf:
             return _BufferedReplayResult()
@@ -1328,7 +1833,11 @@ class LocalL2DataPlane:
             return _BufferedReplayResult()
 
         replay_now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
-        current_gen = self._current_stream_generation(venue, symbol)
+        current_gen = (
+            current_generation
+            if expected_generation is None
+            else int(expected_generation)
+        )
         previous_sequence = book.sequence  # snapshot's sequence
         snapshot_last_update_id = previous_sequence
 
@@ -1653,16 +2162,22 @@ class LocalL2DataPlane:
         """
         from lightfee.core.domain import Venue
 
-        snapshot_candidates: list[tuple[int, str, str, object, int]] = []
+        snapshot_candidates: list[
+            tuple[int, str, str, object, int, bool, str]
+        ] = []
         for key, book in list(self._runtime.books.items()):
             if book.pool == L2PoolAssignment.DROPPED:
                 continue
 
             policy = policy_for_venue(key.venue)
+            hot_refresh_lifecycle = False
+            refresh_reason = "status_snapshot_refresh"
 
             # V1: HOT books rely on WS deltas, but stale HOT books must be
             # demoted and rebuilt instead of remaining permanently not-ready.
             if book.status == L2BookStatus.HOT:
+                hot_refresh_lifecycle = True
+                refresh_reason = "hot_rest_refresh"
                 stale_after_ms = self._hot_stale_after_ms_for_venue(key.venue)
                 effective_freshness_ms = self._effective_hot_freshness_ms(key, book)
                 observed_at_ms = int(getattr(book, "observed_at_ms", 0) or 0)
@@ -1691,6 +2206,7 @@ class LocalL2DataPlane:
                 reason = self._classify_hot_stale_reason(
                     key, book, now_ms, stale_after_ms, policy,
                 )
+                refresh_reason = reason
                 if (
                     policy.bridge_mode in (
                         BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
@@ -1776,7 +2292,15 @@ class LocalL2DataPlane:
             if interval_ms > 0 and last_snapshot_ms > 0:
                 deadline_ms = last_snapshot_ms + interval_ms
             snapshot_candidates.append(
-                (deadline_ms, key.venue, key.symbol, adapter, book.max_depth)
+                (
+                    deadline_ms,
+                    key.venue,
+                    key.symbol,
+                    adapter,
+                    book.max_depth,
+                    hot_refresh_lifecycle,
+                    refresh_reason,
+                )
             )
 
         limit = max(0, int(self.max_concurrent_snapshots or 0))
@@ -1786,8 +2310,34 @@ class LocalL2DataPlane:
         snapshot_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
         selected_candidates = snapshot_candidates[:limit]
 
-        async def _bootstrap_candidate(candidate: tuple[int, str, str, object, int]) -> bool:
-            _deadline_ms, venue, symbol, adapter, depth = candidate
+        for queue_position, candidate in enumerate(selected_candidates, start=1):
+            deadline_ms, venue, symbol, _adapter, _depth, hot_lifecycle, reason = candidate
+            if hot_lifecycle:
+                self._append_hot_refresh_lifecycle(
+                    venue=venue,
+                    symbol=symbol,
+                    now_ms=now_ms,
+                    status="queued",
+                    reason=reason,
+                    deadline_ms=deadline_ms,
+                    queue_position=queue_position,
+                    attempted_count=len(selected_candidates),
+                )
+                self._append_hot_refresh_lifecycle(
+                    venue=venue,
+                    symbol=symbol,
+                    now_ms=now_ms,
+                    status="started",
+                    reason=reason,
+                    deadline_ms=deadline_ms,
+                    queue_position=queue_position,
+                    attempted_count=len(selected_candidates),
+                )
+
+        async def _bootstrap_candidate(
+            candidate: tuple[int, str, str, object, int, bool, str],
+        ) -> bool:
+            _deadline_ms, venue, symbol, adapter, depth, _hot_lifecycle, _reason = candidate
             return await self.bootstrap_book(
                 venue=venue,
                 symbol=symbol,
@@ -1801,6 +2351,34 @@ class LocalL2DataPlane:
             return_exceptions=True,
         )
         dispatched = sum(1 for result in results if result is True)
+
+        for queue_position, (candidate, result) in enumerate(
+            zip(selected_candidates, results, strict=False),
+            start=1,
+        ):
+            deadline_ms, venue, symbol, _adapter, _depth, hot_lifecycle, reason = candidate
+            if not hot_lifecycle:
+                continue
+            if isinstance(result, BaseException):
+                status = "degraded"
+                success = False
+                error = f"{type(result).__name__}: {str(result)[:300]}"
+            else:
+                success = result is True
+                status = "ready" if success else "degraded"
+                error = ""
+            self._append_hot_refresh_lifecycle(
+                venue=venue,
+                symbol=symbol,
+                now_ms=now_ms,
+                status=status,
+                reason=reason,
+                deadline_ms=deadline_ms,
+                queue_position=queue_position,
+                attempted_count=len(selected_candidates),
+                success=success,
+                error=error,
+            )
 
         if selected_candidates:
             self._journal.append(

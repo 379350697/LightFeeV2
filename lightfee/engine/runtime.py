@@ -43,6 +43,7 @@ from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_dispatch_runtime import (
     EntryDispatchRuntime,
+    EntryDispatchResult,
     _align_base_quantity_down,
     _common_base_quantity_step,
 )
@@ -6825,7 +6826,7 @@ class LiveRuntime:
                 else None
             )
             pending_before = len(self.state.pending_entries)
-            dispatched_ok = await self._dispatch_entry(
+            dispatch_result = await self._dispatch_entry_result(
                 candidate,
                 selected_at_ms,
                 price_hint=self._entry_quote_truth_price_hint(
@@ -6836,27 +6837,13 @@ class LiveRuntime:
                 selected_deadline_monotonic=selected_deadline,
                 selected_at_ms=selected_at_ms,
             )
-            if dispatched_ok:
+            if dispatch_result.dispatched:
                 dispatched += 1
                 remaining_slots -= 1
                 self._invalidate_entry_account_truth_generation()
                 last_reason = "entries_dispatched"
             else:
-                dispatch_block_reason = str(
-                    getattr(self, "_last_entry_dispatch_block_reason", "") or ""
-                )
-                if not dispatch_block_reason:
-                    dispatch_block_reason = "entry_dispatch_reason_invariant_missing"
-                    self.journal.append(
-                        "entry.dispatch_reason_invariant_violation",
-                        {
-                            "pair_id": self._candidate_pair_id(candidate),
-                            "reason": dispatch_block_reason,
-                            "source": "ranked_candidate_dispatch",
-                            "decision": "skip_entry",
-                            "ts_ms": wall_clock_now_ms(),
-                        },
-                    )
+                dispatch_block_reason = str(dispatch_result.reason or "")
                 last_reason = self._record_ranked_candidate_blocker(
                     candidate_blockers,
                     self._candidate_pair_id(candidate),
@@ -15198,7 +15185,7 @@ class LiveRuntime:
                 reason = str(diag.get("reason", "not_ready"))
                 reason_totals[reason] += 1
                 if len(not_ready) < 24:
-                    not_ready.append({
+                    sample = {
                         "pair_id": pair_id,
                         "venue": str(diag.get("venue", leg.venue)),
                         "symbol": str(diag.get("symbol", leg.symbol)),
@@ -15209,7 +15196,99 @@ class LiveRuntime:
                         "observed_at_ms": int(diag.get("observed_at_ms", 0) or 0),
                         "sequence": int(diag.get("sequence", 0) or 0),
                         "leg_state": str(diag.get("leg_state", "")),
-                    })
+                    }
+                    book = self.local_l2_runtime.get_book(leg.venue, leg.symbol)
+                    pool = "missing"
+                    if book is not None:
+                        pool = str(
+                            getattr(
+                                getattr(book, "pool", ""),
+                                "value",
+                                getattr(book, "pool", ""),
+                            )
+                            or "unknown"
+                        )
+                        sample.update(
+                            {
+                                "pool": pool,
+                                "owner": pool,
+                                "owner_pool": pool,
+                                "last_update_id": int(
+                                    getattr(book, "last_update_id", 0) or 0
+                                ),
+                                "pending_snapshot_bridge": bool(
+                                    getattr(book, "pending_snapshot_bridge", False)
+                                ),
+                                "fault_reason": str(
+                                    getattr(book, "fault_reason", "") or ""
+                                ),
+                            }
+                        )
+                    else:
+                        sample.update(
+                            {
+                                "pool": pool,
+                                "owner": pool,
+                                "owner_pool": pool,
+                                "last_update_id": 0,
+                                "pending_snapshot_bridge": False,
+                                "fault_reason": "missing_book",
+                            }
+                        )
+                    data_plane = getattr(self, "l2_data_plane", None)
+                    snap_states = getattr(data_plane, "_snap_states", {}) or {}
+                    freshness_states = (
+                        getattr(data_plane, "_freshness_states", {}) or {}
+                    )
+                    snap_state = None
+                    freshness_state = None
+                    try:
+                        from lightfee.marketdata.l2 import LocalL2BookKey
+
+                        key = LocalL2BookKey(
+                            venue=str(leg.venue).lower(),
+                            symbol=str(leg.symbol).upper(),
+                        )
+                        snap_state = snap_states.get(key)
+                        freshness_state = freshness_states.get(key)
+                    except Exception:
+                        snap_state = None
+                        freshness_state = None
+                    snapshot_in_flight = bool(
+                        getattr(snap_state, "snapshot_in_flight", False)
+                    ) if snap_state is not None else False
+                    stream_generation = int(
+                        getattr(snap_state, "stream_generation", 0) or 0
+                    ) if snap_state is not None else 0
+                    sample.update(
+                        {
+                            "snapshot_in_flight": snapshot_in_flight,
+                            "refresh_in_flight": snapshot_in_flight,
+                            "snapshot_attempt_id": int(
+                                getattr(snap_state, "snapshot_attempt_id", 0) or 0
+                            ) if snap_state is not None else 0,
+                            "stream_generation": stream_generation,
+                            "generation": stream_generation,
+                            "last_snapshot_ms": int(
+                                getattr(snap_state, "last_snapshot_ms", 0) or 0
+                            ) if snap_state is not None else 0,
+                            "request_started_ms": int(
+                                getattr(snap_state, "request_started_ms", 0) or 0
+                            ) if snap_state is not None else 0,
+                            "consecutive_failures": int(
+                                getattr(snap_state, "consecutive_failures", 0) or 0
+                            ) if snap_state is not None else 0,
+                            "last_rest_refresh_ms": int(
+                                getattr(
+                                    freshness_state,
+                                    "last_rest_refresh_ms",
+                                    0,
+                                )
+                                or 0
+                            ) if freshness_state is not None else 0,
+                        }
+                    )
+                    not_ready.append(sample)
 
         reason_counts = Counter(sample["reason"] for sample in not_ready)
         return {
@@ -16140,6 +16219,61 @@ class LiveRuntime:
         selected_at_ms: int | None = None,
     ) -> bool:
         return await self.entry_dispatch_runtime._dispatch_entry(
+            candidate,
+            now_ms,
+            price_hint=price_hint,
+            selected_deadline_monotonic=selected_deadline_monotonic,
+            selected_at_ms=selected_at_ms,
+        )
+
+    async def _dispatch_entry_result(
+        self,
+        candidate,
+        now_ms: int,
+        price_hint: float = 0.0,
+        selected_deadline_monotonic: float | None = None,
+        selected_at_ms: int | None = None,
+    ):
+        dispatch_override = self.__dict__.get("_dispatch_entry")
+        if dispatch_override is not None:
+            dispatched = await dispatch_override(
+                candidate,
+                now_ms,
+                price_hint=price_hint,
+                selected_deadline_monotonic=selected_deadline_monotonic,
+                selected_at_ms=selected_at_ms,
+            )
+            if hasattr(dispatched, "dispatched"):
+                return dispatched
+            pair_id = self.entry_dispatch_runtime._candidate_pair_id(candidate)
+            if bool(dispatched):
+                return EntryDispatchResult(
+                    dispatched=True,
+                    reason="entries_dispatched",
+                    decision="submitted",
+                    stage="submitted",
+                    evidence={"pair_id": pair_id, "candidate_pair_id": pair_id},
+                )
+            reason = "entry_dispatch_reason_invariant_missing"
+            self.journal.append(
+                "entry.dispatch_reason_invariant_violation",
+                {
+                    "pair_id": pair_id,
+                    "candidate_pair_id": pair_id,
+                    "reason": reason,
+                    "source": "runtime_dispatch_override",
+                    "decision": "skip_entry",
+                    "ts_ms": now_ms,
+                },
+            )
+            return EntryDispatchResult(
+                dispatched=False,
+                reason=reason,
+                decision="skip_entry",
+                stage="runtime_dispatch_override",
+                evidence={"pair_id": pair_id, "candidate_pair_id": pair_id},
+            )
+        return await self.entry_dispatch_runtime._dispatch_entry_result(
             candidate,
             now_ms,
             price_hint=price_hint,
