@@ -176,6 +176,8 @@ class LocalL2DataPlane:
         adapter,  # VenueAdapter — provides fetch_l2_snapshot()
         depth: int = 50,
         now_ms: int = 0,
+        *,
+        _snapshot_in_flight_claimed: bool = False,
     ) -> bool:
         """Bootstrap a single book with a REST snapshot via the adapter.
 
@@ -191,13 +193,19 @@ class LocalL2DataPlane:
             self._snap_states[key] = ss
 
         water_level_ms = max(1, ss.snapshot_cooldown_ms)
-        if ss.snapshot_in_flight:
+        if ss.snapshot_in_flight and not _snapshot_in_flight_claimed:
+            return False
+        if _snapshot_in_flight_claimed and not ss.snapshot_in_flight:
             return False
         if ss.last_snapshot_ms > 0 and (now_ms - ss.last_snapshot_ms) < water_level_ms:
+            if _snapshot_in_flight_claimed:
+                ss.snapshot_in_flight = False
             return False
 
         # Consecutive failure gate: don't hammer a failing endpoint
         if ss.consecutive_failures >= ss.max_consecutive_failures:
+            if _snapshot_in_flight_claimed:
+                ss.snapshot_in_flight = False
             return False
 
         request_generation = self._current_stream_generation(venue, symbol)
@@ -1060,6 +1068,7 @@ class LocalL2DataPlane:
             "ts_ms": now_ms,
         }
         if book is not None:
+            raw_age_ms = int(book.age_ms(now_ms))
             payload.update(
                 {
                     "book_status": self._status_value(book.status),
@@ -1067,7 +1076,12 @@ class LocalL2DataPlane:
                     "observed_at_ms": int(
                         getattr(book, "observed_at_ms", 0) or 0
                     ),
-                    "age_ms": book.age_ms(now_ms),
+                    # A WS update may land while a REST request is in flight,
+                    # after this lifecycle attempt's captured ``now_ms``.  Age
+                    # is never negative; retain the lead separately so the
+                    # evidence remains causal without looking like clock drift.
+                    "age_ms": max(raw_age_ms, 0),
+                    "observation_lead_ms": max(-raw_age_ms, 0),
                     "sequence": int(getattr(book, "sequence", 0) or 0),
                     "last_update_id": int(
                         getattr(book, "last_update_id", 0) or 0
@@ -2310,29 +2324,28 @@ class LocalL2DataPlane:
         snapshot_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
         selected_candidates = snapshot_candidates[:limit]
 
-        for queue_position, candidate in enumerate(selected_candidates, start=1):
-            deadline_ms, venue, symbol, _adapter, _depth, hot_lifecycle, reason = candidate
-            if hot_lifecycle:
-                self._append_hot_refresh_lifecycle(
-                    venue=venue,
-                    symbol=symbol,
-                    now_ms=now_ms,
-                    status="queued",
-                    reason=reason,
-                    deadline_ms=deadline_ms,
-                    queue_position=queue_position,
-                    attempted_count=len(selected_candidates),
-                )
-                self._append_hot_refresh_lifecycle(
-                    venue=venue,
-                    symbol=symbol,
-                    now_ms=now_ms,
-                    status="started",
-                    reason=reason,
-                    deadline_ms=deadline_ms,
-                    queue_position=queue_position,
-                    attempted_count=len(selected_candidates),
-                )
+        # ``sync_snapshots`` is invoked from the periodic lane, the background
+        # pre-scan lane, and the post-shortlist lane.  Claim each selected book
+        # synchronously before the first await so two lanes cannot both pass the
+        # in-flight check and then enqueue the same REST request.  The bootstrap
+        # coroutine owns and releases the claim once it starts.
+        claims: list[tuple[_BookSnapshotState, int]] = []
+        for (
+            _deadline_ms,
+            venue,
+            symbol,
+            _adapter,
+            _depth,
+            _hot,
+            _reason,
+        ) in selected_candidates:
+            key = LocalL2BookKey(venue=venue, symbol=symbol)
+            ss = self._snap_states.get(key)
+            if ss is None:
+                ss = _BookSnapshotState(venue=venue, symbol=symbol)
+                self._snap_states[key] = ss
+            ss.snapshot_in_flight = True
+            claims.append((ss, int(ss.snapshot_attempt_id or 0)))
 
         async def _bootstrap_candidate(
             candidate: tuple[int, str, str, object, int, bool, str],
@@ -2344,12 +2357,56 @@ class LocalL2DataPlane:
                 adapter=adapter,
                 depth=depth,
                 now_ms=now_ms,
+                _snapshot_in_flight_claimed=True,
             )
 
-        results = await asyncio.gather(
-            *(_bootstrap_candidate(candidate) for candidate in selected_candidates),
-            return_exceptions=True,
-        )
+        try:
+            for queue_position, candidate in enumerate(selected_candidates, start=1):
+                (
+                    deadline_ms,
+                    venue,
+                    symbol,
+                    _adapter,
+                    _depth,
+                    hot_lifecycle,
+                    reason,
+                ) = candidate
+                if hot_lifecycle:
+                    self._append_hot_refresh_lifecycle(
+                        venue=venue,
+                        symbol=symbol,
+                        now_ms=now_ms,
+                        status="queued",
+                        reason=reason,
+                        deadline_ms=deadline_ms,
+                        queue_position=queue_position,
+                        attempted_count=len(selected_candidates),
+                    )
+                    self._append_hot_refresh_lifecycle(
+                        venue=venue,
+                        symbol=symbol,
+                        now_ms=now_ms,
+                        status="started",
+                        reason=reason,
+                        deadline_ms=deadline_ms,
+                        queue_position=queue_position,
+                        attempted_count=len(selected_candidates),
+                    )
+
+            results = await asyncio.gather(
+                *(_bootstrap_candidate(candidate) for candidate in selected_candidates),
+                return_exceptions=True,
+            )
+        finally:
+            # If setup failed before a bootstrap coroutine advanced its attempt
+            # id, release only that untouched dispatch claim.  Active bootstrap
+            # attempts release their own in-flight state in ``bootstrap_book``.
+            for ss, claimed_attempt_id in claims:
+                if (
+                    ss.snapshot_in_flight
+                    and int(ss.snapshot_attempt_id or 0) == claimed_attempt_id
+                ):
+                    ss.snapshot_in_flight = False
         dispatched = sum(1 for result in results if result is True)
 
         for queue_position, (candidate, result) in enumerate(

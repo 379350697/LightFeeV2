@@ -652,6 +652,122 @@ class TestMarketSnapshotDiagnostics:
         assert dispatched == 0
         assert adapter.calls == ["FIRSTUSDT", "SECONDUSDT"]
 
+    @pytest.mark.asyncio
+    async def test_concurrent_sync_snapshots_singleflights_same_hot_book(self):
+        """Concurrent runtime lanes must not dispatch the same HOT refresh twice."""
+        import asyncio
+
+        from lightfee.core.domain import Venue
+
+        class Adapter:
+            def __init__(self):
+                self.call_count = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def fetch_l2_snapshot(
+                self,
+                symbol: str,
+                depth: int = 50,
+            ) -> LocalL2Update:
+                self.call_count += 1
+                self.started.set()
+                await self.release.wait()
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(110.0, 1.0)],
+                    asks=[PriceLevel(111.0, 1.0)],
+                    sequence=101,
+                    event_time_ms=9_000,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        dp.hot_stale_after_ms = 10_000
+
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.apply_snapshot(
+            [PriceLevel(100.0, 1.0)],
+            [PriceLevel(101.0, 1.0)],
+            sequence=100,
+            now_ms=1_000,
+        )
+        book.transition_to_bootstrapping(1_000)
+        book.transition_to_hot()
+
+        adapter = Adapter()
+        first = asyncio.create_task(
+            dp.sync_snapshots(
+                {Venue.BINANCE: adapter},
+                now_ms=9_000,
+                scan_promoted=True,
+            )
+        )
+        second = asyncio.create_task(
+            dp.sync_snapshots(
+                {Venue.BINANCE: adapter},
+                now_ms=9_000,
+                scan_promoted=True,
+            )
+        )
+        await adapter.started.wait()
+        adapter.release.set()
+
+        assert sorted(await asyncio.gather(first, second)) == [0, 1]
+        assert adapter.call_count == 1
+        lifecycle = [
+            payload
+            for kind, payload in journal.records
+            if kind == "runtime.local_l2_hot_refresh_lifecycle"
+        ]
+        assert [payload["status"] for payload in lifecycle] == [
+            "queued",
+            "started",
+            "ready",
+        ]
+        assert not [
+            payload for payload in lifecycle if payload["status"] == "degraded"
+        ]
+
+    def test_hot_refresh_lifecycle_separates_concurrent_observation_lead(self):
+        class Journal:
+            def __init__(self):
+                self.records = []
+
+            def append(self, kind, payload):
+                self.records.append((kind, payload))
+
+        rt = LocalL2Runtime()
+        journal = Journal()
+        dp = LocalL2DataPlane(l2_runtime=rt, journal=journal)
+        book = rt.ensure_book("gate", "COTIUSDT")
+        book.status = L2BookStatus.HOT
+        book.pool = L2PoolAssignment.HOT_EXEC
+        book.observed_at_ms = 9_250
+
+        dp._append_hot_refresh_lifecycle(
+            venue="gate",
+            symbol="COTIUSDT",
+            now_ms=9_000,
+            status="ready",
+            reason="rest_refresh_late",
+        )
+
+        payload = journal.records[-1][1]
+        assert payload["age_ms"] == 0
+        assert payload["observation_lead_ms"] == 250
+
     def test_sequence_gap_rebuild_evidence_uses_pre_transition_status(self):
         class Journal:
             def __init__(self):
