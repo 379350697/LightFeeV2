@@ -817,6 +817,7 @@ class MarketDataClient:
         *,
         params: Optional[dict[str, Any]] = None,
         attempt_timeout_s: float,
+        return_received_at: bool = False,
     ) -> Any:
         """Retry one idempotent GET once on a connection-level failure.
 
@@ -828,10 +829,16 @@ class MarketDataClient:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                return await asyncio.wait_for(
-                    self._public_get(path, params=params),
+                request = (
+                    self._public_get_with_received_at(path, params=params)
+                    if return_received_at
+                    else self._public_get(path, params=params)
+                )
+                result = await asyncio.wait_for(
+                    request,
                     timeout=max(float(attempt_timeout_s), 0.001),
                 )
+                return result
             except asyncio.TimeoutError:
                 last_error = PublicTransportError(
                     PublicTransportErrorCategory.TRANSPORT_FAILURE,
@@ -3741,9 +3748,11 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw, market_received_at_ms = await self._public_get_with_received_at(
+        raw, market_received_at_ms = await self._public_get_with_recycled_transport_retry(
             spec.funding_ticker_path,
             params={"category": "linear"},
+            attempt_timeout_s=self._exchange_http_timeout_ms / 1000.0,
+            return_received_at=True,
         )
         result_wrap = raw.get("result", raw)
         items = result_wrap.get("list", []) if isinstance(result_wrap, dict) else (result_wrap if isinstance(result_wrap, list) else [])
@@ -3965,9 +3974,11 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw, market_received_at_ms = await self._public_get_with_received_at(
+        raw, market_received_at_ms = await self._public_get_with_recycled_transport_retry(
             spec.funding_ticker_path,
             params={"productType": "USDT-FUTURES"},
+            attempt_timeout_s=self._exchange_http_timeout_ms / 1000.0,
+            return_received_at=True,
         )
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
@@ -4227,8 +4238,10 @@ class MarketDataClient:
         for s in symbols:
             venue_sym_to_canon[self._to_venue_symbol(s)] = s.upper()
 
-        raw, market_received_at_ms = await self._public_get_with_received_at(
-            spec.funding_ticker_path
+        raw, market_received_at_ms = await self._public_get_with_recycled_transport_retry(
+            spec.funding_ticker_path,
+            attempt_timeout_s=self._exchange_http_timeout_ms / 1000.0,
+            return_received_at=True,
         )
         items = raw if isinstance(raw, list) else [raw]
 

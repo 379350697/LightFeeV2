@@ -1940,6 +1940,91 @@ class TestProductionSidecarParserRegressions:
         assert client.recycle_count == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "style_name", "ticker_payload"),
+        [
+            (bybit_spec, "_fetch_bybit_style", {"result": {"list": []}}),
+            (bitget_spec, "_fetch_bitget_style", {"data": []}),
+            (gate_spec, "_fetch_gate_style", []),
+        ],
+    )
+    async def test_bulk_tickers_recycle_failed_transport_once(
+        self,
+        spec_fn,
+        style_name,
+        ticker_payload,
+    ):
+        spec = spec_fn()
+
+        class FakeTickerClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.ticker_attempts = 0
+                self.recycle_count = 0
+
+            async def _recycle_public_http_client(self):
+                self.recycle_count += 1
+
+            async def _public_get(self, path, params=None):
+                if path == spec.funding_ticker_path:
+                    self.ticker_attempts += 1
+                    if self.ticker_attempts == 1:
+                        raise PublicTransportError(
+                            PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                            f"timeout: GET {path}",
+                        )
+                    return ticker_payload
+                return {}
+
+        client = FakeTickerClient()
+        await getattr(client, style_name)(["BTCUSDT"])
+
+        assert client.ticker_attempts == 2
+        assert client.recycle_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("spec_fn", "style_name"),
+        [
+            (bybit_spec, "_fetch_bybit_style"),
+            (bitget_spec, "_fetch_bitget_style"),
+            (gate_spec, "_fetch_gate_style"),
+        ],
+    )
+    async def test_bulk_tickers_do_not_retry_http_response_errors(
+        self,
+        spec_fn,
+        style_name,
+    ):
+        spec = spec_fn()
+
+        class FakeTickerClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(spec)
+                self.ticker_attempts = 0
+                self.recycle_count = 0
+
+            async def _recycle_public_http_client(self):
+                self.recycle_count += 1
+
+            async def _public_get(self, path, params=None):
+                if path == spec.funding_ticker_path:
+                    self.ticker_attempts += 1
+                    raise PublicTransportError(
+                        PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                        "HTTP 429",
+                        status_code=429,
+                    )
+                return {}
+
+        client = FakeTickerClient()
+        with pytest.raises(PublicTransportError, match="HTTP 429"):
+            await getattr(client, style_name)(["BTCUSDT"])
+
+        assert client.ticker_attempts == 1
+        assert client.recycle_count == 0
+
+    @pytest.mark.asyncio
     async def test_okx_funding_rate_uses_batch_any_before_symbol_fallback(self):
         class FakeOkxClient(MarketDataClient):
             def __init__(self):
