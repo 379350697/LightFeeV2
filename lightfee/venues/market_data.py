@@ -1194,13 +1194,25 @@ class MarketDataClient:
                 include_open_interest=include_open_interest,
             )
         elif venue_id == Venue.BYBIT:
-            tickers = await self._fetch_bybit_style(symbols)
+            tickers = await self._fetch_bybit_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         elif venue_id == Venue.BITGET:
-            tickers = await self._fetch_bitget_style(symbols)
+            tickers = await self._fetch_bitget_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         elif venue_id == Venue.GATE:
-            tickers = await self._fetch_gate_style(symbols)
+            tickers = await self._fetch_gate_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         elif venue_id == Venue.HYPERLIQUID:
-            tickers = await self._fetch_hyperliquid_style(symbols)
+            tickers = await self._fetch_hyperliquid_style(
+                symbols,
+                include_open_interest=include_open_interest,
+            )
         else:
             tickers = {}
         return self._enrich_tickers(tickers, observed_at_ms=_now_ms())
@@ -3151,8 +3163,13 @@ class MarketDataClient:
                         and oi_mark_price.get(venue_sym, 0.0) > 0.0
                         else None
                     ),
-                    raw_unit="base",
-                    contract_multiplier=1.0,
+                    raw_unit=(
+                        "base"
+                        if venue_sym in oi_map
+                        and oi_mark_price.get(venue_sym, 0.0) > 0.0
+                        else ""
+                    ),
+                    contract_multiplier=1.0 if venue_sym in oi_map else None,
                     conversion_mark_price=oi_mark_price.get(venue_sym) or None,
                     observed_at_ms=oi_observed_at_ms.get(venue_sym, 0),
                     received_at_ms=oi_observed_at_ms.get(venue_sym, now_ms),
@@ -3547,6 +3564,14 @@ class MarketDataClient:
                 for venue_sym in venue_sym_to_canon:
                     oi_evidence_status[venue_sym] = "http_error"
                     oi_evidence_reason[venue_sym] = _http_error_reason(exc)
+        elif spec.open_interest_path and not include_open_interest:
+            oi_evidence_status = {
+                venue_sym: "unavailable" for venue_sym in venue_sym_to_canon
+            }
+            oi_evidence_reason = {
+                venue_sym: "entry_targeted_revalidation_required"
+                for venue_sym in venue_sym_to_canon
+            }
 
         result: dict[str, FundingTicker] = {}
         seen_canon: set[str] = set()  # dedup: 1000-prefix stripping may produce duplicate entries
@@ -3704,7 +3729,12 @@ class MarketDataClient:
 
     # -- Bybit -------------------------------------------------------------
 
-    async def _fetch_bybit_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_bybit_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         venue_sym_to_canon: dict[str, str] = {}
@@ -3775,15 +3805,20 @@ class MarketDataClient:
             canon = venue_sym_to_canon.get(sym)
             if canon is None:
                 continue
-            (
-                open_interest_quote,
-                raw_open_interest,
-                raw_open_interest_unit,
-                oi_status,
-                oi_reason,
-            ) = _bybit_total_open_interest(
-                item
-            )
+            if include_open_interest:
+                (
+                    open_interest_quote,
+                    raw_open_interest,
+                    raw_open_interest_unit,
+                    oi_status,
+                    oi_reason,
+                ) = _bybit_total_open_interest(item)
+            else:
+                open_interest_quote = None
+                raw_open_interest = None
+                raw_open_interest_unit = ""
+                oi_status = "unavailable"
+                oi_reason = "entry_targeted_revalidation_required"
             has_open_interest_quote = oi_status == "observed"
             instrument = instrument_map.get(sym, {})
             price_filter = instrument.get("priceFilter", {})
@@ -3918,7 +3953,12 @@ class MarketDataClient:
 
     # -- Bitget ------------------------------------------------------------
 
-    async def _fetch_bitget_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_bitget_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         venue_sym_to_canon: dict[str, str] = {}
@@ -3989,27 +4029,36 @@ class MarketDataClient:
             mark = _safe_float(
                 item.get("markPrice", item.get("lastPr", item.get("last", 0)))
             )
-            holding_amount, has_holding_amount, oi_key = _first_present_float(
-                item,
-                "holdingAmount",
-                "openInterest",
-            )
-            if has_holding_amount and mark > 0.0:
+            holding_amount = 0.0
+            has_holding_amount = False
+            if include_open_interest:
+                holding_amount, has_holding_amount, oi_key = _first_present_float(
+                    item,
+                    "holdingAmount",
+                    "openInterest",
+                )
+            else:
+                oi_key = ""
+            if include_open_interest and has_holding_amount and mark > 0.0:
                 open_interest_quote = holding_amount * mark
                 oi_status = "observed"
                 oi_reason = f"{oi_key}_times_mark"
-            elif has_holding_amount:
+            elif include_open_interest and has_holding_amount:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = "missing_mark_price"
-            elif oi_key:
+            elif include_open_interest and oi_key:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = f"invalid_{oi_key}"
-            else:
+            elif include_open_interest:
                 open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
+            else:
+                open_interest_quote = None
+                oi_status = "unavailable"
+                oi_reason = "entry_targeted_revalidation_required"
             funding_item = funding_map.get(sym, {})
             contract = contract_map.get(sym, {})
             underlying, quote_currency = _canonical_contract_identity(
@@ -4166,7 +4215,12 @@ class MarketDataClient:
 
     # -- Gate --------------------------------------------------------------
 
-    async def _fetch_gate_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_gate_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         venue_sym_to_canon: dict[str, str] = {}
@@ -4264,15 +4318,20 @@ class MarketDataClient:
             quanto = _positive_exchange_number(
                 contract_item.get("quanto_multiplier")
             )
-            oi_contracts, has_oi_contracts, oi_key = _first_present_float(
-                item,
-                "total_size",
-            )
-            if has_oi_contracts and quanto > 0 and mark > 0:
+            oi_contracts = 0.0
+            has_oi_contracts = False
+            if include_open_interest:
+                oi_contracts, has_oi_contracts, oi_key = _first_present_float(
+                    item,
+                    "total_size",
+                )
+            else:
+                oi_key = ""
+            if include_open_interest and has_oi_contracts and quanto > 0 and mark > 0:
                 open_interest_quote = oi_contracts * quanto * mark
                 oi_status = "observed"
                 oi_reason = f"{oi_key}_times_quanto_mark"
-            elif has_oi_contracts:
+            elif include_open_interest and has_oi_contracts:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = (
@@ -4280,14 +4339,18 @@ class MarketDataClient:
                     if quanto <= 0
                     else "missing_mark_price"
                 )
-            elif oi_key:
+            elif include_open_interest and oi_key:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = f"invalid_{oi_key}"
-            else:
+            elif include_open_interest:
                 open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
+            else:
+                open_interest_quote = None
+                oi_status = "unavailable"
+                oi_reason = "entry_targeted_revalidation_required"
             funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
                 contract_item.get("funding_next_apply", 0)
             )
@@ -4410,7 +4473,12 @@ class MarketDataClient:
 
     # -- Hyperliquid -------------------------------------------------------
 
-    async def _fetch_hyperliquid_style(self, symbols: list[str]) -> dict[str, FundingTicker]:
+    async def _fetch_hyperliquid_style(
+        self,
+        symbols: list[str],
+        *,
+        include_open_interest: bool = True,
+    ) -> dict[str, FundingTicker]:
         spec = self._spec
         venue_str = spec.venue_id.value
         canonical_set = {s.upper() for s in symbols}
@@ -4488,26 +4556,35 @@ class MarketDataClient:
             quantity_step = 10.0 ** (-size_decimals)
             metadata_complete = price_tick > 0.0 and quantity_step > 0.0
 
-            open_interest, has_open_interest, oi_key = _first_present_float(
-                ctx,
-                "openInterest",
-            )
-            if has_open_interest and mark > 0.0:
+            open_interest = 0.0
+            has_open_interest = False
+            if include_open_interest:
+                open_interest, has_open_interest, oi_key = _first_present_float(
+                    ctx,
+                    "openInterest",
+                )
+            else:
+                oi_key = ""
+            if include_open_interest and has_open_interest and mark > 0.0:
                 open_interest_quote = open_interest * mark
                 oi_status = "observed"
                 oi_reason = f"{oi_key}_times_mark"
-            elif has_open_interest:
+            elif include_open_interest and has_open_interest:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = "missing_mark_price"
-            elif oi_key:
+            elif include_open_interest and oi_key:
                 open_interest_quote = None
                 oi_status = "parse_error"
                 oi_reason = f"invalid_{oi_key}"
-            else:
+            elif include_open_interest:
                 open_interest_quote = None
                 oi_status = "unavailable"
                 oi_reason = "missing_open_interest"
+            else:
+                open_interest_quote = None
+                oi_status = "unavailable"
+                oi_reason = "entry_targeted_revalidation_required"
 
             result[f"{venue_str}:{canon.upper()}"] = FundingTicker(
                 venue=venue_str,

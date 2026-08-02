@@ -511,6 +511,21 @@ class TestPublisher:
 
         assert "candidate_unknown_field:0:taker_fee_evidence_complete" in errors
 
+    def test_schema_v3_rejects_and_strips_runtime_executable_envelope(self):
+        raw = self._complete_v3_candidate()
+        raw["executable_envelope"] = {"route": "attacker_controlled"}
+        payload = {
+            "schema_version": 4,
+            "quotes": self._complete_v3_contract_quotes(),
+            "candidates": [raw],
+        }
+
+        errors = validate_v4_snapshot_contract(payload)
+        snapshot = _dict_to_snapshot(payload)
+
+        assert "candidate_unknown_field:0:executable_envelope" in errors
+        assert snapshot.candidates[0].executable_envelope is None
+
     def test_schema_v3_rejects_boolean_numeric_economics_fields(self):
         raw = self._complete_v3_candidate()
         raw["funding_edge_bps"] = True

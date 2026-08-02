@@ -13,7 +13,7 @@ Rust references:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -24,13 +24,28 @@ class ExecutionRoute(Enum):
     REJECTED = "rejected"
 
 
-@dataclass
+@dataclass(frozen=True)
 class IncrementalEntryExecutionPlan:
     route: ExecutionRoute
     full_target_quantity: float = 0.0
     initial_maker_target_quantity: float = 0.0
     maker_min_valid_clip_quantity: Optional[float] = None
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExecutableEntryEnvelope:
+    """Shared V1 entry sizing envelope for selection and dispatch."""
+
+    plan: IncrementalEntryExecutionPlan
+    maker_leg: str
+    hedge_leg: str
+    requested_quantity: float
+    effective_dispatch_quantity: float
+    min_hedgeable_chunk: float = 0.0
+    blocker_reason: str = ""
+    blocker_evidence: dict[str, object] = field(default_factory=dict)
+    context_key: tuple[object, ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +323,228 @@ def plan_incremental_entry_execution(
             maker_min_valid_clip_quantity=maker_min_clip,
             reason=None,
         ),
+    )
+
+
+def entry_pair_minimum_reason(
+    *,
+    quantity: float,
+    long_price: float,
+    short_price: float,
+    long_metadata: dict,
+    short_metadata: dict,
+    strategy_min_notional: float,
+) -> tuple[str, dict[str, object]]:
+    failures: list[dict[str, float | str]] = []
+    for leg, price, metadata in (
+        ("long", long_price, long_metadata),
+        ("short", short_price, short_metadata),
+    ):
+        min_quantity = float(metadata.get("min_quantity", 0.0) or 0.0)
+        min_notional = max(
+            float(metadata.get("min_notional", 0.0) or 0.0),
+            max(float(strategy_min_notional or 0.0), 0.0),
+        )
+        notional = max(float(quantity or 0.0), 0.0) * max(
+            float(price or 0.0), 0.0
+        )
+        if quantity + 1e-12 < min_quantity or notional + 1e-9 < min_notional:
+            failures.append(
+                {
+                    "leg": leg,
+                    "quantity": quantity,
+                    "price": price,
+                    "notional_quote": notional,
+                    "min_quantity": min_quantity,
+                    "min_notional_quote": min_notional,
+                }
+            )
+    if not failures:
+        return "", {}
+    return "entry_pair_minimum_not_met", {"pair_minimum_failures": failures}
+
+
+def executable_entry_envelope_context_key(
+    *,
+    target_quantity: float,
+    maker_leg: str,
+    long_price: float,
+    short_price: float,
+    long_metadata: dict,
+    short_metadata: dict,
+    strategy_min_notional: float,
+    common_base_quantity_step: float,
+    slice_ratio: float,
+    max_initial_clip_ratio: float,
+) -> tuple[object, ...]:
+    maker_leg_name = str(maker_leg or "").lower()
+    if maker_leg_name not in {"long", "short"}:
+        maker_leg_name = "long"
+
+    def _float_value(value) -> float:
+        try:
+            numeric = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return numeric if math.isfinite(numeric) else 0.0
+
+    def _metadata_key(metadata: dict) -> tuple[float, float]:
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return (
+            _float_value(metadata.get("min_quantity", 0.0)),
+            _float_value(metadata.get("min_notional", 0.0)),
+        )
+
+    return (
+        _float_value(target_quantity),
+        maker_leg_name,
+        _float_value(long_price),
+        _float_value(short_price),
+        _metadata_key(long_metadata),
+        _metadata_key(short_metadata),
+        _float_value(strategy_min_notional),
+        _float_value(common_base_quantity_step),
+        _float_value(slice_ratio),
+        _float_value(max_initial_clip_ratio),
+    )
+
+
+def build_executable_entry_envelope(
+    *,
+    target_quantity: float,
+    maker_leg: str,
+    long_price: float,
+    short_price: float,
+    long_metadata: dict,
+    short_metadata: dict,
+    strategy_min_notional: float,
+    common_base_quantity_step: float,
+    slice_ratio: float,
+    max_initial_clip_ratio: float,
+) -> ExecutableEntryEnvelope:
+    """Build the single executable entry envelope reused by live selection/dispatch."""
+
+    context_key = executable_entry_envelope_context_key(
+        target_quantity=target_quantity,
+        maker_leg=maker_leg,
+        long_price=long_price,
+        short_price=short_price,
+        long_metadata=long_metadata,
+        short_metadata=short_metadata,
+        strategy_min_notional=strategy_min_notional,
+        common_base_quantity_step=common_base_quantity_step,
+        slice_ratio=slice_ratio,
+        max_initial_clip_ratio=max_initial_clip_ratio,
+    )
+    requested_quantity = max(float(target_quantity or 0.0), 0.0)
+    maker_leg_name = str(maker_leg or "").lower()
+    if maker_leg_name not in {"long", "short"}:
+        maker_leg_name = "long"
+    hedge_leg_name = "short" if maker_leg_name == "long" else "long"
+    maker_metadata = long_metadata if maker_leg_name == "long" else short_metadata
+    hedge_metadata = short_metadata if maker_leg_name == "long" else long_metadata
+    maker_price_source = long_price if maker_leg_name == "long" else short_price
+    hedge_price_source = short_price if maker_leg_name == "long" else long_price
+    maker_price = float(maker_price_source or 0.0)
+    hedge_price = float(hedge_price_source or 0.0)
+
+    def _rejected(reason: str, evidence: dict[str, object]) -> ExecutableEntryEnvelope:
+        return ExecutableEntryEnvelope(
+            context_key=context_key,
+            plan=IncrementalEntryExecutionPlan(
+                route=ExecutionRoute.REJECTED,
+                reason=reason,
+            ),
+            maker_leg=maker_leg_name,
+            hedge_leg=hedge_leg_name,
+            requested_quantity=requested_quantity,
+            effective_dispatch_quantity=0.0,
+            blocker_reason=reason,
+            blocker_evidence=evidence,
+        )
+
+    minimum_reason, minimum_evidence = entry_pair_minimum_reason(
+        quantity=requested_quantity,
+        long_price=float(long_price or 0.0),
+        short_price=float(short_price or 0.0),
+        long_metadata=long_metadata,
+        short_metadata=short_metadata,
+        strategy_min_notional=strategy_min_notional,
+    )
+    if minimum_reason:
+        return _rejected(minimum_reason, minimum_evidence)
+
+    maker_min_notional = max(
+        float(strategy_min_notional or 0.0),
+        float(maker_metadata.get("min_notional", 0.0) or 0.0),
+    )
+    hedge_min_notional = max(
+        float(strategy_min_notional or 0.0),
+        float(hedge_metadata.get("min_notional", 0.0) or 0.0),
+    )
+    maker_min_quantity = max(
+        float(maker_metadata.get("min_quantity", 0.0) or 0.0), 0.0
+    )
+    hedge_min_quantity = max(
+        float(hedge_metadata.get("min_quantity", 0.0) or 0.0), 0.0
+    )
+    if maker_price > 0.0 and maker_min_quantity > 0.0:
+        maker_min_notional = max(maker_min_notional, maker_min_quantity * maker_price)
+    evidence = {
+        "target_quantity": requested_quantity,
+        "maker_leg": maker_leg_name,
+        "hedge_leg": hedge_leg_name,
+        "maker_price_hint": maker_price,
+        "hedge_price_hint": hedge_price,
+        "maker_min_notional_quote": maker_min_notional,
+        "hedge_min_notional_quote": hedge_min_notional,
+        "maker_min_quantity": maker_min_quantity,
+        "hedge_min_quantity": hedge_min_quantity,
+        "common_base_quantity_step": float(common_base_quantity_step or 0.0),
+    }
+    try:
+        min_hedgeable_chunk = min_hedgeable_chunk_from_notional(
+            min_base_quantity=hedge_min_quantity,
+            min_notional_quote=hedge_min_notional,
+            step_base_quantity=float(common_base_quantity_step or 0.0),
+            price_hint=hedge_price if hedge_price > 0.0 else None,
+        )
+    except ValueError:
+        return _rejected("min_hedgeable_chunk_invalid", evidence)
+    route, plan = plan_incremental_entry_execution(
+        target_quantity=requested_quantity,
+        slice_ratio=slice_ratio,
+        min_hedgeable_chunk=min_hedgeable_chunk,
+        maker_min_notional_quote=maker_min_notional,
+        maker_price_hint=maker_price if maker_price > 0.0 else None,
+        max_initial_clip_ratio=max_initial_clip_ratio,
+        hedge_min_notional_quote=hedge_min_notional,
+        hedge_price_hint=hedge_price if hedge_price > 0.0 else None,
+    )
+    if route == ExecutionRoute.REJECTED:
+        reason = str(plan.reason or "planner_rejected_entry")
+        rejected_evidence = {
+            **evidence,
+            "min_hedgeable_chunk": min_hedgeable_chunk,
+            "maker_min_valid_clip_quantity": plan.maker_min_valid_clip_quantity,
+            "planner_route": route.value,
+            "planner_reason": reason,
+        }
+        return _rejected(reason, rejected_evidence)
+    effective_dispatch_quantity = (
+        plan.initial_maker_target_quantity
+        if route == ExecutionRoute.PASSIVE_INCREMENTAL
+        else plan.full_target_quantity
+    )
+    return ExecutableEntryEnvelope(
+        context_key=context_key,
+        plan=plan,
+        maker_leg=maker_leg_name,
+        hedge_leg=hedge_leg_name,
+        requested_quantity=requested_quantity,
+        effective_dispatch_quantity=effective_dispatch_quantity,
+        min_hedgeable_chunk=min_hedgeable_chunk,
     )
 
 

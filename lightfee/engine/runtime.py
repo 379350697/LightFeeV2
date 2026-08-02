@@ -47,7 +47,11 @@ from lightfee.engine.entry_dispatch_runtime import (
     _align_base_quantity_down,
     _common_base_quantity_step,
 )
-from lightfee.engine.execution_planner import min_hedgeable_chunk_from_notional
+from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
+    build_executable_entry_envelope,
+    min_hedgeable_chunk_from_notional,
+)
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
@@ -434,10 +438,10 @@ class LiveRuntime:
         self._entry_account_truth_generation: dict[str, Any] | None = None
         self._entry_account_truth_ready_at_ms: int = 0
         self._entry_account_truth_venue_receipts: dict[str, dict[str, Any]] = {}
-        self._entry_account_truth_last_good_venue_receipts: dict[
-            str, dict[str, Any]
+        self._entry_account_truth_generation_counter: int = 0
+        self._entry_account_truth_target_barriers: dict[
+            str, asyncio.Task
         ] = {}
-        self._entry_account_truth_venue_tasks: dict[str, asyncio.Task] = {}
         self._prescan_l2_sync_task: asyncio.Task | None = None
         self._snapshot_freshness_decision_last_emit_ms: dict[
             tuple[str, str, str, str, str, str], int
@@ -4770,7 +4774,6 @@ class LiveRuntime:
         self._entry_account_truth_generation = None
         self._entry_account_truth_ready_at_ms = 0
         self._entry_account_truth_venue_receipts.clear()
-        self._entry_account_truth_last_good_venue_receipts.clear()
 
     def _entry_account_truth_per_venue_timeout_ms(self) -> int:
         """Return the target-leg account-truth budget."""
@@ -4783,28 +4786,6 @@ class LiveRuntime:
             return max(int(configured or 0), 1)
         except (TypeError, ValueError):
             return 1
-
-    @staticmethod
-    def _entry_account_truth_receipt_is_recent_attempt(
-        receipt: Mapping[str, Any] | None,
-        *,
-        now_ms: int,
-        retry_after_ms: int,
-    ) -> bool:
-        """Reuse a recent failed receipt so one slow venue cannot be hammered.
-
-        It never authorizes entry: callers still require a complete fresh
-        receipt.  The short negative cache only makes the failure fan out to
-        every candidate safely while the next refresh opportunity is pending.
-        """
-        if not isinstance(receipt, Mapping):
-            return False
-        try:
-            finished_at_ms = int(receipt.get("finished_at_ms", 0) or 0)
-        except (TypeError, ValueError):
-            return False
-        age_ms = int(now_ms) - finished_at_ms
-        return finished_at_ms > 0 and 0 <= age_ms <= max(int(retry_after_ms), 1)
 
     def _entry_account_truth_candidate_venues(self, candidate) -> tuple[Venue, ...]:
         venues: list[Venue] = []
@@ -4904,8 +4885,14 @@ class LiveRuntime:
             "finished_at_ms": finished_at_ms,
             "duration_ms": duration_ms,
             "age_ms": age_ms,
-            "last_good_finished_at_ms": _int_or_zero(
-                receipt.get("last_good_finished_at_ms")
+            "target_pair_generation_id": str(
+                receipt.get("target_pair_generation_id") or ""
+            ),
+            "target_pair_generation_started_at_ms": _int_or_zero(
+                receipt.get("target_pair_generation_started_at_ms")
+            ),
+            "target_pair_generation_finished_at_ms": _int_or_zero(
+                receipt.get("target_pair_generation_finished_at_ms")
             ),
             "position_count": len(positions) if isinstance(positions, list) else 0,
             "open_order_count": len(open_orders) if isinstance(open_orders, list) else 0,
@@ -5055,10 +5042,6 @@ class LiveRuntime:
         venue_name = venue.value
         symbol_key = str(symbol or "").upper()
         started_at_ms = wall_clock_now_ms()
-        positions: list[dict[str, Any]] = []
-        open_orders: list[dict[str, Any]] = []
-        probe_evidence: list[dict[str, Any]] = []
-        errors: list[str] = []
         max_age_ms = max(
             int(self.config.runtime.private_position_max_age_ms or 0),
             1,
@@ -5068,114 +5051,60 @@ class LiveRuntime:
         if callable(private_state):
             private_state = private_state()
 
-        private_position = None
-        if private_state is not None:
-            position_if_fresh = getattr(private_state, "position_if_fresh", None)
-            if callable(position_if_fresh):
-                private_position = position_if_fresh(
-                    symbol_key,
-                    max_age_ms,
-                    started_at_ms,
-                )
-            active_orders_if_fresh = getattr(
-                private_state,
-                "active_orders_for_symbol_if_fresh",
-                None,
-            )
-            if callable(active_orders_if_fresh):
-                private_orders = active_orders_if_fresh(
-                    symbol_key,
-                    max_age_ms,
-                    started_at_ms,
-                )
-                if private_orders:
-                    for order in private_orders:
-                        open_orders.append(
-                            {
-                                "venue": venue_name,
-                                "symbol": symbol_key,
-                                "order_id": str(getattr(order, "order_id", "") or ""),
-                                "client_order_id": str(
-                                    getattr(order, "client_order_id", "") or ""
-                                ),
-                                "state": str(
-                                    getattr(getattr(order, "state", None), "value", "")
-                                    or ""
-                                ),
-                                "updated_at_ms": int(
-                                    getattr(order, "updated_at_ms", 0) or 0
-                                ),
-                            }
-                        )
-                    finished_at_ms = wall_clock_now_ms()
-                    return {
-                        "venue": venue_name,
-                        "truth_supported": True,
-                        "truth_available": True,
-                        "complete": False,
-                        "positions": [],
-                        "open_orders": open_orders,
-                        "probe_evidence": [
-                            {
-                                "venue": venue_name,
-                                "symbol": symbol_key,
-                                "endpoint": "private_ws",
-                                "classification": "active_order_push",
-                                "finished_at_ms": finished_at_ms,
-                            }
-                        ],
-                        "errors": [],
-                        "truth_probe_count": 1,
-                        "started_at_ms": started_at_ms,
-                        "finished_at_ms": finished_at_ms,
-                    }
-
-        if private_position is not None:
-            position = PositionSnapshot(
-                venue=venue,
-                symbol=symbol_key,
-                side=Side.BUY if private_position.size >= 0 else Side.SELL,
-                quantity=abs(float(private_position.size or 0.0)),
-                entry_price=0.0,
-                observed_at_ms=int(private_position.updated_at_ms or 0),
-            )
-            positions.append(
-                self._recovery_ledger_position_payload(
-                    position,
-                    venue_name=venue_name,
+        async def _position_probe() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+            positions: list[dict[str, Any]] = []
+            probe_evidence: list[dict[str, Any]] = []
+            errors: list[str] = []
+            private_position = None
+            if private_state is not None:
+                position_if_fresh = getattr(private_state, "position_if_fresh", None)
+                if callable(position_if_fresh):
+                    private_position = position_if_fresh(
+                        symbol_key,
+                        max_age_ms,
+                        started_at_ms,
+                    )
+            if private_position is not None:
+                position = PositionSnapshot(
+                    venue=venue,
                     symbol=symbol_key,
+                    side=Side.BUY if private_position.size >= 0 else Side.SELL,
+                    quantity=abs(float(private_position.size or 0.0)),
+                    entry_price=0.0,
+                    observed_at_ms=int(private_position.updated_at_ms or 0),
                 )
-            )
-            probe_evidence.append(
-                {
-                    "venue": venue_name,
-                    "symbol": symbol_key,
-                    "endpoint": "private_ws",
-                    "classification": "position_push",
-                    "finished_at_ms": started_at_ms,
-                }
-            )
-            if abs(position.quantity) > 1e-12:
-                finished_at_ms = wall_clock_now_ms()
-                return {
-                    "venue": venue_name,
-                    "truth_supported": True,
-                    "truth_available": True,
-                    "complete": False,
-                    "positions": positions,
-                    "open_orders": [],
-                    "probe_evidence": probe_evidence,
-                    "errors": [],
-                    "truth_probe_count": 1,
-                    "started_at_ms": started_at_ms,
-                    "finished_at_ms": finished_at_ms,
-                }
-        else:
+                positions.append(
+                    self._recovery_ledger_position_payload(
+                        position,
+                        venue_name=venue_name,
+                        symbol=symbol_key,
+                    )
+                )
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": symbol_key,
+                        "endpoint": "private_ws",
+                        "classification": "position_push",
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                )
+                return positions, probe_evidence, errors
             fetch_position = getattr(adapter, "fetch_position", None)
             if not callable(fetch_position):
                 fetch_position = getattr(transport, "fetch_position", None)
             if not callable(fetch_position):
                 errors.append(f"{venue_name}:{symbol_key}:fetch_position_unavailable")
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": symbol_key,
+                        "endpoint": "fetch_position",
+                        "classification": "position_probe_failed",
+                        "error": "fetch_position_unavailable",
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                )
             else:
                 try:
                     position = await fetch_position(symbol_key)
@@ -5199,37 +5128,133 @@ class LiveRuntime:
                     )
                 except Exception as exc:
                     errors.append(f"{venue_name}:{symbol_key}:positions:{exc}")
+                    probe_evidence.append(
+                        {
+                            "venue": venue_name,
+                            "symbol": symbol_key,
+                            "endpoint": "fetch_position",
+                            "classification": "position_probe_failed",
+                            "error": str(exc),
+                            "finished_at_ms": wall_clock_now_ms(),
+                        }
+                    )
+            return positions, probe_evidence, errors
 
-        fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
-        if not callable(fetch_open_orders):
-            fetch_open_orders = getattr(transport, "fetch_open_orders", None)
+        async def _open_order_probe() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+            open_orders: list[dict[str, Any]] = []
+            probe_evidence: list[dict[str, Any]] = []
+            errors: list[str] = []
+            if private_state is not None:
+                active_orders_if_fresh = getattr(
+                    private_state,
+                    "active_orders_for_symbol_if_fresh",
+                    None,
+                )
+                if callable(active_orders_if_fresh):
+                    private_orders = active_orders_if_fresh(
+                        symbol_key,
+                        max_age_ms,
+                        started_at_ms,
+                    )
+                    if private_orders is not None:
+                        for order in private_orders:
+                            open_orders.append(
+                                {
+                                    "venue": venue_name,
+                                    "symbol": symbol_key,
+                                    "order_id": str(
+                                        getattr(order, "order_id", "") or ""
+                                    ),
+                                    "client_order_id": str(
+                                        getattr(order, "client_order_id", "") or ""
+                                    ),
+                                    "state": str(
+                                        getattr(
+                                            getattr(order, "state", None),
+                                            "value",
+                                            "",
+                                        )
+                                        or ""
+                                    ),
+                                    "updated_at_ms": int(
+                                        getattr(order, "updated_at_ms", 0) or 0
+                                    ),
+                                }
+                            )
+                        probe_evidence.append(
+                            {
+                                "venue": venue_name,
+                                "symbol": symbol_key,
+                                "endpoint": "private_ws",
+                                "classification": "active_order_push",
+                                "open_order_count": len(open_orders),
+                                "finished_at_ms": wall_clock_now_ms(),
+                            }
+                        )
+                        return open_orders, probe_evidence, errors
+
+            fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+            if not callable(fetch_open_orders):
+                fetch_open_orders = getattr(transport, "fetch_open_orders", None)
+            try:
+                if callable(fetch_open_orders):
+                    rows = open_order_items(await fetch_open_orders(symbol_key))
+                else:
+                    rows = await self.residual_repair_runtime._fetch_residual_repair_open_orders(
+                        adapter,
+                        venue,
+                        symbol_key,
+                    )
+                open_orders.extend(
+                    self._recovery_ledger_open_order_payloads(
+                        rows,
+                        venue_name=venue_name,
+                        symbol=symbol_key,
+                    )
+                )
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": symbol_key,
+                        "endpoint": "fetch_open_orders",
+                        "classification": "open_order_probe_succeeded",
+                        "open_order_count": len(rows)
+                        if isinstance(rows, (list, tuple, set))
+                        else 0,
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                )
+            except Exception as exc:
+                errors.append(f"{venue_name}:{symbol_key}:open_orders:{exc}")
+                probe_evidence.append(
+                    {
+                        "venue": venue_name,
+                        "symbol": symbol_key,
+                        "endpoint": "fetch_open_orders",
+                        "classification": "open_order_probe_failed",
+                        "error": str(exc),
+                        "finished_at_ms": wall_clock_now_ms(),
+                    }
+                )
+            return open_orders, probe_evidence, errors
+
+        open_order_task = asyncio.create_task(
+            _open_order_probe(),
+            name=f"funding-entry-account-truth-open-orders:{venue_name}:{symbol_key}",
+        )
         try:
-            if callable(fetch_open_orders):
-                rows = open_order_items(await fetch_open_orders(symbol_key))
-            else:
-                rows = await self.residual_repair_runtime._fetch_residual_repair_open_orders(
-                    adapter,
-                    venue,
-                    symbol_key,
-                )
-            open_orders.extend(
-                self._recovery_ledger_open_order_payloads(
-                    rows,
-                    venue_name=venue_name,
-                    symbol=symbol_key,
-                )
-            )
-            probe_evidence.append(
-                {
-                    "venue": venue_name,
-                    "symbol": symbol_key,
-                    "endpoint": "fetch_open_orders",
-                    "classification": "open_order_probe_succeeded",
-                    "finished_at_ms": wall_clock_now_ms(),
-                }
-            )
-        except Exception as exc:
-            errors.append(f"{venue_name}:{symbol_key}:open_orders:{exc}")
+            position_result = await _position_probe()
+            open_order_result = await open_order_task
+        except BaseException:
+            if not open_order_task.done():
+                open_order_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await open_order_task
+            raise
+        positions, position_evidence, position_errors = position_result
+        open_orders, open_order_evidence, open_order_errors = open_order_result
+        probe_evidence = [*position_evidence, *open_order_evidence]
+        errors = [*position_errors, *open_order_errors]
 
         finished_at_ms = wall_clock_now_ms()
         complete = not errors and len(probe_evidence) >= 2
@@ -5252,12 +5277,9 @@ class LiveRuntime:
         candidate,
     ) -> tuple[dict[str, dict[str, Any]], int]:
         now_ms = wall_clock_now_ms()
-        receipts: dict[str, dict[str, Any]] = {}
         required_venues = self._entry_account_truth_candidate_venues(candidate)
         symbol = str(getattr(candidate, "symbol", "") or "").upper()
-        timeout_count = 0
-        timeout_ms = self._entry_account_truth_per_venue_timeout_ms()
-        pending: list[tuple[Venue, asyncio.Task]] = []
+        cached_pair: dict[str, dict[str, Any]] = {}
         for venue in required_venues:
             venue_name = venue.value
             receipt_key = f"{venue_name}:{symbol}"
@@ -5266,33 +5288,118 @@ class LiveRuntime:
                 cached,
                 now_ms=now_ms,
             ):
-                receipts[venue_name] = dict(cached or {})
-                continue
-            if self._entry_account_truth_receipt_is_recent_attempt(
-                cached,
-                now_ms=now_ms,
-                retry_after_ms=timeout_ms,
-            ):
-                receipts[venue_name] = dict(cached or {})
-                continue
-            adapter = self._venue_adapters.get(venue)
-            if adapter is None:
-                receipts[venue_name] = {
-                    "venue": venue_name,
-                    "truth_supported": False,
-                    "truth_available": False,
-                    "complete": False,
-                    "positions": [],
-                    "open_orders": [],
-                    "probe_evidence": [],
-                    "errors": [f"{venue_name}:*:adapter_unavailable"],
-                    "truth_probe_count": 0,
-                    "started_at_ms": now_ms,
-                    "finished_at_ms": wall_clock_now_ms(),
-                }
-                continue
-            task = self._entry_account_truth_venue_tasks.get(receipt_key)
-            if task is None or task.done():
+                cached_pair[venue_name] = dict(cached or {})
+        if len(cached_pair) == len(required_venues) and cached_pair:
+            generation_ids = {
+                str(receipt.get("target_pair_generation_id") or "")
+                for receipt in cached_pair.values()
+            }
+            generation_ids.discard("")
+            if len(generation_ids) == 1:
+                return cached_pair, 0
+        return await self._entry_account_truth_target_barrier(
+            required_venues,
+            symbol,
+        )
+
+    async def _entry_account_truth_target_barrier(
+        self,
+        required_venues: list,
+        symbol: str,
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        """Singleflight a whole target-pair truth generation.
+
+        The first caller runs the generation inline so probes are scheduled on
+        its own event-loop turn.  Concurrent requests for the same venue pair
+        await the shared in-flight future instead of starting a second set of
+        probes.  The generation id is fixed when the barrier starts, so no
+        caller can re-label a probe started by another caller as its own
+        generation.
+        """
+        barrier_key = (
+            f"{','.join(venue.value for venue in required_venues)}:{symbol}"
+        )
+        barrier = self._entry_account_truth_target_barriers.get(barrier_key)
+        if barrier is None or barrier.done():
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self._entry_account_truth_target_barriers[barrier_key] = future
+            try:
+                result = (
+                    await self._entry_account_truth_target_receipts_inner(
+                        required_venues,
+                        symbol,
+                    )
+                )
+                if not future.done():
+                    future.set_result(result)
+                return result
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                raise
+            finally:
+                if (
+                    self._entry_account_truth_target_barriers.get(barrier_key)
+                    is future
+                ):
+                    self._entry_account_truth_target_barriers.pop(
+                        barrier_key,
+                        None,
+                    )
+        try:
+            return await barrier
+        finally:
+            if barrier.done() and self._entry_account_truth_target_barriers.get(
+                barrier_key
+            ) is barrier:
+                self._entry_account_truth_target_barriers.pop(barrier_key, None)
+
+    async def _entry_account_truth_target_receipts_inner(
+        self,
+        required_venues: list,
+        symbol: str,
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        timeout_ms = self._entry_account_truth_per_venue_timeout_ms()
+
+        async def _collect_generation(
+            attempt: int,
+        ) -> tuple[dict[str, dict[str, Any]], int]:
+            receipts: dict[str, dict[str, Any]] = {}
+            timeout_count = 0
+            generation_started_at_ms = wall_clock_now_ms()
+            self._entry_account_truth_generation_counter += 1
+            generation_counter = self._entry_account_truth_generation_counter
+            target_pair_generation_id = (
+                f"{symbol}:"
+                f"{','.join(venue.value for venue in required_venues)}:"
+                f"{generation_started_at_ms}:"
+                f"{generation_counter}:attempt{attempt + 1}"
+            )
+            pending: list[tuple[Venue, asyncio.Task]] = []
+            for venue in required_venues:
+                venue_name = venue.value
+                adapter = self._venue_adapters.get(venue)
+                if adapter is None:
+                    receipts[venue_name] = {
+                        "venue": venue_name,
+                        "truth_supported": False,
+                        "truth_available": False,
+                        "complete": False,
+                        "positions": [],
+                        "open_orders": [],
+                        "probe_evidence": [],
+                        "errors": [f"{venue_name}:*:adapter_unavailable"],
+                        "truth_probe_count": 0,
+                        "started_at_ms": generation_started_at_ms,
+                        "finished_at_ms": wall_clock_now_ms(),
+                        "target_pair_generation_id": target_pair_generation_id,
+                        "target_pair_generation_started_at_ms": (
+                            generation_started_at_ms
+                        ),
+                        "target_pair_generation_attempt": attempt + 1,
+                    }
+                    continue
                 task = asyncio.create_task(
                     asyncio.wait_for(
                         self._collect_entry_candidate_truth_for_venue(
@@ -5302,81 +5409,101 @@ class LiveRuntime:
                         ),
                         timeout=timeout_ms / 1_000.0,
                     ),
-                    name=f"funding-entry-account-truth:{venue_name}:{symbol}",
+                    name=(
+                        "funding-entry-account-truth:"
+                        f"{venue_name}:{symbol}:attempt{attempt + 1}"
+                    ),
                 )
-                self._entry_account_truth_venue_tasks[receipt_key] = task
-            pending.append((venue, task))
+                pending.append((venue, task))
 
-        if pending:
-            results = await asyncio.gather(
-                *(task for _venue, task in pending),
-                return_exceptions=True,
-            )
-            for (venue, _task), result in zip(pending, results):
-                venue_name = venue.value
+            if pending:
+                results = await asyncio.gather(
+                    *(task for _venue, task in pending),
+                    return_exceptions=True,
+                )
+                generation_finished_at_ms = wall_clock_now_ms()
+                for (venue, _task), result in zip(pending, results):
+                    venue_name = venue.value
+                    receipt_key = f"{venue_name}:{symbol}"
+                    if isinstance(result, asyncio.TimeoutError):
+                        timeout_count += 1
+                        receipt = {
+                            "venue": venue_name,
+                            "truth_supported": False,
+                            "truth_available": False,
+                            "complete": False,
+                            "positions": [],
+                            "open_orders": [],
+                            "probe_evidence": [],
+                            "errors": [
+                                f"{venue_name}:*:account_truth_timeout:{timeout_ms}ms"
+                            ],
+                            "truth_probe_count": 0,
+                            "started_at_ms": generation_started_at_ms,
+                            "finished_at_ms": wall_clock_now_ms(),
+                        }
+                    elif isinstance(result, BaseException):
+                        receipt = {
+                            "venue": venue_name,
+                            "truth_supported": False,
+                            "truth_available": False,
+                            "complete": False,
+                            "positions": [],
+                            "open_orders": [],
+                            "probe_evidence": [],
+                            "errors": [f"{venue_name}:*:account_truth:{result}"],
+                            "truth_probe_count": 0,
+                            "started_at_ms": generation_started_at_ms,
+                            "finished_at_ms": wall_clock_now_ms(),
+                        }
+                    else:
+                        receipt = dict(result)
+                    receipt["target_pair_generation_id"] = target_pair_generation_id
+                    receipt["target_pair_generation_started_at_ms"] = (
+                        generation_started_at_ms
+                    )
+                    receipt["target_pair_generation_finished_at_ms"] = (
+                        generation_finished_at_ms
+                    )
+                    receipt["target_pair_generation_attempt"] = attempt + 1
+                    self._entry_account_truth_venue_receipts[receipt_key] = dict(receipt)
+                    receipts[venue_name] = receipt
+            generation_finished_at_ms = wall_clock_now_ms()
+            for venue_name, receipt in receipts.items():
+                receipt.setdefault(
+                    "target_pair_generation_id",
+                    target_pair_generation_id,
+                )
+                receipt.setdefault(
+                    "target_pair_generation_started_at_ms",
+                    generation_started_at_ms,
+                )
+                receipt.setdefault(
+                    "target_pair_generation_finished_at_ms",
+                    generation_finished_at_ms,
+                )
+                receipt.setdefault("target_pair_generation_attempt", attempt + 1)
                 receipt_key = f"{venue_name}:{symbol}"
-                if (
-                    _task.done()
-                    and self._entry_account_truth_venue_tasks.get(receipt_key)
-                    is _task
-                ):
-                    self._entry_account_truth_venue_tasks.pop(receipt_key, None)
-                if isinstance(result, asyncio.TimeoutError):
-                    timeout_count += 1
-                    receipt = {
-                        "venue": venue_name,
-                        "truth_supported": False,
-                        "truth_available": False,
-                        "complete": False,
-                        "positions": [],
-                        "open_orders": [],
-                        "probe_evidence": [],
-                        "errors": [
-                            f"{venue_name}:*:account_truth_timeout:{timeout_ms}ms"
-                        ],
-                        "truth_probe_count": 0,
-                        "started_at_ms": now_ms,
-                        "finished_at_ms": wall_clock_now_ms(),
-                    }
-                elif isinstance(result, BaseException):
-                    receipt = {
-                        "venue": venue_name,
-                        "truth_supported": False,
-                        "truth_available": False,
-                        "complete": False,
-                        "positions": [],
-                        "open_orders": [],
-                        "probe_evidence": [],
-                        "errors": [f"{venue_name}:*:account_truth:{result}"],
-                        "truth_probe_count": 0,
-                        "started_at_ms": now_ms,
-                        "finished_at_ms": wall_clock_now_ms(),
-                    }
-                else:
-                    receipt = dict(result)
-                if self._entry_account_truth_receipt_is_fresh_complete(
+                self._entry_account_truth_venue_receipts[receipt_key] = dict(receipt)
+            return receipts, timeout_count
+
+        total_timeout_count = 0
+        receipts: dict[str, dict[str, Any]] = {}
+        for attempt in range(2):
+            receipts, timeout_count = await _collect_generation(attempt)
+            total_timeout_count += timeout_count
+            incomplete = [
+                receipt
+                for receipt in receipts.values()
+                if not self._entry_account_truth_receipt_is_fresh_complete(
                     receipt,
                     now_ms=wall_clock_now_ms(),
-                ):
-                    receipt["last_good_finished_at_ms"] = int(
-                        receipt.get("finished_at_ms", 0) or 0
-                    )
-                    self._entry_account_truth_last_good_venue_receipts[
-                        receipt_key
-                    ] = dict(receipt)
-                else:
-                    last_good = (
-                        self._entry_account_truth_last_good_venue_receipts.get(
-                            receipt_key
-                        )
-                    )
-                    if isinstance(last_good, Mapping):
-                        receipt["last_good_finished_at_ms"] = int(
-                            last_good.get("finished_at_ms", 0) or 0
-                        )
-                self._entry_account_truth_venue_receipts[receipt_key] = dict(receipt)
-                receipts[venue_name] = receipt
-        return receipts, timeout_count
+                )
+            ]
+            if not incomplete and len(receipts) == len(required_venues):
+                return receipts, total_timeout_count
+        return receipts, total_timeout_count
+
 
     def _record_entry_account_truth_target_block(
         self,
@@ -5588,6 +5715,20 @@ class LiveRuntime:
             candidate
         )
         now_ms = wall_clock_now_ms()
+        generation_ids = {
+            str(receipt.get("target_pair_generation_id") or "")
+            for receipt in receipts.values()
+        }
+        generation_ids.discard("")
+        common_generation_id = (
+            next(iter(generation_ids)) if len(generation_ids) == 1 else ""
+        )
+        if common_generation_id:
+            if not isinstance(self.state.last_scan, dict):
+                self.state.last_scan = {}
+            self.state.last_scan["entry_account_truth_generation_id"] = (
+                common_generation_id
+            )
         incomplete = [
             venue
             for venue, receipt in receipts.items()
@@ -5599,7 +5740,13 @@ class LiveRuntime:
         position_count, open_order_count = (
             self._entry_account_truth_live_artifact_counts(receipts)
         )
-        if not incomplete and position_count == 0 and open_order_count == 0:
+        if (
+            not incomplete
+            and len(receipts) == len(target_venues)
+            and common_generation_id
+            and position_count == 0
+            and open_order_count == 0
+        ):
             return True, False, ""
         global_recovery_block = bool(position_count or open_order_count)
         if global_recovery_block:
@@ -5631,6 +5778,9 @@ class LiveRuntime:
         elif timeout_count:
             reason = "entry_account_truth_timeout_before_dispatch"
             event_kind = "runtime.entry_account_truth_timeout"
+        elif not common_generation_id:
+            reason = "entry_account_truth_generation_mixed_before_dispatch"
+            event_kind = "runtime.entry_account_truth_incomplete"
         else:
             reason = "entry_account_truth_incomplete_before_dispatch"
             event_kind = "runtime.entry_account_truth_incomplete"
@@ -5954,12 +6104,12 @@ class LiveRuntime:
                 with suppress(asyncio.CancelledError):
                     await task
             setattr(self, task_name, None)
-        for task in list(self._entry_account_truth_venue_tasks.values()):
-            if not task.done():
-                task.cancel()
+        for barrier in list(self._entry_account_truth_target_barriers.values()):
+            if not barrier.done():
+                barrier.cancel()
                 with suppress(asyncio.CancelledError):
-                    await task
-        self._entry_account_truth_venue_tasks.clear()
+                    await barrier
+        self._entry_account_truth_target_barriers.clear()
         shutdown_timeout_s = max(self.config.runtime.shutdown_grace_period_ms, 1) / 1000.0
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + shutdown_timeout_s
@@ -6458,6 +6608,7 @@ class LiveRuntime:
         selection_blockers: Counter[str] = Counter()
         admission_blockers: Counter[str] = Counter()
         candidate_blockers: dict[str, str] = {}
+        selected_candidates: list = []
         checked = 0
         dispatched = 0
         last_reason = "no_tradeable_candidate"
@@ -6815,6 +6966,7 @@ class LiveRuntime:
                     break
                 continue
 
+            selected_candidates.append(candidate)
             selected_at_ms = wall_clock_now_ms()
             submit_deadline_ms = max(
                 int(self.config.strategy.selected_submit_deadline_ms or 0),
@@ -6836,6 +6988,7 @@ class LiveRuntime:
                 ),
                 selected_deadline_monotonic=selected_deadline,
                 selected_at_ms=selected_at_ms,
+                executable_envelope=candidate.executable_envelope,
             )
             if dispatch_result.dispatched:
                 dispatched += 1
@@ -6870,7 +7023,7 @@ class LiveRuntime:
 
         self.state.last_scan["tradeable_count"] = len(candidates)
         self.state.last_scan["ranked_candidate_checked_count"] = checked
-        self.state.last_scan["selected_candidate_count"] = dispatched
+        self.state.last_scan["selected_candidate_count"] = len(selected_candidates)
         self.state.last_scan["dispatched_candidate_count"] = dispatched
         self.state.last_scan["remaining_slots"] = remaining_slots
         self.state.last_scan["entry_prewarm_candidate_count"] = prewarm_candidate_count
@@ -6887,6 +7040,18 @@ class LiveRuntime:
         }
         self.state.last_scan["strategy_blocked_reason_counts"] = (
             strategy_rejection_counts
+        )
+        self._emit_entry_opportunity_funnel(
+            reason=last_reason,
+            snapshot=snapshot,
+            tradeable=candidates,
+            selected=selected_candidates,
+            dispatched_candidate_count=dispatched,
+            remaining_slots=remaining_slots,
+            tradeable_selection_blocker_counts=selection_blockers,
+            candidate_blockers=candidate_blockers,
+            now_ms=wall_clock_now_ms(),
+            admission_blocker_counts=admission_blockers,
         )
         if dispatched == 0:
             self.state.last_scan["no_entry_reason"] = last_reason
@@ -15738,50 +15903,50 @@ class LiveRuntime:
                     0.0,
                 ),
             }
-            def _align_and_check_pair_minimum(
+            def _align_selection_quantity(
                 quantity: float,
-                long_price: float,
-                short_price: float,
-            ) -> tuple[float, str]:
+            ) -> tuple[float, str, dict[str, object]]:
                 aligned = max(float(quantity or 0.0), 0.0)
                 if has_explicit_target_quantity and common_step > 0.0:
                     aligned = _align_base_quantity_down(aligned, common_step)
                 if aligned <= 0.0:
-                    return 0.0, "entry_pair_minimum_not_met"
-                if not has_explicit_target_quantity:
-                    return aligned, ""
-                reason, _details = (
-                    self.entry_dispatch_runtime._entry_pair_minimum_reason(
-                        quantity=aligned,
-                        long_price=long_price,
-                        short_price=short_price,
-                        long_metadata=long_minimum_metadata,
-                        short_metadata=short_minimum_metadata,
-                        strategy_min_notional=strategy_min_notional,
+                    return (
+                        0.0,
+                        "entry_pair_minimum_not_met",
+                        {
+                            "requested_base_quantity": quantity,
+                            "aligned_base_quantity": 0.0,
+                            "common_base_quantity_step": common_step,
+                        },
                     )
-                )
-                return aligned, reason
+                return aligned, "", {}
 
-            final_quantity, quantity_blocker = _align_and_check_pair_minimum(
+            (
+                final_quantity,
+                quantity_blocker,
+                quantity_blocker_evidence,
+            ) = _align_selection_quantity(
                 aligned_quantity,
-                long_ask,
-                short_bid,
             )
             if quantity_blocker:
                 blocker_counts[quantity_blocker] += 1
-                blocker_samples.append(
-                    self._entry_reprice_blocker_sample(
-                        candidate,
-                        quantity_blocker,
-                    )
+                sample = self._entry_reprice_blocker_sample(
+                    candidate,
+                    quantity_blocker,
                 )
+                sample.update(quantity_blocker_evidence)
+                blocker_samples.append(sample)
                 continue
             if final_quantity <= 0.0:
                 reason = "entry_pair_minimum_not_met"
                 blocker_counts[reason] += 1
-                blocker_samples.append(
-                    self._entry_reprice_blocker_sample(candidate, reason)
-                )
+                sample = self._entry_reprice_blocker_sample(candidate, reason)
+                sample.update({
+                    "requested_base_quantity": aligned_quantity,
+                    "aligned_base_quantity": final_quantity,
+                    "common_base_quantity_step": common_step,
+                })
+                blocker_samples.append(sample)
                 continue
             candidate.entry_target_quantity = (
                 final_quantity if has_explicit_target_quantity else 0.0
@@ -15793,10 +15958,67 @@ class LiveRuntime:
                 long_ask + short_bid
             ) / 2.0
 
+            candidate_maker_leg = str(
+                getattr(candidate, "entry_maker_leg", "") or ""
+            ).lower()
+            maker_leg_name = (
+                candidate_maker_leg
+                if candidate_maker_leg in {"long", "short"}
+                else "long"
+                if str(
+                    getattr(self.config.strategy, "maker_leg_default", "buy")
+                    or "buy"
+                ).lower()
+                == "buy"
+                else "short"
+            )
+            # The first executable envelope is built before Local-L2/account
+            # truth from the currently available pre-lease BBO and aligned
+            # quantity.  Local-L2 then sizes against this envelope's planned
+            # full target, and the same pure helper rebuilds the envelope only
+            # after final quote/economics revalidation changes the context.
+            pre_lease_long_planner_price = (
+                long_bid if maker_leg_name == "long" else long_ask
+            )
+            pre_lease_short_planner_price = (
+                short_bid if maker_leg_name == "long" else short_ask
+            )
+            envelope = build_executable_entry_envelope(
+                target_quantity=final_quantity,
+                maker_leg=maker_leg_name,
+                long_price=pre_lease_long_planner_price,
+                short_price=pre_lease_short_planner_price,
+                long_metadata=long_minimum_metadata,
+                short_metadata=short_minimum_metadata,
+                strategy_min_notional=strategy_min_notional,
+                common_base_quantity_step=common_step,
+                slice_ratio=self.config.strategy.maker_initial_slice_ratio,
+                max_initial_clip_ratio=(
+                    self.config.strategy.entry_max_initial_clip_ratio
+                ),
+            )
+            if envelope.blocker_reason:
+                reason = str(envelope.blocker_reason)
+                blocker_counts[reason] += 1
+                sample = self._entry_reprice_blocker_sample(candidate, reason)
+                sample.update({
+                    "blocking_domain": "entry_execution_planner",
+                    "source": "selection_execution_planner",
+                    "requested_base_quantity": requested_quantity,
+                    "aligned_base_quantity": final_quantity,
+                    **envelope.blocker_evidence,
+                })
+                blocker_samples.append(sample)
+                continue
+            candidate.executable_envelope = envelope
             quote_lease = self.entry_dispatch_runtime._local_l2_final_quote_lease(
                 candidate,
                 now_ms,
-                target_quantity=final_quantity,
+                target_quantity=(
+                    envelope.plan.full_target_quantity
+                    if envelope.plan.full_target_quantity > 0.0
+                    else final_quantity
+                ),
             )
             require_l2_vwap = bool(
                 quote_lease is not None
@@ -15895,23 +16117,76 @@ class LiveRuntime:
                 )
                 blocker_samples.append(sample)
                 continue
-            final_quantity, quantity_blocker = _align_and_check_pair_minimum(
+            (
+                final_quantity,
+                quantity_blocker,
+                quantity_blocker_evidence,
+            ) = _align_selection_quantity(
                 _cap_to_live_notional(
                     final_quantity,
                     max(decision.long_entry_price, decision.short_entry_price),
-                ),
-                decision.long_entry_price,
-                decision.short_entry_price,
+                )
             )
             if quantity_blocker:
                 blocker_counts[quantity_blocker] += 1
-                blocker_samples.append(
-                    self._entry_reprice_blocker_sample(
-                        candidate,
-                        quantity_blocker,
-                    )
+                sample = self._entry_reprice_blocker_sample(
+                    candidate,
+                    quantity_blocker,
                 )
+                sample.update(quantity_blocker_evidence)
+                blocker_samples.append(sample)
                 continue
+            candidate_maker_leg = str(
+                getattr(candidate, "entry_maker_leg", "") or ""
+            ).lower()
+            maker_leg_name = (
+                candidate_maker_leg
+                if candidate_maker_leg in {"long", "short"}
+                else "long"
+                if str(
+                    getattr(self.config.strategy, "maker_leg_default", "buy")
+                    or "buy"
+                ).lower()
+                == "buy"
+                else "short"
+            )
+            long_planner_price = long_bid if maker_leg_name == "long" else long_ask
+            short_planner_price = (
+                short_bid if maker_leg_name == "long" else short_ask
+            )
+            # Rebuild the shared envelope from the same pure helper now that
+            # the final L2/economics revalidation has settled quantity, prices
+            # and venue metadata.  The pre-lease envelope built above remains
+            # the authority used to size Local-L2; this rebuild replaces it in
+            # the typed handoff to dispatch.
+            envelope = build_executable_entry_envelope(
+                target_quantity=final_quantity,
+                maker_leg=maker_leg_name,
+                long_price=long_planner_price,
+                short_price=short_planner_price,
+                long_metadata=long_minimum_metadata,
+                short_metadata=short_minimum_metadata,
+                strategy_min_notional=strategy_min_notional,
+                common_base_quantity_step=common_step,
+                slice_ratio=self.config.strategy.maker_initial_slice_ratio,
+                max_initial_clip_ratio=(
+                    self.config.strategy.entry_max_initial_clip_ratio
+                ),
+            )
+            if envelope.blocker_reason:
+                reason = str(envelope.blocker_reason)
+                blocker_counts[reason] += 1
+                sample = self._entry_reprice_blocker_sample(candidate, reason)
+                sample.update({
+                    "blocking_domain": "entry_execution_planner",
+                    "source": "selection_execution_planner",
+                    "requested_base_quantity": requested_quantity,
+                    "aligned_base_quantity": final_quantity,
+                    **envelope.blocker_evidence,
+                })
+                blocker_samples.append(sample)
+                continue
+            candidate.executable_envelope = envelope
             edge = decision.edge
             candidate.entry_cross_bps = edge.entry_cross_bps
             candidate.entry_fee_bps = edge.entry_fee_bps
@@ -16217,6 +16492,8 @@ class LiveRuntime:
         price_hint: float = 0.0,
         selected_deadline_monotonic: float | None = None,
         selected_at_ms: int | None = None,
+        *,
+        executable_envelope: ExecutableEntryEnvelope,
     ) -> bool:
         return await self.entry_dispatch_runtime._dispatch_entry(
             candidate,
@@ -16224,6 +16501,7 @@ class LiveRuntime:
             price_hint=price_hint,
             selected_deadline_monotonic=selected_deadline_monotonic,
             selected_at_ms=selected_at_ms,
+            executable_envelope=executable_envelope,
         )
 
     async def _dispatch_entry_result(
@@ -16233,6 +16511,8 @@ class LiveRuntime:
         price_hint: float = 0.0,
         selected_deadline_monotonic: float | None = None,
         selected_at_ms: int | None = None,
+        *,
+        executable_envelope: ExecutableEntryEnvelope,
     ):
         dispatch_override = self.__dict__.get("_dispatch_entry")
         if dispatch_override is not None:
@@ -16242,6 +16522,7 @@ class LiveRuntime:
                 price_hint=price_hint,
                 selected_deadline_monotonic=selected_deadline_monotonic,
                 selected_at_ms=selected_at_ms,
+                executable_envelope=executable_envelope,
             )
             if hasattr(dispatched, "dispatched"):
                 return dispatched
@@ -16279,6 +16560,7 @@ class LiveRuntime:
             price_hint=price_hint,
             selected_deadline_monotonic=selected_deadline_monotonic,
             selected_at_ms=selected_at_ms,
+            executable_envelope=executable_envelope,
         )
 
     # ------------------------------------------------------------------

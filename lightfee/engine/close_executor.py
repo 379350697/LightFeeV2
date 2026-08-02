@@ -76,6 +76,15 @@ def order_error_may_have_created_exposure(error: Exception) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _positive_ms(value) -> Optional[int]:
+    """Return value only when it is a genuine positive millisecond timestamp."""
+    try:
+        numeric = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
+
+
 def _extract_gate_error_fields(error_str: str) -> dict[str, Optional[str]]:
     """V1 gate_http_error_details: extract label and message from Gate error string.
 
@@ -257,11 +266,16 @@ class CompensationFailedError(Exception):
 
 @dataclass
 class CloseExecutionLeg:
-    """V1 CloseExecutionLeg: single filled close order."""
+    """V1 CloseExecutionLeg: single filled close order.
+
+    Timing is real-or-null: ``submit_started_at_ms`` and ``latency_ms`` are
+    ``None`` unless a genuine submit timestamp and a genuine fill timestamp
+    produced them.  ``0`` is never a measurement.
+    """
     fill: OrderFill
     client_order_id: str = ""
-    submit_started_at_ms: int = 0
-    latency_ms: int = 0
+    submit_started_at_ms: Optional[int] = None
+    latency_ms: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1128,8 +1142,8 @@ class CloseExecutor:
                     # before the adapter accepted the *successful* request;
                     # synthetic/reconciled fills deliberately have no such
                     # evidence and therefore cannot promote a benchmark.
-                    submit_started_at_ms=int(
-                        short_result.get("submitted_at_ms") or 0
+                    submit_started_at_ms=_positive_ms(
+                        short_result.get("submitted_at_ms")
                     ),
                 ))
                 chunk_short_order_ids.append(short_result["fill"].order_id)
@@ -1213,8 +1227,8 @@ class CloseExecutor:
                 long_legs.append(CloseExecutionLeg(
                     fill=long_result["fill"],
                     client_order_id=long_cid,
-                    submit_started_at_ms=int(
-                        long_result.get("submitted_at_ms") or 0
+                    submit_started_at_ms=_positive_ms(
+                        long_result.get("submitted_at_ms")
                     ),
                 ))
                 chunk_long_order_ids.append(long_result["fill"].order_id)

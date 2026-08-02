@@ -40,12 +40,29 @@ from lightfee.engine.state import (
 from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
-from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
+    ExecutionRoute,
+    IncrementalEntryExecutionPlan,
+)
 from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
+
+
+def _dispatch_envelope() -> ExecutableEntryEnvelope:
+    return ExecutableEntryEnvelope(
+        plan=IncrementalEntryExecutionPlan(
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            full_target_quantity=1.0,
+        ),
+        maker_leg="long",
+        hedge_leg="short",
+        requested_quantity=1.0,
+        effective_dispatch_quantity=1.0,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +92,10 @@ def make_test_config(temp_dir: str) -> AppConfig:
             local_l2_ws_enabled=False,
             pending_entry_pre_submit_hedgeable_fill_guard_enabled=False,
             funding_new_entries_enabled=True,
+            # These tests exercise post-economics venue admission.  Keep the
+            # no-private-margin fallback above the venue minimum clip so the
+            # injected executor/precheck remains the stage under test.
+            funding_missing_margin_fallback_notional_quote=50.0,
         ),
         persistence=PersistenceConfig(
             event_log_path=str(Path(temp_dir) / "events.jsonl"),
@@ -431,8 +452,8 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
-            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
+            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
             assert first is True
             assert second is False
@@ -488,11 +509,7 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            dispatched = await runtime._dispatch_entry(
-                candidate,
-                1778787000000,
-                price_hint=100.0,
-            )
+            dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=100.0, executable_envelope=_dispatch_envelope())
 
             assert dispatched is False
             assert executor.calls == 0
@@ -567,11 +584,7 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            dispatched = await runtime._dispatch_entry(
-                candidate,
-                1778787000000,
-                price_hint=100.0,
-            )
+            dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=100.0, executable_envelope=_dispatch_envelope())
 
             assert dispatched is True
             assert executor.calls == 1
@@ -636,11 +649,7 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            dispatched = await runtime._dispatch_entry(
-                candidate,
-                1778787000000,
-                price_hint=0.57329,
-            )
+            dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.57329, executable_envelope=_dispatch_envelope())
 
             assert dispatched is True
             assert executor.calls == 1
@@ -693,11 +702,7 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            dispatched = await runtime._dispatch_entry(
-                candidate,
-                1778787000000,
-                price_hint=0.57329,
-            )
+            dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.57329, executable_envelope=_dispatch_envelope())
 
             assert dispatched is False
             assert runtime.entry_executor.calls == 0
@@ -750,8 +755,8 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
-            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+            first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
+            second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
             assert first is True
             assert second is False
@@ -846,8 +851,8 @@ class TestRuntimePreflight:
             )
             _seed_dispatch_bbo(runtime, candidate)
 
-            assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0) is True
-            assert await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0) is False
+            assert await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope()) is True
+            assert await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0, executable_envelope=_dispatch_envelope()) is False
             assert executor.calls == 1
 
             if expected_reason == "post_only_would_take":

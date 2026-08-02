@@ -574,7 +574,9 @@ class TestSidecarServiceRateLimitWiring:
         }
         assert snapshot.candidate_build_diagnostics["blocked_reason_counts"] == {
             "funding_edge_below_floor": 1,
-            "outside_scan_window": 1,
+            "expected_edge_below_floor": 1,
+            "worst_case_edge_below_floor": 1,
+            "outside_scan_window": 2,
         }
         timing = snapshot.candidate_build_diagnostics
         assert timing["refresh_started_at_ms"] == 10_000

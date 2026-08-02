@@ -788,6 +788,9 @@ def _dict_to_snapshot(d: dict) -> SidecarSnapshot:
         2. Snapshot quotes for long_venue:symbol and short_venue:symbol
         """
         c = dict(c)
+        # executable_envelope is runtime-only typed state created after
+        # snapshot ingress. Never let a JSON object become dispatch state.
+        c.pop("executable_envelope", None)
         # v1/v2 snapshots predate the complete economics contract. Keep their
         # displayed legacy fields for V1 recovery/diagnostics, but they can
         # never grant live admission even when a hand-edited old snapshot

@@ -75,14 +75,14 @@ class TestFundingLifecycleParity:
 
     def test_entry_horizon_uses_existing_strategy_min_scan_floor(self):
         now_ms = 1000000
-        pos = _make_position(funding_timestamp_ms=now_ms + 299999)
+        pos = _make_position(funding_timestamp_ms=now_ms + 179999)
         cfg = _config()
 
         decision = FundingLifecycle.entry_horizon(pos, now_ms, cfg, source="position")
 
         assert decision.allowed is False
         assert decision.reason == "entry_blocked_first_funding_too_close"
-        assert decision.effective_min_before_ms == 300_000
+        assert decision.effective_min_before_ms == 180_000
         assert decision.source == "position"
 
 

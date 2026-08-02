@@ -1352,6 +1352,7 @@ _EVENT_KIND_PHASES = {
     ),
     "reconciliation.entry_flat_unresolved_maker_retained": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.opportunity_funnel": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "funding.opportunity_funnel": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "review.candidate_rejected": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "review.candidate_shortlisted": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.active_position_tick": V1LifecycleClosurePhase.OPEN_POSITION.value,

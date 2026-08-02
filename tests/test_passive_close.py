@@ -616,6 +616,7 @@ def _make_passive_progress(
     order_id="pa001", client_order_id="",
     cumulative_quantity=0.005, average_price=50001.0,
     fee_quote=1.25, state=PassiveOrderState.PARTIALLY_FILLED,
+    last_fill_time_ms=2000,
 ) -> PassiveOrderProgress:
     return PassiveOrderProgress(
         venue=venue, symbol=symbol, side=side,
@@ -623,9 +624,9 @@ def _make_passive_progress(
         cumulative_quantity=cumulative_quantity,
         average_price=average_price,
         fee_quote=fee_quote,
-        last_fill_time_ms=2000,
+        last_fill_time_ms=last_fill_time_ms,
         state=state,
-        observed_at_ms=2000,
+        observed_at_ms=last_fill_time_ms,
     )
 
 
@@ -648,6 +649,541 @@ def _mock_adapter_passive_ok(venue=Venue.BINANCE):
     adapter.query_passive_order_progress = AsyncMock(return_value=None)
     adapter.place_order = AsyncMock(return_value=_make_order_fill(venue=venue))
     return adapter
+
+
+@pytest.mark.asyncio
+async def test_passive_close_maker_submit_records_latency_segments():
+    journal = _open_journal()
+    try:
+        clock = {"now": 1_000}
+        adapter = _mock_adapter_with_tick(Venue.BINANCE)
+
+        async def submit_passive_order(request):
+            clock["now"] = 1_037
+            return PassiveOrderAck(
+                venue=Venue.BINANCE,
+                symbol=request.symbol,
+                side=request.side,
+                order_id="maker-oid",
+                client_order_id=request.client_order_id or "",
+                price=request.price or 0.0,
+                quantity=request.quantity,
+                accepted_at_ms=clock["now"],
+                state=PassiveOrderState.OPEN,
+            )
+
+        adapter.submit_passive_order = AsyncMock(side_effect=submit_passive_order)
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        executor._now_ms = lambda: clock["now"]
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49_999.0, 50_001.0))
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            # Deliberately distinct from the captured submit time (1_000):
+            # the submit time must come from the real capture, never from the
+            # cycle/phase clocks.
+            multi_phase_started_at_ms=500,
+            phase_state=PassivePhaseState(
+                active_maker_leg=ActiveMakerLeg.LONG,
+                phase_started_at_ms=600,
+                cycle_started_at_ms=700,
+            ),
+        )
+
+        submitted = await executor._submit_maker_order(
+            state,
+            pending,
+            position,
+            Venue.BINANCE,
+            Side.SELL,
+            "long",
+            50_000.0,
+            0.01,
+        )
+
+        assert submitted is True
+        assert pending.phase_state.maker_submit_started_at_ms == 1_000
+        assert pending.phase_state.maker_ack_at_ms == 1_037
+        payload = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_maker_submitted"
+        ][-1]
+        assert payload["maker_submit_started_at_ms"] == 1_000
+        assert payload["maker_ack_at_ms"] == 1_037
+        assert payload["maker_submit_to_ack_ms"] == 37
+        assert "route_key" not in payload
+        assert payload["long_venue"] == "binance"
+        assert payload["short_venue"] == "okx"
+    finally:
+        journal.close()
+
+
+class TestMakerSubmitTimeRealOrNull:
+    """V1 real-or-null contract for maker submit time.
+
+    The maker submit time must be the timestamp captured immediately before
+    the real submit call (V1 exit.rs:2006), carried through phase state into
+    the leg record and telemetry. It must never be synthesized from the
+    cycle/phase/multi-phase clocks, never be 0, and must be None when no real
+    submit happened or the genuine timestamp is unknown.
+    """
+
+    def _executor(self, journal, clock):
+        executor = PassiveCloseExecutor(
+            {}, journal, config_overrides={"runtime_mode": "paper"},
+        )
+        executor._now_ms = lambda: clock["now"]
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (49_999.0, 50_001.0))
+        return executor
+
+    def _pending(self, position, *, submit_at_ms=None, cycle=1000, phase=2000):
+        phase_state = PassivePhaseState(
+            active_maker_leg=ActiveMakerLeg.LONG,
+            phase_started_at_ms=phase,
+            cycle_started_at_ms=cycle,
+            maker_submit_started_at_ms=submit_at_ms,
+        )
+        return PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            multi_phase_started_at_ms=500,
+            phase_state=phase_state,
+        )
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param(
+                {
+                    "clock_now": 3_500,
+                    "submit_at_ms": 3_500,
+                    "resting_at_ms": 3_600,
+                    "fill_at_ms": 3_700,
+                    "apply_at_ms": 3_700,
+                    "expected_submit_at_ms": 3_500,
+                    "expected_submit_to_fill_ms": 200,
+                    "forbidden_submit_at_ms": (1_000, 2_000),
+                },
+                id="real-submit-time-wins-over-cycle-and-phase",
+            ),
+            pytest.param(
+                {
+                    "clock_now": 3_000,
+                    "submit_at_ms": None,
+                    "resting_at_ms": None,
+                    "fill_at_ms": 2_800,
+                    "apply_at_ms": 3_000,
+                    "expected_submit_at_ms": None,
+                    "expected_submit_to_fill_ms": None,
+                    "leg_latency_is_none": True,
+                },
+                id="missing-submit-time-is-null",
+            ),
+            pytest.param(
+                {
+                    "clock_now": 3_500,
+                    "submit_at_ms": 3_500,
+                    "resting_at_ms": 3_600,
+                    "fill_at_ms": 3_700,
+                    "apply_at_ms": 3_700,
+                    "expected_submit_at_ms": 3_500,
+                    "expected_ack_at_ms": None,
+                    "expected_ack_to_fill_ms": None,
+                },
+                id="missing-ack-time-is-null",
+            ),
+        ],
+    )
+    def test_maker_progress_timing_is_real_or_null(self, case):
+        """Maker progress preserves real timestamps and nulls missing proof."""
+        journal = _open_journal()
+        try:
+            clock = {"now": case["clock_now"]}
+            executor = self._executor(journal, clock)
+            position = _make_position()
+            pending = self._pending(
+                position,
+                submit_at_ms=case["submit_at_ms"],
+                cycle=1_000,
+                phase=2_000,
+            )
+            if case["resting_at_ms"] is not None:
+                # Operational resting age is not proof of an ACK time.
+                pending.phase_state.maker_resting_since_ms = case["resting_at_ms"]
+            pending.maker_fill = PendingPassiveLegFill()
+
+            progress = _make_passive_progress(
+                cumulative_quantity=0.01,
+                average_price=50_100.0,
+                last_fill_time_ms=case["fill_at_ms"],
+                state=PassiveOrderState.FILLED,
+            )
+            executor._apply_maker_progress(pending, progress, case["apply_at_ms"])
+
+            payload = [
+                record["payload"]
+                for record in journal.read_all()
+                if record["kind"] == "exit.passive_close_maker_progress"
+            ][-1]
+            assert len(pending.long_legs) == 1
+            assert pending.long_legs[0].submit_started_at_ms == case[
+                "expected_submit_at_ms"
+            ]
+            if case.get("leg_latency_is_none"):
+                assert pending.long_legs[0].latency_ms is None
+            assert payload["maker_submit_started_at_ms"] == case[
+                "expected_submit_at_ms"
+            ]
+            if "expected_submit_to_fill_ms" in case:
+                assert payload["maker_submit_to_fill_ms"] == case[
+                    "expected_submit_to_fill_ms"
+                ]
+            for forbidden in case.get("forbidden_submit_at_ms", ()):
+                assert payload["maker_submit_started_at_ms"] != forbidden
+            if "expected_ack_at_ms" in case:
+                assert payload["maker_ack_at_ms"] == case["expected_ack_at_ms"]
+                assert payload["maker_ack_to_fill_ms"] == case[
+                    "expected_ack_to_fill_ms"
+                ]
+        finally:
+            journal.close()
+
+    def test_replacement_submit_uses_new_time_not_old(self):
+        """A cancel-replace re-submit captures a fresh submit time.
+
+        First submit at 3000, replacement submit at 5000. The leg produced
+        after the replacement must carry 5000, never the old 3000.
+        """
+        journal = _open_journal()
+        try:
+            clock = {"now": 3_000}
+            adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+            executor = PassiveCloseExecutor(
+                {Venue.BINANCE: adapter},
+                journal,
+                config_overrides={"runtime_mode": "paper"},
+            )
+            executor._now_ms = lambda: clock["now"]
+            executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+            executor.set_l2_quote_resolver(lambda venue, symbol: (49_999.0, 50_001.0))
+            position = _make_position()
+            pending = self._pending(
+                position,
+                submit_at_ms=3_000,
+                cycle=1_000,
+                phase=2_000,
+            )
+            # First real submit writes the first timestamp into phase state.
+            first_submitted = asyncio.run(
+                executor._submit_maker_order(
+                    EngineState(), pending, position, Venue.BINANCE,
+                    Side.SELL, "long", 50_000.0, 0.01,
+                )
+            )
+            assert first_submitted is True
+            assert pending.phase_state.maker_submit_started_at_ms == 3_000
+
+            # A failed replacement attempt is real, but it did not produce a
+            # new accepted maker order. It must not overwrite the accepted
+            # order's timestamp authority.
+            clock["now"] = 4_000
+            adapter.submit_passive_order = AsyncMock(
+                side_effect=OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "replacement transport outcome uncertain",
+                )
+            )
+            failed_replacement = asyncio.run(
+                executor._submit_maker_order(
+                    EngineState(), pending, position, Venue.BINANCE,
+                    Side.SELL, "long", 50_050.0, 0.01,
+                )
+            )
+            assert failed_replacement is False
+            assert pending.phase_state.maker_submit_started_at_ms == 3_000
+
+            # Replacement: clock advances, a new real submit overwrites the
+            # phase-state authority with the fresh timestamp.
+            clock["now"] = 5_000
+            adapter.submit_passive_order = AsyncMock(
+                return_value=_make_passive_ack(
+                    venue=Venue.BINANCE,
+                    order_id="oid-2",
+                    client_order_id="cid-2",
+                    price=50_100.0,
+                )
+            )
+            second_submitted = asyncio.run(
+                executor._submit_maker_order(
+                    EngineState(), pending, position, Venue.BINANCE,
+                    Side.SELL, "long", 50_100.0, 0.01,
+                )
+            )
+            assert second_submitted is True
+            assert pending.phase_state.maker_submit_started_at_ms == 5_000
+            assert pending.phase_state.maker_submit_started_at_ms != 3_000
+
+            pending.maker_fill = PendingPassiveLegFill()
+            progress = _make_passive_progress(
+                cumulative_quantity=0.01,
+                average_price=50_100.0,
+                last_fill_time_ms=5_200,
+                state=PassiveOrderState.FILLED,
+            )
+            executor._apply_maker_progress(pending, progress, 5_200)
+            assert len(pending.long_legs) == 1
+            assert pending.long_legs[0].submit_started_at_ms == 5_000
+        finally:
+            journal.close()
+
+    def test_submit_and_ack_times_round_trip_and_old_snapshot_defaults_to_none(self):
+        """Current evidence round-trips; old snapshots remain real-or-null."""
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+
+        position = _make_position()
+        state = EngineState()
+        pending = self._pending(position, submit_at_ms=3_500)
+        pending.phase_state.maker_ack_at_ms = 3_600
+        state.pending_passive_closes[position.position_id] = pending
+
+        snapshot = state.to_dict()
+        phase_data = snapshot["pending_passive_closes"][position.position_id]["phase_state"]
+        assert phase_data["maker_submit_started_at_ms"] == 3_500
+        assert phase_data["maker_ack_at_ms"] == 3_600
+
+        restored = _restore_state_from_snapshot_dict(snapshot)
+        restored_phase = restored.pending_passive_closes[position.position_id].phase_state
+        assert restored_phase.maker_submit_started_at_ms == 3_500
+        assert restored_phase.maker_ack_at_ms == 3_600
+
+        phase_data.pop("maker_submit_started_at_ms")
+        phase_data.pop("maker_ack_at_ms")
+        restored_old = _restore_state_from_snapshot_dict(snapshot)
+        restored_old_phase = restored_old.pending_passive_closes[position.position_id].phase_state
+        assert restored_old_phase.maker_submit_started_at_ms is None
+        assert restored_old_phase.maker_ack_at_ms is None
+
+
+@pytest.mark.asyncio
+async def test_passive_close_hedge_fill_records_submit_fill_latency_without_synthetic_ack():
+    journal = _open_journal()
+    try:
+        clock = {"now": 2_000}
+        adapter = _mock_adapter_with_tick(Venue.OKX)
+
+        async def place_order(request):
+            clock["now"] = 2_050
+            return OrderFill(
+                venue=Venue.OKX,
+                symbol=request.symbol,
+                side=request.side,
+                quantity=request.quantity,
+                price=request.price or 50_000.0,
+                order_id="hedge-oid",
+                client_order_id=request.client_order_id,
+                filled_at_ms=clock["now"],
+            )
+
+        adapter.place_order = AsyncMock(side_effect=place_order)
+        executor = PassiveCloseExecutor({Venue.OKX: adapter}, journal)
+        executor._now_ms = lambda: clock["now"]
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(active_maker_leg=ActiveMakerLeg.LONG),
+        )
+        pending.maker_fill = PendingPassiveLegFill(
+            quantity=0.01,
+            average_price=50_000.0,
+            last_fill_time_ms=1_900,
+            order_id="maker-oid",
+        )
+
+        result = await executor._submit_hedge_for_delta(
+            state,
+            pending,
+            position,
+            0.01,
+            maker_terminal=True,
+        )
+
+        assert result.success is True
+        payload = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_hedge_filled"
+        ][-1]
+        assert payload["hedge_submit_started_at_ms"] == 2_000
+        assert payload["hedge_ack_at_ms"] is None
+        assert payload["hedge_fill_at_ms"] == 2_050
+        assert payload["hedge_submit_to_ack_ms"] is None
+        assert payload["hedge_ack_to_fill_ms"] is None
+        assert payload["hedge_submit_to_fill_ms"] == 50
+        assert "route_key" not in payload
+        assert payload["hedge_venue"] == "okx"
+        assert payload["hedge_leg"] == "short"
+    finally:
+        journal.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compensation_available", [False, True])
+async def test_passive_close_hedge_deadline_records_truth_and_compensation_latency(
+    compensation_available,
+):
+    journal = _open_journal()
+    try:
+        clock = {"now": 3_000}
+        close_executor = {}
+        if compensation_available:
+            async def compensate(**_kwargs):
+                clock["now"] = 3_250
+
+            close_executor = MagicMock()
+            close_executor.compensate_failed_full_close = compensate
+        executor = PassiveCloseExecutor({}, journal)
+        executor._close_executor = close_executor
+        executor._now_ms = lambda: clock["now"]
+
+        async def refresh_final_truth(
+            state,
+            pending,
+            position,
+            decision,
+            *,
+            source,
+            now_ms,
+        ):
+            assert now_ms == 3_000
+            clock["now"] = 3_100
+            return {"decision": "enter_fail_closed"}
+
+        executor._refresh_passive_close_final_hedge_truth_before_terminal = (
+            refresh_final_truth
+        )
+        if compensation_available:
+            async def clear_if_live_flat(*_args, **_kwargs):
+                return True
+
+            executor._clear_if_live_flat = clear_if_live_flat
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=0.02,
+            chunk_quantities=[0.02],
+            phase_state=PassivePhaseState(
+                active_maker_leg=ActiveMakerLeg.LONG,
+                cycle_started_at_ms=2_300,
+                maker_resting_since_ms=2_450,
+                maker_submit_started_at_ms=2_400,
+                maker_ack_at_ms=2_450,
+            ),
+        )
+        pending.maker_fill = PendingPassiveLegFill(
+            quantity=0.02,
+            average_price=50_000.0,
+            last_fill_time_ms=2_500,
+            order_id="maker-oid",
+        )
+        pending.hedge_fill = PendingPassiveLegFill(
+            quantity=0.01,
+            average_price=50_000.0,
+            last_fill_time_ms=2_650,
+            order_id="hedge-oid",
+            client_order_id="hedge-cid",
+        )
+        pending.short_legs.append(
+            PersistedCloseExecutionLeg(
+                fill=OrderFill(
+                    venue=Venue.OKX,
+                    symbol=position.symbol,
+                    side=Side.BUY,
+                    quantity=0.01,
+                    price=50_000.0,
+                    order_id="hedge-oid",
+                    client_order_id="hedge-cid",
+                    filled_at_ms=2_650,
+                ),
+                client_order_id="hedge-cid",
+                submit_started_at_ms=2_600,
+                latency_ms=50,
+            )
+        )
+        decision = {
+            "hedge_venue": Venue.OKX,
+            "hedge_side": Side.BUY,
+            "hedge_leg": "short",
+            "hedge_elapsed_ms": 900,
+            "hard_deadline_ms": 800,
+            "soft_deadline_ms": 400,
+            "unhedged_gap": 0.01,
+            "price_hint": 50_000.0,
+        }
+
+        resolved = await executor._enter_passive_close_hedge_fail_closed(
+            state,
+            pending,
+            position,
+            decision,
+            source="test_deadline",
+        )
+
+        assert resolved is compensation_available
+        fail_closed = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_hedge_deadline_fail_closed"
+        ][-1]
+        assert fail_closed["private_truth_started_at_ms"] == 3_000
+        assert fail_closed["private_truth_observed_at_ms"] == 3_100
+        assert fail_closed["private_truth_latency_ms"] == 100
+        assert fail_closed["maker_submit_to_ack_ms"] == 50
+        assert fail_closed["maker_ack_to_fill_ms"] == 50
+        assert fail_closed["hedge_ack_at_ms"] is None
+        assert fail_closed["hedge_submit_to_ack_ms"] is None
+        assert fail_closed["hedge_ack_to_fill_ms"] is None
+        assert fail_closed["hedge_submit_to_fill_ms"] == 50
+        assert "route_key" not in fail_closed
+        compensation_kind = (
+            "exit.passive_close_hedge_deadline_compensation_succeeded"
+            if compensation_available
+            else "exit.passive_close_hedge_deadline_compensation_unavailable"
+        )
+        compensation = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == compensation_kind
+        ][-1]
+        if compensation_available:
+            assert compensation["compensation_started_at_ms"] == 3_100
+            assert compensation["compensation_finished_at_ms"] == 3_250
+            assert compensation["compensation_latency_ms"] == 150
+        else:
+            assert compensation["compensation_started_at_ms"] is None
+            assert compensation["compensation_finished_at_ms"] is None
+            assert compensation["compensation_latency_ms"] is None
+    finally:
+        journal.close()
 
 
 def _attach_bybit_min_notional_transport(adapter, min_notional="5"):
@@ -10827,3 +11363,95 @@ class TestPassiveManagerProfileAndConfig:
         assert executor._config.max_zero_fill_cycles == 5
         assert executor._config.default_tick_size == 0.5
         assert executor._config.close_chunk_max_notional_quote == 1000.0
+
+
+@pytest.mark.asyncio
+async def test_passive_close_reconciliation_timing_is_real_or_null():
+    """Reconciliation fill with no matching leg leaves submit/fill timing null.
+
+    A reconciled fill that lacks a genuine submit timestamp must not be
+    persisted with a synthetic 0 or current-time value.
+    """
+    journal = _open_journal()
+    try:
+        clock = {"now": 5_000}
+        adapter = MagicMock()
+        adapter.fetch_order_fill_reconciliation = AsyncMock(
+            return_value=OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="HOMEUSDT",
+                side=Side.BUY,
+                quantity=10.0,
+                average_price=1.0,
+                order_id="hedge-order",
+                client_order_id="hedge-cid",
+                fee_quote=0.02,
+                filled_at_ms=0,
+                metadata={
+                    "evidence_source": "bybit_execution_list",
+                    "response_classification": "confirmed_fill",
+                },
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BYBIT: adapter}, journal)
+        executor._now_ms = lambda: clock["now"]
+        state = EngineState()
+        position = _make_position()
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(active_maker_leg=ActiveMakerLeg.LONG),
+        )
+        pending.maker_fill = PendingPassiveLegFill(
+            quantity=10.0,
+            average_price=1.1,
+            order_id="maker-order",
+            client_order_id="maker-cid",
+        )
+        state.pending_close_reconciliations.append({
+            "kind": "accepted_order_truth_gap",
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "venue": Venue.BYBIT.value,
+            "leg": "short",
+            "order_id": "hedge-order",
+            "client_order_id": "hedge-cid",
+            "short_legs": [{
+                "venue": Venue.BYBIT.value,
+                "order_id": "hedge-order",
+                "client_order_id": "hedge-cid",
+            }],
+        })
+
+        result = await executor._refresh_passive_close_final_hedge_truth_before_terminal(
+            state,
+            pending,
+            position,
+            {
+                "hedge_venue": Venue.BYBIT,
+                "hedge_leg": "short",
+                "hedge_side": Side.BUY,
+                "unhedged_gap": 10.0,
+            },
+            source="drive_unhedged_gap",
+            now_ms=clock["now"],
+        )
+
+        assert result["decision"] == "reconciled_continue_pending"
+        # No matching pending leg and no genuine fill timestamp -> timing null.
+        recorded_leg = pending.short_legs[-1]
+        assert recorded_leg.submit_started_at_ms is None
+        assert recorded_leg.latency_ms is None
+        assert recorded_leg.fill.filled_at_ms == 0
+        # Journal payload must not mint a current-time fill or 0ms latency.
+        fail_payloads = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.passive_close_hedge_filled"
+        ]
+        assert fail_payloads == []
+    finally:
+        journal.close()

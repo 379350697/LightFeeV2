@@ -21,7 +21,7 @@ from lightfee.strategy.candidate_identity import (
     candidate_revision_id as build_candidate_revision_id,
     opportunity_lease_id as build_opportunity_lease_id,
 )
-from lightfee.strategy.discovery import funding_entry_static_block_reasons
+from lightfee.strategy.discovery import BlockReason, funding_entry_static_block_reasons
 from lightfee.strategy.risk_allocator import StrategyRiskAllocator
 
 
@@ -222,9 +222,11 @@ def _build_same_symbol_pairs(
     )
 
     quotes_by_symbol: dict[str, list[QuoteSnapshot]] = {}
+    valid_quote_by_id: dict[int, bool] = {}
     seen_quote_identities: set[tuple[str, str]] = set()
     duplicate_quote_identities: set[tuple[str, str]] = set()
     for quote in quotes.values():
+        valid_quote_by_id[id(quote)] = _valid_trade_quote(quote)
         identity = (
             str(quote.venue).strip().lower(),
             str(quote.symbol).strip().upper(),
@@ -278,45 +280,10 @@ def _build_same_symbol_pairs(
                 # Validate both records before any arithmetic or ordering.
                 # A malformed funding scalar must reject only this directed
                 # pair, never abort publication of unrelated venue/symbols.
-                if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
+                if not valid_quote_by_id[id(long_q)] or not valid_quote_by_id[id(short_q)]:
                     _record_rejection(rejection_counts, "invalid_trade_quote")
                     _record_rejection(blocked_reason_counts, "invalid_trade_quote")
                     continue
-                economics_mode = str(
-                    config.funding_economics_mode or "v1_exact"
-                ).lower()
-                if economics_mode != "enhanced_live":
-                    long_ts = int(long_q.funding_timestamp_ms or 0)
-                    short_ts = int(short_q.funding_timestamp_ms or 0)
-                    if abs(long_ts - short_ts) <= _INTERVAL_ALIGNED_THRESHOLD_MS:
-                        first_stage_funding_edge_bps = float(
-                            short_q.funding_rate_bps
-                        ) - float(long_q.funding_rate_bps)
-                    elif long_ts < short_ts:
-                        first_stage_funding_edge_bps = -float(
-                            long_q.funding_rate_bps
-                        )
-                    else:
-                        first_stage_funding_edge_bps = float(
-                            short_q.funding_rate_bps
-                        )
-                    # This is an exact necessary gate, not a ranking bound.  A
-                    # pair below the configured raw-funding floor can never be
-                    # rescued by cross or fee economics, so it receives its
-                    # final decision without allocating a full candidate.
-                    if (
-                        first_stage_funding_edge_bps
-                        < config.min_funding_edge_bps
-                    ):
-                        _record_rejection(
-                            rejection_counts,
-                            "funding_edge_below_floor",
-                        )
-                        _record_rejection(
-                            blocked_reason_counts,
-                            "funding_edge_below_floor",
-                        )
-                        continue
                 rejection_counts_before = dict(rejection_counts)
                 candidate = _candidate_for_pair(
                     long_q=long_q,
@@ -347,18 +314,24 @@ def _build_same_symbol_pairs(
                     for reason in construction_reasons:
                         _record_rejection(blocked_reason_counts, reason)
                     continue
-                admission_reasons = funding_entry_static_block_reasons(
-                    candidate,
-                    config,
-                    observed_at_ms,
-                    require_complete_economics=True,
-                    include_entry_control=False,
+                admission_reasons = tuple(
+                    candidate.blocked_reasons if candidate.blocked else ()
                 )
                 if admission_reasons:
                     candidate.blocked = True
                     candidate.blocked_reasons = list(admission_reasons)
                     for reason in admission_reasons:
                         _record_rejection(blocked_reason_counts, reason)
+                    if (
+                        str(config.funding_economics_mode or "v1_exact").lower()
+                        != "enhanced_live"
+                        and BlockReason.FUNDING_EDGE_BELOW_FLOOR.value in admission_reasons
+                    ):
+                        _record_rejection(
+                            rejection_counts,
+                            BlockReason.FUNDING_EDGE_BELOW_FLOOR.value,
+                        )
+                        continue
                 candidates.append(candidate)
 
     eligible = sorted(
@@ -423,15 +396,12 @@ def _candidate_for_pair(
     ):
         _record_rejection(rejection_counts, "quote_after_candidate_watermark")
         return None
-    if not _valid_trade_quote(long_q) or not _valid_trade_quote(short_q):
-        _record_rejection(rejection_counts, "invalid_trade_quote")
-        return None
     long_mid = _mid(long_q)
     short_mid = _mid(short_q)
     if long_mid <= 0.0 or short_mid <= 0.0 or long_q.ask <= 0.0 or short_q.bid <= 0.0:
         _record_rejection(rejection_counts, "invalid_reference_price")
         return None
-    contract_block_reasons = _funding_contract_block_reasons(long_q, short_q)
+    contract_block_reasons = list(_funding_contract_block_reasons(long_q, short_q))
     # V1 prices a directed entry against the actual executable long ask and
     # short bid, rather than an unrelated midpoint.  This is the denominator
     # used by its cross, sizing and passive-spread recovery terms.
@@ -701,7 +671,6 @@ def _candidate_for_pair(
     )
     if any(observed_at_ms <= 0 for observed_at_ms in required_economics_observations):
         candidate_block_reasons.append("funding_economics_observation_missing")
-    candidate_blocked = bool(candidate_block_reasons)
     # Preserve the V1 discovery economics precisely.  Candidate construction
     # has only BBO size, so it uses V1's deliberately conservative depth
     # heuristic; live admission replaces the entry part with current L2 VWAP
@@ -725,7 +694,7 @@ def _candidate_for_pair(
 
         if _below_pair_minimum(quantity):
             candidate_block_reasons.append("entry_pair_minimum_not_met")
-            candidate_blocked = True
+    candidate_blocked = bool(candidate_block_reasons)
     long_entry_slippage_bps = _heuristic_slippage_bps(long_q, quantity, taking_ask=True)
     short_entry_slippage_bps = _heuristic_slippage_bps(short_q, quantity, taking_ask=False)
     entry_maker_leg = _select_maker_leg(long_entry_slippage_bps, short_entry_slippage_bps)
@@ -788,51 +757,50 @@ def _candidate_for_pair(
         observed_at_ms=economics_observed_at_ms,
         economics_complete=(quantity > 0.0 and bool(first_ts) and not candidate_block_reasons),
     )
-    # A common-base hedge cannot be claimed for an unnormalised, inverse,
-    # quanto, mismatched-underlying, or otherwise incompatible pair.  This is
-    # a contract-safety fact, not a model preference: V1-compatible scoring
-    # may remain visible in the sidecar, but no mode may label the candidate
-    # complete or send it to live admission.
     pair_id = make_candidate_pair_id(long_q.symbol, long_q.venue, short_q.venue)
-    candidate_revision_id = build_candidate_revision_id(
-        pair_id=pair_id,
-        long_quote=long_q,
-        short_quote=short_q,
-        settlement_timestamps_ms=(first_ts, long_ts, short_ts, second_ts),
-        entry_route=(entry_maker_leg if passive_execution_enabled else "taker_both"),
-        exit_route=(exit_maker_leg if passive_execution_enabled else "taker_both"),
-        model_epoch=calculation_version,
-        economics={
-            "long_funding_rate_bps": long_q.funding_rate_bps,
-            "short_funding_rate_bps": short_q.funding_rate_bps,
-            "long_forecast_rate_bps": long_forecast.predicted_settled_rate_bps,
-            "short_forecast_rate_bps": short_forecast.predicted_settled_rate_bps,
-            "entry_target_quantity": quantity,
-            "long_taker_fee_bps": long_fee,
-            "short_taker_fee_bps": short_fee,
-            "long_maker_fee_bps": long_maker_fee,
-            "short_maker_fee_bps": short_maker_fee,
-            "entry_cross_bps": expected.entry_cross_bps,
-            "entry_fee_bps": expected.entry_fee_bps,
-            "exit_fee_bps": expected.exit_fee_bps,
-            "entry_slippage_bps": expected.entry_slippage_bps,
-            "exit_slippage_bps": expected.exit_slippage_bps,
-            "expected_net_edge_bps": expected.expected_net_edge_bps,
-            "worst_case_edge_bps": expected.worst_case_edge_bps,
-            "ranking_edge_bps": expected.ranking_edge_bps,
-        },
+    economics_complete = (
+        expected.economics_complete
+        and allocation.base_quantity > 0.0
+        and (
+            economics_mode != "enhanced_live"
+            or (forecast_ready and forecast_distribution_stable)
+        )
+        and not candidate_block_reasons
     )
-    opportunity_lease_id = build_opportunity_lease_id(
-        pair_id=pair_id,
-        long_quote=long_q,
-        short_quote=short_q,
+    admission_candidate = CandidateInput(
+        long_venue=long_q.venue,
+        short_venue=short_q.venue,
+        symbol=str(long_q.symbol).upper(),
+        funding_diff_bps=gate_funding,
+        funding_edge_bps=first_stage_funding,
+        expected_edge_bps=expected.expected_net_edge_bps,
+        worst_case_edge_bps=expected.worst_case_edge_bps,
+        ranking_edge_bps=expected.ranking_edge_bps,
+        opportunity_type=opportunity_type,
+        blocked=candidate_blocked,
+        blocked_reasons=candidate_block_reasons,
+        entry_notional_quote=allocation.reference_notional_quote,
         first_funding_timestamp_ms=first_ts,
         second_funding_timestamp_ms=second_ts,
-        entry_route=(entry_maker_leg if passive_execution_enabled else "taker_both"),
-        exit_route=(exit_maker_leg if passive_execution_enabled else "taker_both"),
-        model_epoch=calculation_version,
+        economics_observed_at_ms=expected.observed_at_ms,
+        economics_complete=economics_complete,
     )
-    return CandidateInput(
+    admission_reasons = funding_entry_static_block_reasons(
+        admission_candidate,
+        config,
+        observed_at_ms,
+        require_complete_economics=True,
+        include_entry_control=False,
+    )
+    if (
+        str(config.funding_economics_mode or "v1_exact").lower()
+        != "enhanced_live"
+        and BlockReason.FUNDING_EDGE_BELOW_FLOOR.value in admission_reasons
+    ):
+        admission_candidate.blocked = True
+        admission_candidate.blocked_reasons = list(admission_reasons)
+        return admission_candidate
+    candidate = CandidateInput(
         long_venue=long_q.venue,
         short_venue=short_q.venue,
         symbol=str(long_q.symbol).upper(),
@@ -889,8 +857,8 @@ def _candidate_for_pair(
         ),
         contract_price_consistency_long_price=float(long_q.ask),
         contract_price_consistency_short_price=float(short_q.bid),
-        candidate_revision_id=candidate_revision_id,
-        opportunity_lease_id=opportunity_lease_id,
+        candidate_revision_id="",
+        opportunity_lease_id="",
         candidate_built_at_ms=now_ms,
         entry_target_quantity=allocation.base_quantity,
         long_max_executable_quantity=long_depth,
@@ -923,15 +891,7 @@ def _candidate_for_pair(
             / 10_000.0
         ),
         economics_observed_at_ms=expected.observed_at_ms,
-        economics_complete=(
-            expected.economics_complete
-            and allocation.base_quantity > 0.0
-            and (
-                economics_mode != "enhanced_live"
-                or (forecast_ready and forecast_distribution_stable)
-            )
-            and not candidate_block_reasons
-        ),
+        economics_complete=economics_complete,
         calculation_version=expected.calculation_version,
         model_epoch=calculation_version,
         forecast_long_rate_bps=long_forecast.predicted_settled_rate_bps,
@@ -964,6 +924,55 @@ def _candidate_for_pair(
         blocked=candidate_blocked,
         blocked_reasons=candidate_block_reasons,
     )
+    if admission_reasons:
+        candidate.blocked = True
+        candidate.blocked_reasons = list(admission_reasons)
+    if (
+        str(config.funding_economics_mode or "v1_exact").lower()
+        != "enhanced_live"
+        and BlockReason.FUNDING_EDGE_BELOW_FLOOR.value in admission_reasons
+    ):
+        return candidate
+
+    candidate.candidate_revision_id = build_candidate_revision_id(
+        pair_id=pair_id,
+        long_quote=long_q,
+        short_quote=short_q,
+        settlement_timestamps_ms=(first_ts, long_ts, short_ts, second_ts),
+        entry_route=(entry_maker_leg if passive_execution_enabled else "taker_both"),
+        exit_route=(exit_maker_leg if passive_execution_enabled else "taker_both"),
+        model_epoch=calculation_version,
+        economics={
+            "long_funding_rate_bps": long_q.funding_rate_bps,
+            "short_funding_rate_bps": short_q.funding_rate_bps,
+            "long_forecast_rate_bps": long_forecast.predicted_settled_rate_bps,
+            "short_forecast_rate_bps": short_forecast.predicted_settled_rate_bps,
+            "entry_target_quantity": quantity,
+            "long_taker_fee_bps": long_fee,
+            "short_taker_fee_bps": short_fee,
+            "long_maker_fee_bps": long_maker_fee,
+            "short_maker_fee_bps": short_maker_fee,
+            "entry_cross_bps": expected.entry_cross_bps,
+            "entry_fee_bps": expected.entry_fee_bps,
+            "exit_fee_bps": expected.exit_fee_bps,
+            "entry_slippage_bps": expected.entry_slippage_bps,
+            "exit_slippage_bps": expected.exit_slippage_bps,
+            "expected_net_edge_bps": expected.expected_net_edge_bps,
+            "worst_case_edge_bps": expected.worst_case_edge_bps,
+            "ranking_edge_bps": expected.ranking_edge_bps,
+        },
+    )
+    candidate.opportunity_lease_id = build_opportunity_lease_id(
+        pair_id=pair_id,
+        long_quote=long_q,
+        short_quote=short_q,
+        first_funding_timestamp_ms=first_ts,
+        second_funding_timestamp_ms=second_ts,
+        entry_route=(entry_maker_leg if passive_execution_enabled else "taker_both"),
+        exit_route=(exit_maker_leg if passive_execution_enabled else "taker_both"),
+        model_epoch=calculation_version,
+    )
+    return candidate
 
 
 def check_stale_snapshot(snapshot_published_at_ms: int, max_age_ms: int, now_ms: int) -> bool:

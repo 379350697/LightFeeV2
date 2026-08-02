@@ -1,0 +1,19 @@
+[
+  {
+    "blocked_reasons": [],
+    "entry_cross_bps": 0.33332500020832817,
+    "entry_maker_leg": "Long",
+    "entry_notional_quote": 50.0,
+    "expected_edge_bps": 12.333241668958276,
+    "first_funding_leg": "Long",
+    "first_funding_timestamp_ms": 1000600000,
+    "funding_edge_bps": 20.0,
+    "long_venue": "binance",
+    "pair_id": "btcusdt:binance->okx",
+    "quantity": 0.0008333125005208203,
+    "ranking_edge_bps": 10.333241668958276,
+    "short_venue": "okx",
+    "symbol": "BTCUSDT",
+    "worst_case_edge_bps": 10.333241668958276
+  }
+]

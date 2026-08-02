@@ -34,11 +34,16 @@ from lightfee.core.domain import (
 )
 from lightfee.engine.entry import EntryState
 from lightfee.engine.entry_sync import EntryExecutionResult, EntrySyncExecutor
-from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
+    ExecutionRoute,
+    IncrementalEntryExecutionPlan,
+)
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchResult, EntryDispatchRuntime
+import lightfee.engine.entry_dispatch_runtime as dispatch_module
 from lightfee.engine.state import (
     ActiveMakerLeg,
     OpenPosition,
@@ -64,6 +69,20 @@ from typing import Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+
+def _dispatch_envelope(*, maker_leg: str = "long") -> ExecutableEntryEnvelope:
+    hedge_leg = "short" if maker_leg == "long" else "long"
+    return ExecutableEntryEnvelope(
+        plan=IncrementalEntryExecutionPlan(
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            full_target_quantity=1.0,
+        ),
+        maker_leg=maker_leg,
+        hedge_leg=hedge_leg,
+        requested_quantity=1.0,
+        effective_dispatch_quantity=1.0,
+    )
 
 
 def _attach_live_oi_evidence(candidate, *, now_ms: int, value_quote: float = 2_000_000.0):
@@ -1086,7 +1105,7 @@ def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
     payload = next(
         record["payload"]
         for record in records
-        if record["kind"] == "entry.opportunity_funnel"
+        if record["kind"] == "funding.opportunity_funnel"
     )
 
     assert payload["reason"] == "entries_dispatched"
@@ -1105,12 +1124,14 @@ def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
     assert payload["blocked_candidate_samples"] == [
         {
             "pair_id": "hemiusdt:binance->hyperliquid",
+            "blocker": "quote_stale",
             "selection_blocker": "quote_stale",
         }
     ]
     assert payload["selection_blocked_candidate_samples"] == [
         {
             "pair_id": "hemiusdt:binance->hyperliquid",
+            "blocker": "quote_stale",
             "stage": "entry_selection",
             "reason_family": "quote",
             "selection_blocker": "quote_stale",
@@ -1129,6 +1150,44 @@ def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
         }
     ]
     assert runtime.state.last_scan["opportunity_funnel"]["dispatched_candidate_count"] == 1
+
+
+def test_entry_opportunity_funnel_bounds_blocker_samples(config, tmp_journal):
+    from lightfee.engine.runtime import LiveRuntime
+
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.state.last_scan = {"raw_candidate_count": 100}
+    candidate_blockers = {
+        f"pair-{i:03d}": "quote_stale" for i in range(50)
+    }
+    runtime._emit_entry_opportunity_funnel(
+        reason="no_candidate_selected",
+        snapshot=SimpleNamespace(candidates=[]),
+        tradeable=[],
+        selected=[],
+        dispatched_candidate_count=0,
+        remaining_slots=1,
+        tradeable_selection_blocker_counts=Counter(),
+        candidate_blockers=candidate_blockers,
+        now_ms=5_000,
+    )
+    records = [
+        json.loads(line)
+        for line in tmp_journal.path.read_text().splitlines()
+        if line.strip()
+    ]
+    payload = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "funding.opportunity_funnel"
+    )
+    assert payload["blocked_candidate_sample_count"] == 50
+    assert len(payload["blocked_candidate_samples"]) == 24
+    assert payload["blocked_candidate_samples_truncated"] is True
+    assert runtime.state.last_scan["opportunity_funnel"][
+        "blocked_candidate_samples_truncated"
+    ] is True
 
 
 def test_select_entry_candidates_records_final_selection_skip_reasons(
@@ -1306,7 +1365,7 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
     )
 
     assert selected == [candidate]
-    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0)
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
     assert dispatched is True
     assert executor.ctx is not None
@@ -1385,9 +1444,7 @@ async def test_dispatch_entry_cancels_selected_context_when_no_submit_evidence(
         funding_timestamp_ms=now_ms + 300_000,
     )
 
-    dispatched = await runtime._dispatch_entry(
-        candidate, now_ms, price_hint=1.0
-    )
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
     records = runtime.journal.read_all()
     kinds = [record["kind"] for record in records]
@@ -1471,7 +1528,7 @@ async def test_selected_submit_deadline_does_not_wait_for_slow_cancel_cleanup(
 
     loop = asyncio.get_running_loop()
     started = loop.time()
-    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0)
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0, executable_envelope=_dispatch_envelope())
     elapsed_s = loop.time() - started
 
     cleanup_tasks = (
@@ -1559,9 +1616,7 @@ async def test_dispatch_entry_keeps_order_truth_path_when_submit_evidence_exists
         funding_timestamp_ms=now_ms + 300_000,
     )
 
-    dispatched = await runtime._dispatch_entry(
-        candidate, now_ms, price_hint=1.0
-    )
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
     records = runtime.journal.read_all()
     kinds = [record["kind"] for record in records]
@@ -1989,7 +2044,7 @@ async def test_dispatch_entry_rechecks_first_funding_horizon_after_selection_del
         funding_timestamp_ms=now_ms + 59_000,
     )
 
-    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0)
+    dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
     assert dispatched is False
     assert executor.called is False
@@ -2020,6 +2075,21 @@ class TestPlannerDispatchIntegration:
         return book
 
     @staticmethod
+    def _install_hot_bbo(runtime, venue: str, symbol: str, *, bid: float, ask: float, observed_at_ms: int):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue,
+                symbol=symbol,
+                bid=bid,
+                ask=ask,
+                observed_at_ms=observed_at_ms,
+                received_at_ms=observed_at_ms,
+                source="test_ws_bbo",
+            ),
+            now_ms=observed_at_ms,
+        )
+
+    @staticmethod
     def _candidate(symbol: str = "BTCUSDT"):
         from lightfee.sidecar.snapshot import CandidateInput
 
@@ -2043,6 +2113,128 @@ class TestPlannerDispatchIntegration:
             economics_complete=True,
             economics_observed_at_ms=1_000,
             ), now_ms=5_000)
+
+    @staticmethod
+    def _quote(
+        venue: str,
+        symbol: str = "BTCUSDT",
+        *,
+        bid: float,
+        ask: float,
+        observed_at_ms: int = 5_000,
+        min_notional: float = 10.0,
+        min_quantity: float = 0.001,
+        quantity_step: float = 0.001,
+    ):
+        from lightfee.sidecar.snapshot import QuoteSnapshot
+
+        return QuoteSnapshot(
+            venue=venue,
+            symbol=symbol,
+            bid=bid,
+            ask=ask,
+            bid_size=10.0,
+            ask_size=10.0,
+            observed_at_ms=observed_at_ms,
+            funding_rate_observed_at_ms=observed_at_ms,
+            funding_rate_received_at_ms=observed_at_ms,
+            funding_rate_source="test_fixture",
+            funding_rate_sample_id=f"funding:{venue}:{symbol}:{observed_at_ms}",
+            quantity_step_base=quantity_step,
+            min_quantity_base=min_quantity,
+            min_notional_quote=min_notional,
+            min_notional_evidence_complete=True,
+            contract_normalization_complete=True,
+        )
+
+    def _selection_envelope_fixture(self, config, tmp_journal):
+        config.strategy.min_entry_leg_notional_quote = 10.0
+        config.strategy.maker_initial_slice_ratio = 0.5
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+        )
+        runtime.journal = tmp_journal
+        runtime.state.last_scan = {}
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.entry_executor = self._capturing_executor()
+        candidate = self._candidate()
+        candidate.entry_target_quantity = 0.01
+        candidate.entry_notional_quote = 500.0
+        candidate.entry_maker_leg = "long"
+        market_quotes = [
+            self._quote("binance", bid=49_990.0, ask=50_000.0),
+            self._quote("okx", bid=50_020.0, ask=50_030.0),
+        ]
+        for venue, bid, ask in (
+            ("binance", 49_990.0, 50_000.0),
+            ("okx", 50_020.0, 50_030.0),
+        ):
+            self._install_hot_book(
+                runtime,
+                venue,
+                "BTCUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=5_000,
+            )
+            self._install_hot_bbo(
+                runtime,
+                venue,
+                "BTCUSDT",
+                bid=bid,
+                ask=ask,
+                observed_at_ms=5_000,
+            )
+        selected = runtime._reprice_entry_candidates_for_selection(
+            [candidate],
+            market_quotes=market_quotes,
+            now_ms=5_000,
+        )[0]
+        return runtime, selected, binance, okx
+
+    @staticmethod
+    def _allow_standard_entry_dispatch(runtime, monkeypatch):
+        dispatch = runtime.entry_dispatch_runtime
+        monkeypatch.setattr(
+            dispatch,
+            "_entry_price_resolution",
+            lambda *_args, **_kwargs: (50_005.0, 49_990.0, 50_020.0, None),
+        )
+
+        async def precheck(**_kwargs):
+            return True
+
+        monkeypatch.setattr(dispatch, "_precheck_entry_admission", precheck)
+
+    @staticmethod
+    def _account_truth_receipt(
+        venue: str,
+        *,
+        generation_id: str,
+        complete: bool = True,
+        errors: tuple[str, ...] = (),
+    ) -> dict:
+        return {
+            "venue": venue,
+            "truth_supported": True,
+            "truth_available": complete and not errors,
+            "complete": complete and not errors,
+            "positions": [],
+            "open_orders": [],
+            "probe_evidence": [
+                {"endpoint": "fetch_position"},
+                {"endpoint": "fetch_open_orders"},
+            ] if complete else [],
+            "errors": list(errors),
+            "truth_probe_count": 2 if complete else 0,
+            "started_at_ms": 7_000,
+            "finished_at_ms": 7_001,
+            "target_pair_generation_id": generation_id,
+        }
 
     def _legacy_target_zero_standard_dispatch_fixture(
         self,
@@ -2182,6 +2374,211 @@ class TestPlannerDispatchIntegration:
             executor=executor,
             final_quote_calls=final_quote_calls,
         )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_reuses_selection_executable_envelope_without_replanning(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+    ):
+        runtime, selected, _binance, _okx = self._selection_envelope_fixture(
+            config,
+            tmp_journal,
+        )
+        self._allow_standard_entry_dispatch(runtime, monkeypatch)
+        selection_envelope = selected.executable_envelope
+        assert selection_envelope is not None
+        builder_calls = []
+        context_envelopes = []
+        real_builder = dispatch_module.build_executable_entry_envelope
+        real_context_builder = dispatch_module.EntryDispatchRuntime._build_entry_context
+
+        def observe_builder(*args, **kwargs):
+            builder_calls.append((args, kwargs))
+            return real_builder(*args, **kwargs)
+
+        def observe_context(self, **kwargs):
+            context_envelopes.append(kwargs["executable_envelope"])
+            return real_context_builder(self, **kwargs)
+
+        monkeypatch.setattr(
+            dispatch_module,
+            "build_executable_entry_envelope",
+            observe_builder,
+        )
+        monkeypatch.setattr(
+            dispatch_module.EntryDispatchRuntime,
+            "_build_entry_context",
+            observe_context,
+        )
+
+        dispatched = await runtime._dispatch_entry(
+            selected,
+            5_000,
+            price_hint=50_005.0,
+            executable_envelope=selection_envelope,
+        )
+        assert dispatched, json.dumps(runtime.journal.read_all(), default=str)
+        # The envelope built before account truth is the exact handoff used at
+        # submit; unchanged context must not change route or planned quantity.
+        executor = runtime.entry_executor
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(
+            selection_envelope.effective_dispatch_quantity
+        )
+        assert executor.ctx.short_quantity == pytest.approx(
+            selection_envelope.effective_dispatch_quantity
+        )
+        assert builder_calls == []
+        assert context_envelopes == [selection_envelope]
+        # No dynamic private telemetry attribute remains on the candidate.
+        assert not hasattr(selected, "_entry_executable_envelope")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mutation", ["quantity", "spec", "price", "balance"])
+    async def test_dispatch_recomputes_selection_envelope_when_context_changes(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+        mutation,
+    ):
+        runtime, selected, _binance, okx = self._selection_envelope_fixture(
+            config,
+            tmp_journal,
+        )
+        builder_calls = []
+        real_builder = dispatch_module.build_executable_entry_envelope
+
+        def observe_builder(*args, **kwargs):
+            builder_calls.append((args, kwargs))
+            return real_builder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dispatch_module,
+            "build_executable_entry_envelope",
+            observe_builder,
+        )
+        original_effective = selected.executable_envelope.effective_dispatch_quantity
+        if mutation == "quantity":
+            selected.entry_target_quantity = 0.02
+            selected.entry_notional_quote = 1_000.0
+        elif mutation == "spec":
+            okx._min_notional_quote = 500.0
+        elif mutation == "balance":
+            from lightfee.engine.entry_readiness import QuoteLease
+
+            config.runtime.mode = "live"
+            _binance.available_margin_quote = 200.0
+            okx.available_margin_quote = 200.0
+            monkeypatch.setattr(
+                runtime,
+                "_entry_wall_clock_now_ms",
+                lambda: 5_000,
+            )
+            pair_id = runtime._candidate_pair_id(selected)
+            balance_lease = QuoteLease(
+                pair_id=pair_id,
+                symbol=selected.symbol,
+                long_venue=selected.long_venue,
+                short_venue=selected.short_venue,
+                long_bid=49_990.0,
+                long_ask=49_990.0001,
+                short_bid=50_020.0,
+                short_ask=50_030.0,
+                long_observed_at_ms=5_000,
+                short_observed_at_ms=5_000,
+                created_at_ms=5_000,
+                expires_at_ms=6_500,
+                long_bid_size=10.0,
+                long_ask_size=10.0,
+                short_bid_size=10.0,
+                short_ask_size=10.0,
+                provider="ws_bbo_quote_lease",
+                candidate_revision_id=selected.candidate_revision_id,
+            )
+            runtime.entry_readiness_provider._leases[pair_id] = balance_lease
+
+        self._allow_standard_entry_dispatch(runtime, monkeypatch)
+        if mutation == "balance":
+            monkeypatch.setattr(
+                runtime.entry_dispatch_runtime,
+                "_entry_price_resolution",
+                lambda *_args, **_kwargs: (
+                    49_990.0,
+                    49_990.0,
+                    50_020.0,
+                    balance_lease,
+                ),
+            )
+            monkeypatch.setattr(
+                dispatch_module,
+                "_ws_bbo_ioc_price_hints",
+                lambda *_args, **_kwargs: (49_990.0, 50_020.0),
+            )
+            monkeypatch.setattr(
+                runtime.entry_dispatch_runtime,
+                "_entry_order_price_hints_from_quote_lease",
+                lambda *_args, **_kwargs: (49_990.0, 49_990.0, 50_020.0),
+            )
+        if mutation == "price":
+            monkeypatch.setattr(
+                runtime.entry_dispatch_runtime,
+                "_entry_price_resolution",
+                lambda *_args, **_kwargs: (50_006.0, 49_991.0, 50_021.0, None),
+            )
+        dispatched = await runtime._dispatch_entry(
+            selected,
+            5_000,
+            price_hint=50_005.0,
+            executable_envelope=selected.executable_envelope,
+        )
+        assert dispatched, json.dumps(runtime.journal.read_all(), default=str)
+        # A changed contract key must invoke the same pure helper exactly once;
+        # quantity changes also alter the submitted plan quantity.
+        executor = runtime.entry_executor
+        assert executor.ctx is not None
+        if mutation in {"quantity", "balance"}:
+            assert executor.ctx.long_quantity != pytest.approx(original_effective)
+        assert len(builder_calls) == 1
+        assert not hasattr(selected, "_entry_executable_envelope")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid_envelope", [None, object()])
+    async def test_dispatch_missing_envelope_fails_closed_without_building_one(
+        self,
+        config,
+        tmp_journal,
+        monkeypatch,
+        invalid_envelope,
+    ):
+        runtime, selected, _binance, _okx = self._selection_envelope_fixture(
+            config,
+            tmp_journal,
+        )
+        builder_calls = []
+        real_builder = dispatch_module.build_executable_entry_envelope
+
+        def observe_builder(*args, **kwargs):
+            builder_calls.append((args, kwargs))
+            return real_builder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dispatch_module,
+            "build_executable_entry_envelope",
+            observe_builder,
+        )
+        result = await runtime._dispatch_entry_result(
+            selected,
+            5_000,
+            price_hint=50_005.0,
+            executable_envelope=invalid_envelope,
+        )
+
+        assert result.dispatched is False
+        assert result.reason == "invalid_executable_entry_envelope"
+        assert builder_calls == []
 
     @pytest.mark.asyncio
     async def test_ranked_flow_only_prewarms_l2_before_finalization(
@@ -2831,6 +3228,7 @@ class TestPlannerDispatchIntegration:
         runtime.state.risk_mode = GlobalRiskMode.RUNNING
         runtime.state.last_scan = {}
         candidate = self._candidate()
+        candidate.executable_envelope = _dispatch_envelope()
         candidate.first_funding_timestamp_ms = 305_000
         candidate.entry_target_quantity = 0.001
         candidate.entry_max_executable_quantity = 0.001
@@ -3452,11 +3850,7 @@ class TestPlannerDispatchIntegration:
             level_quantity=10.0,
         )
 
-        dispatched = await fixture.runtime._dispatch_entry(
-            fixture.candidate,
-            5_000,
-            price_hint=50_000.0,
-        )
+        dispatched = await fixture.runtime._dispatch_entry(fixture.candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert fixture.executor.calls == 1
@@ -3509,11 +3903,7 @@ class TestPlannerDispatchIntegration:
             level_quantity=0.0005,
         )
 
-        dispatched = await fixture.runtime._dispatch_entry(
-            fixture.candidate,
-            5_000,
-            price_hint=50_000.0,
-        )
+        dispatched = await fixture.runtime._dispatch_entry(fixture.candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert fixture.executor.calls == 0
@@ -3700,7 +4090,7 @@ class TestPlannerDispatchIntegration:
             lambda *_: (50_000.0, 100.0, 100_000.0, lease),
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         blockers = [
@@ -3723,7 +4113,7 @@ class TestPlannerDispatchIntegration:
         candidate = self._candidate()
         candidate.economics_observed_at_ms = 0
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         policy_events = [
@@ -3750,7 +4140,7 @@ class TestPlannerDispatchIntegration:
         candidate.calculation_version = "enhanced_shadow"
         candidate.model_epoch = "enhanced_shadow"
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         policy_events = [
@@ -3772,7 +4162,7 @@ class TestPlannerDispatchIntegration:
         runtime.journal = tmp_journal
         candidate = self._candidate()
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         policy_events = [
@@ -3806,7 +4196,7 @@ class TestPlannerDispatchIntegration:
         candidate.forecast_sample_count = 0
         candidate.forecast_shadow_age_ms = 0
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         policy_events = [
@@ -3840,7 +4230,7 @@ class TestPlannerDispatchIntegration:
         candidate.forecast_distribution_stable = False
         candidate.forecast_stability_reason = "p90_error_distribution_drift"
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         policy_events = [
@@ -3931,16 +4321,8 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        blocked = await runtime._dispatch_entry(
-            blocked_candidate,
-            5000,
-            price_hint=50000.0,
-        )
-        dispatched = await runtime._dispatch_entry(
-            allowed_candidate,
-            5001,
-            price_hint=50000.0,
-        )
+        blocked = await runtime._dispatch_entry(blocked_candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
+        dispatched = await runtime._dispatch_entry(allowed_candidate, 5001, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert blocked is False
         assert dispatched is True
@@ -4019,16 +4401,8 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        blocked = await runtime._dispatch_entry(
-            blocked_candidate,
-            5000,
-            price_hint=50000.0,
-        )
-        dispatched = await runtime._dispatch_entry(
-            allowed_candidate,
-            5001,
-            price_hint=50000.0,
-        )
+        blocked = await runtime._dispatch_entry(blocked_candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
+        dispatched = await runtime._dispatch_entry(allowed_candidate, 5001, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert blocked is False
         assert dispatched is True
@@ -4242,6 +4616,114 @@ class TestPlannerDispatchIntegration:
         assert runtime.journal.read_all() == []
 
     @pytest.mark.asyncio
+    async def test_entry_account_truth_mixed_generation_blocks_before_dispatch(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        monkeypatch.setattr(
+            runtime,
+            "_entry_account_truth_target_receipts",
+            AsyncMock(return_value=({
+                "binance": self._account_truth_receipt(
+                    "binance",
+                    generation_id="generation-a",
+                ),
+                "okx": self._account_truth_receipt(
+                    "okx",
+                    generation_id="generation-b",
+                ),
+            }, 0)),
+        )
+
+        ready, global_block, reason = (
+            await runtime._entry_account_truth_dispatch_readiness(
+                self._candidate("BTCUSDT")
+            )
+        )
+
+        assert (ready, global_block, reason) == (
+            False,
+            False,
+            "entry_account_truth_generation_mixed_before_dispatch",
+        )
+        assert runtime.state.last_scan["blocking_reason"] == reason
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_retries_whole_pair_once_after_failure(
+        self, config, tmp_journal,
+    ):
+        class CountingAccountTruthAdapter(FakeVenueAdapter):
+            open_order_calls = 0
+
+            def __init__(self, *args, fail_first_open: bool = False, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.fail_first_open = fail_first_open
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                self.open_order_calls += 1
+                if self.fail_first_open and self.open_order_calls == 1:
+                    raise RuntimeError("first open order failure")
+                return []
+
+        config.runtime.mode = "live"
+        adapters = {
+            Venue.BINANCE: CountingAccountTruthAdapter(Venue.BINANCE),
+            Venue.OKX: CountingAccountTruthAdapter(
+                Venue.OKX,
+                fail_first_open=True,
+            ),
+        }
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is True
+        )
+        assert adapters[Venue.BINANCE].fetch_position_call_count == 2
+        assert adapters[Venue.OKX].fetch_position_call_count == 2
+        assert adapters[Venue.BINANCE].open_order_calls == 2
+        assert adapters[Venue.OKX].open_order_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_recent_failure_is_not_ready(
+        self, config, tmp_journal, monkeypatch,
+    ):
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        monkeypatch.setattr(
+            runtime,
+            "_entry_account_truth_target_receipts",
+            AsyncMock(return_value=({
+                "binance": self._account_truth_receipt(
+                    "binance",
+                    generation_id="generation-a",
+                ),
+                "okx": self._account_truth_receipt(
+                    "okx",
+                    generation_id="generation-a",
+                    complete=False,
+                    errors=("okx:BTCUSDT:open_orders:private order probe failed",),
+                ),
+            }, 0)),
+        )
+
+        assert (
+            await runtime._entry_account_truth_ready_before_dispatch(
+                self._candidate("BTCUSDT")
+            )
+            is False
+        )
+        assert runtime.state.last_scan["blocking_reason"] == (
+            "entry_account_truth_incomplete_before_dispatch"
+        )
+
+    @pytest.mark.asyncio
     async def test_entry_account_truth_pending_global_sweep_does_not_hold_target_pair(
         self, config, tmp_journal, monkeypatch,
     ):
@@ -4303,14 +4785,23 @@ class TestPlannerDispatchIntegration:
         self, config, tmp_journal,
     ):
         release = asyncio.Event()
+        all_probes_started = asyncio.Event()
+        probe_count = 0
 
         class BlockingAccountTruthAdapter(FakeVenueAdapter):
             position_calls = 0
             open_order_calls = 0
 
+            async def _block_probe(self):
+                nonlocal probe_count
+                probe_count += 1
+                if probe_count == 4:
+                    all_probes_started.set()
+                await release.wait()
+
             async def fetch_position(self, symbol: str):
                 self.position_calls += 1
-                await release.wait()
+                await self._block_probe()
                 return PositionSnapshot(
                     venue=self._venue,
                     symbol=symbol,
@@ -4322,6 +4813,7 @@ class TestPlannerDispatchIntegration:
 
             async def fetch_open_orders(self, symbol: str | None = None):
                 self.open_order_calls += 1
+                await self._block_probe()
                 return []
 
         config.runtime.mode = "live"
@@ -4342,15 +4834,85 @@ class TestPlannerDispatchIntegration:
                 self._candidate("BTCUSDT")
             )
         )
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await asyncio.wait_for(all_probes_started.wait(), timeout=1.0)
         assert adapters[Venue.BINANCE].position_calls == 1
         assert adapters[Venue.OKX].position_calls == 1
+        assert adapters[Venue.BINANCE].open_order_calls == 1
+        assert adapters[Venue.OKX].open_order_calls == 1
 
         release.set()
         assert await asyncio.gather(first, second) == [True, True]
-        assert adapters[Venue.BINANCE].open_order_calls == 1
-        assert adapters[Venue.OKX].open_order_calls == 1
+
+        generation_ids = {
+            receipt["target_pair_generation_id"]
+            for receipt in runtime._entry_account_truth_venue_receipts.values()
+        }
+        assert len(generation_ids) == 1
+
+    @pytest.mark.asyncio
+    async def test_entry_account_truth_outer_barrier_cancellation_drains_local_probes(
+        self, config, tmp_journal,
+    ):
+        probe_started = asyncio.Event()
+        probes_cancelled = asyncio.Event()
+        started_count = 0
+        cancelled_count = 0
+        active_count = 0
+
+        class CancellableAccountTruthAdapter(FakeVenueAdapter):
+            async def _block_probe(self):
+                nonlocal started_count, cancelled_count, active_count
+                started_count += 1
+                active_count += 1
+                if started_count == 4:
+                    probe_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled_count += 1
+                    if cancelled_count == 4:
+                        probes_cancelled.set()
+                    raise
+                finally:
+                    active_count -= 1
+
+            async def fetch_position(self, symbol: str):
+                await self._block_probe()
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                await self._block_probe()
+
+        config.runtime.mode = "live"
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={
+                Venue.BINANCE: CancellableAccountTruthAdapter(Venue.BINANCE),
+                Venue.OKX: CancellableAccountTruthAdapter(Venue.OKX),
+            },
+        )
+        runtime.journal = tmp_journal
+
+        barrier_task = asyncio.create_task(
+            runtime._entry_account_truth_target_barrier(
+                [Venue.BINANCE, Venue.OKX],
+                "BTCUSDT",
+            )
+        )
+        await asyncio.wait_for(probe_started.wait(), timeout=1.0)
+
+        barrier_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await barrier_task
+        await asyncio.wait_for(probes_cancelled.wait(), timeout=1.0)
+
+        assert active_count == 0
+        assert runtime._entry_account_truth_target_barriers == {}
+        assert not any(
+            task is not asyncio.current_task()
+            and not task.done()
+            and task.get_name().startswith("funding-entry-account-truth")
+            for task in asyncio.all_tasks()
+        )
 
     @pytest.mark.asyncio
     async def test_entry_account_truth_before_dispatch_times_out_target_venue(
@@ -4996,7 +5558,7 @@ class TestPlannerDispatchIntegration:
 
         candidate = self._candidate()
 
-        assert await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0) is True
+        assert await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope()) is True
         assert runtime.state.pending_entries == {}
         pair_key = ("BTCUSDT", "binance", "okx")
         assert runtime._zero_fill_cooldown_until_ms[pair_key] > 5000
@@ -5050,7 +5612,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is True
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope()) is True
 
         assert binance.last_request is not None
         assert binance.last_request.post_only is True
@@ -5086,11 +5648,7 @@ class TestPlannerDispatchIntegration:
             bid=49990.0, ask=50000.0, observed_at_ms=4800,
         )
 
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
+        dispatched = await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert binance.last_request is None
@@ -5185,7 +5743,7 @@ class TestPlannerDispatchIntegration:
         candidate.entry_max_executable_quantity = 0.001
         assert runtime.entry_readiness_provider.decide(candidate, 5_000).allowed
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert runtime.entry_executor.ctx is None
@@ -5327,7 +5885,7 @@ class TestPlannerDispatchIntegration:
         candidate.entry_max_executable_quantity = 0.001
         assert runtime.entry_readiness_provider.decide(candidate, 5_000).allowed
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert runtime.entry_executor.ctx is None
@@ -5839,11 +6397,7 @@ class TestPlannerDispatchIntegration:
         readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
         assert readiness.allowed
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5000,
-            price_hint=50000.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
@@ -6224,11 +6778,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
+        dispatched = await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert binance.last_request is None
@@ -6796,11 +7346,7 @@ class TestPlannerDispatchIntegration:
             candidate_blockers=blockers,
         )
         for selected_candidate in selected:
-            await runtime._dispatch_entry(
-                selected_candidate,
-                1400,
-                price_hint=50_000.0,
-            )
+            await runtime._dispatch_entry(selected_candidate, 1400, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         pair_id = runtime._candidate_pair_id(candidate)
         assert selected == []
@@ -6938,11 +7484,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5_000,
-            price_hint=50_000.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=50_000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True, runtime._last_entry_dispatch_block_reason
         assert provider.calls == 1
@@ -7052,8 +7594,6 @@ class TestPlannerDispatchIntegration:
         submitted = await dispatch._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
-            route=ExecutionRoute.FALLBACK_TO_STANDARD,
-            effective_quantity=0.01,
             price_hint=50_000.0,
             maker_venue=Venue.BINANCE,
             maker_leg=Side.BUY,
@@ -7165,8 +7705,6 @@ class TestPlannerDispatchIntegration:
         submitted = await dispatch._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
-            route=ExecutionRoute.FALLBACK_TO_STANDARD,
-            effective_quantity=0.01,
             price_hint=50_000.0,
             maker_venue=Venue.BINANCE,
             maker_leg=Side.BUY,
@@ -7289,8 +7827,6 @@ class TestPlannerDispatchIntegration:
         submitted = await dispatch._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
-            route=ExecutionRoute.FALLBACK_TO_STANDARD,
-            effective_quantity=0.01,
             price_hint=50_000.0,
             maker_venue=Venue.BINANCE,
             maker_leg=Side.BUY,
@@ -7778,11 +8314,7 @@ class TestPlannerDispatchIntegration:
         readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
         assert readiness.allowed
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5000,
-            price_hint=101.5,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=101.5, executable_envelope=_dispatch_envelope(maker_leg="short"))
 
         records = tmp_journal.read_all()
         assert dispatched is True, [
@@ -7857,11 +8389,7 @@ class TestPlannerDispatchIntegration:
         readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
         assert readiness.allowed
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5000,
-            price_hint=12345.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=12345.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert binance.last_request is not None
@@ -8044,11 +8572,7 @@ class TestPlannerDispatchIntegration:
             )
         )
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5100,
-            price_hint=12345.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5100, price_hint=12345.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert binance.last_request is not None
@@ -8125,11 +8649,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            7001,
-            price_hint=12345.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 7001, price_hint=12345.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert binance.last_request is not None
@@ -8203,11 +8723,7 @@ class TestPlannerDispatchIntegration:
             expire_during_pre_submit_window,
         )
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5_000,
-            price_hint=12345.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=12345.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert binance.last_request is None
@@ -8340,11 +8856,7 @@ class TestPlannerDispatchIntegration:
             )
         )
 
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
+        dispatched = await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert binance.last_request is None
@@ -8372,7 +8884,7 @@ class TestPlannerDispatchIntegration:
         self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=3000)
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
 
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is False
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope()) is False
 
         assert binance.last_request is None
         assert runtime.state.pending_entries == {}
@@ -8411,7 +8923,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0) is True
+        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0, executable_envelope=_dispatch_envelope()) is True
 
         assert binance.last_request is not None
         assert binance.last_request.price == 50000.0
@@ -8470,7 +8982,7 @@ class TestPlannerDispatchIntegration:
             )
 
         # Dispatch with valid price hint
-        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         # Verify journal records entry_dispatched (planner passed)
         records = runtime.journal.read_all()
@@ -8519,7 +9031,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -8587,18 +9099,21 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.ctx is not None
-        assert executor.ctx.long_quantity == pytest.approx(700.0)
-        assert executor.ctx.short_quantity == pytest.approx(700.0)
+        # V1 planner is venue-agnostic: with slice_ratio=1.0 the passive maker
+        # clip is reduced by exactly one hedge-min chunk (100 OKX lots) so the
+        # hedge remainder stays legal.  No OKX full-target override exists.
+        assert executor.ctx.long_quantity == pytest.approx(600.0)
+        assert executor.ctx.short_quantity == pytest.approx(600.0)
         records = runtime.journal.read_all()
         selected = [
             r for r in records
             if r["kind"] == "execution.entry_selected"
         ][-1]
-        assert selected["payload"]["quantity"] == pytest.approx(700.0)
+        assert selected["payload"]["quantity"] == pytest.approx(600.0)
         quantity_plan = [
             r for r in records
             if r["kind"] == "execution.entry_quantity_plan"
@@ -8608,8 +9123,8 @@ class TestPlannerDispatchIntegration:
         assert payload["raw_quantity"] == pytest.approx(720.5692497072687)
         assert payload["common_quantity"] == pytest.approx(700.0)
         assert payload["full_target_quantity"] == pytest.approx(700.0)
-        assert payload["initial_maker_target_quantity"] == pytest.approx(700.0)
-        assert payload["effective_quantity"] == pytest.approx(700.0)
+        assert payload["initial_maker_target_quantity"] == pytest.approx(600.0)
+        assert payload["effective_quantity"] == pytest.approx(600.0)
         assert payload["quantity_plan_reason"] == "exchange_step_rounding"
         assert payload["quantity_contract_status"] == "hedgeable_adjusted"
         assert payload["unhedgeable_residual_quantity"] == pytest.approx(
@@ -8863,7 +9378,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        assert await runtime._dispatch_entry(candidate, 5_000, price_hint=1.0) is False
+        assert await runtime._dispatch_entry(candidate, 5_000, price_hint=1.0, executable_envelope=_dispatch_envelope()) is False
         assert executor.called is False
         blocked = [
             record["payload"]
@@ -9067,7 +9582,7 @@ class TestPlannerDispatchIntegration:
         runtime.entry_executor = executor
         runtime._entry_wall_clock_now_ms = lambda: 5_000
 
-        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=100.5)
+        dispatched = await runtime._dispatch_entry(candidate, 5_000, price_hint=100.5, executable_envelope=_dispatch_envelope())
         assert dispatched is True, [
             (
                 record["kind"],
@@ -9181,7 +9696,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.called is True
@@ -9259,7 +9774,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert executor.called is False
@@ -9354,7 +9869,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.called is True
@@ -9426,12 +9941,13 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.ctx is not None
-        assert executor.ctx.long_quantity == pytest.approx(1800.0)
-        assert executor.ctx.short_quantity == pytest.approx(1800.0)
+        # V1 planner: slice_ratio=1.0 minus one hedge-min chunk (100 OKX lots).
+        assert executor.ctx.long_quantity == pytest.approx(1700.0)
+        assert executor.ctx.short_quantity == pytest.approx(1700.0)
         records = runtime.journal.read_all()
         assert "order.passive_submitted" not in [r["kind"] for r in records]
         payload = [
@@ -9442,7 +9958,8 @@ class TestPlannerDispatchIntegration:
         assert payload["raw_quantity"] == pytest.approx(1856.0)
         assert payload["common_quantity"] == pytest.approx(1800.0)
         assert payload["full_target_quantity"] == pytest.approx(1800.0)
-        assert payload["effective_quantity"] == pytest.approx(1800.0)
+        assert payload["initial_maker_target_quantity"] == pytest.approx(1700.0)
+        assert payload["effective_quantity"] == pytest.approx(1700.0)
         assert payload["quantity_contract_status"] == "hedgeable_adjusted"
         assert payload["unhedgeable_residual_quantity"] == pytest.approx(56.0)
 
@@ -9488,7 +10005,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert executor.called is False
@@ -9544,7 +10061,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert executor.called is False
@@ -9605,7 +10122,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert executor.called is False
@@ -9710,7 +10227,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0)
+        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -9770,21 +10287,12 @@ class TestPlannerDispatchIntegration:
     def test_entry_context_keeps_retired_es_field_neutral_for_new_entries(self, config, tmp_journal):
         """New entries must not carry a retired ES admission value into recovery state."""
         from lightfee.engine.entry import EntryType
-        from lightfee.sidecar.snapshot import CandidateInput
 
-        runtime = LiveRuntime(config, venue_adapters={})
-        runtime.journal = tmp_journal
-        candidate = CandidateInput(
-            long_venue="binance",
-            short_venue="bybit",
-            symbol="BTCUSDT",
-            funding_diff_bps=8.0,
-            funding_edge_bps=8.0,
-            expected_edge_bps=5.0,
-            worst_case_edge_bps=2.0,
-            ranking_edge_bps=5.0,
-            entry_target_quantity=0.01,
+        runtime, candidate, _binance, _okx = self._selection_envelope_fixture(
+            config, tmp_journal
         )
+        envelope = candidate.executable_envelope
+        assert envelope is not None
 
         def build_context():
             return runtime.entry_dispatch_runtime._build_entry_context(
@@ -9792,12 +10300,10 @@ class TestPlannerDispatchIntegration:
                 entry_id="es-entry",
                 long_venue=Venue.BINANCE,
                 short_venue=Venue.BYBIT,
-                effective_quantity=0.01,
+                executable_envelope=envelope,
                 long_order_price_hint=50_000.0,
                 short_order_price_hint=50_000.0,
                 maker_leg=Side.BUY,
-                entry_type=EntryType.STANDARD_DUAL_TAKER,
-                route=ExecutionRoute.FALLBACK_TO_STANDARD,
                 now_ms=1_000,
             )
 
@@ -9809,12 +10315,10 @@ class TestPlannerDispatchIntegration:
                 entry_id="es-entry",
                 long_venue=Venue.BINANCE,
                 short_venue=Venue.BYBIT,
-                effective_quantity=0.01,
+                executable_envelope=envelope,
                 long_order_price_hint=50_000.0,
                 short_order_price_hint=50_000.0,
                 maker_leg=Side.BUY,
-                entry_type=EntryType.STANDARD_DUAL_TAKER,
-                route=ExecutionRoute.FALLBACK_TO_STANDARD,
                 now_ms=1_000,
                 expected_shortfall_bps_entry=12.5,
             ).expected_shortfall_bps_entry
@@ -9883,7 +10387,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=0.2068)
+        dispatched = await runtime._dispatch_entry(candidate, now_ms, price_hint=0.2068, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.ctx is not None
@@ -10404,7 +10908,7 @@ class TestPlannerDispatchIntegration:
                 )
             )
 
-        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         assert runtime.state.pending_entries == {}
         records = runtime.journal.read_all()
@@ -10590,7 +11094,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
+        await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0, executable_envelope=_dispatch_envelope())
 
         records = runtime.journal.read_all()
         # Venue minimums are now checked before route construction so the
@@ -10634,7 +11138,7 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        await runtime._dispatch_entry(candidate, 5000, price_hint=0.0)
+        await runtime._dispatch_entry(candidate, 5000, price_hint=0.0, executable_envelope=_dispatch_envelope())
 
         records = runtime.journal.read_all()
         kinds = [r["kind"] for r in records]

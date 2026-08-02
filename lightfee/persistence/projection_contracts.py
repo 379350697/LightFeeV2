@@ -206,6 +206,7 @@ JOURNAL_ONLY_LIFECYCLE_KINDS: frozenset[str] = frozenset({
 
 JOURNAL_ONLY_DIAGNOSTIC_KINDS: frozenset[str] = frozenset({
     "entry.opportunity_funnel",
+    "funding.opportunity_funnel",
     "runtime.active_position_tick",
     "runtime.active_tick_error",
     "runtime.adapter_shutdown_error",

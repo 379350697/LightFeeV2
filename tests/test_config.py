@@ -44,7 +44,7 @@ def test_strategy_config_entry_defaults_use_the_composed_on_demand_mode():
     assert cfg.post_funding_hold_secs == 300
     assert cfg.local_l2_scan_assignment_lease_enabled is False
     assert cfg.entry_quote_prewarm_extra_candidate_count == 0
-    assert cfg.maker_initial_slice_ratio == 0.25
+    assert cfg.maker_initial_slice_ratio == 0.5
     assert cfg.maker_entry_max_reposts == 1
 
 
@@ -430,12 +430,32 @@ class TestConfigLoading:
         assert config.runtime.mode == "paper"
         assert len(config.venues) >= 4
         assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert config.strategy.max_scan_minutes_before_funding == 30
+        assert config.strategy.min_scan_minutes_before_funding == 3
+        assert config.strategy.min_funding_edge_bps == 6.0
+        assert config.strategy.min_expected_edge_bps == 1.2
+        assert config.strategy.min_worst_case_edge_bps == 0.6
+        assert config.strategy.entry_sizing_mode == "liquidity_aware"
+        assert config.strategy.maker_initial_slice_ratio == 0.5
+        assert config.strategy.max_top_book_usage_ratio == 0.95
+        assert config.strategy.entry_quote_lease_max_skew_ms == 250
 
     def test_loads_live_example_config(self):
         config = load_config("config/live.example.toml")
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
         assert config.strategy.entry_readiness_provider == ENTRY_READINESS_PROVIDER_ON_DEMAND
+        assert config.strategy.max_scan_minutes_before_funding == 30
+        assert config.strategy.min_scan_minutes_before_funding == 3
+        assert config.strategy.min_funding_edge_bps == 6.0
+        assert config.strategy.min_expected_edge_bps == 1.2
+        assert config.strategy.min_worst_case_edge_bps == 0.6
+        assert config.strategy.entry_sizing_mode == "liquidity_aware"
+        assert config.strategy.maker_initial_slice_ratio == 0.5
+        assert config.strategy.max_top_book_usage_ratio == 0.95
+        assert config.strategy.entry_quote_lease_max_skew_ms == 250
+        assert config.strategy.maker_hedge_deadline_ms == 800
+        assert config.strategy.live_entry_notional_cap_quote == 50.0
 
     def test_config_relative_artifacts_resolve_from_project_root_without_mutating_literals(
         self,

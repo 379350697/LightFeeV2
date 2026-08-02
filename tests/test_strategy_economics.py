@@ -16,6 +16,7 @@ from lightfee.engine.entry_gate_runtime import EntryGateRuntime
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.marketdata.open_interest import open_interest_sample_id
 from lightfee.sidecar.pairing import build_same_symbol_pairs
+from lightfee.sidecar import pairing as pairing_module
 from lightfee.sidecar.publisher import load_snapshot, publish_snapshot
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -1139,10 +1140,85 @@ def test_sidecar_candidate_rejects_source_quote_after_refresh_timestamp() -> Non
     )
     assert diagnostics["future_input_quote_count"] == 1
     assert diagnostics["rejection_counts"] == {
-        "funding_edge_below_floor": 1,
-        "quote_after_candidate_watermark": 1,
+        "quote_after_candidate_watermark": 2,
     }
     assert diagnostics["directional_pair_count"] == 2
+
+
+def test_sidecar_routes_low_funding_edge_through_shared_static_helper(monkeypatch) -> None:
+    calls: list[CandidateInput] = []
+    shared_helper = pairing_module.funding_entry_static_block_reasons
+
+    def observe_helper(candidate, config, now_ms, **kwargs):
+        calls.append(candidate)
+        return shared_helper(candidate, config, now_ms, **kwargs)
+
+    monkeypatch.setattr(
+        pairing_module,
+        "funding_entry_static_block_reasons",
+        observe_helper,
+    )
+    quote_defaults = {
+        "funding_timestamp_ms": 100_000,
+        "funding_interval_ms": 28_800_000,
+        "observed_at_ms": 1_000,
+        "funding_rate_observed_at_ms": 1_000,
+        "funding_rate_event_at_ms": 1_000,
+        "funding_rate_received_at_ms": 1_000,
+        "funding_rate_source": "test_fixture",
+        "price_precision": 2,
+        "quantity_precision": 3,
+        "price_tick": 0.01,
+        "quantity_step_base": 0.001,
+        "min_quantity_base": 0.001,
+        "min_notional_quote": 1.0,
+        "min_notional_evidence_complete": True,
+        "venue_status": "active",
+        "contract_normalization_complete": True,
+        "mark_index_source": "test_fixture",
+    }
+    quotes = {
+        "cheap:BTCUSDT": QuoteSnapshot(
+            venue="cheap",
+            symbol="BTCUSDT",
+            bid=99.9,
+            ask=100.0,
+            funding_rate_bps=0.0,
+            **quote_defaults,
+        ),
+        "rich:BTCUSDT": QuoteSnapshot(
+            venue="rich",
+            symbol="BTCUSDT",
+            bid=100.2,
+            ask=100.3,
+            funding_rate_bps=5.0,
+            **quote_defaults,
+        ),
+    }
+    candidates = build_same_symbol_pairs(
+        quotes,
+        ["BTCUSDT"],
+        strategy=StrategyConfig(
+            min_funding_edge_bps=6.0,
+            min_expected_edge_bps=-100.0,
+            min_worst_case_edge_bps=-100.0,
+            min_scan_minutes_before_funding=0,
+            max_scan_minutes_before_funding=0,
+            entry_window_secs=0,
+        ),
+        venue_fee_bps={"cheap": 0.0, "rich": 0.0},
+        venue_maker_fee_bps={"cheap": 0.0, "rich": 0.0},
+        observed_at_ms=1_000,
+    )
+
+    low_edge = next(
+        candidate
+        for candidate in calls
+        if candidate.long_venue == "cheap" and candidate.short_venue == "rich"
+    )
+    assert low_edge.funding_edge_bps < 6.0
+    assert "funding_edge_below_floor" in low_edge.blocked_reasons
+    assert all(candidate is not low_edge for candidate in candidates)
 
 
 def test_funding_forecast_worst_case_uses_short_lower_and_long_upper_bounds() -> None:
@@ -2123,8 +2199,7 @@ def test_funding_candidate_requires_valid_configured_taker_fees() -> None:
 
     assert missing == []
     assert diagnostics["rejection_counts"] == {
-        "configured_taker_fee_unavailable": 1,
-        "funding_edge_below_floor": 1,
+        "configured_taker_fee_unavailable": 2,
     }
     assert explicit_zero.long_taker_fee_bps == 0.0
     assert explicit_zero.short_taker_fee_bps == 0.0
@@ -2166,8 +2241,7 @@ def test_funding_candidate_rejects_boolean_configured_taker_fee() -> None:
 
     assert candidates == []
     assert diagnostics["rejection_counts"] == {
-        "configured_taker_fee_unavailable": 1,
-        "funding_edge_below_floor": 1,
+        "configured_taker_fee_unavailable": 2,
     }
 
 

@@ -1,0 +1,64 @@
+{
+  "oracle": "v1-discovery",
+  "v1_repo": "/Users/wl/projects/LightFee",
+  "v1_commit": "ca4b1667ed8e59e05de847934d7182d6fbfaecbc",
+  "v1_worktree_clean": true,
+  "source_hashes": {
+    "discovery.rs": "a862e498220f846d2270f592095c75019a1c7689e62a1a04f282164add0a0e65",
+    "discovery_worktree_matches_commit_blob": true
+  },
+  "entry_sizing_mode": "liquidity_aware",
+  "approved_values": {
+    "min_funding_edge_bps": 6.0,
+    "min_expected_edge_bps": 1.2,
+    "min_worst_case_edge_bps": 0.6,
+    "max_top_book_usage_ratio": 0.95,
+    "live_entry_notional_cap_quote": 50.0,
+    "max_scan_minutes_before_funding": 25,
+    "min_scan_minutes_before_funding": 3
+  },
+  "raw_input": "raw_input.json",
+  "v1_expected": "raw_output.json",
+  "v2_input_adaptation": {
+    "funding_rate_bps": "The V1 decimal funding rates are converted to V2 basis points at the model boundary.",
+    "funding_missing_margin_fallback_notional_quote": "Explicitly carries V1's fixed_live_entry_notional_quote=50.0 for the no-private-margin sidecar input; it is not copied from v1_expected.entry_notional_quote."
+  },
+  "canonicalization": {
+    "comparable_fields": [
+      "pair_id",
+      "symbol",
+      "long_venue",
+      "short_venue",
+      "funding_edge_bps",
+      "expected_edge_bps",
+      "worst_case_edge_bps",
+      "ranking_edge_bps",
+      "quantity",
+      "entry_notional_quote",
+      "entry_cross_bps",
+      "entry_maker_leg",
+      "first_funding_leg",
+      "first_funding_timestamp_ms",
+      "blocked_reasons"
+    ],
+    "representation_only": {
+      "entry_maker_leg": "V2 enum-like lowercase text is compared with V1's capitalized label.",
+      "first_funding_leg": "V2 enum-like lowercase text is compared with V1's capitalized label.",
+      "quantity": "V2 entry_target_quantity is the same base-unit quantity represented as V1 quantity."
+    },
+    "not_compared": {
+      "v2_candidate_identity": "V2 revision and lease identifiers have no V1 raw_output field and are not V1 business-result fields.",
+      "v2_provenance_and_diagnostics": "V2 observation, forecast, advisory, and diagnostic fields have no V1 raw_output counterpart.",
+      "v2_execution_only_fields": "V2 per-leg execution and contract-proof evidence are inputs or execution evidence, not emitted V1 oracle results."
+    }
+  },
+  "compile_only_stubs": [
+    "crate::rate_limit::RateLimitRuntime: compile-only placeholder for the real V1 runtime-injected execution manager behind a #[serde(skip)] field on RuntimeConfig. Not touched by discovery/config/market/liquidity/model semantics."
+  ],
+  "excluded_provider_submodules": [
+    "opportunity_input exchange_only/live_scan/sidecar_backed/sidecar_scan/sidecar_snapshot/source_backed: live-data fetch executors not on the executed discovery path; their types are excluded. The opportunity-input types discovery reads (OpportunityInputSnapshot, PairedOpportunityInput, OpportunityInputAcquisitionMode, ...) are included verbatim from real opportunity_input/types.rs."
+  ],
+  "offline": true,
+  "network_downloads": 0,
+  "reproduce": "cd /private/tmp/lightfee_v1_oracle_harness && cargo build --offline && ./target/debug/lightfee_v1_oracle_harness"
+}

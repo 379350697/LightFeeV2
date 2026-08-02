@@ -21,14 +21,14 @@ def _candidate(first_ms: int):
 def test_entry_horizon_blocks_inside_v1_min_scan_window_by_default():
     cfg = StrategyConfig()
     now_ms = 1_000_000
-    candidate = _candidate(now_ms + 59_000)
+    candidate = _candidate(now_ms + 179_000)
 
     decision = FundingLifecycle.entry_horizon(candidate, now_ms, cfg)
 
     assert decision.allowed is False
     assert decision.reason == "entry_blocked_first_funding_too_close"
-    assert decision.remaining_to_first_funding_ms == 59_000
-    assert decision.effective_min_before_ms == 300_000
+    assert decision.remaining_to_first_funding_ms == 179_000
+    assert decision.effective_min_before_ms == 180_000
 
 
 def test_entry_horizon_allows_when_remaining_meets_existing_min_scan():

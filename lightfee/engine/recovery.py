@@ -737,6 +737,16 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     ),
                     maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
                     maker_resting_since_ms=int(ps_data.get("maker_resting_since_ms", 0)),
+                    maker_submit_started_at_ms=(
+                        int(ps_data["maker_submit_started_at_ms"])
+                        if ps_data.get("maker_submit_started_at_ms") is not None
+                        else None
+                    ),
+                    maker_ack_at_ms=(
+                        int(ps_data["maker_ack_at_ms"])
+                        if ps_data.get("maker_ack_at_ms") is not None
+                        else None
+                    ),
                     maker_viability_rejected_this_cycle=bool(
                         ps_data.get("maker_viability_rejected_this_cycle", False)
                     ),

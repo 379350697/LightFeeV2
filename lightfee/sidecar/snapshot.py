@@ -7,6 +7,8 @@ from enum import Enum
 from math import isfinite
 from typing import Callable, Optional
 
+from lightfee.engine.execution_planner import ExecutableEntryEnvelope
+
 
 SNAPSHOT_SCHEMA_VERSION = 5
 LEGACY_SNAPSHOT_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
@@ -1530,6 +1532,12 @@ class CandidateInput:
     forecast_p90_drift_bps: float = 0.0
     forecast_source: str = "quoted_rate"
 
+    # Explicit typed handoff for the shared executable entry envelope.  Built
+    # by ranked selection before Local-L2/account truth and passed explicitly
+    # to dispatch; never serialized in sidecar snapshots and never carried as
+    # a dynamic private attribute.
+    executable_envelope: ExecutableEntryEnvelope | None = None
+
 
 def _candidate_field_contract_errors(
     candidate: dict[str, object],
@@ -1538,7 +1546,14 @@ def _candidate_field_contract_errors(
 ) -> list[str]:
     """Strictly type-check every candidate field consumed after JSON parsing."""
     errors: list[str] = []
-    known_fields = {candidate_field.name for candidate_field in dataclass_fields(CandidateInput)}
+    # Dispatch envelopes are in-memory runtime state, never sidecar schema.
+    # Keep this explicit rather than deriving the wire schema directly from
+    # CandidateInput, which also carries the typed runtime handoff.
+    known_fields = {
+        candidate_field.name
+        for candidate_field in dataclass_fields(CandidateInput)
+        if candidate_field.name != "executable_envelope"
+    }
     for field_name in candidate.keys() - known_fields:
         errors.append(f"candidate_unknown_field:{index}:{field_name}")
     for candidate_field in dataclass_fields(CandidateInput):

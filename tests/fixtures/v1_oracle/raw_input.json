@@ -1,0 +1,128 @@
+{
+  "case_id": "btcusdt_binance_to_okx",
+  "now_ms": 1000000000,
+  "symbols": ["BTCUSDT"],
+  "runtime": {
+    "mode": "live",
+    "passive_execution_enabled": true
+  },
+  "strategy": {
+    "entry_notional_cap_quote": 200.0,
+    "live_entry_notional_cap_quote": 50.0,
+    "fixed_live_entry_notional_quote": 50.0,
+    "max_scan_minutes_before_funding": 25,
+    "min_scan_minutes_before_funding": 3,
+    "max_top_book_usage_ratio": 0.95,
+    "min_funding_edge_bps": 6.0,
+    "min_expected_edge_bps": 1.2,
+    "min_worst_case_edge_bps": 0.6,
+    "entry_sizing_mode": "liquidity_aware",
+    "funding_economics_mode": "v1_exact",
+    "funding_missing_margin_fallback_notional_quote": 50.0,
+    "entry_exit_reserve_bps": 4.0,
+    "execution_buffer_bps": 2.0,
+    "capital_buffer_bps": 1.0
+  },
+  "venues": [
+    {
+      "venue": "binance",
+      "enabled": true,
+      "taker_fee_bps": 0.5,
+      "maker_fee_bps": 1.0,
+      "max_notional": 50000.0
+    },
+    {
+      "venue": "okx",
+      "enabled": true,
+      "taker_fee_bps": 0.5,
+      "maker_fee_bps": 1.0,
+      "max_notional": 50000.0
+    }
+  ],
+  "market": {
+    "observed_at_ms": 1000000000,
+    "quotes": [
+      {
+        "venue": "binance",
+        "symbol": "BTCUSDT",
+        "bid": 60000.0,
+        "ask": 60001.0,
+        "bid_size": 2.0,
+        "ask_size": 2.0,
+        "mark_price": 60000.5,
+        "funding_rate": 0.0001,
+        "funding_timestamp_ms": 1000600000,
+        "funding_evidence": {
+          "observed_at_ms": 1000000000,
+          "event_at_ms": 1000000000,
+          "received_at_ms": 1000000000,
+          "source": "v1_fixture",
+          "sample_id": "funding:binance:BTCUSDT:1000000000:1:1000600000"
+        },
+        "contract": {
+          "funding_interval_ms": 28800000,
+          "underlying": "BTC",
+          "quote_currency": "USDT",
+          "contract_type": "linear",
+          "contract_multiplier": 1.0,
+          "mark_index_source": "v1_fixture",
+          "price_precision": 2,
+          "quantity_precision": 8,
+          "price_tick": 0.01,
+          "quantity_step_base": 0.000001,
+          "min_quantity_base": 0.000001,
+          "min_notional_quote": 0.0,
+          "min_notional_evidence_complete": true,
+          "venue_status": "active",
+          "contract_normalization_complete": true
+        }
+      },
+      {
+        "venue": "okx",
+        "symbol": "BTCUSDT",
+        "bid": 60002.0,
+        "ask": 60003.0,
+        "bid_size": 2.0,
+        "ask_size": 2.0,
+        "mark_price": 60002.5,
+        "funding_rate": 0.001,
+        "funding_timestamp_ms": 1000600000,
+        "funding_evidence": {
+          "observed_at_ms": 1000000000,
+          "event_at_ms": 1000000000,
+          "received_at_ms": 1000000000,
+          "source": "v1_fixture",
+          "sample_id": "funding:okx:BTCUSDT:1000000000:21:1000600000"
+        },
+        "contract": {
+          "funding_interval_ms": 28800000,
+          "underlying": "BTC",
+          "quote_currency": "USDT",
+          "contract_type": "linear",
+          "contract_multiplier": 1.0,
+          "mark_index_source": "v1_fixture",
+          "price_precision": 2,
+          "quantity_precision": 8,
+          "price_tick": 0.01,
+          "quantity_step_base": 0.000001,
+          "min_quantity_base": 0.000001,
+          "min_notional_quote": 0.0,
+          "min_notional_evidence_complete": true,
+          "venue_status": "active",
+          "contract_normalization_complete": true
+        }
+      }
+    ]
+  },
+  "paired_opportunity": {
+    "long_venue": "binance",
+    "short_venue": "okx",
+    "long_funding_rate": 0.0001,
+    "short_funding_rate": 0.0021,
+    "funding_diff_pct_per_hour": 0.20,
+    "long_funding_timestamp_ms": 1000600000,
+    "short_funding_timestamp_ms": 1000600000,
+    "direction_consistent": true,
+    "interval_aligned": true
+  }
+}

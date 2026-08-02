@@ -157,14 +157,14 @@ class StrategyConfig:
     max_global_net_exposure_quote: float = 0.0
     max_concurrent_venue_pairs: int = 0
     max_strategy_bucket_exposure_quote: float = 0.0
-    max_scan_minutes_before_funding: int = 25
-    min_scan_minutes_before_funding: int = 5
+    max_scan_minutes_before_funding: int = 30
+    min_scan_minutes_before_funding: int = 3
     max_stagger_gap_minutes: int = 480
-    max_top_book_usage_ratio: float = 0.85
+    max_top_book_usage_ratio: float = 0.95
     staggered_exit_mode: str = "after_first_stage"
     min_funding_edge_bps: float = 6.0
-    min_expected_edge_bps: float = 1.0
-    min_worst_case_edge_bps: float = 0.0
+    min_expected_edge_bps: float = 1.2
+    min_worst_case_edge_bps: float = 0.6
     small_test_max_entry_notional_quote: float = 60.0
     small_test_expected_edge_relaxation_bps: float = 0.5
     small_test_worst_case_edge_relaxation_bps: float = 0.5
@@ -334,7 +334,7 @@ class StrategyConfig:
     death_single_side_protection_enabled: bool = True
     max_risk_snapshot_age_ms: int = 30000
     execution_liquidity_enabled: bool = True
-    entry_sizing_mode: str = "fixed_notional"
+    entry_sizing_mode: str = "liquidity_aware"
     fixed_live_entry_notional_quote: float = 50.0
     live_target_leverage: int = 4
     # V1's live primary window was six routes, with two warm shadows below.
@@ -414,7 +414,7 @@ class StrategyConfig:
     maker_try_window_ms: int = 1500
     maker_min_fill_ratio: float = 0.25
     maker_entry_progress_poll_ms: int = 500  # V1: 1000; V2: 500 for tighter active polling
-    maker_initial_slice_ratio: float = 0.25
+    maker_initial_slice_ratio: float = 0.5
     entry_max_initial_clip_ratio: float = 0.8
     maker_leg_default: str = "buy"
     entry_readiness_provider: str = ENTRY_READINESS_PROVIDER_ON_DEMAND

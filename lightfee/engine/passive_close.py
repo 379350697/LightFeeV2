@@ -88,6 +88,15 @@ from lightfee.engine.recovery import (
     clear_legacy_recovery_block_via_core,
     clear_stale_fail_closed_if_recovery_clean,
 )
+
+
+def _positive_ms(value) -> int | None:
+    """Return value only when it is a genuine positive millisecond timestamp."""
+    try:
+        numeric = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
@@ -593,14 +602,16 @@ class PassiveCloseExecutor:
         *,
         source: str,
     ) -> bool:
+        private_truth_started_at_ms = self._now_ms()
         final_truth = await self._refresh_passive_close_final_hedge_truth_before_terminal(
             state,
             pending,
             position,
             decision,
             source=source,
-            now_ms=self._now_ms(),
+            now_ms=private_truth_started_at_ms,
         )
+        private_truth_observed_at_ms = self._now_ms()
         if final_truth.get("decision") in {
             "reconciled_continue_pending",
             "defer_terminal_truth_unavailable",
@@ -610,14 +621,43 @@ class PassiveCloseExecutor:
         enter_fail_closed(state)
         state.last_error = f"passive close hedge deadline breached for {pending.position_id}"
         pending.next_retry_at_ms = 0
+        hedge_venue = decision.get("hedge_venue")
+        hedge_side = decision.get("hedge_side")
+        hedge_venue_value = (
+            hedge_venue.value if isinstance(hedge_venue, Venue) else str(hedge_venue or "")
+        )
+        hedge_side_value = (
+            hedge_side.value if isinstance(hedge_side, Side) else str(hedge_side or "")
+        )
+        maker_submit_started_at_ms = _positive_ms(
+            pending.phase_state.maker_submit_started_at_ms
+        )
+        maker_ack_at_ms = _positive_ms(pending.phase_state.maker_ack_at_ms)
+        maker_fill_at_ms = _positive_ms(pending.maker_fill.last_fill_time_ms)
+        hedge_submit_started_at_ms = None
+        for leg in reversed([*pending.long_legs, *pending.short_legs]):
+            fill = getattr(leg, "fill", None)
+            if fill is None:
+                continue
+            if (
+                pending.hedge_fill.order_id
+                and fill.order_id == pending.hedge_fill.order_id
+            ) or (
+                pending.hedge_fill.client_order_id
+                and fill.client_order_id == pending.hedge_fill.client_order_id
+            ):
+                hedge_submit_started_at_ms = _positive_ms(
+                    leg.submit_started_at_ms
+                )
+                break
+        hedge_fill_at_ms = _positive_ms(pending.hedge_fill.last_fill_time_ms)
+        hedge_ack_at_ms = None
         payload = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
             "execution_kind": "exit",
-            "hedge_venue": decision.get("hedge_venue").value
-            if isinstance(decision.get("hedge_venue"), Venue) else str(decision.get("hedge_venue", "")),
-            "hedge_side": decision.get("hedge_side").value
-            if isinstance(decision.get("hedge_side"), Side) else str(decision.get("hedge_side", "")),
+            "hedge_venue": hedge_venue_value,
+            "hedge_side": hedge_side_value,
             "hedge_elapsed_ms": decision.get("hedge_elapsed_ms", 0),
             "deadline_ms": decision.get("hard_deadline_ms", 0),
             "soft_deadline_ms": decision.get("soft_deadline_ms", 0),
@@ -626,6 +666,77 @@ class PassiveCloseExecutor:
             * max(decision.get("price_hint", 0.0), 0.0),
             "reconciled": bool(decision.get("reconciled", False)),
             "source": source,
+            "long_venue": position.long_venue.value,
+            "short_venue": position.short_venue.value,
+            "chunk_index": pending.active_chunk_index,
+            "chunk_count": pending.chunk_count(),
+            "maker_submit_started_at_ms": maker_submit_started_at_ms,
+            "maker_ack_at_ms": maker_ack_at_ms,
+            "maker_fill_at_ms": maker_fill_at_ms,
+            "maker_submit_to_ack_ms": (
+                maker_ack_at_ms - maker_submit_started_at_ms
+                if (
+                    maker_submit_started_at_ms is not None
+                    and maker_ack_at_ms is not None
+                    and maker_ack_at_ms >= maker_submit_started_at_ms
+                )
+                else None
+            ),
+            "maker_ack_to_fill_ms": (
+                maker_fill_at_ms - maker_ack_at_ms
+                if (
+                    maker_ack_at_ms is not None
+                    and maker_fill_at_ms is not None
+                    and maker_fill_at_ms >= maker_ack_at_ms
+                )
+                else None
+            ),
+            "maker_submit_to_fill_ms": (
+                maker_fill_at_ms - maker_submit_started_at_ms
+                if (
+                    maker_submit_started_at_ms is not None
+                    and maker_fill_at_ms is not None
+                    and maker_fill_at_ms >= maker_submit_started_at_ms
+                )
+                else None
+            ),
+            "hedge_submit_started_at_ms": hedge_submit_started_at_ms,
+            "hedge_ack_at_ms": hedge_ack_at_ms,
+            "hedge_fill_at_ms": hedge_fill_at_ms,
+            "hedge_submit_to_ack_ms": (
+                hedge_ack_at_ms - hedge_submit_started_at_ms
+                if (
+                    hedge_ack_at_ms is not None
+                    and hedge_submit_started_at_ms is not None
+                    and hedge_ack_at_ms >= hedge_submit_started_at_ms
+                )
+                else None
+            ),
+            "hedge_ack_to_fill_ms": (
+                hedge_fill_at_ms - hedge_ack_at_ms
+                if (
+                    hedge_ack_at_ms is not None
+                    and hedge_fill_at_ms is not None
+                    and hedge_fill_at_ms >= hedge_ack_at_ms
+                )
+                else None
+            ),
+            "hedge_submit_to_fill_ms": (
+                hedge_fill_at_ms - hedge_submit_started_at_ms
+                if (
+                    hedge_submit_started_at_ms is not None
+                    and hedge_fill_at_ms is not None
+                    and hedge_fill_at_ms >= hedge_submit_started_at_ms
+                )
+                else None
+            ),
+            "private_truth_started_at_ms": private_truth_started_at_ms,
+            "private_truth_observed_at_ms": private_truth_observed_at_ms,
+            "private_truth_latency_ms": (
+                private_truth_observed_at_ms - private_truth_started_at_ms
+                if private_truth_observed_at_ms >= private_truth_started_at_ms
+                else None
+            ),
         }
         self._journal.append("execution.hedge_deadline_breached", payload)
         self._journal.append(
@@ -641,6 +752,7 @@ class PassiveCloseExecutor:
         compensate = getattr(self._close_executor, "compensate_failed_full_close", None)
         if callable(compensate):
             short_legs, long_legs = self._pending_runtime_close_legs(pending)
+            compensation_started_at_ms = self._now_ms()
             try:
                 await compensate(
                     position=position,
@@ -657,16 +769,36 @@ class PassiveCloseExecutor:
                     state=state,
                 )
             except Exception as exc:
+                compensation_finished_at_ms = self._now_ms()
                 self._journal.append(
                     "exit.passive_close_hedge_deadline_compensation_failed",
                     {
-                        "position_id": pending.position_id,
-                        "symbol": position.symbol,
+                        **payload,
                         "error": str(exc),
-                        "source": source,
+                        "compensation_started_at_ms": compensation_started_at_ms,
+                        "compensation_finished_at_ms": compensation_finished_at_ms,
+                        "compensation_latency_ms": (
+                            compensation_finished_at_ms - compensation_started_at_ms
+                            if compensation_finished_at_ms >= compensation_started_at_ms
+                            else None
+                        ),
                     },
                 )
                 return False
+            compensation_finished_at_ms = self._now_ms()
+            self._journal.append(
+                "exit.passive_close_hedge_deadline_compensation_succeeded",
+                {
+                    **payload,
+                    "compensation_started_at_ms": compensation_started_at_ms,
+                    "compensation_finished_at_ms": compensation_finished_at_ms,
+                    "compensation_latency_ms": (
+                        compensation_finished_at_ms - compensation_started_at_ms
+                        if compensation_finished_at_ms >= compensation_started_at_ms
+                        else None
+                    ),
+                },
+            )
             if await self._clear_if_live_flat(
                 state,
                 pending,
@@ -680,9 +812,10 @@ class PassiveCloseExecutor:
         self._journal.append(
             "exit.passive_close_hedge_deadline_compensation_unavailable",
             {
-                "position_id": pending.position_id,
-                "symbol": position.symbol,
-                "source": source,
+                **payload,
+                "compensation_started_at_ms": None,
+                "compensation_finished_at_ms": None,
+                "compensation_latency_ms": None,
             },
         )
         return False
@@ -988,7 +1121,7 @@ class PassiveCloseExecutor:
                 delta_qty=delta_qty,
                 total_qty=float(truth_decision.reconciled_qty or 0.0),
             ),
-            filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or now_ms,
+            filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or 0,
         )
         previous_qty = pending.hedge_fill.quantity
         new_qty = previous_qty + fill.quantity
@@ -1004,10 +1137,41 @@ class PassiveCloseExecutor:
         pending.hedge_fill.order_id = fill.order_id
         pending.hedge_fill.client_order_id = fill.client_order_id or client_order_id
 
+        # Recover the genuine submit timestamp from the leg that matches this
+        # accepted order when available; otherwise leave it null rather than
+        # minting a synthetic submit time from the reconciliation clock.
+        matching_leg_submit = None
+        for leg in (
+            pending.long_legs if hedge_leg == "long" else pending.short_legs
+        ):
+            leg_fill = getattr(leg, "fill", None)
+            if leg_fill is None:
+                continue
+            matches_order = (
+                order_id
+                and str(getattr(leg_fill, "order_id", "") or "") == str(order_id)
+            ) or (
+                client_order_id
+                and str(getattr(leg_fill, "client_order_id", "") or "")
+                == str(client_order_id)
+            )
+            if matches_order:
+                matching_leg_submit = _positive_ms(
+                    getattr(leg, "submit_started_at_ms", None)
+                )
+                if matching_leg_submit is not None:
+                    break
         leg = PersistedCloseExecutionLeg(
             fill=fill,
             client_order_id=fill.client_order_id,
-            submit_started_at_ms=now_ms,
+            submit_started_at_ms=matching_leg_submit,
+            latency_ms=(
+                _positive_ms(fill.filled_at_ms) - matching_leg_submit
+                if matching_leg_submit is not None
+                and _positive_ms(fill.filled_at_ms) is not None
+                and _positive_ms(fill.filled_at_ms) >= matching_leg_submit
+                else None
+            ),
         )
         if hedge_leg == "long":
             pending.long_legs.append(leg)
@@ -1250,10 +1414,41 @@ class PassiveCloseExecutor:
             delta_qty = max(0.0, float(result.fill.quantity or 0.0) - recorded_qty)
             if delta_qty > 1e-12:
                 fill = replace(result.fill, quantity=delta_qty)
+                matching_leg_submit = None
+                for leg in (
+                    pending.long_legs
+                    if leg_label == "long"
+                    else pending.short_legs
+                ):
+                    leg_fill = getattr(leg, "fill", None)
+                    if leg_fill is None:
+                        continue
+                    matches_order = (
+                        order_id
+                        and str(getattr(leg_fill, "order_id", "") or "")
+                        == str(order_id)
+                    ) or (
+                        client_order_id
+                        and str(getattr(leg_fill, "client_order_id", "") or "")
+                        == str(client_order_id)
+                    )
+                    if matches_order:
+                        matching_leg_submit = _positive_ms(
+                            getattr(leg, "submit_started_at_ms", None)
+                        )
+                        if matching_leg_submit is not None:
+                            break
                 leg = PersistedCloseExecutionLeg(
                     fill=fill,
                     client_order_id=fill.client_order_id or client_order_id,
-                    submit_started_at_ms=now_ms,
+                    submit_started_at_ms=matching_leg_submit,
+                    latency_ms=(
+                        _positive_ms(fill.filled_at_ms) - matching_leg_submit
+                        if matching_leg_submit is not None
+                        and _positive_ms(fill.filled_at_ms) is not None
+                        and _positive_ms(fill.filled_at_ms) >= matching_leg_submit
+                        else None
+                    ),
                 )
                 if leg_label == "short":
                     pending.short_legs.append(leg)
@@ -1709,6 +1904,8 @@ class PassiveCloseExecutor:
                     pending.phase_state.maker_client_order_id = ""
                     pending.phase_state.maker_resting_limit_price = None
                     pending.phase_state.maker_resting_since_ms = 0
+                    pending.phase_state.maker_submit_started_at_ms = None
+                    pending.phase_state.maker_ack_at_ms = None
                 self._journal.append(
                     "runtime.passive_close_readiness_ready",
                     {
@@ -1969,6 +2166,8 @@ class PassiveCloseExecutor:
                         pending.phase_state.maker_client_order_id = ""
                         pending.phase_state.maker_resting_limit_price = None
                         pending.phase_state.maker_resting_since_ms = 0
+                        pending.phase_state.maker_submit_started_at_ms = None
+                        pending.phase_state.maker_ack_at_ms = None
 
             # --- Delta hedge: hedge outstanding gap between maker and hedge ---
             # V1: hedges unhedged_gap, not just maker_fill_delta, so that
@@ -2651,6 +2850,10 @@ class PassiveCloseExecutor:
             client_order_id=maker_cid,
         )
 
+        # V1 exit.rs:2006 — capture the submit-start timestamp immediately
+        # before the real submit call. Keep it local until ACK success so a
+        # failed replacement cannot pair its timestamp with an older order.
+        maker_submit_started_at_ms = self._now_ms()
         try:
             ack = await adapter.submit_passive_order(request)
         except NotImplementedError:
@@ -2883,10 +3086,13 @@ class PassiveCloseExecutor:
 
         ack_order_id = normalize_order_identity(ack.order_id)
         ack_client_order_id = normalize_order_identity(ack.client_order_id)
+        maker_ack_at_ms = _positive_ms(ack.accepted_at_ms)
         pending.phase_state.maker_order_id = ack_order_id
         pending.phase_state.maker_client_order_id = ack_client_order_id
         pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
+        pending.phase_state.maker_submit_started_at_ms = maker_submit_started_at_ms
+        pending.phase_state.maker_ack_at_ms = maker_ack_at_ms
         self._record_close_order_identity_history(
             pending,
             venue=maker_venue,
@@ -2910,6 +3116,19 @@ class PassiveCloseExecutor:
                 "price": pending.phase_state.maker_resting_limit_price,
                 "quantity": chunk_quantity,
                 "chunk_index": pending.active_chunk_index,
+                "chunk_count": pending.chunk_count(),
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "maker_submit_started_at_ms": maker_submit_started_at_ms,
+                "maker_ack_at_ms": maker_ack_at_ms,
+                "maker_submit_to_ack_ms": (
+                    maker_ack_at_ms - maker_submit_started_at_ms
+                    if (
+                        maker_ack_at_ms is not None
+                        and maker_ack_at_ms >= maker_submit_started_at_ms
+                    )
+                    else None
+                ),
                 "phase": pending.phase_state.phase.value,
             },
         )
@@ -2950,6 +3169,8 @@ class PassiveCloseExecutor:
             pending.phase_state.maker_client_order_id = ""
             pending.phase_state.maker_resting_limit_price = None
             pending.phase_state.maker_resting_since_ms = 0
+            pending.phase_state.maker_submit_started_at_ms = None
+            pending.phase_state.maker_ack_at_ms = None
             pending.next_retry_at_ms = 0
             self._journal.append(
                 "execution.dual_taker_armed",
@@ -2984,6 +3205,8 @@ class PassiveCloseExecutor:
             pending.phase_state.maker_client_order_id = ""
             pending.phase_state.maker_resting_limit_price = None
             pending.phase_state.maker_resting_since_ms = 0
+            pending.phase_state.maker_submit_started_at_ms = None
+            pending.phase_state.maker_ack_at_ms = None
             pending.maker_fill = PendingPassiveLegFill()
             pending.hedge_fill = PendingPassiveLegFill()
             pending.next_retry_at_ms = 0
@@ -3118,18 +3341,36 @@ class PassiveCloseExecutor:
                 order_id=progress.order_id,
                 client_order_id=progress.client_order_id,
                 fee_quote=progress.fee_quote,
-                filled_at_ms=progress.last_fill_time_ms or now_ms,
+                filled_at_ms=progress.last_fill_time_ms or 0,
             )
             leg = PersistedCloseExecutionLeg(
                 fill=maker_fill,
                 client_order_id=progress.client_order_id,
-                submit_started_at_ms=now_ms,
+                submit_started_at_ms=_positive_ms(
+                    pending.phase_state.maker_submit_started_at_ms
+                ),
             )
             if maker_leg == ActiveMakerLeg.LONG:
                 pending.long_legs.append(leg)
             else:
                 pending.short_legs.append(leg)
 
+            maker_submit_started_at_ms = _positive_ms(
+                pending.phase_state.maker_submit_started_at_ms
+            )
+            maker_ack_at_ms = _positive_ms(pending.phase_state.maker_ack_at_ms)
+            maker_fill_at_ms = _positive_ms(progress.last_fill_time_ms)
+            position_snapshot = pending.position_snapshot
+            long_venue_value = (
+                position_snapshot.long_venue.value
+                if position_snapshot is not None
+                else ""
+            )
+            short_venue_value = (
+                position_snapshot.short_venue.value
+                if position_snapshot is not None
+                else ""
+            )
             self._journal.append(
                 "exit.passive_close_maker_progress",
                 {
@@ -3140,6 +3381,32 @@ class PassiveCloseExecutor:
                     "delta_quantity": delta_qty,
                     "state": progress.state.value,
                     "maker_leg": maker_leg.value,
+                    "maker_venue": progress.venue.value,
+                    "long_venue": long_venue_value,
+                    "short_venue": short_venue_value,
+                    "chunk_index": pending.active_chunk_index,
+                    "chunk_count": pending.chunk_count(),
+                    "maker_submit_started_at_ms": maker_submit_started_at_ms,
+                    "maker_ack_at_ms": maker_ack_at_ms,
+                    "maker_fill_at_ms": maker_fill_at_ms,
+                    "maker_submit_to_fill_ms": (
+                        maker_fill_at_ms - maker_submit_started_at_ms
+                        if (
+                            maker_submit_started_at_ms is not None
+                            and maker_fill_at_ms is not None
+                            and maker_fill_at_ms >= maker_submit_started_at_ms
+                        )
+                        else None
+                    ),
+                    "maker_ack_to_fill_ms": (
+                        maker_fill_at_ms - maker_ack_at_ms
+                        if (
+                            maker_ack_at_ms is not None
+                            and maker_fill_at_ms is not None
+                            and maker_fill_at_ms >= maker_ack_at_ms
+                        )
+                        else None
+                    ),
                 },
             )
 
@@ -3327,7 +3594,13 @@ class PassiveCloseExecutor:
             client_order_id=hedge_cid,
         )
 
-        def record_hedge_fill(fill: OrderFill) -> None:
+        hedge_submit_started_at_ms = 0
+
+        def record_hedge_fill(
+            fill: OrderFill,
+            *,
+            submit_started_at_ms: int = 0,
+        ) -> None:
             fill_client_order_id = fill.client_order_id or hedge_cid
             previous_qty = pending.hedge_fill.quantity
             new_qty = previous_qty + fill.quantity
@@ -3342,10 +3615,24 @@ class PassiveCloseExecutor:
             pending.hedge_fill.order_id = fill.order_id
             pending.hedge_fill.client_order_id = fill_client_order_id
 
+            started_at_ms = _positive_ms(
+                submit_started_at_ms or hedge_submit_started_at_ms
+            )
+            hedge_fill_at_ms = _positive_ms(fill.filled_at_ms)
+            hedge_ack_at_ms = None
             leg = PersistedCloseExecutionLeg(
                 fill=fill,
                 client_order_id=fill_client_order_id,
-                submit_started_at_ms=self._now_ms(),
+                submit_started_at_ms=started_at_ms,
+                latency_ms=(
+                    hedge_fill_at_ms - started_at_ms
+                    if (
+                        started_at_ms is not None
+                        and hedge_fill_at_ms is not None
+                        and hedge_fill_at_ms >= started_at_ms
+                    )
+                    else None
+                ),
             )
             if hedge_leg_label == "long":
                 pending.long_legs.append(leg)
@@ -3364,6 +3651,39 @@ class PassiveCloseExecutor:
                     "cumulative_hedge": pending.hedge_fill.quantity,
                     "cumulative_maker": pending.maker_fill.quantity,
                     "chunk_index": pending.active_chunk_index,
+                    "chunk_count": pending.chunk_count(),
+                    "long_venue": position.long_venue.value,
+                    "short_venue": position.short_venue.value,
+                    "hedge_submit_started_at_ms": started_at_ms,
+                    "hedge_ack_at_ms": hedge_ack_at_ms,
+                    "hedge_fill_at_ms": hedge_fill_at_ms,
+                    "hedge_submit_to_ack_ms": (
+                        hedge_ack_at_ms - started_at_ms
+                        if (
+                            hedge_ack_at_ms is not None
+                            and started_at_ms is not None
+                            and hedge_ack_at_ms >= started_at_ms
+                        )
+                        else None
+                    ),
+                    "hedge_ack_to_fill_ms": (
+                        hedge_fill_at_ms - hedge_ack_at_ms
+                        if (
+                            hedge_ack_at_ms is not None
+                            and hedge_fill_at_ms is not None
+                            and hedge_fill_at_ms >= hedge_ack_at_ms
+                        )
+                        else None
+                    ),
+                    "hedge_submit_to_fill_ms": (
+                        hedge_fill_at_ms - started_at_ms
+                        if (
+                            started_at_ms is not None
+                            and hedge_fill_at_ms is not None
+                            and hedge_fill_at_ms >= started_at_ms
+                        )
+                        else None
+                    ),
                 },
             )
 
@@ -3437,8 +3757,7 @@ class PassiveCloseExecutor:
                         or hedge_cid
                     ),
                     fee_quote=getattr(reconciliation, "fee_quote", None),
-                    filled_at_ms=getattr(reconciliation, "filled_at_ms", 0)
-                    or self._now_ms(),
+                    filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or 0,
                 )
                 record_hedge_fill(fill)
                 state.remove_pending_close_reconciliation(active_truth_gap)
@@ -3523,6 +3842,7 @@ class PassiveCloseExecutor:
             )
 
         try:
+            hedge_submit_started_at_ms = self._now_ms()
             fill = await adapter.place_order(request)
         except Exception as e:
             req_ctx = RequestContext.from_order_request(request)
@@ -3577,9 +3897,12 @@ class PassiveCloseExecutor:
                         price=recon_price,
                         order_id=duplicate_reconcile.order_id,
                         client_order_id=duplicate_reconcile.client_order_id or hedge_cid,
-                        filled_at_ms=self._now_ms(),
+                        filled_at_ms=0,
                     )
-                    record_hedge_fill(fill)
+                    record_hedge_fill(
+                        fill,
+                        submit_started_at_ms=hedge_submit_started_at_ms,
+                    )
 
                 self._journal.append(
                     "exit.passive_close_hedge_duplicate_client_order_reconcile_result",
@@ -3645,6 +3968,7 @@ class PassiveCloseExecutor:
                         time_in_force=TimeInForce.IOC,
                         client_order_id=retry_cid,
                     )
+                    retry_submit_started_at_ms = self._now_ms()
                     try:
                         retry_fill = await adapter.place_order(retry_request)
                     except Exception as retry_error:
@@ -3677,7 +4001,10 @@ class PassiveCloseExecutor:
                             retry_fill,
                             client_order_id=retry_fill.client_order_id or retry_cid,
                         )
-                        record_hedge_fill(retry_fill)
+                        record_hedge_fill(
+                            retry_fill,
+                            submit_started_at_ms=retry_submit_started_at_ms,
+                        )
                     total_filled = recon_fill_qty + max(float(retry_fill.quantity or 0.0), 0.0)
                     residual = max(delta - total_filled, 0.0)
                     self._journal.append(
@@ -3795,9 +4122,12 @@ class PassiveCloseExecutor:
                         order_id=getattr(reconciliation, "order_id", "") or "",
                         client_order_id=getattr(reconciliation, "client_order_id", None) or hedge_cid,
                         fee_quote=getattr(reconciliation, "fee_quote", None),
-                        filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or self._now_ms(),
+                        filled_at_ms=getattr(reconciliation, "filled_at_ms", 0) or 0,
                     )
-                    record_hedge_fill(fill)
+                    record_hedge_fill(
+                        fill,
+                        submit_started_at_ms=hedge_submit_started_at_ms,
+                    )
                     residual = max(delta - fill.quantity, 0.0)
                     success = residual < 1e-12
                     event_kind = (
@@ -4038,7 +4368,10 @@ class PassiveCloseExecutor:
                     filled_at_ms=getattr(reconciliation, "filled_at_ms", 0)
                     or self._now_ms(),
                 )
-                record_hedge_fill(fill)
+                record_hedge_fill(
+                    fill,
+                    submit_started_at_ms=hedge_submit_started_at_ms,
+                )
                 residual = max(delta - fill.quantity, 0.0)
                 success = residual < 1e-12
                 self._journal.append(
@@ -4146,7 +4479,10 @@ class PassiveCloseExecutor:
         success = residual < 1e-12
 
         if fill.quantity > 0:
-            record_hedge_fill(fill)
+            record_hedge_fill(
+                fill,
+                submit_started_at_ms=hedge_submit_started_at_ms,
+            )
 
         if not success and filled_qty > 0:
             self._journal.append(
@@ -4923,6 +5259,7 @@ class PassiveCloseExecutor:
             side: Side,
             leg_label: str,
             source: str,
+            submit_started_at_ms: Optional[int] = None,
         ) -> None:
             gap = max(pending_fill.quantity - existing_qty, 0.0)
             if gap <= 1e-9:
@@ -4941,11 +5278,17 @@ class PassiveCloseExecutor:
                 fee_quote=fee_quote,
                 filled_at_ms=pending_fill.last_fill_time_ms,
             )
+            submit_ms = _positive_ms(submit_started_at_ms)
+            fill_ms = _positive_ms(pending_fill.last_fill_time_ms)
             target.append(CloseExecutionLeg(
                 fill=fill,
                 client_order_id=pending_fill.client_order_id,
-                submit_started_at_ms=pending_fill.last_fill_time_ms,
-                latency_ms=0,
+                submit_started_at_ms=submit_ms,
+                latency_ms=(
+                    fill_ms - submit_ms
+                    if submit_ms is not None and fill_ms is not None and fill_ms >= submit_ms
+                    else None
+                ),
             ))
             self._journal.append(
                 "exit.passive_close_synthesized_missing_leg",
@@ -4964,6 +5307,17 @@ class PassiveCloseExecutor:
         existing_long_qty = sum(leg.fill.quantity for leg in long_legs if leg.fill)
         existing_short_qty = sum(leg.fill.quantity for leg in short_legs if leg.fill)
         maker_leg = pending.phase_state.active_maker_leg
+        # Real-or-null: recover the hedge submit time from the matching hedge
+        # leg record when available; otherwise keep it null rather than
+        # synthesizing from phase/cycle clocks or the fill timestamp.
+        hedge_legs = pending.short_legs if maker_leg == ActiveMakerLeg.LONG else pending.long_legs
+        hedge_submit_ms = None
+        for leg in hedge_legs:
+            if getattr(leg, "fill", None) is None:
+                continue
+            hedge_submit_ms = _positive_ms(getattr(leg, "submit_started_at_ms", None))
+            if hedge_submit_ms is not None:
+                break
         if maker_leg == ActiveMakerLeg.LONG:
             append_synthesized_leg(
                 long_legs,
@@ -4973,6 +5327,7 @@ class PassiveCloseExecutor:
                 side=Side.SELL,
                 leg_label="long",
                 source="maker_fill",
+                submit_started_at_ms=pending.phase_state.maker_submit_started_at_ms,
             )
             append_synthesized_leg(
                 short_legs,
@@ -4982,6 +5337,7 @@ class PassiveCloseExecutor:
                 side=Side.BUY,
                 leg_label="short",
                 source="hedge_fill",
+                submit_started_at_ms=hedge_submit_ms,
             )
         else:
             append_synthesized_leg(
@@ -4992,6 +5348,7 @@ class PassiveCloseExecutor:
                 side=Side.BUY,
                 leg_label="short",
                 source="maker_fill",
+                submit_started_at_ms=pending.phase_state.maker_submit_started_at_ms,
             )
             append_synthesized_leg(
                 long_legs,
@@ -5001,6 +5358,7 @@ class PassiveCloseExecutor:
                 side=Side.SELL,
                 leg_label="long",
                 source="hedge_fill",
+                submit_started_at_ms=hedge_submit_ms,
             )
 
         close = build_close_execution_from_legs(
@@ -7480,6 +7838,7 @@ class PassiveCloseExecutor:
         )
         try:
             fill = await adapter.place_order(request)
+            live_one_sided_submit_started_at_ms = self._now_ms()
         except Exception as exc:
             uncertainty_payload: dict[str, Any] = {}
             if isinstance(exc, OrderSubmitError):
@@ -7624,7 +7983,20 @@ class PassiveCloseExecutor:
         leg = PersistedCloseExecutionLeg(
             fill=fill,
             client_order_id=client_order_id,
-            submit_started_at_ms=self._now_ms(),
+            submit_started_at_ms=_positive_ms(
+                live_one_sided_submit_started_at_ms
+            ),
+            latency_ms=(
+                _positive_ms(fill.filled_at_ms)
+                - _positive_ms(live_one_sided_submit_started_at_ms)
+                if (
+                    _positive_ms(fill.filled_at_ms) is not None
+                    and _positive_ms(live_one_sided_submit_started_at_ms) is not None
+                    and _positive_ms(fill.filled_at_ms)
+                    >= _positive_ms(live_one_sided_submit_started_at_ms)
+                )
+                else None
+            ),
         )
         if leg_label == "short":
             pending.short_legs.append(leg)
@@ -7759,6 +8131,8 @@ class PassiveCloseExecutor:
         pending.phase_state.maker_client_order_id = ""
         pending.phase_state.maker_resting_limit_price = None
         pending.phase_state.maker_resting_since_ms = 0
+        pending.phase_state.maker_submit_started_at_ms = None
+        pending.phase_state.maker_ack_at_ms = None
         self._journal.append(
             "exit.passive_close_owned_one_sided_close_order_cancelled_for_ioc",
             {
@@ -8016,6 +8390,7 @@ class PassiveCloseExecutor:
         )
         try:
             fill = await adapter.place_order(request)
+            live_excess_submit_started_at_ms = self._now_ms()
         except Exception as exc:
             self._journal.append(
                 "exit.passive_close_live_imbalanced_excess_error",
@@ -8045,7 +8420,18 @@ class PassiveCloseExecutor:
         leg = PersistedCloseExecutionLeg(
             fill=fill,
             client_order_id=client_order_id,
-            submit_started_at_ms=self._now_ms(),
+            submit_started_at_ms=_positive_ms(live_excess_submit_started_at_ms),
+            latency_ms=(
+                _positive_ms(fill.filled_at_ms)
+                - _positive_ms(live_excess_submit_started_at_ms)
+                if (
+                    _positive_ms(fill.filled_at_ms) is not None
+                    and _positive_ms(live_excess_submit_started_at_ms) is not None
+                    and _positive_ms(fill.filled_at_ms)
+                    >= _positive_ms(live_excess_submit_started_at_ms)
+                )
+                else None
+            ),
         )
         if excess_leg == "short":
             pending.short_legs.append(leg)
@@ -8860,6 +9246,11 @@ class PassiveCloseExecutor:
         if matched_price > 0.0:
             pending.phase_state.maker_resting_limit_price = matched_price
         pending.phase_state.maker_resting_since_ms = now_ms
+        # The adopted order's genuine submit timestamp is unknown (it was not
+        # captured before its real submit) — never attribute a different
+        # attempt's submit time to it.
+        pending.phase_state.maker_submit_started_at_ms = None
+        pending.phase_state.maker_ack_at_ms = None
         pending.next_retry_at_ms = now_ms + self._config.progress_poll_interval_ms
         self._journal.append(
             "exit.passive_close_existing_reduce_only_order_adopted",

@@ -101,7 +101,6 @@ class TestTransportConstruction:
     def test_has_market_data_client_methods(self):
         transport = VenueTransport(spec=binance_spec(), mode="paper")
         assert hasattr(transport, "fetch_funding_tickers")
-        assert hasattr(transport, "fetch_perp_liquidity")
         assert hasattr(transport, "fetch_l2_snapshot")
         assert hasattr(transport, "spec")
 
@@ -13422,3 +13421,208 @@ class TestBinanceAsterPrecisionFix:
         assert normalized == pytest.approx(357.0)
 
         await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Open-interest opt-out contract: with include_open_interest=False every
+# touched venue must not parse/publish OI and must mark it as targeted
+# revalidation-required.  Binance and Aster share the binance-style fetcher.
+# ---------------------------------------------------------------------------
+
+
+class _OiOptOutBinanceStyle(MarketDataClient):
+    def __init__(self, spec):
+        super().__init__(spec)
+        self.paths = []
+
+    async def _public_get(self, path, params=None, timeout=None):
+        self.paths.append(("GET", path))
+        if "bookTicker" in path:
+            return [{
+                "symbol": "BONKUSDT", "bidPrice": "0.1", "askPrice": "0.11",
+                "bidQty": "100", "askQty": "100",
+            }]
+        if "premiumIndex" in path:
+            return [{"symbol": "BONKUSDT", "markPrice": "0.1"}]
+        if "openInterest" in path:
+            return {"symbol": "BONKUSDT", "openInterest": "5000", "time": 1000}
+        if "exchangeInfo" in path:
+            return {"symbols": [{
+                "symbol": "BONKUSDT", "contractType": "PERPETUAL",
+                "pricePrecision": 6, "quantityPrecision": 5,
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.001"},
+                    {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                ],
+            }]}
+        return {}
+
+
+class _OiOptOutOkx(MarketDataClient):
+    def __init__(self):
+        super().__init__(okx_spec())
+        self.paths = []
+
+    async def _public_get(self, path, params=None, timeout=None):
+        self.paths.append(("GET", path))
+        if "/api/v5/market/tickers" in path:
+            return {"data": [{
+                "instId": "BONK-USDT-SWAP", "bidPx": "0.1", "askPx": "0.11",
+                "bidSz": "100", "askSz": "100", "last": "0.1",
+                "markPx": "0.1", "volCcy24h": "100000",
+            }]}
+        if "/api/v5/public/funding-rate" in path:
+            return {"data": [{
+                "instId": params.get("instId"),
+                "fundingRate": "0.0001", "nextFundingTime": "2000000000000",
+                "markPrice": "0.1", "indexPrice": "0.1",
+            }]}
+        if "/api/v5/public/open-interest" in path:
+            return {"data": [{"instId": "BONK-USDT-SWAP", "oiUsd": "1000"}]}
+        if "/api/v5/public/instruments" in path:
+            return {"data": [{
+                "instId": "BONK-USDT-SWAP", "instType": "SWAP", "state": "live",
+                "ctVal": "100", "lotSz": "1", "tickSz": "0.001",
+            }]}
+        return {"data": []}
+
+
+class _OiOptOutBybit(MarketDataClient):
+    def __init__(self):
+        super().__init__(bybit_spec())
+        self.paths = []
+
+    async def _public_get(self, path, params=None, timeout=None):
+        self.paths.append(("GET", path))
+        if "/v5/market/tickers" in path:
+            return {"retCode": 0, "result": {"list": [{
+                "symbol": "BONKUSDT", "bid1Price": "0.1", "ask1Price": "0.11",
+                "openInterest": "5000", "fundingRate": "0.0001",
+            }]}}
+        if "/v5/market/instruments-info" in path:
+            return {"retCode": 0, "result": {"list": [{
+                "symbol": "BONKUSDT", "priceFilter": {"tickSize": "0.001"},
+                "lotSizeFilter": {
+                    "qtyStep": "1", "minOrderQty": "1",
+                    "minNotionalValue": "5",
+                },
+            }]}}
+        return {"retCode": 0, "result": {"list": []}}
+
+
+class _OiOptOutBitget(MarketDataClient):
+    def __init__(self):
+        super().__init__(bitget_spec())
+        self.paths = []
+
+    async def _public_get(self, path, params=None, timeout=None):
+        self.paths.append(("GET", path))
+        if "tickers" in path:
+            return {"code": "00000", "data": [{
+                "symbol": "BONKUSDT", "lastPr": "0.1", "bidPr": "0.1",
+                "askPr": "0.11", "fundingRate": "0.0001",
+                "holdingAmount": "5000", "markPrice": "0.1",
+            }]}
+        if "current-fund-rate" in path:
+            return {"code": "00000", "data": {
+                "symbol": "BONKUSDT", "fundingRate": "0.0001",
+            }}
+        if "contracts" in path:
+            return {"code": "00000", "data": [{
+                "symbol": "BONKUSDT", "priceEndStep": "0.001",
+                "sizeMult": "1", "minTradeNum": "1",
+                "pricePrecision": "6", "sizePrecision": "0",
+            }]}
+        return {"code": "00000", "data": []}
+
+
+class _OiOptOutGate(MarketDataClient):
+    def __init__(self):
+        super().__init__(gate_spec())
+        self.paths = []
+
+    async def _public_get(self, path, params=None, timeout=None):
+        self.paths.append(("GET", path))
+        if "tickers" in path:
+            return [{
+                "contract": "BONK_USDT", "last": "0.1", "highest_bid": "0.1",
+                "lowest_ask": "0.11", "funding_rate": "0.0001",
+                "total_size": "5000", "mark_price": "0.1",
+                "quanto_multiplier": "1",
+            }]
+        if "contracts" in path:
+            return [{
+                "contract": "BONK_USDT", "order_size_min": "1",
+                "order_price_round": "0.001", "mark_price": "0.1",
+                "quanto_multiplier": "1",
+            }]
+        return []
+
+
+class _OiOptOutHyperliquid(MarketDataClient):
+    def __init__(self):
+        super().__init__(hyperliquid_spec())
+        self.paths = []
+
+    async def _public_post(self, path, body=None):
+        self.paths.append(("POST", path, body))
+        req = body or {}
+        if req.get("type") == "metaAndAssetCtxs":
+            return [
+                {"universe": [{"name": "BONK", "szDecimals": 5, "pxDecimals": 7}]},
+                [{
+                    "coin": "BONK", "markPx": "0.1", "midPx": "0.1",
+                    "impactPxs": ["0.1", "0.11"], "openInterest": "5000",
+                }],
+            ]
+        return {}
+
+
+_oi_opt_out_cases = [
+    ("binance", lambda: _OiOptOutBinanceStyle(binance_spec()),
+     lambda client: client._fetch_binance_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "openInterest" in p[1] and "exchangeInfo" not in p[1]]),
+    ("aster", lambda: _OiOptOutBinanceStyle(aster_spec()),
+     lambda client: client._fetch_binance_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "openInterest" in p[1] and "exchangeInfo" not in p[1]]),
+    ("okx", lambda: _OiOptOutOkx(),
+     lambda client: client._fetch_okx_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "open-interest" in p[1]]),
+    ("bybit", lambda: _OiOptOutBybit(),
+     lambda client: client._fetch_bybit_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "openInterest" in p[1]]),
+    ("bitget", lambda: _OiOptOutBitget(),
+     lambda client: client._fetch_bitget_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "holding" in p[1].lower() or "oi" in p[1].lower()]),
+    ("gate", lambda: _OiOptOutGate(),
+     lambda client: client._fetch_gate_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if "oi" in p[1].lower()]),
+    ("hyperliquid", lambda: _OiOptOutHyperliquid(),
+     lambda client: client._fetch_hyperliquid_style(["BONKUSDT"], include_open_interest=False),
+     lambda client: [p for p in client.paths if p[1] and isinstance(p[1], dict) and "oi" in json.dumps(p[1]).lower()]),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "venue_name,make_client,fetch,oi_endpoint_calls",
+    _oi_opt_out_cases,
+    ids=[case[0] for case in _oi_opt_out_cases],
+)
+async def test_open_interest_opt_out_never_parses_or_fetches_oi(
+    venue_name,
+    make_client,
+    fetch,
+    oi_endpoint_calls,
+):
+    client = make_client()
+    tickers = await fetch(client)
+    assert oi_endpoint_calls(client) == []
+    for ticker in tickers.values():
+        assert ticker.open_interest_evidence_status == "unavailable"
+        assert ticker.open_interest_evidence_reason == (
+            "entry_targeted_revalidation_required"
+        )
+        assert ticker.open_interest_quote is None
+        assert ticker.raw_open_interest is None

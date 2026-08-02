@@ -9,7 +9,11 @@ from lightfee.engine.entry import EntryState
 from lightfee.engine.business_contract import entry_route_key
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.entry_sync import EntryExecutionResult
-from lightfee.engine.execution_planner import ExecutionRoute
+from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
+    ExecutionRoute,
+    IncrementalEntryExecutionPlan,
+)
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import PendingEntry
 from lightfee.marketdata.ws_bbo import TopBookQuote
@@ -28,6 +32,19 @@ from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.symbol_rules import SymbolRule
 from lightfee.venues.transport import ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE
 from tests.test_live_startup_preflight import make_test_config
+
+
+def _dispatch_envelope() -> ExecutableEntryEnvelope:
+    return ExecutableEntryEnvelope(
+        plan=IncrementalEntryExecutionPlan(
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            full_target_quantity=1.0,
+        ),
+        maker_leg="long",
+        hedge_leg="short",
+        requested_quantity=1.0,
+        effective_dispatch_quantity=1.0,
+    )
 
 
 pytestmark = pytest.mark.live_harness
@@ -439,8 +456,8 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         candidate = _candidate(symbol, venue, other_venue)
         _seed_dispatch_bbo(runtime, candidate)
 
-        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
-        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
+        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert first is True
         assert second is False
@@ -533,8 +550,8 @@ async def test_aster_submit_reject_evidence_creates_symbol_admission_block():
         candidate = _candidate("ESPORTSUSDT", "aster", "binance")
         _seed_dispatch_bbo(runtime, candidate)
 
-        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.08)
-        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=0.08)
+        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=0.08, executable_envelope=_dispatch_envelope())
+        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=0.08, executable_envelope=_dispatch_envelope())
 
         assert first is True
         assert second is False
@@ -598,11 +615,7 @@ async def test_bybit_expired_key_blocks_paired_entry_before_maker_submit_venue_w
         clean_candidate = _candidate("CLEANUSDT", "binance", "aster")
         _seed_dispatch_bbo(runtime, bybit_candidate)
 
-        first = await runtime._dispatch_entry(
-            bybit_candidate,
-            1778787000000,
-            price_hint=1.0,
-        )
+        first = await runtime._dispatch_entry(bybit_candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
         filtered = runtime._filter_candidates_by_entry_admission(
             [bybit_candidate, clean_candidate],
             now_ms=1778787001000,
@@ -664,11 +677,7 @@ async def test_aster_zero_headroom_blocks_hedge_side_before_maker_submit():
         candidate = _candidate("HUSDT", "binance", "aster")
         _seed_dispatch_bbo(runtime, candidate)
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            1778787000000,
-            price_hint=1.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is False
         assert executor.calls == 0
@@ -762,11 +771,7 @@ async def test_real_aster_adapter_zero_headroom_allows_submit_when_account_truth
         candidate = _candidate("HUSDT", "binance", "aster")
         _seed_dispatch_bbo(runtime, candidate)
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            1778787000000,
-            price_hint=1.0,
-        )
+        dispatched = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert dispatched is True
         assert executor.calls == 1
@@ -1931,8 +1936,8 @@ async def test_binance_5022_exception_path_creates_cooldown_without_admission_bl
         candidate = _candidate("GTXUSDT", "binance", "bybit")
         _seed_dispatch_bbo(runtime, candidate)
 
-        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
-        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0)
+        first = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
+        second = await runtime._dispatch_entry(candidate, 1778787001000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert first is False
         assert second is False
@@ -1987,7 +1992,7 @@ async def test_recovered_admission_block_prevents_dispatch_until_ttl_expires():
         runtime.entry_executor = executor
         candidate = _candidate("LITEUSDT", "bybit", "binance")
 
-        blocked = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0)
+        blocked = await runtime._dispatch_entry(candidate, 1778787000000, price_hint=1.0, executable_envelope=_dispatch_envelope())
 
         assert blocked is False
         assert executor.calls == 0

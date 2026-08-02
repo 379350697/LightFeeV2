@@ -29,9 +29,10 @@ from lightfee.engine.business_contract import classify_entry_quantity_contract
 from lightfee.engine.entry_readiness import QuoteLease
 from lightfee.engine.exit import EXECUTION_BENCHMARK_MAX_OBSERVATION_TO_SUBMIT_MS
 from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
     ExecutionRoute,
-    min_hedgeable_chunk_from_notional,
-    plan_incremental_entry_execution,
+    build_executable_entry_envelope,
+    executable_entry_envelope_context_key,
 )
 from lightfee.engine.pending_entry_admission import (
     PendingEntryAdmissionCore,
@@ -844,11 +845,11 @@ class EntryDispatchRuntime:
         return resolver(*args, **kwargs)
 
     def _local_l2_effective_enabled(self, *args: Any, **kwargs: Any):
-        resolver = getattr(
-            self.ctx,
-            "_entry_local_l2_effective_enabled",
-            self.ctx._local_l2_effective_enabled,
-        )
+        resolver = getattr(self.ctx, "_entry_local_l2_effective_enabled", None)
+        if resolver is None:
+            resolver = getattr(self.ctx, "_local_l2_effective_enabled", None)
+        if resolver is None:
+            return False
         return resolver(*args, **kwargs)
 
     def _post_only_maker_bbo_guard(self, *args: Any, **kwargs: Any):
@@ -2302,44 +2303,6 @@ class EntryDispatchRuntime:
         if abs(initial_maker_target_quantity - full_target_quantity) > 1e-9:
             return "passive_initial_slice"
         return "full_target_quantity"
-
-    @staticmethod
-    def _entry_pair_minimum_reason(
-        *,
-        quantity: float,
-        long_price: float,
-        short_price: float,
-        long_metadata: dict,
-        short_metadata: dict,
-        strategy_min_notional: float,
-    ) -> tuple[str, dict]:
-        failures: list[dict[str, float | str]] = []
-        for leg, price, metadata in (
-            ("long", long_price, long_metadata),
-            ("short", short_price, short_metadata),
-        ):
-            min_quantity = float(metadata.get("min_quantity", 0.0) or 0.0)
-            min_notional = max(
-                float(metadata.get("min_notional", 0.0) or 0.0),
-                max(float(strategy_min_notional or 0.0), 0.0),
-            )
-            notional = max(float(quantity or 0.0), 0.0) * max(
-                float(price or 0.0), 0.0
-            )
-            if quantity + 1e-12 < min_quantity or notional + 1e-9 < min_notional:
-                failures.append(
-                    {
-                        "leg": leg,
-                        "quantity": quantity,
-                        "price": price,
-                        "notional_quote": notional,
-                        "min_quantity": min_quantity,
-                        "min_notional_quote": min_notional,
-                    }
-                )
-        if not failures:
-            return "", {}
-        return "entry_pair_minimum_not_met", {"pair_minimum_failures": failures}
 
     @staticmethod
     def _entry_normalized_price_consistency_reason(
@@ -5317,18 +5280,20 @@ class EntryDispatchRuntime:
         entry_id: str,
         long_venue: Venue,
         short_venue: Venue,
-        effective_quantity: float,
+        executable_envelope: ExecutableEntryEnvelope,
         long_order_price_hint: float,
         short_order_price_hint: float,
         maker_leg: Side,
-        entry_type: EntryType,
-        route: ExecutionRoute,
         now_ms: int,
         expected_shortfall_bps_entry: float = 0.0,
         long_quantity_metadata: dict[str, Any] | None = None,
         short_quantity_metadata: dict[str, Any] | None = None,
         common_base_quantity_step: float = 0.0,
     ) -> EntryContext:
+        route = executable_envelope.plan.route
+        effective_quantity = executable_envelope.effective_dispatch_quantity
+        entry_type = EntryType.PASSIVE_INCREMENTAL if route == ExecutionRoute.PASSIVE_INCREMENTAL else EntryType.STANDARD_DUAL_TAKER
+
         def _positive_ms(value) -> int:
             try:
                 parsed = int(value or 0)
@@ -5414,6 +5379,7 @@ class EntryDispatchRuntime:
             short_price_hint=short_order_price_hint,
             maker_leg=maker_leg,
             entry_type=entry_type,
+            planned_route=route,
             created_at_ms=now_ms,
             opportunity_type=opportunity_type,
             funding_timestamp_ms=funding_timestamp_ms,
@@ -5705,8 +5671,6 @@ class EntryDispatchRuntime:
         *,
         ctx: EntryContext,
         candidate,
-        route: ExecutionRoute,
-        effective_quantity: float,
         price_hint: float,
         maker_venue: Venue,
         maker_leg: Side,
@@ -5732,7 +5696,7 @@ class EntryDispatchRuntime:
             candidate_pair_id = self._candidate_pair_id(candidate)
             planned_entry_notional_quote = max(
                 float(ctx.long_price_hint), float(ctx.short_price_hint)
-            ) * float(effective_quantity)
+            ) * float(ctx.long_quantity)
             selected_seq = self.ctx.journal.append(
                 "execution.entry_selected",
                 {
@@ -5742,8 +5706,8 @@ class EntryDispatchRuntime:
                     "pair_id": candidate_pair_id,
                     "long_venue": ctx.long_venue.value,
                     "short_venue": ctx.short_venue.value,
-                    "quantity": effective_quantity,
-                    "route": route.value,
+                    "quantity": ctx.long_quantity,
+                    "route": ctx.planned_route.value,
                     "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                     "price_hint": price_hint,
                     "long_order_price_hint": ctx.long_price_hint,
@@ -5773,7 +5737,7 @@ class EntryDispatchRuntime:
                     # basis so offline analysis can independently prove the
                     # selected cohort's configured per-leg cap.
                     "planned_entry_notional_quote": planned_entry_notional_quote,
-                    "planned_entry_quantity": float(effective_quantity),
+                    "planned_entry_quantity": float(ctx.long_quantity),
                     "planned_long_entry_price": float(ctx.long_price_hint),
                     "planned_short_entry_price": float(ctx.short_price_hint),
                     "expected_net_edge_bps": float(
@@ -5917,7 +5881,7 @@ class EntryDispatchRuntime:
                 if not rebind_reason:
                     try:
                         economics_quantity = max(
-                            float(effective_quantity or 0.0),
+                            float(ctx.long_quantity or 0.0),
                             float(
                                 getattr(
                                     candidate,
@@ -5928,7 +5892,7 @@ class EntryDispatchRuntime:
                             ),
                         )
                     except (TypeError, ValueError, OverflowError):
-                        economics_quantity = float(effective_quantity or 0.0)
+                        economics_quantity = float(ctx.long_quantity or 0.0)
                     economics_reason = self._apply_final_entry_economics(
                         candidate,
                         quantity=economics_quantity,
@@ -6117,7 +6081,7 @@ class EntryDispatchRuntime:
                         if not final_lease_reason:
                             try:
                                 economics_quantity = max(
-                                    float(effective_quantity or 0.0),
+                                    float(ctx.long_quantity or 0.0),
                                     float(
                                         getattr(
                                             candidate,
@@ -6128,7 +6092,7 @@ class EntryDispatchRuntime:
                                     ),
                                 )
                             except (TypeError, ValueError, OverflowError):
-                                economics_quantity = float(effective_quantity or 0.0)
+                                economics_quantity = float(ctx.long_quantity or 0.0)
                             economics_reason = self._apply_final_entry_economics(
                                 candidate,
                                 quantity=economics_quantity,
@@ -6198,7 +6162,7 @@ class EntryDispatchRuntime:
                 long_venue=ctx.long_venue,
                 short_venue=ctx.short_venue,
                 notional_quote=max(ctx.long_price_hint, ctx.short_price_hint)
-                * effective_quantity,
+                * ctx.long_quantity,
                 minimum_evidence_by_venue=(
                     leverage_evidence_for_sizing or {}
                 ),
@@ -6494,11 +6458,18 @@ class EntryDispatchRuntime:
                     from dataclasses import asdict, is_dataclass
 
                     if is_dataclass(candidate):
-                        result.pending_entry.frozen_candidate = asdict(candidate)
+                        frozen = asdict(candidate)
                     else:
-                        result.pending_entry.frozen_candidate = dict(
+                        frozen = dict(
                             getattr(candidate, "__dict__", {}) or {}
                         )
+                    # The executable envelope is an explicit dispatch-time
+                    # handoff, not a persisted candidate field.  Drop it before
+                    # the frozen candidate reaches the journal/persistence so
+                    # route enums and planner dataclasses never enter JSONL.
+                    if isinstance(frozen, dict):
+                        frozen.pop("executable_envelope", None)
+                    result.pending_entry.frozen_candidate = frozen
                 self.ctx.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
                 self.ctx._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
                 self.ctx._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
@@ -6610,6 +6581,8 @@ class EntryDispatchRuntime:
         price_hint: float = 0.0,
         selected_deadline_monotonic: float | None = None,
         selected_at_ms: int | None = None,
+        *,
+        executable_envelope: ExecutableEntryEnvelope,
     ) -> bool:
         result = await self._dispatch_entry_result(
             candidate,
@@ -6617,6 +6590,7 @@ class EntryDispatchRuntime:
             price_hint=price_hint,
             selected_deadline_monotonic=selected_deadline_monotonic,
             selected_at_ms=selected_at_ms,
+            executable_envelope=executable_envelope,
         )
         self._record_legacy_entry_dispatch_result(result)
         return result.dispatched
@@ -6628,6 +6602,8 @@ class EntryDispatchRuntime:
         price_hint: float = 0.0,
         selected_deadline_monotonic: float | None = None,
         selected_at_ms: int | None = None,
+        *,
+        executable_envelope: ExecutableEntryEnvelope,
     ) -> EntryDispatchResult:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
@@ -6635,6 +6611,16 @@ class EntryDispatchRuntime:
         Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
         Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
         """
+        if not isinstance(executable_envelope, ExecutableEntryEnvelope):
+            return self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason="invalid_executable_entry_envelope",
+                blocked_reasons=["invalid_executable_entry_envelope"],
+                source="executable_entry_envelope",
+                decision="skip_dispatch",
+                extra={"envelope_type": type(executable_envelope).__name__},
+            )
         deadline_result = self._selected_pre_submit_deadline_exceeded(
             candidate,
             selected_deadline_monotonic=selected_deadline_monotonic,
@@ -6829,6 +6815,140 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+
+        # V1 entry route planning: build the shared executable envelope before
+        # private live checks, then reuse it unless the quantity/price/spec
+        # context changes.
+        strategy = self.ctx.config.strategy
+        min_notional = strategy.min_entry_leg_notional_quote
+        candidate_maker_leg = executable_envelope.maker_leg
+        maker_leg_name = (
+            candidate_maker_leg
+            if candidate_maker_leg in {"long", "short"}
+            else "long"
+            if strategy.maker_leg_default == "buy"
+            else "short"
+        )
+        maker_leg = Side.BUY if maker_leg_name == "long" else Side.SELL
+        if quote_lease is not None:
+            if maker_leg == Side.BUY:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_bid", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_bid", 0.0) or 0.0
+                )
+            else:
+                long_order_price_hint = float(
+                    getattr(quote_lease, "long_ask", 0.0) or 0.0
+                )
+                short_order_price_hint = float(
+                    getattr(quote_lease, "short_ask", 0.0) or 0.0
+                )
+        common_base_quantity_step = _common_base_quantity_step(
+            okx_base_step,
+            long_quantity_step,
+            short_quantity_step,
+        )
+        maker_quantity_metadata = (
+            long_quantity_metadata
+            if maker_leg == Side.BUY
+            else short_quantity_metadata
+        )
+        hedge_quantity_metadata = (
+            short_quantity_metadata
+            if maker_leg == Side.BUY
+            else long_quantity_metadata
+        )
+
+        def _block_entry_envelope(envelope: ExecutableEntryEnvelope):
+            reason = str(envelope.blocker_reason or "planner_rejected_entry")
+            payload = {
+                "symbol": candidate.symbol,
+                "target_quantity": envelope.requested_quantity,
+                "maker_venue": (
+                    long_venue.value if maker_leg == Side.BUY else short_venue.value
+                ),
+                "hedge_venue": (
+                    short_venue.value if maker_leg == Side.BUY else long_venue.value
+                ),
+                "reason": reason,
+                "ts_ms": now_ms,
+                **envelope.blocker_evidence,
+            }
+            if reason == "min_hedgeable_chunk_invalid":
+                self.ctx.journal.append(
+                    "runtime.entry_skipped_planner_metadata_invalid",
+                    payload,
+                )
+            elif reason != "entry_pair_minimum_not_met":
+                self.ctx.journal.append(
+                    "runtime.entry_skipped_planner_rejected",
+                    payload,
+                )
+            source = (
+                "entry_pair_minimum"
+                if reason == "entry_pair_minimum_not_met"
+                else "entry_execution_planner"
+            )
+            return self._emit_entry_dispatch_viability_blocked(
+                candidate,
+                now_ms,
+                reason=reason,
+                blocked_reasons=[reason],
+                source=source,
+                decision="skip_before_first_leg",
+                extra=payload,
+            )
+
+        envelope: ExecutableEntryEnvelope = executable_envelope
+
+        def _entry_envelope_for_quantity(
+            target_quantity: float,
+            emit_block: bool = True,
+        ):
+            nonlocal envelope
+            context_key = executable_entry_envelope_context_key(
+                target_quantity=target_quantity,
+                maker_leg=maker_leg_name,
+                long_price=long_order_price_hint,
+                short_price=short_order_price_hint,
+                long_metadata=long_quantity_metadata,
+                short_metadata=short_quantity_metadata,
+                strategy_min_notional=min_notional,
+                common_base_quantity_step=common_base_quantity_step,
+                slice_ratio=strategy.maker_initial_slice_ratio,
+                max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
+            )
+            if tuple(envelope.context_key or ()) == context_key:
+                return envelope
+            envelope = build_executable_entry_envelope(
+                target_quantity=target_quantity,
+                maker_leg=maker_leg_name,
+                long_price=long_order_price_hint,
+                short_price=short_order_price_hint,
+                long_metadata=long_quantity_metadata,
+                short_metadata=short_quantity_metadata,
+                strategy_min_notional=min_notional,
+                common_base_quantity_step=common_base_quantity_step,
+                slice_ratio=strategy.maker_initial_slice_ratio,
+                max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
+            )
+            if envelope.blocker_reason:
+                if not emit_block:
+                    return envelope
+                return _block_entry_envelope(envelope)
+            return envelope
+
+        if executable_envelope.blocker_reason:
+            return _block_entry_envelope(executable_envelope)
+
+        envelope = _entry_envelope_for_quantity(
+            quantity,
+        )
+        if isinstance(envelope, EntryDispatchResult):
+            return envelope
+
         # Private margin and portfolio limits are live-entry checks only.
         # Recovery, passive close and residual repair do not pass through
         # this branch.  The retired expected-shortfall model deliberately has
@@ -6944,7 +7064,15 @@ class EntryDispatchRuntime:
                     source="strategy_risk_allocator",
                     decision="skip_before_first_leg",
                 )
+            previous_planned_quantity = quantity
             quantity, margin_constrained = margin_resolution
+            quantity = max(float(quantity or 0.0), 0.0)
+            if abs(quantity - previous_planned_quantity) > 1e-12:
+                envelope = _entry_envelope_for_quantity(
+                    quantity,
+                )
+                if isinstance(envelope, EntryDispatchResult):
+                    return envelope
             risk_admission = StrategyRiskAllocator().assess_portfolio_admission(
                 open_positions=self.ctx.state.open_positions.values(),
                 symbol=str(candidate.symbol),
@@ -7055,223 +7183,24 @@ class EntryDispatchRuntime:
                 )
                 return result
 
-        # V1 entry route planning: derive route and maker leg from execution planner.
-        # Strategy config provides min-notional; venue-specific chunk/min-notional
-        # are resolved from the adapter or spec when available.
-        strategy = self.ctx.config.strategy
-        min_notional = strategy.min_entry_leg_notional_quote
-        # The economics builder selected the passive leg from current
-        # per-leg impact.  Reusing it here is mandatory: otherwise the
-        # candidate could receive short-maker fees/spread recovery while the
-        # dispatcher rests the long order.  Legacy candidates retain the V1
-        # configured preference because they carry no selection evidence.
-        candidate_maker_leg = str(
-            getattr(candidate, "entry_maker_leg", "") or ""
-        ).lower()
-        maker_leg = (
-            Side.BUY
-            if candidate_maker_leg == "long"
-            else Side.SELL
-            if candidate_maker_leg == "short"
-            else Side.BUY
-            if strategy.maker_leg_default == "buy"
-            else Side.SELL
-        )
-        if quote_lease is not None:
-            if maker_leg == Side.BUY:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_bid", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_bid", 0.0) or 0.0
-                )
-            else:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_ask", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_ask", 0.0) or 0.0
-                )
-        maker_planner_price = (
-            long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
-        )
-        hedge_planner_price = (
-            short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
-        )
-
-        common_base_quantity_step = _common_base_quantity_step(
-            okx_base_step,
-            long_quantity_step,
-            short_quantity_step,
-        )
-        pair_minimum_reason, pair_minimum_evidence = (
-            self._entry_pair_minimum_reason(
-                quantity=quantity,
-                long_price=long_order_price_hint,
-                short_price=short_order_price_hint,
-                long_metadata=long_quantity_metadata,
-                short_metadata=short_quantity_metadata,
-                strategy_min_notional=min_notional,
-            )
-        )
-        if pair_minimum_reason:
-            result = self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=pair_minimum_reason,
-                blocked_reasons=[pair_minimum_reason],
-                source="entry_pair_minimum",
-                decision="skip_before_first_leg",
-                extra=pair_minimum_evidence,
-            )
-            return result
-
-        maker_quantity_metadata = (
-            long_quantity_metadata
-            if maker_leg == Side.BUY
-            else short_quantity_metadata
-        )
-        hedge_quantity_metadata = (
-            short_quantity_metadata
-            if maker_leg == Side.BUY
-            else long_quantity_metadata
-        )
-        maker_min_notional = max(
-            float(min_notional or 0.0),
-            float(maker_quantity_metadata.get("min_notional", 0.0) or 0.0),
-        )
-        hedge_min_notional = max(
-            float(min_notional or 0.0),
-            float(hedge_quantity_metadata.get("min_notional", 0.0) or 0.0),
-        )
-        maker_min_quantity = self._safe_positive_float(
-            maker_quantity_metadata.get("min_quantity")
-        )
-        hedge_min_quantity = self._safe_positive_float(
-            hedge_quantity_metadata.get("min_quantity")
-        )
-        # The first maker clip must itself satisfy the symbol's quantity
-        # minimum; express that floor in the planner's notional contract.
-        if maker_planner_price > 0.0 and maker_min_quantity > 0.0:
-            maker_min_notional = max(
-                maker_min_notional,
-                maker_min_quantity * maker_planner_price,
-            )
-        try:
-            min_hedgeable_chunk = min_hedgeable_chunk_from_notional(
-                min_base_quantity=hedge_min_quantity,
-                min_notional_quote=hedge_min_notional,
-                # Every fill chunk must be executable on both venues, not
-                # merely on the hedge venue's smaller native step.
-                step_base_quantity=common_base_quantity_step,
-                price_hint=(
-                    hedge_planner_price if hedge_planner_price > 0.0 else None
-                ),
-            )
-        except ValueError:
-            payload = {
-                "symbol": candidate.symbol,
-                "maker_venue": (
-                    long_venue.value
-                    if maker_leg == Side.BUY
-                    else short_venue.value
-                ),
-                "hedge_venue": (
-                    short_venue.value
-                    if maker_leg == Side.BUY
-                    else long_venue.value
-                ),
-                "maker_min_notional_quote": maker_min_notional,
-                "hedge_min_notional_quote": hedge_min_notional,
-                "hedge_min_quantity": hedge_min_quantity,
-                "common_base_quantity_step": common_base_quantity_step,
-                "reason": "min_hedgeable_chunk_invalid",
-                "ts_ms": now_ms,
-            }
-            self.ctx.journal.append(
-                "runtime.entry_skipped_planner_metadata_invalid",
-                payload,
-            )
-            result = self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason="min_hedgeable_chunk_invalid",
-                blocked_reasons=["min_hedgeable_chunk_invalid"],
-                source="entry_execution_planner",
-                decision="skip_before_first_leg",
-                extra=payload,
-            )
-            return result
-
-        route, plan = plan_incremental_entry_execution(
-            target_quantity=quantity,
-            slice_ratio=strategy.maker_initial_slice_ratio,
-            min_hedgeable_chunk=min_hedgeable_chunk,
-            maker_min_notional_quote=maker_min_notional,
-            maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
-            max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
-            hedge_min_notional_quote=hedge_min_notional,
-            hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
-        )
-
-        if route == ExecutionRoute.REJECTED:
-            plan_reason = str(plan.reason or "planner_rejected_entry")
-            self.ctx.journal.append(
-                "runtime.entry_skipped_planner_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "target_quantity": quantity,
-                    "reason": plan_reason,
-                },
-            )
-            result = self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=plan_reason,
-                blocked_reasons=[plan_reason],
-                source="entry_execution_planner",
-                decision="skip_before_first_leg",
-                extra={"target_quantity": quantity},
-            )
-            return result
-
-        if (
-            okx_base_step is not None
-            and okx_base_step > 0
-            and route == ExecutionRoute.PASSIVE_INCREMENTAL
-            and plan.full_target_quantity > 0
-        ):
-            plan.initial_maker_target_quantity = plan.full_target_quantity
-
-        # Map planner route to EntryType
-        if route == ExecutionRoute.PASSIVE_INCREMENTAL:
-            entry_type = EntryType.PASSIVE_INCREMENTAL
-            effective_quantity = plan.initial_maker_target_quantity
-        elif route == ExecutionRoute.FALLBACK_TO_STANDARD:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-        else:
-            entry_type = EntryType.STANDARD_DUAL_TAKER
-            effective_quantity = plan.full_target_quantity
-
         # Sizing/rounding and route selection can change the common quantity
         # after the first shortlist revalidation. Refresh L2 once more for
         # the *actual* standard-IOC quantity, recalculate the same immutable
         # economics contract, and derive bounded limits from those exact
         # levels. A passive route deliberately retains V1 post-only pricing.
         local_l2_execution = self._local_l2_effective_enabled()
-        if live_candidate and entry_type == EntryType.STANDARD_DUAL_TAKER:
+        if live_candidate and envelope.plan.route != ExecutionRoute.PASSIVE_INCREMENTAL:
             final_quote_result = FinalQuoteLeaseResult(quote_lease)
             if local_l2_execution:
                 final_quote_result = self._local_l2_final_quote_result(
                     candidate,
                     now_ms,
-                    target_quantity=effective_quantity,
+                    target_quantity=envelope.effective_dispatch_quantity,
                 )
                 final_quote_result = await self._maybe_recheck_local_l2_final_quote_result(
                     candidate,
                     now_ms,
-                    target_quantity=effective_quantity,
+                    target_quantity=envelope.effective_dispatch_quantity,
                     result=final_quote_result,
                     selected_deadline_monotonic=selected_deadline_monotonic,
                 )
@@ -7290,7 +7219,7 @@ class EntryDispatchRuntime:
                     decision="skip_before_first_leg",
                     extra={
                         **final_quote_result.evidence,
-                        "effective_quantity": effective_quantity,
+                        "effective_quantity": envelope.effective_dispatch_quantity,
                     },
                 )
                 return result
@@ -7306,7 +7235,7 @@ class EntryDispatchRuntime:
             economics_result = self._revalidate_final_entry_economics(
                 candidate=candidate,
                 quote_lease=execution_quote_lease,
-                required_base_quantity=effective_quantity,
+                required_base_quantity=envelope.effective_dispatch_quantity,
                 now_ms=now_ms,
                 source="final_submit_economics",
                 execution_is_passive=False,
@@ -7325,7 +7254,7 @@ class EntryDispatchRuntime:
                 )
             quote_lease = execution_quote_lease
 
-        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
+        if quote_lease is not None and envelope.plan.route != ExecutionRoute.PASSIVE_INCREMENTAL:
             if local_l2_execution:
                 long_order_price_hint, short_order_price_hint = (
                     _standard_ioc_price_hints(quote_lease)
@@ -7339,6 +7268,11 @@ class EntryDispatchRuntime:
                     float(getattr(quote_lease, "long_buy_vwap", 0.0) or 0.0)
                     + float(getattr(quote_lease, "short_sell_vwap", 0.0) or 0.0)
                 ) / 2.0
+            envelope = _entry_envelope_for_quantity(
+                quantity,
+            )
+            if isinstance(envelope, EntryDispatchResult):
+                return envelope
 
         price_consistency_reason = self._entry_normalized_price_consistency_reason(
             long_price=long_order_price_hint,
@@ -7352,32 +7286,6 @@ class EntryDispatchRuntime:
                 blocked_reasons=[price_consistency_reason],
                 source="final_submit_price_normalization",
                 decision="skip_before_first_leg",
-            )
-            return result
-
-        final_pair_minimum_reason, final_pair_minimum_evidence = (
-            self._entry_pair_minimum_reason(
-                quantity=(
-                    plan.full_target_quantity
-                    if entry_type == EntryType.PASSIVE_INCREMENTAL
-                    else effective_quantity
-                ),
-                long_price=long_order_price_hint,
-                short_price=short_order_price_hint,
-                long_metadata=long_quantity_metadata,
-                short_metadata=short_quantity_metadata,
-                strategy_min_notional=min_notional,
-            )
-        )
-        if final_pair_minimum_reason:
-            result = self._emit_entry_dispatch_viability_blocked(
-                candidate,
-                now_ms,
-                reason=final_pair_minimum_reason,
-                blocked_reasons=[final_pair_minimum_reason],
-                source="final_entry_pair_minimum",
-                decision="skip_before_first_leg",
-                extra=final_pair_minimum_evidence,
             )
             return result
 
@@ -7397,14 +7305,14 @@ class EntryDispatchRuntime:
         quantity_plan_reason = self._entry_quantity_plan_reason(
             raw_quantity=raw_quantity,
             common_quantity=quantity,
-            full_target_quantity=plan.full_target_quantity,
-            initial_maker_target_quantity=plan.initial_maker_target_quantity,
+            full_target_quantity=envelope.plan.full_target_quantity,
+            initial_maker_target_quantity=envelope.plan.initial_maker_target_quantity,
             margin_constrained=margin_constrained,
         )
         quantity_contract = classify_entry_quantity_contract(
             raw_quantity=raw_quantity,
             common_quantity=quantity,
-            effective_quantity=effective_quantity,
+            effective_quantity=envelope.effective_dispatch_quantity,
         )
         self.ctx.journal.append(
             "execution.entry_quantity_plan",
@@ -7415,14 +7323,14 @@ class EntryDispatchRuntime:
                 "short_venue": short_venue.value,
                 "raw_quantity": raw_quantity,
                 "common_quantity": quantity,
-                "full_target_quantity": plan.full_target_quantity,
-                "initial_maker_target_quantity": plan.initial_maker_target_quantity,
-                "effective_quantity": effective_quantity,
+                "full_target_quantity": envelope.plan.full_target_quantity,
+                "initial_maker_target_quantity": envelope.plan.initial_maker_target_quantity,
+                "effective_quantity": envelope.effective_dispatch_quantity,
                 "quantity_plan_reason": quantity_plan_reason,
                 **quantity_contract,
-                "route": route.value,
+                "route": envelope.plan.route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
-                "min_hedgeable_chunk": min_hedgeable_chunk,
+                "min_hedgeable_chunk": envelope.min_hedgeable_chunk,
                 "okx_base_quantity_step": okx_base_step,
                 "common_base_quantity_step": _common_base_quantity_step(
                     okx_base_step,
@@ -7476,6 +7384,7 @@ class EntryDispatchRuntime:
             **self._entry_passive_metadata(maker_venue, candidate.symbol),
             **maker_quantity_metadata,
         }
+        current_entry_type = EntryType.PASSIVE_INCREMENTAL if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL else EntryType.STANDARD_DUAL_TAKER
         hedgeability_decision = PendingEntryAdmissionCore.decide(
             PendingEntryAdmissionRequest(
                 symbol=candidate.symbol,
@@ -7483,13 +7392,13 @@ class EntryDispatchRuntime:
                 short_venue=short_venue.value,
                 maker_venue=maker_venue.value,
                 hedge_venue=hedge_venue.value,
-                entry_type=entry_type.value,
+                entry_type=current_entry_type.value,
                 maker_metadata=maker_admission_metadata,
                 maker_quantity_step=maker_quantity_step,
                 hedge_quantity_step=hedge_quantity_step,
-                min_hedgeable_chunk=min_hedgeable_chunk,
-                full_target_quantity=plan.full_target_quantity,
-                initial_maker_target_quantity=plan.initial_maker_target_quantity,
+                min_hedgeable_chunk=envelope.min_hedgeable_chunk,
+                full_target_quantity=envelope.plan.full_target_quantity,
+                initial_maker_target_quantity=envelope.plan.initial_maker_target_quantity,
                 guard_enabled=hedgeability_guard_enabled,
                 small_fill_buffer_enabled=small_fill_buffer_enabled,
                 ts_ms=now_ms,
@@ -7602,11 +7511,11 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
             long_venue=long_venue,
             short_venue=short_venue,
-            quantity=effective_quantity,
+            quantity=envelope.effective_dispatch_quantity,
             long_order_price_hint=long_order_price_hint,
             short_order_price_hint=short_order_price_hint,
             maker_venue=maker_venue,
-            entry_type=entry_type,
+            entry_type=current_entry_type,
             maker_client_order_id=maker_cid,
             hedge_client_order_id=hedge_cid,
             return_result=True,
@@ -7632,7 +7541,7 @@ class EntryDispatchRuntime:
             )
 
         maker_bbo_evidence: dict = {}
-        if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
+        if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL:
             maker_order_price_hint = (
                 long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
             )
@@ -7700,28 +7609,6 @@ class EntryDispatchRuntime:
                     },
                 )
 
-            if live_candidate and repriced_price > 0.0:
-                economics_result = self._revalidate_final_entry_economics(
-                    candidate=candidate,
-                    quote_lease=quote_lease,
-                    required_base_quantity=plan.full_target_quantity,
-                    now_ms=now_ms,
-                    source="final_passive_reprice",
-                    execution_is_passive=True,
-                    return_result=True,
-                )
-                if isinstance(economics_result, EntryDispatchResult):
-                    return economics_result
-                if economics_result is False:
-                    return self._emit_entry_dispatch_viability_blocked(
-                        candidate,
-                        now_ms,
-                        reason="final_passive_reprice_revalidation_failed",
-                        blocked_reasons=["final_passive_reprice_revalidation_failed"],
-                        source="final_passive_reprice",
-                        decision="skip_before_first_leg",
-                    )
-
             passive_price_consistency_reason = (
                 self._entry_normalized_price_consistency_reason(
                     long_price=long_order_price_hint,
@@ -7739,32 +7626,41 @@ class EntryDispatchRuntime:
                 )
                 return result
 
-            passive_minimum_reason, passive_minimum_evidence = (
-                self._entry_pair_minimum_reason(
-                    quantity=plan.full_target_quantity,
-                    long_price=long_order_price_hint,
-                    short_price=short_order_price_hint,
-                    long_metadata=long_quantity_metadata,
-                    short_metadata=short_quantity_metadata,
-                    strategy_min_notional=min_notional,
-                )
+            envelope = _entry_envelope_for_quantity(
+                quantity,
             )
-            if passive_minimum_reason:
-                result = self._emit_entry_dispatch_viability_blocked(
-                    candidate,
-                    now_ms,
-                    reason=passive_minimum_reason,
-                    blocked_reasons=[passive_minimum_reason],
-                    source="final_passive_pair_minimum",
-                    decision="skip_before_first_leg",
-                    extra=passive_minimum_evidence,
+            if isinstance(envelope, EntryDispatchResult):
+                return envelope
+
+            if live_candidate and repriced_price > 0.0:
+                reprice_quantity = envelope.plan.full_target_quantity
+                economics_result = self._revalidate_final_entry_economics(
+                    candidate=candidate,
+                    quote_lease=quote_lease,
+                    required_base_quantity=reprice_quantity,
+                    now_ms=now_ms,
+                    source="final_passive_reprice",
+                    execution_is_passive=(
+                        envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL
+                    ),
+                    return_result=True,
                 )
-                return result
+                if isinstance(economics_result, EntryDispatchResult):
+                    return economics_result
+                if economics_result is False:
+                    return self._emit_entry_dispatch_viability_blocked(
+                        candidate,
+                        now_ms,
+                        reason="final_passive_reprice_revalidation_failed",
+                        blocked_reasons=["final_passive_reprice_revalidation_failed"],
+                        source="final_passive_reprice",
+                        decision="skip_before_first_leg",
+                    )
 
         final_submission_quantity = (
-            plan.full_target_quantity
-            if entry_type == EntryType.PASSIVE_INCREMENTAL
-            else effective_quantity
+            envelope.plan.full_target_quantity
+            if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL
+            else envelope.effective_dispatch_quantity
         )
         if live_candidate:
             final_economics_reason = self._apply_final_entry_economics(
@@ -7818,7 +7714,8 @@ class EntryDispatchRuntime:
             evidence: dict,
         ) -> tuple[str, dict]:
             nonlocal price_hint, long_order_price_hint, short_order_price_hint
-            nonlocal maker_bbo_evidence
+            nonlocal maker_bbo_evidence, final_submission_quantity
+            nonlocal envelope
             payload = dict(evidence)
             if not isinstance(quote_lease, QuoteLease):
                 return "", payload
@@ -7830,7 +7727,7 @@ class EntryDispatchRuntime:
                 quote_lease,
                 candidate,
                 maker_leg=maker_leg,
-                entry_type=entry_type,
+                entry_type=EntryType.PASSIVE_INCREMENTAL if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL else EntryType.STANDARD_DUAL_TAKER,
                 local_l2_execution=local_l2_execution,
             )
             payload.update(
@@ -7842,7 +7739,6 @@ class EntryDispatchRuntime:
                     "submit_rebind_long_order_price_hint": long_order_price_hint,
                     "submit_rebind_short_order_price_hint": short_order_price_hint,
                     "submit_rebind_price_hint": price_hint,
-                    "submit_rebind_quantity": final_submission_quantity,
                 }
             )
             price_rebind_reason = self._entry_normalized_price_consistency_reason(
@@ -7852,10 +7748,26 @@ class EntryDispatchRuntime:
             if price_rebind_reason:
                 return price_rebind_reason, payload
 
-            if entry_type in (
-                EntryType.PASSIVE_INCREMENTAL,
-                EntryType.PASSIVE_FALLBACK,
-            ):
+            envelope = _entry_envelope_for_quantity(
+                quantity,
+                emit_block=False,
+            )
+            if isinstance(envelope, EntryDispatchResult):
+                return envelope.reason or "entry_execution_planner_rejected", payload
+            if envelope.blocker_reason:
+                payload.update(envelope.blocker_evidence)
+                return (
+                    str(envelope.blocker_reason or "entry_execution_planner_rejected"),
+                    payload,
+                )
+            final_submission_quantity = (
+                envelope.plan.full_target_quantity
+                if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL
+                else envelope.effective_dispatch_quantity
+            )
+            payload["submit_rebind_quantity"] = final_submission_quantity
+
+            if envelope.plan.route == ExecutionRoute.PASSIVE_INCREMENTAL:
                 maker_order_price_hint = (
                     long_order_price_hint
                     if maker_leg == Side.BUY
@@ -7878,20 +7790,6 @@ class EntryDispatchRuntime:
                     payload.update(rebinding_bbo_evidence)
                     return bbo_reason or "post_only_bbo_rebind_failed", payload
                 maker_bbo_evidence = rebinding_bbo_evidence
-
-            pair_minimum_reason, pair_minimum_evidence = (
-                self._entry_pair_minimum_reason(
-                    quantity=final_submission_quantity,
-                    long_price=long_order_price_hint,
-                    short_price=short_order_price_hint,
-                    long_metadata=long_quantity_metadata,
-                    short_metadata=short_quantity_metadata,
-                    strategy_min_notional=min_notional,
-                )
-            )
-            if pair_minimum_reason:
-                payload.update(pair_minimum_evidence)
-                return pair_minimum_reason, payload
 
             if live_candidate:
                 economics_rebind_reason = self._apply_final_entry_economics(
@@ -8017,12 +7915,10 @@ class EntryDispatchRuntime:
             entry_id=entry_id,
             long_venue=long_venue,
             short_venue=short_venue,
-            effective_quantity=effective_quantity,
+            executable_envelope=envelope,
             long_order_price_hint=long_order_price_hint,
             short_order_price_hint=short_order_price_hint,
             maker_leg=maker_leg,
-            entry_type=entry_type,
-            route=route,
             now_ms=now_ms,
             expected_shortfall_bps_entry=0.0,
             long_quantity_metadata=long_quantity_metadata,
@@ -8042,8 +7938,6 @@ class EntryDispatchRuntime:
         return await self._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
-            route=route,
-            effective_quantity=effective_quantity,
             price_hint=price_hint,
             maker_venue=maker_venue,
             maker_leg=maker_leg,
@@ -8064,6 +7958,8 @@ class EntryDispatchRuntime:
         price_hint: float = 0.0,
         selected_deadline_monotonic: float | None = None,
         selected_at_ms: int | None = None,
+        *,
+        executable_envelope: ExecutableEntryEnvelope,
     ) -> bool:
         result = await self._dispatch_entry_result(
             candidate,
@@ -8071,6 +7967,7 @@ class EntryDispatchRuntime:
             price_hint=price_hint,
             selected_deadline_monotonic=selected_deadline_monotonic,
             selected_at_ms=selected_at_ms,
+            executable_envelope=executable_envelope,
         )
         self._record_legacy_entry_dispatch_result(result)
         return result.dispatched

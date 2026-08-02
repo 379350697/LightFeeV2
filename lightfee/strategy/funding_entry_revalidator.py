@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from math import isfinite
 from typing import Iterable
@@ -10,6 +11,7 @@ from lightfee.config.schema import StrategyConfig
 from lightfee.sidecar.snapshot import CandidateInput
 from lightfee.strategy.economics import EdgeBreakdown, build_edge_breakdown
 from lightfee.strategy.fee_contract import derive_candidate_stage_fee_bps
+from lightfee.strategy.discovery import funding_entry_static_block_reasons
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,12 +242,27 @@ class FundingEntryRevalidator:
             exit_fee_bps=exit_fee_bps,
             entry_slippage_bps=entry_slippage_bps,
         )
-        if not edge.economics_complete:
-            return FundingEntryRevalidation(False, "incomplete_economics", edge, long_price, short_price, l2_entry_slippage_bps)
-        if edge.expected_net_edge_bps < config.min_expected_edge_bps:
-            return FundingEntryRevalidation(False, "final_expected_edge_below_floor", edge, long_price, short_price, l2_entry_slippage_bps)
-        if edge.worst_case_edge_bps < config.min_worst_case_edge_bps:
-            return FundingEntryRevalidation(False, "final_worst_edge_below_floor", edge, long_price, short_price, l2_entry_slippage_bps)
+        final_candidate = copy.copy(candidate)
+        final_candidate.economics_complete = edge.economics_complete
+        final_candidate.economics_observed_at_ms = edge.observed_at_ms
+        final_candidate.funding_edge_bps = edge.funding_edge_bps
+        final_candidate.expected_edge_bps = edge.expected_net_edge_bps
+        final_candidate.expected_net_edge_bps = edge.expected_net_edge_bps
+        final_candidate.worst_case_edge_bps = edge.worst_case_edge_bps
+        reasons = funding_entry_static_block_reasons(
+            final_candidate,
+            config,
+            now_ms,
+            require_complete_economics=True,
+            include_entry_control=False,
+        )
+        if reasons:
+            reason = reasons[0]
+            if reason == "expected_edge_below_floor":
+                reason = "final_expected_edge_below_floor"
+            elif reason == "worst_case_edge_below_floor":
+                reason = "final_worst_case_edge_below_floor"
+            return FundingEntryRevalidation(False, reason, edge, long_price, short_price, l2_entry_slippage_bps)
         return FundingEntryRevalidation(True, "", edge, long_price, short_price, l2_entry_slippage_bps)
 
     def decide_after_first_leg(

@@ -1,7 +1,15 @@
 """Tests for strategy discovery, scoring, and market view."""
 
+import json
+from pathlib import Path
+
 from lightfee.config.schema import StrategyConfig
-from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot
+from lightfee.sidecar.pairing import build_same_symbol_pairs
+from lightfee.sidecar.snapshot import (
+    CandidateInput,
+    QuoteSnapshot,
+    funding_rate_sample_id,
+)
 from lightfee.strategy.discovery import discover_tradeable_candidates
 from lightfee.strategy.market_view import (
     compute_raw_cross_bps,
@@ -301,3 +309,191 @@ class TestZeroSizeGate:
         ]
         result = discover_tradeable_candidates(candidates, config, NOW_IN_SCAN_WINDOW_MS)
         assert len(result) == 1
+
+
+class TestV1OracleDifferential:
+    """Run the frozen V1 result through the real V2 discovery boundary.
+
+    ``raw_input.json`` is the only source for V2 inputs.  ``raw_output.json``
+    is loaded only after production discovery has returned and is used only as
+    the exact comparison right-hand side.
+    """
+
+    FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "v1_oracle"
+
+    _COMPARABLE_FIELDS = (
+        "pair_id",
+        "symbol",
+        "long_venue",
+        "short_venue",
+        "funding_edge_bps",
+        "expected_edge_bps",
+        "worst_case_edge_bps",
+        "ranking_edge_bps",
+        "quantity",
+        "entry_notional_quote",
+        "entry_cross_bps",
+        "entry_maker_leg",
+        "first_funding_leg",
+        "first_funding_timestamp_ms",
+        "blocked_reasons",
+    )
+
+    def _fixture(self, name: str) -> dict:
+        with (self.FIXTURE_DIR / name).open() as handle:
+            return json.load(handle)
+
+    @staticmethod
+    def _v1_enum_label(value: object) -> str:
+        """Canonicalize only the enum spelling difference between V1 and V2."""
+        return str(value).rsplit(".", 1)[-1].capitalize()
+
+    def _build_v2_input(self, raw_input: dict) -> tuple[dict[str, QuoteSnapshot], StrategyConfig]:
+        """Adapt raw V1 records to the V2 production input model.
+
+        The only arithmetic here converts V1's decimal funding-rate unit to
+        V2's basis-point unit.  No V1 expected field is read or reconstructed.
+        Contract and evidence fields are explicit raw-input records because V2
+        correctly refuses to infer them from BBO values.
+        """
+        paired = raw_input["paired_opportunity"]
+        funding_rate_by_venue_bps = {
+            paired["long_venue"]: float(paired["long_funding_rate"]) * 10_000.0,
+            paired["short_venue"]: float(paired["short_funding_rate"]) * 10_000.0,
+        }
+        observed_at_ms = int(raw_input["market"]["observed_at_ms"])
+        quotes: dict[str, QuoteSnapshot] = {}
+        for raw_quote in raw_input["market"]["quotes"]:
+            venue = str(raw_quote["venue"])
+            symbol = str(raw_quote["symbol"])
+            funding_timestamp_ms = int(raw_quote["funding_timestamp_ms"])
+            evidence = raw_quote["funding_evidence"]
+            contract = raw_quote["contract"]
+            rate_bps = funding_rate_by_venue_bps[venue]
+            assert evidence["sample_id"] == funding_rate_sample_id(
+                venue=venue,
+                symbol=symbol,
+                observed_at_ms=int(evidence["observed_at_ms"]),
+                rate_bps=rate_bps,
+                funding_timestamp_ms=funding_timestamp_ms,
+            )
+            quotes[f"{venue}:{symbol}"] = QuoteSnapshot(
+                venue=venue,
+                symbol=symbol,
+                bid=float(raw_quote["bid"]),
+                ask=float(raw_quote["ask"]),
+                observed_at_ms=observed_at_ms,
+                bid_size=float(raw_quote["bid_size"]),
+                ask_size=float(raw_quote["ask_size"]),
+                funding_rate_bps=rate_bps,
+                funding_rate_observed_at_ms=int(evidence["observed_at_ms"]),
+                funding_rate_event_at_ms=int(evidence["event_at_ms"]),
+                funding_rate_received_at_ms=int(evidence["received_at_ms"]),
+                funding_rate_source=str(evidence["source"]),
+                funding_rate_sample_id=str(evidence["sample_id"]),
+                funding_timestamp_ms=funding_timestamp_ms,
+                funding_interval_ms=int(contract["funding_interval_ms"]),
+                mark_price=float(raw_quote["mark_price"]),
+                underlying=str(contract["underlying"]),
+                quote_currency=str(contract["quote_currency"]),
+                contract_type=str(contract["contract_type"]),
+                contract_multiplier=float(contract["contract_multiplier"]),
+                mark_index_source=str(contract["mark_index_source"]),
+                price_precision=int(contract["price_precision"]),
+                quantity_precision=int(contract["quantity_precision"]),
+                price_tick=float(contract["price_tick"]),
+                quantity_step_base=float(contract["quantity_step_base"]),
+                min_quantity_base=float(contract["min_quantity_base"]),
+                min_notional_quote=float(contract["min_notional_quote"]),
+                min_notional_evidence_complete=bool(
+                    contract["min_notional_evidence_complete"]
+                ),
+                venue_status=str(contract["venue_status"]),
+                contract_normalization_complete=bool(
+                    contract["contract_normalization_complete"]
+                ),
+            )
+
+        return quotes, StrategyConfig(**raw_input["strategy"])
+
+    def _run_v2_production(self, raw_input: dict) -> list[CandidateInput]:
+        quotes, strategy = self._build_v2_input(raw_input)
+        venues = {
+            str(venue["venue"]): venue
+            for venue in raw_input["venues"]
+            if bool(venue["enabled"])
+        }
+        return build_same_symbol_pairs(
+            quotes,
+            list(raw_input["symbols"]),
+            strategy=strategy,
+            venue_fee_bps={
+                venue: float(values["taker_fee_bps"])
+                for venue, values in venues.items()
+            },
+            venue_maker_fee_bps={
+                venue: float(values["maker_fee_bps"])
+                for venue, values in venues.items()
+            },
+            venue_notional_caps={
+                venue: float(values["max_notional"])
+                for venue, values in venues.items()
+            },
+            passive_execution_enabled=bool(
+                raw_input["runtime"]["passive_execution_enabled"]
+            ),
+            observed_at_ms=int(raw_input["market"]["observed_at_ms"]),
+        )
+
+    @classmethod
+    def _canonicalize_actual(cls, candidate: CandidateInput) -> dict[str, object]:
+        """Keep only the explicit V1 result contract and normalize spelling."""
+        return {
+            "pair_id": candidate.pair_id,
+            "symbol": candidate.symbol,
+            "long_venue": candidate.long_venue,
+            "short_venue": candidate.short_venue,
+            "funding_edge_bps": candidate.funding_edge_bps,
+            "expected_edge_bps": candidate.expected_edge_bps,
+            "worst_case_edge_bps": candidate.worst_case_edge_bps,
+            "ranking_edge_bps": candidate.ranking_edge_bps,
+            "quantity": candidate.entry_target_quantity,
+            "entry_notional_quote": candidate.entry_notional_quote,
+            "entry_cross_bps": candidate.entry_cross_bps,
+            "entry_maker_leg": cls._v1_enum_label(candidate.entry_maker_leg),
+            "first_funding_leg": cls._v1_enum_label(candidate.first_funding_leg),
+            "first_funding_timestamp_ms": candidate.first_funding_timestamp_ms,
+            "blocked_reasons": list(candidate.blocked_reasons),
+        }
+
+    @classmethod
+    def _canonicalize_expected(cls, row: dict[str, object]) -> dict[str, object]:
+        assert set(row) == set(cls._COMPARABLE_FIELDS)
+        return {
+            **row,
+            "entry_maker_leg": cls._v1_enum_label(row["entry_maker_leg"]),
+            "first_funding_leg": cls._v1_enum_label(row["first_funding_leg"]),
+        }
+
+    def _assert_exact(self, actual: list[CandidateInput], expected_rows: list[dict]) -> None:
+        actual_rows = [self._canonicalize_actual(candidate) for candidate in actual]
+        expected = [self._canonicalize_expected(row) for row in expected_rows]
+        assert actual_rows == expected
+
+    def test_v2_production_result_matches_v1_oracle_exactly(self):
+        metadata = self._fixture("oracle_fixture_metadata.json")
+        raw_input = self._fixture(metadata["raw_input"])
+        assert metadata["v1_commit"] == (
+            "ca4b1667ed8e59e05de847934d7182d6fbfaecbc"
+        )
+        assert metadata["source_hashes"]["discovery.rs"] == (
+            "a862e498220f846d2270f592095c75019a1c7689e62a1a04f282164add0a0e65"
+        )
+        assert metadata["entry_sizing_mode"] == "liquidity_aware"
+        assert metadata["canonicalization"]["comparable_fields"] == list(
+            self._COMPARABLE_FIELDS
+        )
+
+        actual = self._run_v2_production(raw_input)
+        expected_rows = self._fixture(metadata["v1_expected"])
+        self._assert_exact(actual, expected_rows)

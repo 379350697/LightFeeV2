@@ -2061,14 +2061,80 @@ class EntryGateRuntime:
         max_concurrent_positions = max(self.ctx.config.strategy.max_concurrent_positions, 1)
         open_position_count = len(self.ctx.state.open_positions)
         normalized_remaining_slots = max(int(remaining_slots), 0)
+        blocked_candidate_sample_count = len(candidate_blockers)
+        max_blocked_candidate_samples = 24
         blocked_candidate_samples = [
             {
                 "pair_id": pair_id,
+                "blocker": blocker,
                 "selection_blocker": blocker,
             }
-            for pair_id, blocker in list(sorted(candidate_blockers.items()))[:24]
+            for pair_id, blocker in sorted(candidate_blockers.items())[
+                :max_blocked_candidate_samples
+            ]
         ]
+        blocked_candidate_samples_truncated = (
+            blocked_candidate_sample_count > len(blocked_candidate_samples)
+        )
+        generation_keys = (
+            "candidate_generation_id",
+            "snapshot_generation_id",
+            "opportunity_input_generation_id",
+            "quote_truth_generation_id",
+            "entry_account_truth_generation_id",
+            "account_truth_generation_id",
+            "ranked_candidate_checked_count",
+        )
+        generations = {
+            key: last_scan.get(key)
+            for key in generation_keys
+            if last_scan.get(key) is not None
+        }
+        snapshot_generation = getattr(snapshot, "generation_id", None)
+        if snapshot_generation is not None:
+            generations.setdefault("snapshot_generation_id", snapshot_generation)
+        strategy = self.ctx.config.strategy
+        config_identifiers = {
+            "max_scan_minutes_before_funding": int(
+                getattr(strategy, "max_scan_minutes_before_funding", 0) or 0
+            ),
+            "min_scan_minutes_before_funding": int(
+                getattr(strategy, "min_scan_minutes_before_funding", 0) or 0
+            ),
+            "min_funding_edge_bps": float(
+                getattr(strategy, "min_funding_edge_bps", 0.0) or 0.0
+            ),
+            "min_expected_edge_bps": float(
+                getattr(strategy, "min_expected_edge_bps", 0.0) or 0.0
+            ),
+            "min_worst_case_edge_bps": float(
+                getattr(strategy, "min_worst_case_edge_bps", 0.0) or 0.0
+            ),
+            "entry_sizing_mode": str(getattr(strategy, "entry_sizing_mode", "") or ""),
+            "maker_initial_slice_ratio": float(
+                getattr(strategy, "maker_initial_slice_ratio", 0.0) or 0.0
+            ),
+            "max_top_book_usage_ratio": float(
+                getattr(strategy, "max_top_book_usage_ratio", 0.0) or 0.0
+            ),
+            "entry_quote_lease_max_skew_ms": int(
+                getattr(strategy, "entry_quote_lease_max_skew_ms", 0) or 0
+            ),
+            "maker_hedge_deadline_ms": int(
+                getattr(strategy, "maker_hedge_deadline_ms", 0) or 0
+            ),
+            "live_entry_notional_cap_quote": float(
+                getattr(strategy, "live_entry_notional_cap_quote", 0.0) or 0.0
+            ),
+        }
         payload = {
+            "event_schema": "funding.opportunity_funnel.v1",
+            "contract_identifiers": {
+                "contract": "v1_funding_entry_semantics",
+                "source": "ranked_candidate_loop",
+            },
+            "config_identifiers": config_identifiers,
+            "generations": generations,
             "reason": str(reason or "entry_opportunity_funnel"),
             "candidate_count": len(getattr(snapshot, "candidates", []) or []),
             "tradeable_count": len(tradeable),
@@ -2110,6 +2176,10 @@ class EntryGateRuntime:
                 )
                 for rank, candidate in enumerate(list(selected)[:24], start=1)
             ],
+            "blocked_candidate_sample_count": blocked_candidate_sample_count,
+            "blocked_candidate_samples_truncated": (
+                blocked_candidate_samples_truncated
+            ),
             "blocked_candidate_samples": blocked_candidate_samples,
             "selection_blocked_candidate_samples": [
                 {
@@ -2125,7 +2195,7 @@ class EntryGateRuntime:
         }
         if self.ctx.state.last_scan is not None:
             self.ctx.state.last_scan["opportunity_funnel"] = payload
-        self.ctx.journal.append("entry.opportunity_funnel", payload)
+        self.ctx.journal.append("funding.opportunity_funnel", payload)
 
     @staticmethod
     def _entry_selection_blocker_reason_family(blocker: str) -> str:

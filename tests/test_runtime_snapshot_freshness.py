@@ -26,6 +26,11 @@ from lightfee.engine.market_data_runtime import (
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.recovery import recover_from_snapshot
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.execution_planner import (
+    ExecutableEntryEnvelope,
+    ExecutionRoute,
+    IncrementalEntryExecutionPlan,
+)
 from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
 from lightfee.marketdata.ws_bbo import TopBookQuote
 from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
@@ -47,6 +52,19 @@ from lightfee.sidecar.snapshot import (
 )
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
+
+
+def _dispatch_envelope() -> ExecutableEntryEnvelope:
+    return ExecutableEntryEnvelope(
+        plan=IncrementalEntryExecutionPlan(
+            route=ExecutionRoute.FALLBACK_TO_STANDARD,
+            full_target_quantity=1.0,
+        ),
+        maker_leg="long",
+        hedge_leg="short",
+        requested_quantity=1.0,
+        effective_dispatch_quantity=1.0,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -5985,7 +6003,12 @@ async def test_runtime_blocks_only_when_execution_l2_needed_by_sizing_is_stale(t
 
     runtime.journal.open()
     try:
-        dispatched = await runtime._dispatch_entry(candidate, now_ms=70000, price_hint=100.5)
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            now_ms=70000,
+            price_hint=100.5,
+            executable_envelope=_dispatch_envelope(),
+        )
     finally:
         runtime.journal.close()
 

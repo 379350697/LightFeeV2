@@ -721,6 +721,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "reconciliation.entry_flat_not_found_terminal_cleared",
         "reconciliation.entry_flat_unresolved_maker_retained",
         "entry.opportunity_funnel",
+        "funding.opportunity_funnel",
         "review.candidate_shortlisted",
         "runtime.active_position_tick",
         "runtime.close_price_evidence_fallback",

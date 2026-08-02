@@ -159,5 +159,5 @@ def test_entry_admissibility_allows_clean_candidate():
     }
     assert decision.evidence["first_funding_timestamp_ms"] == 1_300_000
     assert decision.evidence["remaining_to_first_funding_ms"] == 300_000
-    assert decision.evidence["effective_min_before_ms"] == 300_000
+    assert decision.evidence["effective_min_before_ms"] == 180_000
     assert decision.evidence["source"] == "candidate"

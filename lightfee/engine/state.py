@@ -1100,6 +1100,14 @@ class PassivePhaseState:
     maker_client_order_id: str = ""
     maker_resting_limit_price: Optional[float] = None
     maker_resting_since_ms: int = 0
+    # Genuine maker-submit started timestamp captured immediately before the
+    # actual submit call (V1 exit.rs:2006), then committed with the accepted
+    # order identity. Sole authority for leg/telemetry submit time; never
+    # synthesized from phase/cycle clocks.
+    maker_submit_started_at_ms: Optional[int] = None
+    # Genuine ACK timestamp for the same maker submission. Operational resting
+    # age is tracked separately and must never be promoted as ACK evidence.
+    maker_ack_at_ms: Optional[int] = None
     maker_viability_rejected_this_cycle: bool = False
     maker_viability_rejection_reason: str = ""
     maker_viability_rejection_decision: str = ""
@@ -1118,11 +1126,16 @@ class PendingPassiveLegFill:
 
 @dataclass
 class PersistedCloseExecutionLeg:
-    """V1 PersistedCloseExecutionLeg: serializable close leg for passive close."""
+    """V1 PersistedCloseExecutionLeg: serializable close leg for passive close.
+
+    Timing is real-or-null: ``submit_started_at_ms`` and ``latency_ms`` are
+    ``None`` unless a genuine submit timestamp and a genuine fill timestamp
+    produced them.  ``0`` is never a measurement.
+    """
     fill: Optional[OrderFill] = None
     client_order_id: str = ""
-    submit_started_at_ms: int = 0
-    latency_ms: int = 0
+    submit_started_at_ms: Optional[int] = None
+    latency_ms: Optional[int] = None
 
 
 @dataclass
@@ -2237,6 +2250,10 @@ class EngineState:
                         "maker_client_order_id": ppc.phase_state.maker_client_order_id,
                         "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,
                         "maker_resting_since_ms": ppc.phase_state.maker_resting_since_ms,
+                        "maker_submit_started_at_ms": (
+                            ppc.phase_state.maker_submit_started_at_ms
+                        ),
+                        "maker_ack_at_ms": ppc.phase_state.maker_ack_at_ms,
                         "maker_viability_rejected_this_cycle": (
                             ppc.phase_state.maker_viability_rejected_this_cycle
                         ),
