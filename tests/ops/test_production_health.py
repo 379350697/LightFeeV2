@@ -258,11 +258,8 @@ def test_snapshot_transport_green_is_not_funding_ready_when_all_candidates_block
     )
 
     assert report.details["contract_errors"] == []
-    assert report.ok
-    assert "funding_entry_readiness_no_unblocked_candidates" not in report.fingerprints
-    assert report.details["nonblocking_observations"] == [
-        "funding_entry_readiness_no_unblocked_candidates"
-    ]
+    assert not report.ok
+    assert "funding_entry_readiness_no_unblocked_candidates" in report.fingerprints
     assert report.details["candidate_count"] == 1
     assert report.details["blocked_candidate_count"] == 1
     assert report.details["unblocked_candidate_count"] == 0

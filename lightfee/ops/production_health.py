@@ -151,7 +151,6 @@ def analyze_sidecar_snapshot(
             details={"root_type": type(snapshot).__name__},
         )
     fingerprints: list[str] = []
-    nonblocking_observations: list[str] = []
     raw_schema_version = snapshot.get("schema_version")
     if raw_schema_version == SNAPSHOT_SCHEMA_VERSION:
         shared_contract_errors = validate_v5_snapshot_contract(snapshot)
@@ -449,13 +448,7 @@ def analyze_sidecar_snapshot(
         and unblocked_candidate_count == 0
         and not has_candidate_waiting_for_funding_window
     ):
-        # A fresh, contract-valid snapshot may legitimately contain no
-        # executable opportunity.  Candidate admission remains fail-closed;
-        # this is an operator observation, not evidence that the sidecar
-        # service itself is unhealthy.
-        nonblocking_observations.append(
-            "funding_entry_readiness_no_unblocked_candidates"
-        )
+        fingerprints.append("funding_entry_readiness_no_unblocked_candidates")
 
     return HealthReport(
         name="sidecar_snapshot",
@@ -474,7 +467,6 @@ def analyze_sidecar_snapshot(
             "funding_interval_quote_counts_by_venue": dict(
                 sorted(interval_quote_counts.items())
             ),
-            "nonblocking_observations": nonblocking_observations,
             "funding_interval_known_counts_by_venue": dict(
                 sorted(interval_known_counts.items())
             ),
