@@ -1479,6 +1479,39 @@ async def test_pending_entry_does_not_query_planned_hedge_cid_before_submit(
 
 
 @pytest.mark.asyncio
+async def test_pending_entry_reconcile_uses_stored_hedge_cid_when_recovery_placeholder_exists(
+    config, tmp_journal,
+):
+    result = PositionReconciliationResult(
+        position_id="entry-v1-drift",
+        symbol="DEXEUSDT",
+        long_status="uncertain",
+        short_status="uncertain",
+        is_flat=False,
+    )
+    reconciler = _CapturingReconciler(result)
+    runtime = _runtime(config, tmp_journal, reconciler)
+    pending = _pending_entry(
+        pending_id="entry-dexe-cid-recovery",
+        symbol="DEXEUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_order_id="bybit-maker-order",
+        hedge_order_id="entry-dexe-cid-recovery-recovery-short",
+        hedge_client_order_id="bn-dexe-safe-cid",
+        maker_leg_filled=10.6,
+        hedge_leg_filled=10.6,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=2000)
+
+    call = reconciler.calls[-1]
+    assert call["short_order_id"] == pending.hedge_order_id
+    assert call["short_client_order_id"] == "bn-dexe-safe-cid"
+
+
+@pytest.mark.asyncio
 async def test_finalize_zero_fill_retains_pending_when_maker_open_order_truth_exists(
     config, tmp_journal,
 ):
@@ -2929,7 +2962,74 @@ async def test_startup_recovery_imbalanced_live_truth_finalizes_balanced_positio
 
 
 @pytest.mark.asyncio
-async def test_startup_blocked_pending_entry_retries_live_truth_recovery(
+async def test_startup_recovery_live_excess_hedge_queues_residual_repair(
+    config, tmp_journal,
+):
+    """Exchange truth must preserve, then repair, a duplicate hedge fill."""
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="DEXEUSDT",
+                side=Side.BUY,
+                quantity=10.6,
+                entry_price=8.0,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionOpenOrdersAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="DEXEUSDT",
+                side=Side.SELL,
+                quantity=21.2,
+                entry_price=8.0,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-dexe-live-excess-hedge",
+        symbol="DEXEUSDT",
+        target_quantity=10.6,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="long",
+        maker_leg_filled=10.6,
+        hedge_leg_filled=10.6,
+        maker_price=8.0,
+        maker_fill_price=8.0,
+        hedge_fill_price=8.0,
+        maker_order_id="bybit-maker-filled",
+        hedge_order_id="entry-dexe-live-excess-hedge-recovery-short",
+        hedge_client_order_id="bn-dexe-hedge-cid",
+        uncertain_outcome=True,
+        created_at_ms=1000,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._recover_pending_entry_hedges(now_ms=200_000)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(10.6)
+    assert pending.hedge_leg_filled == pytest.approx(21.2), tmp_journal.read_all()
+    assert len(runtime.state.pending_residual_repairs) == 1, tmp_journal.read_all()
+    [residual] = runtime.state.pending_residual_repairs
+    assert residual["repair_venue"] == Venue.BINANCE.value
+    assert residual["repair_side"] == Side.BUY.value
+    assert residual["repair_quantity"] == pytest.approx(10.6)
+    finalized = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.pending_entry_finalized"
+    ][-1]
+    assert finalized["raw_maker_leg_filled"] == pytest.approx(10.6)
+    assert finalized["raw_hedge_leg_filled"] == pytest.approx(21.2)
+
+
+@pytest.mark.asyncio
+async def test_startup_blocked_pending_entry_preserves_live_excess_for_residual_repair(
     config,
 ):
     SnapshotStore(config.persistence.snapshot_path).write({
@@ -2994,12 +3094,20 @@ async def test_startup_blocked_pending_entry_retries_live_truth_recovery(
     assert runtime.state.pending_entries == {}
     opened = runtime.state.open_positions["entry-aria-blocked"]
     assert opened.matched_quantity == pytest.approx(619.0)
-    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
-    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
-    assert runtime.state.recovery_blocked_reason is None
+    # A prior implementation treated this as fully recovered by retaining only
+    # the matched 619 contracts.  That would silently discard the Bybit excess
+    # of 619 contracts.  Preserve exchange truth, queue its repair, and stay
+    # fail-closed until the repair lifecycle is resolved.
+    assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+    assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+    assert len(runtime.state.pending_residual_repairs) == 1
+    [residual] = runtime.state.pending_residual_repairs
+    assert residual["repair_venue"] == Venue.BYBIT.value
+    assert residual["repair_side"] == Side.SELL.value
+    assert residual["repair_quantity"] == pytest.approx(619.0)
     kinds = [event["kind"] for event in runtime.journal.read_all()]
     assert "pending_entry.live_position_imbalanced_hydrated" in kinds
-    assert "runtime.recovery_blocked" not in kinds
+    assert "execution.residual_repair_queued" in kinds
 
 
 @pytest.mark.asyncio

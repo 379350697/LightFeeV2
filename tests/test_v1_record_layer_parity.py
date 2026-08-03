@@ -24,6 +24,7 @@ from typing import Optional as _Optional
 
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     Side,
     TimeInForce,
@@ -89,6 +90,7 @@ class FakeAdapter(VenueAdapter):
     amend_order_call_count: int = 0
     cancel_order_call_count: int = 0
     fetch_order_fill_results: list = field(default_factory=list)
+    fetch_order_fill_calls: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def venue(self) -> Venue:
@@ -146,6 +148,7 @@ class FakeAdapter(VenueAdapter):
         )
 
     async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=""):
+        self.fetch_order_fill_calls.append((symbol, order_id, client_order_id))
         if self.fetch_order_fill_results:
             return self.fetch_order_fill_results.pop(0)
         return None
@@ -745,8 +748,20 @@ class TestV1ReconciliationClientOrderId:
     async def test_reconciler_falls_back_to_client_order_id_when_no_order_id(self):
         long_adapter = FakeAdapter(Venue.BINANCE)
         short_adapter = FakeAdapter(Venue.OKX)
-        # Preload a fill result that will be returned for the clientOrderId lookup
-        expected_fill = _fake_fill(Venue.BINANCE, "BTCUSDT", Side.BUY, 0.01, 50000.0, "real-order-123")
+        # A clientOrderId lookup must preserve its exchange fill-truth evidence;
+        # an OrderFill alone is intentionally not proof during reconciliation.
+        expected_fill = OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.01,
+            average_price=50000.0,
+            order_id="real-order-123",
+            metadata={
+                "evidence_source": "binance_order_status",
+                "raw_exchange_status": "FILLED",
+            },
+        )
         long_adapter.fetch_order_fill_results = [expected_fill]
 
         reconciler = OrderReconciler(adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter})
@@ -761,6 +776,9 @@ class TestV1ReconciliationClientOrderId:
         assert result.long_status == "filled"
         assert result.long_fill is not None
         assert result.long_fill.order_id == "real-order-123"
+        assert long_adapter.fetch_order_fill_calls == [
+            ("BTCUSDT", "", "entry-1000-BTCUSDT-maker"),
+        ]
 
 
 # ===========================================================================

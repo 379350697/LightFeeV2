@@ -1846,6 +1846,7 @@ class _FakeReconciler:
         self._adapters = adapters or {}
         self._order_diagnostics: list[dict] = []
         self.result: PositionReconciliationResult | None = None
+        self.calls: list[dict] = []
 
     def drain_order_diagnostics(self) -> list[dict]:
         events = list(self._order_diagnostics)
@@ -1853,6 +1854,7 @@ class _FakeReconciler:
         return events
 
     async def reconcile_position(self, **kwargs) -> PositionReconciliationResult:
+        self.calls.append(kwargs)
         if self.result is not None:
             return self.result
         return PositionReconciliationResult(
@@ -1974,6 +1976,24 @@ class _CountingVenueAdapter(_FakeVenueAdapter):
         return await super().normalize_quantity(symbol, quantity)
 
 
+class _FilledOrderStatus:
+    def __init__(self, quantity: float):
+        self.status = "filled"
+        self.filled_quantity = quantity
+        self.executed_qty = quantity
+
+
+class _OrderStatusVenueAdapter(_FakeVenueAdapter):
+    def __init__(self, venue: Venue, status: _FilledOrderStatus):
+        super().__init__(venue)
+        self.status = status
+        self.order_status_calls: list[tuple[str, str]] = []
+
+    async def get_order_status(self, symbol: str, order_id: str):
+        self.order_status_calls.append((symbol, order_id))
+        return self.status
+
+
 def _make_test_config(tmp_path, **strategy_overrides):
     """Create a minimal AppConfig for runtime testing."""
     from lightfee.config.schema import (
@@ -2048,6 +2068,213 @@ def _make_pending_entry_for_hedge_delta(**overrides) -> PendingEntry:
     }
     values.update(overrides)
     return PendingEntry(**values)
+
+
+class TestPendingEntryHedgeTruthProgress:
+    @pytest.mark.asyncio
+    async def test_reconcile_live_hedge_progress_consumes_fifo_before_retry(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        runtime._venue_adapters = {
+            Venue.BINANCE: _FakeVenueAdapter(Venue.BINANCE),
+            Venue.BYBIT: hedge_adapter,
+        }
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-dexe-reconcile-progress",
+            symbol="DEXEUSDT",
+            long_status="filled",
+            short_status="filled",
+            short_position=PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="DEXEUSDT",
+                side=Side.SELL,
+                quantity=1.0,
+                entry_price=10.0,
+                observed_at_ms=2100,
+            ),
+        )
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-dexe-reconcile-progress",
+            symbol="DEXEUSDT",
+            target_quantity=1.0,
+            maker_leg_filled=1.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(1.0, 10.0, 1100),
+            ],
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_state(now_ms=2200)
+
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+        assert hedge_adapter._place_order_calls == []
+
+    @pytest.mark.asyncio
+    async def test_order_status_hedge_progress_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        hedge_adapter = _OrderStatusVenueAdapter(
+            Venue.BYBIT,
+            _FilledOrderStatus(1.0),
+        )
+        runtime._venue_adapters = {Venue.BYBIT: hedge_adapter}
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-dexe-order-status-progress",
+            symbol="DEXEUSDT",
+            target_quantity=1.0,
+            maker_leg_filled=1.0,
+            hedge_order_id="hedge-order-id",
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(1.0, 10.0, 1100),
+            ],
+        )
+
+        await runtime._recover_poll_order_status(
+            pending.pending_id,
+            pending,
+            now_ms=2200,
+        )
+
+        assert hedge_adapter.order_status_calls == [("DEXEUSDT", "hedge-order-id")]
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+
+    @pytest.mark.asyncio
+    async def test_live_position_hedge_progress_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        long_adapter = _FakeVenueAdapter(Venue.BINANCE)
+        long_adapter.position = PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="DEXEUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            entry_price=10.0,
+            observed_at_ms=2100,
+        )
+        short_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        short_adapter.position = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="DEXEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            entry_price=10.0,
+            observed_at_ms=2100,
+        )
+        runtime._venue_adapters = {
+            Venue.BINANCE: long_adapter,
+            Venue.BYBIT: short_adapter,
+        }
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-dexe-live-progress",
+            symbol="DEXEUSDT",
+            target_quantity=1.0,
+            maker_leg_filled=1.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(1.0, 10.0, 1100),
+            ],
+            uncertain_outcome=True,
+        )
+
+        hydrated = await runtime._recover_hydrate_from_live_positions(
+            pending,
+            now_ms=2200,
+        )
+
+        assert hydrated is True
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+
+    @pytest.mark.asyncio
+    async def test_force_reconcile_hedge_progress_consumes_fifo(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        runtime._venue_adapters = {
+            Venue.BINANCE: _FakeVenueAdapter(Venue.BINANCE),
+            Venue.BYBIT: _FakeVenueAdapter(Venue.BYBIT),
+        }
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-dexe-force-progress",
+            symbol="DEXEUSDT",
+            long_status="filled",
+            short_status="filled",
+            long_fill=OrderFill(
+                venue=Venue.BINANCE,
+                symbol="DEXEUSDT",
+                side=Side.BUY,
+                quantity=1.0,
+                price=10.0,
+                order_id="maker-order-id",
+                filled_at_ms=2100,
+            ),
+            short_fill=OrderFill(
+                venue=Venue.BYBIT,
+                symbol="DEXEUSDT",
+                side=Side.SELL,
+                quantity=1.0,
+                price=10.0,
+                order_id="hedge-order-id",
+                filled_at_ms=2100,
+            ),
+        )
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-dexe-force-progress",
+            symbol="DEXEUSDT",
+            target_quantity=1.0,
+            maker_leg_filled=1.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(1.0, 10.0, 1100),
+            ],
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_entries_force(now_ms=2200)
+
+        assert pending.hedge_leg_filled == pytest.approx(1.0)
+        assert pending.missing_hedge_quantity() <= 1e-9
+        assert pending.maker_remainder_slices == []
+
+    @pytest.mark.asyncio
+    async def test_force_reconcile_maps_order_identifiers_when_maker_is_short(self, tmp_path):
+        runtime = _make_open_runtime(tmp_path)
+        runtime.reconciler = _FakeReconciler()
+        runtime._venue_adapters = {
+            Venue.BINANCE: _FakeVenueAdapter(Venue.BINANCE),
+            Venue.BYBIT: _FakeVenueAdapter(Venue.BYBIT),
+        }
+        runtime.reconciler.result = PositionReconciliationResult(
+            position_id="entry-short-maker-force-reconcile",
+            symbol="DEXEUSDT",
+        )
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-short-maker-force-reconcile",
+            symbol="DEXEUSDT",
+            maker_leg="short",
+            maker_order_id="short-maker-order",
+            maker_client_order_id="short-maker-cid",
+            hedge_order_id="long-hedge-order",
+            hedge_client_order_id="long-hedge-cid",
+            uncertain_outcome=True,
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        await runtime._reconcile_pending_entries_force(now_ms=2200)
+
+        assert runtime.reconciler.calls == [{
+            "position_id": pending.pending_id,
+            "symbol": "DEXEUSDT",
+            "long_venue": Venue.BINANCE,
+            "short_venue": Venue.BYBIT,
+            "long_order_id": "long-hedge-order",
+            "short_order_id": "short-maker-order",
+            "long_client_order_id": "long-hedge-cid",
+            "short_client_order_id": "short-maker-cid",
+        }]
 
 
 class TestV1PendingEntryHedgeDeltaRuntimeClosure:
