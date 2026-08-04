@@ -272,6 +272,23 @@ class EntryGateRuntime:
         if adapter is None:
             return None, "hyperliquid_adapter_unavailable"
 
+        prior_failure_at_ms: int | None = None
+        prior_failure_error = ""
+        cache = getattr(self.ctx, "_entry_balance_snapshot_cache", {})
+        if isinstance(cache, dict):
+            prior_entry = cache.get(Venue.HYPERLIQUID)
+            if isinstance(prior_entry, dict):
+                prior_result = prior_entry.get("result")
+                if (
+                    isinstance(prior_result, (tuple, list))
+                    and len(prior_result) >= 2
+                    and not bool(prior_result[0])
+                ):
+                    fetched_at_ms = int(prior_entry.get("fetched_at_ms", 0) or 0)
+                    if fetched_at_ms > 0:
+                        prior_failure_at_ms = fetched_at_ms
+                        prior_failure_error = str(prior_result[1] or "")
+
         cached_result, was_cached = self._cached_entry_balance_snapshot(
             Venue.HYPERLIQUID,
             now_ms,
@@ -284,13 +301,36 @@ class EntryGateRuntime:
 
         try:
             snapshot = await adapter.fetch_account_balance_snapshot()
+            if snapshot is None:
+                error = "hyperliquid_account_balance_unavailable"
+                self._store_entry_balance_snapshot(
+                    Venue.HYPERLIQUID,
+                    now_ms,
+                    (False, error),
+                )
+                return None, error
             self._store_entry_balance_snapshot(
                 Venue.HYPERLIQUID,
                 now_ms,
                 (True, snapshot),
             )
-            if snapshot is None:
-                return None, "hyperliquid_account_balance_unavailable"
+            if prior_failure_at_ms is not None:
+                self._append_runtime_diagnostic_event(
+                    "runtime.entry_admission_venue_recovered",
+                    {
+                        "venue": Venue.HYPERLIQUID.value,
+                        "reason": "hyperliquid_account_balance_unavailable",
+                        "source": "entry_balance_snapshot",
+                        "previous_failure_at_ms": prior_failure_at_ms,
+                        "recovered_at_ms": now_ms,
+                        "failure_duration_ms": max(now_ms - prior_failure_at_ms, 0),
+                        "previous_raw_error": prior_failure_error[:500],
+                        "balance_snapshot_available": True,
+                    },
+                    now_ms=now_ms,
+                    key_parts=(Venue.HYPERLIQUID.value, "entry_balance_snapshot"),
+                    interval_ms=self._ENTRY_ADMISSION_VENUE_DEGRADED_LOG_INTERVAL_MS,
+                )
             return snapshot, None
         except Exception as e:
             error = str(e) or e.__class__.__name__

@@ -439,6 +439,11 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",
+        "entry.pending_registered",
+        "runtime.entry_owner_claimed",
+        "runtime.entry_owner_handoff_complete",
+        "runtime.entry_admission_venue_degraded",
+        "runtime.entry_admission_venue_recovered",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -454,6 +459,20 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")
         == "ENTRY_QUOTE_LEASE"
+    )
+    assert map_lifecycle_event_kind("entry.pending_registered") == "PENDING_ENTRY"
+    assert map_lifecycle_event_kind("runtime.entry_owner_claimed") == "DIAGNOSTIC_ONLY"
+    assert (
+        map_lifecycle_event_kind("runtime.entry_owner_handoff_complete")
+        == "DIAGNOSTIC_ONLY"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_admission_venue_degraded")
+        == "DIAGNOSTIC_ONLY"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_admission_venue_recovered")
+        == "DIAGNOSTIC_ONLY"
     )
 
 

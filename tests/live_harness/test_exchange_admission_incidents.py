@@ -687,6 +687,108 @@ async def test_hyperliquid_balance_unavailable_blocks_entry_with_evidence_gap():
 
 
 @pytest.mark.asyncio
+async def test_hyperliquid_empty_balance_snapshot_is_cached_and_recovery_is_journaled_after_ttl():
+    with tempfile.TemporaryDirectory() as td:
+        now_ms = 1778787002000
+        hyperliquid = BalanceAdapter()
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal.open()
+        candidate = _candidate("MOVEUSDT", "bybit", "hyperliquid")
+
+        for requested_at_ms in (now_ms, now_ms + 1):
+            assert await runtime._filter_candidates_by_entry_balance_admission(
+                [candidate], now_ms=requested_at_ms, stage="shortlist"
+            ) == []
+
+        assert hyperliquid.balance_calls == 1
+        assert runtime._entry_balance_snapshot_cache[Venue.HYPERLIQUID]["result"] == (
+            False,
+            "hyperliquid_account_balance_unavailable",
+        )
+
+        recovered_at_ms = now_ms + runtime._RISK_SNAPSHOT_TTL_MS_DEFAULT + 1
+        hyperliquid.balance = AccountBalanceSnapshot(
+            venue=Venue.HYPERLIQUID,
+            asset="USDC",
+            free=100.0,
+            locked=0.0,
+            observed_at_ms=recovered_at_ms,
+            balance_classification="unified_collateral_available",
+            user_abstraction="unifiedAccount",
+            spot_usdc_available=100.0,
+        )
+
+        assert await runtime._filter_candidates_by_entry_balance_admission(
+            [candidate], now_ms=recovered_at_ms, stage="shortlist"
+        ) == [candidate]
+        assert hyperliquid.balance_calls == 2
+        recovery = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_recovered"
+        ]
+        assert len(recovery) == 1
+        payload = recovery[0]
+        assert payload["previous_failure_at_ms"] == now_ms
+        assert payload["recovered_at_ms"] == recovered_at_ms
+        assert payload["previous_raw_error"] == "hyperliquid_account_balance_unavailable"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_hyperliquid_balance_recovery_is_journaled_after_cached_failure_expires():
+    with tempfile.TemporaryDirectory() as td:
+        now_ms = 1778787002000
+        hyperliquid = BalanceAdapter(error=RuntimeError("clearinghouse unavailable"))
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters={Venue.BYBIT: FlatAdapter(), Venue.HYPERLIQUID: hyperliquid},
+        )
+        runtime.journal.open()
+        candidate = _candidate("MOVEUSDT", "bybit", "hyperliquid")
+
+        assert await runtime._filter_candidates_by_entry_balance_admission(
+            [candidate], now_ms=now_ms, stage="shortlist"
+        ) == []
+
+        hyperliquid.error = None
+        hyperliquid.balance = AccountBalanceSnapshot(
+            venue=Venue.HYPERLIQUID,
+            asset="USDC",
+            free=100.0,
+            locked=0.0,
+            observed_at_ms=now_ms + runtime._RISK_SNAPSHOT_TTL_MS_DEFAULT + 1,
+            balance_classification="unified_collateral_available",
+            user_abstraction="unifiedAccount",
+            spot_usdc_available=100.0,
+        )
+        recovered_at_ms = now_ms + runtime._RISK_SNAPSHOT_TTL_MS_DEFAULT + 1
+
+        assert await runtime._filter_candidates_by_entry_balance_admission(
+            [candidate], now_ms=recovered_at_ms, stage="shortlist"
+        ) == [candidate]
+        assert hyperliquid.balance_calls == 2
+
+        recovery = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_venue_recovered"
+        ]
+        assert len(recovery) == 1
+        payload = recovery[0]
+        assert payload["venue"] == "hyperliquid"
+        assert payload["reason"] == "hyperliquid_account_balance_unavailable"
+        assert payload["previous_failure_at_ms"] == now_ms
+        assert payload["recovered_at_ms"] == recovered_at_ms
+        assert payload["failure_duration_ms"] == runtime._RISK_SNAPSHOT_TTL_MS_DEFAULT + 1
+        assert payload["previous_raw_error"] == "clearinghouse unavailable"
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
 async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
     with tempfile.TemporaryDirectory() as td:
         aster = RejectingHedgeAdapter(

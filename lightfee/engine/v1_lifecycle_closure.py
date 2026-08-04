@@ -1147,7 +1147,18 @@ _EVENT_KIND_PHASES = {
     "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "startup.order_path_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "startup.trading_preflight": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "entry.pending_registered": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "entry.opened": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_admission_venue_degraded": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.entry_admission_venue_recovered": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
+    "runtime.entry_owner_claimed": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
+    "runtime.entry_owner_handoff_complete": (
+        V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value
+    ),
     "runtime.position_opened": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_corrected": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.position_drift_skipped_passive_close_owner": (
