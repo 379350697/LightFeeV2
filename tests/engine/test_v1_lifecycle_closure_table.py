@@ -331,6 +331,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.private_ws_stopped",
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
+        "runtime.recovery_fail_closed",
         "scan.no_entry_diagnostics",
         "startup.order_path_preflight",
         "startup.trading_preflight",
@@ -457,6 +458,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.close_residual_detected") == "RESIDUAL_REPAIR"
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
+    assert map_lifecycle_event_kind("runtime.recovery_fail_closed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")

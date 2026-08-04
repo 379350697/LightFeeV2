@@ -38,6 +38,17 @@ normal provisional accounting terminal: it records flat-truth evidence and
 known quantities, deliberately omits `net_quote`, and must not create a PnL
 fact from guessed execution prices or fees.
 
+Before taking that provisional branch, recovery must preserve and consult the
+durable `PendingPassiveClose.long_legs` / `short_legs` order evidence. A
+restart must round-trip each leg's exchange order ID, client order ID, fill and
+timing, together with every behavior-affecting passive phase counter. If either
+leg has proven persisted identities, flat lifecycle cleanup uses the existing
+pending-close reconciliation queue; it must not downgrade to an identity-less
+provisional bill. A restart must not reset a near-threshold maker/L2 failure
+budget and replay retries that should escalate to a taker close. Legacy
+snapshots with no such evidence keep the conservative provisional branch rather
+than inferring an order from price, time, or quantity.
+
 Terminal reduce-only, already-flat, under-min, or price-unavailable close branches can clear only after live exchange truth proves both legs flat. If live truth shows residual exposure and the residual is tradeable, route through V1-style compensation/flattening. If truth is incomplete or cleanup cannot prove flat, retain/fail-closed with structured evidence.
 
 Bybit reduce-only close `110017/orderQty will be truncated to zero` is terminal
@@ -92,8 +103,8 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-08 | Passive close terminality proof gate | fixed, deployed/cloud verified | Maker progress query timeout now keeps zero-fill cycle state; one-sided ACK-only flatten now registers `accepted_order_truth_gap` and waits for exchange truth before terminal lifecycle; clear path now passes full exchange positions/open-orders truth to recovery core. Merged as `74475c5` and included in the latest deployed main line. |
 | 2026-06-10 | MOVEUSDT ACK-only duplicate-client diagnose closure | fixed locally, deploy pending | CL-066 closes the deployed MOVEUSDT evidence-consumption gap where Bybit ACK-only accepted ids plus same-client-id `110072` stayed in active diagnose errors after reconciliation/terminal/current exchange truth proved flat. Diagnose now treats ACK-only `order.uncertain` as implicit truth-gap registration when accepted ids and no-fill evidence are present, binds nested request identities, and resolves matching duplicate-client artifacts only behind flat/no-open-orders truth. Close execution now records duplicate-client live-flat as `exit.close_duplicate_client_order_resolved_live_flat`, not zero-quantity `order.filled`. |
 | 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed, deployed/cloud verified | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. Cloud verification under `fd1579d` is flat/no-open-orders with no active order errors and no unmapped lifecycle events. |
-| 2026-08-04 | Fully filled passive close had no terminal bill | local fixed; deploy pending | CL-095 keeps `exit.passive_close_resolved` operational-only and emits exactly one standard terminal accounting event after dual-leg-zero/no-residual completion. Missing entry-fee evidence stays explicitly provisional. |
-| 2026-08-04 | Live-flat cleanup without a reconcilable close identity had no terminal bill | local fixed; deploy pending | CL-095 now emits one provisional `exit.billing_evidence_unavailable` event after double-flat/open-order truth, and does not enqueue an identity-less reconciliation or fabricate PnL. |
+| 2026-08-04 | Fully filled passive close had no terminal bill | base deployed `ec1d305`; behavior watch | CL-095 keeps `exit.passive_close_resolved` operational-only and emits exactly one standard terminal accounting event after dual-leg-zero/no-residual completion. Missing entry-fee evidence stays explicitly provisional. |
+| 2026-08-04 | Recovered close lost order identity and retry/escalation budget | root correction local; deploy pending | The deployed HOMEUSDT recovery exposed that snapshots kept only aggregate maker/hedge fields. The correction round-trips all passive close execution legs, independent position snapshot, and phase retry/escalation counters; recovered known IDs enter reconciliation while a near-threshold L2 failure escalates without replaying maker retries. Truly identity-less legacy evidence still emits a conservative provisional terminal without fabricated PnL. |
 
 ## Recurrences
 

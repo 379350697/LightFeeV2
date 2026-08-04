@@ -1140,6 +1140,7 @@ _EVENT_KIND_PHASES = {
     "runtime.order_quote_stale_health_summary": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.reconciling": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.recovery_fail_closed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.risk_mode_changed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.stale_fail_closed_cleared": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     # Risk warnings are observability records for an existing position, not

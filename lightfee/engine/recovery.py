@@ -39,6 +39,7 @@ from lightfee.engine.state import (
     PendingPassiveClose,
     PendingPassiveLegFill,
     PendingPassiveOrder,
+    PersistedCloseExecutionLeg,
     RecoveryWorkSnapshot,
     normalize_pending_close_reconciliations,
 )
@@ -337,6 +338,44 @@ def _restore_close_leg_records(data: list[dict[str, Any]]) -> list[CloseLegRecor
                 fee_quote=float(item.get("fee_quote", 0)),
             ))
     return records
+
+
+def _restore_persisted_close_execution_legs(
+    data: Any,
+) -> list[PersistedCloseExecutionLeg]:
+    """Restore the per-order passive-close evidence retained across restart.
+
+    ``PendingPassiveLegFill`` only retains the most recent aggregate fill.  A
+    passive close can span several maker/hedge orders, so terminal
+    reconciliation must retain every individually identified close leg.
+    Older snapshots did not include this field and deliberately restore to an
+    empty list; callers then retain the existing evidence-unavailable path.
+    """
+    legs: list[PersistedCloseExecutionLeg] = []
+    for item in data or []:
+        if not isinstance(item, dict):
+            continue
+        legs.append(
+            PersistedCloseExecutionLeg(
+                fill=_deserialize_order_fill(item.get("fill")),
+                client_order_id=str(item.get("client_order_id", "") or ""),
+                submit_started_at_ms=int(item.get("submit_started_at_ms", 0) or 0),
+                latency_ms=int(item.get("latency_ms", 0) or 0),
+            )
+        )
+    return legs
+
+
+def _serialize_persisted_close_execution_leg(
+    leg: PersistedCloseExecutionLeg,
+) -> dict[str, Any]:
+    """Serialize one immutable passive-close order record for recovery."""
+    return {
+        "fill": _serialize_order_fill(leg.fill),
+        "client_order_id": str(leg.client_order_id or ""),
+        "submit_started_at_ms": int(leg.submit_started_at_ms or 0),
+        "latency_ms": int(leg.latency_ms or 0),
+    }
 
 
 def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
@@ -704,6 +743,12 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     cycle_started_at_ms=int(ps_data.get("cycle_started_at_ms", 0)),
                     zero_fill_cycles_in_phase=int(ps_data.get("zero_fill_cycles_in_phase", 0)),
                     maker_submit_attempt=int(ps_data.get("maker_submit_attempt", 0)),
+                    maker_submit_consecutive_failures=int(
+                        ps_data.get("maker_submit_consecutive_failures", 0) or 0
+                    ),
+                    missing_l2_tick_consecutive_count=int(
+                        ps_data.get("missing_l2_tick_consecutive_count", 0) or 0
+                    ),
                     maker_order_id=str(ps_data.get("maker_order_id", "")),
                     maker_client_order_id=str(ps_data.get("maker_client_order_id", "")),
                     maker_resting_limit_price=ps_data.get("maker_resting_limit_price"),
@@ -727,9 +772,21 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     order_id=str(hf.get("order_id", "")),
                     client_order_id=str(hf.get("client_order_id", "")),
                 )
+                position_id = str(pdata.get("position_id", pid) or pid)
+                # Keep the canonical open-position instance when it was
+                # restored, but retain V1's independent passive-close snapshot
+                # for the recovery edge case where the primary owner is absent.
+                position_snapshot = state.open_positions.get(position_id)
+                if position_snapshot is None:
+                    persisted_position_snapshot = pdata.get("position_snapshot")
+                    if isinstance(persisted_position_snapshot, dict):
+                        position_snapshot = _deserialize_open_position(
+                            persisted_position_snapshot
+                        )
                 state.pending_passive_closes[pid] = PendingPassiveClose(
-                    position_id=pdata.get("position_id", pid),
+                    position_id=position_id,
                     reason=pdata.get("reason", ""),
+                    position_snapshot=position_snapshot,
                     short_stage=pdata.get("short_stage", "") or "exit_short",
                     long_stage=pdata.get("long_stage", "") or "exit_long",
                     target_quantity=float(pdata.get("target_quantity", 0)),
@@ -739,9 +796,39 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     phase_state=phase_state,
                     maker_fill=maker_fill,
                     hedge_fill=hedge_fill,
+                    long_legs=_restore_persisted_close_execution_legs(
+                        pdata.get("long_legs")
+                    ),
+                    short_legs=_restore_persisted_close_execution_legs(
+                        pdata.get("short_legs")
+                    ),
+                    passive_manager_runtimes={
+                        str(venue): PassiveOrderManagerRuntime.from_dict(runtime)
+                        for venue, runtime in dict(
+                            pdata.get("passive_manager_runtimes", {}) or {}
+                        ).items()
+                        if isinstance(runtime, dict)
+                    },
+                    small_fill_min_notional_attempts=int(
+                        pdata.get("small_fill_min_notional_attempts", 0) or 0
+                    ),
+                    last_small_fill_missing_quantity=float(
+                        pdata.get("last_small_fill_missing_quantity", 0.0) or 0.0
+                    ),
+                    small_fill_buffer_started_at_ms=(
+                        int(pdata["small_fill_buffer_started_at_ms"])
+                        if pdata.get("small_fill_buffer_started_at_ms") is not None
+                        else None
+                    ),
                     next_retry_at_ms=int(pdata.get("next_retry_at_ms", 0)),
                     multi_phase_started_at_ms=int(pdata.get("multi_phase_started_at_ms", 0)),
                     created_cycle=int(pdata.get("created_cycle", 0)),
+                    ops_count_this_window=int(
+                        pdata.get("ops_count_this_window", 0) or 0
+                    ),
+                    ops_window_started_at_ms=int(
+                        pdata.get("ops_window_started_at_ms", 0) or 0
+                    ),
                 )
 
     # Restore local-L2 state (V1 parity)
@@ -1577,6 +1664,11 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
         pid: {
             "position_id": ppc.position_id,
             "reason": ppc.reason,
+            "position_snapshot": (
+                _serialize_open_position(ppc.position_snapshot)
+                if ppc.position_snapshot is not None
+                else None
+            ),
             "short_stage": ppc.short_stage,
             "long_stage": ppc.long_stage,
             "target_quantity": ppc.target_quantity,
@@ -1591,6 +1683,13 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
                 "cycle_attempt": ppc.phase_state.cycle_attempt,
                 "cycle_started_at_ms": ppc.phase_state.cycle_started_at_ms,
                 "zero_fill_cycles_in_phase": ppc.phase_state.zero_fill_cycles_in_phase,
+                "maker_submit_attempt": ppc.phase_state.maker_submit_attempt,
+                "maker_submit_consecutive_failures": (
+                    ppc.phase_state.maker_submit_consecutive_failures
+                ),
+                "missing_l2_tick_consecutive_count": (
+                    ppc.phase_state.missing_l2_tick_consecutive_count
+                ),
                 "maker_order_id": ppc.phase_state.maker_order_id,
                 "maker_client_order_id": ppc.phase_state.maker_client_order_id,
                 "maker_resting_limit_price": ppc.phase_state.maker_resting_limit_price,
@@ -1612,9 +1711,26 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
                 "order_id": ppc.hedge_fill.order_id,
                 "client_order_id": ppc.hedge_fill.client_order_id,
             },
+            "long_legs": [
+                _serialize_persisted_close_execution_leg(leg)
+                for leg in ppc.long_legs
+            ],
+            "short_legs": [
+                _serialize_persisted_close_execution_leg(leg)
+                for leg in ppc.short_legs
+            ],
+            "passive_manager_runtimes": {
+                str(venue): runtime.to_dict()
+                for venue, runtime in ppc.passive_manager_runtimes.items()
+            },
+            "small_fill_min_notional_attempts": ppc.small_fill_min_notional_attempts,
+            "last_small_fill_missing_quantity": ppc.last_small_fill_missing_quantity,
+            "small_fill_buffer_started_at_ms": ppc.small_fill_buffer_started_at_ms,
             "next_retry_at_ms": ppc.next_retry_at_ms,
             "multi_phase_started_at_ms": ppc.multi_phase_started_at_ms,
             "created_cycle": ppc.created_cycle,
+            "ops_count_this_window": ppc.ops_count_this_window,
+            "ops_window_started_at_ms": ppc.ops_window_started_at_ms,
         }
         for pid, ppc in state.pending_passive_closes.items()
     }

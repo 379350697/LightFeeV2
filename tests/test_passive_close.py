@@ -2703,6 +2703,98 @@ class TestFallbackResidualReal:
             "fee_quote": 0.0,
         }]
 
+    def test_restart_retains_close_order_identity_for_live_flat_reconciliation(self):
+        """A recovered passive close must keep proven IDs for billing reconciliation."""
+        from lightfee.engine.recovery import (
+            _restore_state_from_snapshot_dict,
+            build_persistent_state_view,
+        )
+
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {}, journal, config_overrides={"runtime_mode": "live"}
+        )
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-restart-reconcile",
+            symbol="HOMEUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=OrderFill(
+                        venue=Venue.OKX,
+                        symbol=position.symbol,
+                        side=Side.SELL,
+                        quantity=20.0,
+                        price=46.2,
+                        order_id="okx-close-order",
+                        client_order_id="okx-close-client",
+                        fee_quote=0.01,
+                        filled_at_ms=1000,
+                    ),
+                    client_order_id="okx-close-client",
+                )
+            ],
+            short_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=OrderFill(
+                        venue=Venue.BYBIT,
+                        symbol=position.symbol,
+                        side=Side.BUY,
+                        quantity=20.0,
+                        price=46.3,
+                        order_id="bybit-close-order",
+                        client_order_id="bybit-close-client",
+                        fee_quote=0.01,
+                        filled_at_ms=1001,
+                    ),
+                    client_order_id="bybit-close-client",
+                )
+            ],
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        restored = _restore_state_from_snapshot_dict(build_persistent_state_view(state))
+        recovered_position = restored.open_positions[position.position_id]
+        recovered_pending = restored.pending_passive_closes[position.position_id]
+        executor._clear_live_flat_state(
+            restored,
+            recovered_pending,
+            recovered_position,
+            source="recovered_live_flat",
+            actual_long_size=0.0,
+            actual_short_size=0.0,
+            exchange_truth={
+                "truth_available": True,
+                "positions_flat": True,
+                "open_orders_flat": True,
+            },
+        )
+
+        assert len(restored.pending_close_reconciliations) == 1
+        reconciliation = restored.pending_close_reconciliations[0]
+        assert reconciliation["long_legs"][0]["order_id"] == "okx-close-order"
+        assert reconciliation["short_legs"][0]["order_id"] == "bybit-close-order"
+        assert "exit.billing_evidence_unavailable" not in [
+            record["kind"] for record in journal.read_all()
+        ]
+
     def test_beatusdt_live_imbalanced_under_min_excess_compensates_flat(self):
         """Both live legs nonzero but imbalanced must not retry stale local dust."""
         journal = _open_journal()
@@ -7120,6 +7212,62 @@ class TestReduceOnlyRejectedEscalation:
 
 class TestMissingL2TickEscalation:
     """Missing L2/tick data escalates after max consecutive failures."""
+
+    def test_restart_preserves_missing_l2_budget_before_escalation(self):
+        """Restart must not replay maker retries already consumed before fallback."""
+        from lightfee.engine.recovery import (
+            _restore_state_from_snapshot_dict,
+            build_persistent_state_view,
+        )
+
+        journal = _open_journal()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: _mock_adapter_with_tick(Venue.BINANCE)},
+            journal,
+        )
+        position = _make_position(
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+        )
+        state = EngineState()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                missing_l2_tick_consecutive_count=(
+                    PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES - 1
+                ),
+            ),
+        )
+
+        restored = _restore_state_from_snapshot_dict(build_persistent_state_view(state))
+        pending = restored.pending_passive_closes[position.position_id]
+        recovered_position = restored.open_positions[position.position_id]
+        asyncio.run(
+            executor._submit_maker_order(
+                restored,
+                pending,
+                recovered_position,
+                Venue.BINANCE,
+                Side.SELL,
+                "long",
+                0.0,
+                1.0,
+            )
+        )
+
+        assert (
+            pending.phase_state.missing_l2_tick_consecutive_count
+            == PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES
+        )
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
 
     def test_missing_l2_escalates_after_max_failures(self):
         """When price_hint is 0 three consecutive times, escalate to DUAL_TAKER."""

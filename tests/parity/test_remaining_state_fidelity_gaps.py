@@ -19,6 +19,9 @@ from lightfee.engine.state import (
     PendingEntry,
     PendingClose,
     PendingPassiveClose,
+    PendingPassiveLegFill,
+    PersistedCloseExecutionLeg,
+    PassiveOrderManagerRuntime,
     PassivePhaseState,
     PassiveExecutionPhase,
     ActiveMakerLeg,
@@ -37,7 +40,7 @@ from lightfee.engine.recovery import (
     _restore_state_from_snapshot_dict,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from lightfee.core.domain import Venue, Side
+from lightfee.core.domain import OrderFill, Venue, Side
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +291,114 @@ class TestStateRoundTrip:
         assert pe is not None
         assert pe.symbol == "ETH-USDT"
         assert pe.run_id == "test-run-001"
+
+    def test_passive_close_order_evidence_roundtrips_for_live_flat_reconciliation(self):
+        """Restart retains every known close order, not only the last aggregate fill."""
+        state = self._make_populated_state()
+        position = state.open_positions["pos-1"]
+        state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            short_stage="exit_short",
+            long_stage="exit_long",
+            target_quantity=2.0,
+            chunk_quantities=[1.0, 1.0],
+            active_chunk_index=1,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_submit_attempt=3,
+                maker_submit_consecutive_failures=2,
+                missing_l2_tick_consecutive_count=2,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=1.0,
+                order_id="maker-last-order",
+                client_order_id="maker-last-client",
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=1.0,
+                order_id="hedge-last-order",
+                client_order_id="hedge-last-client",
+            ),
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=OrderFill(
+                        venue=Venue.BINANCE,
+                        symbol=position.symbol,
+                        side=Side.SELL,
+                        quantity=1.0,
+                        price=3001.0,
+                        order_id="long-close-order-1",
+                        client_order_id="long-close-client-1",
+                        fee_quote=0.1,
+                        filled_at_ms=101,
+                    ),
+                    client_order_id="long-close-client-1",
+                    submit_started_at_ms=100,
+                    latency_ms=5,
+                )
+            ],
+            short_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=OrderFill(
+                        venue=Venue.OKX,
+                        symbol=position.symbol,
+                        side=Side.BUY,
+                        quantity=1.0,
+                        price=3002.0,
+                        order_id="short-close-order-1",
+                        client_order_id="short-close-client-1",
+                        fee_quote=0.2,
+                        filled_at_ms=102,
+                    ),
+                    client_order_id="short-close-client-1",
+                    submit_started_at_ms=101,
+                    latency_ms=6,
+                )
+            ],
+            passive_manager_runtimes={
+                "binance": PassiveOrderManagerRuntime(consecutive_failures=2)
+            },
+            small_fill_min_notional_attempts=1,
+            last_small_fill_missing_quantity=0.25,
+            small_fill_buffer_started_at_ms=99,
+            ops_count_this_window=4,
+            ops_window_started_at_ms=98,
+        )
+
+        view = build_persistent_state_view(state)
+        restored = _restore_state_from_snapshot_dict(view)
+        pending = restored.pending_passive_closes[position.position_id]
+
+        assert pending.position_snapshot is restored.open_positions[position.position_id]
+        assert pending.phase_state.maker_submit_attempt == 3
+        assert pending.phase_state.maker_submit_consecutive_failures == 2
+        assert pending.phase_state.missing_l2_tick_consecutive_count == 2
+        assert pending.long_legs[0].fill is not None
+        assert pending.long_legs[0].fill.order_id == "long-close-order-1"
+        assert pending.long_legs[0].client_order_id == "long-close-client-1"
+        assert pending.short_legs[0].fill is not None
+        assert pending.short_legs[0].fill.order_id == "short-close-order-1"
+        assert pending.passive_manager_runtimes["binance"].consecutive_failures == 2
+        assert pending.small_fill_min_notional_attempts == 1
+        assert pending.last_small_fill_missing_quantity == 0.25
+        assert pending.small_fill_buffer_started_at_ms == 99
+        assert pending.ops_count_this_window == 4
+        assert pending.ops_window_started_at_ms == 98
+
+        # V1 persists the passive-close-owned position snapshot independently.
+        # It remains recoverable even if the primary open-position owner is
+        # absent from an inconsistent pre-recovery snapshot.
+        view["open_positions"] = {}
+        restored_without_primary_owner = _restore_state_from_snapshot_dict(view)
+        orphan_pending = restored_without_primary_owner.pending_passive_closes[
+            position.position_id
+        ]
+        assert orphan_pending.position_snapshot is not None
+        assert orphan_pending.position_snapshot.position_id == position.position_id
+        assert orphan_pending.position_snapshot.symbol == position.symbol
 
 
 # ---------------------------------------------------------------------------
