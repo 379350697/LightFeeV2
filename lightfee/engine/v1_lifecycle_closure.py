@@ -1142,6 +1142,11 @@ _EVENT_KIND_PHASES = {
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.risk_mode_changed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.stale_fail_closed_cleared": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    # Risk warnings are observability records for an existing position, not
+    # lifecycle transitions.  Keeping them in the open-position projection
+    # prevents the auditor from treating a normal risk snapshot as unmapped.
+    "risk.warning_triggered": V1LifecycleClosurePhase.OPEN_POSITION.value,
+    "risk.warning_cleared": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "scan.no_entry_diagnostics": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "scan.strategy_shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "scan.shortlist_ready": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,

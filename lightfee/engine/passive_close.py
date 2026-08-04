@@ -3680,6 +3680,18 @@ class PassiveCloseExecutor:
                 },
             )
 
+        # A passive close has the same durable accounting obligation as a
+        # standard close.  `exit.passive_close_resolved` below is an
+        # operational lifecycle event; it is intentionally not a ledger-close
+        # event.  Emit the normal terminal event only when both legs are known
+        # flat and no residual task was created.
+        fully_closed = (
+            residual is None
+            and position.matched_quantity < 1e-12
+            and position.long_quantity < 1e-12
+            and position.short_quantity < 1e-12
+        )
+
         # If fully closed, remove from open positions
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(pending.position_id, None)
@@ -3707,6 +3719,73 @@ class PassiveCloseExecutor:
                 **closure_fields,
             },
         )
+        if fully_closed:
+            def leg_record(leg: CloseExecutionLeg) -> dict[str, Any]:
+                fill = leg.fill
+                return {
+                    "venue": fill.venue.value,
+                    "order_id": fill.order_id,
+                    "client_order_id": fill.client_order_id or leg.client_order_id,
+                    "quantity": fill.quantity,
+                    "average_price": fill.price,
+                    "fee_quote": fill.fee_quote,
+                    "filled_at_ms": fill.filled_at_ms,
+                }
+
+            funding_quote = (
+                position.captured_funding_quote + position.second_stage_funding_quote
+            )
+            entry_fee_quote = position.total_entry_fee_quote
+            exit_fee_quote = position.realized_exit_fee_quote
+            price_pnl_quote = position.realized_price_pnl_quote
+            entry_fee_evidence_complete = position.entry_fee_evidence_complete
+            terminal_payload = {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "reason": pending.reason,
+                "closed_at_ms": now_ms,
+                "close_path": "passive_close_fills",
+                "long_closed_qty": long_closed,
+                "short_closed_qty": short_closed,
+                "exit_quantity": matched_closed,
+                "long_legs": [leg_record(leg) for leg in long_legs if leg.fill],
+                "short_legs": [leg_record(leg) for leg in short_legs if leg.fill],
+                "price_pnl": price_pnl_quote,
+                "realized_price_pnl_quote": price_pnl_quote,
+                "funding_pnl_quote": funding_quote,
+                "entry_fee_quote": entry_fee_quote,
+                "total_entry_fee_quote": entry_fee_quote,
+                "entry_fee_evidence_complete": entry_fee_evidence_complete,
+                "exit_fee_quote": exit_fee_quote,
+                "total_exit_fee_quote": exit_fee_quote,
+                "net_quote": (
+                    price_pnl_quote + funding_quote - entry_fee_quote - exit_fee_quote
+                ),
+                "net_quote_status": (
+                    "final" if entry_fee_evidence_complete else "provisional"
+                ),
+                "terminal_accounting_status": (
+                    "final"
+                    if entry_fee_evidence_complete
+                    else "provisional_entry_fee_evidence_unavailable"
+                ),
+                "chunk_count": pending.chunk_count(),
+            }
+            if entry_fee_evidence_complete:
+                self._journal.append_critical(now_ms, "exit.closed", terminal_payload)
+            else:
+                self._journal.append_critical(
+                    now_ms,
+                    "exit.billing_evidence_unavailable",
+                    {
+                        **terminal_payload,
+                        "terminal_reason": (
+                            "entry_fee_evidence_unavailable_after_confirmed_passive_close"
+                        ),
+                    },
+                )
         return True
 
     # ------------------------------------------------------------------
@@ -4070,9 +4149,9 @@ class PassiveCloseExecutor:
         source: str,
         payload: dict[str, Any],
         extra: dict[str, Any] | None,
-    ) -> None:
+    ) -> bool:
         if self._runtime_mode != "live":
-            return
+            return False
 
         long_legs, short_legs = self._pending_close_reconciliation_records(
             pending,
@@ -4080,7 +4159,7 @@ class PassiveCloseExecutor:
             extra=extra,
         )
         if not long_legs and not short_legs:
-            return
+            return False
 
         order_key = tuple(
             sorted(
@@ -4089,6 +4168,13 @@ class PassiveCloseExecutor:
                 if record.get("order_id") or record.get("client_order_id")
             )
         )
+        # A local fill quantity without either order identity cannot be
+        # reconciled against a venue statement.  Do not enqueue work that can
+        # never produce a financial terminal; the caller emits the standard
+        # provisional billing terminal after exchange truth proves both legs
+        # flat.
+        if not order_key:
+            return False
         for existing in state.pending_close_reconciliations:
             if not isinstance(existing, dict):
                 continue
@@ -4107,7 +4193,7 @@ class PassiveCloseExecutor:
                 existing.get("position_id") == pending.position_id
                 and existing_key == order_key
             ):
-                return
+                return True
 
         closed_at_ms = self._now_ms()
         reconciliation = {
@@ -4137,6 +4223,7 @@ class PassiveCloseExecutor:
                 "order_ids": order_key,
             },
         )
+        return True
 
     def _register_accepted_order_truth_gap(
         self,
@@ -4328,6 +4415,75 @@ class PassiveCloseExecutor:
             },
         )
 
+    def _emit_live_flat_billing_evidence_unavailable(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        source: str,
+        actual_long_size: float,
+        actual_short_size: float,
+        exchange_truth: dict[str, Any] | None,
+        closure_fields: dict[str, Any],
+    ) -> None:
+        """Durably terminalize a proved-flat close without reconcilable fills.
+
+        Exchange position and open-order truth is sufficient to close the
+        position lifecycle, but it does not establish execution price or fees.
+        The event deliberately omits ``net_quote`` so the projection closes the
+        position without manufacturing a PnL fact.
+        """
+        long_legs, short_legs = self._pending_close_reconciliation_records(
+            pending,
+            position,
+            extra=None,
+        )
+        now_ms = self._now_ms()
+        self._journal.append_critical(
+            now_ms,
+            "exit.billing_evidence_unavailable",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "reason": pending.reason,
+                "resolution_source": source,
+                "terminal_reason": "terminal_live_flat_without_close_order_identity",
+                "close_path": "passive_close_live_flat_no_reconciliation_identity",
+                "closed_at_ms": now_ms,
+                "exit_quantity": position.matched_quantity,
+                "expected_long_quantity": position.long_quantity,
+                "expected_short_quantity": position.short_quantity,
+                "actual_long_size": actual_long_size,
+                "actual_short_size": actual_short_size,
+                "known_long_close_quantity": sum(
+                    float(record.get("quantity") or 0.0) for record in long_legs
+                ),
+                "known_short_close_quantity": sum(
+                    float(record.get("quantity") or 0.0) for record in short_legs
+                ),
+                "close_quantity_evidence_complete": False,
+                "close_order_identity_available": False,
+                "entry_fee_evidence_complete": bool(
+                    position.entry_fee_evidence_complete
+                ),
+                "terminal_accounting_status": (
+                    "provisional_close_execution_evidence_unavailable"
+                ),
+                "net_quote_status": "provisional",
+                "venue_statement_reconciled": False,
+                "exchange_truth": exchange_truth or {
+                    "truth_available": True,
+                    "positions_flat": (
+                        actual_long_size <= 1e-9 and actual_short_size <= 1e-9
+                    ),
+                    "source": source,
+                },
+                **closure_fields,
+            },
+        )
+
     def _clear_live_flat_state(
         self,
         state: EngineState,
@@ -4412,7 +4568,7 @@ class PassiveCloseExecutor:
         ]
         failure_reason = "pending_close_reconciliation_registration_failed"
         try:
-            self._register_close_reconciliation_after_live_flat(
+            reconciliation_registered = self._register_close_reconciliation_after_live_flat(
                 state,
                 pending,
                 position,
@@ -4467,6 +4623,17 @@ class PassiveCloseExecutor:
                 extra=terminal_extra,
                 exchange_truth=exchange_truth,
             )
+            if not reconciliation_registered:
+                failure_reason = "billing_evidence_terminalization_failed"
+                self._emit_live_flat_billing_evidence_unavailable(
+                    pending,
+                    position,
+                    source=source,
+                    actual_long_size=actual_long_size,
+                    actual_short_size=actual_short_size,
+                    exchange_truth=exchange_truth,
+                    closure_fields=closure_fields,
+                )
         except Exception as error:
             state.pending_close_reconciliations = original_reconciliations
             if original_pending is missing:

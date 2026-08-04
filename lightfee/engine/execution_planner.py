@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 from typing import Optional
 
 
@@ -79,6 +80,32 @@ def align_quantity_up_to_step(quantity: float, step: float) -> float:
     if not math.isfinite(step) or step <= 1e-12:
         return quantity
     return math.ceil(quantity / step) * step
+
+
+def common_executable_quantity_step(*steps: float) -> float:
+    """Return the smallest base-quantity grid accepted by every leg.
+
+    V1 plans hedgeability against the hedge venue's native step. V2 submits
+    equal base quantities on both legs, so the planned quantity must also lie
+    on the maker leg's grid before the maker order is submitted.
+    """
+    fractions: list[Fraction] = []
+    for step in steps:
+        if not math.isfinite(step) or step <= _EPS:
+            return 0.0
+        fractions.append(Fraction(str(step)).limit_denominator(1_000_000_000))
+    if not fractions:
+        return 0.0
+
+    common_denominator = 1
+    for step in fractions:
+        common_denominator = math.lcm(common_denominator, step.denominator)
+
+    common_numerator = 1
+    for step in fractions:
+        numerator = step.numerator * (common_denominator // step.denominator)
+        common_numerator = math.lcm(common_numerator, numerator)
+    return float(Fraction(common_numerator, common_denominator))
 
 
 def min_hedgeable_chunk_from_notional(

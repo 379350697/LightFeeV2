@@ -20,6 +20,7 @@ from lightfee.engine.execution_planner import (
     ExecutionRoute,
     align_quantity_down_to_chunk,
     bounded_maker_first_initial_target_quantity,
+    common_executable_quantity_step,
     effective_entry_leg_notional_floor,
     maker_min_valid_clip_quantity,
     min_hedgeable_chunk_from_notional,
@@ -85,6 +86,14 @@ class TestAlignQuantityDownToChunk:
 
     def test_non_finite_chunk_returns_quantity(self):
         assert align_quantity_down_to_chunk(5.0, float("nan")) == 5.0
+
+
+class TestCommonExecutableQuantityStep:
+    def test_uses_the_smallest_grid_legal_for_both_legs(self):
+        assert common_executable_quantity_step(0.002, 0.003) == pytest.approx(0.006)
+
+    def test_preserves_okx_integer_base_contract_grid(self):
+        assert common_executable_quantity_step(0.001, 100.0) == pytest.approx(100.0)
 
 
 # ---------------------------------------------------------------------------

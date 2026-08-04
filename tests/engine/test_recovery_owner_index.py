@@ -90,6 +90,35 @@ def test_live_position_matches_open_position_owner():
     assert owner.confidence == "proven"
 
 
+def test_okx_wire_symbol_matches_canonical_local_open_position_owner():
+    """Recovery ownership compares exchange wire symbols in canonical space."""
+    index = RecoveryOwnerIndex.from_state(
+        {
+            "open_positions": [
+                {
+                    "position_id": "pos-home",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                }
+            ]
+        }
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="okx",
+            symbol="HOME-USDT-SWAP",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "open_position"
+    assert owner.owner_id == "pos-home"
+    assert owner.confidence == "proven"
+
+
 def test_positive_fill_pending_entry_owns_expected_live_position():
     index = RecoveryOwnerIndex.from_state(
         {

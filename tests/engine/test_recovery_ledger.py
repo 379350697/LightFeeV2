@@ -62,6 +62,44 @@ def test_local_flat_plus_live_position_blocks_as_unpaired_live_position():
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is False
 
 
+def test_okx_wire_symbol_is_owned_by_matching_canonical_open_position():
+    from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+
+    local = {
+        "open_positions": [
+            {
+                "position_id": "pos-home",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+            }
+        ],
+        "pending_entries": [],
+    }
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local,
+        exchange_truth={
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": "okx",
+                    "symbol": "HOME-USDT-SWAP",
+                    "side": "buy",
+                    "quantity": 1600.0,
+                }
+            ],
+            "open_orders": [],
+        },
+        owner_index=RecoveryOwnerIndex.from_state(local),
+    )
+
+    assert [(item.kind, item.symbol) for item in ledger.work_items] == [
+        ("owned_open_position", "HOMEUSDT")
+    ]
+    assert ledger.work_items[0].owner.owner_id == "pos-home"
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
 def test_local_baby_state_does_not_own_same_window_unpaired_bybit_positions():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={

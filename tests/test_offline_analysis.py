@@ -407,6 +407,55 @@ class TestProjectionWriter:
         exit_ = [r for r in rows if r["kind"] == "exit.closed"][0]
         assert exit_["net_quote"] == 50.0
 
+    def test_projects_live_flat_billing_gap_without_manufacturing_pnl(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(
+                1,
+                "entry.opened",
+                ts_ms=1000,
+                position_id="pos-live-flat-billing-gap",
+                symbol="HOMEUSDT",
+                long_venue="okx",
+                short_venue="bybit",
+                quantity=10.0,
+            ),
+            _make_record(
+                2,
+                "exit.billing_evidence_unavailable",
+                ts_ms=2000,
+                position_id="pos-live-flat-billing-gap",
+                symbol="HOMEUSDT",
+                long_venue="okx",
+                short_venue="bybit",
+                exit_quantity=10.0,
+                closed_at_ms=2000,
+                terminal_reason="terminal_live_flat_without_close_order_identity",
+                close_quantity_evidence_complete=False,
+                close_order_identity_available=False,
+                net_quote_status="provisional",
+            ),
+        ]
+
+        result = ProjectionWriter(store).project_records(conn, records)
+
+        assert result["failed"] == 0
+        position = conn.execute(
+            "SELECT state, terminal_reason, truth_level FROM position_ledger "
+            "WHERE position_id = ?",
+            ("pos-live-flat-billing-gap",),
+        ).fetchone()
+        assert position["state"] == "closed"
+        assert position["terminal_reason"] == (
+            "terminal_live_flat_without_close_order_identity"
+        )
+        assert position["truth_level"] == "runtime_estimated"
+        pnl = conn.execute(
+            "SELECT * FROM position_pnl_facts WHERE position_id = ?",
+            ("pos-live-flat-billing-gap",),
+        ).fetchall()
+        assert pnl == []
+
     def test_projects_risk_counter_facts(self):
         _td, store, conn = self._open_store()
         records = [

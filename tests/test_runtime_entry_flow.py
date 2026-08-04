@@ -2463,6 +2463,262 @@ class TestPlannerDispatchIntegration:
         assert payload["venue_quantity_metadata"]["bybit"]["quantity_step"] == pytest.approx(0.001)
 
     @pytest.mark.asyncio
+    async def test_dispatch_entry_locks_joint_executable_quantity_before_maker_submission(
+        self, config, tmp_journal,
+    ):
+        """V1 hedgeability plus both venue grids must constrain the maker quantity."""
+        config.strategy.maker_initial_slice_ratio = 1.0
+        config.strategy.min_entry_leg_notional_quote = 150.0
+        binance = FakeVenueAdapter(Venue.BINANCE)
+        okx = FakeVenueAdapter(Venue.OKX, okx_base_quantity_step=100.0)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.OKX: okx},
+        )
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            entry_notional_quote=7420.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.4)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(5200.0)
+        assert executor.ctx.short_quantity == pytest.approx(5200.0)
+        quantity_plan = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "execution.entry_quantity_plan"
+        ][-1]
+        assert quantity_plan["raw_quantity"] == pytest.approx(5300.0)
+        assert quantity_plan["pre_planner_common_quantity"] == pytest.approx(5300.0)
+        assert quantity_plan["common_quantity"] == pytest.approx(5200.0)
+        assert quantity_plan["common_quantity_step"] == pytest.approx(100.0)
+        assert quantity_plan["min_hedgeable_chunk"] == pytest.approx(200.0)
+        assert quantity_plan["quantity_plan_reason"] == "joint_venue_hedgeability_alignment"
+
+    @pytest.mark.asyncio
+    async def test_live_okx_contract_minimum_blocks_maker_before_submission(
+        self, config, tmp_journal,
+    ):
+        """An OKX minSz must constrain the joint plan before the maker exists."""
+        config.runtime.mode = "live"
+        okx = FakeVenueAdapter(Venue.OKX)
+        okx._transport = SimpleNamespace(
+            mode="live",
+            _symbol_metadata={
+                "HOMEUSDT": {"ctVal": 0.1, "lotSz": 1, "minSz": 100},
+            },
+        )
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=5.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is False
+        assert executor.called is False
+        rejected = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_skipped_planner_rejected"
+        ][-1]
+        assert rejected["target_quantity"] == pytest.approx(5.0)
+        assert rejected["reason"] == "target_below_min_hedgeable_chunk"
+
+    @pytest.mark.asyncio
+    async def test_live_okx_contract_minimum_is_recorded_in_joint_entry_plan(
+        self, config, tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        config.strategy.maker_initial_slice_ratio = 1.0
+        okx = FakeVenueAdapter(Venue.OKX)
+        okx._transport = SimpleNamespace(
+            mode="live",
+            _symbol_metadata={
+                "HOMEUSDT": {"ctVal": 0.1, "lotSz": 1, "minSz": 100},
+            },
+        )
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            ctx = None
+
+            async def execute(self, ctx):
+                self.ctx = ctx
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="HOMEUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=15.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.long_quantity == pytest.approx(10.0)
+        assert executor.ctx.short_quantity == pytest.approx(10.0)
+        plan = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "execution.entry_quantity_plan"
+        ][-1]
+        assert plan["minimum_common_base_quantity"] == pytest.approx(10.0)
+        assert plan["venue_quantity_metadata"]["okx"]["quantity_step"] == pytest.approx(0.1)
+        assert plan["venue_quantity_metadata"]["okx"]["min_quantity"] == pytest.approx(10.0)
+        assert plan["venue_quantity_metadata"]["okx"]["source"] == "okx_instrument_metadata"
+
+    @pytest.mark.asyncio
+    async def test_live_okx_missing_contract_minimum_fails_closed_before_submission(
+        self, config, tmp_journal,
+    ):
+        config.runtime.mode = "live"
+        okx = FakeVenueAdapter(Venue.OKX)
+        okx._transport = SimpleNamespace(
+            mode="live",
+            _symbol_metadata={
+                "NOMINUSDT": {"ctVal": 0.1, "lotSz": 1},
+            },
+        )
+        bybit = FakeVenueAdapter(Venue.BYBIT)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+
+        class CapturingExecutor:
+            called = False
+
+            async def execute(self, ctx):
+                self.called = True
+                return EntryExecutionResult(
+                    route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                    state=EntryState.COMPLETED,
+                )
+
+        executor = CapturingExecutor()
+        runtime.entry_executor = executor
+
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        candidate = CandidateInput(
+            long_venue="okx",
+            short_venue="bybit",
+            symbol="NOMINUSDT",
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=15.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+        dispatched = await runtime._dispatch_entry(candidate, 5000, price_hint=1.0)
+
+        assert dispatched is False
+        assert executor.called is False
+        skipped = [
+            record["payload"]
+            for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_skipped_okx_contract_metadata_missing"
+        ][-1]
+        assert skipped["symbol"] == "NOMINUSDT"
+
+    @pytest.mark.asyncio
     async def test_dispatch_entry_skips_when_non_okx_quantity_metadata_missing(
         self, config, tmp_journal,
     ):

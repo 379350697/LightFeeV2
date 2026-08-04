@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
+from lightfee.venues.specs import canonical_symbol_from_venue
 
 
 @dataclass
@@ -121,7 +122,7 @@ class RecoveryOwnerIndex:
         )
 
     def owner_for_position(self, artifact: ExchangeArtifact | Any) -> RecoveryOwner:
-        key = (_venue(artifact), _symbol(artifact))
+        key = (_venue(artifact), _symbol_for_venue(artifact))
         if key in self._positions_by_key:
             return self._positions_by_key[key]
         if key in self._residuals_by_key:
@@ -171,11 +172,11 @@ class RecoveryOwnerIndex:
                 confidence="proven",
                 evidence={"source": "local_open_position"},
             )
-            symbol = _symbol(position)
             for venue in (
                 _venue_from_key(position, "long_venue"),
                 _venue_from_key(position, "short_venue"),
             ):
+                symbol = _symbol_for_venue(position, venue)
                 if venue and symbol:
                     self._positions_by_key[(venue, symbol)] = owner
 
@@ -189,8 +190,8 @@ class RecoveryOwnerIndex:
                 confidence="probable",
                 evidence={"source": "local_residual_repair"},
             )
-            symbol = _symbol(residual)
             venue = _venue(residual)
+            symbol = _symbol_for_venue(residual, venue)
             if symbol:
                 self._residuals_by_symbol[symbol] = owner
             if venue and symbol:
@@ -261,7 +262,7 @@ class RecoveryOwnerIndex:
         self,
         artifact: ExchangeArtifact | Any,
     ) -> RecoveryOwner | None:
-        symbol = _symbol(artifact)
+        symbol = _symbol_for_venue(artifact)
         side = _side(_get(artifact, "side", ""))
         quantity = _float(_get(artifact, "quantity", 0.0))
         if not symbol or not side or quantity <= 0.0:
@@ -304,9 +305,6 @@ class RecoveryOwnerIndex:
         owner: RecoveryOwner,
         pending: Any,
     ) -> None:
-        symbol = _symbol(pending)
-        if not symbol:
-            return
         maker_fill = _float(_get(pending, "maker_leg_filled", 0.0))
         hedge_fill = _float(_get(pending, "hedge_leg_filled", 0.0))
         if maker_fill <= 0.0 and hedge_fill <= 0.0:
@@ -339,11 +337,13 @@ class RecoveryOwnerIndex:
         )
         if long_fill > 0.0:
             long_venue = _venue_from_key(pending, "long_venue")
-            if long_venue:
+            symbol = _symbol_for_venue(pending, long_venue)
+            if long_venue and symbol:
                 self._positions_by_key[(long_venue, symbol)] = position_owner
         if short_fill > 0.0:
             short_venue = _venue_from_key(pending, "short_venue")
-            if short_venue:
+            symbol = _symbol_for_venue(pending, short_venue)
+            if short_venue and symbol:
                 self._positions_by_key[(short_venue, symbol)] = position_owner
 
 
@@ -366,6 +366,10 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 def _symbol(obj: Any) -> str:
     return _text(_get(obj, "symbol", "")).upper()
+
+
+def _symbol_for_venue(obj: Any, venue: str | None = None) -> str:
+    return canonical_symbol_from_venue(venue or _venue(obj), _symbol(obj))
 
 
 def _venue(obj: Any) -> str:
@@ -479,9 +483,19 @@ def _journal_position_specs(
         long_side = _side(payload.get("long_side"))
         short_side = _side(payload.get("short_side"))
         if long_venue and long_quantity > 0.0 and long_side:
-            specs.append((long_venue, symbol, long_side, long_quantity))
+            specs.append((
+                long_venue,
+                canonical_symbol_from_venue(long_venue, symbol),
+                long_side,
+                long_quantity,
+            ))
         if short_venue and short_quantity > 0.0 and short_side:
-            specs.append((short_venue, symbol, short_side, short_quantity))
+            specs.append((
+                short_venue,
+                canonical_symbol_from_venue(short_venue, symbol),
+                short_side,
+                short_quantity,
+            ))
         return tuple(specs)
     # Older positive-fill journal records do not include per-leg venue truth.
     # They must not claim a same-symbol/side/quantity position on an arbitrary

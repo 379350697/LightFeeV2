@@ -576,6 +576,25 @@ def get_spec(venue: Venue) -> VenueSpec:
     return SPEC_REGISTRY[venue]()
 
 
+def canonical_symbol_from_venue(venue: Venue | str, symbol: str) -> str:
+    """Convert a venue wire symbol to LightFee's canonical uppercase symbol.
+
+    Recovery receives raw exchange artifacts, while local state is canonical.
+    An unknown venue or an unexpected conversion failure must preserve the raw
+    symbol so recovery remains fail-closed instead of guessing ownership.
+    """
+    raw_symbol = str(symbol or "").upper()
+    if not raw_symbol:
+        return ""
+    try:
+        resolved_venue = venue if isinstance(venue, Venue) else Venue.from_str(str(venue))
+        converter = get_spec(resolved_venue).symbol_from_venue
+        converted = converter(raw_symbol) if converter is not None else raw_symbol
+        return str(converted or raw_symbol).upper()
+    except (TypeError, ValueError, KeyError):
+        return raw_symbol
+
+
 def get_operation_contract(
     spec: VenueSpec,
     operation: VenueOperation,

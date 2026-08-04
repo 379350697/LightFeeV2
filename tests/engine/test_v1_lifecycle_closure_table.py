@@ -444,6 +444,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.entry_owner_handoff_complete",
         "runtime.entry_admission_venue_degraded",
         "runtime.entry_admission_venue_recovered",
+        "risk.warning_triggered",
+        "risk.warning_cleared",
     ]
 
     unmapped = [kind for kind in recent_event_kinds if map_lifecycle_event_kind(kind) is None]
@@ -474,6 +476,8 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         map_lifecycle_event_kind("runtime.entry_admission_venue_recovered")
         == "DIAGNOSTIC_ONLY"
     )
+    assert map_lifecycle_event_kind("risk.warning_triggered") == "OPEN_POSITION"
+    assert map_lifecycle_event_kind("risk.warning_cleared") == "OPEN_POSITION"
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

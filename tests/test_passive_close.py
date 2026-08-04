@@ -67,7 +67,7 @@ from lightfee.engine.state import (
     PendingPassiveLegFill,
     PersistedCloseExecutionLeg,
 )
-from lightfee.persistence.journal import Journal
+from lightfee.persistence.journal import Journal, replay_journal_records
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1062,73 @@ class TestAdvanceChunkRootInvariant:
         assert result is True
         # Single-chunk → completed → finalized → removed from state
         assert position.position_id not in state.pending_passive_closes
+
+    def test_finalized_passive_close_writes_terminal_billing_with_fill_evidence(self):
+        """A normal fully filled passive close must close the durable bill exactly once."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="p-passive-bill",
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+            long_entry_price=100.0,
+            short_entry_price=105.0,
+            long_entry_fee_quote=1.0,
+            short_entry_fee_quote=2.0,
+            total_entry_fee_quote=3.0,
+            entry_fee_evidence_complete=True,
+            captured_funding_quote=4.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=110.0,
+                fee_quote=1.1,
+                order_id="long-close-order",
+                client_order_id="long-close-cid",
+                last_fill_time_ms=2000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=95.0,
+                fee_quote=0.9,
+                order_id="short-close-order",
+                client_order_id="short-close-cid",
+                last_fill_time_ms=2001,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        assert asyncio.run(executor._advance_chunk(state, pending)) is True
+
+        terminal = [
+            record["payload"]
+            for record in journal.read_all()
+            if record["kind"] == "exit.closed"
+        ]
+        assert len(terminal) == 1
+        payload = terminal[0]
+        assert payload["position_id"] == position.position_id
+        assert payload["terminal_accounting_status"] == "final"
+        assert payload["price_pnl"] == pytest.approx(200.0)
+        assert payload["funding_pnl_quote"] == pytest.approx(4.0)
+        assert payload["entry_fee_quote"] == pytest.approx(3.0)
+        assert payload["exit_fee_quote"] == pytest.approx(2.0)
+        assert payload["net_quote"] == pytest.approx(199.0)
+        assert payload["long_legs"][0]["order_id"] == "long-close-order"
+        assert payload["short_legs"][0]["order_id"] == "short-close-order"
 
 
 class TestTerminalMakerFillHedgeFail:
@@ -5274,6 +5341,37 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         kinds = [e.get("kind") for e in journal.read_all()]
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
+
+    def test_live_flat_without_order_identity_writes_provisional_billing_terminal(self):
+        """A proved-flat close without venue order IDs cannot silently lose its bill."""
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        assert state.pending_close_reconciliations == []
+        terminals = [
+            event["payload"]
+            for event in journal.read_all()
+            if event.get("kind") == "exit.billing_evidence_unavailable"
+        ]
+        assert len(terminals) == 1
+        terminal = terminals[0]
+        assert terminal["position_id"] == position.position_id
+        assert terminal["terminal_reason"] == (
+            "terminal_live_flat_without_close_order_identity"
+        )
+        assert terminal["close_quantity_evidence_complete"] is False
+        assert terminal["close_order_identity_available"] is False
+        assert terminal["actual_long_size"] == 0.0
+        assert terminal["actual_short_size"] == 0.0
+        assert terminal["net_quote_status"] == "provisional"
+        assert "net_quote" not in terminal
+
+        # Local state has already been cleared, so replaying the same journal
+        # cannot create a second terminal on a restart.
+        replayed = replay_journal_records(journal.read_all())
+        assert position.position_id not in replayed["open_position_ids"]
 
     def test_live_flat_cleanup_normalizes_dict_shaped_pending_close_reconciliation_queue(self):
         state, position, journal, executor, long_adapter, short_adapter = (

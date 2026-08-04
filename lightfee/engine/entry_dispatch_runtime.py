@@ -15,6 +15,9 @@ from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.entry import EntryContext, EntryType, normalize_opportunity_type
 from lightfee.engine.execution_planner import (
     ExecutionRoute,
+    common_executable_quantity_step,
+    effective_entry_leg_notional_floor,
+    min_hedgeable_chunk_from_notional,
     plan_incremental_entry_execution,
 )
 from lightfee.engine.recovery import (
@@ -357,30 +360,85 @@ class EntryDispatchRuntime:
             )
             return False
 
-    async def _okx_entry_base_quantity_step(
+    async def _okx_entry_base_quantity_metadata(
         self, venue: Venue, symbol: str,
-    ) -> float | None:
+    ) -> tuple[float | None, float | None, list[str], str]:
+        """Resolve the complete OKX contract quantity boundary in base units.
+
+        OKX exposes ``lotSz`` and ``minSz`` in contract units.  V2 submits
+        canonical base quantities, so both values must be multiplied by
+        ``ctVal`` before an entry can be proven executable.  A step without
+        the corresponding minimum is insufficient: the transport will later
+        reject the hedge as below ``minSz`` after a maker can already fill.
+        """
         if venue != Venue.OKX:
-            return 0.0
+            return 0.0, 0.0, [], "not_okx"
         adapter = self.get_venue_adapter(venue)
         if adapter is None:
-            return None
+            return None, None, ["okx_contract_metadata"], "adapter_missing"
+
+        def contract_metadata(
+            *,
+            ct_val: object,
+            lot_sz: object,
+            min_sz: object,
+            source: str,
+        ) -> tuple[float | None, float | None, list[str], str]:
+            contract_value = self._safe_positive_float(ct_val)
+            contract_step = self._safe_positive_float(lot_sz)
+            contract_minimum = self._safe_positive_float(min_sz)
+            missing_fields: list[str] = []
+            if contract_value <= 0.0:
+                missing_fields.append("okx_contract_ct_val")
+            if contract_step <= 0.0:
+                missing_fields.append("okx_contract_lot_sz")
+            if contract_minimum <= 0.0:
+                missing_fields.append("okx_contract_min_sz")
+            if missing_fields:
+                return None, None, missing_fields, source
+            return (
+                contract_value * contract_step,
+                contract_value * contract_minimum,
+                [],
+                source,
+            )
 
         explicit_step = self._safe_positive_float(
             getattr(adapter, "okx_base_quantity_step", 0.0)
         )
-        if explicit_step > 0:
-            return explicit_step
+        explicit_minimum = self._safe_positive_float(
+            getattr(adapter, "okx_base_min_quantity", 0.0)
+        )
+        if explicit_step > 0.0 and explicit_minimum > 0.0:
+            return (
+                explicit_step,
+                explicit_minimum,
+                [],
+                "okx_explicit_base_quantity_metadata",
+            )
 
         transport = getattr(adapter, "_transport", None)
         if transport is None:
-            return 0.0
+            # Test and paper adapters can expose a base step directly without
+            # modelling the OKX contract wire format.  Production adapters
+            # always have a transport and must use the contract metadata below.
+            if explicit_step > 0.0:
+                return explicit_step, 0.0, [], "okx_explicit_base_step"
+            return 0.0, 0.0, [], "okx_base_quantity_not_applicable"
 
         transport_step = self._safe_positive_float(
             getattr(transport, "okx_base_quantity_step", 0.0)
         )
-        if transport_step > 0:
-            return transport_step
+        transport_minimum = self._safe_positive_float(
+            getattr(transport, "okx_base_min_quantity", 0.0)
+        )
+        if transport_step > 0.0 and transport_minimum > 0.0:
+            return (
+                transport_step,
+                transport_minimum,
+                [],
+                "okx_transport_base_quantity_metadata",
+            )
 
         venue_symbol = symbol
         venue_symbol_fn = getattr(transport, "_venue_symbol", None)
@@ -391,6 +449,7 @@ class EntryDispatchRuntime:
                 venue_symbol = symbol
 
         metadata = getattr(transport, "_symbol_metadata", {}) or {}
+        metadata_missing_fields: list[str] = []
         for key in (symbol, venue_symbol):
             meta = metadata.get(key) or {}
             if not isinstance(meta, dict):
@@ -401,8 +460,18 @@ class EntryDispatchRuntime:
             lot_sz = self._safe_positive_float(
                 meta.get("lot_sz") or meta.get("lotSz") or meta.get("qty_step")
             )
-            if ct_val > 0 and lot_sz > 0:
-                return ct_val * lot_sz
+            min_sz = self._safe_positive_float(
+                meta.get("min_sz") or meta.get("minSz") or meta.get("min_qty")
+            )
+            result = contract_metadata(
+                ct_val=ct_val,
+                lot_sz=lot_sz,
+                min_sz=min_sz,
+                source="okx_instrument_metadata",
+            )
+            if not result[2]:
+                return result
+            metadata_missing_fields = result[2]
 
         try:
             from lightfee.venues.symbol_rules import get_symbol_rules_cache
@@ -410,15 +479,42 @@ class EntryDispatchRuntime:
             rule = await get_symbol_rules_cache().get(transport, Venue.OKX, venue_symbol)
             ct_val = self._safe_positive_float(getattr(rule, "ct_val", 0.0))
             lot_sz = self._safe_positive_float(getattr(rule, "qty_step", 0.0))
-            if ct_val > 0 and lot_sz > 0:
-                return ct_val * lot_sz
+            min_sz = self._safe_positive_float(getattr(rule, "min_qty", 0.0))
+            result = contract_metadata(
+                ct_val=ct_val,
+                lot_sz=lot_sz,
+                min_sz=min_sz,
+                source="okx_symbol_rule",
+            )
+            if not result[2]:
+                return result
         except Exception:
             pass
 
-        mode = str(getattr(transport, "mode", "") or "").lower()
-        if mode == "live":
+        if str(getattr(transport, "mode", "") or "").lower() == "live":
+            return (
+                None,
+                None,
+                metadata_missing_fields or [
+                    "okx_contract_ct_val",
+                    "okx_contract_lot_sz",
+                    "okx_contract_min_sz",
+                ],
+                "okx_contract_metadata_missing",
+            )
+        if explicit_step > 0.0:
+            return explicit_step, 0.0, [], "okx_explicit_base_step"
+        return 0.0, 0.0, [], "okx_base_quantity_not_applicable"
+
+    async def _okx_entry_base_quantity_step(
+        self, venue: Venue, symbol: str,
+    ) -> float | None:
+        quantity_step, _minimum_quantity, missing_fields, _source = (
+            await self._okx_entry_base_quantity_metadata(venue, symbol)
+        )
+        if missing_fields:
             return None
-        return 0.0
+        return quantity_step
 
     async def _okx_aligned_entry_quantity(
         self,
@@ -432,8 +528,10 @@ class EntryDispatchRuntime:
         okx_steps: list[float] = []
         missing = False
         for venue in (long_venue, short_venue):
-            step = await self._okx_entry_base_quantity_step(venue, symbol)
-            if step is None:
+            step, _minimum, missing_fields, _source = (
+                await self._okx_entry_base_quantity_metadata(venue, symbol)
+            )
+            if step is None or missing_fields:
                 missing = True
             elif step > 0:
                 okx_steps.append(step)
@@ -465,11 +563,13 @@ class EntryDispatchRuntime:
         venue: Venue,
         symbol: str,
     ) -> tuple[float | None, list[str]]:
-        okx_step = await self._okx_entry_base_quantity_step(venue, symbol)
+        okx_step, _okx_minimum, okx_missing_fields, _okx_source = (
+            await self._okx_entry_base_quantity_metadata(venue, symbol)
+        )
         if okx_step is None:
-            return None, ["okx_contract_step"]
+            return None, okx_missing_fields or ["okx_contract_metadata"]
         if okx_step > 0:
-            return okx_step, []
+            return okx_step, okx_missing_fields
 
         adapter = self.get_venue_adapter(venue)
         passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
@@ -533,10 +633,22 @@ class EntryDispatchRuntime:
             "missing_fields": list(missing_fields or []),
             "source": "entry_venue_quantity_metadata",
         }
-        okx_step = await self._okx_entry_base_quantity_step(venue, symbol)
+        okx_step, okx_minimum, okx_missing_fields, okx_source = (
+            await self._okx_entry_base_quantity_metadata(venue, symbol)
+        )
+        if venue == Venue.OKX and (okx_step is None or okx_missing_fields):
+            evidence["quantity_step"] = float(okx_step or 0.0)
+            evidence["min_quantity"] = float(okx_minimum or 0.0)
+            evidence["source"] = okx_source
+            evidence["missing_fields"] = list(
+                dict.fromkeys([*evidence["missing_fields"], *okx_missing_fields])
+            )
+            return evidence
         if okx_step and okx_step > 0:
             evidence["quantity_step"] = float(okx_step)
-            evidence["source"] = "okx_contract_step"
+            evidence["min_quantity"] = float(okx_minimum or 0.0)
+            evidence["source"] = okx_source
+            evidence["missing_fields"] = list(okx_missing_fields)
             return evidence
         adapter = self.get_venue_adapter(venue)
         passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
@@ -982,7 +1094,7 @@ class EntryDispatchRuntime:
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
                     "raw_quantity": raw_quantity,
-                    "reason": "okx_ct_val_lot_sz_unconfirmed",
+                    "reason": "okx_contract_quantity_metadata_unconfirmed",
                     "ts_ms": now_ms,
                 },
             )
@@ -1699,6 +1811,8 @@ class EntryDispatchRuntime:
         min_notional = strategy.min_entry_leg_notional_quote
         # V1: maker leg from strategy config (funding arb: long side is typically maker)
         maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
+        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
         if quote_lease is not None:
             if maker_leg == Side.BUY:
                 long_order_price_hint = float(
@@ -1721,19 +1835,91 @@ class EntryDispatchRuntime:
             short_order_price_hint if maker_leg == Side.BUY else long_order_price_hint
         )
 
-        # V1: min_hedgeable_chunk aligns to venue step and notional floor
-        min_hedgeable_chunk = min_notional / price_hint if price_hint > 0 else 0.0
-        if okx_base_step and okx_base_step > 0:
-            min_hedgeable_chunk = max(min_hedgeable_chunk, okx_base_step)
+        # V1 plans the hedge leg before submitting the maker order.  V2 sends
+        # equal base quantities on both legs, therefore use the smallest grid
+        # executable by *both* exchanges rather than relying on the adapter to
+        # silently normalize the hedge after the maker has filled.
+        venue_quantity_metadata = {
+            long_venue.value: await self._entry_venue_quantity_metadata_evidence(
+                long_venue,
+                candidate.symbol,
+                long_quantity_step,
+            ),
+            short_venue.value: await self._entry_venue_quantity_metadata_evidence(
+                short_venue,
+                candidate.symbol,
+                short_quantity_step,
+            ),
+        }
+        common_quantity_step = common_executable_quantity_step(
+            float(long_quantity_step or 0.0),
+            float(short_quantity_step or 0.0),
+        )
+        if common_quantity_step <= 0.0:
+            self.ctx.journal.append(
+                "runtime.entry_skipped_common_quantity_grid_invalid",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "long_quantity_step": long_quantity_step,
+                    "short_quantity_step": short_quantity_step,
+                    "reason": "joint_venue_quantity_grid_invalid",
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
+        long_metadata = venue_quantity_metadata[long_venue.value]
+        short_metadata = venue_quantity_metadata[short_venue.value]
+        maker_metadata = venue_quantity_metadata[maker_venue.value]
+        hedge_metadata = venue_quantity_metadata[hedge_venue.value]
+        minimum_common_base_quantity = max(
+            self._safe_positive_float(long_metadata.get("min_quantity")),
+            self._safe_positive_float(short_metadata.get("min_quantity")),
+        )
+        maker_min_notional = effective_entry_leg_notional_floor(
+            min_notional,
+            self._safe_positive_float(maker_metadata.get("min_notional")),
+        )
+        hedge_min_notional = effective_entry_leg_notional_floor(
+            min_notional,
+            self._safe_positive_float(hedge_metadata.get("min_notional")),
+        )
+        try:
+            min_hedgeable_chunk = min_hedgeable_chunk_from_notional(
+                minimum_common_base_quantity,
+                hedge_min_notional,
+                common_quantity_step,
+                hedge_planner_price if hedge_planner_price > 0.0 else price_hint,
+            )
+        except ValueError as exc:
+            self.ctx.journal.append(
+                "runtime.entry_skipped_joint_hedgeability_invalid",
+                {
+                    "symbol": candidate.symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "common_quantity_step": common_quantity_step,
+                    "minimum_common_base_quantity": minimum_common_base_quantity,
+                    "hedge_min_notional_quote": hedge_min_notional,
+                    "hedge_price_hint": hedge_planner_price,
+                    "reason": str(exc),
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
+
+        pre_planner_common_quantity = quantity
 
         route, plan = plan_incremental_entry_execution(
-            target_quantity=quantity,
+            target_quantity=pre_planner_common_quantity,
             slice_ratio=strategy.maker_initial_slice_ratio,
             min_hedgeable_chunk=min_hedgeable_chunk,
-            maker_min_notional_quote=min_notional,
+            maker_min_notional_quote=maker_min_notional,
             maker_price_hint=maker_planner_price if maker_planner_price > 0 else None,
             max_initial_clip_ratio=strategy.entry_max_initial_clip_ratio,
-            hedge_min_notional_quote=min_notional,
+            hedge_min_notional_quote=hedge_min_notional,
             hedge_price_hint=hedge_planner_price if hedge_planner_price > 0 else None,
         )
 
@@ -1755,6 +1941,10 @@ class EntryDispatchRuntime:
             and plan.full_target_quantity > 0
         ):
             plan.initial_maker_target_quantity = plan.full_target_quantity
+
+        # All subsequent entry context and order construction uses the jointly
+        # executable full target, never the pre-plan quantity.
+        quantity = plan.full_target_quantity
 
         # Map planner route to EntryType
         if route == ExecutionRoute.PASSIVE_INCREMENTAL:
@@ -1780,27 +1970,17 @@ class EntryDispatchRuntime:
         # --- V1 recovery dedup: check for duplicate entries after restart ---
         # Must use the same CID generation as build_entry_orders so the
         # dedup index keys match the actual on-wire clientOrderId.
-        maker_venue = long_venue if maker_leg == Side.BUY else short_venue
-        hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
         maker_cid = generate_exchange_cid(entry_id, "m", maker_venue)
         hedge_cid = generate_exchange_cid(entry_id, "h", hedge_venue)
-        venue_quantity_metadata = {
-            long_venue.value: await self._entry_venue_quantity_metadata_evidence(
-                long_venue,
-                candidate.symbol,
-                long_quantity_step,
-            ),
-            short_venue.value: await self._entry_venue_quantity_metadata_evidence(
-                short_venue,
-                candidate.symbol,
-                short_quantity_step,
-            ),
-        }
-        quantity_plan_reason = self._entry_quantity_plan_reason(
-            raw_quantity=raw_quantity,
-            common_quantity=quantity,
-            full_target_quantity=plan.full_target_quantity,
-            initial_maker_target_quantity=plan.initial_maker_target_quantity,
+        quantity_plan_reason = (
+            "joint_venue_hedgeability_alignment"
+            if abs(plan.full_target_quantity - pre_planner_common_quantity) > 1e-9
+            else self._entry_quantity_plan_reason(
+                raw_quantity=raw_quantity,
+                common_quantity=quantity,
+                full_target_quantity=plan.full_target_quantity,
+                initial_maker_target_quantity=plan.initial_maker_target_quantity,
+            )
         )
         self.ctx.journal.append(
             "execution.entry_quantity_plan",
@@ -1810,6 +1990,7 @@ class EntryDispatchRuntime:
                 "long_venue": long_venue.value,
                 "short_venue": short_venue.value,
                 "raw_quantity": raw_quantity,
+                "pre_planner_common_quantity": pre_planner_common_quantity,
                 "common_quantity": quantity,
                 "full_target_quantity": plan.full_target_quantity,
                 "initial_maker_target_quantity": plan.initial_maker_target_quantity,
@@ -1818,6 +1999,10 @@ class EntryDispatchRuntime:
                 "route": route.value,
                 "maker_leg": maker_leg.value if hasattr(maker_leg, 'value') else str(maker_leg),
                 "min_hedgeable_chunk": min_hedgeable_chunk,
+                "common_quantity_step": common_quantity_step,
+                "minimum_common_base_quantity": minimum_common_base_quantity,
+                "maker_min_notional_quote": maker_min_notional,
+                "hedge_min_notional_quote": hedge_min_notional,
                 "okx_base_quantity_step": okx_base_step,
                 "venue_quantity_steps": {
                     long_venue.value: long_quantity_step or 0.0,

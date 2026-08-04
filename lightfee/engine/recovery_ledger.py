@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from lightfee.venues.specs import canonical_symbol_from_venue
+
 EPSILON = 1e-9
 
 GLOBAL_BLOCKING_KINDS = frozenset(
@@ -561,8 +563,11 @@ def _flatten_exchange_collection(value: Any) -> list[Any]:
 def _symbol(obj: Any) -> str:
     symbol = str(_get(obj, "symbol", "") or "").upper()
     if symbol:
-        return symbol
-    return str(_get(_get(obj, "position_snapshot", {}), "symbol", "") or "").upper()
+        return canonical_symbol_from_venue(_venue(obj), symbol)
+    snapshot_symbol = str(
+        _get(_get(obj, "position_snapshot", {}), "symbol", "") or ""
+    ).upper()
+    return canonical_symbol_from_venue(_venue(obj), snapshot_symbol)
 
 
 def _venue(obj: Any) -> str:
